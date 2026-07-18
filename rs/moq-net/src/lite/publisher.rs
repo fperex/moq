@@ -17,6 +17,15 @@ use crate::{
 
 use super::Version;
 
+/// Publisher-side bookkeeping for one announced path, so upstream route changes
+/// forward as a restart. `sent` is the hop chain last written to the peer, or
+/// `None` while the announce is filtered (reflected or excluded).
+struct WatchedRoute {
+	consumer: crate::broadcast::Consumer,
+	path: crate::PathOwned,
+	sent: Option<OriginList>,
+}
+
 pub(super) struct PublisherConfig<S: web_transport_trait::Session> {
 	pub session: S,
 	/// The origin we read local broadcasts from.
@@ -117,9 +126,20 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let mut interval = web_async::time::interval(PROBE_INTERVAL);
 
 		loop {
-			tokio::select! {
-				res = stream.reader.closed() => return res,
-				_ = interval.tick() => {}
+			// Tick the probe interval, bailing as soon as the peer closes its side.
+			let closed = {
+				let mut closed = std::pin::pin!(stream.reader.closed());
+				let mut tick = std::pin::pin!(interval.tick());
+				kio::wait(|waiter| {
+					if let Poll::Ready(res) = waiter.poll_future(closed.as_mut()) {
+						return Poll::Ready(Some(res));
+					}
+					waiter.poll_future(tick.as_mut()).map(|_| None)
+				})
+				.await
+			};
+			if let Some(res) = closed {
+				return res;
 			}
 
 			let Some(bitrate) = session.stats().estimated_send_rate() else {
@@ -219,6 +239,12 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let mut next_announce_id: u64 = 0;
 		let mut announce_ids: std::collections::HashMap<crate::PathOwned, u64> = std::collections::HashMap::new();
 
+		// Lite05+: watch every announced broadcast's route and forward changes as a
+		// restart, so an upstream failover re-advertises downstream instead of the
+		// peer keeping a stale hop chain. Keyed by suffix; filtered announces are
+		// watched too, since an update can cross the forwarding filter either way.
+		let mut watched: std::collections::HashMap<crate::PathOwned, WatchedRoute> = std::collections::HashMap::new();
+
 		match version {
 			Version::Lite01 | Version::Lite02 => {
 				let mut init = Vec::new();
@@ -273,8 +299,17 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 					match broadcast {
 						Some(broadcast) => {
-							let info = broadcast.info();
-							let hops = &info.hops;
+							let hops = broadcast.route().hops;
+							// Watch even the announces we filter below: a later route update
+							// can cross the forwarding filter in either direction.
+							watched.insert(
+								suffix.clone(),
+								WatchedRoute {
+									consumer: broadcast.clone(),
+									path: path.clone(),
+									sent: None,
+								},
+							);
 							// Apply the same exclude_hop and reflected-announce skips as the live
 							// loop so the count matches exactly what we send (minus the self push).
 							if exclude_hop != 0 && hops.iter().any(|h| h.id() == exclude_hop) {
@@ -287,12 +322,13 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 							let guard = stats.broadcast(&absolute).publisher();
 							stats_guards.entry(absolute.clone()).or_insert(guard);
 							initial.retain(|(s, _)| s != &suffix);
-							initial.push((suffix, hops.clone()));
+							initial.push((suffix, hops));
 						}
 						None => {
 							// A potential race: a just-announced path already unannounced.
 							tracing::debug!(broadcast = %absolute, "unannounce");
 							stats_guards.remove(&absolute);
+							watched.remove(&suffix);
 							initial.retain(|(s, _)| s != &suffix);
 						}
 					}
@@ -310,6 +346,9 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 					if version.has_announce_id() {
 						announce_ids.insert(suffix.clone(), next_announce_id);
 						next_announce_id += 1;
+					}
+					if let Some(entry) = watched.get_mut(suffix) {
+						entry.sent = Some(hops.clone());
 					}
 					lite::AnnounceBroadcast::Active {
 						suffix: suffix.as_path(),
@@ -333,62 +372,220 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			}
 		}
 
-		// Send updates as they arrive.
+		// One announce-loop turn: either an (un)announce from the origin or a route
+		// change on an already-announced broadcast. Resolved outside the select so
+		// the handlers below can freely mutate the maps its futures borrow.
+		enum Op {
+			Announce(Option<crate::announce::Update>),
+			Route(crate::PathOwned, Result<crate::broadcast::Route, Error>),
+		}
+
+		// Send updates as they arrive. Closure wins the race so a dead peer can't
+		// stall on a busy announce feed.
 		loop {
-			tokio::select! {
-				biased;
-				res = stream.reader.closed() => return res,
-				next = announced.next() => {
-						let Some(crate::announce::Update { path, broadcast }) = next else {
-							stream.writer.finish()?;
-							return stream.writer.closed().await;
-						};
+			let op = {
+				let mut closed = std::pin::pin!(stream.reader.closed());
+				kio::wait(|waiter| {
+					if let Poll::Ready(res) = waiter.poll_future(closed.as_mut()) {
+						return Poll::Ready(Err(res));
+					}
+					if let Poll::Ready(next) = announced.poll_next(waiter) {
+						return Poll::Ready(Ok(Op::Announce(next)));
+					}
+					// Poll every watched broadcast for a route change; each wake
+					// rescans the map, which announce-control rates make fine.
+					for (suffix, entry) in watched.iter_mut() {
+						if let Poll::Ready(res) = entry.consumer.poll_route_changed(waiter) {
+							return Poll::Ready(Ok(Op::Route(suffix.clone(), res)));
+						}
+					}
+					Poll::Pending
+				})
+				.await
+			};
+			let op = match op {
+				Ok(op) => op,
+				Err(res) => return res,
+			};
 
-						let suffix = path.strip_prefix(&prefix).expect("origin returned invalid path").to_owned();
-						let absolute = origin.absolute(&path).to_owned();
+			match op {
+				Op::Announce(None) => {
+					stream.writer.finish()?;
+					return stream.writer.closed().await;
+				}
+				Op::Announce(Some(crate::announce::Update { path, broadcast })) => {
+					let suffix = path
+						.strip_prefix(&prefix)
+						.expect("origin returned invalid path")
+						.to_owned();
+					let absolute = origin.absolute(&path).to_owned();
 
-						match broadcast {
-							Some(active) => {
-								let info = active.info();
-								let Some(hops) = Self::prepare_active_hops(&info.hops, self_origin, exclude_hop, version, &absolute) else {
-									continue;
-								};
-								tracing::debug!(broadcast = %absolute, "announce");
-								let bs = stats.broadcast(&absolute);
-								// Count the broadcast name length, not the encoded message size, so
-								// stats don't penalize the broadcast for hop/framing overhead.
-								bs.publisher_announced_bytes(absolute.as_str().len() as u64);
-								let prev = stats_guards.insert(absolute.clone(), bs.publisher());
-								debug_assert!(prev.is_none(), "origin announced a path that was already active");
-								if version.has_announce_id() {
-									let prev = announce_ids.insert(suffix.clone(), next_announce_id);
-									debug_assert!(prev.is_none(), "announce id still assigned for a new announce");
-									next_announce_id += 1;
-								}
-								stream.writer.encode(&lite::AnnounceBroadcast::Active { suffix, hops }).await?;
+					match broadcast {
+						Some(active) => {
+							let route = active.route();
+							if lite::restart_supported(version) {
+								// Watch even if filtered below: a route update can cross
+								// the forwarding filter in either direction.
+								watched.insert(
+									suffix.clone(),
+									WatchedRoute {
+										consumer: active.clone(),
+										path: path.clone(),
+										sent: None,
+									},
+								);
 							}
-							None => {
-								tracing::debug!(broadcast = %absolute, "unannounce");
-								stats_guards.remove(&absolute);
-								if version.has_announce_id() {
-									// Retract by id; nothing to send if the announce was filtered and
-									// the peer never saw it (an unknown id is a protocol violation).
-									if let Some(id) = announce_ids.remove(&suffix) {
-										stats.broadcast(&absolute)
-											.publisher_announced_bytes(absolute.as_str().len() as u64);
-										stream.writer.encode(&lite::AnnounceBroadcast::EndedId { id }).await?;
-									}
-								} else {
-									// Count the name length whether or not a guard is held: the Ended
-									// message is sent even for announces we filtered out above.
-									stats.broadcast(&absolute)
+							let Some(hops) =
+								Self::prepare_active_hops(&route.hops, self_origin, exclude_hop, version, &absolute)
+							else {
+								continue;
+							};
+							tracing::debug!(broadcast = %absolute, "announce");
+							let bs = stats.broadcast(&absolute);
+							// Count the broadcast name length, not the encoded message size, so
+							// stats don't penalize the broadcast for hop/framing overhead.
+							bs.publisher_announced_bytes(absolute.as_str().len() as u64);
+							let prev = stats_guards.insert(absolute.clone(), bs.publisher());
+							debug_assert!(prev.is_none(), "origin announced a path that was already active");
+							if version.has_announce_id() {
+								let prev = announce_ids.insert(suffix.clone(), next_announce_id);
+								debug_assert!(prev.is_none(), "announce id still assigned for a new announce");
+								next_announce_id += 1;
+							}
+							if let Some(entry) = watched.get_mut(&suffix) {
+								entry.sent = Some(hops.clone());
+							}
+							stream
+								.writer
+								.encode(&lite::AnnounceBroadcast::Active { suffix, hops })
+								.await?;
+						}
+						None => {
+							tracing::debug!(broadcast = %absolute, "unannounce");
+							// A watched entry with `sent: None` means the peer holds no live
+							// advertisement (a route-filter retract already sent its Ended);
+							// repeating the Ended would be a spurious wire message. Pre-watch
+							// versions never populate `watched`, so they keep sending the
+							// Ended even for announces filtered above.
+							let retracted = watched.remove(&suffix).is_some_and(|entry| entry.sent.is_none());
+							stats_guards.remove(&absolute);
+							if version.has_announce_id() {
+								// Retract by id; nothing to send if the announce was filtered and
+								// the peer never saw it (an unknown id is a protocol violation).
+								if let Some(id) = announce_ids.remove(&suffix) {
+									stats
+										.broadcast(&absolute)
 										.publisher_announced_bytes(absolute.as_str().len() as u64);
-									// An ended announce doesn't need hops; the receiver matches on path only.
-									stream.writer.encode(&lite::AnnounceBroadcast::Ended { suffix, hops: OriginList::new() }).await?;
+									stream.writer.encode(&lite::AnnounceBroadcast::EndedId { id }).await?;
 								}
+							} else if !retracted {
+								stats
+									.broadcast(&absolute)
+									.publisher_announced_bytes(absolute.as_str().len() as u64);
+								// An ended announce doesn't need hops; the receiver matches on path only.
+								stream
+									.writer
+									.encode(&lite::AnnounceBroadcast::Ended {
+										suffix,
+										hops: OriginList::new(),
+									})
+									.await?;
 							}
 						}
 					}
+				}
+				Op::Route(suffix, res) => {
+					let Ok(route) = res else {
+						// The broadcast is gone; the origin delivers the Ended itself.
+						watched.remove(&suffix);
+						continue;
+					};
+					let Some(entry) = watched.get_mut(&suffix) else {
+						continue;
+					};
+					let absolute = origin.absolute(&entry.path).to_owned();
+					let hops = Self::prepare_active_hops(&route.hops, self_origin, exclude_hop, version, &absolute);
+					let sent = entry.sent.clone();
+					match (hops, sent) {
+						// The forwarded chain is unchanged (e.g. only the cost moved,
+						// which doesn't ride the wire yet): nothing to send.
+						(Some(hops), Some(sent)) if hops == sent => {}
+						// The chain changed (an upstream failover): restart, so the
+						// peer updates its route in place instead of re-resolving.
+						(Some(hops), Some(_)) => {
+							tracing::debug!(broadcast = %absolute, "reannounce");
+							if version.has_announce_id() {
+								// The id exists for every live advertisement; a panic here would
+								// silently kill the announce loop (the peer keeps stale routes),
+								// so a bookkeeping bug degrades to a skipped restart instead.
+								let Some(id) = announce_ids.get(&suffix).copied() else {
+									debug_assert!(false, "announced path without an announce id");
+									tracing::warn!(broadcast = %absolute, "restart without an announce id; skipping");
+									continue;
+								};
+								stats
+									.broadcast(&absolute)
+									.publisher_announced_bytes(absolute.as_str().len() as u64);
+								entry.sent = Some(hops.clone());
+								stream
+									.writer
+									.encode(&lite::AnnounceBroadcast::Restart { id, hops })
+									.await?;
+							} else {
+								// Lite05: a duplicate ANNOUNCE for a live path is the restart.
+								stats
+									.broadcast(&absolute)
+									.publisher_announced_bytes(absolute.as_str().len() as u64);
+								entry.sent = Some(hops.clone());
+								stream
+									.writer
+									.encode(&lite::AnnounceBroadcast::Active { suffix, hops })
+									.await?;
+							}
+						}
+						// Previously filtered, now forwardable: a fresh announce.
+						(Some(hops), None) => {
+							tracing::debug!(broadcast = %absolute, "announce");
+							let bs = stats.broadcast(&absolute);
+							bs.publisher_announced_bytes(absolute.as_str().len() as u64);
+							stats_guards.insert(absolute.clone(), bs.publisher());
+							if version.has_announce_id() {
+								announce_ids.insert(suffix.clone(), next_announce_id);
+								next_announce_id += 1;
+							}
+							entry.sent = Some(hops.clone());
+							stream
+								.writer
+								.encode(&lite::AnnounceBroadcast::Active { suffix, hops })
+								.await?;
+						}
+						// The new chain must not be forwarded (it now loops through the
+						// peer, or the peer excluded it): retract.
+						(None, Some(_)) => {
+							tracing::debug!(broadcast = %absolute, "unannounce (filtered route)");
+							entry.sent = None;
+							stats_guards.remove(&absolute);
+							stats
+								.broadcast(&absolute)
+								.publisher_announced_bytes(absolute.as_str().len() as u64);
+							if version.has_announce_id() {
+								if let Some(id) = announce_ids.remove(&suffix) {
+									stream.writer.encode(&lite::AnnounceBroadcast::EndedId { id }).await?;
+								}
+							} else {
+								stream
+									.writer
+									.encode(&lite::AnnounceBroadcast::Ended {
+										suffix,
+										hops: OriginList::new(),
+									})
+									.await?;
+							}
+						}
+						// Still filtered: keep watching.
+						(None, None) => {}
+					}
+				}
 			}
 		}
 	}
@@ -581,10 +778,10 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 		// Track-level subscriber priority. SUBSCRIBE_UPDATE messages broadcast new values
 		// to both run_track (so future groups inherit the new priority) and serve_group
-		// tasks (so in-flight groups update via PriorityHandle::set_track). The Sender
+		// tasks (so in-flight groups update via PriorityHandle::set_track). The producer
 		// stays in run_subscribe and gets handed to run_track so the same loop that
 		// parses SUBSCRIBE_UPDATEs also fans the new priority out.
-		let (track_priority_tx, track_priority_rx) = tokio::sync::watch::channel(subscribe.priority);
+		let track_priority_tx = kio::Producer::new(subscribe.priority);
 
 		let sub = Subscription {
 			session,
@@ -592,7 +789,8 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			track_name: Arc::from(track.name()),
 			track_stats: Arc::new(track_stats),
 			priority,
-			track_priority: track_priority_rx,
+			track_priority: track_priority_tx.consume(),
+			track_priority_seen: subscribe.priority,
 			version,
 			timescale,
 		};
@@ -850,8 +1048,13 @@ enum Recv {
 /// [`Recv::Boundary`] in an idle moment (after groups and datagrams), so the caller can send
 /// SUBSCRIBE_END as soon as the ending is known rather than waiting for the live edge to reach
 /// it. The caller clears `emit_boundary` after the first boundary so it fires once.
-async fn recv_next(track: &mut track::Subscriber, datagrams: bool, emit_boundary: bool) -> Result<Recv, Error> {
-	kio::wait(|waiter| {
+fn poll_recv_next(
+	track: &mut track::Subscriber,
+	datagrams: bool,
+	emit_boundary: bool,
+	waiter: &kio::Waiter,
+) -> Poll<Result<Recv, Error>> {
+	{
 		let mut groups_finished = false;
 		match track.poll_next_group(waiter) {
 			Poll::Ready(Ok(Some(group))) => return Poll::Ready(Ok(Recv::Group(group))),
@@ -877,14 +1080,19 @@ async fn recv_next(track: &mut track::Subscriber, datagrams: bool, emit_boundary
 			return Poll::Ready(Ok(Recv::Finished));
 		}
 		Poll::Pending
-	})
-	.await
+	}
+}
+
+/// The async form of [`poll_recv_next`], for callers with nothing else to poll.
+#[cfg(test)]
+async fn recv_next(track: &mut track::Subscriber, datagrams: bool, emit_boundary: bool) -> Result<Recv, Error> {
+	kio::wait(|waiter| poll_recv_next(track, datagrams, emit_boundary, waiter)).await
 }
 
 /// Shared per-subscription state for the publisher side. Cloned cheaply. Every
 /// field is either small or already Arc-backed for each in-flight serve_group task
 /// so each in-flight group reads the latest SUBSCRIBE_UPDATE priority via its own
-/// watch::Receiver.
+/// consumer cursor.
 #[derive(Clone)]
 struct Subscription<S: web_transport_trait::Session> {
 	session: S,
@@ -892,7 +1100,9 @@ struct Subscription<S: web_transport_trait::Session> {
 	track_name: Arc<str>,
 	track_stats: Arc<stats::PublisherTrack>,
 	priority: PriorityQueue,
-	track_priority: tokio::sync::watch::Receiver<u8>,
+	track_priority: kio::Consumer<u8>,
+	/// Last track priority observed by this clone, so a change only fires once.
+	track_priority_seen: u8,
 	version: Version,
 	/// Negotiated timestamp scale for this track. `Some(_)` on lite-05+ after
 	/// TRACK_INFO; used to validate per-frame timestamps before encoding.
@@ -907,7 +1117,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		initial_end_group: Option<u64>,
 		reader: &mut crate::coding::Reader<S::RecvStream, Version>,
 		writer: &mut Writer<S::SendStream, Version>,
-		track_priority_tx: &tokio::sync::watch::Sender<u8>,
+		track_priority_tx: &kio::Producer<u8>,
 	) -> Result<(), Error> {
 		let mut tasks: FuturesUnordered<MaybeSendBox<'static, ()>> = FuturesUnordered::new();
 
@@ -931,60 +1141,84 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		// transport (qmux/WebSocket/TCP/UDS report size 0). No group fallback: otherwise off.
 		let datagrams = self.version.has_datagrams() && self.session.max_datagram_size() > 0;
 
+		// Transient one-at-a-time value; the padding is never held in bulk (see `Recv`).
+		#[allow(clippy::large_enum_variant)]
+		enum Event {
+			Recv(Result<Recv, Error>),
+			Update(Result<Option<lite::SubscribeUpdate>, Error>),
+		}
+
 		loop {
-			tokio::select! {
-				// Drive in-flight group futures; never matches because the inner block returns false.
-				true = async {
-					while tasks.next().await.is_some() {}
-					false
-				} => unreachable!(),
-
-				// One cursor drives the whole subscription: poll the cap-aware next group and,
-				// when enabled, the next best-effort datagram. Groups are polled first so a
-				// datagram burst can't starve them; datagrams flow whenever no group is ready
-				// (including while groups are paused above the cap).
-				res = recv_next(&mut track, datagrams, emit_range && !end_sent) => {
-					match res? {
-						Recv::Group(group) => {
-							if emit_range && !start_sent {
-								start_sent = true;
-								writer
-									.encode(&lite::SubscribeResponse::Start(lite::SubscribeStart { group: group.sequence }))
-									.await?;
-							}
-							self.queue_serve(group, &mut tasks);
-						}
-						Recv::Datagram(datagram) => self.serve_datagram(datagram),
-						Recv::Boundary(group) => {
-							// The track declared its exclusive final sequence. Forward it now,
-							// even if trailing groups (below `group`) are still in flight, then
-							// keep serving them until the live edge reaches the boundary.
-							end_sent = true;
-							writer
-								.encode(&lite::SubscribeResponse::End(lite::SubscribeEnd { group }))
-								.await?;
-						}
-						Recv::Finished => {
-							// The live edge reached the boundary; SUBSCRIBE_END was already sent
-							// (or the version predates the track stream). Drain in-flight group
-							// tasks and FIN by returning.
-							while tasks.next().await.is_some() {}
-							return Ok(());
-						}
-					}
-				}
-
+			let event = {
+				let emit_boundary = emit_range && !end_sent;
 				// SUBSCRIBE_UPDATE messages share this hot loop; safe because
 				// decode_maybe is cancel-safe given quinn/qmux's cancel-safe
 				// read primitives (see Reader::decode_maybe doc).
-				upd = reader.decode_maybe::<lite::SubscribeUpdate>() => {
+				let mut update = std::pin::pin!(reader.decode_maybe::<lite::SubscribeUpdate>());
+				kio::wait(|waiter| {
+					// Drive in-flight group futures; completions just drop.
+					let mut cx = std::task::Context::from_waker(waiter.waker());
+					while let Poll::Ready(Some(())) = tasks.poll_next_unpin(&mut cx) {}
+
+					// Control first: SUBSCRIBE_UPDATE/FIN messages are rare, so they can't
+					// starve the data path, while a deep group backlog polled first could
+					// defer an unsubscribe or priority change indefinitely.
+					if let Poll::Ready(upd) = waiter.poll_future(update.as_mut()) {
+						return Poll::Ready(Event::Update(upd));
+					}
+					// One cursor drives the whole subscription: poll the cap-aware next group and,
+					// when enabled, the next best-effort datagram. Groups are polled first so a
+					// datagram burst can't starve them; datagrams flow whenever no group is ready
+					// (including while groups are paused above the cap).
+					if let Poll::Ready(res) = poll_recv_next(&mut track, datagrams, emit_boundary, waiter) {
+						return Poll::Ready(Event::Recv(res));
+					}
+					Poll::Pending
+				})
+				.await
+			};
+
+			match event {
+				Event::Recv(res) => match res? {
+					Recv::Group(group) => {
+						if emit_range && !start_sent {
+							start_sent = true;
+							writer
+								.encode(&lite::SubscribeResponse::Start(lite::SubscribeStart {
+									group: group.sequence,
+								}))
+								.await?;
+						}
+						self.queue_serve(group, &mut tasks);
+					}
+					Recv::Datagram(datagram) => self.serve_datagram(datagram),
+					Recv::Boundary(group) => {
+						// The track declared its exclusive final sequence. Forward it now,
+						// even if trailing groups (below `group`) are still in flight, then
+						// keep serving them until the live edge reaches the boundary.
+						end_sent = true;
+						writer
+							.encode(&lite::SubscribeResponse::End(lite::SubscribeEnd { group }))
+							.await?;
+					}
+					Recv::Finished => {
+						// The live edge reached the boundary; SUBSCRIBE_END was already sent
+						// (or the version predates the track stream). Drain in-flight group
+						// tasks and FIN by returning.
+						while tasks.next().await.is_some() {}
+						return Ok(());
+					}
+				},
+				Event::Update(upd) => {
 					let Some(upd) = upd? else {
 						// Peer FIN'd. They're done with this subscription. Drop any
 						// in-flight serve_group tasks (don't drain) so half-sent
 						// groups get cancelled rather than completed pointlessly.
 						return Ok(());
 					};
-					let _ = track_priority_tx.send(upd.priority);
+					if let Ok(mut value) = track_priority_tx.write() {
+						*value = upd.priority;
+					}
 					// Feed the full update into the model subscriber so the producer's
 					// aggregate reflects it (and a relay re-forwards it upstream).
 					let _ = track.update(crate::track::Subscription {
@@ -1009,7 +1243,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		tracing::debug!(subscribe = self.id, track = %self.track_name, sequence, "serving group");
 
 		// Use the latest priority for new groups so SUBSCRIBE_UPDATE applies to them too.
-		let current_priority = *self.track_priority.borrow_and_update();
+		let current_priority = self.track_priority_current();
 		let handle = self.priority.insert(Priority::new(current_priority, sequence));
 		let fut = self.clone().serve_group(sequence, handle, group);
 		tasks.push(fut.map(|_| ()).maybe_boxed());
@@ -1112,15 +1346,14 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		priority: &mut PriorityHandle,
 		group: &mut group::Consumer,
 	) -> Result<Option<frame::Consumer>, Error> {
-		loop {
-			tokio::select! {
-				biased;
-				_ = stream.closed() => return Err(Error::Cancel),
-				frame = group.next_frame() => return frame,
-				new_pri = priority.next() => stream.set_priority(new_pri),
-				Ok(()) = self.track_priority.changed() => priority.set_track(*self.track_priority.borrow_and_update()),
-			}
-		}
+		Self::serve_step(
+			stream,
+			priority,
+			&self.track_priority,
+			&mut self.track_priority_seen,
+			|waiter| group.poll_next_frame(waiter),
+		)
+		.await
 	}
 
 	/// Await the next chunk of `frame`, applying priority changes meanwhile.
@@ -1130,15 +1363,77 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		priority: &mut PriorityHandle,
 		frame: &mut frame::Consumer,
 	) -> Result<Option<bytes::Bytes>, Error> {
+		Self::serve_step(
+			stream,
+			priority,
+			&self.track_priority,
+			&mut self.track_priority_seen,
+			|waiter| frame.poll_read_chunk(waiter),
+		)
+		.await
+	}
+
+	/// Poll `work` to completion while applying queue and SUBSCRIBE_UPDATE priority
+	/// changes to the stream. Errors with [`Error::Cancel`] if the peer closes first.
+	async fn serve_step<T>(
+		stream: &mut Writer<S::SendStream, Version>,
+		priority: &mut PriorityHandle,
+		track_priority: &kio::Consumer<u8>,
+		track_priority_seen: &mut u8,
+		mut work: impl FnMut(&kio::Waiter) -> Poll<Result<T, Error>>,
+	) -> Result<T, Error> {
+		enum Event<T> {
+			Closed,
+			Work(Result<T, Error>),
+			Priority(u8),
+			TrackPriority(u8),
+		}
+
 		loop {
-			tokio::select! {
-				biased;
-				_ = stream.closed() => return Err(Error::Cancel),
-				chunk = frame.read_chunk() => return chunk,
-				new_pri = priority.next() => stream.set_priority(new_pri),
-				Ok(()) = self.track_priority.changed() => priority.set_track(*self.track_priority.borrow_and_update()),
+			let event = {
+				let mut closed = std::pin::pin!(stream.closed());
+				let seen = *track_priority_seen;
+				kio::wait(|waiter| {
+					if waiter.poll_future(closed.as_mut()).is_ready() {
+						return Poll::Ready(Event::Closed);
+					}
+					if let Poll::Ready(res) = work(waiter) {
+						return Poll::Ready(Event::Work(res));
+					}
+					if let Poll::Ready(new_pri) = priority.poll_next(waiter) {
+						return Poll::Ready(Event::Priority(new_pri));
+					}
+					// A dropped producer just disables this arm, like the queue arm above.
+					match track_priority.poll(waiter, |value| {
+						if **value != seen {
+							Poll::Ready(**value)
+						} else {
+							Poll::Pending
+						}
+					}) {
+						Poll::Ready(Ok(value)) => Poll::Ready(Event::TrackPriority(value)),
+						Poll::Ready(Err(_)) | Poll::Pending => Poll::Pending,
+					}
+				})
+				.await
+			};
+
+			match event {
+				Event::Closed => return Err(Error::Cancel),
+				Event::Work(res) => return res,
+				Event::Priority(new_pri) => stream.set_priority(new_pri),
+				Event::TrackPriority(new_track) => {
+					*track_priority_seen = new_track;
+					priority.set_track(new_track);
+				}
 			}
 		}
+	}
+
+	/// Read the latest SUBSCRIBE_UPDATE track priority, marking it seen.
+	fn track_priority_current(&mut self) -> u8 {
+		self.track_priority_seen = *self.track_priority.read();
+		self.track_priority_seen
 	}
 
 	/// Write a whole chunk, applying priority changes between partial writes,
@@ -1159,7 +1454,8 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 	}
 
 	fn apply_priority(&mut self, stream: &mut Writer<S::SendStream, Version>, priority: &mut PriorityHandle) {
-		priority.set_track(*self.track_priority.borrow_and_update());
+		let track_priority = self.track_priority_current();
+		priority.set_track(track_priority);
 		stream.set_priority(priority.current());
 	}
 }
