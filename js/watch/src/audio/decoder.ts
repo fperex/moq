@@ -11,6 +11,7 @@ import { type AudioBuffer, createAudioBuffer } from "./buffer";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
+import { unlockOnGesture } from "./unlock";
 
 export type DecoderInput = {
 	// Enable to download the audio track.
@@ -70,6 +71,12 @@ export class Decoder {
 	// Audio ring bridging main thread and worklet (shared memory or postMessage transport).
 	#ring: AudioBuffer | undefined;
 
+	// The rate the decoder actually outputs, learned from the first decoded frame. This is the source
+	// of truth for the graph: a decoder can output a different rate than it was configured with (e.g.
+	// Opus decodes to 48kHz on Chrome/Firefox but to the configured rate on Safari). Until a frame
+	// arrives we pre-build the graph from the catalog rate; if the real rate differs we rebuild it.
+	#decodedSampleRate = new Signal<number | undefined>(undefined);
+
 	// The last discontinuity count seen from the container consumer. A change means the
 	// publisher rewound the timeline (e.g. a voice agent interrupted) and we must flush.
 	#discontinuity = 0;
@@ -116,8 +123,14 @@ export class Decoder {
 		const config = effect.get(this.source.out.config);
 		if (!config) return;
 
-		const sampleRate = config.sampleRate;
+		// Pre-build the graph at the catalog rate so warm-up starts before the first frame arrives. The
+		// decoder's actual output rate is the source of truth (see #emit); if it differs, #emit sets
+		// #decodedSampleRate, which re-runs this effect and rebuilds the graph at the real rate.
+		const sampleRate = effect.get(this.#decodedSampleRate) ?? config.sampleRate;
 		const channelCount = config.numberOfChannels;
+
+		// Expose the rate the graph actually runs at.
+		effect.set(this.#out.sampleRate, sampleRate);
 
 		const context = new AudioContext({
 			latencyHint: "interactive", // We don't use real-time because of the buffer.
@@ -128,11 +141,16 @@ export class Decoder {
 		effect.cleanup(() => context.close());
 
 		effect.spawn(async () => {
-			// Register the AudioWorklet processor
-			await Promise.race([context.audioWorklet.addModule(RenderWorklet), effect.cancel]);
-
-			// Ensure the context is running before creating the worklet
-			if (context.state === "closed") return;
+			// Register the AudioWorklet processor, racing the load against teardown. If teardown wins,
+			// `loaded` is undefined and we bail before constructing the node: the module registration was
+			// abandoned, so building against its name would throw. Gate on the race result, not
+			// `context.state`, because `AudioContext.close()` only flips `.state` to "closed" synchronously
+			// on Chrome (Firefox/Safari report "suspended").
+			const loaded = await Promise.race([
+				context.audioWorklet.addModule(RenderWorklet).then(() => true),
+				effect.cancel,
+			]);
+			if (!loaded) return;
 
 			// Create the worklet node. outputChannelCount must be set explicitly
 			// so the process() callback receives a matching channel layout.
@@ -172,11 +190,15 @@ export class Decoder {
 	}
 
 	#runEnabled(effect: Effect): void {
-		const values = effect.getAll([this.in.enabled, this.#out.context]);
-		if (!values) return;
-		const [_, context] = values;
+		const enabled = effect.get(this.in.enabled);
+		if (!enabled) return;
 
-		context.resume();
+		const context = effect.get(this.#out.context);
+		if (!context) return;
+
+		// The context is built at page load (see #runWorklet), before any user gesture, so it
+		// must be started from a real interaction. See unlockOnGesture.
+		unlockOnGesture(effect, context);
 
 		// NOTE: You should disconnect/reconnect the worklet to save power when disabled.
 	}
@@ -393,6 +415,16 @@ export class Decoder {
 		const ring = this.#ring;
 		if (!ring) {
 			// We're probably in the process of closing.
+			sample.close();
+			return;
+		}
+
+		// sample.sampleRate is the source of truth, and it can differ from the rate we pre-built the
+		// graph against (Opus decodes to 48kHz on Chrome/Firefox but to the configured rate on Safari).
+		// If they disagree, rebuild the graph at the real rate and drop this frame; the ring being torn
+		// down can't accept it, and the next frame lands in the correctly-rated ring.
+		if (sample.sampleRate !== ring.rate) {
+			this.#decodedSampleRate.set(sample.sampleRate);
 			sample.close();
 			return;
 		}

@@ -3,7 +3,7 @@
  *
  * @module
  */
-import { type GetPromise, Once, Signal } from "@moq/signals";
+import { type GetPromise, type Getter, Once, Signal } from "@moq/signals";
 import { Timestamp } from "./time.ts";
 
 /** Maximum bytes of frames cached in a group before old frames are evicted from the front. */
@@ -38,10 +38,10 @@ export interface Info {
  * Thrown by a frame read when the reader fell behind the group's eviction window: frames
  * it had not yet read were dropped to stay under the cache cap, so the stream has a gap.
  */
-export class CacheFull extends Error {
+export class Lagged extends Error {
 	constructor() {
-		super("group cache full: frames were evicted before being read");
-		this.name = "CacheFull";
+		super("lagged: frames were evicted before being read");
+		this.name = "Lagged";
 	}
 }
 
@@ -53,7 +53,7 @@ class GroupState {
 	total = new Signal<number>(0); // The total number of frames in the group thus far
 
 	// Frames evicted from the front by the cache cap. A reader that had not consumed
-	// them has a gap, so its next read throws CacheFull rather than skipping silently.
+	// them has a gap, so its next read throws Lagged rather than skipping silently.
 	offset = 0;
 	cacheBytes = 0;
 
@@ -91,6 +91,11 @@ export class Producer {
 
 	#state: GroupState;
 	#mirrors?: Set<GroupState>;
+
+	// Whether any mirror reader is attached (see {@link used}). Fetch coalescing watches it to
+	// cancel an abandoned download; a group can stay open indefinitely (a catalog or JSON stream),
+	// so this is what stops a reader-less fetch instead of the stream ending on its own.
+	#used = new Signal<boolean>(false);
 
 	constructor(sequence: number) {
 		this.#state = new GroupState(sequence);
@@ -131,7 +136,42 @@ export class Producer {
 
 		this.#mirrors ??= new Set();
 		this.#mirrors.add(dst);
+		this.#used.set(true);
+
+		// Track this mirror's close eagerly (not just lazily on the next write) so demand drops the
+		// moment the last reader leaves, letting an abandoned fetch cancel even with no more frames.
+		const dispose = dst.closed.subscribe((c) => {
+			if (c === undefined) return;
+			this.#mirrors?.delete(dst);
+			this.#used.set((this.#mirrors?.size ?? 0) > 0);
+			dispose();
+		});
+
 		return makeConsumer(dst);
+	}
+
+	/**
+	 * Whether any mirror reader is currently attached.
+	 *
+	 * Pairs with {@link unused}. Fetch coalescing watches it to cancel a download once every reader
+	 * has gone: a group can stay open indefinitely (a catalog track, a JSON stream), so it can't
+	 * rely on the stream ending on its own.
+	 *
+	 * @internal Track fan-out and fetch coalescing only.
+	 */
+	get used(): Getter<boolean> {
+		return this.#used;
+	}
+
+	/**
+	 * Resolves once no mirror reader remains (or the group closes).
+	 *
+	 * @internal Track fan-out and fetch coalescing only.
+	 */
+	async unused(): Promise<void> {
+		while (this.#used.peek() && this.#state.closed.peek() === undefined) {
+			await Signal.race(this.#used, this.#state.closed);
+		}
 	}
 
 	/** Writes a frame to the group. */
@@ -271,7 +311,7 @@ export class Consumer {
 	 */
 	async readFrame(): Promise<Frame | undefined> {
 		for (;;) {
-			if (this.#state.offset > 0) throw new CacheFull();
+			if (this.#state.offset > 0) throw new Lagged();
 
 			const read = this.#readBufferedFrame();
 			if (read) return read.frame;
@@ -290,7 +330,7 @@ export class Consumer {
 	 */
 	async readFrameSequence(): Promise<({ sequence: number } & Frame) | undefined> {
 		for (;;) {
-			if (this.#state.offset > 0) throw new CacheFull();
+			if (this.#state.offset > 0) throw new Lagged();
 
 			const read = this.#readBufferedFrame();
 			if (read) return { sequence: read.sequence, payload: read.frame.payload, timestamp: read.frame.timestamp };

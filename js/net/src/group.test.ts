@@ -1,8 +1,29 @@
 import { expect, test } from "bun:test";
-import { CacheFull, MAX_GROUP_CACHE_BYTES, MAX_GROUP_FRAMES, Producer } from "./group.ts";
+import { Lagged, MAX_GROUP_CACHE_BYTES, MAX_GROUP_FRAMES, Producer } from "./group.ts";
 import { Timestamp } from "./time.ts";
 
 const dec = new TextDecoder();
+
+test("used reflects mirror demand and unused resolves when the last reader leaves", async () => {
+	const producer = new Producer(0);
+
+	// No mirror readers: no demand.
+	expect(producer.used.peek()).toBe(false);
+
+	const a = producer.mirror();
+	const b = producer.mirror();
+	expect(producer.used.peek()).toBe(true);
+
+	// Closing one of two keeps demand, so unused() stays pending.
+	a.close();
+	expect(producer.used.peek()).toBe(true);
+
+	// Closing the last reader drops demand; unused() resolves. Fetch coalescing awaits this to
+	// cancel a download that everyone has abandoned (a group may never end on its own).
+	b.close();
+	await producer.unused();
+	expect(producer.used.peek()).toBe(false);
+});
 
 function pair(sequence: number) {
 	const producer = new Producer(sequence);
@@ -55,7 +76,7 @@ test("a caught-up reader does not trip the byte cache cap", async () => {
 	}
 });
 
-test("reading a group whose frames were evicted throws CacheFull", async () => {
+test("reading a group whose frames were evicted throws Lagged", async () => {
 	const { producer, consumer } = pair(0);
 
 	// Overflow the frame cap without reading, so the front frames are evicted.
@@ -64,7 +85,7 @@ test("reading a group whose frames were evicted throws CacheFull", async () => {
 	}
 
 	// The reader fell behind the eviction window: it must error, not skip the gap.
-	expect(consumer.readFrame()).rejects.toBeInstanceOf(CacheFull);
+	expect(consumer.readFrame()).rejects.toBeInstanceOf(Lagged);
 });
 
 test("a group with no eviction reads every frame without error", async () => {
