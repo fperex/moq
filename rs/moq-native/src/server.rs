@@ -252,18 +252,6 @@ impl Server {
 		self
 	}
 
-	#[doc(hidden)]
-	#[deprecated(note = "renamed to `with_publisher`")]
-	pub fn with_publish(self, publish: moq_net::origin::Consumer) -> Self {
-		self.with_publisher(publish)
-	}
-
-	#[doc(hidden)]
-	#[deprecated(note = "renamed to `with_subscriber`")]
-	pub fn with_consume(self, subscribe: moq_net::origin::Producer) -> Self {
-		self.with_subscriber(subscribe)
-	}
-
 	/// Attach a tier-scoped [`moq_net::stats::Handle`] to all sessions accepted by this server.
 	pub fn with_stats(mut self, stats: moq_net::stats::Handle) -> Self {
 		self.moq = self.moq.with_stats(stats);
@@ -944,18 +932,6 @@ impl Request {
 		}
 	}
 
-	#[doc(hidden)]
-	#[deprecated(note = "renamed to `with_publisher`")]
-	pub fn with_publish(self, publish: moq_net::origin::Consumer) -> Self {
-		self.with_publisher(publish)
-	}
-
-	#[doc(hidden)]
-	#[deprecated(note = "renamed to `with_subscriber`")]
-	pub fn with_consume(self, subscribe: moq_net::origin::Producer) -> Self {
-		self.with_subscriber(subscribe)
-	}
-
 	/// Attach a tier-scoped [`moq_net::stats::Handle`] to this session.
 	pub fn with_stats(self, stats: moq_net::stats::Handle) -> Self {
 		let Request {
@@ -996,10 +972,17 @@ impl Request {
 	///
 	/// Taken from the SETUP for the URL-less stream bindings (and moq-transport, which
 	/// carries it in-band), and from the dial [`url`](Self::url) for WebTransport/QUIC.
-	/// `None` only when neither carries one.
-	pub fn path(&self) -> Option<&str> {
+	/// Empty only when neither carries one.
+	pub fn path(&self) -> &str {
+		// An empty SETUP path means the client advertised none, so fall back to the
+		// dial URL. URI-carrying bindings are the ones that must not send a path at
+		// all, so this never discards a path the client meant us to use.
 		let setup = request_ref!(self, r => r.path());
-		setup.or(self.url.as_ref().map(Url::path))
+		if setup.is_empty() {
+			self.url.as_ref().map(Url::path).unwrap_or("")
+		} else {
+			setup
+		}
 	}
 
 	/// The single direction the client advertised in its SETUP, or `None` for a

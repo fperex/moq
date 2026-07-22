@@ -1,3 +1,12 @@
+//! A broadcast is a named collection of tracks, split into a [Producer] and [Consumer] handle.
+//!
+//! A [Producer] creates tracks on demand: a [Consumer] subscribes by name, and the
+//! producer either serves a track it already has or is handed a [`track::Request`] to
+//! fill. Both handles are refcounted clones of one broadcast, which closes when the
+//! last producer drops.
+//!
+//! [Info] is the static metadata; [Route] is the dynamic path the broadcast takes to
+//! reach an origin, including whether it is announced to subscribers.
 use crate::track;
 use std::{
 	collections::{HashMap, VecDeque},
@@ -55,18 +64,56 @@ pub struct Route {
 	/// and as the selection tie-break.
 	pub hops: OriginList,
 
-	/// Preference among routes serving the same broadcast: lower wins, with ties
-	/// broken by hop length and then a deterministic hash. Lets a publisher
-	/// advertise how expensive it is to serve (e.g. a standby transcoder), and
-	/// change its mind as capacity shifts. Local for now: the wire only carries
-	/// hops, so a received route always has the default cost.
+	/// The cost of pulling the broadcast via this route, accumulated per link:
+	/// lower wins, with ties broken by hop length and then a deterministic hash.
+	///
+	/// The original publisher seeds it with its production cost (zero for a live
+	/// publish, something large for a standby that would have to start working,
+	/// like a cold transcoder), and each link adds its own configured price as
+	/// the announcement crosses it, so a route over a metered backbone ranks
+	/// worse than an equal-length one within a datacenter. The accumulation
+	/// restarts at zero at any node actively carrying the broadcast: those
+	/// upstream legs already exist and are not re-paid by one more subscriber,
+	/// so the sum is the cost of the transfers a subscription would newly cause.
+	///
+	/// Carried on the wire from lite-06; older peers always report zero, leaving
+	/// the hop-count tie-break as the effective metric exactly as before.
 	pub cost: u64,
+
+	/// The cost as the announcing peer advertised it, before this link's charge
+	/// was added to [`Self::cost`]. Local bookkeeping, never forwarded: zero on a
+	/// chain of two or more hops means the announcing relay is actively carrying
+	/// the broadcast, which is what the origin's handover gate keys on.
+	pub(crate) advertised: u64,
+
+	/// Whether the broadcast should be announced: advertised to consumers via
+	/// [`crate::origin::Consumer::announced`] while this is the best route. A
+	/// non-announced broadcast stays reachable by exact path for subscribes and
+	/// fetches (e.g. serving cached or on-demand content), so toggling this via
+	/// [`Producer::set_route`] announces or unannounces without touching the
+	/// broadcast itself. Defaults to `false`.
+	pub announce: bool,
 }
 
 impl Route {
-	/// A direct route: no hops, best cost.
+	/// An unannounced direct route: no hops, best cost.
+	///
+	/// The broadcast is reachable only by its exact path, so subscribers must already
+	/// know it exists. Use [`announced`](Self::announced) to advertise it instead.
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// An announced direct route: no hops, best cost.
+	///
+	/// The broadcast is advertised to subscribers via
+	/// [`crate::origin::Consumer::announced`] while this is the best route, on top of
+	/// staying reachable by exact path. Use [`new`](Self::new) to keep it unadvertised.
+	pub fn announced() -> Self {
+		Self {
+			announce: true,
+			..Self::default()
+		}
 	}
 
 	/// Append a hop to the chain, oldest first.
@@ -87,6 +134,12 @@ impl Route {
 	/// Set the cost: lower wins among routes serving the same broadcast.
 	pub fn with_cost(mut self, cost: u64) -> Self {
 		self.cost = cost;
+		self
+	}
+
+	/// Set whether the broadcast is announced via this route.
+	pub fn with_announce(mut self, announce: bool) -> Self {
+		self.announce = announce;
 		self
 	}
 }
@@ -114,9 +167,9 @@ struct BroadcastState {
 	route: Route,
 	route_epoch: u64,
 
-	// Set by an explicit `Producer::finish()` so `Drop` can tell a deliberate
-	// shutdown apart from a producer that was dropped by accident.
-	closed: bool,
+	// Set by an explicit `Producer::finish()` or `Producer::abort()` so `Drop` can
+	// tell a deliberate shutdown apart from a producer dropped by accident.
+	closing: bool,
 }
 
 /// The spliced (route-fed) half of a broadcast: logical tracks that outlive any
@@ -140,6 +193,37 @@ impl BroadcastState {
 			None => Ok(()),
 		}
 	}
+
+	/// Live demand: a subscribed spliced track (route-fed broadcast), or a
+	/// pending request / consumed track (ordinary broadcast). See [`Demand`].
+	fn is_used(&self) -> bool {
+		if let Some(spliced) = &self.spliced {
+			return spliced.tracks.values().any(|track| track.is_used());
+		}
+		!self.requests.is_empty() || self.tracks.iter().any(|track| track.is_used())
+	}
+
+	/// Park `waiter` on every per-track channel feeding [`Self::is_used`]: the
+	/// consumer counts live on those channels, and their flips don't write this
+	/// state, so a watcher registered here alone would miss the edge. `want`
+	/// picks the direction; each channel only arms while its side is unmet.
+	fn register_demand(&self, waiter: &kio::Waiter, want: bool) {
+		if let Some(spliced) = &self.spliced {
+			for track in spliced.tracks.values() {
+				match want {
+					true => track.poll_used(waiter),
+					false => track.poll_unused(waiter),
+				}
+			}
+			return;
+		}
+		for track in self.tracks.iter() {
+			match want {
+				true => track.poll_used(waiter),
+				false => track.poll_unused(waiter),
+			}
+		}
+	}
 }
 
 /// Manages tracks within a broadcast.
@@ -152,10 +236,9 @@ impl BroadcastState {
 ///
 /// **You must keep this producer alive for as long as the broadcast should stay
 /// available.** A broadcast lives as long as at least one [`Producer`] exists;
-/// children do *not* keep it alive (cloning a [`Consumer`], holding a
-/// [`track::Producer`], or holding the [`crate::origin::Publish`] guard does
-/// nothing for the broadcast's lifetime). When the last producer goes away every
-/// consumer observes [`Error::Dropped`].
+/// children do *not* keep it alive (cloning a [`Consumer`] or holding a
+/// [`track::Producer`] does nothing for the broadcast's lifetime). When the last
+/// producer goes away every consumer observes [`Error::Dropped`].
 ///
 /// End the broadcast with [`Self::finish`] rather than dropping it. Dropping is an
 /// easy footgun in garbage-collected bindings (Go, Python, ...), where the handle
@@ -201,14 +284,17 @@ impl Producer {
 		}
 	}
 
+	/// The broadcast's static metadata, fixed when it was created.
 	pub fn info(&self) -> &Info {
 		&self.info
 	}
 
-	/// The shared metadata handle, threaded into session-local tracks so their
-	/// groups reach this broadcast's cache pool.
-	pub(crate) fn info_arc(&self) -> Arc<Info> {
-		self.info.clone()
+	/// A watch-only handle to the broadcast's demand. See [`Demand`].
+	pub fn demand(&self) -> Demand {
+		Demand {
+			alive: self.alive.consume().weak(),
+			state: self.state.clone(),
+		}
 	}
 
 	/// Remove a track from the lookup.
@@ -309,19 +395,6 @@ impl Producer {
 		Poll::Ready((name, producer))
 	}
 
-	/// Re-queue a spliced track for a (new) serving route, e.g. after its previous
-	/// route died. Coalesces with an already-queued entry; a no-op if the track no
-	/// longer exists.
-	pub(crate) fn requeue_spliced(&self, name: &Arc<str>) {
-		let mut state = self.state.lock();
-		if let Some(spliced) = state.spliced.as_mut()
-			&& spliced.tracks.contains_key(name)
-			&& !spliced.pending.contains(name)
-		{
-			spliced.pending.push_back(name.clone());
-		}
-	}
-
 	/// Abort every spliced track, releasing their subscribers with `err`. Called
 	/// when the broadcast closes for good.
 	pub(crate) fn abort_spliced(&self, err: Error) {
@@ -354,7 +427,15 @@ impl Producer {
 	/// gone, so a clone that outlives this call keeps it alive until it too is
 	/// dropped or finished.
 	pub fn finish(self) {
-		self.state.lock().closed = true;
+		self.state.lock().closing = true;
+	}
+
+	/// Mark the broadcast as deliberately ended, without the
+	/// dropped-without-finish warning. Same effect as [`Self::finish`], but takes
+	/// `&self` for callers that can't consume the producer. Used by sessions
+	/// tearing down announced broadcasts when the connection dies.
+	pub(crate) fn abort(&self) {
+		self.state.lock().closing = true;
 	}
 
 	/// Return true if this is the same broadcast instance.
@@ -373,7 +454,7 @@ impl Drop for Producer {
 		if !self.alive.is_last() {
 			return;
 		}
-		if !self.state.read().closed {
+		if !self.state.read().closing {
 			tracing::warn!(
 				"broadcast::Producer dropped without finish(). Keep the producer alive while publishing, then call finish()."
 			);
@@ -382,6 +463,7 @@ impl Drop for Producer {
 }
 
 #[cfg(test)]
+#[allow(missing_docs)] // test-only assertion helpers
 impl Producer {
 	pub fn assert_create_track(
 		&mut self,
@@ -389,6 +471,53 @@ impl Producer {
 		info: impl Into<Option<track::Info>>,
 	) -> track::Producer {
 		self.create_track(name, info).expect("should not have errored")
+	}
+}
+
+/// A session-owned handle to a source broadcast created via
+/// [`crate::origin::Producer::create_broadcast`]: [`Self::finish`] ends it
+/// deliberately, while dropping the guard marks the source aborted (keeping the
+/// dropped-without-finish warning quiet). Either way the origin unannounces once
+/// the last source detaches. Shared by the lite and IETF subscribers so the
+/// drop-vs-finish contract lives in one place.
+pub(crate) struct SourceGuard {
+	// `Option` so `finish` can consume the producer while `Drop` aborts it.
+	producer: Option<Producer>,
+}
+
+impl SourceGuard {
+	pub fn new(producer: Producer) -> Self {
+		Self {
+			producer: Some(producer),
+		}
+	}
+
+	/// A clone of the guarded producer.
+	pub fn producer(&self) -> Producer {
+		self.producer.clone().expect("guard holds a producer until finished")
+	}
+
+	/// End the source deliberately: the origin detaches it immediately,
+	/// unannouncing the path if it was the last.
+	pub fn finish(mut self) {
+		if let Some(producer) = self.producer.take() {
+			producer.finish();
+		}
+	}
+
+	/// Update the source's advertised route in place.
+	pub fn set_route(&mut self, route: Route) {
+		if let Some(producer) = &mut self.producer {
+			let _ = producer.set_route(route);
+		}
+	}
+}
+
+impl Drop for SourceGuard {
+	fn drop(&mut self) {
+		if let Some(producer) = &self.producer {
+			producer.abort();
+		}
 	}
 }
 
@@ -428,19 +557,28 @@ impl Dynamic {
 		Self { info, alive, state }
 	}
 
+	/// The broadcast's static metadata, fixed when it was created.
 	pub fn info(&self) -> &Info {
 		&self.info
 	}
 
 	/// Poll for the next consumer-requested track, without blocking.
+	///
+	/// Returns [`Error::Closed`] once the broadcast was deliberately ended
+	/// ([`Producer::finish`] or aborted), so a serving loop knows to stop and
+	/// release its handle.
 	pub fn poll_requested_track(&mut self, waiter: &kio::Waiter) -> Poll<Result<track::Request, Error>> {
 		let mut state = ready!(self.state.poll(waiter, |state| {
-			if state.requests.has_queued() {
+			if state.requests.has_queued() || state.closing {
 				Poll::Ready(())
 			} else {
 				Poll::Pending
 			}
 		}));
+
+		if state.closing && !state.requests.has_queued() {
+			return Poll::Ready(Err(Error::Closed));
+		}
 
 		let name = state.requests.pop().expect("predicate guaranteed a request");
 		let pending = state.requests.remove(&name).expect("popped key must be pending");
@@ -501,6 +639,7 @@ impl Drop for Dynamic {
 use futures::FutureExt;
 
 #[cfg(test)]
+#[allow(missing_docs)] // test-only assertion helpers
 impl Dynamic {
 	pub fn assert_request(&mut self) -> track::Request {
 		self.requested_track()
@@ -540,6 +679,7 @@ impl Clone for Consumer {
 }
 
 impl Consumer {
+	/// The broadcast's static metadata, fixed when it was created.
 	pub fn info(&self) -> &Info {
 		&self.info
 	}
@@ -610,6 +750,12 @@ impl Consumer {
 			return Ok(pending.consume());
 		}
 
+		// A deliberately-ended broadcast serves nothing new; existing tracks above
+		// stay readable so consumers can drain the cache.
+		if state.closing {
+			return Err(Error::NotFound);
+		}
+
 		// Allocate the name once and share the same Arc across the request, the
 		// requests map, and the FIFO order. The request inherits the broadcast's
 		// cache pool through its `Arc<Info>`, same as a producer-created track.
@@ -626,6 +772,14 @@ impl Consumer {
 		Ok(consumer)
 	}
 
+	/// A watch-only handle to the broadcast's demand. See [`Demand`].
+	pub(crate) fn demand(&self) -> Demand {
+		Demand {
+			alive: self.alive.weak(),
+			state: self.state.clone(),
+		}
+	}
+
 	/// Block until the broadcast is closed (every producer dropped) and return the cause.
 	///
 	/// Always returns [`Error::Dropped`]: a broadcast is just a collection of tracks, so it
@@ -638,6 +792,14 @@ impl Consumer {
 	/// Returns true if every [`Producer`] has been dropped.
 	pub fn is_closed(&self) -> bool {
 		self.alive.is_closed()
+	}
+
+	/// Whether the broadcast is on its way out: deliberately ended (finish/abort
+	/// marked, even while handles remain) or already fully closed. The origin's
+	/// dispatcher treats a rejection from such a source as imminent detach rather
+	/// than a strike.
+	pub(crate) fn is_closing(&self) -> bool {
+		self.is_closed() || self.state.read().closing
 	}
 
 	/// Register a [`kio::Waiter`] that fires when the broadcast closes.
@@ -702,7 +864,80 @@ impl super::WeakEntry for WeakConsumer {
 	}
 }
 
+/// A cloneable, watch-only handle to a broadcast's subscriber demand.
+///
+/// Obtained from [`Producer::demand`]; the broadcast-level sibling of
+/// [`track::Demand`](crate::track::Demand). Demand means live interest in the
+/// broadcast's content: a subscribed spliced track on a route-fed broadcast, or
+/// a pending track request / a consumed track on an ordinary one. A publisher
+/// uses it to run expensive work only while someone is watching, and routing
+/// uses it to advertise a warm copy at zero cost.
+///
+/// It's a weak handle: it neither keeps the broadcast alive nor counts as
+/// demand itself. Once every producer is gone, [`used`](Self::used) /
+/// [`unused`](Self::unused) return [`Error::Dropped`].
+#[derive(Clone)]
+pub struct Demand {
+	alive: kio::ConsumerWeak<()>,
+	state: kio::Shared<BroadcastState>,
+}
+
+impl Demand {
+	/// Whether the broadcast has live demand right now.
+	///
+	/// A point-in-time snapshot with no registration; use [`Self::used`] /
+	/// [`Self::unused`] (or their `poll_*` forms) to wait for the edge.
+	pub fn is_used(&self) -> bool {
+		self.state.read().is_used()
+	}
+
+	/// Block until the broadcast has demand. Resolves immediately if it already
+	/// does; returns [`Error::Dropped`] once every producer is gone.
+	pub async fn used(&self) -> Result<(), Error> {
+		kio::wait(|waiter| self.poll_used(waiter)).await
+	}
+
+	/// Block until the broadcast has no demand. Resolves immediately if it has
+	/// none; returns [`Error::Dropped`] once every producer is gone.
+	pub async fn unused(&self) -> Result<(), Error> {
+		kio::wait(|waiter| self.poll_unused(waiter)).await
+	}
+
+	/// Poll-based variant of [`Self::used`].
+	pub fn poll_used(&self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
+		self.poll_demand(waiter, true)
+	}
+
+	/// Poll-based variant of [`Self::unused`].
+	pub fn poll_unused(&self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
+		self.poll_demand(waiter, false)
+	}
+
+	fn poll_demand(&self, waiter: &kio::Waiter, want: bool) -> Poll<Result<(), Error>> {
+		// Closure is checked first, matching `track::Demand`: a dead broadcast
+		// reports Dropped rather than pretending to answer.
+		if self.alive.poll_closed(waiter).is_ready() {
+			return Poll::Ready(Err(Error::Dropped));
+		}
+		let ready = self.state.poll(waiter, |state| {
+			// The consumer counts live on the per-track channels, whose flips
+			// don't write this state: park on those channels too so the edge
+			// wakes us, then recompute here.
+			state.register_demand(waiter, want);
+			match state.is_used() == want {
+				true => Poll::Ready(()),
+				false => Poll::Pending,
+			}
+		});
+		match ready {
+			Poll::Ready(_) => Poll::Ready(Ok(())),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+}
+
 #[cfg(test)]
+#[allow(missing_docs)] // test-only assertion helpers
 impl Consumer {
 	pub fn assert_not_closed(&self) {
 		assert!(self.closed().now_or_never().is_none(), "should not be closed");
@@ -716,6 +951,74 @@ impl Consumer {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	/// Await with a timeout so a missed demand wake fails the test instead of
+	/// hanging it (time is paused, so the timeout fires instantly when idle).
+	async fn expect<T>(fut: impl Future<Output = T>) -> T {
+		tokio::time::timeout(std::time::Duration::from_secs(1), fut)
+			.await
+			.expect("timed out waiting for a demand edge")
+	}
+
+	/// Demand on an ordinary broadcast tracks subscriber interest, not
+	/// production: a live track producer alone is unused, a consumed track is
+	/// used, and both edges wake parked waiters.
+	#[tokio::test]
+	async fn demand_ordinary() {
+		tokio::time::pause();
+
+		let mut producer = Info::new().produce();
+		let consumer = producer.consume();
+		let demand = producer.demand();
+
+		// No demand yet; `unused` resolves immediately.
+		assert!(!demand.is_used());
+		demand.unused().await.unwrap();
+
+		// Producing alone is not demand.
+		let _track = producer.create_track("a", None).unwrap();
+		assert!(!demand.is_used());
+
+		// A consumer appearing wakes a parked `used`.
+		let (used, handle) = tokio::join!(expect(demand.used()), async { consumer.track("a").unwrap() });
+		used.unwrap();
+		assert!(demand.is_used());
+
+		// The last consumer dropping wakes a parked `unused`.
+		let (unused, ()) = tokio::join!(expect(demand.unused()), async { drop(handle) });
+		unused.unwrap();
+		assert!(!demand.is_used());
+
+		// Every producer gone: both edges report the closure.
+		producer.finish();
+		assert!(matches!(demand.used().await, Err(Error::Dropped)));
+		assert!(matches!(demand.unused().await, Err(Error::Dropped)));
+	}
+
+	/// Demand on a spliced (route-fed) broadcast follows the logical tracks'
+	/// consumers, which is what flips a relay's advertised cost.
+	#[tokio::test]
+	async fn demand_spliced() {
+		tokio::time::pause();
+
+		let producer = Producer::new_spliced(Info::new());
+		let consumer = producer.consume();
+		let demand = producer.demand();
+
+		assert!(!demand.is_used());
+		let track = consumer.track("video").unwrap();
+		assert!(demand.is_used());
+
+		// Dropping the only consumer wakes a parked `unused`, even though the
+		// logical track itself stays cached in the broadcast.
+		let (unused, ()) = tokio::join!(expect(demand.unused()), async { drop(track) });
+		unused.unwrap();
+		assert!(!demand.is_used());
+
+		// A repeat consumer for the cached track counts again.
+		let _track = consumer.track("video").unwrap();
+		assert!(demand.is_used());
+	}
 
 	/// Subscribe and assert the result hasn't resolved yet (it stays pending until
 	/// a publisher accepts). Returns the pending subscription to resolve after accepting.

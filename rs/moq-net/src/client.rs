@@ -14,9 +14,11 @@ pub struct Client {
 	stats: stats::Handle,
 	versions: Versions,
 	setup_path: Option<String>,
+	cost: Option<u64>,
 }
 
 impl Client {
+	/// A client that neither publishes nor subscribes until configured.
 	pub fn new() -> Self {
 		Default::default()
 	}
@@ -36,18 +38,6 @@ impl Client {
 		self
 	}
 
-	#[doc(hidden)]
-	#[deprecated(note = "renamed to `with_publisher`")]
-	pub fn with_publish(self, publish: origin::Consumer) -> Self {
-		self.with_publisher(publish)
-	}
-
-	#[doc(hidden)]
-	#[deprecated(note = "renamed to `with_subscriber`")]
-	pub fn with_consume(self, subscribe: origin::Producer) -> Self {
-		self.with_subscriber(subscribe)
-	}
-
 	/// Attach a tier-scoped [`stats::Handle`]. Per-broadcast and per-subscription
 	/// counters will be bumped through this handle for the lifetime of the session.
 	/// Pass [`stats::Handle::default`] (a no-op handle) to opt out.
@@ -64,20 +54,40 @@ impl Client {
 		self.with_publisher(&origin).with_subscriber(origin)
 	}
 
+	/// Restrict which protocol versions to offer, in preference order.
+	/// Defaults to every version this crate supports.
 	pub fn with_versions(mut self, versions: Versions) -> Self {
 		self.versions = versions;
 		self
 	}
 
-	/// Set the request path to advertise in the SETUP (moq-lite-05 and moq-transport
-	/// 14-18).
+	/// Set the request path to advertise in the SETUP (moq-lite-05 and every
+	/// moq-transport draft we speak).
 	///
-	/// Required on transports that carry no request URI (native QUIC, qmux over
-	/// TCP/TLS) so the server learns which path the client wants; omit it on bindings
-	/// that already carry a URI (WebTransport). Ignored by versions with no in-band
-	/// request path (lite 01-04).
+	/// Only for transports that carry no request URI of their own (native QUIC, qmux
+	/// over TCP/TLS, unix sockets), so the server learns which path the client wants.
+	/// Bindings that already carry a URI (WebTransport, qmux over WebSocket) convey
+	/// the path there and MUST NOT send this; a server is entitled to treat it as a
+	/// protocol violation. An empty path is equivalent to omitting it. Ignored by
+	/// versions with no in-band request path (lite 01-04).
 	pub fn with_path(mut self, path: impl Into<String>) -> Self {
 		self.setup_path = Some(path.into());
+		self
+	}
+
+	/// Price this link, in the units the rest of the mesh uses (moq-lite-06+).
+	///
+	/// Every announcement crossing the connection adds this to its route cost, so
+	/// routing prefers cheap paths over short ones. Use `0` for a link that should
+	/// look free (a sibling in the same datacenter), and something large for one that
+	/// should be a last resort (a metered backbone). An unpriced link costs `1`,
+	/// which makes the cost track the hop count and so reproduces plain
+	/// shortest-path routing.
+	///
+	/// The dialing side owns the price: it is declared in our SETUP so the server
+	/// charges the same link the same amount. A server never sets one.
+	pub fn with_cost(mut self, cost: u64) -> Self {
+		self.cost = Some(cost);
 		self
 	}
 
@@ -199,6 +209,7 @@ impl Client {
 					probe: lite::ProbeLevel::Report,
 					path: self.setup_path.clone(),
 					role: lite::Role::from_origins(self.publish.is_some(), self.subscribe.is_some()),
+					cost: self.cost,
 				};
 
 				let start = lite::start(

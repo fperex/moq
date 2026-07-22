@@ -1,5 +1,6 @@
 /// Errors related to key configuration and cryptographic operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum KeyError {
 	#[error("invalid algorithm for key type")]
 	InvalidAlgorithm,
@@ -43,6 +44,7 @@ pub enum KeyError {
 
 /// Top-level error type for moq-token.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
 	#[error(transparent)]
 	Key(#[from] KeyError),
@@ -55,6 +57,12 @@ pub enum Error {
 
 	#[error("token grants no access to path `{0}`")]
 	NoAccess(String),
+
+	#[error("no publish or subscribe allowed; key scope is useless")]
+	UselessScope,
+
+	#[error("token capabilities exceed the key scope")]
+	ScopeExceeded,
 
 	#[error("invalid algorithm: {0}")]
 	InvalidAlgorithm(String),

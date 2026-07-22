@@ -16,6 +16,7 @@ pub struct Server {
 }
 
 impl Server {
+	/// A server that neither publishes nor subscribes until configured.
 	pub fn new() -> Self {
 		Default::default()
 	}
@@ -36,18 +37,6 @@ impl Server {
 		self
 	}
 
-	#[doc(hidden)]
-	#[deprecated(note = "renamed to `with_publisher`")]
-	pub fn with_publish(self, publish: origin::Consumer) -> Self {
-		self.with_publisher(publish)
-	}
-
-	#[doc(hidden)]
-	#[deprecated(note = "renamed to `with_subscriber`")]
-	pub fn with_consume(self, subscribe: origin::Producer) -> Self {
-		self.with_subscriber(subscribe)
-	}
-
 	/// Attach a tier-scoped [`stats::Handle`]. Per-broadcast and per-subscription
 	/// counters will be bumped through this handle for the lifetime of the session.
 	/// Pass [`stats::Handle::default`] (a no-op handle) to opt out.
@@ -61,6 +50,8 @@ impl Server {
 		self.with_publisher(&origin).with_subscriber(origin)
 	}
 
+	/// Restrict which protocol versions to accept, in preference order.
+	/// Defaults to every version this crate supports.
 	pub fn with_versions(mut self, versions: Versions) -> Self {
 		self.versions = versions;
 		self
@@ -84,8 +75,8 @@ impl Server {
 	/// serve, and call [`ok`](Request::ok) or [`close`](Request::close). Session start
 	/// is deferred to `ok()`, so origins set on the `Request` always take effect.
 	///
-	/// The path is surfaced for moq-lite-05 and every moq-transport draft (14-18);
-	/// it's `None` on versions with no in-band request path (e.g. lite 01-04).
+	/// The path is surfaced for moq-lite-05 and every moq-transport draft we speak;
+	/// it's empty on versions with no in-band request path (e.g. lite 01-04).
 	pub async fn accept_request<S: web_transport_trait::Session>(&self, session: S) -> Result<Request<S>, Error> {
 		// Regimes without a path to read defer to `ok()` without surfacing one, and
 		// carry no role hint, so authorization is unchanged for them.
@@ -311,12 +302,14 @@ enum Handshake<S: web_transport_trait::Session> {
 }
 
 impl<S: web_transport_trait::Session> Request<S> {
-	/// The request path the client advertised in its SETUP, if any.
+	/// The request path the client advertised in its SETUP.
 	///
-	/// Populated for moq-lite-05 and moq-transport 14-18; `None` on versions without
-	/// an in-band request path. See the note on [`Server::accept_request`].
-	pub fn path(&self) -> Option<&str> {
-		self.path.as_deref()
+	/// Empty when the client advertised none: either it sent an empty path, or the
+	/// version carries none in-band (lite 01-04). Those mean the same thing, so the
+	/// wire distinction isn't surfaced. Populated for moq-lite-05 and every
+	/// moq-transport draft we speak. See the note on [`Server::accept_request`].
+	pub fn path(&self) -> &str {
+		self.path.as_deref().unwrap_or("")
 	}
 
 	/// The single [`Role`] the client advertised in its SETUP, or `None` for a
@@ -410,6 +403,8 @@ impl<S: web_transport_trait::Session> Request<S> {
 					probe: lite::ProbeLevel::Report,
 					path: None,
 					role: None,
+					// The dialing side prices the link; we charge what its SETUP declared.
+					cost: None,
 				};
 				let start = lite::start(
 					session.clone(),
@@ -650,10 +645,56 @@ mod tests {
 			probe: lite::ProbeLevel::None,
 			path: path.map(str::to_string),
 			role,
+			cost: None,
 		}
 		.encode(&mut buf, v)
 		.unwrap();
 		buf
+	}
+
+	/// Encode a draft-17+ Setup Stream: the unified SETUP message, whose parameters
+	/// carry the request path the same way lite-05's does.
+	fn ietf_setup(version: ietf::Version, path: Option<&str>) -> Vec<u8> {
+		let mut params = ietf::Parameters::default();
+		if let Some(path) = path {
+			params.set_bytes(ietf::ParameterBytes::Path, path.as_bytes().to_vec());
+		}
+		let parameters = params.encode_bytes(version).unwrap();
+
+		let mut buf = Vec::new();
+		setup::Setup { parameters }
+			.encode(&mut buf, crate::Version::Ietf(version))
+			.unwrap();
+		buf
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn accept_request_reads_ietf_path() {
+		// Every draft-17+ version gates on the SETUP stream before starting, so the
+		// path is known at authorization time just like lite-05.
+		for (alpn, version) in [
+			(ALPN_17, ietf::Version::Draft17),
+			(ALPN_18, ietf::Version::Draft18),
+			(ALPN_19, ietf::Version::Draft19),
+		] {
+			let session = FakeSession::new(alpn, [ietf_setup(version, Some("/team/room"))]);
+			let request = Server::new().accept_request(session).await.unwrap();
+			assert_eq!(request.path(), "/team/room", "{alpn}");
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn accept_request_ietf_without_path_is_empty() {
+		let session = FakeSession::new(ALPN_19, [ietf_setup(ietf::Version::Draft19, None)]);
+		let request = Server::new().accept_request(session).await.unwrap();
+		assert_eq!(request.path(), "");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn accept_request_ietf_empty_path_is_accepted() {
+		let session = FakeSession::new(ALPN_19, [ietf_setup(ietf::Version::Draft19, Some(""))]);
+		let request = Server::new().accept_request(session).await.unwrap();
+		assert_eq!(request.path(), "");
 	}
 
 	/// Encode a lite-05 GROUP uni stream header (just the `DataType::Group` tag).
@@ -667,15 +708,24 @@ mod tests {
 	async fn accept_request_reads_lite05_path() {
 		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(Some("/team/room"), None)]);
 		let request = Server::new().accept_request(session).await.unwrap();
-		assert_eq!(request.path(), Some("/team/room"));
+		assert_eq!(request.path(), "/team/room");
 		assert_eq!(request.role(), None, "a client that omits the role is bidirectional");
 	}
 
 	#[tokio::test(start_paused = true)]
-	async fn accept_request_lite05_without_path_is_none() {
+	async fn accept_request_lite05_without_path_is_empty() {
 		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(None, None)]);
 		let request = Server::new().accept_request(session).await.unwrap();
-		assert_eq!(request.path(), None);
+		assert_eq!(request.path(), "");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn accept_request_lite05_empty_path_is_accepted() {
+		// An empty path is valid on the wire and means the same as omitting it, so a
+		// client that wants the root doesn't have to special-case the parameter.
+		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(Some(""), None)]);
+		let request = Server::new().accept_request(session).await.unwrap();
+		assert_eq!(request.path(), "");
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -691,6 +741,6 @@ mod tests {
 		// keeps reading until it finds the SETUP.
 		let session = FakeSession::new(ALPN_LITE_05, [lite05_group(), lite05_setup(Some("/team/room"), None)]);
 		let request = Server::new().accept_request(session).await.unwrap();
-		assert_eq!(request.path(), Some("/team/room"));
+		assert_eq!(request.path(), "/team/room");
 	}
 }

@@ -11,17 +11,18 @@ use web_async::spawn;
 
 use crate::{COMPRESSED_SUFFIX, SessionsFrame, TrafficFrame, sessions_track, traffic_track};
 
-/// Settings for a [`Producer`]. Construct with [`Config::new`] and chain the
-/// `with_*` setters (e.g. `Config::new().with_origin(origin).with_prefix(".foo")`),
-/// then hand it to [`Producer::new`].
+/// Settings for a [`Producer`]. Construct with [`ProducerConfig::new`] and chain
+/// the `with_*` setters (e.g.
+/// `ProducerConfig::new().with_origin(origin).with_prefix(".foo")`), then hand it
+/// to [`Producer::new`].
 ///
 /// With no origin set the resulting producer is a no-op: its registry is
-/// disabled (bumps are dropped) and no task spawns. Call [`Config::with_origin`]
-/// to publish.
+/// disabled (bumps are dropped) and no task spawns. Call
+/// [`ProducerConfig::with_origin`] to publish.
 #[derive(Clone)]
 #[non_exhaustive]
-pub struct Config {
-	/// Origin that receives the stats broadcast's `publish_broadcast` calls.
+pub struct ProducerConfig {
+	/// Origin the stats broadcasts are created on.
 	/// When `None`, [`Producer::new`] spawns no task and publishes nothing.
 	pub origin: Option<origin::Producer>,
 	/// Top-level path stats are published under (default `.stats`). The full
@@ -47,7 +48,7 @@ pub struct Config {
 	pub depth: usize,
 }
 
-impl Config {
+impl ProducerConfig {
 	/// A config with default settings: no origin (no-op), `.stats` prefix, 1s
 	/// interval, and no node suffix. Call [`Self::with_origin`] to actually
 	/// publish.
@@ -93,7 +94,7 @@ impl Config {
 	}
 }
 
-impl Default for Config {
+impl Default for ProducerConfig {
 	fn default() -> Self {
 		Self::new()
 	}
@@ -126,8 +127,8 @@ impl Producer {
 	/// [`Producer`] clone is dropped. With no origin the producer is a no-op
 	/// (its registry is disabled, nothing is published) and no task spawns, so
 	/// it's safe to build outside an async runtime.
-	pub fn new(config: Config) -> Self {
-		let Config {
+	pub fn new(config: ProducerConfig) -> Self {
+		let ProducerConfig {
 			origin,
 			prefix,
 			node,
@@ -204,6 +205,9 @@ impl Task {
 			ticker.tick().await;
 
 			if weak.upgrade().is_none() {
+				for (_, publisher) in groups.drain() {
+					publisher.broadcast.finish();
+				}
 				return;
 			}
 
@@ -306,7 +310,18 @@ impl Task {
 				});
 			}
 
-			groups.retain(|group, _| active.contains(group));
+			// Deliberate unpublish: finish evicted broadcasts rather than dropping
+			// them, so there is no dropped-without-finish warning.
+			let evicted: Vec<PathOwned> = groups
+				.keys()
+				.filter(|group| !active.contains(*group))
+				.cloned()
+				.collect();
+			for group in evicted {
+				if let Some(publisher) = groups.remove(&group) {
+					publisher.broadcast.finish();
+				}
+			}
 		}
 	}
 }
@@ -372,7 +387,6 @@ fn flush_dynamic<T: Serialize + Default>(
 
 /// One group stats broadcast and its change-detection state.
 struct GroupPublisher {
-	_publish: origin::Publish,
 	broadcast: broadcast::Producer,
 	traffic_tracks: HashMap<String, TrackPair<TrafficFrame>>,
 	session_tracks: HashMap<String, TrackPair<SessionsFrame>>,
@@ -382,7 +396,16 @@ struct GroupPublisher {
 
 impl GroupPublisher {
 	fn create(origin: &origin::Producer, prefix: &Path, group: &Path, node: Option<&str>) -> Option<Self> {
-		let mut broadcast = broadcast::Info::new().produce();
+		let advertised = advertised_path(prefix, group, node);
+		let mut broadcast = match origin.create_broadcast(&advertised, broadcast::Route::new().with_announce(true)) {
+			Ok(broadcast) => broadcast,
+			Err(err) => {
+				tracing::warn!(advertised = %advertised, ?err, "stats: origin rejected stats broadcast");
+				return None;
+			}
+		};
+		tracing::debug!(advertised = %advertised, "stats: publishing broadcast");
+
 		let mut traffic_tracks = HashMap::new();
 		let mut session_tracks = HashMap::new();
 
@@ -411,18 +434,7 @@ impl GroupPublisher {
 			}
 		}
 
-		let advertised = advertised_path(prefix, group, node);
-		let publish = match origin.publish_broadcast(&advertised, &broadcast) {
-			Ok(publish) => publish,
-			Err(err) => {
-				tracing::warn!(advertised = %advertised, ?err, "stats: origin rejected stats broadcast");
-				return None;
-			}
-		};
-		tracing::debug!(advertised = %advertised, "stats: publishing broadcast");
-
 		Some(Self {
-			_publish: publish,
 			broadcast,
 			traffic_tracks,
 			session_tracks,
@@ -547,7 +559,7 @@ mod tests {
 	fn test_producer(node: Option<&str>) -> (Producer, origin::Producer) {
 		let origin = Origin::random().produce();
 		let producer = Producer::new(
-			Config::new()
+			ProducerConfig::new()
 				.with_origin(origin.clone())
 				.with_node(node.map(|s| PathOwned::from(s.to_string()))),
 		);
@@ -724,7 +736,7 @@ mod tests {
 		let (producer, origin) = test_producer(Some("sjc"));
 		let _a = producer.registry().tier(Tier::default()).session("acme");
 		let _b = producer.registry().tier(Tier::default()).session("acme");
-		let _c = producer.registry().tier(Tier::new("internal")).session("peer");
+		let _c = producer.registry().tier(Tier::new("region/sjc")).session("peer");
 
 		drive_tick().await;
 
@@ -735,13 +747,13 @@ mod tests {
 		assert_eq!(snap.sessions_closed, 0);
 		assert!(
 			!frame.contains_key("peer"),
-			"internal session must not appear on the external track"
+			"regional session must not appear on the default track"
 		);
 
-		let snap = *read_session_frame(&broadcast, "internal/sessions.json")
+		let snap = *read_session_frame(&broadcast, "region/sjc/sessions.json")
 			.await
 			.get("peer")
-			.expect("internal entry");
+			.expect("regional entry");
 		assert_eq!(snap.sessions, 1);
 	}
 
@@ -776,10 +788,13 @@ mod tests {
 			assert!(broadcast.track(name).is_ok(), "{name} must exist");
 		}
 
-		// The internal tier never saw traffic, so its tracks were never created.
-		for name in ["internal/publisher.json", "internal/publisher.json.z"] {
+		// The regional tier never saw traffic, so its tracks were never created.
+		// The announced broadcast is an origin-owned splice, so `track()` always
+		// hands back a logical track; only the subscription reveals absence.
+		for name in ["region/sjc/publisher.json", "region/sjc/publisher.json.z"] {
+			let track = broadcast.track(name).expect("logical track");
 			assert!(
-				broadcast.track(name).is_err(),
+				track.subscribe(None).await.is_err(),
 				"{name} must not exist for a tier with no traffic",
 			);
 		}

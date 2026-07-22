@@ -52,7 +52,7 @@ mod consume;
 mod produce;
 
 pub use consume::{Consumer, ConsumerConfig, SessionsConsumer, TrafficConsumer};
-pub use produce::{Config, Producer};
+pub use produce::{Producer, ProducerConfig};
 
 use std::collections::BTreeMap;
 
@@ -71,9 +71,9 @@ pub type SessionsFrame = BTreeMap<String, Presence>;
 /// Suffix appended to a plain track name for its compressed sibling.
 pub const COMPRESSED_SUFFIX: &str = ".z";
 
-/// The traffic track name for a tier and role: `publisher.json` on the default
-/// tier, `<tier>/subscriber.json` on a named one, plus [`COMPRESSED_SUFFIX`]
-/// when `compressed`.
+/// The traffic track name for a tier and role: `<role>.json` at the prefix root
+/// on the default tier (`publisher.json` / `subscriber.json`), `<tier>/<role>.json`
+/// on a named one, plus [`COMPRESSED_SUFFIX`] when `compressed`.
 pub fn traffic_track(tier: &Tier, role: Role, compressed: bool) -> String {
 	let mut name = tier.track_name(&format!("{}.json", role.as_str()));
 	if compressed {
@@ -210,12 +210,15 @@ mod tests {
 
 	#[test]
 	fn track_names() {
-		let ext = Tier::default();
-		let int = Tier::new("internal");
-		assert_eq!(traffic_track(&ext, Role::Publisher, false), "publisher.json");
-		assert_eq!(traffic_track(&ext, Role::Subscriber, true), "subscriber.json.z");
-		assert_eq!(traffic_track(&int, Role::Publisher, false), "internal/publisher.json");
-		assert_eq!(sessions_track(&ext, false), "sessions.json");
-		assert_eq!(sessions_track(&int, true), "internal/sessions.json.z");
+		let default = Tier::default();
+		let regional = Tier::new("region/sjc");
+		assert_eq!(traffic_track(&default, Role::Publisher, false), "publisher.json");
+		assert_eq!(traffic_track(&default, Role::Subscriber, true), "subscriber.json.z");
+		assert_eq!(
+			traffic_track(&regional, Role::Publisher, false),
+			"region/sjc/publisher.json"
+		);
+		assert_eq!(sessions_track(&default, false), "sessions.json");
+		assert_eq!(sessions_track(&regional, true), "region/sjc/sessions.json.z");
 	}
 }

@@ -31,7 +31,7 @@ use crate::container::Frame;
 pub struct Import<E: CatalogExt = ()> {
 	track: crate::container::Producer<crate::catalog::hang::Container>,
 	rendition: crate::catalog::VideoTrack<E>,
-	config: Option<hang::catalog::VideoConfig>,
+	catalog: crate::codec::video::Catalog,
 	last_sps: Option<Bytes>,
 }
 
@@ -46,18 +46,18 @@ impl<E: CatalogExt> Import<E> {
 		reserved: crate::catalog::Reserved<E>,
 		hint: crate::catalog::VideoHint,
 	) -> Self {
-		let rendition = reserved.video_with_hint(track.name(), hint.clone());
+		let rendition = reserved.video(track.name());
+		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint);
 		let mut import = Self {
 			track: reserved
 				.producer()
 				.media_producer(track, crate::catalog::hang::Container::Legacy),
 			rendition,
-			config: None,
+			catalog,
 			last_sps: None,
 		};
-		if let Some(config) = hint.to_config() {
-			import.rendition.set(config.clone());
-			import.config = Some(config);
+		if let Some(config) = import.catalog.initial_config() {
+			import.apply_config(config);
 		}
 		import
 	}
@@ -156,17 +156,16 @@ impl<E: CatalogExt> Import<E> {
 		config.container = hang::catalog::Container::Legacy;
 
 		self.last_sps = Some(sps_nal.clone());
-
-		// A changed SPS just re-mirrors the rendition in place; there are no fixed
-		// tracks to reject a reconfiguration.
-		if self.config.as_ref() == Some(&config) {
-			return Ok(());
-		}
-
-		tracing::debug!(name = ?self.track.name(), ?config, "starting track");
-		self.rendition.set(config.clone());
-		self.config = Some(config);
+		self.apply_config(config);
 		Ok(())
+	}
+
+	/// Apply a resolved config, updating the catalog rendition in place.
+	///
+	/// A changed config just re-mirrors the rendition; there are no fixed tracks to reject a
+	/// reconfiguration.
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) {
+		self.catalog.publish(&mut self.rendition, config);
 	}
 
 	/// Write split frames to the track, resolving the config from the first
@@ -180,7 +179,7 @@ impl<E: CatalogExt> Import<E> {
 			}
 
 			// A keyframe we still can't configure (no SPS) is undecodable.
-			if frame.keyframe && self.config.is_none() {
+			if frame.keyframe && !self.catalog.configured() {
 				return Err(Error::MissingSps.into());
 			}
 

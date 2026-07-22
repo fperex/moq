@@ -294,7 +294,8 @@ A publisher SHOULD advertise only the best path it knows for each broadcast.
 If the best path changes (e.g. a relay failover or upstream restart), the publisher MAY send an ANNOUNCE_RESTART referencing the advertisement's Announce ID: the new announcement atomically replaces the prior one (equivalent to ANNOUNCE_END+ANNOUNCE_START) and the id stays live.
 The first entry of the reconstructed path identifies the original publisher (see [ANNOUNCE_START](#announce-start)); a restart that preserves it is an alternate route to the same broadcast, while one that changes it replaces the broadcast entirely (see [ANNOUNCE_RESTART](#announce-restart)).
 A publisher MUST NOT keep multiple current advertisements for the same broadcast on the same stream — each broadcast has at most one current advertisement at a time, and a second ANNOUNCE_START for an already-available path is a protocol violation (use ANNOUNCE_RESTART).
-A subscriber that sees the same broadcast advertised across multiple streams SHOULD route subscriptions to the advertisement with the shortest total path length (see [ANNOUNCE_START](#announce-start)).
+A subscriber that sees the same broadcast advertised across multiple streams SHOULD route subscriptions to the advertisement with the lowest Route Cost after adding each arriving link's cost, breaking ties by the shortest total path length (see [ANNOUNCE_START](#announce-start)).
+Advertisements from peers that predate the Route Cost carry an effective cost of 0, so a mixed mesh degrades to shortest-path routing.
 
 The subscriber MUST reset the stream if it receives an ANNOUNCE_END or ANNOUNCE_RESTART referencing an Announce ID that was never assigned or already retired, an ANNOUNCE_START for a path that is already available, or any announcement before ANNOUNCE_OK.
 When the stream is closed, the subscriber MUST assume that all broadcasts are now unavailable.
@@ -590,15 +591,17 @@ The parameter-specific value, interpreted according to Parameter ID.
 A capability is available for the session only if the relevant endpoint advertises it; an absent parameter means the sender does not support that capability.
 The following Setup Parameters are defined:
 
-|------|----------|-------------|
-|  ID  | Name     | Value       |
-|-----:|:---------|:------------|
-| 0x1  | Probe    | Level (i)   |
-|------|----------|-------------|
-| 0x2  | Path     | Path (s)    |
-|------|----------|-------------|
-| 0x3  | Role     | Role (i)    |
-|------|----------|-------------|
+|------|-----------|-------------|
+|  ID  | Name      | Value       |
+|-----:|:----------|:------------|
+| 0x1  | Probe     | Level (i)   |
+|------|-----------|-------------|
+| 0x2  | Path      | Path (s)    |
+|------|-----------|-------------|
+| 0x3  | Role      | Role (i)    |
+|------|-----------|-------------|
+| 0x4  | Cost      | Cost (i)    |
+|------|-----------|-------------|
 
 ### Probe Parameter {#probe-parameter}
 The Probe Parameter advertises the sender's capability level when acting as a publisher on a [Probe Stream](#probe).
@@ -621,15 +624,17 @@ The Path Parameter carries the request path the client wishes to reach, equivale
 A server uses it to route the session to the correct origin, relay, or virtual host before any broadcasts are exchanged; its interpretation is otherwise application-defined and opaque to moq-lite.
 Unlike the capability-style Setup Parameters, it is per-hop setup metadata that rides along in SETUP because that is the first client-to-server message of the session.
 
-The Parameter Value is a non-empty UTF-8 string that begins with `/` and uses the path syntax of a URI [RFC3986].
+The Parameter Value is a UTF-8 string using the path syntax of a URI [RFC3986]; a non-empty value begins with `/`.
+The value MAY be empty, which is equivalent to omitting the parameter: both mean the client requests the server's default path.
+A client that wants the default therefore need not special-case the parameter, and a server MUST treat the two forms identically.
 
 This parameter exists for bindings that have no request URI of their own: the native QUIC binding (binding 1 in [Transports](#transports)) and the Qmux-over-TCP/TLS binding (binding 3), both of which negotiate only an ALPN token.
 The remaining bindings convey the path in their own handshake.
 
-- A client using a binding without a request URI (binding 1 or 3) MUST send exactly one Path Parameter in its SETUP.
+- A client using a binding without a request URI (binding 1 or 3) SHOULD send one Path Parameter in its SETUP. Omitting it requests the server's default path.
 - The Path Parameter MUST NOT be sent on a binding that carries a request URI. The WebTransport (binding 2) and Qmux-over-WebSocket (binding 4) bindings convey the path in their handshake URI (the CONNECT request path and the WebSocket request URI, respectively). A server that receives a Path Parameter on either of these bindings MUST close the session with a PROTOCOL_VIOLATION.
 - A server MUST NOT send a Path Parameter. SETUP is bidirectional, but the path is meaningful only from client to server; a client that receives a Path Parameter MUST close the session with a PROTOCOL_VIOLATION.
-- A server that receives a Path that is empty or is not a valid URI path MUST close the session with a PROTOCOL_VIOLATION. A server that does not recognize or support the requested path MUST close the session.
+- A server that receives a Path that is not a valid URI path MUST close the session with a PROTOCOL_VIOLATION. A server that does not recognize or support the requested path MUST close the session.
 
 A relay MUST NOT forward the Path Parameter; like other per-hop setup metadata it applies only to this hop (see [Session](#session)).
 
@@ -649,6 +654,18 @@ A receiver that does not recognize the value MUST treat it as `Both`, so a newer
 The Role Parameter is a hint that only ever narrows the session: a server MUST still enforce the client's authorization on every publish and subscribe regardless of the advertised role, and MUST NOT grant a direction the authorization does not already allow. A server MAY close a session when the advertised role requires a direction the client's authorization does not grant: `Publisher` without publish authorization, or `Subscriber` without subscribe authorization.
 
 Like the [Path Parameter](#path-parameter), the Role Parameter is meaningful only from client to server. A server MUST NOT send a Role Parameter; a client that receives one MUST close the session with a PROTOCOL_VIOLATION. A relay MUST NOT forward it; it applies only to this hop.
+
+### Cost Parameter {#cost-parameter}
+The Cost Parameter declares the routing cost of this connection: each endpoint adds the value to the Route Cost of every announcement it receives over the connection before forwarding or acting on it (see [ANNOUNCE_START](#announce-start)).
+
+The Parameter Value is a variable-length integer in deployment-chosen units, the same units as the Route Cost.
+An absent parameter means the default cost of 1, under which the accumulated Route Cost equals the hop count and routing degenerates to shortest-path, matching the behavior of versions that predate the parameter.
+A deployment prices links to reflect its economics: 0 for a link within a datacenter (making a warm sibling effectively free to reach), larger values for metered or long-haul links.
+A value of 0 is meaningful and distinct from omitting the parameter.
+
+Only the client sends it: the price lives in the dialing side's configuration, and the server reads it from the client's SETUP so both ends charge the same link the same amount.
+A server MUST NOT send a Cost Parameter.
+Like the [Path Parameter](#path-parameter), it is per-hop setup metadata: a relay MUST NOT forward it.
 
 
 ## ANNOUNCE_REQUEST {#announce-request}
@@ -716,6 +733,7 @@ ANNOUNCE_START Message {
   Broadcast Path Suffix (s),
   Hop Count (i),
   Hop ID (i) ...,
+  Route Cost (i),
 }
 ~~~
 
@@ -737,6 +755,20 @@ When forwarding an announcement received from an upstream peer, a relay MUST app
 The total path length is `Hop Count + 1` (including the implicit ANNOUNCE_OK `Hop ID`).
 The first entry of the reconstructed path (the first Hop ID, or the ANNOUNCE_OK `Hop ID` when the list is empty) identifies the original publisher of the broadcast; ANNOUNCE_RESTART uses it to distinguish a route change from a replacement (see [ANNOUNCE_RESTART](#announce-restart)).
 A Hop ID value of 0 means the hop is unknown: either it was never assigned (e.g. when bridging from an older protocol version) or a relay deliberately withholds it to obscure the underlying routing; the Hop Count still reflects the total number of entries including unknown hops.
+
+**Route Cost**:
+The marginal cost of subscribing to the broadcast via this advertisement, in units chosen by the deployment.
+The original publisher seeds the value with its production cost: 0 for content it is already producing, larger for content it would have to start producing on demand (e.g. a standby transcoder that advertises every broadcast it could serve, at a cost reflecting the work of actually serving it).
+When forwarding an announcement received from an upstream peer, a relay adds the cost of the link the announcement arrived on (see [Cost Parameter](#cost-parameter)), saturating rather than wrapping so an absurd upstream value ranks last instead of overflowing to best.
+
+A relay that is actively carrying the broadcast (a live subscription exists for at least one of its tracks) SHOULD advertise 0 instead of the accumulated value: its ingress is already paid for, so the marginal cost of one more subscriber is only the links between them, which downstream receivers add themselves.
+This is what lets a cluster deduplicate: a subscriber that sees both a warm copy at cost 0 and the original at the full path cost pulls the copy that already exists.
+When the relay stops carrying the broadcast it SHOULD restore the accumulated value via ANNOUNCE_RESTART, optionally after a grace period so brief subscriber churn does not flap routing across the mesh.
+
+Two relays that independently begin carrying the same broadcast will each see the other's zero-cost advertisement as cheaper than their own source, and switching simultaneously would leave the broadcast with no source at all.
+An actively-carrying relay SHOULD therefore apply a deterministic tie-break before re-parenting onto a strictly cheaper advertisement from another actively-carrying relay (one that advertised a Route Cost of 0 from a path of two or more hops; a single-hop path is the original publisher, which can never adopt a route to its own broadcast), such as comparing a stable hash of the broadcast path and each endpoint's Hop ID, so that exactly one side moves.
+Cheaper advertisements from anything else, e.g. a forwarding relay or a repriced upstream, carry no such hazard and SHOULD be adopted immediately.
+Hop-based loop detection (dropping any advertisement whose reconstructed path contains the receiver's own Hop ID) remains the authority on loop freedom; the tie-break only prevents the transient double-switch.
 
 
 ## ANNOUNCE_END {#announce-end}
@@ -782,6 +814,7 @@ ANNOUNCE_RESTART Message {
   Announce ID (i),
   Hop Count (i),
   Hop ID (i) ...,
+  Route Cost (i),
 }
 ~~~
 
@@ -792,8 +825,9 @@ Set to 0x2 to indicate an ANNOUNCE_RESTART message.
 The ordinal implicitly assigned by a prior ANNOUNCE_START on this stream.
 Referencing an id that was never assigned, or one already retired by an ANNOUNCE_END, is a protocol violation.
 
-**Hop Count** and **Hop ID**:
+**Hop Count**, **Hop ID**, and **Route Cost**:
 As defined for [ANNOUNCE_START](#announce-start).
+A restart whose only change is the Route Cost is valid: it is how a relay advertises that it started or stopped actively carrying the broadcast.
 
 
 ## SUBSCRIBE
@@ -1126,12 +1160,15 @@ The `Message Length` describes the payload size on the wire.
 # Appendix A: Changelog
 
 ## moq-lite-06
+- Allowed an empty SETUP `Path` parameter, equivalent to omitting it; both request the server's default path. Previously an empty value was a protocol violation, which made the two ways of asking for the default disagree.
 - Corrected SUBSCRIBE_END `Group` to an exclusive bound: the first sequence that will never be delivered, with 0 meaning no groups were produced. It was previously specified as the inclusive last group, which could not distinguish an empty track from one whose only group was 0.
 - Split ANNOUNCE_BROADCAST into three typed messages: ANNOUNCE_START (0x0), ANNOUNCE_END (0x1), and ANNOUNCE_RESTART (0x2), each prefixed with a Type discriminator like the subscribe stream's responses.
 - Added implicit Announce IDs: each ANNOUNCE_START assigns the next per-stream ordinal.
 - ANNOUNCE_END and ANNOUNCE_RESTART reference the Announce ID instead of repeating the broadcast path.
 - Replaced the duplicate-`active` restart idiom with ANNOUNCE_RESTART; a second ANNOUNCE_START for an already-available path is now a protocol violation.
 - Defined the first entry of the reconstructed path as the original publisher's identity: a restart that preserves it is a route change (TRACK_INFO stays valid, subscriptions may resume), one that changes it replaces the broadcast (TRACK_INFO discarded, nothing resumes).
+- Added a `Route Cost` field to ANNOUNCE_START and ANNOUNCE_RESTART: the accumulated cost of the transfers a subscription via this advertisement would newly cause. Route selection prefers the lowest cost, with path length as the tie-break.
+- Added a SETUP `Cost` parameter (0x4) declaring the price a link adds to every announcement crossing it; unpriced links default to 1, degrading to shortest-path routing.
 
 ## moq-lite-05
 - Renamed ANNOUNCE_INTEREST to ANNOUNCE_REQUEST and ANNOUNCE to ANNOUNCE_BROADCAST.

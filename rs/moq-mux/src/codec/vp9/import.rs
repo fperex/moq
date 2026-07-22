@@ -17,8 +17,7 @@ pub struct Import<E: CatalogExt = ()> {
 	// This importer's catalog rendition, published on the first key frame.
 	rendition: crate::catalog::VideoTrack<E>,
 
-	// The resolved config, used to detect resolution / format changes.
-	config: Option<hang::catalog::VideoConfig>,
+	catalog: crate::codec::video::Catalog,
 }
 
 impl<E: CatalogExt> Import<E> {
@@ -32,17 +31,17 @@ impl<E: CatalogExt> Import<E> {
 		reserved: crate::catalog::Reserved<E>,
 		hint: crate::catalog::VideoHint,
 	) -> Self {
-		let rendition = reserved.video_with_hint(track.name(), hint.clone());
+		let rendition = reserved.video(track.name());
+		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint);
 		let mut import = Self {
 			track: reserved
 				.producer()
 				.media_producer(track, crate::catalog::hang::Container::Legacy),
 			rendition,
-			config: None,
+			catalog,
 		};
-		if let Some(config) = hint.to_config() {
-			import.rendition.set(config.clone());
-			import.config = Some(config);
+		if let Some(config) = import.catalog.initial_config() {
+			import.apply_config(config);
 		}
 		import
 	}
@@ -66,15 +65,16 @@ impl<E: CatalogExt> Import<E> {
 		config.coded_height = Some(height as u32);
 		config.container = hang::catalog::Container::Legacy;
 
-		if self.config.as_ref() == Some(&config) {
-			return Ok(());
-		}
-
-		tracing::debug!(name = ?self.track.name(), ?config, "starting track");
-		self.rendition.set(config.clone());
-		self.config = Some(config);
-
+		self.apply_config(config);
 		Ok(())
+	}
+
+	/// Apply a resolved config, updating the catalog rendition in place.
+	///
+	/// A changed config just re-mirrors the rendition; there are no fixed tracks to reject a
+	/// reconfiguration.
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) {
+		self.catalog.publish(&mut self.rendition, config);
 	}
 
 	/// Decode a single VP9 frame (or superframe).

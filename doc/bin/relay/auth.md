@@ -47,6 +47,38 @@ moq-token generate --algorithm ES256 --out-dir ./private/ --public-dir ./keys/
 
 A random key ID is generated if `--id` is not specified.
 
+### Scope a Key
+
+Keys can embed immutable publish and subscribe limits. Every token signed or
+verified with a scoped key must stay within those limits. Rotate the key if its
+scope needs to change.
+
+```bash
+# This key may publish below project/live and subscribe below project/watch.
+moq-token generate \
+  --root project \
+  --publish live \
+  --subscribe watch \
+  --out private.jwk \
+  --public public.jwk
+```
+
+The scope is stored in both halves of an asymmetric JWK:
+
+```json
+{
+  "scope": {
+    "root": "project",
+    "put": ["live"],
+    "get": ["watch"]
+  }
+}
+```
+
+Existing JWKs without `scope` remain unrestricted for backwards compatibility.
+The library rejects the entire token when any requested role or path exceeds the
+key scope; it never silently intersects permissions.
+
 ### Configure the Relay
 
 Single key (simplest):
@@ -120,6 +152,8 @@ The JWT payload contains these claims:
 | `exp` | Expiration time (Unix timestamp) |
 | `iat` | Issued-at time (Unix timestamp) |
 
+`get` is named that way because `sub` is a reserved JWT claim.
+
 The `exp` claim is enforced for the whole session, not just at connect time. The relay closes the connection once `exp` passes, so a client must reconnect with a fresh token to continue. The same applies to mTLS: the connection is closed when the client certificate's `notAfter` is reached.
 
 ### Path Matching
@@ -138,9 +172,9 @@ path boundaries, so `foo` grants `foo` and `foo/bar` but never `foobar`.
 
 | root | put | get | Can publish | Can subscribe |
 |------|-----|-----|-------------|---------------|
-| `demo` | `my-stream` | `""` | `demo/my-stream` | `demo/*` |
-| `rooms/123` | `alice` | `""` | `rooms/123/alice` | `rooms/123/*` |
-| `""` | `""` | `""` | Everything | Everything |
+| `demo` | `["my-stream"]` | `[""]` | `demo/my-stream` | `demo/*` |
+| `rooms/123` | `["alice"]` | `[""]` | `rooms/123/alice` | `rooms/123/*` |
+| `""` | `[""]` | `[""]` | Everything | Everything |
 
 ### Connection Path
 
@@ -161,9 +195,11 @@ Per connection the relay issues `GET <base>?root=<path>&kid=<kid>&mtls=true&tran
 - `alias` — the canonical full root to scope this connection to: the path with its first segment (a stable id, current vanity, or recently-changed vanity) resolved to the project's canonical id, the rest of the path preserved (e.g. `demo/room/cam` → `x7k2qp/room/cam`). The relay uses it verbatim, so the server owns the entire mapping. Absent → the request path is used unchanged.
 - `public` — `{ "subscribe": [...], "publish": [...] }` anonymous access prefixes (relative to the root), used when there is no JWT. Absent → no public access.
 - `key` — the verifying JWK (a JSON object, deserialized directly) for the requested `kid`. Absent → key-not-found, and the JWT is rejected.
-- `tier` — the billing tier label this connection's stats record under (an arbitrary string, e.g. `internal`, `local`, `region/sjc`). The relay forwards `mtls=true` and lets the API decide; absent defaults to `--auth-mtls-tier` (itself defaulting to `internal`) for mTLS peers and the default (unprefixed) tier for JWT/public connections. So the API can bucket a first-party token to `internal`, or a cert-verified connection back to the default tier. An empty label selects the default tier. See [Stats](/bin/relay/config#stats) for how tier labels map to track names. For backward compatibility the relay still accepts the older boolean `internal` field (`true` → the `internal` tier, `false` → the default tier) when `tier` is absent.
+- `tier`: the billing tier label this connection's stats record under (an arbitrary string, e.g. `local` or `region/sjc`). Absent or empty selects the default unprefixed tier. See [Stats](/bin/relay/config#stats) for how tier labels map to track names.
 
 This lets a project stay reachable by both its stable id and its current/old vanity path, all mapping to the same broadcast tree: with the API resolving `demo` → `x7k2qp`, both `cdn.moq.dev/demo/foo` and `cdn.moq.dev/x7k2qp/foo` scope to `/x7k2qp/foo`.
+
+The token root is still checked against the path the client dialed, not the alias. A [scoped key](#scope-a-key) is immutable, so its scope has to be anchored at whichever name the tokens it signs are rooted at: anchor it at the stable id and its tokens work on stable-id paths, anchor it at a vanity name and they stop working once that name changes. Reconciling the two is tracked separately.
 
 ```toml
 [auth]
@@ -222,10 +258,10 @@ certificate chaining to that CA is granted **full publish and subscribe access
 within the connection URL path**. The URL path scopes the grant exactly like a
 JWT's `root` claim, so a peer dialing `/demo` can only publish and subscribe
 under `demo/`. A peer dialing `/` (as cluster nodes do) gets an empty root and
-unscoped, cluster-wide access. The session records on the `internal` billing
-tier by default, configurable via `--auth-mtls-tier` (the auth API's `tier` field
-overrides per-connection); this only selects the stats tier used for billing and
-grants no extra permissions.
+unscoped, cluster-wide access. The session records on the default unprefixed
+billing tier unless `--auth-mtls-tier` or the auth API's `tier` field selects a
+named tier; this only selects the stats tier used for billing and grants no extra
+permissions.
 
 This is primarily intended for relay-to-relay (clustering) authentication, as a
 simpler alternative to distributing long-lived JWTs.
@@ -318,8 +354,8 @@ moq --client-connect "unix:///run/moq/internal.sock/?jwt=$TOKEN" --broadcast my-
 Stream transports are native-only: browsers can't open raw TCP or Unix sockets,
 so the JS client doesn't support them. The plain-stream path has no TLS ALPN, so
 the MoQ version is negotiated in-band via qmux and the exact version is agreed up
-front (the listener offers moq-lite-05, the only version that carries a request
-path in-band, so a JWT/path can ride the SETUP).
+front. The negotiated version carries the request path in its SETUP (moq-lite-05
+and the moq-transport drafts both do), so a JWT/path can ride it.
 
 ## Example Configurations
 

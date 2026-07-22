@@ -254,6 +254,13 @@ pub struct ClusterConfig {
 	/// `https://host/?jwt=TOKEN`; a bare host or `host:port` is deprecated but
 	/// still accepted (wrapped in `https://.../`). Accepts a comma-separated list
 	/// on the CLI or repeat the flag; in config files use a TOML array.
+	///
+	/// A `?cost=N` query param prices the link (moq-lite-06+): every
+	/// announcement crossing it adds `N` to its route cost, so routing prefers
+	/// cheap paths over short ones. Use `0` for a same-datacenter sibling and
+	/// something large for a metered backbone; an unpriced link costs 1, which
+	/// reproduces plain hop counting. The param is consumed by this relay, not
+	/// sent to the peer.
 	#[serde(alias = "connect")]
 	#[arg(
 		id = "cluster-connect",
@@ -317,8 +324,7 @@ pub struct ClusterConfig {
 	pub token: Option<PathBuf>,
 
 	/// Billing tier label that cluster-peer (relay-to-relay) traffic records
-	/// stats under. Default `internal`. An empty value selects the default
-	/// (unprefixed) tier.
+	/// stats under. Defaults to the unprefixed tier.
 	#[arg(id = "cluster-tier", long = "cluster-tier", env = "MOQ_CLUSTER_TIER")]
 	pub tier: Option<String>,
 }
@@ -349,8 +355,8 @@ pub struct Cluster {
 
 	/// Stats registry. One instance per relay; sessions pick a billing tier via
 	/// [`stats::Registry::tier`](moq_net::stats::Registry::tier) at acceptance time
-	/// (default tier for JWT/public, `internal` for mTLS / cluster peers, or any label
-	/// the auth API returns) so traffic classes land in separate counter sets. Defaults
+	/// (the default tier unless configured otherwise, or any label the auth API
+	/// returns) so traffic classes land in separate counter sets. Defaults
 	/// to a disabled (no-op) registry until [`with_stats`](Self::with_stats) is called.
 	pub stats: moq_net::stats::Registry,
 }
@@ -427,10 +433,10 @@ impl Cluster {
 		self
 	}
 
-	/// Billing tier cluster-peer traffic records under (`--cluster-tier`,
-	/// default `internal`). An empty label is the default (unprefixed) tier.
+	/// Billing tier cluster-peer traffic records under (`--cluster-tier`).
+	/// An absent or empty label selects the default unprefixed tier.
 	fn cluster_tier(&self) -> Tier {
-		crate::trusted_tier(self.config.tier.clone())
+		crate::configured_tier(self.config.tier.clone())
 	}
 
 	/// Returns an [`origin::Producer`] scoped to this session's subscribe permissions.
@@ -571,13 +577,13 @@ impl Cluster {
 		// Held in scope so the registration stays announced until `run` exits.
 		// Discovery is paired with it: a gossip-only relay (passive rendezvous) has
 		// nothing to discover, so we only run it when we also have an outbound peer.
-		let _self_registration: Option<origin::Broadcast> = if gossip {
+		let self_registration: Option<moq_net::broadcast::Producer> = if gossip {
 			// Checked above: gossip requires `node`.
 			let node = node.as_deref().expect("gossip requires --cluster-node");
 			let path = Path::new(MESH_PREFIX).join(node);
 			let broadcast = self
 				.origin
-				.create_broadcast(&path)
+				.create_broadcast(&path, moq_net::broadcast::Route::new().with_announce(true))
 				.expect(".internal/origins is within the relay origin's root");
 			tracing::info!(%node, %path, "advertising cluster node URL");
 
@@ -597,12 +603,18 @@ impl Cluster {
 		};
 
 		if tasks.is_empty() {
-			// Passive rendezvous: park to keep `_self_registration` alive. The
+			// Passive rendezvous: park to keep `self_registration` alive. The
 			// process still exits via the other arms of `tokio::select!` in main.
 			std::future::pending::<()>().await
 		}
 
 		while tasks.join_next().await.is_some() {}
+
+		// Deliberate shutdown: finish the registration rather than dropping it, so
+		// there is no dropped-without-finish warning.
+		if let Some(registration) = self_registration {
+			registration.finish();
+		}
 		Ok(())
 	}
 
@@ -824,6 +836,13 @@ impl Cluster {
 	#[tracing::instrument("remote", skip_all, err, fields(%remote))]
 	async fn run_remote(self, remote: &str, token: String) -> anyhow::Result<()> {
 		let mut url = peer_url(remote)?;
+		// The link's price, declared by us as the dialing side and charged to
+		// every announcement crossing the connection (see
+		// `moq_net::Client::with_cost`). Carried as a `?cost=` query
+		// param on the peer URL so static lists, gossip, and connect-api feeds can
+		// each price their links: 0 for a same-datacenter sibling, higher for a
+		// metered backbone. Stripped here; the value rides SETUP, not the URL.
+		let cost = take_cost(&mut url)?;
 		// Apply the shared cluster token unless the URL already carries its own
 		// non-empty `?jwt=` (an inline token on a static `connect` peer wins; the
 		// shared token still covers discovered peers that have none). An empty
@@ -843,7 +862,7 @@ impl Cluster {
 
 		loop {
 			let started = tokio::time::Instant::now();
-			let result = self.run_remote_once(&url).await;
+			let result = self.run_remote_once(&url, cost).await;
 			let elapsed = started.elapsed();
 
 			match result {
@@ -862,7 +881,7 @@ impl Cluster {
 		}
 	}
 
-	async fn run_remote_once(&self, url: &Url) -> anyhow::Result<()> {
+	async fn run_remote_once(&self, url: &Url, cost: Option<u64>) -> anyhow::Result<()> {
 		let mut log_url = url.clone();
 		log_url.set_query(None);
 		tracing::info!(url = %log_url, "dialing cluster peer");
@@ -873,17 +892,54 @@ impl Cluster {
 			.clone()
 			.context("internal: cluster peer dial without an attached QUIC client")?;
 
-		// Cluster-to-cluster traffic is internal by definition.
-		let cs = client
+		// Cluster dials use their configured stats tier.
+		let mut client = client
 			.with_publisher(&self.origin)
 			.with_subscriber(self.origin.clone())
-			.with_stats(self.stats.tier(self.cluster_tier()))
+			.with_stats(self.stats.tier(self.cluster_tier()));
+		if let Some(cost) = cost {
+			client = client.with_cost(cost);
+		}
+		let cs = client
 			.connect(url.clone())
 			.await
 			.context("failed to connect to cluster peer")?;
 
 		Err(cs.closed().await.into())
 	}
+}
+
+/// Extract and remove the `cost` query param from a peer URL.
+///
+/// The param is dial-side configuration, not something the peer reads off the
+/// URL (it rides SETUP instead), so it is stripped before connecting. An
+/// unparseable value is an error rather than a silent default: a mispriced link
+/// skews routing for every broadcast crossing it.
+fn take_cost(url: &mut Url) -> anyhow::Result<Option<u64>> {
+	let Some(value) = url
+		.query_pairs()
+		.find_map(|(key, value)| (key == "cost").then(|| value.into_owned()))
+	else {
+		return Ok(None);
+	};
+	let cost: u64 = value
+		.parse()
+		.with_context(|| format!("invalid cost {value:?} on cluster peer URL"))?;
+
+	let remaining: Vec<(String, String)> = url
+		.query_pairs()
+		.filter(|(key, _)| key != "cost")
+		.map(|(key, value)| (key.into_owned(), value.into_owned()))
+		.collect();
+	url.set_query(None);
+	if !remaining.is_empty() {
+		let mut pairs = url.query_pairs_mut();
+		for (key, value) in &remaining {
+			pairs.append_pair(key, value);
+		}
+	}
+
+	Ok(Some(cost))
 }
 
 /// Whether a `--cluster-connect-api` source is an http(s) URL (otherwise it's
@@ -958,6 +1014,36 @@ where
 mod tests {
 	use super::*;
 	use crate::Config;
+
+	/// `?cost=` is read and stripped (it rides SETUP, not the URL), other
+	/// query params survive, and a garbage value is an error rather than a
+	/// silent default.
+	#[test]
+	fn cost_param_is_consumed() {
+		let mut url = Url::parse("https://peer.example/?jwt=abc&cost=0").unwrap();
+		assert_eq!(take_cost(&mut url).unwrap(), Some(0));
+		assert_eq!(url.as_str(), "https://peer.example/?jwt=abc");
+
+		let mut url = Url::parse("https://peer.example/").unwrap();
+		assert_eq!(take_cost(&mut url).unwrap(), None);
+		assert_eq!(url.as_str(), "https://peer.example/");
+
+		let mut url = Url::parse("https://peer.example/?cost=cheap").unwrap();
+		assert!(take_cost(&mut url).is_err());
+	}
+
+	#[test]
+	fn cluster_tier_defaults_to_unprefixed() {
+		let cluster = Cluster::new(ClusterConfig::default()).expect("cluster");
+		assert_eq!(cluster.cluster_tier(), Tier::default());
+
+		let cluster = Cluster::new(ClusterConfig {
+			tier: Some("region/sjc".to_string()),
+			..Default::default()
+		})
+		.expect("cluster");
+		assert_eq!(cluster.cluster_tier(), Tier::new("region/sjc"));
+	}
 
 	/// Stand-in dial task: never makes progress, exposes an AbortHandle.
 	fn placeholder_handle() -> AbortHandle {

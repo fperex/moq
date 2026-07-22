@@ -35,7 +35,7 @@ use moq_net::Timestamp;
 /// manages the track, catalog config, and keyframe-based group boundaries.
 ///
 /// Elementary streams we don't decode are carried verbatim, one MoQ track per
-/// PID, when the catalog `E` carries the [`mpegts`](catalog) section: PES-framed
+/// PID, when the catalog `E` carries the [`mpegts`](super::Mpegts) section: PES-framed
 /// streams ride the normal PES reassembly, section-framed streams (SCTE-35, marked
 /// by a program-level 'CUEI' registration descriptor, and other private sections)
 /// are intercepted before the reader and reassembled. With a base `Catalog<()>`
