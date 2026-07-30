@@ -368,7 +368,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 			} => {
 				// The client's SETUP was read in `accept_request`; hand the stream back
 				// for GOAWAY. A server never advertises a path, hence `None`.
-				let protocol = ietf::start(
+				let (protocol, goaway) = ietf::start(
 					session.clone(),
 					None,
 					None,
@@ -380,7 +380,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					Some(peer_setup),
 				)?;
 				tracing::debug!(?version, "connected");
-				return Ok(Session::new(session, version.into(), None, protocol));
+				return Ok(Session::new(session, version.into(), None, protocol, goaway));
 			}
 			Handshake::LiteBare { session, version } => {
 				let start = lite::start(
@@ -397,6 +397,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					version.into(),
 					start.recv_bandwidth,
 					start.driver,
+					start.goaway,
 				));
 			}
 			Handshake::LiteSetup {
@@ -411,6 +412,8 @@ impl<S: web_transport_trait::Session> Request<S> {
 					role: None,
 					// The dialing side prices the link; we charge what its SETUP declared.
 					cost: None,
+					// Filled by `lite::start` from the attached origin handles.
+					origin: None,
 				};
 				let start = lite::start(
 					session.clone(),
@@ -426,6 +429,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					version.into(),
 					start.recv_bandwidth,
 					start.driver,
+					start.goaway,
 				));
 			}
 			Handshake::Legacy {
@@ -453,7 +457,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 		};
 		stream.writer.encode(&server_setup).await?;
 
-		let (recv_bw, protocol) = match version {
+		let (recv_bw, protocol, goaway) = match version {
 			Version::Lite(v) => {
 				let stream = stream.with_version(v);
 				// Pre-lite-05: no Setup Stream, so nothing to advertise or seed.
@@ -466,12 +470,12 @@ impl<S: web_transport_trait::Session> Request<S> {
 					lite::Setup::default(),
 					None,
 				)?;
-				(start.recv_bandwidth, start.driver)
+				(start.recv_bandwidth, start.driver, start.goaway)
 			}
 			Version::Ietf(v) => {
 				let stream = stream.with_version(v);
 				// Draft 14-16: path came in the bidi SETUP, no uni SETUP to hand back.
-				let protocol = ietf::start(
+				let (protocol, goaway) = ietf::start(
 					session.clone(),
 					Some(stream),
 					request_id_max,
@@ -482,11 +486,11 @@ impl<S: web_transport_trait::Session> Request<S> {
 					None,
 					None,
 				)?;
-				(None, protocol)
+				(None, protocol, goaway)
 			}
 		};
 
-		Ok(Session::new(session, version, recv_bw, protocol))
+		Ok(Session::new(session, version, recv_bw, protocol, goaway))
 	}
 
 	/// Reject the session, closing the transport with `err`'s wire code.
@@ -649,6 +653,7 @@ mod tests {
 			path: path.map(str::to_string),
 			role,
 			cost: None,
+			origin: None,
 		}
 		.encode(&mut buf, v)
 		.unwrap();

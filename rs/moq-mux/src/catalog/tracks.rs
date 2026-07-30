@@ -1,38 +1,9 @@
 use std::marker::PhantomData;
 use std::time::Duration;
 
-use moq_net::Timestamp;
-
+use super::Estimate;
 use super::Producer;
 use super::hang::{Catalog, CatalogExt};
-use crate::container::jitter::Metrics;
-
-/// The catalog fields a [`Rendition`] can measure from the frames fed to it.
-///
-/// An absent field is one to measure: whatever the config already carries when it reaches
-/// [`Rendition::set`] is authoritative and left alone, and the rest is detected and kept current.
-#[derive(Clone, Default, Debug, PartialEq)]
-#[non_exhaustive]
-pub struct Estimate {
-	/// The maximum jitter before the next frame is emitted.
-	pub jitter: Option<Duration>,
-	/// The maximum bitrate in bits per second.
-	pub bitrate: Option<u64>,
-}
-
-impl Estimate {
-	/// Set the jitter (or clear it with `None`).
-	pub fn with_jitter(mut self, jitter: impl Into<Option<Duration>>) -> Self {
-		self.jitter = jitter.into();
-		self
-	}
-
-	/// Set the bitrate in bits per second (or clear it with `None`).
-	pub fn with_bitrate(mut self, bitrate: impl Into<Option<u64>>) -> Self {
-		self.bitrate = bitrate.into();
-		self
-	}
-}
 
 /// A catalog config that can be published as a named rendition.
 ///
@@ -81,12 +52,17 @@ impl Estimate {
 /// ```
 ///
 /// Note that `insert` takes the whole [`Catalog`], not just the extension, so the built-in media
-/// configs use the same trait. Writing to `catalog.video` / `catalog.audio` from a custom config
-/// fights the media pipeline for those sections; stay in your own.
+/// configs use the same trait. Writing to `catalog.video` / `catalog.audio` / `catalog.text` from a
+/// custom config fights the media pipeline for those sections; stay in your own.
 ///
-/// To advertise a timeline for a custom track, set your config's timeline field from
-/// [`catalog::Producer::timeline`](crate::catalog::Producer::timeline) before [`set`](Rendition::set)
-/// (the same way an importer does), and record group opens through its recorder.
+/// To index a custom track in the broadcast's timeline, enroll it via
+/// [`catalog::Producer::enroll`](crate::catalog::Producer::enroll) (or build it through
+/// [`media_producer`](crate::catalog::Producer::media_producer), which does so for you).
+///
+/// Opting into detection is only half of it: something has to measure. Write the track through a
+/// [`container::Producer`](crate::container::Producer) and hand its
+/// [`estimate`](crate::container::Producer::estimate) to [`Rendition::estimate`], or drive a
+/// [`Estimator`](super::Estimator) yourself.
 pub trait RenditionConfig<E: CatalogExt>: Sized + 'static {
 	/// Insert or replace this config under `name`.
 	fn insert(self, catalog: &mut Catalog<E>, name: &str);
@@ -217,6 +193,26 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::AudioConfig {
 	}
 }
 
+impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::TextConfig {
+	fn insert(self, catalog: &mut Catalog<E>, name: &str) {
+		catalog.text.renditions.insert(name.to_string(), self);
+	}
+	fn get_mut<'a>(catalog: &'a mut Catalog<E>, name: &str) -> Option<&'a mut Self> {
+		catalog.text.renditions.get_mut(name)
+	}
+	fn remove(catalog: &mut Catalog<E>, name: &str) {
+		catalog.text.renditions.remove(name);
+	}
+
+	// Only jitter: a cue track has no bitrate field, so there is nothing to fill from a measurement.
+	fn estimate(&self) -> Estimate {
+		Estimate::default().with_jitter(self.jitter)
+	}
+	fn set_estimate(&mut self, estimate: Estimate) {
+		self.jitter = estimate.jitter;
+	}
+}
+
 /// A clonable reservation context handed to importers so they declare their tracks up front.
 ///
 /// Made via [`Producer::reserve`]. While any `Reserved` clone is alive the track set may still
@@ -251,6 +247,14 @@ impl<E: CatalogExt> Reserved<E> {
 
 	/// Reserve an audio rendition; shorthand for [`init`](Self::init).
 	pub fn audio(&self, name: impl Into<String>) -> AudioTrack<E> {
+		self.init(name)
+	}
+
+	/// Reserve a text (caption/subtitle) rendition; shorthand for [`init`](Self::init).
+	///
+	/// Nothing about a cue track is detected from its payload, so the caller [`set`](Rendition::set)s
+	/// a complete config up front rather than waiting on a bitstream.
+	pub fn text(&self, name: impl Into<String>) -> TextTrack<E> {
 		self.init(name)
 	}
 
@@ -299,11 +303,14 @@ pub struct Rendition<E: CatalogExt, C: RenditionConfig<E>> {
 	/// Whether a config has been published, so a lazily-configured importer (e.g. H.264 before its
 	/// SPS) holds the handle without a catalog entry, and drops without a spurious removal.
 	present: bool,
-	/// Detects jitter and bitrate from the frames fed in, keeping the config's fields current.
-	metrics: Metrics,
 	/// The fields the config carried at [`set`](Self::set): authoritative, never overwritten by
-	/// detection. Whatever is absent here is what the detector fills.
+	/// detection. Whatever is absent here is what detection fills.
 	supplied: Estimate,
+	/// The last estimate handed to [`estimate`](Self::estimate), kept so a config set afterwards
+	/// starts from whatever was already measured.
+	detected: Estimate,
+	/// The last estimate written to the config, so an unchanged one doesn't republish the catalog.
+	published: Option<Estimate>,
 	_config: PhantomData<fn() -> C>,
 }
 
@@ -311,6 +318,8 @@ pub struct Rendition<E: CatalogExt, C: RenditionConfig<E>> {
 pub type VideoTrack<E = ()> = Rendition<E, hang::catalog::VideoConfig>;
 /// A single audio track's catalog rendition. See [`Rendition`].
 pub type AudioTrack<E = ()> = Rendition<E, hang::catalog::AudioConfig>;
+/// A single text (caption/subtitle) track's catalog rendition. See [`Rendition`].
+pub type TextTrack<E = ()> = Rendition<E, hang::catalog::TextConfig>;
 
 impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 	fn new(reserved: Reserved<E>, name: impl Into<String>) -> Self {
@@ -319,8 +328,9 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 			gate: Some(reserved),
 			name: name.into(),
 			present: false,
-			metrics: Metrics::new(),
 			supplied: Estimate::default(),
+			detected: Estimate::default(),
+			published: None,
 			_config: PhantomData,
 		}
 	}
@@ -338,13 +348,15 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 	/// Insert or replace the rendition, fulfilling the reservation and publishing the catalog.
 	///
 	/// Whatever [`Estimate`] fields `config` already carries are authoritative and left alone; the
-	/// rest are auto-detected, seeded with any metrics accumulated before the rendition existed (a
-	/// dirty start or a B-frame reorder) and kept current as frames arrive. A caller who wants to
-	/// pre-empt detection sets the field on the config, or (for a config an importer builds out of
-	/// the bitstream) hands the importer a hint like [`VideoHint`].
+	/// rest are filled by [`estimate`](Self::estimate), seeded with anything already measured before
+	/// the rendition existed (a dirty start or a B-frame reorder). A caller who wants to pre-empt
+	/// detection sets the field on the config, or (for a config an importer builds out of the
+	/// bitstream) hands the importer a hint like [`VideoHint`].
 	pub fn set(&mut self, mut config: C) {
 		self.supplied = config.estimate();
-		config.set_estimate(self.resolved());
+		let resolved = self.resolved();
+		self.published = Some(resolved.clone());
+		config.set_estimate(resolved);
 
 		// Write the config first (still withheld, since we're holding our reservation), then release
 		// the reservation. If this was the last one, the release flushes a complete snapshot.
@@ -356,22 +368,38 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 		self.gate = None;
 	}
 
-	/// The supplied fields, with anything absent filled from the detector.
+	/// The supplied fields, with anything absent filled from what was detected.
 	fn resolved(&self) -> Estimate {
 		let mut estimate = self.supplied.clone();
 		if estimate.jitter.is_none() {
-			estimate.jitter = self.metrics.jitter();
+			estimate.jitter = self.detected.jitter;
 		}
 		if estimate.bitrate.is_none() {
-			estimate.bitrate = self.metrics.bitrate();
+			estimate.bitrate = self.detected.bitrate;
 		}
 		estimate
 	}
 
-	/// Republish the estimate after the detector moved a field nothing supplied.
-	fn refresh(&mut self) {
-		let estimate = self.resolved();
-		self.update(|config| config.set_estimate(estimate));
+	/// Publish a measured [`Estimate`], filling only the fields the config didn't supply at
+	/// [`set`](Self::set).
+	///
+	/// Mint the estimate from an [`Estimator`](super::Estimator), usually the one a
+	/// [`container::Producer`](crate::container::Producer) keeps for you:
+	/// `rendition.estimate(track.estimate())`. Cheap to call after every write, since an estimate
+	/// that resolves to what the catalog already carries doesn't republish it.
+	///
+	/// Calling this before [`set`](Self::set) is not wasted: the measurement is remembered and seeds
+	/// the config once it lands.
+	pub fn estimate(&mut self, estimate: Estimate) {
+		self.detected = estimate;
+
+		let resolved = self.resolved();
+		if self.published.as_ref() == Some(&resolved) {
+			return;
+		}
+		self.published = Some(resolved.clone());
+
+		self.update(|config| config.set_estimate(resolved));
 	}
 
 	/// Refine the rendition in place (e.g. a synthesized description), publishing if present.
@@ -382,33 +410,6 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 		let mut guard = self.catalog.lock();
 		if let Some(config) = C::get_mut(&mut guard, &self.name) {
 			f(config);
-		}
-	}
-
-	/// Record one frame (presentation timestamp + encoded size), auto-filling the jitter if the
-	/// config didn't provide it and the detected value changed.
-	///
-	/// Crate-internal: the codec importers feed the catalog's bitrate/jitter estimator as they
-	/// publish. Not a knob for external callers.
-	pub(crate) fn record_frame(&mut self, ts: Timestamp, bytes: usize) {
-		if self.metrics.record_frame(ts, bytes).is_some() && self.supplied.jitter.is_none() {
-			self.refresh();
-		}
-	}
-
-	/// Record a frame's reorder delay (`PTS - DTS`), auto-filling the jitter as for
-	/// [`record_frame`](Self::record_frame).
-	pub(crate) fn record_reorder(&mut self, reorder: Timestamp) {
-		if self.metrics.record_reorder(reorder).is_some() && self.supplied.jitter.is_none() {
-			self.refresh();
-		}
-	}
-
-	/// Close the current group (`next` is its end timestamp when known), auto-filling the bitrate
-	/// if the config didn't provide it and the detected maximum rose.
-	pub(crate) fn record_group_end(&mut self, next: Option<Timestamp>) {
-		if self.metrics.finish_group(next).is_some() && self.supplied.bitrate.is_none() {
-			self.refresh();
 		}
 	}
 }
@@ -448,18 +449,20 @@ mod tests {
 		config
 	}
 
-	fn ts(micros: u64) -> Timestamp {
-		Timestamp::from_micros(micros).unwrap()
+	fn ts(micros: u64) -> moq_net::Timestamp {
+		moq_net::Timestamp::from_micros(micros).unwrap()
 	}
 
-	/// Feed ~40ms 100 kB frames (one per group) over more than the bitrate window.
+	/// Feed ~40ms 100 kB frames (one per group) over more than the bitrate window, as a
+	/// [`container::Producer`](crate::container::Producer) would.
 	fn feed<E: CatalogExt, C: RenditionConfig<E>>(rendition: &mut Rendition<E, C>) {
+		let mut estimator = super::super::Estimator::new();
 		for i in 0..60u64 {
 			let t = ts(i * 40_000);
-			rendition.record_group_end(Some(t));
-			rendition.record_frame(t, 100_000);
+			estimator.cut(Some(t));
+			estimator.write(t, 100_000);
+			rendition.estimate(estimator.estimate());
 		}
-		rendition.record_group_end(None);
 	}
 
 	#[test]
@@ -512,6 +515,26 @@ mod tests {
 		assert!(config.jitter.is_some(), "the unhinted jitter should still be detected");
 	}
 
+	/// Frames flow before the config resolves (H.264 publishes until its first SPS), so a
+	/// measurement taken while the rendition is still empty has to seed the config once it lands.
+	#[test]
+	fn measurements_before_set_seed_the_config() {
+		let (_broadcast, catalog, mut rendition) = video_track();
+		feed(&mut rendition);
+		rendition.set(config(None, None));
+
+		let snapshot = catalog.snapshot();
+		let config = snapshot.video.renditions.get("v").unwrap();
+		assert!(
+			config.jitter.is_some(),
+			"the jitter measured before `set` should carry over"
+		);
+		assert!(
+			config.bitrate.is_some(),
+			"the bitrate measured before `set` should carry over"
+		);
+	}
+
 	/// A detected value the stream later reveals wins: `set` recaptures what the new config carries.
 	#[test]
 	fn resetting_recaptures_supplied() {
@@ -528,46 +551,20 @@ mod tests {
 		assert_eq!(config.bitrate, Some(789), "the re-set bitrate is now authoritative");
 	}
 
-	/// Two renditions can advertise one shared timeline: the same handle yields the same section, so
-	/// an aligned ladder (source + rung) indexes off a single `.timeline.z` track.
+	/// The broadcast has one timeline: every rendition's groups index into the same track, so
+	/// an aligned ladder (source + rung) shares it by construction.
 	#[test]
-	fn renditions_share_a_timeline() {
+	fn renditions_share_the_broadcast_timeline() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = super::super::Producer::new(&mut broadcast).unwrap();
-		let reserved = catalog.reserve();
+		let mut catalog = super::super::Producer::new(&mut broadcast).unwrap();
 
-		let shared = catalog.timeline("video").unwrap();
-		let mut source = reserved.video("video0");
-		let mut rung = reserved.video("video1");
-		drop(reserved);
-
-		for rendition in [&mut source, &mut rung] {
-			let mut config = config(None, None);
-			config.timeline = Some(shared.section());
-			rendition.set(config);
-		}
-
-		let snapshot = catalog.snapshot();
-		let source_tl = snapshot
-			.video
-			.renditions
-			.get("video0")
-			.unwrap()
-			.timeline
-			.as_ref()
-			.unwrap();
-		let rung_tl = snapshot
-			.video
-			.renditions
-			.get("video1")
-			.unwrap()
-			.timeline
-			.as_ref()
-			.unwrap();
-		assert_eq!(source_tl.track, "video.timeline.z");
+		let _recorder = catalog.enroll("video0").unwrap();
+		let timeline = catalog.timeline();
+		assert_eq!(timeline.section().track, hang::timeline::DEFAULT_NAME);
 		assert_eq!(
-			rung_tl.track, source_tl.track,
-			"both renditions index off one shared timeline track"
+			catalog.snapshot().timeline,
+			Some(timeline.section()),
+			"the one timeline is advertised at the catalog root"
 		);
 	}
 
@@ -591,8 +588,6 @@ mod tests {
 			schema: String,
 			#[serde(default, skip_serializing_if = "Option::is_none")]
 			bitrate: Option<u64>,
-			#[serde(default, skip_serializing_if = "Option::is_none")]
-			timeline: Option<hang::catalog::Timeline>,
 		}
 
 		impl RenditionConfig<TelemetryExt> for Telemetry {
@@ -619,7 +614,6 @@ mod tests {
 			Telemetry {
 				schema: "gps/v1".to_string(),
 				bitrate,
-				timeline: None,
 			}
 		}
 
@@ -629,8 +623,7 @@ mod tests {
 			(broadcast, catalog)
 		}
 
-		/// A custom kind gets the same detection and drop-removal as video/audio, and advertises a
-		/// timeline the same explicit way an importer does.
+		/// A custom kind gets the same detection and drop-removal as video/audio.
 		#[test]
 		fn detects_and_advertises() {
 			let (_broadcast, catalog) = produce();
@@ -638,26 +631,52 @@ mod tests {
 			let mut rendition = reserved.init::<Telemetry>("gps");
 			drop(reserved);
 
-			// The caller advertises the timeline explicitly, exactly as an importer does for video/audio.
-			let mut config = telemetry(None);
-			config.timeline = Some(catalog.timeline("gps").unwrap().section());
-			rendition.set(config);
+			rendition.set(telemetry(None));
 			feed(&mut rendition);
 
 			let snapshot = catalog.snapshot();
 			let config = snapshot.telemetry.get("gps").unwrap();
 			assert!(config.bitrate.is_some(), "absent bitrate should be auto-detected");
-			assert_eq!(
-				config.timeline.as_ref().map(|t| t.track.as_str()),
-				Some("gps.timeline.z"),
-				"the advertised timeline names the companion track"
-			);
 
 			drop(rendition);
 			assert!(
 				!catalog.snapshot().telemetry.contains_key("gps"),
 				"the rendition should be removed on drop"
 			);
+		}
+
+		/// The whole point of opting in: write a custom track through a
+		/// [`container::Producer`](crate::container::Producer) and its catalog bitrate/jitter keep
+		/// themselves current, with no per-frame bookkeeping in the caller.
+		#[test]
+		fn measures_a_custom_track() {
+			let (mut broadcast, mut catalog) = produce();
+			let reserved = catalog.reserve();
+			let mut rendition = reserved.init::<Telemetry>("gps");
+			drop(reserved);
+			rendition.set(telemetry(None));
+
+			let net = broadcast.create_track("gps", None).unwrap();
+			let mut track = catalog
+				.media_producer(net, crate::catalog::hang::Container::Legacy)
+				.unwrap();
+
+			// 40ms records of 5 kB: 1 Mbps, over more than the bitrate window.
+			for i in 0..60u64 {
+				track
+					.write(crate::container::Frame {
+						timestamp: ts(i * 40_000),
+						duration: None,
+						payload: bytes::Bytes::from(vec![0u8; 5_000]),
+						keyframe: true,
+					})
+					.unwrap();
+				rendition.estimate(track.estimate());
+			}
+
+			let snapshot = catalog.snapshot();
+			let config = snapshot.telemetry.get("gps").unwrap();
+			assert_eq!(config.bitrate, Some(1_000_000));
 		}
 
 		/// A field the config supplies is authoritative even though the kind opts into detection.

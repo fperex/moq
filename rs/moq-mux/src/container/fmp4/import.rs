@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::Error;
 use crate::Result;
-use crate::container::jitter::Metrics;
+use crate::catalog::Estimator;
 
 /// Converts fMP4/CMAF files into MoQ broadcast streams using CMAF passthrough.
 ///
@@ -58,6 +58,10 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	// Bytes carried across calls: a partial atom at the tail of one `decode` waits
 	// here for the rest to arrive on the next call.
 	buffer: BytesMut,
+
+	// A segment boundary (a styp or an explicit `cut()`) waiting to land on the next keyframe
+	// fragment, where it becomes a timeline cut at that fragment's timestamp.
+	pending_cut: bool,
 }
 
 #[derive(PartialEq, Debug)]
@@ -72,11 +76,9 @@ struct Fmp4Track {
 	track: moq_net::track::Producer,
 	group: Option<moq_net::group::Producer>,
 
-	// Indexes this track's group opens into its `<name>.timeline.z` timeline, advertised in the
-	// rendition's config. Passthrough writes groups by hand (no `container::Producer`), so the
-	// recorder is fed directly at each keyframe rather than through `with_recorder`.
-	// `None` once recording has failed, matching `container::Producer`: the timeline is an
-	// optional sidecar, so losing it must not take the media down with it.
+	// Reports this track's group opens into the broadcast's timeline. Passthrough writes
+	// groups by hand (no `container::Producer`), so the recorder is fed directly at each
+	// keyframe fragment rather than through `with_recorder`.
 	recorder: Option<crate::timeline::Recorder>,
 
 	// The minimum buffer required for the track.
@@ -91,11 +93,14 @@ struct Fmp4Track {
 	// Sequence to use for the next group, set by `Import::seek`.
 	pending_sequence: Option<u64>,
 
-	// Detects the track bitrate from fragment sizes, used only when the CMAF descriptor didn't
-	// declare one. Jitter comes from the fragment timing above, not this detector.
-	metrics: Metrics,
+	// Measures the track bitrate from fragment sizes, used only when the CMAF descriptor didn't
+	// declare one. Jitter comes from the fragment timing above, not this estimator.
+	estimator: Estimator,
 
-	// Whether the descriptor left the bitrate unset, so the detector should fill it.
+	// The last bitrate written to the catalog, so an unchanged one doesn't republish it.
+	bitrate: Option<u64>,
+
+	// Whether the descriptor left the bitrate unset, so the estimator should fill it.
 	detect_bitrate: bool,
 }
 
@@ -115,7 +120,19 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			moof_size: 0,
 			broadcast,
 			buffer: BytesMut::new(),
+			pending_cut: false,
 		}
+	}
+
+	/// Declare that the next keyframe fragment starts a new segment, for callers that know the
+	/// source's segmentation out of band (e.g. an HLS import following its playlist).
+	///
+	/// A `styp` atom (a CMAF segment on disk) does this on its own, so an importer reading a
+	/// segmented file needs no help. Boundaries are broadcast-wide, but redundant ones cost
+	/// nothing: the timeline ignores a cut that would land inside its minimum segment duration,
+	/// so several renditions of one source may all declare the same boundaries.
+	pub fn cut(&mut self) {
+		self.pending_cut = true;
 	}
 
 	/// Restrict which track roles are published.
@@ -173,7 +190,10 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 		for (atom, start, size) in parsed {
 			match atom {
-				Any::Ftyp(_) | Any::Styp(_) => {}
+				Any::Ftyp(_) => {}
+				// A styp opens a CMAF segment: the on-disk segmentation is the boundary
+				// hint, landing on the next keyframe fragment.
+				Any::Styp(_) => self.pending_cut = true,
 				Any::Moov(moov) => {
 					self.init(moov)?;
 				}
@@ -199,9 +219,17 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	}
 
 	fn init(&mut self, moov: Moov) -> Result<()> {
+		let timeline = self.catalog.timeline();
+
 		// Clone the catalog to avoid the borrow checker.
 		let mut catalog = self.catalog.clone();
 		let mut catalog = catalog.lock();
+
+		// The tracks below enroll in the timeline, so advertise it in the same catalog update
+		// rather than publishing a second snapshot for it.
+		if catalog.timeline.is_none() && !moov.trak.is_empty() {
+			catalog.timeline = Some(timeline.section());
+		}
 
 		for trak in &moov.trak {
 			let track_id = trak.tkhd.track_id;
@@ -236,22 +264,22 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				moq_net::track::Info::default().with_timescale(timescale),
 			)?;
 
-			// Each track indexes its own group opens: audio and video group boundaries differ, so a
-			// per-track timeline (the 1:1 default) is correct here, not a shared one.
-			let timeline = self.catalog.timeline(track.name())?;
+			// Enroll every track in the broadcast's timeline: passthrough writes groups by hand
+			// (no `container::Producer`), so the recorder is fed directly at each group open.
+			// Enrolling on the timeline directly rather than through `catalog::Producer::enroll`,
+			// because the catalog is already locked here; the root section is advertised below.
+			let recorder = timeline.track(track.name())?;
 
 			let detect_bitrate = match kind {
 				TrackKind::Video => {
-					let mut config = self.init_video(trak, &moov)?;
+					let config = self.init_video(trak, &moov)?;
 					let detect = config.bitrate.is_none();
-					config.timeline = Some(timeline.section());
 					catalog.video.renditions.insert(track.name().to_string(), config);
 					detect
 				}
 				TrackKind::Audio => {
-					let mut config = self.init_audio(trak, &moov)?;
+					let config = self.init_audio(trak, &moov)?;
 					let detect = config.bitrate.is_none();
-					config.timeline = Some(timeline.section());
 					catalog.audio.renditions.insert(track.name().to_string(), config);
 					detect
 				}
@@ -263,12 +291,13 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 					kind,
 					track,
 					group: None,
-					recorder: Some(timeline.recorder()),
+					recorder: Some(recorder),
 					jitter: None,
 					last_timestamp: None,
 					min_duration: None,
 					pending_sequence: None,
-					metrics: Metrics::new(),
+					estimator: Estimator::new(),
+					bitrate: None,
 					detect_bitrate,
 				},
 			);
@@ -524,6 +553,9 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 	// Extract all frames out of an mdat atom using CMAF passthrough.
 	fn extract(&mut self, mdat: Mdat, mdat_raw: &[u8]) -> Result<()> {
+		// A pending cut waits for a video keyframe; only an import with no video at all may
+		// anchor a boundary on another track's fragment.
+		let has_video = self.tracks.values().any(|t| t.kind == TrackKind::Video);
 		let moov = self.moov.as_ref().ok_or(Error::NoMoov)?;
 		let moof = self.moof.take().ok_or(Error::NoMoof)?;
 		let moof_size = self.moof_size;
@@ -765,28 +797,27 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			// consumer still drives playback from the fragment's internal timing.
 			let timestamp = min_timestamp.ok_or(Error::MissingTrun)?;
 
-			// A keyframe fragment just opened a new group; index it in the track's timeline (throttled
-			// to the recorder's granularity) so a playlist/seek/VOD reader can map time to group.
-			// The timeline is an optional sidecar (consumers extrapolate across gaps), so a recording
-			// failure must NOT abort the passthrough. Drop the recorder and carry on.
 			if contains_keyframe {
-				let timeline_err = match track.recorder.as_mut() {
-					Some(recorder) => recorder.record(g.sequence, timestamp).err(),
-					None => None,
-				};
-				if let Some(err) = timeline_err {
-					tracing::warn!(?err, "timeline recording failed; dropping the timeline for this track");
-					track.recorder = None;
+				// A pending segment boundary (a styp, or an explicit `cut()`) lands on the next
+				// keyframe fragment: for video that is where a segment can start, and for an
+				// audio-only import the audio fragment is the best anchor there is.
+				if self.pending_cut && (track.kind == TrackKind::Video || !has_video) {
+					self.pending_cut = false;
+					self.catalog.timeline().cut(timestamp)?;
+				}
+
+				// A keyframe fragment just opened a new group; report it so the broadcast's
+				// timeline can index the segment (the timeline absorbs publish failures).
+				if let Some(recorder) = track.recorder.as_mut() {
+					recorder.record(g.sequence, timestamp, true);
 				}
 			}
 
 			// A keyframe fragment starts a new group: close the previous one for the bitrate
-			// detector (used only when the descriptor didn't declare a bitrate).
-			if track.detect_bitrate
-				&& contains_keyframe
-				&& let Some(bitrate) = track.metrics.finish_group(Some(timestamp))
-			{
-				set_detected_bitrate(&mut self.catalog, track, bitrate)?;
+			// estimator (used only when the descriptor didn't declare a bitrate).
+			if contains_keyframe {
+				track.estimator.cut(Some(timestamp));
+				sync_bitrate(&mut self.catalog, track)?;
 			}
 			let fragment_len = fragment_bytes.len();
 
@@ -799,8 +830,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 			track.group = Some(g);
 
-			if track.detect_bitrate {
-				track.metrics.record_frame(timestamp, fragment_len);
+			track.estimator.write(timestamp, fragment_len);
+
+			// Report how far this fragment presents. Every group but the last is bounded by the
+			// next one's open, so this is what keeps the final segment from being published a
+			// group short. Same timescale throughout, so the add can't mismatch scales.
+			if let Some(recorder) = track.recorder.as_mut()
+				&& let Some(max) = max_timestamp
+			{
+				let end = track.min_duration.and_then(|d| max.checked_add(d).ok()).unwrap_or(max);
+				recorder.end(end);
 			}
 
 			if let (Some(min), Some(max), Some(min_duration)) = (min_timestamp, max_timestamp, track.min_duration) {
@@ -843,11 +882,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// Finish all tracks, flushing current groups.
 	pub fn finish(&mut self) -> Result<()> {
 		for track in self.tracks.values_mut() {
-			if track.detect_bitrate
-				&& let Some(bitrate) = track.metrics.finish_group(None)
-			{
-				set_detected_bitrate(&mut self.catalog, track, bitrate)?;
-			}
+			track.estimator.cut(None);
+			sync_bitrate(&mut self.catalog, track)?;
 			if let Some(mut g) = track.group.take() {
 				g.finish()?;
 			}
@@ -889,11 +925,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// control is intentionally not exposed.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		for track in self.tracks.values_mut() {
-			if track.detect_bitrate
-				&& let Some(bitrate) = track.metrics.finish_group(None)
-			{
-				set_detected_bitrate(&mut self.catalog, track, bitrate)?;
-			}
+			track.estimator.cut(None);
+			sync_bitrate(&mut self.catalog, track)?;
 			if let Some(mut g) = track.group.take() {
 				g.finish()?;
 			}
@@ -903,7 +936,27 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	}
 }
 
-/// Apply a detector-supplied bitrate to a track's catalog config, keeping the maximum seen.
+/// Advertise the measured bitrate when it moves, for a passthrough track whose CMAF descriptor
+/// didn't declare one.
+fn sync_bitrate<E: crate::catalog::hang::CatalogExt>(
+	catalog: &mut crate::catalog::Producer<E>,
+	track: &mut Fmp4Track,
+) -> Result<()> {
+	if !track.detect_bitrate {
+		return Ok(());
+	}
+	let Some(bitrate) = track.estimator.estimate().bitrate else {
+		return Ok(());
+	};
+	if track.bitrate == Some(bitrate) {
+		return Ok(());
+	}
+	track.bitrate = Some(bitrate);
+
+	set_detected_bitrate(catalog, track, bitrate)
+}
+
+/// Apply a measured bitrate to a track's catalog config, keeping the maximum seen.
 fn set_detected_bitrate<E: crate::catalog::hang::CatalogExt>(
 	catalog: &mut crate::catalog::Producer<E>,
 	track: &Fmp4Track,

@@ -48,6 +48,15 @@ pub struct Producer<C: Container> {
 	/// Records each group open (sequence + keyframe timestamp) into this rendition's
 	/// timeline track, when the producer was built with one.
 	recorder: Option<crate::timeline::Recorder>,
+
+	/// The furthest presentation point written, i.e. `max(timestamp + duration)`. Reported to
+	/// `recorder` on each [`cut`](Self::cut), since the last group of a track has no successor
+	/// to bound it and its segment would otherwise be published a group short.
+	end: Option<moq_net::Timestamp>,
+
+	/// Measures the jitter and bitrate of what gets written, for the catalog. Always on: it costs
+	/// two counters, and a caller who doesn't publish a rendition simply never reads it.
+	estimator: crate::catalog::Estimator,
 }
 
 impl<C: Container> Producer<C> {
@@ -65,7 +74,27 @@ impl<C: Container> Producer<C> {
 			latency: std::time::Duration::ZERO,
 			pending_sequence: None,
 			recorder: None,
+			end: None,
+			estimator: crate::catalog::Estimator::new(),
 		}
+	}
+
+	/// The jitter and bitrate measured from the frames written so far.
+	///
+	/// Hand it to [`Rendition::estimate`](crate::catalog::Rendition::estimate) after writing
+	/// (`rendition.estimate(track.estimate())`) to advertise it, which fills only the fields the
+	/// rendition's config didn't already supply. See [`Estimator`](crate::catalog::Estimator).
+	pub fn estimate(&self) -> crate::catalog::Estimate {
+		self.estimator.estimate()
+	}
+
+	/// Record a frame's reorder delay (`PTS - DTS`), raising the measured jitter to the decode
+	/// buffer a B-frame stream needs.
+	///
+	/// The one measurement that can't come from the writes themselves: frames carry no decode time,
+	/// so only a caller that demuxed one (a container importer) can supply it.
+	pub fn reorder(&mut self, delay: moq_net::Timestamp) {
+		self.estimator.reorder(delay);
 	}
 
 	/// Whether the next [`write`](Self::write) has to be a keyframe, i.e. no group is currently open
@@ -88,14 +117,12 @@ impl<C: Container> Producer<C> {
 		self
 	}
 
-	/// Record each group open (sequence + keyframe timestamp) through `recorder`, so consumers can
-	/// index the media without downloading it.
+	/// Report each group open (sequence, timestamp, keyframe) through `recorder`, enrolling
+	/// this track in the broadcast's timeline so consumers can index the media without
+	/// downloading it.
 	///
-	/// Mint the recorder from a [`timeline::Producer`](crate::timeline::Producer) (see
-	/// [`catalog::Producer::timeline`](crate::catalog::Producer::timeline)). The record carries no
-	/// track id, so wire one recorder per timeline; a set of aligned renditions shares a timeline by
-	/// recording only the source and advertising the same section on the rest.
-	/// [`media_producer`](crate::catalog::Producer::media_producer) wires the 1:1 default for you.
+	/// Mint the recorder from the broadcast's [`timeline::Producer`](crate::timeline::Producer);
+	/// [`media_producer`](crate::catalog::Producer::media_producer) wires it for you.
 	pub fn with_recorder(mut self, recorder: crate::timeline::Recorder) -> Self {
 		self.recorder = Some(recorder);
 		self
@@ -133,16 +160,11 @@ impl<C: Container> Producer<C> {
 				None => self.inner.append_group()?,
 			};
 
-			// Index the group the moment it opens: its start is this keyframe's timestamp. The
-			// timeline is an optional sidecar (consumers tolerate gaps by extrapolating), so a
-			// recording failure must NOT abort the media write. Drop the recorder and carry on.
-			let timeline_err = match self.recorder.as_mut() {
-				Some(recorder) => recorder.record(group.sequence, frame.timestamp).err(),
-				None => None,
-			};
-			if let Some(err) = timeline_err {
-				tracing::warn!(?err, "timeline recording failed; dropping the timeline for this track");
-				self.recorder = None;
+			// Report the group the moment it opens: its start is this frame's timestamp. The
+			// timeline absorbs publish failures itself (it is an optional sidecar),
+			// so reporting can't abort the media write.
+			if let Some(recorder) = self.recorder.as_mut() {
+				recorder.record(group.sequence, frame.timestamp, frame.keyframe);
 			}
 
 			self.group = Some(group);
@@ -151,8 +173,19 @@ impl<C: Container> Producer<C> {
 		// Buffer or write the frame.
 		if self.latency.is_zero() {
 			let group = self.group.as_mut().unwrap();
+			let (timestamp, duration, bytes) = (frame.timestamp, frame.duration, frame.payload.len());
 			self.container.write(group, &[frame])?;
+
+			// Only what the container accepted is measured. A rejected frame (too large for the
+			// group, a timestamp that won't convert) leaves the producer usable, and the estimate's
+			// extrema never fall, so counting one would inflate the catalog for good.
+			self.estimator.write(timestamp, bytes);
+			self.observe_end(timestamp, duration);
 		} else {
+			// Buffered frames are measured on the way in instead. The flush that eventually writes
+			// them takes the track down with it when it fails, so there is nothing to unwind.
+			self.estimator.write(frame.timestamp, frame.payload.len());
+			self.observe_end(frame.timestamp, frame.duration);
 			self.buffer.push(frame);
 
 			// Flush if the buffered span has reached the latency budget. Compute
@@ -178,11 +211,42 @@ impl<C: Container> Producer<C> {
 	/// `end` bounds the final buffered frame when the publisher knows where the
 	/// group's content stops. The next [`write`](Self::write) must be a keyframe.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<(), C::Error> {
+		// Before the flush, which can fail: an unbounded cut leaves the measurement open to fold
+		// into the next group anyway, so cutting often costs the catalog nothing.
+		self.estimator.cut(end);
+
+		// Tell the timeline where this group's content stops: the caller's bound when it has
+		// one, otherwise the furthest point we wrote. Only the last group of a track actually
+		// needs this (every earlier one is bounded by its successor's open), but reporting it
+		// on every cut keeps the timeline's frontier honest as we go.
+		if let Some(recorder) = self.recorder.as_mut()
+			&& let Some(end) = end.max(self.end)
+		{
+			recorder.end(end);
+		}
+
 		self.flush(end)?;
 		if let Some(mut group) = self.group.take() {
 			group.finish()?;
 		}
 		Ok(())
+	}
+
+	/// Raise the furthest presentation point written, for [`cut`](Self::cut) to report.
+	fn observe_end(&mut self, timestamp: moq_net::Timestamp, duration: Option<moq_net::Timestamp>) {
+		if self.recorder.is_none() {
+			return;
+		}
+		// Timestamp and duration can be at different scales, so add them in micros; the
+		// sub-microsecond rounding that costs is far below a segment boundary.
+		let micros = timestamp.as_micros() + duration.map(|d| d.as_micros()).unwrap_or(0);
+		let Ok(micros) = u64::try_from(micros) else { return };
+		let Ok(end) = moq_net::Timestamp::from_micros(micros) else {
+			return;
+		};
+		if self.end.is_none_or(|prev| end > prev) {
+			self.end = Some(end);
+		}
 	}
 
 	#[doc(hidden)]
@@ -226,6 +290,9 @@ impl<C: Container> Producer<C> {
 	/// frame at `end` is the eventual shape, once decoders are known to skip one.
 	pub fn discontinuity(&mut self) -> Result<(), C::Error> {
 		self.cut(None)?;
+		// Nothing is measured across the break: the frames still open on this side have no end, and
+		// the gap to the far side is not a frame duration.
+		self.estimator.discontinuity();
 		let mut group = match self.pending_sequence.take() {
 			Some(sequence) => self.inner.create_group(moq_net::group::Info { sequence })?,
 			None => self.inner.append_group()?,
@@ -335,6 +402,126 @@ mod tests {
 			keyframe,
 			duration: None,
 		}
+	}
+
+	fn sized_frame(timestamp_us: u64, keyframe: bool, bytes: usize) -> Frame {
+		Frame {
+			payload: Bytes::from(vec![0u8; bytes]),
+			..frame(timestamp_us, keyframe)
+		}
+	}
+
+	/// The catalog estimate falls out of the writes themselves: a publisher never records anything
+	/// by hand, it just hands `estimate()` to its rendition.
+	#[tokio::test]
+	async fn writes_measure_the_catalog_estimate() {
+		let track = track_producer("test", hang::container::track_info());
+		let mut producer = Producer::new(track, Container::Legacy);
+
+		// 25ms frames of 5 kB, a keyframe every 10, over more than the bitrate window.
+		for i in 0..80u64 {
+			producer.write(sized_frame(i * 25_000, i % 10 == 0, 5_000)).unwrap();
+		}
+		producer.finish().unwrap();
+
+		let estimate = producer.estimate();
+		assert_eq!(estimate.jitter, Some(std::time::Duration::from_millis(25)));
+		assert_eq!(estimate.bitrate, Some(1_600_000));
+	}
+
+	/// One group per frame (how the importer facade drives audio) closes each group with an
+	/// unbounded `cut`, which leaves the measurement open for the next frame's timestamp to close.
+	/// Dropping it there instead would leave an audio track's bitrate permanently undetectable.
+	#[tokio::test]
+	async fn per_frame_groups_still_measure_bitrate() {
+		let track = track_producer("test", hang::container::track_info());
+		let mut producer = Producer::new(track, Container::Legacy);
+
+		// 40ms packets of 5 kB: 1 Mbps.
+		for i in 0..40u64 {
+			let keyframe = producer.needs_keyframe();
+			producer.write(sized_frame(i * 40_000, keyframe, 5_000)).unwrap();
+			producer.cut(None).unwrap();
+		}
+
+		assert_eq!(producer.estimate().bitrate, Some(1_000_000));
+	}
+
+	/// A break in the timeline is not a frame duration, so the estimate never spans one. Without the
+	/// reset a paused publisher would advertise the whole gap as the buffer a player must hold.
+	#[tokio::test]
+	async fn discontinuity_is_not_measured_across() {
+		let track = track_producer("test", hang::container::track_info());
+		let mut producer = Producer::new(track, Container::Legacy);
+
+		producer.write(sized_frame(0, true, 5_000)).unwrap();
+		producer.discontinuity().unwrap();
+		// Resumed 40 minutes later, on a re-anchored clock.
+		producer.write(sized_frame(2_405_070_000, true, 5_000)).unwrap();
+		producer.finish().unwrap();
+
+		assert_eq!(producer.estimate().jitter, None);
+		assert_eq!(producer.estimate().bitrate, None);
+	}
+
+	/// Write-only container that rejects the frame at a given timestamp, standing in for one the
+	/// container can't encode (over the group size limit, a timestamp that won't convert).
+	#[derive(Clone)]
+	struct RejectAt(u64);
+
+	impl super::Container for RejectAt {
+		type Error = crate::Error;
+
+		fn write(&self, _group: &mut moq_net::group::Producer, frames: &[Frame]) -> Result<(), Self::Error> {
+			match frames.iter().any(|f| f.timestamp.as_micros() == self.0 as u128) {
+				true => Err(moq_net::Error::FrameTooLarge.into()),
+				false => Ok(()),
+			}
+		}
+
+		fn poll_read(
+			&self,
+			_group: &mut moq_net::group::Consumer,
+			_waiter: &kio::Waiter,
+		) -> std::task::Poll<Result<Option<Vec<Frame>>, Self::Error>> {
+			unreachable!("RejectAt is write-only")
+		}
+	}
+
+	/// A rejected frame leaves the producer usable, so the caller can carry on. Its bytes never
+	/// reached the wire, and the estimate's maximum never falls, so counting them would pin an
+	/// inflated bitrate on the catalog permanently.
+	#[tokio::test]
+	async fn a_rejected_frame_is_not_measured() {
+		let track = track_producer("test", hang::container::track_info());
+		let mut producer = Producer::new(track, RejectAt(40_000));
+
+		// 40ms frames of 5 kB (1 Mbps), except one 500 kB frame the container turns away.
+		for i in 0..40u64 {
+			let bytes = if i == 1 { 500_000 } else { 5_000 };
+			let result = producer.write(sized_frame(i * 40_000, true, bytes));
+			assert_eq!(result.is_err(), i == 1, "only the rejected frame fails");
+		}
+
+		assert_eq!(producer.estimate().bitrate, Some(1_000_000));
+	}
+
+	/// Reorder delay is the one input the writes can't reveal, since frames carry no decode time.
+	#[tokio::test]
+	async fn reorder_raises_the_measured_jitter() {
+		let track = track_producer("test", hang::container::track_info());
+		let mut producer = Producer::new(track, Container::Legacy);
+
+		producer.write(frame(0, true)).unwrap();
+		producer.write(frame(16_000, false)).unwrap();
+		assert_eq!(producer.estimate().jitter, Some(std::time::Duration::from_millis(16)));
+
+		producer.reorder(Timestamp::from_micros(48_000).unwrap());
+		assert_eq!(
+			producer.estimate().jitter,
+			Some(std::time::Duration::from_millis(48)),
+			"a B-frame stream needs the deeper decode buffer"
+		);
 	}
 
 	/// Drain all groups from a finished track, returning their frame counts.

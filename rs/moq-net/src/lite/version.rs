@@ -72,11 +72,53 @@ impl Version {
 		}
 	}
 
+	/// Whether the session supports the GOAWAY control stream (0x5) for graceful
+	/// shutdown and migration. Added in lite-04.
+	#[allow(clippy::match_like_matches_macro)]
+	pub fn has_goaway(self) -> bool {
+		// Match form so future versions default forward (CLAUDE.md convention).
+		match self {
+			Self::Lite01 | Self::Lite02 | Self::Lite03 => false,
+			_ => true,
+		}
+	}
+
 	/// Whether announcements carry implicit announce ids: each `active`
 	/// ANNOUNCE_BROADCAST assigns the next per-stream ordinal, and `ended`/`restart`
 	/// reference that id instead of repeating the path. Added in lite-06.
 	#[allow(clippy::match_like_matches_macro)]
 	pub fn has_announce_id(self) -> bool {
+		// Match form so future versions default forward (CLAUDE.md convention).
+		match self {
+			Self::Lite01 | Self::Lite02 | Self::Lite03 | Self::Lite04 | Self::Lite05 => false,
+			_ => true,
+		}
+	}
+
+	/// Whether ANNOUNCE_REQUEST carries the Exclude Hop field: the subscriber's own
+	/// origin id, which the publisher uses to skip announces whose hop chain already
+	/// passed through the subscriber. Present in lite-04 and lite-05 only.
+	///
+	/// The receiver's own reflected-announce check drops those announces anyway (and
+	/// catches loops of any length, not just the two-hop case), so lite-06 drops the
+	/// field and keeps the check. Lite-06 also declares the same identity session-wide
+	/// in the SETUP `Origin` parameter, which filters announcements and subscriptions
+	/// alike rather than one announce stream.
+	///
+	/// Unlike the gates above, this lists the versions that *have* the field: it was
+	/// removed rather than added, so future versions default to not carrying it.
+	pub fn has_exclude_hop(self) -> bool {
+		matches!(self, Self::Lite04 | Self::Lite05)
+	}
+
+	/// Whether SUBSCRIBE, SUBSCRIBE_UPDATE, FETCH, and GROUP carry frame indices
+	/// alongside their group sequences, so a subscription or fetch can start and end
+	/// partway through a group. Added in lite-06.
+	///
+	/// Older versions only address whole groups, so a route change has to wait for the
+	/// next group before it can resume.
+	#[allow(clippy::match_like_matches_macro)]
+	pub fn has_frame_bounds(self) -> bool {
 		// Match form so future versions default forward (CLAUDE.md convention).
 		match self {
 			Self::Lite01 | Self::Lite02 | Self::Lite03 | Self::Lite04 | Self::Lite05 => false,

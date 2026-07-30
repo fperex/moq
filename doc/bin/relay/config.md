@@ -24,6 +24,16 @@ key = "key.pem"
 
 ## Full Reference
 
+### Top-level keys {#drain-timeout}
+
+```toml
+# How long accepted sessions may keep running after a shutdown signal
+# (SIGINT/ctrl-c, or SIGTERM on unix). The first signal sends every session a
+# GOAWAY (telling clients to reconnect) and waits this long before force-closing
+# them; a second signal exits immediately. Default: "10s".
+drain_timeout = "10s"
+```
+
 ### \[log]
 
 Logging configuration.
@@ -183,6 +193,17 @@ Client settings used when connecting to other relays (clustering).
 [client]
 # Disable TLS verification (development only!)
 tls.disable_verify = true
+
+# What to do with the URI an upstream peer names in its GOAWAY:
+# "follow" (default), "same-host", or "ignore". A followed redirect is dialed
+# exactly as given, so it must carry its own credentials; scheme downgrades and
+# redirects toward loopback/private/IPC addresses are always refused.
+goaway.redirect = "follow"
+
+# How long the old upstream keeps serving after its replacement connects. This
+# is a cap: a shorter deadline on the received GOAWAY wins, since the peer
+# force-closes then anyway, but a longer one does not extend it. Default: "10s".
+goaway.handover = "10s"
 
 # Or provide trusted root certificates. By default these replace the system
 # roots, so the relay trusts only these CAs.
@@ -401,30 +422,36 @@ environment variable (`MOQ_STATS_ENABLED`, `MOQ_STATS_PREFIX`,
 
 Memory budget for cached groups. Old (non-latest) groups stay cached until their
 track's retention window expires, the `duration` ceiling is reached, or the pool
-runs out of room, whichever comes first; under memory pressure the
-least-recently-read groups are evicted first. The latest group of every track is
+runs out of room, whichever comes first. Under memory pressure each track evicts
+its own stalest groups as it writes, ordered by when each was last written or
+served from cache, and proportional to how much it writes, so usage converges on
+the budget without any global scan; groups that FETCH requests keep hitting are
+retained over ones nobody reads. The latest group of every track is
 always retained. With none of the knobs set the cache is unbounded and only each
 track's own window limits memory.
 
 ```toml
 [cache]
-# Maximum bytes of cached group payload. Accepts absolute sizes ("8GiB",
-# "512MB") or a percentage of memory ("75%", respecting the cgroup limit
-# inside containers). Unbounded when unset.
+# Target bytes of cached group payload, which usage converges toward as tracks
+# write (not a hard limit). Accepts absolute sizes ("8GiB", "512MB") or a percentage of
+# memory ("75%", respecting the cgroup limit inside containers). Unbounded
+# when unset.
 capacity = "8GiB"
 
 # Keep at least this much system memory available ("2GiB" or "10%"). Enables a
 # background governor that re-sizes the cache every few seconds: it grows into
-# idle memory and shrinks (evicting) when the rest of the system needs it, so
-# the cache is effectively the lowest-priority user of RAM. Combine with
-# `capacity` to also cap the absolute size.
+# idle memory and shrinks (evicting as tracks write) when the rest of the system
+# needs it, so the cache is effectively the lowest-priority user of RAM. Combine
+# with `capacity` to also bound the target from above.
 headroom = "2GiB"
 
-# Maximum age of a non-latest cached group ("30s", "500ms"). Caps each track's
-# own retention window: a publisher advertising a longer window is clamped down
-# to this, bounding how much history a track accumulates no matter what upstream
-# asks for. The latest group of every track is always retained, as it is the
-# live edge. Unbounded (each track keeps its own window) when unset.
+# Maximum time a non-latest cached group is retained since it was last written
+# or served from cache by a FETCH ("30s", "500ms"). Caps each track's own
+# retention window: a publisher advertising a longer window is clamped down to
+# this, bounding how much history a track accumulates no matter what upstream
+# asks for. A FETCH cache hit restarts the clock, so actively-read history
+# stays cached. The latest group of every track is always retained, as it is
+# the live edge. Unbounded (each track keeps its own window) when unset.
 duration = "30s"
 ```
 
@@ -434,12 +461,12 @@ available memory). `duration` is the age counterpart: it stops a long-running
 relay from accumulating hours of history per track when the byte budget alone
 leaves room for it.
 
-A track's expiry is evaluated as it writes its next group, so `duration` caps
-how much history an *active* publisher builds up rather than acting as a
-background reaper. A publisher that stops writing but stays connected keeps what
-it had cached until it resumes or the broadcast closes, and a publisher that
-disconnects has its groups released once the broadcast closes (see
-`cluster.linger`). Set `capacity` or `headroom` alongside it to bound those.
+All eviction happens as tracks write (there is no background reaper), so both
+`duration` and the byte budget cap how much history *active* publishers build
+up. A publisher that stops writing but stays connected keeps what it had cached
+until it resumes or the broadcast closes; under memory pressure the byte budget
+is repaid by the tracks that are still writing. A publisher that disconnects has
+its groups released once the broadcast closes (see `cluster.linger`).
 
 All three flags also accept CLI arguments (`--cache-capacity`,
 `--cache-headroom`, `--cache-duration`) and environment variables

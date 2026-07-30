@@ -1,7 +1,7 @@
 {
 	"name": "@moq/publish",
 	"type": "module",
-	"version": "0.4.0",
+	"version": "0.4.2",
 	"jsr": false,
 	"description": "Publish Media over QUIC broadcasts",
 	"license": "(MIT OR Apache-2.0)",
@@ -27,7 +27,8 @@
 	"dependencies": {
 		"@moq/hang": "workspace:^",
 		"@moq/net": "workspace:^",
-		"@moq/signals": "workspace:^"
+		"@moq/signals": "workspace:^",
+		"mediabunny": "^1.51.0"
 	},
 	"devDependencies": {
 		"@types/audioworklet": "^0.0.100",
