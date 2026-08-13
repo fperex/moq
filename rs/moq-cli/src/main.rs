@@ -1,14 +1,18 @@
 //! moq-cli: a media router that wires one endpoint onto a shared MoQ Origin.
 //!
-//! The binary is `moq`. See [`args`] for the `import`/`export` command grammar;
-//! this module orchestrates the shared Origin and spawns the MoQ side plus the
-//! selected endpoint.
+//! The binary is `moq`. See [`args`] for the `import`/`export`/`play` command
+//! grammar; this module orchestrates the shared Origin and spawns the MoQ side
+//! plus the selected endpoint.
 
 mod args;
+#[cfg(feature = "cluster-lan")]
+mod cluster;
 #[cfg(feature = "capture")]
 mod devices;
 mod hls;
 mod moq;
+#[cfg(feature = "play")]
+mod play;
 mod publish;
 mod rtc;
 mod rtmp;
@@ -35,13 +39,15 @@ static ALLOC: moq_native::jemalloc::tikv_jemallocator::Jemalloc = moq_native::je
 /// iroh endpoint so the rest of the code is feature-agnostic.
 #[derive(Clone)]
 struct Net {
+	/// The shared QUIC tuning, handed to whichever roles this process builds.
+	quic: moq_native::quic::Config,
 	#[cfg(feature = "iroh")]
 	iroh: Option<moq_native::iroh::Endpoint>,
 }
 
 impl Net {
-	fn client(&self, config: moq_native::ClientConfig) -> anyhow::Result<moq_native::Client> {
-		let client = config.init()?;
+	fn client(&self, config: moq_native::connect::Config) -> anyhow::Result<moq_native::Client> {
+		let client = config.init(self.quic.clone())?;
 		#[cfg(feature = "iroh")]
 		let client = match self.iroh.clone() {
 			Some(iroh) => client.with_iroh(iroh),
@@ -50,8 +56,8 @@ impl Net {
 		Ok(client)
 	}
 
-	fn server(&self, config: moq_native::ServerConfig) -> anyhow::Result<moq_native::Server> {
-		let server = config.init()?;
+	fn server(&self, config: moq_native::listen::Config) -> anyhow::Result<moq_native::Server> {
+		let server = config.init(self.quic.clone())?;
 		#[cfg(feature = "iroh")]
 		let server = match self.iroh.clone() {
 			Some(iroh) => server.with_iroh(iroh),
@@ -59,6 +65,81 @@ impl Net {
 		};
 		Ok(server)
 	}
+}
+
+/// Which way media flows, which is what an inbound session is offered.
+#[derive(Clone, Copy)]
+pub enum Direction {
+	/// `import`: clients subscribe to what this process publishes.
+	Import,
+	/// `export`: clients publish into this process's origin.
+	Export,
+}
+
+/// Bind the MoQ listener and spawn everything that serves on it: ordinary
+/// clients, the LAN mesh when `--cluster-lan` is on, and the certificate
+/// endpoint for an explicit `--listen`. A no-op with no listener configured.
+///
+async fn spawn_server(
+	tasks: &mut JoinSet<anyhow::Result<()>>,
+	moq: &MoqSide,
+	origin: &moq_net::origin::Producer,
+	net: &Net,
+	direction: Direction,
+) -> anyhow::Result<()> {
+	if !moq.serves() {
+		return Ok(());
+	}
+
+	let server = net.server(moq.server_config())?;
+	let certificates = server.certificates();
+
+	#[cfg(feature = "cluster-lan")]
+	let lan = match moq.lan() {
+		true => Some(cluster::Lan::start(&moq.cluster, origin.clone(), &server, moq.client.clone()).await?),
+		false => None,
+	};
+	#[cfg(feature = "cluster-lan")]
+	match lan {
+		Some((lan, discovery)) => {
+			tasks.spawn(cluster::serve(
+				server,
+				lan.clone(),
+				origin.clone(),
+				direction,
+				moq.server.bind.is_some(),
+			));
+			tasks.spawn(lan.run(discovery));
+		}
+		None => spawn_serve(tasks, server, origin, direction),
+	}
+	#[cfg(not(feature = "cluster-lan"))]
+	spawn_serve(tasks, server, origin, direction);
+
+	// The certificate endpoint is for clients dialing a URL, so it follows the
+	// explicit listener rather than the mesh's ephemeral one.
+	if let Some(web_bind) = moq.server.bind.clone() {
+		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
+	}
+
+	Ok(())
+}
+
+/// Serve ordinary clients with moq-native's own accept loop.
+fn spawn_serve(
+	tasks: &mut JoinSet<anyhow::Result<()>>,
+	server: moq_native::Server,
+	origin: &moq_net::origin::Producer,
+	direction: Direction,
+) {
+	let origin = origin.clone();
+	tasks.spawn(async move {
+		match direction {
+			Direction::Import => server.serve_publish(origin.consume()).await?,
+			Direction::Export => server.serve_consume(origin).await?,
+		}
+		Ok(())
+	});
 }
 
 #[tokio::main]
@@ -91,8 +172,9 @@ async fn main() -> anyhow::Result<()> {
 	cli.moq.validate()?;
 
 	let net = Net {
+		quic: cli.moq.quic.clone(),
 		#[cfg(feature = "iroh")]
-		iroh: cli.moq.iroh.clone().bind(&cli.moq.client.quic).await?,
+		iroh: cli.moq.iroh.clone().bind(&cli.moq.quic).await?,
 	};
 
 	#[cfg(feature = "jemalloc")]
@@ -104,6 +186,8 @@ async fn main() -> anyhow::Result<()> {
 		match cli.command {
 			Command::Import(import) => run_import(cli.moq, import, net).await,
 			Command::Export(export) => run_export(cli.moq, export, net).await,
+			#[cfg(feature = "play")]
+			Command::Play(args) => run_play(cli.moq, args, net).await,
 			#[cfg(feature = "transcode")]
 			Command::Transcode(args) => transcode::run(cli.moq, args, net).await,
 			Command::Token(_) => unreachable!("handled above, before the transport is bound"),
@@ -116,6 +200,46 @@ async fn main() -> anyhow::Result<()> {
 		result = run => result,
 		Err(err) = jemalloc => Err(err).context("jemalloc profiler failed"),
 	}
+}
+
+/// Attach the MoQ side so it fills the shared Origin: dial a relay, accept
+/// inbound sessions, or both. Shared by every verb that consumes.
+async fn spawn_moq_consume(
+	moq: &MoqSide,
+	net: &Net,
+	origin: &moq_net::origin::Producer,
+	tasks: &mut JoinSet<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+	if moq.client.url.is_some()
+		&& let Some(reconnect) = net.client(moq.client.clone())?.consume(origin.clone())
+	{
+		tasks.spawn(async move { Ok(reconnect.closed().await?) });
+	}
+	spawn_server(tasks, moq, origin, net, Direction::Export).await?;
+	// Every configured MoQ attachment is now initialized. In particular, a
+	// combined client + LAN process must not report ready before the listener and
+	// mDNS announcement have succeeded.
+	moq::notify_ready();
+	Ok(())
+}
+
+/// Fill the shared Origin from MoQ, then play one broadcast locally.
+///
+/// The playback event loop runs on this task's thread rather than a spawned one:
+/// winit can only build an event loop on the process main thread, which is where
+/// `#[tokio::main]` polls this future.
+#[cfg(feature = "play")]
+async fn run_play(moq: MoqSide, args: play::Args, net: Net) -> anyhow::Result<()> {
+	// Before anything dials: a codec we can't decode is a blank window otherwise.
+	args.validate()?;
+
+	let origin = moq.origin()?;
+	let name = moq.broadcast.clone().unwrap_or_default();
+	let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
+
+	spawn_moq_consume(&moq, &net, &origin, &mut tasks).await?;
+
+	play::run(origin.consume(), name, args, tasks)
 }
 
 /// Route one source INTO the shared Origin, exposing it to the MoQ network.
@@ -136,7 +260,7 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 	}
 
 	// The uplink's bandwidth estimate, for sources that can encode to fit it. Only
-	// an outbound client has one: a `--server-bind` publisher's sessions are
+	// an outbound client has one: a `--listen` publisher's sessions are
 	// inbound and never surfaced here, so it stays `None` and those sources encode
 	// at their configured rate. Capture is the only such source today, so without
 	// that feature nothing reads this.
@@ -144,10 +268,9 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 	let mut send_bandwidth = None;
 
 	// MoQ side: publish the Origin outward.
-	if moq.client.connect.is_some()
+	if moq.client.url.is_some()
 		&& let Some(reconnect) = net.client(moq.client.clone())?.publish(origin.consume())
 	{
-		moq::notify_ready();
 		// Read before the handle moves into the task. This consumer is
 		// persistent: it survives reconnects, reading `None` while down, so it
 		// can be wired up before anything connects.
@@ -157,58 +280,66 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 		}
 		tasks.spawn(async move { Ok(reconnect.closed().await?) });
 	}
-	if let Some(web_bind) = moq.server.bind.clone() {
-		let server = net.server(moq.server.clone())?;
-		let certificates = server.certificates();
-		moq::notify_ready();
-		let origin = origin.consume();
-		tasks.spawn(async move { Ok(server.serve_publish(origin).await?) });
-		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
-	}
+	spawn_server(&mut tasks, &moq, &origin, &net, Direction::Import).await?;
+	// Every configured MoQ attachment is now initialized. In particular, a
+	// combined client + LAN process must not report ready before the listener and
+	// mDNS announcement have succeeded.
+	moq::notify_ready();
 
 	// Foreign side: the single source.
+	let latency_max = import.latency_max;
+	// The MoQ side every gateway publishes into, minted per source since each takes it
+	// by value onto its own task.
+	let target = |name: String| crate::moq::ImportTarget {
+		origin: origin.clone(),
+		name,
+		latency_max,
+	};
+
 	if let Some(format) = import.source.stdin_format() {
 		warn_if_missing_format(&name);
 		let broadcast = origin
 			.create_broadcast(&name, moq_net::broadcast::Route::new().with_announce(true))
 			.context("failed to create broadcast")?;
-		local = Some(Publish::new(broadcast, &format)?);
+		local = Some(Publish::new(broadcast, &format, import.latency_max)?);
 	} else {
 		match import.source {
 			ImportSource::Hls(hls) => {
 				warn_if_missing_format(&name);
 				let origin = origin.clone();
-				tasks.spawn(async move { hls::import(&origin, name, hls.playlist).await });
+				let latency_max = import.latency_max;
+				tasks.spawn(async move { hls::import(&origin, name, hls.playlist, latency_max).await });
 			}
 			ImportSource::Rtmp(rtmp) => {
 				if let Some(addr) = rtmp.listen {
 					let name = require_broadcast(name, "import rtmp --listen")?;
-					tasks.spawn(rtmp::listen_import(origin.clone(), addr, name));
+					tasks.spawn(rtmp::listen_import(target(name), addr));
 				} else if let Some(url) = rtmp.connect {
-					tasks.spawn(rtmp::connect_import(origin.clone(), url, name));
+					tasks.spawn(rtmp::connect_import(target(name), url));
 				}
 			}
 			ImportSource::Srt(srt) => {
 				if let Some(addr) = srt.listen {
 					let name = require_broadcast(name, "import srt --listen")?;
-					tasks.spawn(srt::listen_import(origin.clone(), addr, name, srt.latency));
+					tasks.spawn(srt::listen_import(target(name), addr, srt.latency));
 				} else if let Some(url) = srt.connect {
-					tasks.spawn(srt::connect_import(origin.clone(), url, name, srt.latency));
+					tasks.spawn(srt::connect_import(target(name), url, srt.latency));
 				}
 			}
 			ImportSource::Rtc(rtc) => {
 				if let Some(addr) = rtc.listen {
 					let name = require_broadcast(name, "import rtc --listen")?;
 					tasks.spawn(rtc::listen_import(
-						origin.clone(),
-						addr,
-						rtc.udp_bind,
-						rtc.public_addr,
-						rtc.cors,
-						name,
+						target(name),
+						rtc::Listen {
+							addr,
+							udp_bind: rtc.udp_bind,
+							public_addr: rtc.public_addr,
+							cors: rtc.cors,
+						},
 					));
 				} else if let Some(url) = rtc.connect {
-					tasks.spawn(rtc::connect_import(origin.clone(), url, name));
+					tasks.spawn(rtc::connect_import(target(name), url));
 				}
 			}
 			#[cfg(feature = "capture")]
@@ -217,7 +348,12 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 				let broadcast = origin
 					.create_broadcast(&name, moq_net::broadcast::Route::new().with_announce(true))
 					.context("failed to create broadcast")?;
-				local = Some(Publish::capture(broadcast, &capture, send_bandwidth)?);
+				local = Some(Publish::capture(
+					broadcast,
+					&capture,
+					send_bandwidth,
+					import.latency_max,
+				)?);
 			}
 			_ => unreachable!("container formats are handled by stdin_format above"),
 		}
@@ -247,26 +383,13 @@ async fn run_export(moq: MoqSide, export: Export, net: Net) -> anyhow::Result<()
 	}
 
 	// MoQ side: fill the Origin.
-	if moq.client.connect.is_some()
-		&& let Some(reconnect) = net.client(moq.client.clone())?.consume(origin.clone())
-	{
-		moq::notify_ready();
-		tasks.spawn(async move { Ok(reconnect.closed().await?) });
-	}
-	if let Some(web_bind) = moq.server.bind.clone() {
-		let server = net.server(moq.server.clone())?;
-		let certificates = server.certificates();
-		moq::notify_ready();
-		let origin = origin.clone();
-		tasks.spawn(async move { Ok(server.serve_consume(origin).await?) });
-		tasks.spawn(async move { web::run_web(&web_bind, certificates).await });
-	}
+	spawn_moq_consume(&moq, &net, &origin, &mut tasks).await?;
 
 	// Foreign side: the single sink.
-	if let Some((format, max_latency, fragment_duration)) = export.sink.stdout() {
+	if let Some((format, latency, fragment_duration)) = export.sink.stdout() {
 		let args = SubscribeArgs {
 			format,
-			max_latency,
+			latency,
 			fragment_duration,
 			catalog: export.catalog_format,
 			select: export.select,
@@ -280,11 +403,12 @@ async fn run_export(moq: MoqSide, export: Export, net: Net) -> anyhow::Result<()
 				tasks.spawn(hls::export(origin.consume(), args, name));
 			}
 			ExportSink::Rtmp(rtmp) => {
+				let latency = rtmp.latency();
 				if let Some(addr) = rtmp.endpoint.listen {
 					let name = require_broadcast(name, "export rtmp --listen")?;
-					tasks.spawn(rtmp::listen_export(origin.consume(), addr, name, rtmp.latency_max));
+					tasks.spawn(rtmp::listen_export(origin.consume(), addr, name, latency));
 				} else if let Some(url) = rtmp.endpoint.connect {
-					tasks.spawn(rtmp::connect_export(origin.consume(), url, name, rtmp.latency_max));
+					tasks.spawn(rtmp::connect_export(origin.consume(), url, name, latency));
 				}
 			}
 			ExportSink::Srt(srt) => {
@@ -300,11 +424,13 @@ async fn run_export(moq: MoqSide, export: Export, net: Net) -> anyhow::Result<()
 					let name = require_broadcast(name, "export rtc --listen")?;
 					tasks.spawn(rtc::listen_export(
 						origin.consume(),
-						addr,
-						rtc.udp_bind,
-						rtc.public_addr,
-						rtc.cors,
 						name,
+						rtc::Listen {
+							addr,
+							udp_bind: rtc.udp_bind,
+							public_addr: rtc.public_addr,
+							cors: rtc.cors,
+						},
 					));
 				} else if let Some(url) = rtc.connect {
 					tasks.spawn(rtc::connect_export(origin.consume(), url, name));

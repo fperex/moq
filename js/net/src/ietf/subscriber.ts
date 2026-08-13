@@ -11,6 +11,7 @@ import { withTimeout } from "../util/timeout.ts";
 import type { Session } from "./adapter.ts";
 import { TrackAliases } from "./aliases.ts";
 import { Frame, type Group as GroupMessage } from "./object.ts";
+import { toWire } from "./priority.ts";
 import { type Publish, PublishError } from "./publish.ts";
 import { type PublishNamespace, PublishNamespaceError, PublishNamespaceOk } from "./publish_namespace.ts";
 import { RequestError, RequestOk } from "./request.ts";
@@ -164,6 +165,7 @@ export class Subscriber {
 							console.debug(`announced: broadcast=${path} active=false`);
 
 							this.#announced.delete(path);
+							this.#consumes.evict(path);
 							for (const consumer of this.#announcedConsumers) {
 								const suffix = Path.stripPrefix(consumer.prefix, path);
 								if (suffix === null) continue;
@@ -202,6 +204,12 @@ export class Subscriber {
 		} catch (err: unknown) {
 			const e = error(err);
 			console.warn(`subscribe_namespace error: ${reason(e)}`);
+
+			// Abort the stream rather than letting the caller's `finally` close it cleanly.
+			// A rejected namespace subscription is a failure, and a consumer that can't tell
+			// it from "nothing is published under this prefix" waits forever on a broadcast
+			// that will never be announced. Matches the lite subscriber.
+			announced.close(e);
 		}
 	}
 
@@ -346,7 +354,7 @@ export class Subscriber {
 			requestId,
 			trackNamespace: broadcast,
 			trackName: request.name,
-			subscriberPriority: request.priority,
+			subscriberPriority: toWire(request.priority),
 		});
 		await msg.encode(state.stream.writer, version);
 		console.debug(`subscribe written: id=${requestId} broadcast=${broadcast} track=${request.name}`);
@@ -448,6 +456,9 @@ export class Subscriber {
 			console.debug(`runPublishNamespace: stream.reader.closed resolved for ${path}`);
 		} finally {
 			this.#announced.delete(path);
+			// The path is gone, so stop sharing its broadcast: a holder outliving the publisher
+			// would otherwise hand the dead generation to whoever consumes the path next.
+			this.#consumes.evict(path);
 			console.debug(`announced: broadcast=${path} active=false`);
 
 			for (const consumer of this.#announcedConsumers) {

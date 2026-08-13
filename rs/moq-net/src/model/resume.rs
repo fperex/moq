@@ -19,6 +19,7 @@
 //! stays open indefinitely (a JSON append log, a catalog with deltas) survive a route
 //! change at all.
 
+use std::collections::BTreeMap;
 use std::task::{Poll, ready};
 
 use crate::{Datagram, Error, Result, frame, group, track};
@@ -284,13 +285,15 @@ impl Producer {
 		if state.finished || state.abort.is_some() {
 			return Err(Error::Closed);
 		}
-		let start = if state.segments.is_empty() {
-			None
-		} else {
-			// Segments exist but never produced anything: replace them, which the very
-			// first position does.
-			Some(state.resume_position().unwrap_or_default())
-		};
+		// One past the newest delivered position. With nothing delivered (or no
+		// segments at all) the replacement outright replaces them and starts
+		// unbounded, exactly like a first splice: a `Position::default()` boundary
+		// here would turn the subscriber's live-edge demand into a full backfill
+		// from group 0.
+		let start = state.resume_position();
+		if start.is_none() {
+			state.segments.clear();
+		}
 		state.switch(track, start)
 	}
 
@@ -327,6 +330,12 @@ impl Producer {
 	/// the condition for arming an idle release.
 	pub(crate) fn is_spliced(&self) -> bool {
 		!self.state.read().segments.is_empty()
+	}
+
+	/// One past the newest delivered position across the segments. The origin's
+	/// serve task reads this as its delivered-progress signal.
+	pub(crate) fn resume_position(&self) -> Option<Position> {
+		self.state.read().resume_position()
 	}
 
 	/// Mark the logical track as complete: no further switches. Subscribers see a
@@ -498,15 +507,21 @@ impl Consumer {
 /// [`kio::Pending`] wrapper.
 ///
 /// Waits for a segment to exist (no route may have served the track yet), then
-/// issues the fetch against the newest segment's track and resolves with it.
+/// issues the fetch against the newest segment's track and resolves with it. A
+/// fetch whose copy dies fails over: it re-latches onto a newer segment if one
+/// already spliced in, or parks for the next takeover like a live subscription
+/// (the front aborting the track ends the wait). An error from a copy that is
+/// still live (e.g. the group is gone upstream) is authoritative and surfaces.
 pub struct Fetching {
 	state: kio::Consumer<ResumeState>,
 	sequence: u64,
 	options: group::Fetch,
-	// The underlying fetch, latched once a segment exists. Behind a shared lock
-	// both to allow `&self` polling and to break the type recursion with
-	// `track::Fetching` (which can wrap a resume [`Fetching`]).
-	inner: web_async::Lock<Option<kio::Pending<track::Fetching>>>,
+	// The latched segment (id, its track, the in-flight fetch), set once a
+	// segment exists. Behind a shared lock both to allow `&self` polling and to
+	// break the type recursion with `track::Fetching` (which can wrap a resume
+	// [`Fetching`]).
+	#[allow(clippy::type_complexity)]
+	inner: web_async::Lock<Option<(u64, track::Consumer, kio::Pending<track::Fetching>)>>,
 }
 
 impl kio::Pollable for Fetching {
@@ -515,31 +530,88 @@ impl kio::Pollable for Fetching {
 	fn poll(&self, waiter: &kio::Waiter) -> Poll<Self::Output> {
 		let mut inner = self.inner.lock();
 
-		if inner.is_none() {
-			// Wait for the first segment; the newest wins if several arrived.
-			let track = match self.state.poll(waiter, |s| {
-				if s.abort.is_some() || !s.segments.is_empty() {
+		loop {
+			if inner.is_none() {
+				// Wait for the first segment; the newest wins if several arrived.
+				let (id, track) = match self.state.poll(waiter, |s| {
+					if s.abort.is_some() || !s.segments.is_empty() {
+						Poll::Ready(match &s.abort {
+							Some(err) => Err(err.clone()),
+							None => {
+								let segment = s.segments.last().expect("nonempty");
+								Ok((segment.id, segment.track.clone()))
+							}
+						})
+					} else {
+						Poll::Pending
+					}
+				}) {
+					Poll::Ready(Ok(res)) => res?,
+					// The producer is gone; use whatever segment it froze with.
+					Poll::Ready(Err(state)) => match (&state.abort, state.segments.last()) {
+						(Some(err), _) => return Poll::Ready(Err(err.clone())),
+						(None, Some(segment)) => (segment.id, segment.track.clone()),
+						(None, None) => return Poll::Ready(Err(Error::NotFound)),
+					},
+					Poll::Pending => return Poll::Pending,
+				};
+				let fetch = track.fetch_group(self.sequence, self.options.clone());
+				*inner = Some((id, track, fetch));
+			}
+
+			let (latched, track, fetch) = inner.as_ref().expect("latched above");
+			let err = match kio::Pollable::poll(&**fetch, waiter) {
+				Poll::Ready(Err(err)) => err,
+				Poll::Ready(Ok(group)) => return Poll::Ready(Ok(group)),
+				// Park on the resume state too: the front aborting must end an
+				// in-flight fetch even when the latched copy never answers it.
+				Poll::Pending => {
+					return match self.state.poll(waiter, |s| match &s.abort {
+						Some(err) => Poll::Ready(err.clone()),
+						None => Poll::Pending,
+					}) {
+						Poll::Ready(Ok(err)) => Poll::Ready(Err(err)),
+						// The producer froze without aborting; only the copy can
+						// answer now.
+						_ => Poll::Pending,
+					};
+				}
+			};
+
+			// The latched copy failed the fetch. Fail over to a segment spliced in
+			// above it, if any; ids are monotonic, so "newer" is a plain compare.
+			let latched = *latched;
+			let next = match self.state.poll(waiter, |s| {
+				if s.abort.is_some() || s.segments.last().is_some_and(|segment| segment.id > latched) {
 					Poll::Ready(match &s.abort {
 						Some(err) => Err(err.clone()),
-						None => Ok(s.segments.last().expect("nonempty").track.clone()),
+						None => {
+							let segment = s.segments.last().expect("checked newer");
+							Ok((segment.id, segment.track.clone()))
+						}
 					})
 				} else {
 					Poll::Pending
 				}
 			}) {
 				Poll::Ready(Ok(res)) => res?,
-				// The producer is gone; use whatever segment it froze with.
-				Poll::Ready(Err(state)) => match (&state.abort, state.segments.last()) {
-					(Some(err), _) => return Poll::Ready(Err(err.clone())),
-					(None, Some(segment)) => segment.track.clone(),
-					(None, None) => return Poll::Ready(Err(Error::NotFound)),
+				// The producer froze; no replacement can arrive.
+				Poll::Ready(Err(_)) => return Poll::Ready(Err(err)),
+				// No replacement yet, and the waiter is registered for the next
+				// switch. A dead copy's failure is the route's, not the group's:
+				// park for the takeover, exactly like a live subscription stalls.
+				// A live copy's answer stands.
+				Poll::Pending => match track.poll_complete(&kio::Waiter::noop()) {
+					Poll::Ready(Err(_)) => return Poll::Pending,
+					_ => return Poll::Ready(Err(err)),
 				},
-				Poll::Pending => return Poll::Pending,
 			};
-			*inner = Some(track.fetch_group(self.sequence, self.options.clone()));
-		}
 
-		kio::Pollable::poll(&**inner.as_ref().expect("latched above"), waiter)
+			let (id, track) = next;
+			let fetch = track.fetch_group(self.sequence, self.options.clone());
+			*inner = Some((id, track, fetch));
+			// Loop: poll the replacement fetch in this same pass.
+		}
 	}
 }
 
@@ -947,10 +1019,12 @@ struct SegmentSub {
 	/// The cursor drains what it already holds, then retires; see
 	/// [`Self::retired`].
 	pruned: bool,
-	/// A received group held back by the subscriber's [`Subscriber::end_at`] cap,
+	/// Received groups held back by the subscriber's [`Subscriber::end_at`] cap,
 	/// re-offered once the cap rises (arrival-order reads consume the underlying
-	/// cursor, so the group is parked here instead of dropped).
-	parked: Option<group::Consumer>,
+	/// cursor, so they are parked here instead of dropped). Keyed by sequence so
+	/// the lowest is re-offered first; holding them here (rather than blocking on
+	/// the first) keeps in-range groups that arrive behind a capped one flowing.
+	parked: BTreeMap<u64, group::Consumer>,
 }
 
 impl SegmentSub {
@@ -982,7 +1056,7 @@ impl SegmentSub {
 	/// replaced before producing, so it holds nothing. The straggler bound in
 	/// `reap` cuts what lingers too long, parked group and all.
 	fn retired(&self) -> bool {
-		self.pruned && (self.end.is_none() || (matches!(self.sub, SubState::Done(_)) && self.parked.is_none()))
+		self.pruned && (self.end.is_none() || (matches!(self.sub, SubState::Done(_)) && self.parked.is_empty()))
 	}
 }
 
@@ -1063,7 +1137,7 @@ impl Subscriber {
 				}
 				if seg.pruned {
 					seg.sub = SubState::Done(None);
-					seg.parked = None;
+					seg.parked.clear();
 					cut -= 1;
 				}
 			}
@@ -1153,10 +1227,11 @@ impl Subscriber {
 				Some(existing) => {
 					if existing.end != segment.end {
 						existing.end = segment.end;
-						let cap = min_some(existing.last_group(), self.end_sequence);
 						if let SubState::Active(sub) = &mut existing.sub {
-							sub.end_at(cap);
-							// Also shrink the demand so the session can cap upstream.
+							// Shrink the demand so the session can cap upstream. The
+							// read bounds stay on this subscriber (see `poll_recv_group`):
+							// an inner `end_at` would park boundary-crossing groups in the
+							// inner cursor, hiding the segment's completion.
 							let _ = sub.update(slice(&self.last_prefs, segment.start, segment.end));
 						}
 						// A still-pending subscription picks the moved boundary up
@@ -1175,7 +1250,7 @@ impl Subscriber {
 						end: segment.end,
 						sub: SubState::Pending(sub),
 						pruned: false,
-						parked: None,
+						parked: BTreeMap::new(),
 					});
 				}
 			}
@@ -1207,20 +1282,16 @@ impl Subscriber {
 	/// Resolve a segment's pending subscription, if any. Ready once the segment is
 	/// `Active` or `Done`; a rejected or closed track becomes `Done` (stall, not
 	/// error). Never consumes groups, so terminal-state pollers can share it.
-	fn poll_activate(
-		seg: &mut SegmentSub,
-		prefs: &Subscription,
-		min_sequence: u64,
-		end_sequence: Option<u64>,
-		waiter: &kio::Waiter,
-	) -> Poll<()> {
+	fn poll_activate(seg: &mut SegmentSub, prefs: &Subscription, min_sequence: u64, waiter: &kio::Waiter) -> Poll<()> {
 		if let SubState::Pending(pending) = &mut seg.sub {
 			match pending.poll_ok(waiter) {
 				Poll::Ready(Ok(mut sub)) => {
-					// Enforce the bounds on the read cursor, and re-slice demand in
-					// case a boundary moved while the subscription was pending.
+					// Enforce the floor on the read cursor, and re-slice demand in
+					// case a boundary moved while the subscription was pending. The
+					// upper bounds (segment boundary and `end_at` cap) are enforced by
+					// this subscriber, never on the inner cursor: an inner cap would
+					// park groups there and hide the segment's completion.
 					sub.start_at(seg.first_group().max(min_sequence));
-					sub.end_at(min_some(seg.last_group(), end_sequence));
 					let _ = sub.update(slice(prefs, seg.start, seg.end));
 					seg.sub = SubState::Active(sub);
 				}
@@ -1238,13 +1309,12 @@ impl Subscriber {
 		seg: &mut SegmentSub,
 		prefs: &Subscription,
 		min_sequence: u64,
-		end_sequence: Option<u64>,
 		waiter: &kio::Waiter,
 	) -> Poll<Option<group::Consumer>> {
 		loop {
 			match &mut seg.sub {
 				SubState::Pending(_) => {
-					ready!(Self::poll_activate(seg, prefs, min_sequence, end_sequence, waiter));
+					ready!(Self::poll_activate(seg, prefs, min_sequence, waiter));
 				}
 				SubState::Active(sub) => match sub.poll_recv_group(waiter) {
 					Poll::Ready(Ok(Some(group))) => {
@@ -1296,46 +1366,47 @@ impl Subscriber {
 		self.poll_sync(waiter);
 
 		let end_sequence = self.end_sequence;
+		let min_sequence = self.min_sequence;
 		let beyond_cap = |sequence: u64| end_sequence.is_some_and(|end| sequence > end);
 
 		let mut all_done = true;
 		for index in 0..self.segments.len() {
-			// Re-offer a group parked at the cap once the cap rises.
-			let parked = self.segments[index].parked.take_if(|group| !beyond_cap(group.sequence));
-			if let Some(group) = parked
-				&& group.sequence >= self.min_sequence
-			{
-				let sequence = group.sequence;
+			// A `start_at` overtook these parked groups; drop them and read on.
+			// Eviction/expiry (which aborts a cached group) drops its entry too,
+			// bounding parking by the track's cache policy rather than retaining
+			// every group a long-capped subscription ever observed.
+			self.segments[index]
+				.parked
+				.retain(|sequence, group| *sequence >= min_sequence && !group.is_aborted());
+
+			// Re-offer the lowest parked group back inside the cap once it rises.
+			while let Some(&sequence) = self.segments[index].parked.keys().next() {
+				if beyond_cap(sequence) {
+					break;
+				}
+				let group = self.segments[index]
+					.parked
+					.remove(&sequence)
+					.expect("parked key just observed");
+				// Folded into a group already handed out: try the next parked one.
 				if let Some(group) = self.hand_out(index, group) {
 					self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
 					return Poll::Ready(Ok(Some(group)));
 				}
 			}
-			// A `start_at` overtook the parked group; drop it and read on.
-			if self.segments[index].parked.is_some() {
-				// Still capped: the segment isn't done, it's parked.
-				all_done = false;
-				continue;
-			}
 
 			loop {
-				let polled = Self::poll_segment(
-					&mut self.segments[index],
-					&self.last_prefs,
-					self.min_sequence,
-					end_sequence,
-					waiter,
-				);
+				let polled = Self::poll_segment(&mut self.segments[index], &self.last_prefs, min_sequence, waiter);
 				match polled {
 					Poll::Ready(Some(group)) => {
 						if beyond_cap(group.sequence) {
-							// `end_at` parks the subscriber; hold the group until
-							// the cap rises rather than dropping it.
-							self.segments[index].parked = Some(group);
-							all_done = false;
-							break;
+							// `end_at` holds the group until the cap rises rather than
+							// dropping it; keep draining so an in-range group that
+							// arrived behind it still flows.
+							self.segments[index].parked.insert(group.sequence, group);
+							continue;
 						}
-						if group.sequence < self.min_sequence {
+						if group.sequence < min_sequence {
 							// A `start_at` raced an already-delivered group; skip it
 							// and re-poll the same segment for what's behind it.
 							continue;
@@ -1350,11 +1421,15 @@ impl Subscriber {
 						return Poll::Ready(Ok(Some(group)));
 					}
 					Poll::Ready(None) => break,
-					Poll::Pending => {
-						all_done = false;
-						break;
-					}
+					Poll::Pending => break,
 				}
+			}
+
+			// Parked groups become deliverable if the cap rises, and a segment that
+			// hasn't completed can still produce; either way the track isn't over.
+			let seg = &self.segments[index];
+			if !seg.parked.is_empty() || !matches!(seg.sub, SubState::Done(_)) {
+				all_done = false;
 			}
 		}
 
@@ -1432,7 +1507,7 @@ impl Subscriber {
 		// datagrams must still resolve the subscription (registering demand) and
 		// be woken when it activates.
 		if let Some(seg) = self.segments.last_mut()
-			&& Self::poll_activate(seg, &self.last_prefs, self.min_sequence, self.end_sequence, waiter).is_ready()
+			&& Self::poll_activate(seg, &self.last_prefs, self.min_sequence, waiter).is_ready()
 			&& let SubState::Active(sub) = &mut seg.sub
 		{
 			match sub.poll_recv_datagram(waiter) {
@@ -1477,13 +1552,7 @@ impl Subscriber {
 		let Some(seg) = self.segments.last_mut() else {
 			return Poll::Ready(Ok(0));
 		};
-		ready!(Self::poll_activate(
-			seg,
-			&self.last_prefs,
-			self.min_sequence,
-			self.end_sequence,
-			waiter
-		));
+		ready!(Self::poll_activate(seg, &self.last_prefs, self.min_sequence, waiter));
 		match &mut seg.sub {
 			SubState::Done(count) => Poll::Ready(Ok(count.unwrap_or(0))),
 			SubState::Active(sub) => match ready!(sub.poll_finished(waiter)) {
@@ -1518,14 +1587,12 @@ impl Subscriber {
 	}
 
 	/// Cap the subscriber at the specified sequence (inclusive), or remove the cap.
+	///
+	/// Enforced on this subscriber's reads (see [`Self::poll_recv_group`]), never
+	/// on the inner segment cursors, so a capped group parks here and a rising cap
+	/// re-offers it.
 	pub fn end_at(&mut self, sequence: impl Into<Option<u64>>) {
 		self.end_sequence = sequence.into();
-		for seg in &mut self.segments {
-			let cap = min_some(seg.last_group(), self.end_sequence);
-			if let SubState::Active(sub) = &mut seg.sub {
-				sub.end_at(cap);
-			}
-		}
 	}
 
 	/// The shared preferences channel, so `track::SubscriberControl` can wrap it.
@@ -1918,6 +1985,56 @@ mod test {
 		assert_eq!(recv(&mut sub), 1);
 	}
 
+	/// A parked beyond-cap group must not block in-range groups that arrive
+	/// behind it: a relay can ingest a burst micro-reordered (newest first).
+	#[tokio::test]
+	async fn end_at_reoffers_reordered_arrivals() {
+		let (mut track_a, consumer_a) = track_pair("a");
+
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		sub.end_at(1);
+
+		// Reordered burst: the beyond-cap group arrives first.
+		write_group(&mut track_a, 2, "a2");
+		write_group(&mut track_a, 0, "a0");
+		write_group(&mut track_a, 1, "a1");
+
+		// The capped group parks without blocking the in-range late arrivals.
+		assert_eq!(recv(&mut sub), 0);
+		assert_eq!(recv(&mut sub), 1);
+		recv_pending(&mut sub);
+
+		// Raising the cap re-offers the parked group.
+		sub.end_at(2);
+		assert_eq!(recv(&mut sub), 2);
+	}
+
+	/// A parked group the producer aborts (eviction/expiry) is dropped rather
+	/// than re-offered when the cap rises.
+	#[tokio::test]
+	async fn evicted_parked_groups_are_dropped() {
+		let (mut track_a, consumer_a) = track_pair("a");
+
+		let mut producer = Producer::new();
+		producer.switch(&consumer_a, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+
+		sub.end_at(0);
+		write_group(&mut track_a, 0, "a0");
+		assert_eq!(recv(&mut sub), 0);
+
+		let straggler = track_a.create_group(group::Info { sequence: 1 }).unwrap();
+		recv_pending(&mut sub);
+		straggler.abort(Error::Old).unwrap();
+
+		sub.end_at(None);
+		write_group(&mut track_a, 2, "a2");
+		assert_eq!(recv(&mut sub), 2, "the evicted parked group is dropped, not re-offered");
+	}
+
 	#[tokio::test]
 	async fn next_group_skips_boundary_duplicate() {
 		let (mut track_a, consumer_a) = track_pair("a");
@@ -2308,6 +2425,108 @@ mod test {
 		group.start_at(2).unwrap();
 		group.write_frame(Timestamp::ZERO, b"b2".to_vec()).unwrap();
 		assert_eq!(read(&mut reading), b"b2");
+	}
+
+	#[tokio::test]
+	async fn takeover_after_empty_segment_keeps_live_edge() {
+		let (track_a, consumer_a) = track_pair("a");
+		let (track_b, consumer_b) = track_pair("b");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+		recv_pending(&mut sub);
+		assert_eq!(track_a.subscription().unwrap().start, None);
+
+		// A dies before producing anything; B takes over.
+		drop(track_a);
+		producer.takeover(&consumer_b).unwrap();
+		recv_pending(&mut sub);
+
+		// The replacement must inherit live-edge demand, not a full backfill.
+		assert_eq!(track_b.subscription().unwrap().start, None);
+	}
+
+	#[tokio::test]
+	async fn fetch_fails_over_to_a_newer_segment() {
+		let (track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let consumer = producer.consume();
+
+		// The latched copy is dead: the fetch parks for a takeover instead of
+		// surfacing the route's failure as the group's.
+		track_a.abort(Error::Dropped).unwrap();
+		let fetch = consumer.fetch_group(0, None);
+		let mut fetch = std::pin::pin!(fetch);
+		assert!(futures::poll!(fetch.as_mut()).is_pending(), "a dead copy should park");
+
+		// The replacement has the group cached; the fetch fails over to it.
+		write_group(&mut track_b, 0, "b0");
+		producer.takeover(&consumer_b).unwrap();
+		let group = fetch.await.expect("fetch should fail over");
+		assert_eq!(group.sequence, 0);
+	}
+
+	#[tokio::test]
+	async fn fetch_aborts_with_the_track() {
+		let (track_a, consumer_a) = track_pair("a");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let consumer = producer.consume();
+
+		track_a.abort(Error::Dropped).unwrap();
+		let fetch = consumer.fetch_group(0, None);
+		let mut fetch = std::pin::pin!(fetch);
+		assert!(futures::poll!(fetch.as_mut()).is_pending(), "a dead copy should park");
+
+		// The logical track aborting ends the wait with its error.
+		producer.abort(Error::Cancel).unwrap();
+		assert!(matches!(fetch.await, Err(Error::Cancel)));
+	}
+
+	#[tokio::test]
+	async fn fetch_pending_ends_when_the_track_aborts() {
+		let (track_a, consumer_a) = track_pair("a");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let consumer = producer.consume();
+
+		// A fetch handler exists but never answers: the latched fetch parks.
+		let handler = track_a.dynamic();
+		let fetch = consumer.fetch_group(0, None);
+		let mut fetch = std::pin::pin!(fetch);
+		assert!(
+			futures::poll!(fetch.as_mut()).is_pending(),
+			"unanswered fetch should park"
+		);
+
+		// The front aborting must end the in-flight fetch, not strand it on the
+		// copy that will never answer.
+		producer.abort(Error::Cancel).unwrap();
+		assert!(matches!(fetch.await, Err(Error::Cancel)));
+		drop(handler);
+	}
+
+	#[tokio::test]
+	async fn fetch_error_from_a_live_copy_is_authoritative() {
+		let (_track_a, consumer_a) = track_pair("a");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let consumer = producer.consume();
+
+		// The copy is alive and will never carry group 0 (no fetch handler):
+		// its answer surfaces instead of parking for a takeover.
+		let result = consumer
+			.fetch_group(0, None)
+			.now_or_never()
+			.expect("a live copy's answer must resolve immediately");
+		assert!(matches!(result, Err(Error::NotFound)));
 	}
 
 	#[tokio::test]

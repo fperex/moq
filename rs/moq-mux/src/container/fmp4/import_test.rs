@@ -75,6 +75,61 @@ fn test_bbb_catalog() {
 }
 
 #[test]
+fn aac_without_decoder_specific_info_is_rejected() {
+	let data = include_bytes!("test_data/bbb.mp4");
+	let (ftyp, mut moov) = decode_init(data);
+
+	let dec_config = moov
+		.trak
+		.iter_mut()
+		.find_map(|trak| match &mut trak.mdia.minf.stbl.stsd.codecs[0] {
+			mp4_atom::Codec::Mp4a(mp4a) => Some(&mut mp4a.esds.es_desc.dec_config),
+			_ => None,
+		})
+		.expect("bbb has an AAC track");
+	dec_config.dec_specific = None;
+
+	let mut init = Vec::new();
+	ftyp.encode(&mut init).unwrap();
+	moov.encode(&mut init).unwrap();
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
+	let err = fmp4.decode(&init).unwrap_err();
+
+	assert!(matches!(
+		err,
+		crate::Error::Cmaf(crate::container::fmp4::Error::MissingDecoderSpecific)
+	));
+}
+
+#[test]
+fn aac_decoder_specific_info_is_preserved() {
+	let data = include_bytes!("test_data/bbb.mp4");
+	let (ftyp, mut moov) = decode_init(data);
+	let expected = vec![0x12, 0x10, 0x56, 0xe5, 0x00];
+
+	let dec_specific = moov
+		.trak
+		.iter_mut()
+		.find_map(|trak| match &mut trak.mdia.minf.stbl.stsd.codecs[0] {
+			mp4_atom::Codec::Mp4a(mp4a) => mp4a.esds.es_desc.dec_config.dec_specific.as_mut(),
+			_ => None,
+		})
+		.expect("bbb has an AAC DecoderSpecificInfo");
+	dec_specific.raw = expected.clone();
+
+	let mut init = Vec::new();
+	ftyp.encode(&mut init).unwrap();
+	moov.encode(&mut init).unwrap();
+
+	let catalog = run_fmp4(&init);
+	let audio = catalog.audio.renditions.values().next().expect("AAC rendition");
+	assert_eq!(audio.description.as_deref(), Some(expected.as_slice()));
+}
+
+#[test]
 fn dropping_import_retires_catalog_renditions() {
 	let data = include_bytes!("test_data/bbb.mp4");
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
@@ -381,6 +436,14 @@ fn scale() -> moq_net::Timescale {
 	moq_net::Timescale::new(1_000_000).unwrap()
 }
 
+fn info(track_id: u32, timescale: moq_net::Timescale, sequence_number: u32) -> super::FragmentInfo {
+	super::FragmentInfo {
+		track_id,
+		timescale,
+		sequence_number,
+	}
+}
+
 fn sample(timestamp_us: u64, keyframe: bool, duration_us: Option<u64>) -> crate::container::Frame {
 	crate::container::Frame {
 		timestamp: moq_net::Timestamp::from_micros(timestamp_us).unwrap(),
@@ -395,7 +458,7 @@ fn sample(timestamp_us: u64, keyframe: bool, duration_us: Option<u64>) -> crate:
 #[test]
 fn decode_rejects_durationless_multisample() {
 	let frames = vec![sample(0, true, None), sample(33_000, false, None)];
-	let frag = super::encode_fragment(1, scale(), 0, &frames).unwrap();
+	let frag = super::encode_fragment(info(1, scale(), 0), &frames).unwrap();
 	let err = super::decode(frag, scale()).unwrap_err();
 	assert!(matches!(err, super::Error::MissingSampleDuration), "got {err:?}");
 }
@@ -403,7 +466,7 @@ fn decode_rejects_durationless_multisample() {
 /// A single-sample fragment needs no duration (nothing follows it), so it still decodes.
 #[test]
 fn decode_single_sample_no_duration_ok() {
-	let frag = super::encode_fragment(1, scale(), 0, &[sample(0, true, None)]).unwrap();
+	let frag = super::encode_fragment(info(1, scale(), 0), &[sample(0, true, None)]).unwrap();
 	let out = super::decode(frag, scale()).unwrap();
 	assert_eq!(out.len(), 1);
 	assert_eq!(out[0].timestamp.as_micros(), 0);
@@ -414,7 +477,7 @@ fn decode_single_sample_no_duration_ok() {
 #[test]
 fn decode_multisample_with_durations_roundtrips() {
 	let frames = vec![sample(0, true, Some(33_000)), sample(33_000, false, Some(33_000))];
-	let frag = super::encode_fragment(1, scale(), 0, &frames).unwrap();
+	let frag = super::encode_fragment(info(1, scale(), 0), &frames).unwrap();
 	let out = super::decode(frag, scale()).unwrap();
 	assert_eq!(out.len(), 2);
 	assert_eq!(out[0].timestamp.as_micros(), 0);
@@ -579,12 +642,12 @@ async fn segmented_source_groups_per_segment() {
 
 		for (i, offset) in [0u64, 500_000].into_iter().enumerate() {
 			let frames = [sample(base + offset, i == 0, Some(500_000))];
-			let frag = super::encode_fragment(video_id, video_scale, segment as u32, &frames).unwrap();
+			let frag = super::encode_fragment(info(video_id, video_scale, segment as u32), &frames).unwrap();
 			fmp4.decode(&frag).unwrap();
 		}
 		for offset in [0u64, 250_000, 500_000, 750_000] {
 			let frames = [sample(base + offset, true, Some(250_000))];
-			let frag = super::encode_fragment(audio_id, audio_scale, segment as u32, &frames).unwrap();
+			let frag = super::encode_fragment(info(audio_id, audio_scale, segment as u32), &frames).unwrap();
 			fmp4.decode(&frag).unwrap();
 		}
 	}
@@ -631,9 +694,7 @@ async fn segmented_source_indexes_one_group_range_per_track() {
 		fmp4.decode(&styp()).unwrap();
 		for (i, offset) in [0u64, 500_000].into_iter().enumerate() {
 			let frag = super::encode_fragment(
-				video_id,
-				video_scale,
-				segment as u32,
+				info(video_id, video_scale, segment as u32),
 				&[sample(base + offset, i == 0, Some(500_000))],
 			)
 			.unwrap();
@@ -641,9 +702,7 @@ async fn segmented_source_indexes_one_group_range_per_track() {
 		}
 		for offset in [0u64, 250_000, 500_000, 750_000] {
 			let frag = super::encode_fragment(
-				audio_id,
-				audio_scale,
-				segment as u32,
+				info(audio_id, audio_scale, segment as u32),
 				&[sample(base + offset, true, Some(250_000))],
 			)
 			.unwrap();
@@ -717,9 +776,7 @@ async fn segment_ranges_with_skew(
 		// IDR lands after it. Two fragments each keeps the ranges unambiguous.
 		for offset in [0u64, 500_000] {
 			let frag = super::encode_fragment(
-				audio_id,
-				audio_scale,
-				segment as u32,
+				info(audio_id, audio_scale, segment as u32),
 				&[sample(base + offset, true, Some(500_000))],
 			)
 			.unwrap();
@@ -727,9 +784,7 @@ async fn segment_ranges_with_skew(
 		}
 		for (i, offset) in [0u64, 500_000].into_iter().enumerate() {
 			let frag = super::encode_fragment(
-				video_id,
-				video_scale,
-				segment as u32,
+				info(video_id, video_scale, segment as u32),
 				&[sample(video_base + offset, i == 0, Some(500_000))],
 			)
 			.unwrap();
@@ -820,17 +875,13 @@ async fn a_single_leading_styp_still_segments_on_keyframes() {
 	for segment in 0..4u64 {
 		let base = segment * 1_000_000;
 		let frag = super::encode_fragment(
-			video_id,
-			video_scale,
-			segment as u32,
+			info(video_id, video_scale, segment as u32),
 			&[sample(base, true, Some(1_000_000))],
 		)
 		.unwrap();
 		fmp4.decode(&frag).unwrap();
 		let frag = super::encode_fragment(
-			audio_id,
-			audio_scale,
-			segment as u32,
+			info(audio_id, audio_scale, segment as u32),
 			&[sample(base, true, Some(1_000_000))],
 		)
 		.unwrap();

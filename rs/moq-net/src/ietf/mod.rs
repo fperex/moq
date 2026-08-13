@@ -7,6 +7,7 @@
 #[macro_use]
 mod parameters;
 mod adapter;
+pub mod cluster;
 mod control;
 mod fetch;
 mod goaway;
@@ -14,6 +15,7 @@ mod group;
 mod location;
 pub mod message;
 mod namespace;
+mod priority;
 mod properties;
 mod publish;
 mod publish_namespace;
@@ -33,6 +35,7 @@ pub use group::*;
 pub use location::*;
 pub use message::Message;
 pub use parameters::*;
+pub use properties::Properties;
 pub use publish::*;
 pub use publish_namespace::*;
 use publisher::*;

@@ -23,7 +23,10 @@ async fn avc3_source_to_cmaf_export_roundtrip() {
 	live.track.finish().unwrap();
 
 	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
-	let init = fragment_now(&mut exporter).await.data;
+	let init = chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
 
 	let mut cursor = Cursor::new(init.as_ref());
 	let mut saw_ftyp = false;
@@ -83,7 +86,10 @@ async fn legacy_aac_source_to_cmaf_export_synthesizes_esds() {
 	live.track.finish().unwrap();
 
 	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
-	let init = fragment_now(&mut exporter).await.data;
+	let init = chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
 
 	let mut cursor = Cursor::new(init.as_ref());
 	let mut moov: Option<mp4_atom::Moov> = None;
@@ -110,7 +116,7 @@ async fn legacy_aac_source_to_cmaf_export_synthesizes_esds() {
 	assert_eq!(dec_config.object_type_indication, 0x40, "MPEG-4 AAC");
 	assert_eq!(dec_config.stream_type, 0x05, "audio stream");
 
-	let dec_specific = &dec_config.dec_specific;
+	let dec_specific = dec_config.dec_specific.as_ref().expect("AAC DecoderSpecificInfo");
 	assert_eq!(dec_specific.profile, 2, "AAC-LC");
 	assert_eq!(dec_specific.freq_index, 4, "44100 Hz");
 	assert_eq!(dec_specific.chan_conf, 2, "stereo");
@@ -140,7 +146,10 @@ async fn vp8_source_to_cmaf_export_synthesizes_vp08() {
 	live.track.finish().unwrap();
 
 	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
-	let init = fragment_now(&mut exporter).await.data;
+	let init = chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
 
 	let mut cursor = Cursor::new(init.as_ref());
 	let mut moov: Option<mp4_atom::Moov> = None;
@@ -195,7 +204,10 @@ async fn vp9_source_to_cmaf_export_synthesizes_vp09() {
 	live.track.finish().unwrap();
 
 	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
-	let init = fragment_now(&mut exporter).await.data;
+	let init = chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
 
 	let mut cursor = Cursor::new(init.as_ref());
 	let mut moov: Option<mp4_atom::Moov> = None;
@@ -257,7 +269,10 @@ async fn av1_source_to_cmaf_export_synthesizes_av01() {
 	live.track.finish().unwrap();
 
 	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
-	let init = fragment_now(&mut exporter).await.data;
+	let init = chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
 
 	let mut cursor = Cursor::new(init.as_ref());
 	let mut moov: Option<mp4_atom::Moov> = None;
@@ -421,12 +436,12 @@ async fn single_track_export_init_matches_fragment_track_id() {
 	);
 }
 
-/// `next_fragment` reports the init flag, per-fragment sync-sample independence,
-/// and a positive duration. With a sub-GOP fragment cap, a part in the middle of
-/// a GOP is reported as non-independent while the GOP's leading part stays
+/// `next_chunk` emits the init segment first, then fragments reporting sync-sample
+/// independence and a positive duration. With a sub-GOP fragment cap, a part in the
+/// middle of a GOP is reported as non-independent while the GOP's leading part stays
 /// independent. This is the metadata an HLS/LL-HLS packager consumes.
 #[tokio::test(start_paused = true)]
-async fn next_fragment_reports_segment_metadata() {
+async fn next_chunk_reports_segment_metadata() {
 	let mut live = Live::avc3();
 	// GOP 0: keyframe@0 (SPS+PPS+IDR), delta@33ms. GOP 1: keyframe@66ms.
 	live.track.write(video_frame(0, true)).unwrap();
@@ -438,26 +453,51 @@ async fn next_fragment_reports_segment_metadata() {
 	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await)
 		.with_fragment_duration(std::time::Duration::from_millis(20));
 
-	// First emit is the init segment.
-	let init = fragment_now(&mut exporter).await;
-	assert!(init.init, "first fragment must be the init segment");
-	assert!(!init.independent);
-	assert_eq!(init.duration, 0.0);
+	// First emit is the init segment, which carries no segmenting metadata to assert on.
+	chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
 
 	// The track is finished, so its three media fragments are all available. The
 	// catalog stays open, so the exporter never reaches a clean end. Read the
 	// known fragment count rather than looping to `None`.
 	let mut independents = Vec::new();
 	for _ in 0..3 {
-		let frag = fragment_now(&mut exporter).await;
-		assert!(!frag.init);
-		assert!(frag.duration > 0.0, "media fragment duration should be positive");
+		let frag = chunk_now(&mut exporter).await.fragment().expect("a media fragment");
+		assert!(
+			frag.duration > std::time::Duration::ZERO,
+			"media fragment duration should be positive"
+		);
 		independents.push(frag.independent);
 	}
 
 	// GOP 0 leading part (independent), GOP 0 trailing part (dependent),
 	// GOP 1 leading part (independent).
 	assert_eq!(independents, vec![true, false, true]);
+}
+
+/// `Chunk::data` reaches the bytes of either variant, so a consumer that only wants
+/// to write the stream out doesn't have to match. `next` is that consumer.
+#[tokio::test(start_paused = true)]
+async fn chunk_data_reaches_both_variants() {
+	use crate::container::fmp4::Chunk;
+
+	let mut live = Live::avc3();
+	live.track.write(video_frame(0, true)).unwrap();
+
+	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await)
+		.with_fragment_duration(std::time::Duration::ZERO);
+
+	let init = chunk_now(&mut exporter).await;
+	assert!(matches!(init, Chunk::Init(_)), "the init segment comes first");
+	assert_eq!(&init.data()[4..8], b"ftyp");
+	assert_eq!(init.data().clone(), init.into_data());
+
+	let fragment = chunk_now(&mut exporter).await;
+	assert!(matches!(fragment, Chunk::Fragment(_)));
+	assert_eq!(&fragment.data()[4..8], b"moof");
+	assert_eq!(fragment.data().clone(), fragment.into_data());
 }
 
 #[tokio::test(start_paused = true)]
@@ -467,12 +507,69 @@ async fn zero_fragment_duration_emits_without_successor() {
 
 	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await)
 		.with_fragment_duration(std::time::Duration::ZERO);
-	assert!(fragment_now(&mut exporter).await.init);
+	chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
 
-	let fragment = fragment_now(&mut exporter).await;
-	assert!(!fragment.init);
+	let fragment = chunk_now(&mut exporter).await.fragment().expect("a media fragment");
 	assert!(fragment.independent, "a keyframe-led fragment can start a segment");
-	assert!(fragment.duration > 0.0);
+	assert!(fragment.duration > std::time::Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ntsc_tail_uses_a_representable_catalog_cadence() {
+	use hang::catalog::{Container, H264, VideoConfig};
+
+	let mut live = Live::new(".ntsc", |catalog, name| {
+		let mut config = VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: true,
+		});
+		config.coded_width = Some(320);
+		config.coded_height = Some(240);
+		config.framerate = Some(30_000.0 / 1001.0);
+		config.container = Container::Legacy;
+		catalog.lock().video.renditions.insert(name, config);
+	});
+	live.track.write(video_frame(0, true)).unwrap();
+	live.track.finish().unwrap();
+
+	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
+	chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
+	let fragment = chunk_now(&mut exporter).await.fragment().expect("a media fragment");
+	assert_eq!(super::sample_durations(&fragment.data), vec![Some(1001)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unusable_framerate_uses_the_standard_fallback_rate() {
+	use hang::catalog::{Container, VideoCodec, VideoConfig};
+
+	let mut live = Live::new(".vp8", |catalog, name| {
+		let mut config = VideoConfig::new(VideoCodec::VP8);
+		config.framerate = Some(0.0005);
+		config.container = Container::Legacy;
+		catalog.lock().video.renditions.insert(name, config);
+	});
+	live.track.write(raw_frame(0, &[0x82, 0x00], true)).unwrap();
+	live.track.finish().unwrap();
+
+	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
+	chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
+
+	let fragment = chunk_now(&mut exporter).await.fragment().expect("a media fragment");
+	assert_eq!(fragment.duration, std::time::Duration::from_secs_f64(1.0 / 30.0));
+	let timescale = moq_net::Timescale::new(90_000).unwrap();
+	let decoded = super::decode(fragment.data, timescale).unwrap();
+	assert_eq!(decoded[0].duration.unwrap().as_scale(timescale), 3_000);
 }
 
 #[tokio::test(start_paused = true)]
@@ -491,15 +588,17 @@ async fn audio_only_default_mode_emits_without_successor() {
 	live.track.write(raw_frame(0, &[0x01, 0x02, 0x03, 0x04], true)).unwrap();
 
 	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
-	assert!(fragment_now(&mut exporter).await.init);
+	chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
 
-	let fragment = fragment_now(&mut exporter).await;
-	assert!(!fragment.init);
+	let fragment = chunk_now(&mut exporter).await.fragment().expect("a media fragment");
 	assert!(fragment.independent, "audio fragments are always independent");
 	// An AAC frame is 1024 samples, so the catalog fallback is the real duration.
 	assert!(
-		(fragment.duration - 1024.0 / 44100.0).abs() < 1e-4,
-		"expected one AAC frame of duration, got {}",
+		(fragment.duration.as_secs_f64() - 1024.0 / 44100.0).abs() < 1e-4,
+		"expected one AAC frame of duration, got {:?}",
 		fragment.duration
 	);
 }
@@ -513,12 +612,15 @@ async fn opus_frame_duration_from_toc() {
 	live.track.write(raw_frame(0, &[0x08, 0xaa, 0xbb, 0xcc], true)).unwrap();
 
 	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
-	assert!(fragment_now(&mut exporter).await.init);
+	chunk_now(&mut exporter)
+		.await
+		.init()
+		.expect("the init segment comes first");
 
-	let fragment = fragment_now(&mut exporter).await;
+	let fragment = chunk_now(&mut exporter).await.fragment().expect("a media fragment");
 	assert!(
-		(fragment.duration - 0.02).abs() < 1e-4,
-		"expected the 20 ms TOC duration, got {}",
+		(fragment.duration.as_secs_f64() - 0.02).abs() < 1e-4,
+		"expected the 20 ms TOC duration, got {:?}",
 		fragment.duration
 	);
 }
@@ -585,13 +687,13 @@ fn synthesize_flac_trak() {
 	assert_eq!(stream_info, (96_000, 1));
 }
 
-/// The next fragment, required to be ready without another frame arriving.
-async fn fragment_now(
+/// The next chunk, required to be ready without another frame arriving.
+async fn chunk_now(
 	exporter: &mut crate::container::fmp4::Export<crate::catalog::Consumer>,
-) -> crate::container::fmp4::Fragment {
-	tokio::time::timeout(std::time::Duration::from_millis(1), exporter.next_fragment())
+) -> crate::container::fmp4::Chunk {
+	tokio::time::timeout(std::time::Duration::from_millis(1), exporter.next_chunk())
 		.await
 		.expect("waited for a successor frame")
 		.expect("exporter failed")
-		.expect("expected a fragment")
+		.expect("expected a chunk")
 }

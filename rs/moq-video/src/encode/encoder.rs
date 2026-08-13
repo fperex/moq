@@ -144,6 +144,7 @@ impl Encoder {
 		// I420 chroma is subsampled 2x2, so the encoded resolution must be even.
 		let size = config.size();
 		size.validate("encoder")?;
+		size.validate_encodable("encoder", config.framerate)?;
 
 		let backend = backend::open(config)?;
 		Ok(Self {
@@ -711,7 +712,7 @@ mod tests {
 	/// Full zero-copy path: real camera -> D3D11 NV12 texture -> hardware encoder
 	/// via the DXGI device manager, no CPU round-trip. Ignored: needs a camera and
 	/// a GPU. Run with `--ignored`.
-	#[cfg(target_os = "windows")]
+	#[cfg(all(target_os = "windows", feature = "capture"))]
 	#[tokio::test]
 	#[ignore]
 	async fn mediafoundation_camera_texture() {

@@ -1,12 +1,14 @@
-import * as announce from "../announced.ts";
+import { type Dispose, type Getter, Signal } from "@moq/signals";
 import type * as broadcast from "../broadcast.ts";
 import { error, reason } from "../error.ts";
 import type * as group from "../group.ts";
+import type { Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
 import { type Stream, Writer } from "../stream.ts";
 import type { Timescale } from "../time.ts";
 import type { Session } from "./adapter.ts";
 import { Frame, Group as GroupMessage } from "./object.ts";
+import { fromWire } from "./priority.ts";
 import { PublishDone } from "./publish.ts";
 import { PublishNamespace, PublishNamespaceDone, PublishNamespaceOk } from "./publish_namespace.ts";
 import { RequestError, RequestOk } from "./request.ts";
@@ -20,6 +22,21 @@ import {
 import { TrackStatus, type TrackStatusRequest } from "./track.ts";
 import { Version } from "./version.ts";
 
+/** What {@link Publisher.runGroup} needs to serve one group. */
+interface RunGroup {
+	/** The subscription's request ID, doubling as the track alias. */
+	requestId: bigint;
+
+	/** The group to serve. */
+	group: group.Consumer;
+
+	/** The track's advertised timescale, applied to every frame timestamp. */
+	timescale: Timescale;
+
+	/** Settles when the subscriber leaves, dropping a group still queued for a stream slot. */
+	unsubscribed: Promise<void>;
+}
+
 /**
  * Handles publishing broadcasts using moq-transport protocol.
  * Uses the stream-per-request pattern (real bidi streams for v17, virtual for v14-v16).
@@ -30,91 +47,25 @@ export class Publisher {
 	#quic: WebTransport;
 	#session: Session;
 
-	// Our published broadcasts.
-	#broadcasts: Map<Path.Valid, broadcast.Producer> = new Map();
-
-	// Any consumers that want each new announcement.
-	#announcedConsumers = new Set<announce.Producer>();
+	// The published broadcasts, borrowed from the origin this session serves. The origin
+	// outlives the session, so this is read-only here: subscribe_namespace streams watch it
+	// for changes, and closing the session leaves the broadcasts alone. The namespaces are
+	// only advertised in response to a SUBSCRIBE_NAMESPACE (see {@link runSubscribeNamespace}),
+	// mirroring the moq-lite publisher.
+	#broadcasts: Getter<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>;
 
 	/**
 	 * Creates a new Publisher instance.
 	 * @param quic - The WebTransport session (for uni streams)
 	 * @param session - The session abstraction for bidi streams and request IDs
+	 * @param publish - The origin whose broadcasts this session serves; omit to publish nothing
 	 *
 	 * @internal
 	 */
-	constructor(quic: WebTransport, session: Session) {
+	constructor(quic: WebTransport, session: Session, publish?: OriginConsumer) {
 		this.#quic = quic;
 		this.#session = session;
-	}
-
-	/**
-	 * Publishes a broadcast with any associated tracks.
-	 * Opens a bidi stream to send PublishNamespace and waits for response.
-	 */
-	publish(path: Path.Valid, broadcast: broadcast.Producer) {
-		this.#broadcasts.set(path, broadcast);
-		this.#notifyConsumers(path, true);
-		void this.#runPublish(path, broadcast);
-	}
-
-	async #runPublish(path: Path.Valid, broadcast: broadcast.Producer) {
-		try {
-			const requestId = await this.#session.nextRequestId();
-			if (requestId === undefined) return;
-
-			const stream = await this.#session.openBi();
-
-			try {
-				// Write PublishNamespace
-				await stream.writer.u53(PublishNamespace.id);
-				const msg = new PublishNamespace({ requestId, trackNamespace: path });
-				await msg.encode(stream.writer, this.#session.version);
-
-				// Read response (RequestOk and PublishNamespaceOk share 0x07)
-				const respTypeId = await stream.reader.u53();
-				if (respTypeId === RequestOk.id) {
-					// Draft-14 sends PublishNamespaceOk (requestId only, no parameters)
-					if (this.#session.version === Version.DRAFT_14) {
-						await PublishNamespaceOk.decode(stream.reader, this.#session.version);
-					} else {
-						await RequestOk.decode(stream.reader, this.#session.version);
-					}
-				} else {
-					throw new Error(`PublishNamespace rejected: typeId=0x${respTypeId.toString(16)}`);
-				}
-
-				// Wait for broadcast to close or stream to close (peer cancelled)
-				await Promise.race([broadcast.closed, stream.reader.closed]);
-
-				// For v14-v16: send explicit PublishNamespaceDone (removed in v17+)
-				if (
-					this.#session.version === Version.DRAFT_14 ||
-					this.#session.version === Version.DRAFT_15 ||
-					this.#session.version === Version.DRAFT_16
-				) {
-					try {
-						await stream.writer.u53(PublishNamespaceDone.id);
-						const done = new PublishNamespaceDone({ trackNamespace: path, requestId });
-						await done.encode(stream.writer, this.#session.version);
-					} catch {
-						// Stream might already be closed
-					}
-				}
-
-				stream.close();
-			} catch (err) {
-				stream.abort(error(err));
-				throw err;
-			}
-		} catch (err: unknown) {
-			const e = error(err);
-			console.warn(`announce failed: broadcast=${path} error=${reason(e)}`);
-		} finally {
-			broadcast.close();
-			this.#broadcasts.delete(path);
-			this.#notifyConsumers(path, false);
-		}
+		this.#broadcasts = publish?.broadcasts ?? new Signal(new Map());
 	}
 
 	/**
@@ -126,7 +77,7 @@ export class Publisher {
 	async runSubscribe(msg: Subscribe, stream: Stream) {
 		const version = this.#session.version;
 		const name = msg.trackNamespace;
-		const broadcast = this.#broadcasts.get(name);
+		const broadcast = this.#broadcasts.peek()?.get(name);
 
 		if (!broadcast) {
 			// Write error response
@@ -151,7 +102,7 @@ export class Publisher {
 			return;
 		}
 
-		const track = broadcast.subscribe(msg.trackName, { priority: msg.subscriberPriority });
+		const track = broadcast.subscribe(msg.trackName, { priority: fromWire(msg.subscriberPriority) });
 
 		try {
 			// Declaring the timescale is what opts the track into timestamps; every object
@@ -171,12 +122,28 @@ export class Publisher {
 			await ok.encode(stream.writer, version);
 			console.debug(`publish ok: broadcast=${name} track=${track.name}`);
 
+			// Cancels groups still queued for a stream slot. Only the subscriber leaving counts:
+			// a track that ran out of groups still has to flush the ones already queued, and we
+			// close the stream ourselves below to say so.
+			let finished = false;
+			let unsubscribe!: () => void;
+			const unsubscribed = new Promise<void>((resolve) => {
+				unsubscribe = resolve;
+			});
+			void stream.reader.closed.then(
+				() => {
+					if (!finished) unsubscribe();
+				},
+				// A reset is always the peer.
+				() => unsubscribe(),
+			);
+
 			// Serve track groups, racing with stream close (= Unsubscribe)
 			const serving = (async () => {
 				for (;;) {
 					const group = await track.recvGroup();
 					if (!group) return;
-					void this.#runGroup(msg.requestId, group, timescale);
+					void this.#runGroup({ requestId: msg.requestId, group, timescale, unsubscribed });
 				}
 			})();
 
@@ -199,6 +166,10 @@ export class Publisher {
 				}
 			}
 
+			// Only now is the close below ours. Claiming it any earlier would read a peer FIN
+			// that lands while PublishDone is still going out as our own completion, leaving
+			// queued groups to open for a subscriber that has already left.
+			finished = true;
 			stream.close();
 		} catch (err: unknown) {
 			const e = error(err);
@@ -212,9 +183,22 @@ export class Publisher {
 	/**
 	 * Runs a group and sends its frames using ObjectStream (Subgroup delivery mode).
 	 */
-	async #runGroup(requestId: bigint, group: group.Consumer, timescale: Timescale) {
+	async #runGroup(options: RunGroup) {
+		const { requestId, group, timescale, unsubscribed } = options;
 		try {
-			const stream = await Writer.open(this.#quic, this.#session.version);
+			// One stream per group is faster than a peer at its limit can retire them, so this
+			// is the one path that doesn't wait for a slot: the transport would serve the opens
+			// in the order we asked, which is oldest-first, exactly backwards for live media.
+			// Failing here drops the group and lets the next one compete for the next slot.
+			const stream = await Writer.tryOpen(this.#quic, {
+				cancel: unsubscribed,
+				version: this.#session.version,
+				waitUntilAvailable: false,
+			});
+			if (!stream) {
+				group.close(new Error("no stream slot"));
+				return;
+			}
 
 			const header = new GroupMessage({
 				trackAlias: requestId,
@@ -252,13 +236,22 @@ export class Publisher {
 
 	/**
 	 * Handles an incoming SUBSCRIBE_NAMESPACE on a bidi stream.
-	 * Sends RequestOk, then streams Namespace/NamespaceDone entries.
+	 *
+	 * Namespaces are only advertised in response to one of these, and the state
+	 * is local to this stream's task, mirroring the moq-lite publisher. Draft-16+
+	 * streams Namespace/NamespaceDone entries inline; draft-14/15 predate those
+	 * messages, so each advertisement is a PUBLISH_NAMESPACE request of its own
+	 * over the control stream, closed out with PUBLISH_NAMESPACE_DONE.
 	 *
 	 * @internal
 	 */
 	async runSubscribeNamespace(msg: SubscribeNamespace, stream: Stream) {
 		const version = this.#session.version;
 		const prefix = msg.namespace;
+		const legacy = version === Version.DRAFT_14 || version === Version.DRAFT_15;
+
+		// Draft-14/15: the open PUBLISH_NAMESPACE request per advertised suffix.
+		const requests = new Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>();
 
 		try {
 			// Send OK response
@@ -274,39 +267,65 @@ export class Publisher {
 				await ok.encode(stream.writer, version);
 			}
 
-			const announced = new announce.Producer(prefix);
-			for (const name of this.#broadcasts.keys()) {
+			const advertise = async (suffix: Path.Valid) => {
+				if (legacy) {
+					await this.#advertise(prefix, suffix, requests);
+				} else {
+					await stream.writer.u53(SubscribeNamespaceEntry.id);
+					await new SubscribeNamespaceEntry({ suffix }).encode(stream.writer, version);
+				}
+			};
+			const withdraw = async (suffix: Path.Valid) => {
+				if (legacy) {
+					await this.#withdraw(suffix, requests);
+				} else {
+					await stream.writer.u53(SubscribeNamespaceEntryDone.id);
+					await new SubscribeNamespaceEntryDone({ suffix }).encode(stream.writer, version);
+				}
+			};
+
+			// Advertise the currently published broadcasts under the prefix. Keyed by suffix,
+			// valued by the routing front, so a republish diffs as withdraw-then-advertise
+			// rather than nothing.
+			let active = new Map<Path.Valid, broadcast.Consumer>();
+			for (const [name, front] of this.#broadcasts.peek() ?? []) {
 				const suffix = Path.stripPrefix(prefix, name);
 				if (suffix === null) continue;
-				announced.append({ path: suffix, active: true });
+				active.set(suffix, front);
 			}
-			this.#announcedConsumers.add(announced);
-			const consumer = announced.consume();
+			for (const suffix of active.keys()) {
+				await advertise(suffix);
+			}
 
-			// Close the consumer when the stream closes
-			stream.reader.closed.then(
-				() => announced.close(),
-				() => announced.close(),
-			);
+			// Wait for updates to the broadcasts.
+			for (;;) {
+				// TODO Make a better helper within Signals.
+				let dispose!: Dispose;
+				const changed = new Promise<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>((resolve) => {
+					dispose = this.#broadcasts.changed(resolve);
+				});
 
-			try {
-				for (;;) {
-					const entry = await consumer.next();
-					if (!entry) break;
+				// Wait until the map of broadcasts changes or the peer unsubscribes.
+				const broadcasts = await Promise.race([changed, stream.reader.closed]);
+				dispose();
+				if (!broadcasts) break;
 
-					if (entry.active) {
-						await stream.writer.u53(SubscribeNamespaceEntry.id);
-						const e = new SubscribeNamespaceEntry({ suffix: entry.path });
-						await e.encode(stream.writer, version);
-					} else {
-						await stream.writer.u53(SubscribeNamespaceEntryDone.id);
-						const e = new SubscribeNamespaceEntryDone({ suffix: entry.path });
-						await e.encode(stream.writer, version);
-					}
+				const newActive = new Map<Path.Valid, broadcast.Consumer>();
+				for (const [name, front] of broadcasts) {
+					const suffix = Path.stripPrefix(prefix, name);
+					if (suffix === null) continue;
+					newActive.set(suffix, front);
 				}
-			} finally {
-				announced.close();
-				this.#announcedConsumers.delete(announced);
+
+				// Withdraw first so a republish reads as withdraw-then-advertise (a restart).
+				for (const [removed, front] of active) {
+					if (newActive.get(removed) !== front) await withdraw(removed);
+				}
+				for (const [added, front] of newActive) {
+					if (active.get(added) !== front) await advertise(added);
+				}
+
+				active = newActive;
 			}
 
 			stream.close();
@@ -314,7 +333,76 @@ export class Publisher {
 			const e = error(err);
 			console.debug(`subscribe_namespace stream error: ${reason(e)}`);
 			stream.abort(e);
+		} finally {
+			// This subscription's advertisements die with it: close out every open
+			// draft-14/15 PUBLISH_NAMESPACE request.
+			for (const suffix of [...requests.keys()]) {
+				await this.#withdraw(suffix, requests);
+			}
 		}
+	}
+
+	/**
+	 * Advertise one namespace on its own PUBLISH_NAMESPACE request (draft-14/15,
+	 * which have no NAMESPACE entry message). A declined request is logged and
+	 * skipped rather than failing the subscription.
+	 */
+	async #advertise(
+		prefix: Path.Valid,
+		suffix: Path.Valid,
+		requests: Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>,
+	) {
+		const path = Path.join(prefix, suffix);
+
+		const requestId = await this.#session.nextRequestId();
+		if (requestId === undefined) return;
+
+		const request = await this.#session.openBi();
+		try {
+			await request.writer.u53(PublishNamespace.id);
+			const msg = new PublishNamespace({ requestId, trackNamespace: path });
+			await msg.encode(request.writer, this.#session.version);
+
+			// Read response (RequestOk and PublishNamespaceOk share 0x07)
+			const respTypeId = await request.reader.u53();
+			if (respTypeId !== RequestOk.id) {
+				throw new Error(`PublishNamespace rejected: typeId=0x${respTypeId.toString(16)}`);
+			}
+			// Draft-14 sends PublishNamespaceOk (requestId only, no parameters)
+			if (this.#session.version === Version.DRAFT_14) {
+				await PublishNamespaceOk.decode(request.reader, this.#session.version);
+			} else {
+				await RequestOk.decode(request.reader, this.#session.version);
+			}
+
+			requests.set(suffix, { path, requestId, stream: request });
+		} catch (err: unknown) {
+			const e = error(err);
+			console.warn(`announce failed: broadcast=${path} error=${reason(e)}`);
+			request.abort(e);
+		}
+	}
+
+	/**
+	 * Close out a namespace's PUBLISH_NAMESPACE request with PUBLISH_NAMESPACE_DONE
+	 * (draft-14/15).
+	 */
+	async #withdraw(
+		suffix: Path.Valid,
+		requests: Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>,
+	) {
+		const request = requests.get(suffix);
+		if (!request) return;
+		requests.delete(suffix);
+
+		try {
+			await request.stream.writer.u53(PublishNamespaceDone.id);
+			const done = new PublishNamespaceDone({ trackNamespace: request.path, requestId: request.requestId });
+			await done.encode(request.stream.writer, this.#session.version);
+		} catch {
+			// Stream might already be closed
+		}
+		request.stream.close();
 	}
 
 	/**
@@ -345,17 +433,5 @@ export class Publisher {
 			await ok.encode(stream.writer, version);
 		}
 		stream.close();
-	}
-
-	#notifyConsumers(path: Path.Valid, active: boolean) {
-		for (const consumer of this.#announcedConsumers) {
-			const suffix = Path.stripPrefix(consumer.prefix, path);
-			if (suffix === null) continue;
-			try {
-				consumer.append({ path: suffix, active });
-			} catch {
-				// Consumer already closed, will be cleaned up
-			}
-		}
 	}
 }

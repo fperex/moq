@@ -9,7 +9,7 @@ use std::{
 use web_transport_trait::Stats;
 
 use crate::{
-	Error, Version, bandwidth, goaway,
+	Error, SessionError, Version, bandwidth, goaway,
 	util::{MaybeBoxedExt, MaybeSendBox},
 };
 
@@ -104,12 +104,18 @@ impl Session {
 	/// Close the transport with an explicit error, instead of waiting for the last
 	/// clone to drop. Idempotent: the first close wins.
 	pub fn abort(&self, err: Error) {
-		self.shared.close(err.to_code(), err.to_string().as_ref());
+		self.shared
+			.close(SessionError::from(&err).to_code(), err.to_string().as_ref());
 	}
 
 	/// Block until the transport session is closed, returning the reason.
+	///
+	/// A close code the peer sent is decoded through the session registry (so an auth
+	/// rejection arrives as [`Error::Unauthorized`]); an unregistered code is kept
+	/// verbatim as [`Error::Remote`], and a close carrying no application code surfaces
+	/// as [`Error::Transport`]. See [`Error::from_transport`].
 	pub async fn closed(&self) -> Error {
-		Error::Transport(self.shared.inner.closed().await)
+		self.shared.inner.closed().await
 	}
 
 	/// Drain the peer gracefully: the handle for sending this session's single
@@ -254,12 +260,12 @@ impl SessionShared {
 
 impl Drop for SessionShared {
 	fn drop(&mut self) {
-		self.close(Error::Cancel.to_code(), "dropped");
+		self.close(SessionError::Cancel.to_code(), "dropped");
 	}
 }
 
 impl Session {
-	pub(super) fn new<S: web_transport_trait::Session>(
+	pub(super) fn new<S: crate::transport::poll::Session>(
 		session: S,
 		version: Version,
 		recv_bandwidth: Option<bandwidth::Consumer>,
@@ -281,7 +287,7 @@ impl Session {
 
 		let session = Self {
 			shared: Arc::new(SessionShared {
-				inner: Box::new(session),
+				inner: Box::new(SessionInnerImpl(std::sync::Mutex::new(session))),
 				closed: std::sync::atomic::AtomicBool::new(false),
 			}),
 			version,
@@ -310,8 +316,9 @@ impl Session {
 struct SendBandwidth<S> {
 	session: S,
 	producer: bandwidth::Producer,
-	// The transport close, boxed once so it can be re-polled each step.
-	closed: MaybeSendBox<'static, ()>,
+	// A dedicated clone for the close watch, since each pending poll operation
+	// needs its own handle.
+	closed: S,
 	mode: SendBandwidthMode,
 }
 
@@ -322,18 +329,11 @@ enum SendBandwidthMode {
 	Polling { sleep: MaybeSendBox<'static, ()> },
 }
 
-impl<S: web_transport_trait::Session> SendBandwidth<S> {
+impl<S: crate::transport::poll::Session> SendBandwidth<S> {
 	const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 	fn new(session: S, producer: bandwidth::Producer) -> Self {
-		let closed = {
-			let session = session.clone();
-			async move {
-				session.closed().await;
-			}
-		}
-		.maybe_boxed();
-
+		let closed = session.clone();
 		Self {
 			session,
 			producer,
@@ -354,7 +354,8 @@ impl<S: web_transport_trait::Session> SendBandwidth<S> {
 	}
 
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
-		if waiter.poll_future(self.closed.as_mut()).is_ready() {
+		let mut cx = std::task::Context::from_waker(waiter.waker());
+		if self.closed.poll_closed(&mut cx).is_ready() {
 			return Poll::Ready(());
 		}
 
@@ -400,34 +401,31 @@ impl<S: web_transport_trait::Session> SendBandwidth<S> {
 // allowing the !Send browser WebTransport on wasm.
 trait SessionInner: web_transport_trait::MaybeSend + web_transport_trait::MaybeSync {
 	fn close(&self, code: u32, reason: &str);
-	fn closed(&self) -> MaybeSendBox<'_, String>;
+	fn closed(&self) -> MaybeSendBox<'static, Error>;
 	fn stats(&self) -> ConnectionStats;
 }
 
-impl<S: web_transport_trait::Session> SessionInner for S {
+// The poll interface takes `&mut self`, but the shared close-once state is
+// reached through `&self` from every clone, so the canonical handle lives
+// behind a Mutex. The lock is held only for the synchronous calls; `closed`
+// clones a handle out and polls that instead.
+struct SessionInnerImpl<S>(std::sync::Mutex<S>);
+
+impl<S: crate::transport::poll::Session> SessionInner for SessionInnerImpl<S> {
 	fn close(&self, code: u32, reason: &str) {
-		S::close(self, code, reason);
+		self.0.lock().unwrap().close(code, reason);
 	}
 
-	fn closed(&self) -> MaybeSendBox<'_, String> {
-		Box::pin(async move {
-			let err = S::closed(self).await;
-			// Surface the application close code and reason when the transport
-			// carries them: Display alone often drops both (e.g. quinn reports a
-			// bare "connection error: closed"), and the reason is how a peer
-			// distinguishes a GOAWAY-timeout force-close from a network failure.
-			match web_transport_trait::Error::session_error(&err) {
-				Some((code, reason)) if !reason.is_empty() => format!("code={code}: {reason}"),
-				Some((code, _)) => format!("code={code}: {err}"),
-				None => err.to_string(),
-			}
-		})
+	fn closed(&self) -> MaybeSendBox<'static, Error> {
+		let mut session = self.0.lock().unwrap().clone();
+		Box::pin(async move { Error::from_transport(session.closed().await) })
 	}
 
 	fn stats(&self) -> ConnectionStats {
 		// estimated_recv_rate is filled in at the Session level (it comes from MoQ PROBE,
 		// not the transport), so leave it at the Default `None` here.
-		let stats = S::stats(self);
+		let session = self.0.lock().unwrap();
+		let stats = session.stats();
 		ConnectionStats {
 			rtt: stats.rtt(),
 			estimated_send_rate: stats.estimated_send_rate(),

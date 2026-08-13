@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.8...moq-ffi-v0.3.9) - 2026-08-07
+
+### Other
+
+- drop Intel macOS release targets ([#2715](https://github.com/moq-dev/moq/pull/2715))
+
+## [0.3.8](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.7...moq-ffi-v0.3.8) - 2026-08-06
+
+### Fixed
+
+- *(libmoq)* unbreak the Linux C link list, and make VAAPI opt-in ([#2669](https://github.com/moq-dev/moq/pull/2669))
+
+## [0.3.7](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.6...moq-ffi-v0.3.7) - 2026-08-05
+
+### Added
+
+- *(bindings)* publish raw video with a native encoder ([#2608](https://github.com/moq-dev/moq/pull/2608))
+
+## [0.3.6](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.5...moq-ffi-v0.3.6) - 2026-08-03
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.3.5](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.4...moq-ffi-v0.3.5) - 2026-07-29
 
 ### Other

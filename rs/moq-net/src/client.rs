@@ -79,17 +79,20 @@ impl Client {
 		self
 	}
 
-	/// Price this link, in the units the rest of the mesh uses (moq-lite-06+).
+	/// Price this link, in the units the rest of the mesh uses (moq-lite-06+, and
+	/// `moqt-17`+ via the MoQ Cluster extension).
 	///
-	/// Every announcement crossing the connection adds this to its route cost, so
-	/// routing prefers cheap paths over short ones. Use `0` for a link that should
-	/// look free (a sibling in the same datacenter), and something large for one that
-	/// should be a last resort (a metered backbone). An unpriced link costs `1`,
-	/// which makes the cost track the hop count and so reproduces plain
+	/// The dialer is the side that knows what a link costs, because it chose the peer:
+	/// use `0` for a sibling in the same datacenter and something large for another
+	/// region across a metered backbone. So this prices both directions. We add it to
+	/// the route cost of every announcement the peer sends us, and declare it in our
+	/// SETUP so the peer adds it to every announcement we send, which is what a server
+	/// accepting an anonymous connection needs: it cannot tell a sibling from a
+	/// stranger, so it has no price of its own to apply.
+	///
+	/// A price the peer declares applies only where we set none. An unpriced link costs
+	/// `1`, which makes the cost track the hop count and so reproduces plain
 	/// shortest-path routing.
-	///
-	/// The dialing side owns the price: it is declared in our SETUP so the server
-	/// charges the same link the same amount. A server never sets one.
 	pub fn with_cost(mut self, cost: u64) -> Self {
 		self.cost = Some(cost);
 		self
@@ -98,11 +101,13 @@ impl Client {
 	/// Assign an origin (hop) id to the peer, used whenever the peer doesn't declare
 	/// one itself.
 	///
-	/// Some relays never declare their identity: every moq-transport version (the
-	/// protocol carries no hop ids), and moq-lite peers without the hops extension.
-	/// Broadcasts received from such a peer are normally attributed to a random
-	/// per-connection origin, so they can't be recognized across sessions. This knob
-	/// pins that identity instead, exactly as if the peer had declared it:
+	/// Some relays never declare their identity: moq-lite peers without the hops
+	/// extension, and moq-transport peers that don't negotiate the MoQ Cluster
+	/// extension (or predate it, on `moqt-16` and earlier).
+	/// Broadcasts received from such a peer are normally attributed to the reserved
+	/// origin 0 ("unknown"), which identifies nothing: it never proves continuity,
+	/// so their advertisements neither splice nor survive a restart in place. This
+	/// knob pins a real identity instead, exactly as if the peer had declared it:
 	///
 	/// - broadcasts received from the peer carry `origin` in their hop chains, so
 	///   every session dialing the same relay (with the same id) resolves to one
@@ -111,8 +116,7 @@ impl Client {
 	///   nor served back to the peer, preventing an echo through a relay that does
 	///   no loop detection of its own.
 	///
-	/// An identity the peer does declare (moq-lite with the hops extension) wins
-	/// over this one.
+	/// An identity the peer does declare wins over this one.
 	pub fn with_peer_origin(mut self, origin: crate::Origin) -> Self {
 		self.peer_origin = Some(origin);
 		self
@@ -121,7 +125,10 @@ impl Client {
 	/// Perform the MoQ handshake, returning the [`Session`] and the [`Driver`] that
 	/// runs its protocol work. The driver must be polled (spawned or awaited) for
 	/// the session to make progress.
-	pub async fn connect<S: web_transport_trait::Session>(&self, session: S) -> Result<(Session, Driver), Error> {
+	pub async fn connect<S: crate::transport::poll::Session>(
+		&self,
+		mut session: S,
+	) -> Result<(Session, Driver), Error> {
 		if self.publish.is_none() && self.subscribe.is_none() {
 			tracing::warn!("not publishing or consuming anything");
 		}
@@ -155,18 +162,20 @@ impl Client {
 					.ok_or(Error::Version)?;
 
 				// Draft-17+: SETUP is exchanged by the connection driver.
-				let (protocol, goaway) = ietf::start(
-					session.clone(),
-					None,
-					None,
-					true,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					ietf::Version::Draft19,
-					self.setup_path.clone(),
-					None,
-				)?;
+				let (protocol, goaway) = ietf::start(ietf::Config {
+					session: session.clone(),
+					setup: None,
+					request_id_max: None,
+					client: true,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					cost: self.cost,
+					version: ietf::Version::Draft19,
+					path: self.setup_path.clone(),
+					peer_setup_stream: None,
+					peer_cluster: None,
+				})?;
 
 				tracing::debug!(version = ?v, "connected");
 				return Ok(Session::new(session, v, None, protocol, goaway));
@@ -179,18 +188,20 @@ impl Client {
 
 				// Draft-17+: SETUP is exchanged by the connection driver.
 				// We advertise the request path in our SETUP for URL-less transports.
-				let (protocol, goaway) = ietf::start(
-					session.clone(),
-					None,
-					None,
-					true,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					ietf::Version::Draft18,
-					self.setup_path.clone(),
-					None,
-				)?;
+				let (protocol, goaway) = ietf::start(ietf::Config {
+					session: session.clone(),
+					setup: None,
+					request_id_max: None,
+					client: true,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					cost: self.cost,
+					version: ietf::Version::Draft18,
+					path: self.setup_path.clone(),
+					peer_setup_stream: None,
+					peer_cluster: None,
+				})?;
 
 				tracing::debug!(version = ?v, "connected");
 				return Ok(Session::new(session, v, None, protocol, goaway));
@@ -203,18 +214,20 @@ impl Client {
 
 				// Draft-17+: SETUP is exchanged by the connection driver.
 				// We advertise the request path in our SETUP for URL-less transports.
-				let (protocol, goaway) = ietf::start(
-					session.clone(),
-					None,
-					None,
-					true,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					ietf::Version::Draft17,
-					self.setup_path.clone(),
-					None,
-				)?;
+				let (protocol, goaway) = ietf::start(ietf::Config {
+					session: session.clone(),
+					setup: None,
+					request_id_max: None,
+					client: true,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					cost: self.cost,
+					version: ietf::Version::Draft17,
+					path: self.setup_path.clone(),
+					peer_setup_stream: None,
+					peer_cluster: None,
+				})?;
 
 				tracing::debug!(version = ?v, "connected");
 				return Ok(Session::new(session, v, None, protocol, goaway));
@@ -260,16 +273,16 @@ impl Client {
 					origin: None,
 				};
 
-				let start = lite::start(
-					session.clone(),
-					None,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
+				let start = lite::start(lite::Config {
+					session: session.clone(),
+					setup_stream: None,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
 					version,
 					our_setup,
-					None,
-				)?;
+					peer_setup: None,
+				})?;
 
 				// Block until the initial announce set has landed (Lite05+ reports it
 				// via AnnounceOk + N), so a `request_broadcast()` for a live path resolves
@@ -290,16 +303,16 @@ impl Client {
 					.select(Version::Lite(lite::Version::Lite04))
 					.ok_or(Error::Version)?;
 
-				let start = lite::start(
-					session.clone(),
-					None,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					lite::Version::Lite04,
-					lite::Setup::default(),
-					None,
-				)?;
+				let start = lite::start(lite::Config {
+					session: session.clone(),
+					setup_stream: None,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					version: lite::Version::Lite04,
+					our_setup: lite::Setup::default(),
+					peer_setup: None,
+				})?;
 
 				// Lite04 has no initial-set boundary, so this resolves immediately.
 				let (session, mut driver) = Session::new(
@@ -319,16 +332,16 @@ impl Client {
 					.ok_or(Error::Version)?;
 
 				// Starting with draft-03, there's no more SETUP control stream.
-				let start = lite::start(
-					session.clone(),
-					None,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					lite::Version::Lite03,
-					lite::Setup::default(),
-					None,
-				)?;
+				let start = lite::start(lite::Config {
+					session: session.clone(),
+					setup_stream: None,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					version: lite::Version::Lite03,
+					our_setup: lite::Setup::default(),
+					peer_setup: None,
+				})?;
 
 				// Lite03 has no initial-set boundary, so this resolves immediately.
 				let (session, mut driver) = Session::new(
@@ -349,7 +362,7 @@ impl Client {
 			Some(p) => return Err(Error::UnknownAlpn(p.to_string())),
 		};
 
-		let mut stream = Stream::open(&session, encoding).await?;
+		let mut stream = Stream::open(&mut session, encoding).await?;
 
 		// The encoding is always an IETF version for SETUP negotiation.
 		let ietf_encoding = ietf::Version::try_from(encoding).map_err(|_| Error::Version)?;
@@ -381,18 +394,18 @@ impl Client {
 		let (recv_bw, protocol, connecting, goaway) = match version {
 			Version::Lite(v) => {
 				let stream = stream.with_version(v);
-				let start = lite::start(
-					session.clone(),
-					Some(stream),
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					v,
+				let start = lite::start(lite::Config {
+					session: session.clone(),
+					setup_stream: Some(stream),
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					version: v,
 					// This path only handles versions negotiated via the bidi SETUP exchange
 					// (pre-lite-05), which have no Setup Stream.
-					lite::Setup::default(),
-					None,
-				)?;
+					our_setup: lite::Setup::default(),
+					peer_setup: None,
+				})?;
 
 				(start.recv_bandwidth, start.driver, Some(start.connecting), start.goaway)
 			}
@@ -405,18 +418,20 @@ impl Client {
 
 				let stream = stream.with_version(v);
 				// Draft 14-16: the path rode in the bidi SETUP above, not the uni one.
-				let (protocol, goaway) = ietf::start(
-					session.clone(),
-					Some(stream),
+				let (protocol, goaway) = ietf::start(ietf::Config {
+					session: session.clone(),
+					setup: Some(stream),
 					request_id_max,
-					true,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					v,
-					None,
-					None,
-				)?;
+					client: true,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					cost: self.cost,
+					version: v,
+					path: None,
+					peer_setup_stream: None,
+					peer_cluster: None,
+				})?;
 				(None, protocol, None, goaway)
 			}
 		};
@@ -440,6 +455,9 @@ mod tests {
 		sync::{Arc, Mutex},
 	};
 
+	use std::task::{Context, Poll};
+
+	use crate::SessionError;
 	use crate::coding::{Decode, Encode};
 	use bytes::{BufMut, Bytes};
 
@@ -463,6 +481,8 @@ mod tests {
 	#[derive(Clone, Default)]
 	struct FakeSession {
 		state: Arc<FakeSessionState>,
+		// Per-clone, so each pending poll_closed keeps its own registration live.
+		park: kio::Park,
 	}
 
 	#[derive(Default)]
@@ -470,7 +490,7 @@ mod tests {
 		protocol: Option<&'static str>,
 		control_stream: Mutex<Option<(FakeSendStream, FakeRecvStream)>>,
 		close_events: Mutex<Vec<(u32, String)>>,
-		close_notify: tokio::sync::Notify,
+		closed: kio::Fan,
 		control_writes: Arc<Mutex<Vec<u8>>>,
 		send_rate: Mutex<Option<u64>>,
 	}
@@ -486,11 +506,14 @@ mod tests {
 				protocol,
 				control_stream: Mutex::new(Some((send, recv))),
 				close_events: Mutex::new(Vec::new()),
-				close_notify: tokio::sync::Notify::new(),
+				closed: kio::Fan::default(),
 				control_writes: writes,
 				send_rate: Mutex::new(None),
 			};
-			Self { state: Arc::new(state) }
+			Self {
+				state: Arc::new(state),
+				park: kio::Park::default(),
+			}
 		}
 
 		fn set_send_rate(&self, rate: Option<u64>) {
@@ -502,43 +525,50 @@ mod tests {
 		}
 
 		async fn wait_for_first_close(&self) -> (u32, String) {
-			loop {
-				let notified = self.state.close_notify.notified();
-				if let Some(close) = self.state.close_events.lock().unwrap().first().cloned() {
-					return close;
+			kio::wait(|waiter| {
+				self.state.closed.register(waiter);
+				match self.state.close_events.lock().unwrap().first().cloned() {
+					Some(close) => std::task::Poll::Ready(close),
+					None => std::task::Poll::Pending,
 				}
-				notified.await;
-			}
+			})
+			.await
 		}
 	}
 
-	impl web_transport_trait::Session for FakeSession {
+	impl web_transport_trait::poll::Session for FakeSession {
 		type SendStream = FakeSendStream;
 		type RecvStream = FakeRecvStream;
 		type Error = FakeError;
 
-		async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
-			std::future::pending().await
+		fn poll_accept_uni(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Self::RecvStream, Self::Error>> {
+			Poll::Pending
 		}
 
-		async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-			std::future::pending().await
+		fn poll_accept_bi(
+			&mut self,
+			_cx: &mut Context<'_>,
+		) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+			Poll::Pending
 		}
 
-		async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-			self.state.control_stream.lock().unwrap().take().ok_or(FakeError)
+		fn poll_open_bi(
+			&mut self,
+			_cx: &mut Context<'_>,
+		) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+			Poll::Ready(self.state.control_stream.lock().unwrap().take().ok_or(FakeError))
 		}
 
-		async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
-			std::future::pending().await
+		fn poll_open_uni(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, Self::Error>> {
+			Poll::Pending
 		}
 
-		fn send_datagram(&self, _payload: Bytes) -> Result<(), Self::Error> {
-			Ok(())
+		fn poll_send_datagram(&mut self, _cx: &mut Context<'_>, _payload: &[u8]) -> Poll<Result<(), Self::Error>> {
+			Poll::Ready(Ok(()))
 		}
 
-		async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-			std::future::pending().await
+		fn poll_recv_datagram(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>> {
+			Poll::Pending
 		}
 
 		fn max_datagram_size(&self) -> usize {
@@ -549,18 +579,17 @@ mod tests {
 			self.state.protocol
 		}
 
-		fn close(&self, code: u32, reason: &str) {
+		fn close(&mut self, code: u32, reason: &str) {
 			self.state.close_events.lock().unwrap().push((code, reason.to_string()));
-			self.state.close_notify.notify_waiters();
+			self.state.closed.wake();
 		}
 
-		async fn closed(&self) -> Self::Error {
-			loop {
-				let notified = self.state.close_notify.notified();
-				if !self.state.close_events.lock().unwrap().is_empty() {
-					return FakeError;
-				}
-				notified.await;
+		fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error> {
+			// Register before checking so a close racing this poll still wakes it.
+			self.state.closed.register(self.park.hold(cx));
+			match self.state.close_events.lock().unwrap().is_empty() {
+				false => Poll::Ready(FakeError),
+				true => Poll::Pending,
 			}
 		}
 
@@ -586,12 +615,12 @@ mod tests {
 		writes: Arc<Mutex<Vec<u8>>>,
 	}
 
-	impl web_transport_trait::SendStream for FakeSendStream {
+	impl web_transport_trait::poll::SendStream for FakeSendStream {
 		type Error = FakeError;
 
-		async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+		fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
 			self.writes.lock().unwrap().put_slice(buf);
-			Ok(buf.len())
+			Poll::Ready(Ok(buf.len()))
 		}
 
 		fn set_priority(&mut self, _order: u8) {}
@@ -602,8 +631,8 @@ mod tests {
 
 		fn reset(&mut self, _code: u32) {}
 
-		async fn closed(&mut self) -> Result<(), Self::Error> {
-			Ok(())
+		fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+			Poll::Ready(Ok(()))
 		}
 	}
 
@@ -611,25 +640,25 @@ mod tests {
 		data: VecDeque<u8>,
 	}
 
-	impl web_transport_trait::RecvStream for FakeRecvStream {
+	impl web_transport_trait::poll::RecvStream for FakeRecvStream {
 		type Error = FakeError;
 
-		async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
+		fn poll_read(&mut self, _cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<Result<Option<usize>, Self::Error>> {
 			if self.data.is_empty() {
-				return Ok(None);
+				return Poll::Ready(Ok(None));
 			}
 
 			let size = dst.len().min(self.data.len());
 			for slot in dst.iter_mut().take(size) {
 				*slot = self.data.pop_front().unwrap();
 			}
-			Ok(Some(size))
+			Poll::Ready(Ok(Some(size)))
 		}
 
 		fn stop(&mut self, _code: u32) {}
 
-		async fn closed(&mut self) -> Result<(), Self::Error> {
-			Ok(())
+		fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+			Poll::Ready(Ok(()))
 		}
 	}
 
@@ -685,7 +714,9 @@ mod tests {
 		// with no origin; RequiredExtension (or similar) is what an
 		// auto-created origin's first interaction with a Lite01 peer trips.
 		let (code, _) = fake.wait_for_first_close().await;
-		assert_ne!(code, Error::Version.to_code(), "SessionInfo failed to decode");
+		// Session closes encode through the session registry, so compare against that one:
+		// `Error::Version.to_code()` is the local table's value and would never match.
+		assert_ne!(code, SessionError::Version.to_code(), "SessionInfo failed to decode");
 	}
 
 	#[tokio::test(start_paused = true)]

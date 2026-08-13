@@ -42,35 +42,27 @@ async fn backend_test(scheme: &str, backend: moq_native::QuicBackend) {
 		client_bind: None,
 		authority: "localhost",
 		path: "",
-		expect_path: None,
+		expect_path: Some(""),
 		backend,
 		qlog: None,
 	})
 	.await;
 }
 
-/// Dial a URL with a path and a query and assert the server sees both.
+/// Dial a URL with a path and a query and assert the server sees both separately.
 ///
 /// Raw QUIC (`moqt`/`moql`) has no request URI, so the whole request target has to
 /// ride the SETUP; WebTransport carries it in the CONNECT URL instead. Either way the
-/// server reports the same thing through [`moq_native::Request::path`].
+/// server reports the same route and query through [`moq_native::Request`].
 #[cfg(any(feature = "quinn", feature = "quiche", feature = "noq"))]
 async fn path_test(scheme: &str, backend: moq_native::QuicBackend) {
-	// A relay reads `?jwt=` off this, so dropping the query silently unauthenticates.
-	let expect_path = match scheme {
-		"moqt" | "moql" => Some("/room?jwt=abc"),
-		// WebTransport splits the two: the path is the request target, the query stays
-		// on the URL.
-		_ => Some("/room"),
-	};
-
 	connect_test(ConnectTest {
 		scheme,
 		bind: "[::]:0",
 		client_bind: None,
 		authority: "localhost",
 		path: "/room?jwt=abc",
-		expect_path,
+		expect_path: Some("/room"),
 		backend,
 		qlog: None,
 	})
@@ -89,7 +81,7 @@ async fn no_sni_test(scheme: &str, backend: moq_native::QuicBackend) {
 		client_bind: None,
 		authority: "127.0.0.1",
 		path: "",
-		expect_path: None,
+		expect_path: Some(""),
 		backend,
 		qlog: None,
 	})
@@ -124,29 +116,33 @@ async fn connect_test(config: ConnectTest<'_>) {
 		.expect("failed to write frame");
 	group.finish().expect("failed to finish group");
 
-	let mut server_config = moq_native::ServerConfig::default();
+	let mut server_config = moq_native::listen::Config::default();
 	server_config.bind = Some(bind.to_string());
 	server_config.tls.generate = vec!["localhost".into()];
 	server_config.backend = Some(backend.clone());
-	server_config.quic.qlog = qlog.map(Into::into);
+	let mut quic = moq_native::quic::Config::default();
+	quic.qlog = qlog.map(Into::into);
 
-	let mut server = server_config.init().expect("failed to init server");
+	let server = server_config.init(quic.clone()).expect("failed to init server");
+	let mut server = server.listen().await.expect("failed to listen");
 	let addr = server.local_addr().expect("failed to get local addr");
 
 	// ── subscriber (client) ─────────────────────────────────────────
 	let sub_origin = Origin::random().produce();
 	let mut announcements = sub_origin.consume().announced();
 
-	let mut client_config = moq_native::ClientConfig::default();
-	client_config.tls.disable_verify = Some(true);
+	let mut client_config = moq_native::connect::Config::default();
+	client_config.tls.insecure = Some(true);
 	client_config.backend = Some(backend);
-	client_config.quic.qlog = qlog.map(Into::into);
+	let mut quic = moq_native::quic::Config::default();
+	quic.qlog = qlog.map(Into::into);
 	// Bind the client to the same address family as the server so an IPv4 dial
 	// doesn't try to egress from an IPv6 socket (and vice versa).
-	client_config.bind = client_bind.unwrap_or(bind).parse().expect("invalid bind address");
+	client_config.bind = Some(client_bind.unwrap_or(bind).parse().expect("invalid bind address"));
 
-	let client = client_config.init().expect("failed to init client");
+	let client = client_config.init(quic.clone()).expect("failed to init client");
 	let url: url::Url = format!("{scheme}://{authority}:{}{path}", addr.port()).parse().unwrap();
+	let expect_query = path.split_once('?').map(|(_, query)| query.to_string());
 
 	// ── run server and client concurrently ──────────────────────────
 	let expect_path = expect_path.map(str::to_string);
@@ -159,6 +155,7 @@ async fn connect_test(config: ConnectTest<'_>) {
 		if let Some(expect_path) = expect_path {
 			assert_eq!(request.path(), expect_path);
 		}
+		assert_eq!(request.query(), expect_query.as_deref());
 		let session = request.with_publisher(&pub_origin).ok().await?;
 
 		let _broadcast = broadcast;
@@ -169,7 +166,7 @@ async fn connect_test(config: ConnectTest<'_>) {
 	});
 
 	let client = client.with_subscriber(sub_origin);
-	let session = tokio::time::timeout(TIMEOUT, client.connect(url))
+	let (_client, connection) = tokio::time::timeout(TIMEOUT, connect_once(client, url))
 		.await
 		.expect("client connect timed out")
 		.expect("client connect failed");
@@ -204,7 +201,7 @@ async fn connect_test(config: ConnectTest<'_>) {
 
 	assert_eq!(&frame.payload[..], b"hello");
 
-	drop(session);
+	drop(connection);
 	server_handle
 		.await
 		.expect("server task panicked")
@@ -284,30 +281,30 @@ async fn mtls_test(scheme: &str, backend: moq_native::QuicBackend, reject: bool)
 
 	let pub_origin = Origin::random().produce();
 
-	let mut server_config = moq_native::ServerConfig::default();
+	let mut server_config = moq_native::listen::Config::default();
 	server_config.bind = Some("127.0.0.1:0".to_string());
 	server_config.tls.cert = vec![paths.server_cert.clone()];
 	server_config.tls.key = vec![paths.server_key.clone()];
 	server_config.tls.root = vec![paths.ca.clone()];
 	server_config.backend = Some(backend.clone());
-	server_config.quic.gso = Some(false);
-	server_config.quic.keep_alive = Some(Duration::from_secs(1));
+	// One shared tuning, handed to both roles the way a binary would.
+	let mut quic = moq_native::quic::Config::default();
+	quic.gso = Some(false);
+	quic.keep_alive = Some(Duration::from_secs(1));
 
-	let mut server = server_config.init().expect("failed to init server");
+	let server = server_config.init(quic.clone()).expect("failed to init server");
+	let mut server = server.listen().await.expect("failed to listen");
 	let addr = server.local_addr().expect("failed to get local addr");
 
-	let mut client_config = moq_native::ClientConfig::default();
+	let mut client_config = moq_native::connect::Config::default();
 	client_config.tls.root = vec![paths.ca.clone()];
 	client_config.tls.system_roots = Some(false);
 	client_config.tls.cert = Some(paths.client_cert.clone());
 	client_config.tls.key = Some(paths.client_key.clone());
 	client_config.tls.host_name = Some("localhost".to_string());
 	client_config.backend = Some(backend);
-	client_config.bind = "0.0.0.0:0".parse().unwrap();
-	client_config.quic.gso = Some(false);
-	client_config.quic.keep_alive = Some(Duration::from_secs(1));
-
-	let client = client_config.init().expect("failed to init client");
+	client_config.bind = Some("0.0.0.0:0".parse().unwrap());
+	let client = client_config.init(quic.clone()).expect("failed to init client");
 	// Dial the IP while verifying the certificate's localhost SAN. This covers
 	// the independent TLS hostname override alongside client authentication.
 	let url: url::Url = format!("{scheme}://127.0.0.1:{}", addr.port()).parse().unwrap();
@@ -327,7 +324,8 @@ async fn mtls_test(scheme: &str, backend: moq_native::QuicBackend, reject: bool)
 		Ok::<_, anyhow::Error>(has_cert)
 	});
 
-	let session = tokio::time::timeout(TIMEOUT, client.connect(url))
+	// The mTLS cases assert on the connect result itself, so keep it a `Result`.
+	let connection = tokio::time::timeout(TIMEOUT, connect_once(client, url))
 		.await
 		.expect("client connect timed out");
 
@@ -337,9 +335,9 @@ async fn mtls_test(scheme: &str, backend: moq_native::QuicBackend, reject: bool)
 		.expect("server dropped identity result");
 	assert!(has_cert, "server did not observe the client certificate");
 	if !reject {
-		session.as_ref().expect("client connect failed");
+		connection.as_ref().expect("client connect failed");
 	}
-	drop(session);
+	drop(connection);
 
 	if reject {
 		server_handle.abort();
@@ -484,7 +482,7 @@ async fn iroh_connect() {
 	let mut server_iroh_config = EndpointConfig::default();
 	server_iroh_config.enabled = Some(true);
 	let server_endpoint = server_iroh_config
-		.bind(&moq_native::quic::Client::default())
+		.bind(&moq_native::quic::Config::default())
 		.await
 		.expect("failed to bind server iroh endpoint")
 		.expect("server iroh endpoint not enabled");
@@ -496,14 +494,15 @@ async fn iroh_connect() {
 	let server_endpoint_id = server_endpoint.id();
 
 	// Server still needs a QUIC bind for init, but we'll connect via iroh
-	let mut server_config = moq_native::ServerConfig::default();
+	let mut server_config = moq_native::listen::Config::default();
 	server_config.bind = Some("[::]:0".to_string());
 	server_config.tls.generate = vec!["localhost".into()];
 
-	let mut server = server_config
-		.init()
+	let server = server_config
+		.init(Default::default())
 		.expect("failed to init server")
 		.with_iroh(server_endpoint);
+	let mut server = server.listen().await.expect("failed to listen");
 
 	// ── subscriber (client) ─────────────────────────────────────────
 	let sub_origin = Origin::random().produce();
@@ -513,16 +512,16 @@ async fn iroh_connect() {
 	let mut client_iroh_config = EndpointConfig::default();
 	client_iroh_config.enabled = Some(true);
 	let client_endpoint = client_iroh_config
-		.bind(&moq_native::quic::Client::default())
+		.bind(&moq_native::quic::Config::default())
 		.await
 		.expect("failed to bind client iroh endpoint")
 		.expect("client iroh endpoint not enabled");
 
-	let mut client_config = moq_native::ClientConfig::default();
-	client_config.tls.disable_verify = Some(true);
+	let mut client_config = moq_native::connect::Config::default();
+	client_config.tls.insecure = Some(true);
 
 	let client = client_config
-		.init()
+		.init(Default::default())
 		.expect("failed to init client")
 		.with_iroh(client_endpoint)
 		.with_iroh_addrs(server_addrs);
@@ -540,7 +539,8 @@ async fn iroh_connect() {
 		// URL, leaving the SETUP as the only place for the request target.
 		assert_eq!(request.transport(), moq_native::Transport::Iroh);
 		assert_eq!(request.url(), None);
-		assert_eq!(request.path(), "/room?jwt=abc");
+		assert_eq!(request.path(), "/room");
+		assert_eq!(request.query(), Some("jwt=abc"));
 		let session = request.with_publisher(&pub_origin).ok().await?;
 
 		let _broadcast = broadcast;
@@ -551,7 +551,7 @@ async fn iroh_connect() {
 	});
 
 	let client = client.with_subscriber(sub_origin);
-	let session = tokio::time::timeout(TIMEOUT, client.connect(url))
+	let (_client, connection) = tokio::time::timeout(TIMEOUT, connect_once(client, url))
 		.await
 		.expect("client connect timed out")
 		.expect("client connect failed");
@@ -586,7 +586,7 @@ async fn iroh_connect() {
 
 	assert_eq!(&frame.payload[..], b"hello");
 
-	drop(session);
+	drop(connection);
 	server_handle
 		.await
 		.expect("server task panicked")
@@ -712,4 +712,20 @@ async fn noq_qlog() {
 async fn quiche_qlog() {
 	let traces = qlog_test("https", moq_native::QuicBackend::Quiche).await;
 	assert!(!traces.is_empty(), "expected at least one trace");
+}
+
+/// Dial once and hand back the client with its connection.
+///
+/// These tests want a single transport, so reconnecting is off: there is nothing
+/// left to redial, and dropping the connection closes the transport because it
+/// holds the last session clone.
+///
+/// The client comes back because it owns the transport endpoint (iroh's dies with
+/// it), and the caller has to outlive the connection it just got.
+async fn connect_once(
+	client: moq_native::Client,
+	url: url::Url,
+) -> moq_native::Result<(moq_native::Client, moq_native::Connection)> {
+	let connection = client.clone().with_reconnect(false).connect(url).established().await?;
+	Ok((client, connection))
 }

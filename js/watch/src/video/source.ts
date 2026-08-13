@@ -1,6 +1,5 @@
 import type * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
-import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
 
@@ -38,6 +37,11 @@ export type SourceInput = {
 	// A function that checks if a video configuration can be played. Renditions that fail the
 	// probe are filtered out. Nothing is selected until one is provided.
 	supported: Getter<Supported | undefined>;
+
+	// The connection's PROBE estimates, used to auto-select a rendition when the target has no
+	// explicit bitrate. Usually wired from a `Connection.Shared`'s or `Reload`'s `probe`.
+	// Optional: without it auto-selection falls back to the preference order alone.
+	probe: Getter<Moq.Connection.Probe | undefined>;
 };
 
 type SourceOutput = {
@@ -50,9 +54,6 @@ type SourceOutput = {
 	// The name of the active rendition.
 	track: Signal<string | undefined>;
 	config: Signal<Catalog.VideoConfig | undefined>;
-
-	// The per-rendition jitter (ms) to add to the sync buffer. Wired into Sync by the parent.
-	jitter: Signal<Moq.Time.Milli | undefined>;
 };
 
 /**
@@ -220,7 +221,6 @@ export class Source {
 		error: new Signal<SourceError | undefined>(undefined),
 		track: new Signal<string | undefined>(undefined),
 		config: new Signal<Catalog.VideoConfig | undefined>(undefined),
-		jitter: new Signal<Moq.Time.Milli | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -231,6 +231,7 @@ export class Source {
 			broadcast: getter(props?.broadcast),
 			target: getter(props?.target),
 			supported: getter(props?.supported),
+			probe: getter(props?.probe),
 		};
 
 		this.#signals.run(this.#runCatalog.bind(this));
@@ -261,16 +262,25 @@ export class Source {
 		effect.spawn(async () => {
 			const available: Record<string, Catalog.VideoConfig> = {};
 
+			// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
+			// waits for the tasks it spawned, so an unraced probe would hold the next run shut
+			// for good. Captured here so it stays this run's promise once we start awaiting.
+			const cancelled = effect.cancel.then(() => undefined);
+
 			for (const [name, config] of Object.entries(renditions)) {
-				let isSupported = false;
+				let isSupported: boolean | undefined = false;
 				try {
-					isSupported = await supported(config);
+					isSupported = await Promise.race([supported(config), cancelled]);
 				} catch (err) {
 					console.warn(
 						`[Source] video rendition ${name} (${config.codec}) support probe failed; treating as unsupported`,
 						err,
 					);
 				}
+
+				// Torn down: stop probing and publish nothing, since the rerun redoes this.
+				if (effect.abort.aborted) return;
+
 				if (isSupported) available[name] = config;
 			}
 
@@ -296,16 +306,13 @@ export class Source {
 			const config = available[target.name];
 			effect.set(this.#out.track, target.name);
 			effect.set(this.#out.config, config);
-			effect.set(this.#out.jitter, config.jitter !== undefined ? Time.Milli(config.jitter) : undefined);
 			return;
 		}
 
 		// Auto-select: use recv bandwidth if no explicit bitrate target.
 		let effectiveTarget = target;
 		if (!target?.bitrate) {
-			const broadcast = effect.get(this.in.broadcast);
-			const connection = broadcast ? effect.get(broadcast.in.connection) : undefined;
-			const estimate = connection && effect.get(connection.probe).estimatedRecvRate;
+			const estimate = effect.get(this.in.probe)?.estimatedRecvRate;
 			if (estimate != null) {
 				// Apply a safety margin (80%) to avoid oscillation.
 				const safeBitrate = Math.round(estimate * 0.8);
@@ -320,10 +327,6 @@ export class Source {
 
 		effect.set(this.#out.track, selected);
 		effect.set(this.#out.config, config);
-
-		// Use catalog jitter if available, otherwise estimate from framerate.
-		const jitter = config.jitter ?? (config.framerate ? Math.ceil(1000 / config.framerate) : undefined);
-		effect.set(this.#out.jitter, jitter !== undefined ? Time.Milli(jitter) : undefined);
 	}
 
 	/**

@@ -39,7 +39,35 @@ async with moq.Client("https://relay.example.com") as client:
     ...
 ```
 
-`Client(url, *, tls_verify=True, tls_roots=None, tls_system_roots=None, tls_fingerprints=None, tls_cert=None, tls_key=None, bind=None, publish=None, subscribe=None)`. Use `tls_cert` and `tls_key` for mutual TLS. Without `publish` / `subscribe` an internal origin is created automatically. Pass an `OriginProducer` to share state across multiple clients.
+`Client(url, *, tls_verify=True, tls_roots=None, tls_system_roots=None, tls_fingerprints=None, tls_cert=None, tls_key=None, bind=None, reconnect=True, backoff=None, publish=None, subscribe=None)`. Use `tls_cert` and `tls_key` for mutual TLS. Without `publish` / `subscribe` an internal origin is created automatically. Pass an `OriginProducer` to share state across multiple clients.
+
+The session automatically reconnects with backoff when the transport drops (a relay restart, a laptop waking from sleep), and broadcasts consumed through it ride out the gap. Pass `reconnect=False` for a one-shot dial, or `backoff=moq.Backoff(initial_ms=500, multiplier=2, max_ms=10_000, timeout_ms=0)` to tune the pacing (`timeout_ms=0` retries forever). Observe the transitions with `Session.status()`:
+
+```python
+while True:
+    status = await client.session.status()  # CONNECTED / DISCONNECTED / MIGRATING
+```
+
+`Session.closed()` resolves only when the connection stops for good: it raises the terminal error when the retries are exhausted, and returns normally after a local shutdown.
+
+Inspect a server request's logical endpoint before accepting it with the query-free `request.path`. It is consistent across transports and returns `""` for the root or missing path. `request.query` returns the encoded query and may contain credentials:
+
+```python
+import asyncio
+
+active = set()
+async with moq.Server("127.0.0.1:4443", tls_generate=["localhost"]) as server:
+    async for request in server:
+        if request.path == "/admin":
+            await request.reject(403)
+            continue
+        session = await request.accept()
+        closed = asyncio.create_task(session.closed())
+        active.add(closed)
+        closed.add_done_callback(active.discard)
+
+await asyncio.gather(*active, return_exceptions=True)
+```
 
 A server can reject the connection on auth grounds: `moq.Error.Unauthorized` (HTTP 401) or `moq.Error.Forbidden` (HTTP 403). These are terminal, so handle them separately from a transient transport failure rather than reconnecting. `moq.is_auth(err)` catches both:
 
@@ -70,6 +98,32 @@ broadcast.finish()
 ```
 
 Supported codec formats include `opus`, `avc3`, `hev1`, `av01`, `vp09`, and others. See [`hang`](/lib/rs/crate/hang) for the full list.
+
+### Publishing raw media
+
+`publish_media` above takes frames you already encoded. To hand over raw pixels or PCM instead and let the codec run inside the bindings, use `publish_video` / `publish_audio`. Pixel format, resolution, and framerate are fixed at publish time, so each frame carries only its pixels and a timestamp:
+
+```python
+video = broadcast.publish_video(
+    moq.VideoEncoderInput(
+        format=moq.VideoPixelFormat.RGBA,
+        width=1280,
+        height=720,
+        framerate=30,
+    ),
+    moq.VideoEncoderOutput(
+        codec=moq.VideoCodec.H264,
+        kind=moq.VideoEncoderKind.AUTO(),
+    ),
+)
+
+video.write(moq.VideoFrame(timestamp_us=pts_us, data=rgba))
+video.finish()
+```
+
+`VideoEncoderKind.AUTO()` prefers a hardware encoder and falls back to software; `SOFTWARE()`, `HARDWARE()`, and `NAMED("videotoolbox")` pin the choice (each variant is a class, so call it). The bindings compile VideoToolbox (macOS), Media Foundation (Windows), and openh264 (software, everywhere); the Linux hardware codecs are a libmoq-only build option. `set_bitrate` retunes the live encoder without forcing a keyframe, cheap enough to drive from a congestion controller.
+
+The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition appears once the first keyframe is encoded, so subscribers discover it through the catalog rather than a name you pick. `cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `gop` frames on its own, and each of those cuts a group.
 
 `publish_media` fills the catalog by parsing the codec bitstream. For a video format you can pass a `VideoHint` to supply fields the stream can't reveal (such as `bitrate`), or to publish the catalog before the first keyframe:
 

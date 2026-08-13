@@ -330,7 +330,7 @@ impl Consume {
 		&mut self,
 		catalog: Id,
 		index: usize,
-		latency: std::time::Duration,
+		latency: moq_mux::Latency,
 		on_frame: OnStatus,
 	) -> Result<Id, Error> {
 		let consume = self.catalog.get(catalog).ok_or(Error::CatalogNotFound)?;
@@ -382,7 +382,7 @@ impl Consume {
 		&mut self,
 		catalog: Id,
 		index: usize,
-		latency: std::time::Duration,
+		latency: moq_mux::Latency,
 		on_frame: OnStatus,
 	) -> Result<Id, Error> {
 		let consume = self.catalog.get(catalog).ok_or(Error::CatalogNotFound)?;

@@ -298,7 +298,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			let timescale = moq_net::Timescale::new(trak.mdia.mdhd.timescale as u64)?;
 			let track = self.broadcast.create_track(
 				self.broadcast.unique_name(suffix),
-				moq_net::track::Info::default().with_timescale(timescale),
+				self.catalog.track_info().with_timescale(timescale),
 			)?;
 
 			// Enroll every track in the broadcast's timeline: passthrough writes groups by hand
@@ -512,18 +512,13 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				// The descriptor's bitrate is optional: a 0 means "unknown", so leave the field unset
 				// and let the frame-size detector fill it instead of publishing a bogus 0.
 				let bitrate = desc.avg_bitrate.max(desc.max_bitrate);
-				let profile = desc.dec_specific.profile;
+				let dec_specific = desc.dec_specific.as_ref().ok_or(Error::MissingDecoderSpecific)?;
+				let profile = dec_specific.profile;
 				let sample_rate = mp4a.audio.sample_rate.integer() as u32;
 				let channel_count = mp4a.audio.channel_count as u32;
 
-				// Build the AudioSpecificConfig (ISO 14496-3 §1.6.2.1)
-				// This is what GStreamer/WebCodecs need as codec_data.
-				let description = crate::codec::aac::Config {
-					profile,
-					sample_rate,
-					channel_count,
-				}
-				.encode();
+				// Keep the complete AudioSpecificConfig so SBR/PS extensions reach the decoder.
+				let description = bytes::Bytes::copy_from_slice(&dec_specific.raw);
 
 				let mut config = AudioConfig::new(AAC { profile }, sample_rate, channel_count);
 				if bitrate > 0 {

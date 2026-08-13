@@ -8,8 +8,6 @@
 //! until the first keyframe so the backend never sees a delta frame it can't
 //! decode.
 
-use std::time::Duration;
-
 use bytes::Bytes;
 use hang::catalog::{AV1, VideoCodec, VideoConfig};
 use moq_mux::codec::{annexb, h264, h265};
@@ -44,10 +42,12 @@ pub enum Kind {
 pub struct Config {
 	/// Which backend to use.
 	pub kind: Kind,
-	/// Upper bound on buffering before a stalled group is skipped. `None` uses
-	/// the moq-mux default (skip aggressively); set it to your playout buffer for
-	/// a softer skip. Forwarded to the container consumer's `with_latency`.
-	pub latency_max: Option<Duration>,
+	/// How far playback may drift from the live edge before a stalled group is
+	/// skipped. Defaults to [`Latency::REAL_TIME`](moq_mux::Latency::REAL_TIME)
+	/// (skip aggressively); set [`Latency::max`](moq_mux::Latency::max) to your
+	/// playout buffer for a softer skip. Forwarded to
+	/// [`moq_mux::container::Consumer::with_latency`].
+	pub latency: moq_mux::Latency,
 	/// Ask the decoder to emit frames at this size (both dimensions even) instead
 	/// of the stream's native one. Best effort: a hardware decoder with a
 	/// built-in scaler (NVDEC) honors it for free, other backends ignore it.
@@ -57,7 +57,7 @@ pub struct Config {
 }
 
 impl Config {
-	/// A default config: automatic backend selection, default latency.
+	/// A default config: automatic backend selection, real-time latency.
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -637,6 +637,66 @@ mod tests {
 				"re-encoded frame {i} came back as luma {luma}, expected about {want}"
 			);
 		}
+	}
+
+	/// The multi-rung transcode path stays on hardware through decode, resize, and
+	/// encode: the Direct3D11 video processor scales the decoded texture on its own
+	/// device and the encoder MFT reads the result in place. The residency
+	/// assertion catches a CPU fallback even when the pixels and dimensions still
+	/// look right, which is what a ladder pays for once per rung.
+	#[cfg(target_os = "windows")]
+	#[test]
+	#[ignore = "explicit live-DXVA GPU probe; VideoProcessorBlt can hang on affected drivers"]
+	fn mediafoundation_resized_texture_reencodes_in_place() {
+		let target = crate::Size::new(160, 120);
+		let resize = crate::resize::Config {
+			acceleration: crate::resize::Acceleration::Gpu,
+			..Default::default()
+		};
+		let Some((decoded, _decoder)) = decode_levels(3, gray_size()) else {
+			return;
+		};
+		let Some(device) = decoded.iter().find_map(|frame| match &frame.surface {
+			Surface::Texture(texture) => Some(texture.device()),
+			_ => None,
+		}) else {
+			panic!("Media Foundation decode did not return a Direct3D11 texture");
+		};
+		if !crate::frame::d3d11::supports_nv12_render_target(device) {
+			eprintln!("skipping: driver cannot render to NV12");
+			return;
+		}
+		let resized: Vec<_> = decoded
+			.iter()
+			.map(|frame| frame.resize_with(target, &resize).unwrap())
+			.collect();
+		for frame in &resized {
+			assert_eq!(frame.size(), target);
+			assert!(
+				matches!(frame.surface, Surface::Texture(_)),
+				"Direct3D11 resize downloaded to the CPU"
+			);
+		}
+
+		let encoder = Encoder::new(&EncodeConfig {
+			kind: EncodeKind::Named("mediafoundation".into()),
+			..EncodeConfig::new(target.width, target.height, 30)
+		});
+		let Ok(mut encoder) = encoder else {
+			eprintln!("skipping: no Media Foundation H.264 hardware encoder available");
+			return;
+		};
+
+		let mut packets = 0;
+		for (i, out) in resized.iter().enumerate() {
+			if i == 0 {
+				encoder.keyframe();
+			}
+			packets += encoder.encode(out).unwrap().len();
+		}
+		packets += encoder.finish().unwrap().len();
+
+		assert!(packets > 0, "re-encoding resized textures produced no packets");
 	}
 
 	/// H.265 has no software encoder or decoder, so the HEVC round-trip rides the

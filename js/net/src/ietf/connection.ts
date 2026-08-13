@@ -1,9 +1,11 @@
 import { type Getter, Signal } from "@moq/signals";
-import type * as announce from "../announced.ts";
+import * as announce from "../announced.ts";
 import type * as broadcast from "../broadcast.ts";
 import type { Established } from "../connection/established.ts";
 import { type Probe, type Stats, transportStats } from "../connection/stats.ts";
 import { type Transport, transportOf } from "../connection/transport.ts";
+import { error, fromClose } from "../error.ts";
+import type { Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
 import { type Reader, Readers, type Stream } from "../stream.ts";
 import { ControlStreamAdapter, NativeSession, type Session } from "./adapter.ts";
@@ -72,6 +74,7 @@ export class Connection implements Established {
 		version,
 		client,
 		discovery = true,
+		publish,
 	}: {
 		url: URL;
 		quic: WebTransport;
@@ -81,6 +84,8 @@ export class Connection implements Established {
 		/** Whether this peer initiated the session, selecting the even request-ID space. */
 		client: boolean;
 		discovery?: boolean;
+		/** The origin whose broadcasts are served to the peer. Omit to publish nothing. */
+		publish?: OriginConsumer;
 	}) {
 		this.url = url;
 		this.discovery = discovery;
@@ -103,7 +108,7 @@ export class Connection implements Established {
 			});
 		}
 
-		this.#publisher = new Publisher(this.#quic, this.#session);
+		this.#publisher = new Publisher(this.#quic, this.#session, publish);
 		this.#subscriber = new Subscriber(this.#session);
 
 		void this.#run();
@@ -144,15 +149,6 @@ export class Connection implements Established {
 	}
 
 	/**
-	 * Publishes a broadcast to the connection.
-	 * @param name - The broadcast path to publish
-	 * @param broadcast - The broadcast to publish
-	 */
-	publish(path: Path.Valid, producer: broadcast.Producer) {
-		this.#publisher.publish(path, producer);
-	}
-
-	/**
 	 * Gets an announced reader for the specified prefix.
 	 * @param prefix - The prefix for announcements
 	 * @returns An Announced instance
@@ -172,6 +168,16 @@ export class Connection implements Established {
 	 */
 	consume(path: Path.Valid): broadcast.Consumer {
 		return this.#subscriber.consume(path);
+	}
+
+	/**
+	 * Watches a broadcast, live only while it is announced.
+	 *
+	 * @param path - The path of the broadcast to watch
+	 * @returns A reactive handle to the broadcast
+	 */
+	announcedBroadcast(path: Path.Valid): announce.Broadcast {
+		return new announce.Broadcast({ connection: this, path });
 	}
 
 	/**
@@ -295,11 +301,8 @@ export class Connection implements Established {
 		}
 	}
 
-	/**
-	 * Returns a promise that resolves when the connection is closed.
-	 * @returns A promise that resolves when closed
-	 */
-	get closed(): Promise<void> {
-		return this.#quic.closed.then(() => undefined);
+	/** Resolves when the session closes, decoding the peer's close code; see {@link Established.closed}. */
+	get closed(): Promise<Error | null> {
+		return this.#quic.closed.then(fromClose, (err: unknown) => error(err));
 	}
 }

@@ -9,6 +9,8 @@ Relays can be joined together to proxy announcements and subscriptions between e
 
 A broadcast carries a small hop list as it travels. Each relay it passes through adds itself to the list, which is how loops are caught and how the network picks the shortest path when there's more than one. When two paths are the same length, every relay breaks the tie the same way (a hash of the broadcast name and hop list), so the whole cluster converges on one route instead of flapping between equals.
 
+Both wire protocols carry this. `moq-lite` has the hop list and route cost in its announcements natively; `moq-transport` gets them from the [MoQ Cluster extension](/draft/moq-cluster), negotiated per session on `moqt-17` and later. A peer that doesn't speak the extension still works, it just contributes no path or price of its own.
+
 ## Topology
 
 Each relay lists the peers it wants to dial in `cluster.connect`. That's it; the topology is whatever you draw with those links. Each peer is a full URL (e.g. `https://us-east.example.com/`); a bare host or `host:port` is deprecated but still accepted, and is wrapped in `https://.../` with a warning.
@@ -35,7 +37,7 @@ Pick the shape that matches your traffic. Linear chains are great for fanout; sm
 
 ## Link costs
 
-Hop counting treats every link the same, but links rarely cost the same: traffic between two relays in one datacenter is free, while a metered backbone bills per byte. On `moq-lite-06` (still work-in-progress and opt-in via `--version`), announcements carry a route cost so relays can route by price instead of distance.
+Hop counting treats every link the same, but links rarely cost the same: traffic between two relays in one datacenter is free, while a metered backbone bills per byte. Announcements carry a route cost so relays can route by price instead of distance, on `moq-lite-06` (still work-in-progress and opt-in via `--version`) and on `moqt-17` and later.
 
 Price a link by adding `?cost=N` to the peer URL:
 
@@ -47,7 +49,9 @@ connect = [
 ]
 ```
 
-The dialing relay declares the price during setup and both ends charge it: every announcement crossing the link adds `N` to its cost. An unpriced link costs 1, which reproduces plain hop counting. The param is consumed locally; it is never sent as part of the URL.
+`?cost=N` prices what *this* relay charges to pull a broadcast from that peer, so it steers this relay's own routing. It is also declared during setup, which tells the peer what pulling from us costs, so a link priced on one side alone still ranks the same from both. The param is consumed locally; it is never sent as part of the URL.
+
+Price is per direction. Pulling from a metered origin can cost far more than pushing to it, so each end declares its own and the two need not match; a relay that receives a price it disagrees with keeps its own `?cost=` for its own routing. An unpriced direction costs 1, which reproduces plain hop counting.
 
 The cost a relay advertises is the *marginal* cost of pulling the broadcast through it. A relay actively carrying a broadcast (a subscriber is pulling it) re-announces it at cost 0: its upstream fetch is already paid for, so a sibling should pull the warm copy over a free intra-DC link instead of opening a second metered fetch. When the last subscriber leaves, the cost decays back after a short grace period. Standby publishers (e.g. a transcoder pool) can seed a large cost so they are only selected when nothing cheaper exists, and the winner's cost drops to 0 once it starts working.
 
@@ -68,9 +72,46 @@ When two gossiping nodes discover each other, only one of them dials: the node w
 
 A relay with `node` + `mesh` and no `connect` is a passive rendezvous: it sits and waits for inbound connections, then helps everyone else find each other.
 
+### On a local network
+
+On a LAN there may be no seed peer to gossip through and no external service to
+list peers. `cluster.lan` advertises this relay over mDNS and dials the peers
+that advertise themselves back, so a rack or a home lab meshes with no seed list
+at all:
+
+```toml
+[cluster]
+node = "us-west.local:4443"
+
+[cluster.lan]
+enabled = true
+secret  = "/etc/moq/cluster.key"
+```
+
+mDNS only replaces *how peers find each other*. They are dialed at their `node`
+URL and authenticate with `cluster.token` exactly like a gossiped or
+`connect_api` peer, the same tiebreaker decides which side dials, and the same
+dial map means a peer found two ways still opens one session. `lan.enabled`
+without `node` is an error, since there'd be no address to advertise.
+
+`lan.secret` is required rather than optional, and every peer needs the same
+value (`openssl rand -hex 32 > cluster.key`). mDNS is an open channel: anyone on
+the network can advertise, including an attacker naming a URL it controls. Since
+the relay attaches `cluster.token` to any peer it dials, an unauthenticated
+advertisement would be enough to collect that token. So each advertisement
+carries a proof of key possession, bound to the record it travels in so it
+cannot be copied into someone else's, and a relay only dials peers whose proof
+verifies.
+
+Startup waits for the mesh to come up before the relay reports itself ready
+(`READY=1` under systemd), so a bad key, a missing `node`, or a host where
+multicast is blocked fails the relay rather than releasing the units that depend
+on it. One working interface is enough: a down VPN adapter or a container bridge
+with multicast off doesn't hold startup back.
+
 ## Origin id
 
-Each relay has an origin id: the value it adds to a broadcast's hop list for loop detection and shortest-path routing. By default a fresh random id is picked on every start, which is fine for loop detection but means a relay looks like a brand-new node each time it restarts.
+Each relay has an origin id: the value it adds to a broadcast's hop list for loop detection and shortest-path routing. On `moq-lite`, and on a `moqt-17`-or-later session that negotiated the cluster extension, each end declares it at setup so the other can avoid announcing (or serving) a path that already flows through it. Older sessions carry no identity, so a peer only has one if you assign it. By default a fresh random id is picked on every start, which is fine for loop detection but means a relay looks like a brand-new node each time it restarts.
 
 Set `cluster.id` to pin a stable id across restarts:
 
@@ -108,10 +149,16 @@ If a fetch fails or returns garbage, the relay logs and keeps the last good list
 
 Cluster peers must authenticate to each other:
 
-- **mTLS** (recommended). Set `tls.root` to the CA that signed the cluster certificates. Inbound connections presenting a valid client cert are granted full access; outbound dials use `client.tls.cert` / `client.tls.key`.
+- **mTLS** (recommended). Set `tls.root` to the CA that signed the cluster certificates. Inbound connections presenting a valid client cert are granted full access; outbound dials use `connect.tls.cert` / `connect.tls.key`.
 - **JWT**. For static `connect` peers, supply the token inline as a `?jwt=` query parameter on the URL. For gossip- and `connect_api`-discovered peers (whose addresses can't carry an inline token), set `cluster.token` to a file holding the JWT; it's presented on any dial whose URL has no inline `?jwt=` (so an inline token wins per-peer). Either way the token needs broad enough scope to cover whatever paths the cluster carries.
 
 See [Authentication](/bin/relay/auth) for the full setup.
+
+Peers are redialed indefinitely, with exponential backoff and jitter so a restarting cluster doesn't
+reconnect in lockstep. That includes a peer that rejects us: a bad token logs `cluster peer error;
+will retry` on every attempt rather than giving up, so watch for a peer that never reaches
+`cluster peer session closed`. The delay escalates to ten seconds at most, so a dead or rejecting
+peer stays loudly visible in the logs and a returning one is picked up within seconds.
 
 ## Migration from older configs
 
