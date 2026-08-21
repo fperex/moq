@@ -313,11 +313,32 @@ pub struct SinkSession {
 	/// Set by [`Self::gated_bi`]. `None` parks `open_bi` itself forever, which is all
 	/// a test driving only uni streams needs.
 	bi_gate: Option<kio::Consumer<bool>>,
+	/// Set by [`Self::gated_uni`] to hold unidirectional stream writes.
+	uni_gate: Option<kio::Consumer<bool>>,
+	/// Set by [`Self::gated_open_uni`] to withhold unidirectional stream credit.
+	uni_open_gate: Option<kio::Consumer<bool>>,
+	uni_open_park: kio::Park,
+	/// The ALPN to report, for a test that needs a specific negotiated version rather
+	/// than the SETUP-negotiated fallback an absent one selects.
+	protocol: Option<&'static str>,
 }
 
 impl SinkSession {
 	pub fn new(log: Log) -> Self {
-		Self { log, bi_gate: None }
+		Self {
+			log,
+			bi_gate: None,
+			uni_gate: None,
+			uni_open_gate: None,
+			uni_open_park: kio::Park::default(),
+			protocol: None,
+		}
+	}
+
+	/// Report `protocol` as the negotiated ALPN.
+	pub fn with_protocol(mut self, protocol: &'static str) -> Self {
+		self.protocol = Some(protocol);
+		self
 	}
 
 	/// Serve bidi streams, holding every write until `gate` flips to true.
@@ -329,6 +350,34 @@ impl SinkSession {
 		Self {
 			log: Log::default(),
 			bi_gate: Some(gate),
+			uni_gate: None,
+			uni_open_gate: None,
+			uni_open_park: kio::Park::default(),
+			protocol: None,
+		}
+	}
+
+	/// Open unidirectional streams immediately, holding their writes until `gate` opens.
+	pub fn gated_uni(gate: kio::Consumer<bool>) -> Self {
+		Self {
+			log: Log::default(),
+			bi_gate: None,
+			uni_gate: Some(gate),
+			uni_open_gate: None,
+			uni_open_park: kio::Park::default(),
+			protocol: None,
+		}
+	}
+
+	/// Hold unidirectional stream opens until `gate` grants stream credit.
+	pub fn gated_open_uni(gate: kio::Consumer<bool>) -> Self {
+		Self {
+			log: Log::default(),
+			bi_gate: None,
+			uni_gate: None,
+			uni_open_gate: Some(gate),
+			uni_open_park: kio::Park::default(),
+			protocol: None,
 		}
 	}
 }
@@ -361,8 +410,18 @@ impl poll::Session for SinkSession {
 		Poll::Ready(Ok((send, PendingRecv)))
 	}
 
-	fn poll_open_uni(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, Self::Error>> {
-		Poll::Ready(Ok(SinkSend::new(self.log.clone())))
+	fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, Self::Error>> {
+		if let Some(gate) = &self.uni_open_gate {
+			let waiter = self.uni_open_park.hold(cx);
+			match gate.poll(waiter, |open| (**open).then_some(()).map_or(Poll::Pending, Poll::Ready)) {
+				Poll::Ready(Ok(())) => {}
+				Poll::Ready(Err(_)) | Poll::Pending => return Poll::Pending,
+			}
+		}
+		Poll::Ready(Ok(match &self.uni_gate {
+			Some(gate) => SinkSend::gated(self.log.clone(), gate.clone()),
+			None => SinkSend::new(self.log.clone()),
+		}))
 	}
 
 	fn poll_send_datagram(&mut self, _cx: &mut Context<'_>, _payload: &[u8]) -> Poll<Result<(), Self::Error>> {
@@ -378,7 +437,7 @@ impl poll::Session for SinkSession {
 	}
 
 	fn protocol(&self) -> Option<&str> {
-		None
+		self.protocol
 	}
 
 	fn close(&mut self, code: u32, reason: &str) {
@@ -459,6 +518,11 @@ pub struct ScriptedSession {
 	/// Per-stream scripts popped by `open_bi` in order; `None` shares `script`
 	/// across every stream.
 	queue: Option<Arc<Mutex<std::collections::VecDeque<Vec<u8>>>>>,
+	/// Set by [`Self::gated_open`]: parks `poll_open_bi` until the gate opens, standing in
+	/// for a peer that has granted no more concurrent streams.
+	open_gate: Option<kio::Consumer<bool>>,
+	/// Keeps the gate registration alive between `poll_open_bi` calls.
+	park: kio::Park,
 }
 
 impl ScriptedSession {
@@ -468,6 +532,8 @@ impl ScriptedSession {
 			eof: false,
 			script: Arc::new(Mutex::new(script)),
 			queue: None,
+			open_gate: None,
+			park: kio::Park::default(),
 		}
 	}
 
@@ -490,6 +556,17 @@ impl ScriptedSession {
 			eof: false,
 			script: Arc::new(Mutex::new(Vec::new())),
 			queue: Some(Arc::new(Mutex::new(scripts.into_iter().collect()))),
+			open_gate: None,
+			park: kio::Park::default(),
+		}
+	}
+
+	/// Answer each stream from `scripts`, but only once the gate opens: a peer that
+	/// replies normally and is simply out of stream credit until then.
+	pub fn gated_open(scripts: Vec<Vec<u8>>, gate: kio::Consumer<bool>) -> Self {
+		Self {
+			open_gate: Some(gate),
+			..Self::per_stream(scripts)
 		}
 	}
 }
@@ -507,7 +584,19 @@ impl poll::Session for ScriptedSession {
 		Poll::Pending
 	}
 
-	fn poll_open_bi(&mut self, _cx: &mut Context<'_>) -> Poll<Result<poll::BiStreams<Self>, Self::Error>> {
+	fn poll_open_bi(&mut self, cx: &mut Context<'_>) -> Poll<Result<poll::BiStreams<Self>, Self::Error>> {
+		if let Some(gate) = self.open_gate.clone() {
+			let waiter = self.park.hold(cx);
+			// A closed gate reads as open: the test dropped the producer, so nothing is
+			// holding the stream back anymore.
+			if gate
+				.poll(waiter, |open| if **open { Poll::Ready(()) } else { Poll::Pending })
+				.is_pending()
+			{
+				return Poll::Pending;
+			}
+		}
+
 		self.log.bi_opens.fetch_add(1, Ordering::Relaxed);
 		let script = match &self.queue {
 			Some(queue) => Arc::new(Mutex::new(queue.lock().unwrap().pop_front().unwrap_or_default())),

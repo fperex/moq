@@ -176,54 +176,77 @@ export function empty(): Valid {
 
 /**
  * Normalize a relative path reference: trim leading/trailing slashes, drop empty
- * segments, and drop `.` segments (no-ops, matching POSIX). `..` is preserved and
- * only interpreted by {@link resolve}.
+ * segments, and drop redundant `.` segments. A reference made only of `.` segments
+ * normalizes to `.` because it names the base's parent, while empty names the base.
+ * `..` is preserved and only interpreted by {@link resolve}.
  *
  * Mirrors the Rust `PathRelative::new` normalization, so JS and Rust agree
  * byte-for-byte on the stored form. Two callers comparing normalized strings can
- * detect that `""`, `"."`, `"/./"` etc. all mean "no reference".
+ * detect equivalent references while preserving the distinction between `""` and `"."`.
  */
 export function normalizeRelative(rel: string): string {
-	return rel
-		.split("/")
-		.filter((s) => s !== "" && s !== ".")
-		.join("/");
+	const raw = rel.split("/");
+	const normalized = raw.filter((s) => s !== "" && s !== ".").join("/");
+
+	return normalized === "" && raw.includes(".") ? "." : normalized;
 }
 
 /**
  * Resolve a relative path reference against a base path.
  *
- * `..` segments pop the last segment of the base; other segments are appended.
- * `.` and empty segments are no-ops. An empty / normalized-empty `rel` returns the
- * base path unchanged.
+ * A non-empty reference replaces the last segment of the base, matching relative URL
+ * resolution. `..` segments then pop another segment; other segments are appended.
+ * `.` and empty segments are no-ops. Excess `..` once the base is empty is also a no-op
+ * (subsequent named segments still append). An empty `rel` returns the base unchanged.
  *
- * Returns `undefined` when a `..` has nothing left to pop, i.e. the reference walks
- * above the root and names nothing. Popping to exactly the root is fine and yields the
- * empty path, which still names a broadcast. The alternative, clamping, would silently
- * land `../../../../x` on an unrelated `x`, so the caller decides what an out-of-range
- * reference means (the hang catalog rejects such a catalog outright).
- *
- * Mirrors the Rust `Path::resolve`, used by hang catalogs to express cross-broadcast
- * track references (a rendition's `broadcast` field).
+ * Mirrors the Rust `Path::resolve`, used by hang catalogs to express
+ * cross-broadcast track references (a rendition's `broadcast` field).
  *
  * @example
  * ```typescript
- * Path.resolve(Path.from("a/b/c"), "../source"); // "a/b/source"
- * Path.resolve(Path.from("a/b"), "x/y");         // "a/b/x/y"
- * Path.resolve(Path.from("a/b"), "./c");         // "a/b/c"
- * Path.resolve(Path.from("a"), "..");            // "" (the root)
- * Path.resolve(Path.from("a"), "../../x");       // undefined
+ * Path.resolve(Path.from("a/b/c"), "./source");  // "a/b/source"
+ * Path.resolve(Path.from("a/b"), ".");           // "a"
+ * Path.resolve(Path.from("a/b/c"), "../source"); // "a/source"
  * ```
  */
-export function resolve(base: Valid, rel: string): Valid | undefined {
+export function resolve(base: Valid, rel: string): Valid {
+	if (rel === "") return base;
+
 	const segments = base === "" ? [] : base.split("/");
+	segments.pop();
 
 	for (const seg of rel.split("/")) {
 		if (seg === "" || seg === ".") {
 			continue;
 		}
 		if (seg === "..") {
-			// Nothing left to pop: the reference walks above the root.
+			segments.pop();
+		} else {
+			segments.push(seg);
+		}
+	}
+
+	return segments.join("/") as Valid;
+}
+
+/**
+ * Resolve a relative path, returning `undefined` if it escapes above the root.
+ *
+ * Unlike {@link resolve}, this distinguishes a valid reference to the empty root
+ * path from excess `..` segments. Use it for untrusted catalog references that
+ * must not be clamped to the root.
+ */
+export function tryResolve(base: Valid, rel: string): Valid | undefined {
+	if (rel === "") return base;
+
+	const segments = base === "" ? [] : base.split("/");
+	segments.pop();
+
+	for (const seg of rel.split("/")) {
+		if (seg === "" || seg === ".") {
+			continue;
+		}
+		if (seg === "..") {
 			if (segments.pop() === undefined) return undefined;
 		} else {
 			segments.push(seg);
@@ -231,4 +254,60 @@ export function resolve(base: Valid, rel: string): Valid | undefined {
 	}
 
 	return segments.join("/") as Valid;
+}
+
+/**
+ * Express `target` relative to `base`: the inverse of {@link resolve}.
+ *
+ * The result round-trips (`resolve(base, relative(target, base)) === target`) and never
+ * walks above the root, so {@link tryResolve} accepts it too.
+ *
+ * A relative reference replaces the last segment of the base, matching relative URL
+ * resolution, so a target nested under the base repeats the base's own last segment.
+ *
+ * The empty reference names the base itself, so that is what a self-reference returns.
+ *
+ * Returns `undefined` for a target no reference can name: a path segment may literally be
+ * `.` or `..`, which resolution reads as navigation instead of as a name. Only the segments
+ * past the shared prefix matter, since the rest are never emitted.
+ *
+ * Mirrors the Rust `Path::relative`, used to author the cross-broadcast track
+ * references a hang catalog carries. Note the argument order: the target comes first,
+ * the opposite of Node's `path.relative(from, to)`.
+ *
+ * @example
+ * ```typescript
+ * Path.relative(Path.from("a/b/c"), Path.from("a/b")); // "b/c"
+ * Path.relative(Path.from("a/c"), Path.from("a/b"));   // "c"
+ * Path.relative(Path.from("a"), Path.from("a/b"));     // "."
+ * Path.relative(Path.from("a/b"), Path.from("a/b"));   // ""
+ * Path.relative(Path.from("a/.."), Path.from("a/b"));  // undefined
+ * ```
+ */
+export function relative(target: Valid, base: Valid): string | undefined {
+	// Only the empty reference can name a base whose last segment is itself `.` or `..`,
+	// since resolution replaces that segment rather than emitting it.
+	if (target === base) return "";
+
+	// Resolution replaces the base's last segment, so walk from its parent.
+	const dir = base === "" ? [] : base.split("/");
+	dir.pop();
+
+	const parts = target === "" ? [] : target.split("/");
+
+	let common = 0;
+	while (common < dir.length && common < parts.length && dir[common] === parts[common]) {
+		common += 1;
+	}
+
+	const down = parts.slice(common);
+	// Resolution would walk on these instead of naming them.
+	if (down.some((part) => part === "." || part === "..")) return undefined;
+
+	const rel = Array(dir.length - common)
+		.fill("..")
+		.concat(down);
+
+	// An empty reference resolves to the base itself, so name the parent explicitly.
+	return rel.length === 0 ? "." : rel.join("/");
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -5,8 +6,42 @@ use base64::Engine;
 
 use super::hang::{Catalog, CatalogExt, Consumer, Extra};
 
-/// Reservation bookkeeping shared across a producer's clones and its
-/// [`Reserved`](super::Reserved) handles.
+/// Everything a catalog producer shares with its clones, under one lock.
+///
+/// One lock rather than one per concern. A name check only means anything if the catalog can't
+/// change under it: split those and two reservations of the same name both pass, which is the state
+/// that let one rendition's entry be written over and deleted by the other. Keeping the publish
+/// gate here too means a [`Guard`] never has to take a second lock while holding this one.
+struct State<E: CatalogExt> {
+	catalog: Catalog<E>,
+
+	/// The names live renditions hold, keyed by section (the [`RenditionConfig`](super::RenditionConfig)
+	/// type) and name. The section is part of the key because each writes a disjoint map: `video["v"]`
+	/// and `audio["v"]` are different renditions and neither says anything about the other.
+	owned: BTreeSet<(std::any::TypeId, String)>,
+
+	/// Gates the initial catalog publish until all reservations resolve (see
+	/// [`reserve`](Producer::reserve)).
+	reservations: Reservations,
+}
+
+/// Take the shared state, ignoring a poisoned lock.
+///
+/// A panic under this lock comes from code we hand the catalog to: a [`RenditionConfig::insert`]
+/// implementation, or serializing an extension during a publish. Neither leaves the state
+/// inconsistent (at worst the catalog is missing an entry, while `owned` and `reservations` still
+/// describe exactly what is live), so poisoning protects nothing here. It would only turn the next
+/// [`Rendition`](super::Rendition) drop into a panic during unwinding, which aborts the process.
+fn take<E: CatalogExt>(state: &Mutex<State<E>>) -> MutexGuard<'_, State<E>> {
+	state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The key a rendition name is held under: its section (the config type) plus the name.
+fn owner_key<C: 'static>(name: &str) -> (std::any::TypeId, String) {
+	(std::any::TypeId::of::<C>(), name.to_string())
+}
+
+/// The initial-publish gate, tracking the [`Reserved`](super::Reserved) handles still outstanding.
 ///
 /// The initial catalog snapshot is withheld from the broadcast until `reservers == 0`. A live
 /// `Reserved` counts as one reserver; a [`Rendition`](super::Rendition) holds its own `Reserved`
@@ -43,10 +78,7 @@ pub struct Producer<E: CatalogExt = ()> {
 	hangz: moq_json::snapshot::Producer<Catalog<E>>,
 	msf_track: moq_net::track::Producer,
 
-	current: Arc<Mutex<Catalog<E>>>,
-
-	/// Gates the initial catalog publish until all reservations resolve (see [`reserve`](Self::reserve)).
-	reservations: Arc<Mutex<Reservations>>,
+	current: Arc<Mutex<State<E>>>,
 
 	/// Shared wall clock for the broadcast's tracks. Every importer on this catalog
 	/// gets a clone (a `Copy` of the same epoch), so timestamps they synthesize when
@@ -61,8 +93,8 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// Retention override for the media tracks minted under this catalog, or `None` to keep
 	/// hang's default. Fixed at construction, so every clone and every
 	/// [`Reserved`](super::Reserved) mints tracks under one policy. See
-	/// [`Config::with_latency_max`].
-	latency_max: Option<std::time::Duration>,
+	/// [`Config::with_max_age`].
+	max_age: Option<std::time::Duration>,
 }
 
 // Manual Clone so a producer is cheaply clonable regardless of whether `E` is.
@@ -73,10 +105,9 @@ impl<E: CatalogExt> Clone for Producer<E> {
 			hangz: self.hangz.clone(),
 			msf_track: self.msf_track.clone(),
 			current: self.current.clone(),
-			reservations: self.reservations.clone(),
 			clock: self.clock,
 			timeline: self.timeline.clone(),
-			latency_max: self.latency_max,
+			max_age: self.max_age,
 		}
 	}
 }
@@ -91,14 +122,14 @@ impl<E: CatalogExt> Clone for Producer<E> {
 #[derive(Clone)]
 pub struct Config<E: CatalogExt = ()> {
 	catalog: Catalog<E>,
-	latency_max: Option<std::time::Duration>,
+	max_age: Option<std::time::Duration>,
 }
 
 impl Default for Config<()> {
 	fn default() -> Self {
 		Self {
 			catalog: Catalog::default(),
-			latency_max: None,
+			max_age: None,
 		}
 	}
 }
@@ -110,7 +141,7 @@ impl<E: CatalogExt> Config<E> {
 	pub fn with_catalog<F: CatalogExt>(self, catalog: Catalog<F>) -> Config<F> {
 		Config {
 			catalog,
-			latency_max: self.latency_max,
+			max_age: self.max_age,
 		}
 	}
 
@@ -125,8 +156,8 @@ impl<E: CatalogExt> Config<E> {
 	///
 	/// Applies to the media tracks the catalog mints. The catalog and timeline tracks keep
 	/// moq-net's default: both are read at the live edge, which is retained unconditionally.
-	pub fn with_latency_max(mut self, latency_max: impl Into<Option<std::time::Duration>>) -> Self {
-		self.latency_max = latency_max.into();
+	pub fn with_max_age(mut self, max_age: impl Into<Option<std::time::Duration>>) -> Self {
+		self.max_age = max_age.into();
 		self
 	}
 }
@@ -170,27 +201,34 @@ impl<E: CatalogExt> Producer<E> {
 		json_config.compression = true;
 		let hangz = moq_json::snapshot::Producer::new(hangz_track, json_config);
 
+		// The contents are `Send + Sync` natively; on wasm moq-net's handles are
+		// `Rc`-backed, so clippy sees a pointlessly atomic `Arc`. Keeping one type for
+		// both targets is worth the unused atomics on the single-threaded one.
+		#[allow(clippy::arc_with_non_send_sync)]
 		Ok(Self {
 			hang,
 			hangz,
 			msf_track,
-			current: Arc::new(Mutex::new(config.catalog)),
-			reservations: Arc::new(Mutex::new(Reservations::default())),
+			current: Arc::new(Mutex::new(State {
+				catalog: config.catalog,
+				owned: BTreeSet::new(),
+				reservations: Reservations::default(),
+			})),
 			clock: crate::Clock::new(),
 			timeline: crate::timeline::Producer::new(broadcast, crate::timeline::Config::default()),
-			latency_max: config.latency_max,
+			max_age: config.max_age,
 		})
 	}
 
 	/// Track properties for a media track under this catalog: hang's media defaults, plus any
-	/// [`Config::with_latency_max`] override.
+	/// [`Config::with_max_age`] override.
 	///
 	/// Chain [`with_timescale`](moq_net::track::Info::with_timescale) for a container that
 	/// carries the source's own scale (CMAF and Matroska both do).
 	pub fn track_info(&self) -> moq_net::track::Info {
 		let info = hang::container::track_info();
-		match self.latency_max {
-			Some(latency_max) => info.with_latency_max(latency_max),
+		match self.max_age {
+			Some(max_age) => info.with_max_age(max_age),
 			None => info,
 		}
 	}
@@ -213,18 +251,17 @@ impl<E: CatalogExt> Producer<E> {
 	/// [`Guard::commit`] instead to handle the error.
 	pub fn lock(&mut self) -> Guard<'_, E> {
 		Guard {
-			catalog: self.current.lock().unwrap(),
+			state: take(&self.current),
 			hang: &mut self.hang,
 			hangz: &mut self.hangz,
 			msf_track: &mut self.msf_track,
-			reservations: &self.reservations,
 			updated: false,
 		}
 	}
 
 	/// Get a snapshot of the current catalog.
 	pub fn snapshot(&self) -> Catalog<E> {
-		self.current.lock().unwrap().clone()
+		take(&self.current).catalog.clone()
 	}
 
 	/// Pace the broadcast's timeline with `config` instead of the default.
@@ -249,16 +286,33 @@ impl<E: CatalogExt> Producer<E> {
 		super::Reserved::new(self.clone())
 	}
 
+	/// Take `name` in `C`'s section for a new [`Rendition`](super::Rendition), which owns it until
+	/// the handle drops.
+	///
+	/// Errors if a live rendition already holds the name, or if the catalog already carries an entry
+	/// under it. That's what makes the rendition the only thing that writes or removes its own slot:
+	/// a lazily-configured importer (H.264 before its first SPS) has no catalog entry yet, and
+	/// without the name being held an outside write would land in the gap, be overwritten by
+	/// [`set`](super::Rendition::set), and then be deleted by the rendition's `Drop`.
+	pub(super) fn acquire<C: super::RenditionConfig<E>>(&self, name: &str) -> crate::Result<()> {
+		let mut state = take(&self.current);
+		if C::get_mut(&mut state.catalog, name).is_some() || !state.owned.insert(owner_key::<C>(name)) {
+			return Err(hang::Error::Duplicate(name.to_string()).into());
+		}
+		Ok(())
+	}
+
 	/// Register a live [`Reserved`](super::Reserved) handle.
 	pub(super) fn add_reserver(&self) {
-		self.reservations.lock().unwrap().reservers += 1;
+		take(&self.current).reservations.reservers += 1;
 	}
 
 	/// Drop a [`Reserved`](super::Reserved) handle, flushing the initial snapshot if that was the
 	/// last thing gating it.
 	pub(super) fn release_reserver(&mut self) {
 		{
-			let mut r = self.reservations.lock().unwrap();
+			let mut state = take(&self.current);
+			let r = &mut state.reservations;
 			r.reservers = r.reservers.saturating_sub(1);
 		}
 		self.flush_if_ready();
@@ -266,8 +320,10 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// Publish the buffered snapshot once, if buffering has just finished with a change staged.
 	pub(super) fn flush_if_ready(&mut self) {
-		{
-			let mut r = self.reservations.lock().unwrap();
+		// Snapshot under the lock and emit outside it, since emitting writes to the catalog tracks.
+		let catalog = {
+			let mut state = take(&self.current);
+			let r = &mut state.reservations;
 			if r.published || r.reservers != 0 {
 				return;
 			}
@@ -278,8 +334,8 @@ impl<E: CatalogExt> Producer<E> {
 			}
 			r.pending = false;
 			r.published = true;
-		}
-		let catalog = self.current.lock().unwrap().clone();
+			state.catalog.clone()
+		};
 		if let Err(err) = emit(&mut self.hang, &mut self.hangz, &mut self.msf_track, &catalog) {
 			tracing::warn!(%err, "failed to publish the catalog");
 		}
@@ -354,11 +410,10 @@ impl<E: CatalogExt> Producer<E> {
 /// mutated. That publish can fail (a closed track, or an extension that won't serialize) and only
 /// logs a warning; call [`commit`](Self::commit) instead to handle the error.
 pub struct Guard<'a, E: CatalogExt = ()> {
-	catalog: MutexGuard<'a, Catalog<E>>,
+	state: MutexGuard<'a, State<E>>,
 	hang: &'a mut moq_json::snapshot::Producer<Catalog<E>>,
 	hangz: &'a mut moq_json::snapshot::Producer<Catalog<E>>,
 	msf_track: &'a mut moq_net::track::Producer,
-	reservations: &'a Mutex<Reservations>,
 	updated: bool,
 }
 
@@ -379,7 +434,7 @@ impl<E: CatalogExt> Guard<'_, E> {
 		self.updated = false;
 
 		{
-			let mut r = self.reservations.lock().unwrap();
+			let r = &mut self.state.reservations;
 			// Withhold every emit while still buffering the initial reserved set; the mutation stays
 			// in `current` and `pending` marks it for the flush once the gate opens.
 			if !r.published && r.reservers != 0 {
@@ -390,7 +445,25 @@ impl<E: CatalogExt> Guard<'_, E> {
 			r.published = true;
 		}
 
-		emit(self.hang, self.hangz, self.msf_track, &self.catalog)
+		emit(self.hang, self.hangz, self.msf_track, &self.state.catalog)
+	}
+
+	/// Release a name taken by [`Producer::acquire`], along with the entry it owns.
+	///
+	/// Both under one lock, so an [`acquire`](Producer::acquire) never sees the rendition half-gone:
+	/// name freed with its entry still there (a spurious duplicate), or entry gone with the name
+	/// still held (a spurious refusal).
+	///
+	/// The name goes first, before any caller code. [`RenditionConfig::remove`](super::RenditionConfig::remove)
+	/// is a third-party hook that can panic, and a stranded entry is recoverable while a stranded
+	/// name is not: nothing would ever reserve it again.
+	pub(super) fn release<C: super::RenditionConfig<E>>(&mut self, name: &str, present: bool) {
+		self.state.owned.remove(&owner_key::<C>(name));
+
+		if present {
+			C::remove(&mut self.state.catalog, name);
+			self.updated = true;
+		}
 	}
 }
 
@@ -398,14 +471,14 @@ impl<E: CatalogExt> Deref for Guard<'_, E> {
 	type Target = Catalog<E>;
 
 	fn deref(&self) -> &Self::Target {
-		&self.catalog
+		&self.state.catalog
 	}
 }
 
 impl<E: CatalogExt> DerefMut for Guard<'_, E> {
 	fn deref_mut(&mut self) -> &mut Self::Target {
 		self.updated = true;
-		&mut self.catalog
+		&mut self.state.catalog
 	}
 }
 
@@ -414,7 +487,7 @@ impl Guard<'_, Extra> {
 	///
 	/// Errors if `name` collides with a reserved media section (`video`/`audio`).
 	pub fn set_section(&mut self, name: impl Into<String>, value: serde_json::Value) -> crate::Result<()> {
-		self.catalog.ext.set(name, value)?;
+		self.state.catalog.ext.set(name, value)?;
 		self.updated = true;
 		Ok(())
 	}
@@ -423,7 +496,7 @@ impl Guard<'_, Extra> {
 	///
 	/// Returns the section's previous value, or `None` if it was absent.
 	pub fn remove_section(&mut self, name: &str) -> Option<serde_json::Value> {
-		let removed = self.catalog.ext.remove(name);
+		let removed = self.state.catalog.ext.remove(name);
 		if removed.is_some() {
 			self.updated = true;
 		}
@@ -509,6 +582,7 @@ fn to_msf(catalog: &hang::Catalog) -> moq_msf::Catalog {
 		track.height = config.coded_height;
 		track.framerate = config.framerate;
 		track.bitrate = config.bitrate;
+		track.stalled = config.stalled;
 		track.init_data = init_data;
 		track.render_group = Some(1);
 		track.alt_group = if has_multiple_video { Some(1) } else { None };
@@ -570,36 +644,30 @@ mod test {
 		// Unset, a catalog mints hang's media defaults, sized so a segmented egress can serve a
 		// full playlist window rather than moq-net's live-edge default.
 		let catalog = Producer::new(&mut broadcast).unwrap();
-		assert_eq!(
-			catalog.track_info().latency_max,
-			hang::container::track_info().latency_max
-		);
-		assert!(catalog.track_info().latency_max > moq_net::track::DEFAULT_LATENCY_MAX);
+		assert_eq!(catalog.track_info().max_age, hang::container::track_info().max_age);
+		assert!(catalog.track_info().max_age > moq_net::track::DEFAULT_MAX_AGE);
 
 		// An override reaches every media track this catalog mints, and does NOT disturb the
 		// timescale hang pins (or survive a retimescale for a source-scale container).
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let config = Config::default().with_latency_max(std::time::Duration::from_secs(3));
+		let config = Config::default().with_max_age(std::time::Duration::from_secs(3));
 		let catalog = Producer::with_config(&mut broadcast, config).unwrap();
 
 		let info = catalog.track_info();
-		assert_eq!(info.latency_max, std::time::Duration::from_secs(3));
+		assert_eq!(info.max_age, std::time::Duration::from_secs(3));
 		assert_eq!(info.timescale, hang::container::TIMESCALE);
 
 		let at = info.with_timescale(moq_net::Timescale::MILLI);
-		assert_eq!(at.latency_max, std::time::Duration::from_secs(3));
+		assert_eq!(at.max_age, std::time::Duration::from_secs(3));
 		assert_eq!(at.timescale, moq_net::Timescale::MILLI);
 
 		// Every handle mints under the same policy, whatever order it was taken in: the codec
 		// paths hold a reservation and the container paths hold a clone.
 		assert_eq!(
-			catalog.reserve().track_info().latency_max,
+			catalog.reserve().track_info().max_age,
 			std::time::Duration::from_secs(3)
 		);
-		assert_eq!(
-			catalog.clone().track_info().latency_max,
-			std::time::Duration::from_secs(3)
-		);
+		assert_eq!(catalog.clone().track_info().max_age, std::time::Duration::from_secs(3));
 	}
 
 	#[test]
@@ -715,8 +783,8 @@ mod test {
 		let waiter = kio::Waiter::noop();
 
 		let reserved = catalog.reserve();
-		let mut audio = reserved.audio("audio0");
-		let mut video = reserved.video("video0");
+		let mut audio = reserved.audio("audio0").unwrap();
+		let mut video = reserved.video("video0").unwrap();
 		drop(reserved); // done reserving; both renditions still outstanding
 
 		// Audio resolves first: withheld, because video is still outstanding.
@@ -750,8 +818,8 @@ mod test {
 		let waiter = kio::Waiter::noop();
 
 		let reserved = catalog.reserve();
-		let mut audio = reserved.audio("audio0");
-		let video = reserved.video("video0");
+		let mut audio = reserved.audio("audio0").unwrap();
+		let video = reserved.video("video0").unwrap();
 		drop(reserved);
 
 		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2));
@@ -783,7 +851,7 @@ mod test {
 		// Meanwhile an eager rendition resolves and stages a catalog change. The importer keeps its
 		// rendition alive (dropping it would retire the track), so bind it.
 		let early = catalog.reserve();
-		let mut a0 = early.audio("audio0");
+		let mut a0 = early.audio("audio0").unwrap();
 		a0.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2));
 		drop(early);
 		assert!(
@@ -792,7 +860,7 @@ mod test {
 		);
 
 		// The deferred importer finally builds its rendition and resolves it.
-		let mut late = deferred.audio("audio1");
+		let mut late = deferred.audio("audio1").unwrap();
 		drop(deferred); // the importer releases its own hold; only the rendition's remains
 		assert!(matches!(consumer.poll_next(&waiter), Poll::Pending));
 		late.set(AudioConfig::new(AudioCodec::Opus, 48_000, 1));
@@ -820,6 +888,7 @@ mod test {
 		video_config.coded_width = Some(1280);
 		video_config.coded_height = Some(720);
 		video_config.bitrate = Some(6_000_000);
+		video_config.stalled = Some(true);
 		video_config.framerate = Some(30.0);
 		video_config.container = Container::Legacy;
 
@@ -850,6 +919,7 @@ mod test {
 		assert_eq!(video.height, Some(720));
 		assert_eq!(video.framerate, Some(30.0));
 		assert_eq!(video.bitrate, Some(6_000_000));
+		assert_eq!(video.stalled, Some(true));
 		assert!(video.init_data.is_none());
 		// H.264 may carry B-frames, so SAP starting type is 2 (leading pictures allowed).
 		assert_eq!(video.max_grp_sap_starting_type, Some(2));

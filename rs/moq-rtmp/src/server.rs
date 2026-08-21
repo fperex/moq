@@ -13,7 +13,7 @@
 //!   down to the player) or [`Play::reject`]. This is the egress path: a player
 //!   (VLC, ffplay, mpv) pulls `rtmp://host/<app>/<key>` and we stream it back.
 //!
-//! This mirrors `moq-native`'s `Server` / `Request`, so the gateway stays
+//! This mirrors `moq-tokio`'s `Server` / `Request`, so the gateway stays
 //! unopinionated about auth: the embedder (e.g. a relay verifying the stream key
 //! as a JWT) owns that policy.
 //!
@@ -269,7 +269,7 @@ impl Server {
 
 	/// Terminate TLS on every accepted connection, turning this into an RTMPS
 	/// listener (`rtmps://`). Pass a `rustls::ServerConfig` (e.g. from
-	/// `moq_native::tls::Listen::server_config` with an empty ALPN list), or
+	/// `moq_tokio::tls::Listen::server_config` with an empty ALPN list), or
 	/// `None` to leave it plaintext.
 	#[cfg(feature = "tls")]
 	pub fn with_tls(mut self, tls: impl Into<Option<std::sync::Arc<rustls::ServerConfig>>>) -> Self {
@@ -484,8 +484,8 @@ pub struct Publish<S = Conn> {
 	stream_key: String,
 	peer: SocketAddr,
 	/// Retention declared on the media tracks this publish mints, or `None` for hang's
-	/// own default. Override with [`with_latency_max`](Self::with_latency_max).
-	latency_max: Option<Duration>,
+	/// own default. Override with [`with_max_age`](Self::with_max_age).
+	max_age: Option<Duration>,
 }
 
 impl<S: Stream> Publish<S> {
@@ -515,8 +515,8 @@ impl<S: Stream> Publish<S> {
 	/// segmented egress (HLS/DASH) reading the broadcast downstream, which may only
 	/// advertise segments that are still fetchable. Lower it when nothing reads history
 	/// and the memory matters.
-	pub fn with_latency_max(mut self, latency_max: impl Into<Option<Duration>>) -> Self {
-		self.latency_max = latency_max.into();
+	pub fn with_max_age(mut self, max_age: impl Into<Option<Duration>>) -> Self {
+		self.max_age = max_age.into();
 		self
 	}
 
@@ -532,7 +532,7 @@ impl<S: Stream> Publish<S> {
 		// Reserve the broadcast path before telling the client the publish succeeded:
 		// if the origin refuses `path`, reject cleanly instead of accepting and then
 		// dropping the connection a moment later.
-		let mut publisher = match Publisher::new(origin, path.as_str(), self.latency_max) {
+		let mut publisher = match Publisher::new(origin, path.as_str(), self.max_age) {
 			Ok(publisher) => publisher,
 			Err(err) => {
 				tracing::warn!(peer = %self.peer, %path, %err, "rejecting RTMP publish: broadcast unavailable");
@@ -622,9 +622,9 @@ pub struct Play<S = Conn> {
 	stream_key: String,
 	peer: SocketAddr,
 	/// How long the FLV muxer waits for a stalled group before skipping to a newer
-	/// one. Defaults to [`DEFAULT_LATENCY`](crate::DEFAULT_LATENCY); override with
-	/// [`with_latency`](Self::with_latency).
-	latency: moq_mux::Latency,
+	/// one. Defaults to [`DEFAULT_MAX_AGE`](crate::DEFAULT_MAX_AGE); override with
+	/// [`with_max_age`](Self::with_max_age).
+	latency: Duration,
 	/// Enhanced-RTMP capabilities advertised by the player in its connect object.
 	capabilities: ClientCapabilities,
 }
@@ -650,11 +650,11 @@ impl<S: Stream> Play<S> {
 
 	/// Set how long the FLV muxer waits for a stalled group before skipping to a
 	/// newer one (the moq-level frame-drop latency). Defaults to
-	/// [`DEFAULT_LATENCY`](crate::DEFAULT_LATENCY). RTMP is unpaced (tags go out as
+	/// [`DEFAULT_MAX_AGE`](crate::DEFAULT_MAX_AGE). RTMP is unpaced (tags go out as
 	/// fast as the socket accepts them), so this bounds buffering, not the wire
-	/// rate. Pass [`Latency::REAL_TIME`](moq_mux::Latency::REAL_TIME) to drop stale groups
+	/// rate. Pass [`Duration::ZERO`] to drop stale groups
 	/// aggressively.
-	pub fn with_latency(mut self, latency: moq_mux::Latency) -> Self {
+	pub fn with_max_age(mut self, latency: Duration) -> Self {
 		self.latency = latency;
 		self
 	}
@@ -730,7 +730,7 @@ impl<S: Stream> Play<S> {
 		let mut export = FlvExport::new(moq_mux::Source::new(origin.consume(), path.as_str()))
 			.await
 			.map_err(|e| anyhow::anyhow!("init FLV export: {e}"))?
-			.with_latency(self.latency)
+			.with_max_age(self.latency)
 			.with_multitrack(self.capabilities.multitrack);
 
 		// Resolve the catalog and codec headers before Play.Start, too. Otherwise a
@@ -940,7 +940,7 @@ async fn accept_until_request<S: Stream>(mut stream: S, peer: SocketAddr) -> any
 							app: app_name,
 							stream_key,
 							peer,
-							latency_max: None,
+							max_age: None,
 						})));
 					}
 					// The client wants to play: hand control back to the caller.
@@ -960,7 +960,7 @@ async fn accept_until_request<S: Stream>(mut stream: S, peer: SocketAddr) -> any
 							app: app_name,
 							stream_key,
 							peer,
-							latency: crate::DEFAULT_LATENCY,
+							latency: crate::DEFAULT_MAX_AGE,
 							capabilities: client_capabilities.clone(),
 						})));
 					}
@@ -1249,9 +1249,9 @@ struct Publisher {
 impl Publisher {
 	/// Open a broadcast at `path` and prime the importer with the FLV file
 	/// header, so subsequent tags decode against an initialized demuxer.
-	fn new(origin: &origin::Producer, path: &str, latency_max: Option<Duration>) -> anyhow::Result<Self> {
+	fn new(origin: &origin::Producer, path: &str, max_age: Option<Duration>) -> anyhow::Result<Self> {
 		let mut broadcast = origin.create_broadcast(path, broadcast::Route::new().with_announce(true))?;
-		let config = moq_mux::catalog::Config::default().with_latency_max(latency_max);
+		let config = moq_mux::catalog::Config::default().with_max_age(max_age);
 		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
 		let handle = broadcast.clone();
 		let mut importer = FlvImport::new(broadcast, catalog.reserve());
@@ -1586,13 +1586,13 @@ mod tests {
 		vseq.extend_from_slice(&[0x01, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0x00, 0x04, 0x67, 0x42, 0xc0, 0x1f]);
 		vseq.extend_from_slice(&[0x01, 0x00, 0x04, 0x68, 0xce, 0x3c, 0x80]);
 
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 		let mut publisher = Publisher::new(&origin, "live/cam0", Some(Duration::from_secs(3))).unwrap();
 		publisher.push(flv::TAG_VIDEO, 0, &vseq).unwrap();
 
 		let broadcast = origin.consume().announced_broadcast("live/cam0").await.unwrap();
 		let info = broadcast.track("0.flv-v").unwrap().info().await.unwrap();
-		assert_eq!(info.latency_max, Duration::from_secs(3));
+		assert_eq!(info.max_age, Duration::from_secs(3));
 	}
 
 	/// End-to-end play: publish a real broadcast into an origin (via the FLV importer, so it
@@ -1616,7 +1616,7 @@ mod tests {
 		vframe.extend_from_slice(&[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x00]);
 
 		// Publish the broadcast at `live/cam0` by feeding synthetic FLV to the importer.
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 		let mut broadcast = origin
 			.create_broadcast("live/cam0", broadcast::Route::new().with_announce(true))
 			.unwrap();
@@ -1665,7 +1665,7 @@ mod tests {
 	async fn play_enhanced_codec_rejects_legacy_client() {
 		const VP9_KEYFRAME_320X240: &[u8] = &[0x82, 0x49, 0x83, 0x42, 0x20, 0x13, 0xf0, 0x0e, 0xf0, 0x00];
 
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 		let mut broadcast = origin
 			.create_broadcast("live/cam0", broadcast::Route::new().with_announce(true))
 			.unwrap();
@@ -1788,7 +1788,7 @@ mod tests {
 		let nalu = |b: u8| vec![0, 0, 0, 0, 0, 5, 0x65, b, 0x84, 0x21, 0x00];
 		let frames = multitrack_body(CODED_FRAMES, &[(0, nalu(0x88)), (1, nalu(0x99))]);
 
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 		let mut broadcast = origin
 			.create_broadcast("live/cam0", broadcast::Route::new().with_announce(true))
 			.unwrap();
@@ -1850,7 +1850,7 @@ mod tests {
 		let mut server = Server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
 		let addr = server.local_addr().unwrap();
 
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 		let consumer = origin.consume();
 
 		let stream = TcpStream::connect(addr).await.unwrap();
@@ -2053,7 +2053,7 @@ mod tests {
 
 	/// The same publish flow, but over TLS: prove [`Server::with_tls`] terminates
 	/// RTMPS and yields an identical [`Request`]. Gated on `tls` (RTMPS support);
-	/// the cert is generated by the `moq-native` dev-dependency.
+	/// the cert is generated by the `moq-tokio` dev-dependency.
 	#[cfg(feature = "tls")]
 	#[tokio::test]
 	async fn rtmps_accept_yields_publish_request() {
@@ -2105,7 +2105,7 @@ mod tests {
 		let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
 
 		// Server: a self-signed cert for `localhost`, fronting the RTMP listener.
-		let mut tls = moq_native::tls::Listen::default();
+		let mut tls = moq_tokio::tls::Listen::default();
 		tls.generate = vec!["localhost".to_string()];
 		let server_config = tls.server_config(vec![]).expect("build RTMPS server config");
 

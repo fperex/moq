@@ -15,9 +15,12 @@ pub enum MoqError {
 	#[error(transparent)]
 	JsonTrack(#[from] moq_json::Error),
 
+	// Native codec errors, behind the optional `audio`/`video` features.
+	#[cfg(all(feature = "audio", not(target_arch = "wasm32")))]
 	#[error(transparent)]
 	Audio(#[from] moq_audio::Error),
 
+	#[cfg(all(feature = "video", not(target_arch = "wasm32")))]
 	#[error(transparent)]
 	Video(#[from] moq_video::Error),
 
@@ -30,6 +33,8 @@ pub enum MoqError {
 	#[error(transparent)]
 	LogLevel(#[from] tracing::metadata::ParseLevelError),
 
+	// Only the native path spawns onto a runtime, so only it can fail to join.
+	#[cfg(not(target_arch = "wasm32"))]
 	#[error(transparent)]
 	Task(#[from] tokio::task::JoinError),
 
@@ -74,6 +79,11 @@ pub enum MoqError {
 	/// A route carried an invalid hop id or too many hops.
 	#[error("invalid route: {0}")]
 	InvalidRoute(String),
+
+	/// A catalog rendition named another broadcast, but this consumer came from a standalone
+	/// broadcast rather than an origin, so there is nothing to resolve the reference against.
+	#[error("unresolvable broadcast reference: {0}")]
+	UnresolvableBroadcast(String),
 
 	#[error("log: {0}")]
 	Log(String),

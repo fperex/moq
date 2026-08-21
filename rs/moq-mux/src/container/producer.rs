@@ -113,8 +113,8 @@ impl<C: Container> Producer<C> {
 	/// it, or a keyframe arrives, packing multiple samples into one container frame (e.g. a CMAF
 	/// moof+mdat). Zero (the default) flushes each frame immediately.
 	///
-	/// This is the publisher-side counterpart to the consumer's
-	/// [`Latency`](crate::Latency), and the one knob here that genuinely *adds* delay.
+	/// This is the publisher-side counterpart to the consumer's max age, and the one
+	/// knob here that genuinely *adds* delay.
 	pub fn with_buffer(mut self, duration: std::time::Duration) -> Self {
 		self.buffer_duration = duration;
 		self
@@ -398,6 +398,19 @@ mod tests {
 			.unwrap()
 	}
 
+	/// A replay window wide enough to read a whole batch back.
+	///
+	/// These tests write every group up front and only then read, which the default
+	/// [`std::time::Duration::ZERO`](std::time::Duration::ZERO) budget collapses to the live
+	/// edge: history has to be asked for.
+	fn replay() -> moq_net::track::Subscription {
+		moq_net::track::Subscription::default().with_max_age(RECORDING_MAX_AGE)
+	}
+
+	/// The media track's full retention window, so readers started after publishing
+	/// can still consume every retained group.
+	const RECORDING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
 	fn frame(timestamp_us: u64, keyframe: bool) -> Frame {
 		Frame {
 			timestamp: Timestamp::from_micros(timestamp_us).unwrap(),
@@ -544,8 +557,12 @@ mod tests {
 	/// consumer can see the break instead of inferring continuity from adjacent sequences.
 	#[tokio::test]
 	async fn discontinuity_publishes_an_empty_group() {
-		let track = track_producer("test", hang::container::track_info());
-		let consumer = track.subscribe(None);
+		// The resumed clock jumps forty minutes, so both the retention window and the
+		// drift budget have to cover it or the pre-discontinuity group reads as ancient.
+		let discontinuity_max_age = std::time::Duration::from_secs(41 * 60);
+		let info = hang::container::track_info().with_max_age(discontinuity_max_age);
+		let track = track_producer("test", info);
+		let consumer = track.subscribe(moq_net::track::Subscription::default().with_max_age(discontinuity_max_age));
 		let mut producer = Producer::new(track, Container::Legacy);
 
 		producer.write(frame(0, true)).unwrap();
@@ -581,7 +598,7 @@ mod tests {
 	#[tokio::test]
 	async fn keyframe_closes_group_immediately() {
 		let track = track_producer("test", hang::container::track_info());
-		let consumer = track.subscribe(None);
+		let consumer = track.subscribe(replay());
 		let mut producer = Producer::new(track, Container::Legacy);
 
 		producer.write(frame(0, true)).unwrap(); // first frame must be a keyframe
@@ -600,7 +617,7 @@ mod tests {
 	#[tokio::test]
 	async fn needs_keyframe_drives_audio_grouping() {
 		let track = track_producer("test", hang::container::track_info());
-		let consumer = track.subscribe(None);
+		let consumer = track.subscribe(replay());
 		let mut producer = Producer::new(track, Container::Legacy);
 
 		// Drive grouping off `needs_keyframe`, as the audio importers do: the first frame of each
@@ -624,7 +641,7 @@ mod tests {
 	#[tokio::test]
 	async fn cut_closes_immediately() {
 		let track = track_producer("test", hang::container::track_info());
-		let consumer = track.subscribe(None);
+		let consumer = track.subscribe(replay());
 		let mut producer = Producer::new(track, Container::Legacy);
 
 		producer.write(frame(0, true)).unwrap();
@@ -642,7 +659,7 @@ mod tests {
 	#[allow(deprecated)]
 	async fn deprecated_finish_group_still_closes() {
 		let track = track_producer("test", hang::container::track_info());
-		let consumer = track.subscribe(None);
+		let consumer = track.subscribe(replay());
 		let mut producer = Producer::new(track, Container::Legacy);
 
 		producer.write(frame(0, true)).unwrap();
@@ -677,7 +694,7 @@ mod tests {
 	#[tokio::test]
 	async fn seek_uses_explicit_sequence() {
 		let track = track_producer("test", hang::container::track_info());
-		let consumer = track.subscribe(None);
+		let consumer = track.subscribe(replay());
 		let mut producer = Producer::new(track, Container::Legacy);
 
 		producer.write(frame(0, true)).unwrap(); // seq 0
@@ -692,7 +709,7 @@ mod tests {
 	#[tokio::test]
 	async fn seek_clears_pending_after_use() {
 		let track = track_producer("test", hang::container::track_info());
-		let consumer = track.subscribe(None);
+		let consumer = track.subscribe(replay());
 		let mut producer = Producer::new(track, Container::Legacy);
 
 		producer.seek(5).unwrap();

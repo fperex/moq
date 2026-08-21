@@ -58,7 +58,7 @@ pub struct Listen {
 pub async fn listen_import(target: ImportTarget, listen: Listen) -> anyhow::Result<()> {
 	let publisher = scope_producer(&target.origin, &target.name)?;
 	let mut config = server_config(&listen);
-	config.latency_max = target.latency_max;
+	config.max_age = target.max_age;
 	let server = moq_rtc::Server::new(config, publisher, target.origin.consume());
 	serve(server.publish_router(), "WHIP", listen).await
 }
@@ -70,7 +70,7 @@ pub async fn listen_export(origin: moq_net::origin::Consumer, name: String, list
 		.with_context(|| format!("failed to scope origin to broadcast `{name}`"))?;
 	// A WHEP server only reads; it still needs a publisher handle for the shared
 	// glue, so hand it an unused, empty Origin producer.
-	let publisher = moq_net::Origin::random().produce();
+	let publisher = moq_tokio::origin::spawn(moq_net::Origin::random());
 	let server = moq_rtc::Server::new(server_config(&listen), publisher, subscriber);
 	serve(server.subscribe_router(), "WHEP", listen).await
 }
@@ -94,7 +94,7 @@ pub async fn connect_import(target: ImportTarget, url: Url) -> anyhow::Result<()
 	notify_ready();
 
 	let mut config = moq_rtc::client::Config::default();
-	config.latency_max = target.latency_max;
+	config.max_age = target.max_age;
 	let client = moq_rtc::Client::new(config);
 	Ok(client.subscribe(url, producer).await?)
 }
@@ -127,7 +127,7 @@ async fn serve(router: axum::Router, role: &str, listen: Listen) -> anyhow::Resu
 		.cors
 		.layer([Method::POST, Method::PATCH, Method::DELETE, Method::OPTIONS])?;
 	let app = router.layer(cors);
-	let listener = moq_native::bind::tcp(listen.addr)?;
+	let listener = moq_tokio::bind::tcp(listen.addr)?;
 
 	tracing::info!(listen = %listen.addr, role, "serving WebRTC");
 	notify_ready();

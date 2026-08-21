@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import * as Moq from "@moq/net";
 import { Origin, Path } from "@moq/net";
-import { Effect } from "@moq/signals";
+import { Effect, Signal } from "@moq/signals";
 import { Broadcast } from "./broadcast";
 
 // A real origin with local broadcasts at the given paths. Resolution is proven by
@@ -36,15 +36,25 @@ function withoutWarnings<T>(fn: () => T): T {
 	}
 }
 
+const settle = async (): Promise<void> => {
+	for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+};
+
+const videoRenditions = (source: Broadcast): string[] =>
+	Object.keys(source.out.catalog.peek()?.video?.renditions ?? {}).sort();
+
+const video = (codec: string, broadcast?: string): Catalog.VideoConfig =>
+	({ codec, container: { kind: "legacy" }, broadcast }) as Catalog.VideoConfig;
+
 describe("relativeBroadcast", () => {
 	it("resolves a legal reference against the origin", () => {
-		const { source, owner } = broadcast("a/b", ["a/b", "a/source", "a/b/sub"]);
+		const { source, owner } = broadcast("a/b", ["a/b", "a/source", "a/sub"]);
 		const effect = new Effect();
 		try {
-			expect(source.relativeBroadcast(effect, "../source")).toBeDefined();
+			expect(source.relativeBroadcast(effect, "./source")).toBeDefined();
 			expect(source.relativeBroadcast(effect, "sub")).toBeDefined();
 			// Nothing routes an unpublished sibling, so the reference stays pending.
-			expect(source.relativeBroadcast(effect, "../missing")).toBeUndefined();
+			expect(source.relativeBroadcast(effect, "./missing")).toBeUndefined();
 		} finally {
 			effect.close();
 			source.close();
@@ -59,11 +69,11 @@ describe("relativeBroadcast", () => {
 			// Clamping would subscribe to an unrelated `x` instead of dropping the rendition;
 			// `x` is published, so a defined result here would prove the clamp bug.
 			withoutWarnings(() => {
-				expect(source.relativeBroadcast(effect, "../../../x")).toBeUndefined();
-				expect(source.relativeBroadcast(effect, "../../../..")).toBeUndefined();
+				expect(source.relativeBroadcast(effect, "../../x")).toBeUndefined();
+				expect(source.relativeBroadcast(effect, "../..")).toBeUndefined();
 			});
 			// Popping to exactly the root stops at it, and the root still names a broadcast.
-			expect(source.relativeBroadcast(effect, "../..")).toBeDefined();
+			expect(source.relativeBroadcast(effect, "..")).toBeDefined();
 		} finally {
 			effect.close();
 			source.close();
@@ -96,8 +106,8 @@ describe("relativeBroadcast", () => {
 		// and serving the rest would hide a publisher bug behind a track that never fills.
 		const { source, owner } = manual({
 			good: rendition(),
-			sibling: rendition("../source"),
-			bad: rendition("../../../x"),
+			sibling: rendition("./source"),
+			bad: rendition("../../x"),
 		});
 
 		const error = console.error;
@@ -120,7 +130,7 @@ describe("relativeBroadcast", () => {
 			format: "vtt",
 			role: "subtitle",
 			container: { kind: "legacy" },
-			broadcast: "../../../x",
+			broadcast: "../../x",
 		} as Catalog.TextConfig;
 		const { source, owner } = manualCatalog({
 			video: { renditions: { good: rendition() } },
@@ -142,8 +152,8 @@ describe("relativeBroadcast", () => {
 	it("accepts a catalog whose references stay within the root", async () => {
 		const { source, owner } = manual({
 			good: rendition(),
-			sibling: rendition("../source"),
-			root: rendition("../.."),
+			sibling: rendition("./source"),
+			root: rendition(".."),
 		});
 
 		try {
@@ -166,7 +176,7 @@ describe("relativeBroadcast", () => {
 			expect(own).toBeDefined();
 			expect(source.relativeBroadcast(effect, undefined)).toBe(own);
 			expect(source.relativeBroadcast(effect, "")).toBe(own);
-			expect(source.relativeBroadcast(effect, "../b")).toBe(own);
+			expect(source.relativeBroadcast(effect, "./b")).toBe(own);
 		} finally {
 			effect.close();
 			source.close();
@@ -189,7 +199,6 @@ describe("blind resolution", () => {
 			catalogFormat: "manual",
 		});
 
-		const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 		await settle();
 
 		// Stand in for a session's serving loop answering the request.
@@ -210,5 +219,70 @@ describe("blind resolution", () => {
 		source.close();
 		owner.close();
 		await settle();
+	});
+});
+
+describe("cross-broadcast renditions", () => {
+	it("hides a rendition until its broadcast is announced", async () => {
+		// A transcoder under `public/` referencing a source under `private/`: a viewer scoped to
+		// `public/` is never told the source exists, and selecting it would render nothing.
+		const owner = new Origin.Producer();
+		const source = new Broadcast({
+			origin: owner,
+			name: Path.from("public/transcode.hang"),
+			enabled: true,
+			catalogFormat: "manual",
+			catalog: {
+				video: {
+					renditions: {
+						local: video("avc1.64001e"),
+						remote: video("avc1.640028", "../private/source"),
+					},
+				},
+			} as Catalog.Root,
+		});
+
+		try {
+			await settle();
+			expect(videoRenditions(source)).toEqual(["local"]);
+
+			// The source is announced, so it becomes usable without a new catalog.
+			const published = owner.publish(Path.from("private/source"));
+			await settle();
+			expect(videoRenditions(source)).toEqual(["local", "remote"]);
+
+			// ...and withdrawn again when it goes away.
+			published.close();
+			await settle();
+			expect(videoRenditions(source)).toEqual(["local"]);
+		} finally {
+			source.close();
+			owner.close();
+		}
+	});
+});
+
+describe("manual catalog", () => {
+	it("republishes a manual catalog mutated in place", async () => {
+		const owner = new Origin.Producer();
+		const catalog = new Signal<Catalog.Root>({
+			video: { renditions: { one: video("avc1.64001e") } },
+		} as Catalog.Root);
+		const source = new Broadcast({ origin: owner, enabled: true, catalogFormat: "manual", catalog });
+
+		try {
+			await settle();
+			expect(videoRenditions(source)).toEqual(["one"]);
+
+			// The input is a signal the caller owns, so it can be updated in place.
+			catalog.mutate((c) => {
+				if (c.video) c.video.renditions.two = video("avc1.640028");
+			});
+			await settle();
+			expect(videoRenditions(source)).toEqual(["one", "two"]);
+		} finally {
+			source.close();
+			owner.close();
+		}
 	});
 });

@@ -12,7 +12,7 @@ export type BroadcastInput = {
 	// origin announce the broadcast, and it survives their reconnects.
 	origin: Getter<Moq.Origin.Table | undefined>;
 
-	// Whether to publish the broadcast. Defaults to false so nothing is announced until ready.
+	// Whether to publish the broadcast. Defaults to true.
 	enabled: Getter<boolean>;
 
 	// The broadcast name.
@@ -34,7 +34,7 @@ export type BroadcastInput = {
 	 * A retention budget, not a delivery one, so lowering it does not reduce latency: it only
 	 * shortens how far back a fetch can reach.
 	 */
-	latencyMax: Getter<number | undefined>;
+	maxAge: Getter<number | undefined>;
 };
 
 /**
@@ -79,11 +79,11 @@ export class Broadcast {
 	constructor(props?: Inputs<BroadcastInput>) {
 		this.in = {
 			origin: getter(props?.origin),
-			enabled: getter(props?.enabled ?? false),
+			enabled: getter(props?.enabled ?? true),
 			name: getter(props?.name ?? Moq.Path.empty()),
 			display: getter(props?.display),
 			flip: getter(props?.flip ?? false),
-			latencyMax: getter(props?.latencyMax),
+			maxAge: getter(props?.maxAge),
 		};
 
 		this.#signals.run(this.#runCatalog.bind(this));
@@ -259,7 +259,7 @@ export class Broadcast {
 			// Media, so declare the retention a FETCH-based consumer needs (the catalog above
 			// keeps the bare defaults: it is read at the live edge, which is always retained).
 			// Matches what a Rust publisher declares via `hang::container::track_info`.
-			const track = request.accept(Container.trackInfo({ latencyMax: this.in.latencyMax.peek() }));
+			const track = request.accept(Container.trackInfo({ maxAge: this.in.maxAge.peek() }));
 
 			// A second subscription for the same name supersedes the first: close the old producer.
 			signal.peek()?.close();

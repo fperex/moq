@@ -3,7 +3,7 @@ import type { Getter } from "@moq/signals";
 import * as Announce from "./announced.ts";
 import type { Consumer as BroadcastConsumer, Producer as BroadcastProducer } from "./broadcast.ts";
 import { accept, connect, Reload } from "./connection/index.ts";
-import { RemoteError } from "./error.ts";
+import { StreamCode, StreamError } from "./error.ts";
 import * as Ietf from "./ietf/index.ts";
 import * as Lite from "./lite/index.ts";
 import { createMockTransportPair } from "./mock.ts";
@@ -140,7 +140,7 @@ test("integration: lite subscription options and updates reach the publisher", a
 	const subscriber = remote.track("video").subscribe({
 		priority: 3,
 		ordered: true,
-		latencyMax: 250,
+		maxAge: 250,
 		startGroup: 0,
 		endGroup: 9,
 	});
@@ -148,17 +148,17 @@ test("integration: lite subscription options and updates reach the publisher", a
 	expect(producer.subscription.peek()).toEqual({
 		priority: 3,
 		ordered: true,
-		latencyMax: 250,
+		maxAge: 250,
 		startGroup: 0,
 		endGroup: 9,
 	});
 
 	const updated = producer.subscription.changed();
-	subscriber.update({ priority: 8, ordered: false, latencyMax: 500, startGroup: 2, endGroup: 12 });
+	subscriber.update({ priority: 8, ordered: false, maxAge: 500, startGroup: 2, endGroup: 12 });
 	expect(await updated).toEqual({
 		priority: 8,
 		ordered: false,
-		latencyMax: 500,
+		maxAge: 500,
 		startGroup: 2,
 		endGroup: 12,
 	});
@@ -492,8 +492,8 @@ test("integration: a group reset carries the peer's code to the subscriber", asy
 		() => undefined,
 		(e: unknown) => e,
 	);
-	expect(err).toBeInstanceOf(RemoteError);
-	expect((err as RemoteError).code).toBe(2);
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.DeliveryTimeout);
 
 	broadcast.close();
 	remote.close();

@@ -15,7 +15,6 @@ use crate::{
 		self,
 		priority::{Priority, PriorityHandle, PriorityQueue},
 	},
-	poll_set::{Machine, PollSet},
 };
 
 use super::Version;
@@ -43,7 +42,7 @@ struct WatchedRoute {
 #[derive(Clone)]
 struct SentRoute {
 	hops: OriginList,
-	cost: lite::RouteCost,
+	cost: crate::broadcast::Cost,
 	/// Whether this is the route we actually serve from (the table's first
 	/// entry) rather than a standby selected because the serving chain flows
 	/// through the peer. Only a serving advertisement carries the demand
@@ -90,6 +89,23 @@ struct Shared<S: crate::transport::poll::Session> {
 	goaway: crate::goaway::Protocol,
 }
 
+/// Largest millisecond duration every implementation can carry losslessly.
+const MAX_SAFE_AGE_MS: u64 = (1_u64 << 53) - 1;
+
+/// The budget to serve a peer with, given what its wire could tell us.
+///
+/// A version without the field decodes as [`Duration::ZERO`], which is
+/// indistinguishable from a peer genuinely asking for the live edge. Serving that
+/// as real time would discard backlog a legacy subscriber never declined, so fall
+/// back to a window wide enough not to drop and leave enforcement to the receiver,
+/// exactly as the IETF path does for the same reason.
+fn serving_max_age(version: Version, requested: Duration) -> Duration {
+	match version.carries_max_age() {
+		true => requested,
+		false => Duration::from_millis(MAX_SAFE_AGE_MS),
+	}
+}
+
 impl<S: crate::transport::poll::Session> Shared<S> {
 	/// The origin to resolve a peer-requested broadcast from: excludes routes
 	/// through the peer when its SETUP declared an origin id, so a subscription
@@ -123,7 +139,7 @@ pub(super) struct Publisher<S: crate::transport::poll::Session> {
 	// A dedicated accept handle: the poll interface takes `&mut self`, and the
 	// shared context stays behind the Arc for the per-stream children.
 	accept: S,
-	children: PollSet<Control<S>>,
+	children: kio::Tasks<crate::util::MaybeSendTask>,
 }
 
 impl<S: crate::transport::poll::Session> Publisher<S> {
@@ -146,7 +162,7 @@ impl<S: crate::transport::poll::Session> Publisher<S> {
 				goaway: config.goaway,
 			}),
 			accept,
-			children: PollSet::new(),
+			children: kio::Tasks::new(),
 		}
 	}
 
@@ -156,10 +172,14 @@ impl<S: crate::transport::poll::Session> Publisher<S> {
 		let mut cx = Context::from_waker(waiter.waker());
 		loop {
 			match Stream::poll_accept(&mut self.accept, self.shared.version, &mut cx) {
-				Poll::Ready(Ok(stream)) => self.children.push(Control {
-					shared: self.shared.clone(),
-					state: ControlState::Start { stream },
-				}),
+				Poll::Ready(Ok(stream)) => {
+					let mut child = Control {
+						shared: self.shared.clone(),
+						state: ControlState::Start { stream },
+					};
+					self.children
+						.push(crate::util::poll_task(move |waiter| child.poll(waiter)));
+				}
 				Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
 				Poll::Pending => break,
 			}
@@ -214,7 +234,7 @@ enum ControlState<S: crate::transport::poll::Session> {
 	Done,
 }
 
-impl<S: crate::transport::poll::Session> Machine for Control<S> {
+impl<S: crate::transport::poll::Session> Control<S> {
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
 		if let Err(err) = ready!(self.poll_serve(waiter)) {
 			tracing::warn!(%err, "control stream error");
@@ -739,7 +759,7 @@ impl AnnounceRun {
 					if !sent.serving {
 						continue;
 					}
-					if sent.cost != lite::RouteCost(0) {
+					if sent.cost.warm != 0 {
 						if let Poll::Ready(Ok(())) = entry.demand.poll_used(waiter) {
 							break 'turn Op::Route(suffix.clone(), Ok(()));
 						}
@@ -1037,12 +1057,12 @@ fn outgoing_cost(
 	demand: &crate::broadcast::Demand,
 	route: &crate::broadcast::Route,
 	serving: bool,
-) -> lite::RouteCost {
+) -> crate::broadcast::Cost {
 	if !version.has_route_cost() {
-		return lite::RouteCost::default();
+		return crate::broadcast::Cost::UNKNOWN;
 	}
 
-	lite::RouteCost(crate::broadcast::outgoing_cost(demand, route, serving))
+	crate::broadcast::outgoing_cost(demand, route, serving)
 }
 
 /// Serves one TRACK stream: resolve the track, answer with its TRACK_INFO, FIN.
@@ -1151,7 +1171,7 @@ impl<S: crate::transport::poll::Session> TrackInfoServe<S> {
 					stream.writer.buffer(&lite::TrackInfo {
 						priority: info.priority,
 						ordered: info.ordered,
-						latency_max: info.latency_max,
+						max_age: info.max_age,
 						timescale: info.timescale,
 					})?;
 					self.state = TrackInfoState::Finish { finished: false };
@@ -1199,11 +1219,12 @@ enum SubscribeState<S: crate::transport::poll::Session> {
 		msg: lite::Subscribe<'static>,
 		subscribing: track::Subscribing,
 	},
-	/// Streaming groups and datagrams.
-	Run(TrackRun<S>),
+	/// Streaming groups and datagrams. Boxed: by far the largest state, and the enum
+	/// is moved on every transition.
+	Run(Box<TrackRun<S>>),
 	/// The track finished: draining the in-flight group streams before the FIN.
 	Drain {
-		children: PollSet<GroupServe<S>>,
+		children: kio::Tasks<crate::util::MaybeSendTask>,
 	},
 	/// FIN and wait for the acknowledgement.
 	Finish {
@@ -1289,7 +1310,7 @@ impl<S: crate::transport::poll::Session> SubscribeServe<S> {
 					let subscription = crate::track::Subscription {
 						priority: msg.priority,
 						ordered: msg.ordered,
-						latency: crate::Latency::max(msg.latency_max),
+						max_age: serving_max_age(self.shared.version, msg.max_age),
 						..Bounds::from(&msg).positions()
 					};
 
@@ -1329,7 +1350,7 @@ impl<S: crate::transport::poll::Session> SubscribeServe<S> {
 						let info = lite::SubscribeOk {
 							priority: msg.priority,
 							ordered: false,
-							latency_max: std::time::Duration::ZERO,
+							max_age: Duration::ZERO,
 							start_group: None,
 							end_group: None,
 						};
@@ -1355,7 +1376,7 @@ impl<S: crate::transport::poll::Session> SubscribeServe<S> {
 					};
 
 					let run = TrackRun::new(sub, track, Bounds::from(&msg), track_priority_tx);
-					self.state = SubscribeState::Run(run);
+					self.state = SubscribeState::Run(Box::new(run));
 				}
 				SubscribeState::Run(run) => {
 					let stream = self.stream.as_mut().expect("stream present");
@@ -1715,7 +1736,7 @@ mod test {
 		use futures::FutureExt;
 
 		let mut producer = track_producer("test");
-		let mut subscriber = producer.subscribe(None);
+		let mut subscriber = producer.subscribe(track::Subscription::default().with_max_age(Duration::from_secs(5)));
 
 		producer.create_group(group::Info { sequence: 2 }).unwrap();
 		match recv_next(&mut subscriber, false, false).await.unwrap() {
@@ -1731,7 +1752,7 @@ mod test {
 			None => panic!("the late-arriving group was skipped"),
 		}
 
-		// Staleness is the latency window's job, not arrival order's: the track
+		// Staleness is the max age window's job, not arrival order's: the track
 		// still finishes normally afterward.
 		producer.finish_at(3).unwrap();
 		match recv_next(&mut subscriber, false, false).await.unwrap() {
@@ -1750,12 +1771,19 @@ mod announce_test {
 	use super::*;
 	use crate::coding::{Decode, Reader};
 	use crate::lite::test_transport::*;
+	use crate::model::ProduceTest;
 	use std::sync::Mutex;
 
 	const VERSION: Version = Version::Lite06Wip;
 
 	/// The broadcast's cold cost: what the route advertises without demand.
 	const COLD: u64 = 7;
+
+	/// What the harness route advertises with no demand, and with it: the carrying
+	/// discount zeroes the warm half only, so the cold path keeps flowing and peers
+	/// can still rank this relay against another warm one.
+	const COLD_COST: crate::broadcast::Cost = crate::broadcast::Cost::new(COLD);
+	const WARM_COST: crate::broadcast::Cost = crate::broadcast::Cost { warm: 0, cold: COLD };
 
 	/// The original publisher stamped on every harness route: content identity is
 	/// keyed on the first hop, so a route change that should ride through as a
@@ -1868,11 +1896,11 @@ mod announce_test {
 					lite::AnnounceBroadcast::Active { cost: first, .. },
 					lite::AnnounceBroadcast::Restart { cost: second, .. },
 				] => {
-					assert_eq!(*first, lite::RouteCost(COLD));
-					assert_eq!(*second, lite::RouteCost(0));
+					assert_eq!(*first, COLD_COST);
+					assert_eq!(*second, WARM_COST);
 				}
 				// The viewer may already be attached when the announce is built.
-				[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, lite::RouteCost(0)),
+				[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, WARM_COST),
 				other => panic!("expected {name} to announce, got {other:?}"),
 			}
 
@@ -1918,9 +1946,9 @@ mod announce_test {
 
 		let mut wire = Wire { writes, cursor: 0 };
 		assert_eq!(wire.take_ok().active, 1, "expected one initial announce");
-		let expected = if demand { 0 } else { COLD };
+		let expected = if demand { WARM_COST } else { COLD_COST };
 		match wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, lite::RouteCost(expected)),
+			[lite::AnnounceBroadcast::Active { cost, .. }] => assert_eq!(*cost, expected),
 			other => panic!("expected the initial announce, got {other:?}"),
 		}
 
@@ -1981,7 +2009,7 @@ mod announce_test {
 		// t=10s: past the fresh deadline, so the restore finally lands.
 		tokio::time::sleep(Duration::from_secs(4)).await;
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, COLD_COST),
 			other => panic!("expected the restore on the fresh deadline, got {other:?}"),
 		}
 	}
@@ -2008,14 +2036,14 @@ mod announce_test {
 
 		// t=6s: only the first has expired.
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, COLD_COST),
 			other => panic!("expected only the first restore, got {other:?}"),
 		}
 
 		// t=8s: now the second's own deadline has passed.
 		tokio::time::sleep(Duration::from_secs(2)).await;
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 1, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			[lite::AnnounceBroadcast::Restart { id: 1, cost, .. }] => assert_eq!(*cost, COLD_COST),
 			other => panic!("expected the second restore, got {other:?}"),
 		}
 	}
@@ -2029,7 +2057,7 @@ mod announce_test {
 		tokio::time::sleep(Duration::from_secs(6)).await;
 
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(COLD)),
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, COLD_COST),
 			other => panic!("expected one cold-cost restart, got {other:?}"),
 		}
 
@@ -2071,7 +2099,7 @@ mod announce_test {
 				},
 			] => {
 				assert_eq!(sent, &hops);
-				assert_eq!(*cost, lite::RouteCost(COLD));
+				assert_eq!(*cost, COLD_COST);
 			}
 			other => panic!("expected the failover restart, got {other:?}"),
 		}
@@ -2091,7 +2119,7 @@ mod announce_test {
 		settle().await;
 
 		match h.wire.take_announces().as_slice() {
-			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, lite::RouteCost(0)),
+			[lite::AnnounceBroadcast::Restart { id: 0, cost, .. }] => assert_eq!(*cost, WARM_COST),
 			other => panic!("expected the warm restart, got {other:?}"),
 		}
 	}
@@ -2169,7 +2197,7 @@ mod announce_test {
 		match wire.take_announces().as_slice() {
 			[lite::AnnounceBroadcast::Active { hops, cost, .. }] => {
 				assert_eq!(hops, &tainted);
-				assert_eq!(*cost, lite::RouteCost(0));
+				assert_eq!(*cost, crate::broadcast::Cost::default());
 			}
 			other => panic!("expected the active route, got {other:?}"),
 		}
@@ -2181,7 +2209,7 @@ mod announce_test {
 		match wire.take_announces().as_slice() {
 			[lite::AnnounceBroadcast::Active { hops, cost, .. }] => {
 				assert_eq!(hops, &pub_hops());
-				assert_eq!(*cost, lite::RouteCost(COLD));
+				assert_eq!(*cost, COLD_COST);
 			}
 			other => panic!("expected the standby route, got {other:?}"),
 		}
@@ -2229,7 +2257,7 @@ mod announce_test {
 		match wire.take_announces().as_slice() {
 			[lite::AnnounceBroadcast::Active { hops, cost, .. }] => {
 				assert_eq!(hops, &pub_hops());
-				assert_eq!(*cost, lite::RouteCost(COLD));
+				assert_eq!(*cost, COLD_COST);
 			}
 			other => panic!("expected the standby announce, got {other:?}"),
 		}
@@ -2318,7 +2346,7 @@ mod announce_test {
 		let demand = consumer.demand();
 
 		let cost = outgoing_cost(Version::Lite06Wip, &demand, &route, false);
-		assert_eq!(cost, lite::RouteCost(broadcast::MAX_COST));
+		assert_eq!(cost, broadcast::Cost::new(broadcast::MAX_COST));
 
 		let mut buf = Vec::new();
 		cost.encode(&mut buf, Version::Lite06Wip)
@@ -2349,25 +2377,26 @@ mod announce_test {
 		assert!(demand.is_used(), "the consumed track should register demand");
 
 		let cost = outgoing_cost(Version::Lite06Wip, &demand, &route, true);
-		assert_eq!(cost, lite::RouteCost(broadcast::DRAIN_COST));
+		assert_eq!(cost, broadcast::Cost::DRAIN);
 
 		// A drain that arrived over the wire propagates through a carrying relay:
 		// the upstream's ceiling plus our link price saturates back to the
 		// ceiling, which pierces this hop's discount too. Without that, each
 		// carrying hop would re-mask the drain as cost 0.
-		let forwarded = lite::RouteCost(broadcast::DRAIN_COST).charged(5).0;
+		let forwarded = broadcast::Cost::DRAIN.charged(5);
 		producer
 			.set_route(broadcast::Route::announced().with_cost(forwarded))
 			.unwrap();
 		let route = consumer.route();
 		let cost = outgoing_cost(Version::Lite06Wip, &demand, &route, true);
-		assert_eq!(cost, lite::RouteCost(broadcast::DRAIN_COST));
+		assert_eq!(cost, broadcast::Cost::DRAIN);
 
-		// A healthy serving route with demand still gets the carrying discount.
+		// A healthy serving route with demand still gets the carrying discount, on
+		// the warm half only: the cold path is what a peer ranks us by.
 		producer.set_route(broadcast::Route::announced().with_cost(7)).unwrap();
 		let route = consumer.route();
 		let cost = outgoing_cost(Version::Lite06Wip, &demand, &route, true);
-		assert_eq!(cost, lite::RouteCost(0));
+		assert_eq!(cost, broadcast::Cost { warm: 0, cold: 7 });
 	}
 }
 
@@ -2434,7 +2463,7 @@ enum Recv {
 /// Groups are served in arrival order (`poll_recv_group`), not sequence order: on a relay, a
 /// burst can be ingested micro-reordered by the upstream leg, and a sequence cursor would then
 /// permanently skip the older group even though it is cached and in demand. Staleness is
-/// governed by the latency window (cache expiry), not arrival raciness.
+/// governed by the max age window (cache expiry), not arrival raciness.
 ///
 /// When `emit_boundary` is set, a declared-but-not-yet-reached final sequence surfaces as
 /// [`Recv::Boundary`] in an idle moment (after groups and datagrams), so the caller can send
@@ -2688,7 +2717,7 @@ struct TrackRun<S: crate::transport::poll::Session> {
 	// datagram-capable transport (qmux/WebSocket/TCP/UDS report size 0). No group
 	// fallback: otherwise off.
 	datagrams: bool,
-	children: PollSet<GroupServe<S>>,
+	children: kio::Tasks<crate::util::MaybeSendTask>,
 }
 
 impl<S: crate::transport::poll::Session> TrackRun<S> {
@@ -2720,7 +2749,7 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
 			start_sent: false,
 			end_sent: false,
 			datagrams,
-			children: PollSet::new(),
+			children: kio::Tasks::new(),
 		}
 	}
 
@@ -2764,7 +2793,7 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
 				let _ = self.track.update(crate::track::Subscription {
 					priority: upd.priority,
 					ordered: upd.ordered,
-					latency: crate::Latency::max(upd.latency_max),
+					max_age: serving_max_age(self.ctx.version, upd.max_age),
 					..bounds.positions()
 				});
 				if let Some(start_group) = upd.start_group {
@@ -2822,8 +2851,9 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
 							false => Priority::new(current_priority, self.ctx.id, sequence),
 						};
 						let handle = self.ctx.priority.insert(priority);
+						let mut serve = GroupServe::new(self.ctx.clone(), sequence, frame_start, handle, group);
 						self.children
-							.push(GroupServe::new(self.ctx.clone(), sequence, frame_start, handle, group));
+							.push(crate::util::poll_task(move |waiter| serve.poll(waiter)));
 					}
 					Recv::Datagram(datagram) => self.ctx.serve_datagram(datagram),
 					Recv::Boundary(group) => {
@@ -2905,6 +2935,10 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 		loop {
 			match &mut self.state {
 				GroupState::Open => {
+					if self.group.poll_expired(waiter) {
+						self.state = GroupState::Done;
+						return Poll::Ready(Err(Error::Old));
+					}
 					let mut cx = Context::from_waker(waiter.waker());
 					let stream = match ready!(self.ctx.session.poll_open_uni(&mut cx)) {
 						Ok(stream) => stream,
@@ -2964,7 +2998,16 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 							match writer.poll_flush(&mut cx) {
 								Poll::Ready(Ok(())) => {}
 								Poll::Ready(Err(err)) => break 'serve Err(err),
-								Poll::Pending => return Poll::Pending,
+								// Parking on the transport is the one stall the group cursor cannot
+								// see, and the only place a served group applies the drift budget:
+								// flow control must not pin a stream that has gone stale. `true`
+								// because the transport still owns bytes the cursor has released.
+								Poll::Pending => {
+									if self.group.poll_expired_while_pending(waiter, true) {
+										break 'serve Err(Error::Old);
+									}
+									return Poll::Pending;
+								}
 							}
 							if let Some(pending) = chunk {
 								match writer.poll_write(&mut cx, pending) {
@@ -2974,7 +3017,16 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 										}
 									}
 									Poll::Ready(Err(err)) => break 'serve Err(err),
-									Poll::Pending => return Poll::Pending,
+									// Parking on the transport is the one stall the group cursor cannot
+									// see, and the only place a served group applies the drift budget:
+									// flow control must not pin a stream that has gone stale. `true`
+									// because the transport still owns bytes the cursor has released.
+									Poll::Pending => {
+										if self.group.poll_expired_while_pending(waiter, true) {
+											break 'serve Err(Error::Old);
+										}
+										return Poll::Pending;
+									}
 								}
 							} else if let Some(pending) = frame {
 								match pending.poll_read_chunk(waiter) {
@@ -3040,7 +3092,7 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 	}
 }
 
-impl<S: crate::transport::poll::Session> Machine for GroupServe<S> {
+impl<S: crate::transport::poll::Session> GroupServe<S> {
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
 		// The machine owns its outcome: the stream was aborted with the reason (or
 		// reset by the writer's Drop), which is all the subscriber sees.
@@ -3204,6 +3256,184 @@ mod serve_group_test {
 		assert_eq!(log.resets(), vec![crate::StreamError::Old.to_code()]);
 	}
 
+	/// A subscription group keeps checking the max age while a transport write is
+	/// flow-control blocked, so a stalled send cannot pin the stream indefinitely.
+	#[tokio::test]
+	async fn blocked_transport_write_expires_with_the_group() {
+		tokio::time::pause();
+
+		let gate = kio::Producer::new(false);
+		let session = SinkSession::gated_uni(gate.consume());
+		let log = session.log.clone();
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			ordered: false,
+			version: Version::Lite06Wip,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut subscriber = track.subscribe(None);
+		let mut old = track.append_group().unwrap();
+		old.write_frame(Timestamp::ZERO, b"old".as_slice()).unwrap();
+		old.finish().unwrap();
+		let group = subscriber.recv_group().await.unwrap().expect("old group");
+
+		let handle = subscription.priority.insert(Priority::new(0, 0, 0));
+		let mut serve = std::pin::pin!(subscription.serve_group(0, 0, handle, group));
+		assert!(
+			futures::poll!(serve.as_mut()).is_pending(),
+			"transport write is blocked"
+		);
+
+		tokio::time::advance(Duration::from_secs(1)).await;
+		let mut edge = track.append_group().unwrap();
+		edge.write_frame(Timestamp::from_millis(1000).unwrap(), b"edge".as_slice())
+			.unwrap();
+		edge.finish().unwrap();
+
+		assert!(matches!(serve.await, Err(Error::Old)));
+		assert_eq!(log.resets(), vec![crate::StreamError::Old.to_code()]);
+	}
+
+	/// The final payload remains guarded after its frame has advanced the group cursor.
+	#[tokio::test]
+	async fn blocked_final_transport_chunk_expires_with_the_group() {
+		tokio::time::pause();
+
+		let gate = kio::Producer::new(true);
+		let session = SinkSession::gated_uni(gate.consume());
+		let log = session.log.clone();
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			ordered: false,
+			version: Version::Lite06Wip,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut subscriber = track.subscribe(None);
+		let mut old = track.append_group().unwrap();
+		let mut frame = old
+			.create_frame(frame::Info {
+				timestamp: Timestamp::ZERO,
+				size: 2,
+			})
+			.unwrap();
+		frame.write(b"a".as_slice()).unwrap();
+		let group = subscriber.recv_group().await.unwrap().expect("old group");
+
+		let handle = subscription.priority.insert(Priority::new(0, 0, 0));
+		let mut serve = std::pin::pin!(subscription.serve_group(0, 0, handle, group));
+		assert!(
+			futures::poll!(serve.as_mut()).is_pending(),
+			"waiting for the final byte"
+		);
+
+		let Ok(mut open) = gate.write() else {
+			panic!("transport gate closed");
+		};
+		*open = false;
+		drop(open);
+		frame.write(b"b".as_slice()).unwrap();
+		frame.finish().unwrap();
+		old.finish().unwrap();
+		assert!(
+			futures::poll!(serve.as_mut()).is_pending(),
+			"the final byte is transport-blocked"
+		);
+
+		tokio::time::advance(Duration::from_secs(1)).await;
+		let mut edge = track.append_group().unwrap();
+		edge.write_frame(Timestamp::from_millis(1000).unwrap(), b"edge".as_slice())
+			.unwrap();
+		edge.finish().unwrap();
+
+		assert!(matches!(serve.await, Err(Error::Old)));
+		assert_eq!(log.resets(), vec![crate::StreamError::Old.to_code()]);
+	}
+
+	/// A subscription group keeps checking the max age while transport stream credit is
+	/// exhausted, so returning credit is reserved for content that is still live.
+	#[tokio::test]
+	async fn blocked_transport_open_expires_with_the_group() {
+		tokio::time::pause();
+
+		let gate = kio::Producer::new(false);
+		let session = SinkSession::gated_open_uni(gate.consume());
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			ordered: false,
+			version: Version::Lite06Wip,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut subscriber = track.subscribe(None);
+		let mut old = track.append_group().unwrap();
+		old.write_frame(Timestamp::ZERO, b"old".as_slice()).unwrap();
+		old.finish().unwrap();
+		let group = subscriber.recv_group().await.unwrap().expect("old group");
+
+		let handle = subscription.priority.insert(Priority::new(0, 0, 0));
+		let mut serve = std::pin::pin!(subscription.serve_group(0, 0, handle, group));
+		assert!(
+			futures::poll!(serve.as_mut()).is_pending(),
+			"stream credit is exhausted"
+		);
+
+		tokio::time::advance(Duration::from_secs(1)).await;
+		let mut edge = track.append_group().unwrap();
+		edge.write_frame(Timestamp::from_millis(1000).unwrap(), b"edge".as_slice())
+			.unwrap();
+		edge.finish().unwrap();
+
+		assert!(matches!(serve.await, Err(Error::Old)));
+	}
+
+	/// Lite01/02 have no max age field, so a SUBSCRIBE from one decodes as
+	/// `Duration::ZERO`. Serving that as a real-time budget would hold every legacy
+	/// peer to the live edge and discard backlog it never declined, so those versions
+	/// get a non-dropping window and leave enforcement to the receiver.
+	///
+	/// These are the two most-preferred negotiated versions, so this is the common
+	/// wire, not an edge case.
+	#[test]
+	fn a_version_without_the_field_serves_a_non_dropping_budget() {
+		for version in [Version::Lite01, Version::Lite02] {
+			let max_age = serving_max_age(version, Duration::ZERO);
+			assert!(
+				max_age >= Duration::from_secs(86_400),
+				"{version:?} must not be served as real time: {max_age:?}"
+			);
+		}
+
+		// A version that does carry it is taken at its word, zero included.
+		assert_eq!(serving_max_age(Version::Lite05, Duration::ZERO), Duration::ZERO);
+		assert_eq!(
+			serving_max_age(Version::Lite05, Duration::from_secs(3)),
+			Duration::from_secs(3)
+		);
+	}
+
 	/// A group that completes cleanly must not reset at all. The completion path
 	/// releases the stream via `poll_close`; leaving the writer to drop after
 	/// `finish()` would fire the Drop fallback and tack a spurious Cancel reset
@@ -3254,6 +3484,7 @@ mod serve_group_test {
 mod tests {
 	use super::*;
 	use crate::lite::test_transport::SinkSession;
+	use crate::model::ProduceTest;
 
 	/// Lite01/02 send the initial active set as ANNOUNCE_INIT. It must apply the
 	/// same per-peer route selection as the live loop: a broadcast whose only
@@ -3287,7 +3518,7 @@ mod tests {
 			.unwrap();
 
 		// Broadcast visibility is deferred until the executor ticks.
-		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		tokio::time::sleep(Duration::from_millis(1)).await;
 
 		let gate = kio::Producer::new(true);
 		let session = SinkSession::gated_bi(gate.consume());

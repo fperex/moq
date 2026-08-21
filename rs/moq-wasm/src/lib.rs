@@ -3,7 +3,7 @@
 //! This is an experiment: rather than reimplementing the moq-lite wire protocol
 //! in TypeScript (as `@moq/net` does today), compile the real `moq-net` Rust
 //! implementation to WebAssembly and drive the browser's WebTransport from
-//! inside it. See `transport.rs` for the WebTransport adapter.
+//! inside it. See `transport.rs` for the dial.
 //!
 //! Scope: the consume path (connect -> broadcast -> track -> group -> frame),
 //! which is the highest-value target (the `@moq/watch` use case). The publish
@@ -72,7 +72,8 @@ impl Session {
 	async fn handshake(transport: transport::Session) -> Result<Session, JsValue> {
 		// Wire a subscribe origin so the session has somewhere to insert the
 		// broadcasts the remote announces; keep a consumer to read them.
-		let origin = moq_net::Origin::random().produce();
+		let (origin, origin_driver) = moq_net::origin::Producer::new(moq_net::Origin::random().into());
+		web_async::spawn(origin_driver);
 		let consumer = origin.consume();
 		let client = moq_net::Client::new().with_subscriber(origin);
 		let (inner, driver) = client.connect(transport).await.map_err(js_err)?;

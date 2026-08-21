@@ -16,7 +16,7 @@ The reference implementation. Used by every server-side tool and by the FFI core
 - [`moq-net`](/lib/rs/crate/moq-net) - Real-time pub/sub
 - [`hang`](/lib/rs/crate/hang) - Media catalog and container
 - [`moq-mux`](/lib/rs/crate/moq-mux) - fMP4/CMAF, MPEG-TS, and FLV import/export
-- [`moq-native`](/lib/rs/crate/moq-native) - QUIC endpoint helpers
+- [`moq-tokio`](/lib/rs/crate/moq-tokio) - QUIC endpoint helpers
 - [...and more](/lib/rs/)
 
 ### [TypeScript](/lib/js/) <Badge type="tip" text="web" />
@@ -51,7 +51,7 @@ Async sequences and structured concurrency for iOS, iPadOS, and macOS. Distribut
 
 ### [Go](/lib/go/)
 
-cgo bindings with prebuilt static libraries per platform. Published as [`github.com/moq-dev/moq-go`](https://github.com/moq-dev/moq-go) (the ergonomic wrapper, imported as `moq`), atop the raw [`github.com/moq-dev/moq-go-ffi`](https://github.com/moq-dev/moq-go-ffi) bindings.
+cgo bindings with prebuilt static libraries per platform. Published as [`moq.dev/moq`](https://pkg.go.dev/moq.dev/moq) (the ergonomic wrapper), atop the raw [`moq.dev/moq-ffi`](https://pkg.go.dev/moq.dev/moq-ffi) bindings.
 
 ## Picking a language
 

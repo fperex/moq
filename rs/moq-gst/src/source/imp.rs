@@ -280,10 +280,10 @@ async fn run_session(
 	element: glib::WeakRef<super::MoqSrc>,
 	shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-	let mut config = moq_native::connect::Config::default();
+	let mut config = moq_tokio::connect::Config::default();
 	config.tls.insecure = Some(settings.tls_disable_verify);
 
-	let origin = moq_net::Origin::random().produce();
+	let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 	let origin_consumer = origin.consume();
 	let client = config.init(Default::default())?.with_subscriber(origin);
 
@@ -442,9 +442,10 @@ async fn reconcile(
 		}
 		.fetch_add(1, Ordering::Relaxed);
 
-		let track_subscriber = broadcast.track(&name)?.subscribe(None).await?;
-		let track = moq_mux::container::Consumer::new(track_subscriber, container)
-			.with_latency(moq_mux::Latency::max(Duration::from_secs(1)));
+		let latency = Duration::from_secs(1);
+		let subscription = moq_net::track::Subscription::default().with_max_age(latency);
+		let track_subscriber = broadcast.track(&name)?.subscribe(subscription).await?;
+		let track = moq_mux::container::Consumer::new(track_subscriber, container);
 
 		let descriptor = TrackDescriptor {
 			kind: d.kind,

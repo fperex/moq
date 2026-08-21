@@ -1,6 +1,6 @@
 //! Small MoQ-side helpers shared across endpoints.
 //!
-//! The dial and accept loops live in `moq-native` (`Client::publish`/`consume`
+//! The dial and accept loops live in `moq-tokio` (`Client::publish`/`consume`
 //! and `Server::serve_publish`/`serve_consume`); this module carries the systemd
 //! readiness notification used by every endpoint plus the MoQ side of an import.
 
@@ -21,7 +21,7 @@ pub struct ImportTarget {
 
 	/// How long relays keep a non-latest group of the published media tracks fetchable
 	/// (`--latency-max`), or `None` for the publisher's own default.
-	pub latency_max: Option<std::time::Duration>,
+	pub max_age: Option<std::time::Duration>,
 }
 
 /// Notify systemd (if any) that the endpoint is up.

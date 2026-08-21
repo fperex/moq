@@ -55,6 +55,21 @@ Price is per direction. Pulling from a metered origin can cost far more than pus
 
 The cost a relay advertises is the *marginal* cost of pulling the broadcast through it. A relay actively carrying a broadcast (a subscriber is pulling it) re-announces it at cost 0: its upstream fetch is already paid for, so a sibling should pull the warm copy over a free intra-DC link instead of opening a second metered fetch. When the last subscriber leaves, the cost decays back after a short grace period. Standby publishers (e.g. a transcoder pool) can seed a large cost so they are only selected when nothing cheaper exists, and the winner's cost drops to 0 once it starts working.
 
+That discount is what makes the cluster share one copy, but it also erases something. Once several relays are all carrying the broadcast they *all* advertise 0, so asking "what does this cost you?" gets the same answer everywhere and can no longer say which of them ought to be the one doing the pulling.
+
+So `moq-lite-06` announcements carry two prices instead of one:
+
+- **warm**: what pulling costs right now, given which relays already have it. Zero at any relay that is carrying. This is the number routing minimizes, and it is what consolidates the fleet onto one copy.
+- **cold**: what the same route would cost if no relay had it. It ignores the discounts entirely, so it does not collapse, and it keeps saying how far each relay sits from the publisher.
+
+The first picks where a relay fetches from. The second picks which relay does the fetching: a carrying relay hands its subscribers over to another carrying relay only when that one's cold price is lower, so the relay nearest the publisher becomes the aggregation point and the rest consolidate onto it. Relays equally far from the publisher tie there and fall back to a hash of the broadcast path, which spreads ownership across the fleet instead of funneling every broadcast onto one of them.
+
+Both matter. Without the warm price every relay opens its own fetch and the backbone carries N copies. Without the cold price the relays that are already carrying cannot be told apart, so the aggregation point lands wherever a coin flip puts it, which can leave a relay one cheap link from the publisher pulling through a relay several expensive links away.
+
+A relay waits about half a second before moving onto another relay, and re-checks when the wait is up. Prices are reported, not observed, so a report still crossing the mesh can be cheaper than what its sender would say now, and while prices are rising a ring of relays could otherwise each defer to a stale neighbour and all let go at once, leaving nobody pulling. The wait outlasts that propagation, so the re-check runs on current prices, and it carries a small per-relay spread so a whole PoP does not reconsider on the same instant. Some moves never wait: reconnecting to the peer you were already pulling from (recognized by its declared identity, so a relay that withheld one waits like anything else), and repairs, meaning replacing a route that has vanished or stopped announcing, which would otherwise keep the relay on a dead source while a live one sits in the table. Leaving a *draining* route does wait, because a relay that received a GOAWAY keeps serving until its handover window closes, and a fleet draining together is exactly when relays re-parent off prices that have not landed. If the drain turns into a disconnection the route vanishes, and that case is immediate, so the wait is never longer than the session it is waiting on. Only trading a working upstream for a better one waits, and that includes a relay with no viewers, whose choice is simply the one it will pull down when a viewer arrives.
+
+`moq-transport` has nowhere to carry the cold price, so those routes keep the older coin-flip behavior.
+
 ## Auto-discovery
 
 Listing every peer by hand can get tedious in larger clusters. Tell the relay its own URL with `cluster.node`, then enable gossip with `cluster.mesh`; connected peers will discover and dial it back automatically:
@@ -104,10 +119,26 @@ cannot be copied into someone else's, and a relay only dials peers whose proof
 verifies.
 
 Startup waits for the mesh to come up before the relay reports itself ready
-(`READY=1` under systemd), so a bad key, a missing `node`, or a host where
-multicast is blocked fails the relay rather than releasing the units that depend
-on it. One working interface is enough: a down VPN adapter or a container bridge
-with multicast off doesn't hold startup back.
+(`READY=1` under systemd), so a bad key, a missing `node`, or a host that cannot
+announce on any interface fails the relay rather than releasing the units that
+depend on it. One working interface is enough: a down VPN adapter or a container
+bridge with multicast off doesn't hold startup back. It only proves this host
+can send, though, so see below for what it doesn't catch.
+
+`lan` is for relays sharing a link, and only that. Peers off the network are
+gossiped, listed by `connect_api`, or seeded in `connect`, and they reach each
+other over their `node` URLs like any other cluster link. A relay is already the
+public address both sides can reach, so there is nothing for peer-to-peer to
+save there; on one link it saves the round trip out and back.
+
+Both hosts need inbound packets for this to work, in two places. mDNS is inbound
+multicast UDP on port 5353, and a host that blocks it still multicasts its own
+announcements out, so peers discover it while it discovers nobody. The session
+is then one dial per pair, taken by the side whose `node` URL sorts first, so the
+*other* side is the one that has to accept an inbound connection on its `node`
+port. Startup readiness only proves an interface announced, not that anything
+answered, so a firewall shows up as a pair that never meshes rather than as a
+relay that fails to start.
 
 ## Origin id
 
@@ -132,25 +163,25 @@ connect_api = "https://api.example.com/cluster/connect"
 node        = "us-west.example.com:4443"
 ```
 
-The source returns a bare JSON array of peer hostnames:
+The source returns a JSON array of peer URLs. Legacy bare hosts remain accepted:
 
 ```json
-["eu-west.example.com:4443", "us-east.example.com:4443"]
+["https://eu-west.example.com/?cost=10", "us-east.example.com:4443"]
 ```
 
-The relay reconciles that list against its live dials: new entries are dialed, entries that disappear are dropped. It composes with `connect` (static seeds that are never reconciled away) and `mesh` (gossip). The relay's own `node` value, when set, is sent as a `?node=` query parameter so the endpoint can return the peers for that specific node; for mTLS-gated endpoints the cluster client certificate identifies the caller as well.
+The relay reconciles that list against its live dials: new entries are dialed, entries that disappear are dropped, and a changed URL for a `connect_api`-owned peer replaces its session. That includes dial-side inputs such as `?cost=` and an inline `?jwt=`. An identical render is a no-op. It composes with `connect` (static seeds that are never reconciled away) and `mesh` (gossip). If another source already owns a peer's session, the API entry remains its updated fallback until that source disappears. The relay's own `node` value, when set, is sent as a `?node=` query parameter so the endpoint can return the peers for that specific node; for mTLS-gated endpoints the cluster client certificate identifies the caller as well.
 
 - **HTTP(S) URL**: re-checked every 30s, but freshness is delegated to a standard HTTP cache (`http-cache`), so the response's `Cache-Control` controls how often a check turns into a real fetch. While the cached list is still fresh (`max-age`), the re-check is served from cache with no network round-trip; once it's stale the cache issues a conditional GET (`ETag` / `Last-Modified`) and falls back to the last cached body if revalidation fails (stale-if-error). Set a longer `max-age` to reduce load on your endpoint, or `no-cache` to force a conditional GET on every tick. Transient endpoint blips don't churn the dial set.
 - **Local file** (a path or `file://` URL): watched via OS filesystem notifications (inotify / FSEvents / kqueue), with a periodic re-check as a safety net.
 
-If a fetch fails or returns garbage, the relay logs and keeps the last good list rather than tearing the cluster down. This keeps the moq-relay binary generic: all routing decisions (which node connects where) live in whatever service answers the endpoint.
+If a fetch fails, an entry is invalid, or one identity has conflicting entries, the relay logs and keeps the entire last good list rather than applying a partial topology. This keeps the moq-relay binary generic: all routing decisions (which node connects where) live in whatever service answers the endpoint.
 
 ## Authentication
 
 Cluster peers must authenticate to each other:
 
 - **mTLS** (recommended). Set `tls.root` to the CA that signed the cluster certificates. Inbound connections presenting a valid client cert are granted full access; outbound dials use `connect.tls.cert` / `connect.tls.key`.
-- **JWT**. For static `connect` peers, supply the token inline as a `?jwt=` query parameter on the URL. For gossip- and `connect_api`-discovered peers (whose addresses can't carry an inline token), set `cluster.token` to a file holding the JWT; it's presented on any dial whose URL has no inline `?jwt=` (so an inline token wins per-peer). Either way the token needs broad enough scope to cover whatever paths the cluster carries.
+- **JWT**. Supply a per-peer token inline as a `?jwt=` query parameter on a static or `connect_api` URL. Alternatively, set `cluster.token` to a file holding the shared JWT; it is presented on any dial whose URL has no inline token. Gossip must use the shared token or mTLS: never put a JWT in `cluster.node`, because that URL is advertised to the mesh and written to logs. Either way the token needs broad enough scope to cover whatever paths the cluster carries.
 
 See [Authentication](/bin/relay/auth) for the full setup.
 
@@ -164,7 +195,7 @@ peer stays loudly visible in the logs and a returning one is picked up within se
 
 `cluster.root` was removed. To dial cluster peers use `cluster.connect`; to advertise this relay's own address set `cluster.node` and enable `cluster.mesh`. `cluster.mesh` is now a boolean gossip toggle (it used to take this relay's URL); the URL moved to `cluster.node`. The old `mesh = "<url>"` form still works for backwards compatibility: it enables gossip and is treated as `cluster.node`, with a deprecation warning (or an error if it conflicts with an explicit `cluster.node`).
 
-`cluster.connect` entries are now full URLs; a bare host or `host:port` still works but logs a deprecation warning. A JWT for a static peer belongs inline as a `?jwt=` query parameter (the `cluster.token` file remains for gossip / `connect_api` peers, which can't carry an inline token).
+`cluster.connect` entries are now full URLs; a bare host or `host:port` still works but logs a deprecation warning. A per-peer JWT belongs inline as a `?jwt=` query parameter on a static or `connect_api` URL. The `cluster.token` file remains the shared fallback and is required for JWT-authenticated gossip; never put a JWT in the advertised `cluster.node` URL.
 
 | Old | New |
 |---|---|

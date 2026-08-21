@@ -9,18 +9,18 @@ The ergonomic Go module for [Media over QUIC](/). This is the package most calle
 
 It wraps the raw [moq-ffi](/lib/go/moq-ffi) bindings in idiomatic Go: `context.Context` cancellation, Go `error` returns (with an `IsShutdown` helper for graceful Cancelled/Closed), and Go 1.23 range-over-func iterators (`iter.Seq2`) for live streams. The record and enum types are re-exported without the `Moq` prefix, so most programs never import the ffi package directly.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/moq-dev/moq-go.svg)](https://pkg.go.dev/github.com/moq-dev/moq-go)
+[![Go Reference](https://pkg.go.dev/badge/moq.dev/moq.svg)](https://pkg.go.dev/moq.dev/moq)
 
-Full API reference: [pkg.go.dev/github.com/moq-dev/moq-go](https://pkg.go.dev/github.com/moq-dev/moq-go), generated automatically from the godoc.
+Full API reference: [pkg.go.dev/moq.dev/moq](https://pkg.go.dev/moq.dev/moq), generated automatically from the godoc.
 
 ## Install
 
 ```bash
-go get github.com/moq-dev/moq-go@latest
+go get moq.dev/moq@latest
 ```
 
 ```go
-import "github.com/moq-dev/moq-go/moq"
+import "moq.dev/moq"
 ```
 
 `CGO_ENABLED=1` is required (the default on Unix). The prebuilt `libmoq_ffi.a` comes transitively from [moq-ffi](/lib/go/moq-ffi), which the wrapper requires; cgo selects the right archive automatically, so there's no Rust toolchain or shared-library setup.
@@ -182,7 +182,7 @@ request, err := dynamic.RequestedTrack(ctx)
 if err != nil {
     log.Fatal(err)
 }
-media, err := broadcast.PublishMediaOnTrack(request, "opus", opusInit)
+media, err := broadcast.PublishAudioOnTrack(request, moq.AudioFormatOpus, opusInit)
 if err != nil {
     log.Fatal(err)
 }
@@ -196,10 +196,17 @@ Video catalog fields that are known before the first keyframe can be supplied
 with `WithVideoHint`:
 
 ```go
-media, err := broadcast.PublishMedia("avc3", nil, moq.WithVideoHint(moq.VideoHint{
+media, err := broadcast.PublishVideo(moq.VideoFormatAvc3, nil, moq.WithVideoHint(moq.VideoHint{
     Coded: &moq.Dimensions{Width: 1920, Height: 1080},
-}))
+}), moq.WithLabel("Main camera"))
 ```
+
+`WithAudioLabel` / `WithVideoLabel` store a human-readable rendition name in the
+catalog without changing the generated transport track name. Labels do not need
+to be unique. `PublishContainer` takes no options at all: a container describes
+each track it publishes from its own metadata.
+
+Each catalog `Video` has a `Stalled` boolean. A true value recommends temporarily avoiding that rendition, but the track remains directly usable. Existing catalogs default it to false.
 
 Properties that apply to every video rendition are updated together. Nil fields clear the corresponding catalog property, and rotation is normalized to the nearest clockwise quarter turn:
 
@@ -235,7 +242,7 @@ broadcast, err := origin.CreateBroadcast("my-broadcast.hang")
 if err != nil {
     // handle error
 }
-mediaProducer, err := broadcast.PublishMedia("aac", asc)
+mediaProducer, err := broadcast.PublishAudio(moq.AudioFormatAac, asc)
 if err != nil {
     // handle error
 }
@@ -253,10 +260,10 @@ If a producer is collected without `Finish()`, the underlying library logs a war
 
 ## Raw media
 
-`PublishMedia` takes frames you already encoded. To hand over raw pixels or PCM instead and let the codec run inside the bindings, use `PublishVideo` / `PublishAudio`. Pixel format, resolution, and framerate are fixed at publish time, so each frame carries only its pixels and a timestamp:
+`PublishAudio` / `PublishVideo` take frames you already encoded. To hand over raw pixels or PCM instead and let the codec run inside the bindings, use `EncodeVideo` / `EncodeAudio`. Pixel format, resolution, and framerate are fixed at publish time, so each frame carries only its pixels and a timestamp:
 
 ```go
-video, err := broadcast.PublishVideo(
+video, err := broadcast.EncodeVideo(
     moq.VideoEncoderInput{
         Format:    moq.VideoPixelFormatRgba,
         Width:     1280,
@@ -277,9 +284,43 @@ err = video.Write(moq.VideoFrame{TimestampUs: ptsUs, Data: rgba})
 video.Finish()
 ```
 
+`DecodeVideo` and `DecodeAudio` are the mirrors: they run the codec inside the bindings on the way in, so a subscriber gets pixels and PCM without linking one. Video frames arrive as tightly-packed I420 and carry the size they actually decoded to, since `Resize` is only best effort:
+
+```go
+catalog, err := broadcast.Catalog(ctx)
+// pick a rendition from catalog.Video
+
+video, err := broadcast.DecodeVideo(name, rendition, moq.VideoDecoderOutput{})
+if err != nil {
+    // handle error
+}
+for frame, err := range video.Frames(ctx) {
+    if err != nil {
+        break
+    }
+    render(frame.Data, frame.Width, frame.Height)
+}
+```
+
+An unrecognized codec fails at `DecodeVideo` itself; a recognized one no native backend handles fails when the decoder opens. Either way you find out before the first frame.
+
 `AutoEncoder()` prefers a hardware encoder and falls back to software; `SoftwareEncoder()`, `HardwareEncoder()`, and `NamedEncoder("videotoolbox")` pin the choice. The bindings compile VideoToolbox (macOS), Media Foundation (Windows), and openh264 (software, everywhere); the Linux hardware codecs are a libmoq-only build option. `SetBitrate` retunes the live encoder without forcing a keyframe, cheap enough to drive from a congestion controller.
 
-The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition appears once the first keyframe is encoded, so subscribers discover it through the catalog rather than a name you pick. `Cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `Gop` frames on its own, and each of those cuts a group.
+The track is named after the codec (`.avc3` / `.hev1`) and its catalog rendition is published immediately, read out of the encoder itself, so subscribers discover it through the catalog rather than a name you pick, and can find it before the first frame exists. `Cut()` starts a new group at the next frame, which is optional: the encoder keyframes every `Gop` frames on its own, and each of those cuts a group.
+
+## Cross-broadcast renditions
+
+A catalog rendition may name a *different* broadcast: `Video.Broadcast` / `Audio.Broadcast` is a path relative to the broadcast the catalog came from, so a transcode output at `live/hd` can describe a track that actually lives in `live/source`. `DecodeAudio` and `DecodeVideo` follow it for you. `SubscribeMedia`, `SubscribeTrack`, `FetchGroup`, and `FetchMediaGroup` take a track name rather than a rendition, so resolve first:
+
+```go
+source, err := broadcast.Resolve(rendition.Broadcast)
+if err != nil {
+    // handle error
+}
+consumer, err := source.SubscribeMedia(name, rendition.Container, nil)
+```
+
+`Resolve(nil)` (or an empty reference) returns the same broadcast, so it is safe to call unconditionally. It needs an origin to fetch a sibling from, so it fails on a broadcast consumed straight from a local producer. `Resolve` reports a sibling that exists but has not been announced yet as unroutable rather than waiting for it, so await the referenced broadcast's announcement first if you may be racing it.
 
 ## Raw Track Controls
 
@@ -368,6 +409,30 @@ for request, err := range dynamic.Requests(ctx) {
     _ = producer.Finish()
 }
 ```
+
+## Fetching media groups
+
+`FetchGroup` hands back raw payloads. `FetchMediaGroup` decodes the same group through the rendition's container, so you get timestamped frames without opening a live subscription:
+
+```go
+catalog, err := consumer.Catalog(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+
+group, err := consumer.FetchMediaGroup("audio0", 42, catalog.Audio["audio0"].Container, nil)
+if err != nil {
+    log.Fatal(err)
+}
+for frame, err := range group.Frames(ctx) {
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("%d: %d bytes\n", frame.TimestampUs, len(frame.Payload))
+}
+```
+
+A fetched media group is finite: it ends after the group's last decoded frame, unlike the live `SubscribeMedia` stream. Latency-based group skipping does not apply, so you always get every frame in the group.
 
 ## Raw track timestamps
 
@@ -474,11 +539,11 @@ just go check
 
 This runs `go/scripts/check.sh`, which builds `moq-ffi` for the host arch, regenerates the bindings with `uniffi-bindgen-go`, stages both the ffi and wrapper modules into `dist/` (wiring the wrapper to the freshly-built ffi via a local `replace`), and runs `go vet`/`go build`/`go test`. Requires `cargo`, `go`, and `uniffi-bindgen-go` on the path; see [moq-ffi](/lib/go/moq-ffi) for the install.
 
-The committed `go/wrapper/go.mod` carries a `require github.com/moq-dev/moq-go-ffi v0.0.0` placeholder; the local `replace` and CI's release-time rewrite supply the real version. Don't "fix" it by hand.
+The committed `go/wrapper/go.mod` carries a `require moq.dev/moq-ffi v0.0.0` placeholder; the local `replace` and CI's release-time rewrite supply the real version. Don't "fix" it by hand.
 
 ## See also
 
-- API reference: [pkg.go.dev/github.com/moq-dev/moq-go](https://pkg.go.dev/github.com/moq-dev/moq-go)
+- API reference: [pkg.go.dev/moq.dev/moq](https://pkg.go.dev/moq.dev/moq)
 - Source: [go/wrapper](https://github.com/moq-dev/moq/tree/main/go/wrapper)
 - Mirror repo: [moq-dev/moq-go](https://github.com/moq-dev/moq-go)
 - Raw bindings it builds on: [moq-ffi](/lib/go/moq-ffi)

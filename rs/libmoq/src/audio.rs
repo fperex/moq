@@ -33,37 +33,37 @@ use crate::{Error, Id, NonZeroSlab, Shared, State, ffi};
 #[repr(C)]
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug)]
-pub enum moq_audio_format {
-	MOQ_AUDIO_FORMAT_U8 = 0,
-	MOQ_AUDIO_FORMAT_S16 = 1,
-	MOQ_AUDIO_FORMAT_S32 = 2,
-	MOQ_AUDIO_FORMAT_F32 = 3,
-	MOQ_AUDIO_FORMAT_U8_PLANAR = 4,
-	MOQ_AUDIO_FORMAT_S16_PLANAR = 5,
-	MOQ_AUDIO_FORMAT_S32_PLANAR = 6,
-	MOQ_AUDIO_FORMAT_F32_PLANAR = 7,
+pub enum moq_audio_sample_format {
+	MOQ_AUDIO_SAMPLE_FORMAT_U8 = 0,
+	MOQ_AUDIO_SAMPLE_FORMAT_S16 = 1,
+	MOQ_AUDIO_SAMPLE_FORMAT_S32 = 2,
+	MOQ_AUDIO_SAMPLE_FORMAT_F32 = 3,
+	MOQ_AUDIO_SAMPLE_FORMAT_U8_PLANAR = 4,
+	MOQ_AUDIO_SAMPLE_FORMAT_S16_PLANAR = 5,
+	MOQ_AUDIO_SAMPLE_FORMAT_S32_PLANAR = 6,
+	MOQ_AUDIO_SAMPLE_FORMAT_F32_PLANAR = 7,
 }
 
 fn audio_format_from_u32(value: u32) -> Result<moq_audio::Format, Error> {
 	use moq_audio::Format;
 	Ok(match value {
-		v if v == moq_audio_format::MOQ_AUDIO_FORMAT_U8 as u32 => Format::U8,
-		v if v == moq_audio_format::MOQ_AUDIO_FORMAT_S16 as u32 => Format::S16,
-		v if v == moq_audio_format::MOQ_AUDIO_FORMAT_S32 as u32 => Format::S32,
-		v if v == moq_audio_format::MOQ_AUDIO_FORMAT_F32 as u32 => Format::F32,
-		v if v == moq_audio_format::MOQ_AUDIO_FORMAT_U8_PLANAR as u32 => Format::U8Planar,
-		v if v == moq_audio_format::MOQ_AUDIO_FORMAT_S16_PLANAR as u32 => Format::S16Planar,
-		v if v == moq_audio_format::MOQ_AUDIO_FORMAT_S32_PLANAR as u32 => Format::S32Planar,
-		v if v == moq_audio_format::MOQ_AUDIO_FORMAT_F32_PLANAR as u32 => Format::F32Planar,
+		v if v == moq_audio_sample_format::MOQ_AUDIO_SAMPLE_FORMAT_U8 as u32 => Format::U8,
+		v if v == moq_audio_sample_format::MOQ_AUDIO_SAMPLE_FORMAT_S16 as u32 => Format::S16,
+		v if v == moq_audio_sample_format::MOQ_AUDIO_SAMPLE_FORMAT_S32 as u32 => Format::S32,
+		v if v == moq_audio_sample_format::MOQ_AUDIO_SAMPLE_FORMAT_F32 as u32 => Format::F32,
+		v if v == moq_audio_sample_format::MOQ_AUDIO_SAMPLE_FORMAT_U8_PLANAR as u32 => Format::U8Planar,
+		v if v == moq_audio_sample_format::MOQ_AUDIO_SAMPLE_FORMAT_S16_PLANAR as u32 => Format::S16Planar,
+		v if v == moq_audio_sample_format::MOQ_AUDIO_SAMPLE_FORMAT_S32_PLANAR as u32 => Format::S32Planar,
+		v if v == moq_audio_sample_format::MOQ_AUDIO_SAMPLE_FORMAT_F32_PLANAR as u32 => Format::F32Planar,
 		_ => return Err(Error::InvalidCode),
 	})
 }
 
-/// PCM layout the caller hands to [`moq_publish_audio_raw_frame`].
+/// PCM layout the caller hands to [`moq_encode_audio_frame`].
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct moq_audio_encoder_input {
-	/// `moq_audio_format` discriminant.
+	/// `moq_audio_sample_format` discriminant.
 	pub format: u32,
 	pub sample_rate: u32,
 	pub channels: u32,
@@ -90,7 +90,7 @@ pub struct moq_audio_encoder_output {
 	pub frame_duration_ms: u32,
 }
 
-/// PCM layout the caller wants out of [`moq_consume_audio_raw`].
+/// PCM layout the caller wants out of [`moq_decode_audio`].
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct moq_audio_decoder_output {
@@ -101,18 +101,18 @@ pub struct moq_audio_decoder_output {
 	pub channels: u32,
 	/// Upper bound on buffering before skipping a stalled group, in
 	/// milliseconds. Same congestion-control knob as
-	/// `moq_consume_audio`'s `latency_max_ms`. 0 = skip
+	/// `moq_consume_audio`'s `max_age_ms`. 0 = skip
 	/// aggressively (the moq-mux default); set to your playout
 	/// buffer (tens to a few hundred ms) for a softer skip. Named
-	/// `_max` to leave room for a future `latency_min_ms`
-	/// (jitter-buffer floor).
-	pub latency_max_ms: u64,
+	/// `_max` to leave room for a future `min_buffer_ms`, a
+	/// jitter-buffer floor rather than a staleness bound.
+	pub max_age_ms: u64,
 }
 
 /// One audio frame: payload bytes plus a presentation timestamp.
 ///
 /// `data` is owned by the consume slab (see
-/// [`moq_consume_audio_raw_frame_free`]) or borrowed by the publish call
+/// [`moq_decode_audio_frame_free`]) or borrowed by the publish call
 /// (the publisher copies before returning).
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -271,7 +271,7 @@ impl Audio {
 ///
 /// The encoder configuration is fixed at construction; subsequent
 /// frame writes pass only payload + timestamp via
-/// [`moq_publish_audio_raw_frame`].
+/// [`moq_encode_audio_frame`].
 ///
 /// Returns a non-zero handle on success or a negative error code.
 ///
@@ -280,7 +280,7 @@ impl Audio {
 /// - `input` / `output` must point to fully populated structs.
 /// - `output->codec` must point to `output->codec_len` bytes of UTF-8.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moq_publish_audio_raw(
+pub unsafe extern "C" fn moq_encode_audio(
 	broadcast: u32,
 	name: *const c_char,
 	name_len: usize,
@@ -335,7 +335,7 @@ fn zeroable(value: u32) -> Option<u32> {
 /// - `frame` must point to a valid [`moq_audio_frame`].
 /// - `frame->data` must point to `frame->data_size` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moq_publish_audio_raw_frame(producer: u32, frame: *const moq_audio_frame) -> i32 {
+pub unsafe extern "C" fn moq_encode_audio_frame(producer: u32, frame: *const moq_audio_frame) -> i32 {
 	ffi::enter(move || {
 		let producer = ffi::parse_id(producer)?;
 		let frame = unsafe { frame.as_ref() }.ok_or(Error::InvalidPointer)?;
@@ -355,7 +355,7 @@ pub unsafe extern "C" fn moq_publish_audio_raw_frame(producer: u32, frame: *cons
 
 /// Flush any pending samples and finalize an audio producer.
 #[unsafe(no_mangle)]
-pub extern "C" fn moq_publish_audio_raw_finish(producer: u32) -> i32 {
+pub extern "C" fn moq_encode_audio_finish(producer: u32) -> i32 {
 	ffi::enter(move || {
 		let producer = ffi::parse_id(producer)?;
 		// The id is dropped first, so nothing new queues behind the flush; whatever
@@ -379,13 +379,13 @@ pub extern "C" fn moq_publish_audio_raw_finish(producer: u32) -> i32 {
 /// more with a terminal code: `0` (closed cleanly) or a negative error. After
 /// the terminal (`<= 0`) callback, `on_frame` is never called again and
 /// `user_data` is never touched again, so release `user_data` there. The
-/// terminal callback fires even after [`moq_consume_audio_raw_close`].
+/// terminal callback fires even after [`moq_decode_audio_close`].
 ///
 /// # Safety
 /// - `output` must point to a valid [`moq_audio_decoder_output`].
 /// - `user_data` must stay valid until the terminal (`<= 0`) `on_frame` callback.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moq_consume_audio_raw(
+pub unsafe extern "C" fn moq_decode_audio(
 	catalog: u32,
 	index: u32,
 	output: *const moq_audio_decoder_output,
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn moq_consume_audio_raw(
 		config.format = audio_format_from_u32(raw.format)?;
 		config.sample_rate = zeroable(raw.sample_rate);
 		config.channels = zeroable(raw.channels);
-		config.latency = moq_mux::Latency::max(Duration::from_millis(raw.latency_max_ms));
+		config.max_age = Duration::from_millis(raw.max_age_ms);
 
 		let on_frame = unsafe { OnStatus::new(user_data, on_frame) };
 
@@ -418,9 +418,9 @@ pub unsafe extern "C" fn moq_consume_audio_raw(
 /// Does NOT free `user_data`; the on-frame callback still fires once more with a
 /// terminal `0` (or a negative error), which is where `user_data` should be
 /// released. Frame IDs already delivered to the callback are likewise not freed;
-/// release each with [`moq_consume_audio_raw_frame_free`].
+/// release each with [`moq_decode_audio_frame_free`].
 #[unsafe(no_mangle)]
-pub extern "C" fn moq_consume_audio_raw_close(consumer: u32) -> i32 {
+pub extern "C" fn moq_decode_audio_close(consumer: u32) -> i32 {
 	ffi::enter(move || {
 		let consumer = ffi::parse_id(consumer)?;
 		State::lock().audio.consume_close(consumer)
@@ -430,12 +430,12 @@ pub extern "C" fn moq_consume_audio_raw_close(consumer: u32) -> i32 {
 /// Copy a delivered frame's metadata into `dst`.
 ///
 /// The written `dst->data` pointer remains valid until the same `id`
-/// is released with [`moq_consume_audio_raw_frame_free`].
+/// is released with [`moq_decode_audio_frame_free`].
 ///
 /// # Safety
 /// - `dst` must point to a writable [`moq_audio_frame`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moq_consume_audio_raw_frame(id: u32, dst: *mut moq_audio_frame) -> i32 {
+pub unsafe extern "C" fn moq_decode_audio_frame(id: u32, dst: *mut moq_audio_frame) -> i32 {
 	ffi::enter(move || {
 		let id = ffi::parse_id(id)?;
 		let dst = unsafe { dst.as_mut() }.ok_or(Error::InvalidPointer)?;
@@ -447,7 +447,7 @@ pub unsafe extern "C" fn moq_consume_audio_raw_frame(id: u32, dst: *mut moq_audi
 /// Required for every delivered frame ID; closing the parent consumer
 /// is not enough.
 #[unsafe(no_mangle)]
-pub extern "C" fn moq_consume_audio_raw_frame_free(id: u32) -> i32 {
+pub extern "C" fn moq_decode_audio_frame_free(id: u32) -> i32 {
 	ffi::enter(move || {
 		let id = ffi::parse_id(id)?;
 		State::lock().audio.frame_free(id)

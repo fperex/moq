@@ -15,6 +15,7 @@ use std::task::Poll;
 use bytes::Bytes;
 
 mod consumer;
+mod group;
 mod producer;
 mod source;
 #[cfg(test)]
@@ -28,6 +29,7 @@ pub mod mkv;
 pub mod ts;
 
 pub use consumer::Consumer;
+pub use group::GroupConsumer;
 pub use producer::Producer;
 pub(crate) use source::ExportSource;
 
@@ -54,7 +56,7 @@ pub struct Frame {
 	/// that don't (Legacy, LOC) leave this `None`. The [`Consumer`] adds it to
 	/// `timestamp` to learn how far a group has presented, so it can advance to
 	/// a newer group as soon as the gap is covered instead of waiting out the
-	/// latency budget.
+	/// max age budget.
 	pub duration: Option<moq_net::Timestamp>,
 
 	/// Encoded codec payload.

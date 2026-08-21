@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
-static ALLOC: moq_native::jemalloc::tikv_jemallocator::Jemalloc = moq_native::jemalloc::tikv_jemallocator::Jemalloc;
+static ALLOC: moq_tokio::jemalloc::tikv_jemallocator::Jemalloc = moq_tokio::jemalloc::tikv_jemallocator::Jemalloc;
 
 mod audio;
 mod emulator;
@@ -71,15 +71,29 @@ pub struct Config {
 
 	/// The MoQ client configuration.
 	#[command(flatten)]
-	pub client: moq_native::connect::Config,
+	pub client: moq_tokio::connect::Config,
 
 	/// QUIC transport tuning (`--quic-*`).
 	#[command(flatten)]
-	pub quic: moq_native::quic::Config,
+	pub quic: moq_tokio::quic::Config,
 
 	/// The log configuration.
 	#[command(flatten)]
-	pub log: moq_native::Log,
+	pub log: moq_tokio::Log,
+}
+
+impl Config {
+	/// Refuse a config parsed from released spellings, naming what replaced each.
+	///
+	/// Checked before anything reads the config: those spellings land on hidden
+	/// fields that nothing honors, so continuing would dial with settings the
+	/// command line never asked for.
+	fn check_deprecated(&self) -> Result<()> {
+		let mut deprecated = self.client.deprecated();
+		deprecated.extend(self.quic.deprecated());
+		anyhow::ensure!(deprecated.is_empty(), "{deprecated}");
+		Ok(())
+	}
 }
 
 /// Shared state for a game session, accessible from multiple threads/tasks.
@@ -209,7 +223,7 @@ async fn run(config: &Config) -> Result<()> {
 	let client = config.client.clone().init(config.quic.clone())?;
 
 	// Publish origin: the game session broadcast.
-	let publish_origin = moq_net::Origin::random().produce();
+	let publish_origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 	let default_game_prefix = format!("{}/game", config.prefix);
 	let default_viewer_prefix = format!("{}/viewer", config.prefix);
 	let game_prefix = config.prefix_game.as_deref().unwrap_or(&default_game_prefix);
@@ -224,7 +238,7 @@ async fn run(config: &Config) -> Result<()> {
 	// Consume origin: viewer broadcasts under the viewer prefix.
 	// JS publishes viewer feedback at "{viewer_prefix}/{name}/{viewerId}"
 	let viewer_path = format!("{viewer_prefix}/{name}");
-	let consume_origin = moq_net::Origin::random().produce();
+	let consume_origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 	let mut viewer_consumer = consume_origin
 		.with_root(&viewer_path)
 		.expect("viewer prefix should be valid")
@@ -240,7 +254,7 @@ async fn run(config: &Config) -> Result<()> {
 
 	// Set up catalog and encoders.
 	let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
-	let video_encoder = video::VideoEncoder::spawn(broadcast.clone(), catalog.clone());
+	let video_encoder = video::VideoEncoder::spawn(broadcast.clone(), catalog.clone()).await;
 
 	let audio_encoder = audio::AudioEncoder::new(broadcast.clone(), catalog.clone(), 44100)?;
 
@@ -306,18 +320,6 @@ fn run_emulator(
 ) -> Result<()> {
 	let mut emu = emulator::Emulator::new(rom_path)?;
 	let start = Instant::now();
-
-	// Run a single tick so the encoders get initial data and publish
-	// codec config, even before any viewer subscribes.
-	emu.tick();
-	let elapsed = start.elapsed();
-	let rgba = Bytes::from(emu.framebuffer());
-	let ts = hang::container::Timestamp::from_micros(elapsed.as_micros() as u64).context("timestamp overflow")?;
-	session.video_encoder.try_frame(rgba, ts);
-	let samples = emu.audio_samples();
-	if !samples.is_empty() {
-		audio_encoder.push_samples(&samples, elapsed)?;
-	}
 
 	// Game Boy runs at exactly 59.727 Hz (4194304 Hz CPU / 70224 cycles per frame).
 	// 1/59.727 ≈ 16742 microseconds per frame.
@@ -460,9 +462,10 @@ fn run_emulator(
 async fn main() -> Result<()> {
 	let config = Config::parse();
 	config.log.init()?;
+	config.check_deprecated()?;
 
 	#[cfg(feature = "jemalloc")]
-	let jemalloc = moq_native::jemalloc::run();
+	let jemalloc = moq_tokio::jemalloc::run();
 	#[cfg(not(feature = "jemalloc"))]
 	let jemalloc = std::future::pending::<anyhow::Result<()>>();
 
@@ -495,11 +498,13 @@ mod tests {
 	///
 	/// The argv is a copy of `demo/boy/justfile`, not a read of it, so this pins the
 	/// binary's flag surface rather than the two staying in sync.
+	/// `--connect` is the only spelling that reaches the dial, and the URL has to
+	/// land where `run` reads it. A second required flag would leave it inert.
 	#[test]
 	fn matches_demo_invocation() {
 		let config = Config::try_parse_from([
 			"moq-boy",
-			"--client-connect",
+			"--connect",
 			"http://localhost:4443",
 			"--rom",
 			"rom/big2small.gb",
@@ -507,14 +512,33 @@ mod tests {
 			"localhost",
 		])
 		.expect("demo/boy/justfile invocation should parse");
+		config.check_deprecated().expect("the demo uses current spellings");
 
-		let connect = config
-			.client
-			.resolved()
-			.url
-			.expect("the connect URL should reach the dial config");
+		let connect = config.client.url.expect("the connect URL should reach the dial config");
 		assert_eq!(connect.scheme(), "http");
 		assert_eq!(connect.host_str(), Some("localhost"));
 		assert_eq!(connect.port(), Some(4443));
+	}
+
+	/// The spelling the demo used to pass. It still parses, so the process can name
+	/// `--connect` rather than leave clap reporting an unexpected argument, but it
+	/// configures nothing and must stop the run.
+	#[test]
+	fn the_released_connect_spelling_is_refused() {
+		let config = Config::try_parse_from([
+			"moq-boy",
+			"--client-connect",
+			"http://localhost:4443",
+			"--rom",
+			"rom/big2small.gb",
+		])
+		.expect("the released spelling still parses");
+		assert_eq!(config.client.url, None);
+
+		let err = config.check_deprecated().expect_err("must refuse").to_string();
+		assert!(
+			err.contains("--client-connect / MOQ_CLIENT_CONNECT -> --connect / MOQ_CONNECT"),
+			"{err}"
+		);
 	}
 }

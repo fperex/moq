@@ -6,7 +6,7 @@ use std::{
 	time::Duration,
 };
 
-use crate::poll_set::{Machine, PollSet};
+use crate::util::poll_task;
 
 use crate::{
 	AsPath, Error, Path, PathOwned, Timescale, Timestamp, bandwidth,
@@ -15,7 +15,7 @@ use crate::{
 	track::{Position, Subscription},
 };
 
-use super::{ConnectingProducer, RouteCost, Version};
+use super::Version;
 
 use web_async::Lock;
 
@@ -193,10 +193,6 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 						&mut run.routes,
 					)?;
 				}
-				// The first `initial_count` Active messages are the initial set; once
-				// they're all in, the caller drops its producer to mark this prefix
-				// connected.
-				run.initial_remaining = run.initial_remaining.saturating_sub(1);
 			}
 			lite::AnnounceBroadcast::Ended { suffix, .. } => {
 				let path = prefix.join(&suffix);
@@ -248,9 +244,10 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 		&mut self,
 		path: PathOwned,
 		mut hops: crate::OriginList,
-		// The route cost off the wire, i.e. as the peer advertised it. Zero before
-		// lite-06, leaving the hop chain as the only routing input as before.
-		cost: RouteCost,
+		// The route cost off the wire, i.e. as the peer advertised it.
+		// [`Cost::UNKNOWN`] before lite-06, leaving the hop chain as the only
+		// routing input as before.
+		cost: crate::broadcast::Cost,
 		// This link's price, added to the wire cost; the pre-charge value is kept
 		// on the route so the origin's handover gate can tell a warm peer apart.
 		link_cost: u64,
@@ -338,15 +335,20 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 	/// Once the peer has sent a GOAWAY every route it announces starts out draining,
 	/// including a restart of one already attached: a connection on its way out must
 	/// not win selection, however good the path it advertises looks.
-	fn announced_route(&self, hops: crate::OriginList, cost: RouteCost, link_cost: u64) -> crate::broadcast::Route {
+	fn announced_route(
+		&self,
+		hops: crate::OriginList,
+		cost: crate::broadcast::Cost,
+		link_cost: u64,
+	) -> crate::broadcast::Route {
 		let mut route = crate::broadcast::Route::new()
 			.with_hops(hops)
-			.with_cost(cost.charged(link_cost).0)
+			.with_cost(cost.charged(link_cost))
 			.with_announce(true);
-		route.advertised = cost.0;
+		route.advertised = cost;
 
 		if self.going_away.is_set() {
-			route.cost = crate::broadcast::DRAIN_COST;
+			route.cost = crate::broadcast::Cost::DRAIN;
 		}
 
 		route
@@ -369,7 +371,7 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 		path: PathOwned,
 		mut hops: crate::OriginList,
 		// The route cost off the wire and this link's price. See `start_announce`.
-		cost: RouteCost,
+		cost: crate::broadcast::Cost,
 		link_cost: u64,
 		// Lite05+: the announce sender's origin id (from AnnounceOk), appended here to
 		// rebuild the full chain since the sender no longer stamps itself. None for older
@@ -464,11 +466,6 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 /// error ends it.
 pub(super) struct SubscriberDriver<S: crate::transport::poll::Session> {
 	subscriber: Subscriber<S>,
-	/// Our own clone of the connection-progress producer, dropped on the first
-	/// poll. Holding it until then keeps `Connecting` pending so `connect()`
-	/// drives the driver at least once, exactly like the old announce task; the
-	/// per-prefix clones then own the boundary.
-	connecting: Option<ConnectingProducer>,
 	/// One machine per permitted prefix. Only an error ends the session; a
 	/// prefix finishing cleanly (publisher FIN) just retires.
 	prefixes: Vec<AnnouncePrefix<S>>,
@@ -478,40 +475,31 @@ pub(super) struct SubscriberDriver<S: crate::transport::poll::Session> {
 	/// Datagram receive; inert on a version or transport without datagrams.
 	datagrams: Option<DatagramRecv<S>>,
 	/// One machine per announced source, serving the origin's track requests.
-	sources: PollSet<SourceServe<S>>,
+	sources: kio::Tasks<crate::util::MaybeSendTask>,
 }
 
 impl<S: crate::transport::poll::Session> SubscriberDriver<S> {
-	/// `connecting` is the connection-progress producer for this session (None for
-	/// versions with no initial-set boundary). Each prefix holds its own clone and
-	/// drops it once its initial set is in; with no prefixes it drops here, so the
-	/// session is connected now.
-	pub fn new(subscriber: Subscriber<S>, connecting: Option<ConnectingProducer>) -> Self {
+	pub fn new(subscriber: Subscriber<S>) -> Self {
 		let prefixes = subscriber
 			.origin
 			.allowed()
 			.map(|p| p.to_owned())
 			.collect::<Vec<PathOwned>>()
 			.into_iter()
-			.map(|prefix| AnnouncePrefix::new(subscriber.clone(), prefix, connecting.clone()))
+			.map(|prefix| AnnouncePrefix::new(subscriber.clone(), prefix))
 			.collect();
 
 		Self {
-			connecting,
 			prefixes,
 			uni: UniAccept::new(subscriber.clone()),
 			bandwidth: Some(RecvBandwidth::new(subscriber.clone())),
 			datagrams: Some(DatagramRecv::new(subscriber.clone())),
-			sources: PollSet::new(),
+			sources: kio::Tasks::new(),
 			subscriber,
 		}
 	}
 
 	pub fn poll(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
-		// Each prefix holds its own clone; with no prefixes, this drop is what
-		// marks the session connected.
-		self.connecting.take();
-
 		let mut i = 0;
 		while i < self.prefixes.len() {
 			match self.prefixes[i].poll(waiter) {
@@ -543,8 +531,8 @@ impl<S: crate::transport::poll::Session> SubscriberDriver<S> {
 		// Sources created by the announce half; their completion never ends the
 		// session (the origin delivers the unannounce itself).
 		while let Poll::Ready(Ok((path, dynamic))) = self.subscriber.sources.poll_pop(waiter) {
-			self.sources
-				.push(SourceServe::new(self.subscriber.clone(), path, dynamic));
+			let mut serve = SourceServe::new(self.subscriber.clone(), path, dynamic);
+			self.sources.push(poll_task(move |waiter| serve.poll(waiter)));
 		}
 		let _ = self.sources.poll(waiter);
 
@@ -558,7 +546,7 @@ struct UniAccept<S: crate::transport::poll::Session> {
 	subscriber: Subscriber<S>,
 	// A dedicated accept handle: the poll interface takes `&mut self`.
 	accept: S,
-	children: PollSet<UniServe<S>>,
+	children: kio::Tasks<crate::util::MaybeSendTask>,
 }
 
 impl<S: crate::transport::poll::Session> UniAccept<S> {
@@ -567,7 +555,7 @@ impl<S: crate::transport::poll::Session> UniAccept<S> {
 		Self {
 			subscriber,
 			accept,
-			children: PollSet::new(),
+			children: kio::Tasks::new(),
 		}
 	}
 
@@ -577,12 +565,15 @@ impl<S: crate::transport::poll::Session> UniAccept<S> {
 		let mut cx = std::task::Context::from_waker(waiter.waker());
 		loop {
 			match self.accept.poll_accept_uni(&mut cx) {
-				Poll::Ready(Ok(stream)) => self.children.push(UniServe {
-					subscriber: self.subscriber.clone(),
-					state: UniState::Start {
-						reader: Reader::new(stream, self.subscriber.version),
-					},
-				}),
+				Poll::Ready(Ok(stream)) => {
+					let mut child = UniServe {
+						subscriber: self.subscriber.clone(),
+						state: UniState::Start {
+							reader: Reader::new(stream, self.subscriber.version),
+						},
+					};
+					self.children.push(poll_task(move |waiter| child.poll(waiter)));
+				}
 				Poll::Ready(Err(err)) => return Poll::Ready(Err(Error::from_transport(err))),
 				Poll::Pending => break,
 			}
@@ -617,7 +608,7 @@ enum UniState<S: crate::transport::poll::Session> {
 	Done,
 }
 
-impl<S: crate::transport::poll::Session> Machine for UniServe<S> {
+impl<S: crate::transport::poll::Session> UniServe<S> {
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
 		if let Err(err) = ready!(self.poll_serve(waiter)) {
 			tracing::debug!(%err, "error running uni stream");
@@ -1079,9 +1070,6 @@ impl<S: crate::transport::poll::Session> ProbeStream<S> {
 struct AnnouncePrefix<S: crate::transport::poll::Session> {
 	subscriber: Subscriber<S>,
 	prefix: PathOwned,
-	// Dropped once this prefix's initial set is in (or on any exit), so a failed
-	// prefix can't hang connect().
-	connecting: Option<ConnectingProducer>,
 	state: PrefixState<S>,
 }
 
@@ -1096,7 +1084,6 @@ enum PrefixState<S: crate::transport::poll::Session> {
 	Cost {
 		stream: Stream<S, Version>,
 		responder_origin: Option<crate::Origin>,
-		initial_count: u64,
 	},
 	/// Lite01/02: reading the ANNOUNCE_INIT set.
 	ReadInit { stream: Stream<S, Version>, run: PrefixRun },
@@ -1111,10 +1098,6 @@ struct PrefixRun {
 	/// it comes from the connect config or the peer's SETUP, neither of which
 	/// changes for the life of the session.
 	link_cost: u64,
-	/// The first `initial_count` Active messages are the initial set; once
-	/// they're all in, the connecting producer drops to mark this prefix
-	/// connected.
-	initial_remaining: u64,
 	routes: HashMap<PathOwned, AnnouncedRoute>,
 	// Lite06+: announce ids. Each received `active` implicitly assigns the next
 	// per-stream ordinal; `ended`/`restart` reference it instead of repeating the
@@ -1126,11 +1109,10 @@ struct PrefixRun {
 }
 
 impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
-	fn new(subscriber: Subscriber<S>, prefix: PathOwned, connecting: Option<ConnectingProducer>) -> Self {
+	fn new(subscriber: Subscriber<S>, prefix: PathOwned) -> Self {
 		Self {
 			subscriber,
 			prefix,
-			connecting,
 			state: PrefixState::Open,
 		}
 	}
@@ -1169,15 +1151,16 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 						false => PrefixState::Cost {
 							stream,
 							responder_origin: None,
-							initial_count: 0,
 						},
 					};
 				}
 				PrefixState::ReadOk { stream } => {
-					// Lite05+: the publisher reports its own origin id (which we stamp onto
-					// every received Announce's hop chain, since it no longer does so
-					// itself) plus the count of initial active announces that follow
-					// immediately.
+					// Lite05+: the publisher reports its own origin id, which we stamp onto
+					// every received Announce's hop chain since it no longer does so itself.
+					// Its `active` count marks where the initial set ends; nothing here needs
+					// that boundary, so it is read and dropped. Callers that must not race an
+					// announcement use `origin::Consumer::announced_broadcast`, which waits
+					// for the path itself.
 					let ok = ready!(stream.reader.poll_decode::<lite::AnnounceOk>(&mut cx))?;
 					// A peer may legally report id 0 (no identity). When the caller assigned
 					// it one, stand that in so the route isn't loop-blind.
@@ -1191,7 +1174,6 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 					self.state = PrefixState::Cost {
 						stream,
 						responder_origin: Some(origin),
-						initial_count: ok.active,
 					};
 				}
 				PrefixState::Cost { .. } => {
@@ -1199,41 +1181,26 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 					let PrefixState::Cost {
 						stream,
 						responder_origin,
-						initial_count,
 					} = std::mem::replace(&mut self.state, PrefixState::Open)
 					else {
 						unreachable!()
 					};
 
-					let mut run = PrefixRun {
+					let run = PrefixRun {
 						responder_origin,
 						link_cost,
-						initial_remaining: 0,
 						routes: HashMap::new(),
 						next_announce_id: 0,
 						announced_by_id: HashMap::new(),
 					};
 
-					// Release the producer once this prefix's initial set is in. Lite01/02
-					// deliver it via ANNOUNCE_INIT (the ReadInit state); Lite05 delivers
-					// `initial_count` Announce::Active counted in the run loop; Lite03/04
-					// have no boundary.
-					match self.subscriber.version {
-						Version::Lite01 | Version::Lite02 => {
-							self.state = PrefixState::ReadInit { stream, run };
-						}
-						_ if self.subscriber.version.has_announce_ok() => {
-							if initial_count == 0 {
-								self.connecting.take();
-							}
-							run.initial_remaining = initial_count;
-							self.state = PrefixState::Run { stream, run };
-						}
-						_ => {
-							self.connecting.take();
-							self.state = PrefixState::Run { stream, run };
-						}
-					}
+					// Lite01/02 send the initial set as one ANNOUNCE_INIT message, so they
+					// read that before the update stream. Every other version streams it as
+					// ordinary announces.
+					self.state = match self.subscriber.version {
+						Version::Lite01 | Version::Lite02 => PrefixState::ReadInit { stream, run },
+						_ => PrefixState::Run { stream, run },
+					};
 				}
 				PrefixState::ReadInit { stream, run } => {
 					let msg = ready!(stream.reader.poll_decode::<lite::AnnounceInit>(&mut cx))?;
@@ -1245,13 +1212,12 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 						self.subscriber.start_announce(
 							path.clone(),
 							crate::OriginList::new(),
-							RouteCost::default(),
+							crate::broadcast::Cost::UNKNOWN,
 							0,
 							run.responder_origin,
 							&mut run.routes,
 						)?;
 					}
-					self.connecting.take();
 					let PrefixState::ReadInit { stream, run } = std::mem::replace(&mut self.state, PrefixState::Open)
 					else {
 						unreachable!()
@@ -1273,9 +1239,6 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 							return Poll::Ready(Ok(()));
 						};
 						self.subscriber.handle_announce(&self.prefix, announce, run)?;
-						if run.initial_remaining == 0 {
-							self.connecting.take();
-						}
 					}
 				}
 			}
@@ -1292,7 +1255,7 @@ struct SourceServe<S: crate::transport::poll::Session> {
 	dynamic: crate::broadcast::Dynamic,
 	// A dedicated close-watch handle, since each pending operation needs its own.
 	closed: S,
-	tracks: PollSet<TrackServeRun<S>>,
+	tracks: kio::Tasks<crate::util::MaybeSendTask>,
 }
 
 impl<S: crate::transport::poll::Session> SourceServe<S> {
@@ -1303,12 +1266,12 @@ impl<S: crate::transport::poll::Session> SourceServe<S> {
 			path,
 			dynamic,
 			closed,
-			tracks: PollSet::new(),
+			tracks: kio::Tasks::new(),
 		}
 	}
 }
 
-impl<S: crate::transport::poll::Session> Machine for SourceServe<S> {
+impl<S: crate::transport::poll::Session> SourceServe<S> {
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
 		let _ = self.tracks.poll(waiter);
 
@@ -1334,7 +1297,8 @@ impl<S: crate::transport::poll::Session> Machine for SourceServe<S> {
 					};
 					// One machine per track serves its lone subscription and any number
 					// of fetches concurrently.
-					self.tracks.push(TrackServeRun::new(serve, request));
+					let mut run = TrackServeRun::new(serve, request);
+					self.tracks.push(poll_task(move |waiter| run.poll(waiter)));
 				}
 				// The source was finished (unannounced) or aborted.
 				Poll::Ready(Err(err)) => {
@@ -1356,6 +1320,7 @@ mod tests {
 	use super::*;
 	use crate::coding::Decode;
 	use crate::lite::test_transport::SinkSession;
+	use crate::model::ProduceTest;
 
 	const VERSION: Version = Version::Lite05;
 
@@ -1889,7 +1854,7 @@ mod tests {
 			.start_announce(
 				Path::new("room/host").to_owned(),
 				crate::OriginList::new(),
-				RouteCost::default(),
+				crate::broadcast::Cost::UNKNOWN,
 				0,
 				None,
 				&mut routes,
@@ -1898,7 +1863,7 @@ mod tests {
 		assert!(accepted);
 
 		// Broadcast visibility is deferred until the executor ticks.
-		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		tokio::time::sleep(Duration::from_millis(1)).await;
 
 		let broadcast = consumer.get_broadcast("room/host").unwrap();
 		let hops: Vec<_> = broadcast.routes()[0].hops.iter().copied().collect();
@@ -1917,7 +1882,7 @@ mod tests {
 			.start_announce(
 				Path::new("room/host").to_owned(),
 				crate::OriginList::new(),
-				RouteCost::default(),
+				crate::broadcast::Cost::UNKNOWN,
 				0,
 				None,
 				&mut routes,
@@ -1960,7 +1925,7 @@ mod tests {
 			.start_announce(
 				path.clone(),
 				crate::OriginList::new(),
-				RouteCost::default(),
+				crate::broadcast::Cost::UNKNOWN,
 				0,
 				Some(crate::Origin::UNKNOWN),
 				&mut routes,
@@ -1973,7 +1938,7 @@ mod tests {
 			.restart_announce(
 				path,
 				crate::OriginList::new(),
-				RouteCost::default(),
+				crate::broadcast::Cost::UNKNOWN,
 				0,
 				Some(crate::Origin::UNKNOWN),
 				&mut routes,
@@ -2001,7 +1966,7 @@ mod tests {
 			.start_announce(
 				path.clone(),
 				crate::OriginList::new(),
-				RouteCost::default(),
+				crate::broadcast::Cost::UNKNOWN,
 				0,
 				Some(publisher),
 				&mut routes,
@@ -2014,7 +1979,7 @@ mod tests {
 			.restart_announce(
 				path,
 				crate::OriginList::new(),
-				RouteCost(5),
+				crate::broadcast::Cost::new(5),
 				0,
 				Some(publisher),
 				&mut routes,
@@ -2054,7 +2019,14 @@ mod tests {
 		let hops = crate::OriginList::try_from(vec![crate::Origin::new(7).unwrap()]).unwrap();
 		let mut routes = HashMap::new();
 		subscriber
-			.start_announce(path.clone(), hops, RouteCost(0), 1, None, &mut routes)
+			.start_announce(
+				path.clone(),
+				hops,
+				crate::broadcast::Cost::default(),
+				1,
+				None,
+				&mut routes,
+			)
 			.unwrap();
 		tokio::time::sleep(Duration::from_millis(1)).await;
 		assert!(consumer.get_broadcast("room/host").is_some());
@@ -2072,7 +2044,14 @@ mod tests {
 		let hops = crate::OriginList::try_from(vec![crate::Origin::new(7).unwrap()]).unwrap();
 		let mut routes = HashMap::new();
 		subscriber
-			.start_announce(path.clone(), hops, RouteCost(0), 1, None, &mut routes)
+			.start_announce(
+				path.clone(),
+				hops,
+				crate::broadcast::Cost::default(),
+				1,
+				None,
+				&mut routes,
+			)
 			.unwrap();
 		tokio::time::sleep(Duration::from_millis(1)).await;
 		routes.remove(&path).expect("announced").finish();
@@ -2133,7 +2112,7 @@ struct SubStream<S: crate::transport::poll::Session> {
 	/// Original SUBSCRIBE params, echoed in every SUBSCRIBE_UPDATE; refreshed as the
 	/// downstream aggregate changes.
 	ordered: bool,
-	latency_max: Duration,
+	max_age: Duration,
 	start: Option<Position>,
 	priority: u8,
 	/// The start the SUBSCRIBE itself carried, fixed for the stream's life. A
@@ -2269,7 +2248,7 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 						let start_moved = active.start != subscription.start;
 						active.priority = subscription.priority;
 						active.ordered = subscription.ordered;
-						active.latency_max = subscription.latency.max;
+						active.max_age = subscription.max_age;
 						active.start = subscription.start;
 						if supports_update {
 							// The floor follows the requested start, in both directions:
@@ -2313,6 +2292,12 @@ impl<S: crate::transport::poll::Session> TrackServe<S> {
 	/// immediately, so a late insert races the group stream (a group whose id isn't
 	/// in the map yet is dropped, stalling the track forever). The caller
 	/// deregisters `id` if the establish fails.
+	///
+	/// The subscription's bounds come straight from the demand aggregate. After a
+	/// route change a takeover boundary caps the *previous* segment's `end_group`;
+	/// the segment resuming the track keeps whatever start the subscribers asked for,
+	/// so a live-edge subscriber gets the live edge upstream rather than a replay of
+	/// the outage.
 	fn prepare_establish(
 		&self,
 		producer: &mut track::Producer,
@@ -2428,7 +2413,7 @@ fn buffer_update<S: crate::transport::poll::Session>(
 	active.stream.writer.buffer(&lite::SubscribeUpdate {
 		priority: active.priority,
 		ordered: active.ordered,
-		latency_max: active.latency_max,
+		max_age: active.max_age,
 		start_group: bounds.start_group,
 		end_group: bounds.end_group,
 		start_frame: bounds.start_frame,
@@ -2483,7 +2468,7 @@ impl<S: crate::transport::poll::Session> Establish<S> {
 						track: self.serve.name.as_str().into(),
 						priority: self.subscription.priority,
 						ordered: self.subscription.ordered,
-						latency_max: self.subscription.latency.max,
+						max_age: self.subscription.max_age,
 						start_group: bounds.start_group,
 						end_group: bounds.end_group,
 						start_frame: bounds.start_frame,
@@ -2528,7 +2513,7 @@ impl<S: crate::transport::poll::Session> Establish<S> {
 			stream,
 			id: self.id,
 			ordered: self.subscription.ordered,
-			latency_max: self.subscription.latency.max,
+			max_age: self.subscription.max_age,
 			start: self.subscription.start,
 			priority: self.subscription.priority,
 			requested: self.subscription.start,
@@ -2567,15 +2552,15 @@ impl<S: crate::transport::poll::Session> TrackServeRun<S> {
 			}
 		} else {
 			// No TRACK stream, so the publisher's retention window never reaches us:
-			// the accepting side picks it (see `origin::Info::latency_default`).
-			let info = track::Info::default().with_latency_max(serve.subscriber.origin.latency_default());
+			// the accepting side picks it (see `origin::Info::default_max_age`).
+			let info = track::Info::default().with_max_age(serve.subscriber.origin.default_max_age());
 			TrackRunState::Serve(ServeLoop::new(&serve, request, info, None))
 		};
 		Self { serve, state }
 	}
 }
 
-impl<S: crate::transport::poll::Session> Machine for TrackServeRun<S> {
+impl<S: crate::transport::poll::Session> TrackServeRun<S> {
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
 		loop {
 			match &mut self.state {
@@ -2695,13 +2680,13 @@ impl<S: crate::transport::poll::Session> TrackInfoFetch<S> {
 					// stream drop.
 					let _ = stream.writer.finish();
 
-					// Publisher Max Latency rides on the wire, so the local retention
+					// Publisher Max Age rides on the wire, so the local retention
 					// window matches what the upstream advertises (relays re-serve with
 					// the same bound). `broadcast` is left at its default here;
 					// `track::Request::accept` stamps the track's real broadcast.
 					let model = track::Info::default()
 						.with_timescale(info.timescale)
-						.with_latency_max(info.latency_max)
+						.with_max_age(info.max_age)
 						.with_priority(info.priority)
 						.with_ordered(info.ordered);
 					return Poll::Ready(Ok(model));
@@ -2724,7 +2709,7 @@ struct ServeLoop<S: crate::transport::poll::Session> {
 	/// Serve on-demand fetches of uncached groups from this session.
 	dynamic: track::Dynamic,
 	sub: Sub<S>,
-	fetches: PollSet<FetchServeRun<S>>,
+	fetches: kio::Tasks<crate::util::MaybeSendTask>,
 	// A dedicated close-watch handle for the session-died arm.
 	closed: S,
 	// SUBSCRIBE_UPDATE only exists on Lite03+, so older peers can't carry a
@@ -2754,7 +2739,7 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
 			serving,
 			dynamic,
 			sub: Sub::None,
-			fetches: PollSet::new(),
+			fetches: kio::Tasks::new(),
 			closed: serve.subscriber.session.clone(),
 			supports_update: !matches!(serve.subscriber.version, Version::Lite01 | Version::Lite02),
 			supports_fetch: serve.subscriber.version.has_track_stream(),
@@ -2808,8 +2793,8 @@ impl<S: crate::transport::poll::Session> ServeLoop<S> {
 					match self.dynamic.poll_requested_group(waiter) {
 						Poll::Ready(Ok(req)) => {
 							if self.supports_fetch {
-								self.fetches
-									.push(FetchServeRun::new(serve.clone(), req, self.timescale));
+								let mut run = FetchServeRun::new(serve.clone(), req, self.timescale);
+								self.fetches.push(poll_task(move |waiter| run.poll(waiter)));
 							} else {
 								req.reject(Error::Version);
 							}
@@ -2973,7 +2958,7 @@ impl<S: crate::transport::poll::Session> FetchServeRun<S> {
 	}
 }
 
-impl<S: crate::transport::poll::Session> Machine for FetchServeRun<S> {
+impl<S: crate::transport::poll::Session> FetchServeRun<S> {
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
 		let mut cx = std::task::Context::from_waker(waiter.waker());
 		loop {
@@ -3071,7 +3056,7 @@ impl<S: crate::transport::poll::Session> Machine for FetchServeRun<S> {
 					// panicking.
 					let group_info = track::Info::default()
 						.with_timescale(self.timescale.unwrap_or_default())
-						.with_latency_max(self.serve.subscriber.origin.latency_default());
+						.with_max_age(self.serve.subscriber.origin.default_max_age());
 					let mut producer = match request.accept(group_info) {
 						Ok(producer) => producer,
 						Err(err) => {

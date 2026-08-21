@@ -5,6 +5,7 @@ import type { Probe as ProbeStats } from "../connection/stats.ts";
 import { BroadcastCache } from "../consume.ts";
 import { error, reason } from "../error.ts";
 import * as netGroup from "../group.ts";
+import type { Origin } from "../hop.ts";
 import * as Path from "../path.ts";
 import { type Reader, Stream } from "../stream.ts";
 import * as Time from "../time.ts";
@@ -15,7 +16,6 @@ import { Datagram as DatagramMessage } from "./datagram.ts";
 import * as DatagramStream from "./datagram_stream.ts";
 import { Fetch as FetchMessage } from "./fetch.ts";
 import type { Group as GroupMessage } from "./group.ts";
-import type { Origin } from "./origin.ts";
 import { sendOrder } from "./priority.ts";
 import { Probe } from "./probe.ts";
 import { ProbeLevel, type Setup } from "./setup.ts";
@@ -372,7 +372,7 @@ export class Subscriber {
 			track: request.name,
 			priority: subscription.priority ?? 0,
 			ordered: subscription.ordered,
-			latencyMax: subscription.latencyMax,
+			maxAge: subscription.maxAge,
 			startGroup: subscription.startGroup,
 			endGroup: subscription.endGroup,
 		});
@@ -518,9 +518,9 @@ export class Subscriber {
 	#toModelInfo(info: TrackInfo): track.Info {
 		return {
 			timescale: Time.Timescale(info.timescale),
-			// Publisher Max Latency rides on the wire, so the local retention window
+			// Publisher Max Age rides on the wire, so the local retention window
 			// matches what the upstream advertises (relays re-serve with the same bound).
-			latencyMax: info.latencyMax,
+			maxAge: info.maxAge,
 			priority: info.priority,
 			ordered: info.ordered,
 		};
@@ -680,7 +680,7 @@ export class Subscriber {
 		let lastSent: track.Subscription = {
 			priority: msg.priority,
 			ordered: msg.ordered,
-			latencyMax: msg.latencyMax,
+			maxAge: msg.maxAge,
 			startGroup: msg.startGroup,
 			endGroup: msg.endGroup,
 		};
@@ -695,11 +695,11 @@ export class Subscriber {
 			}
 
 			// Round-trip the other Subscribe parameters so the publisher doesn't
-			// interpret SUBSCRIBE_UPDATE as a reset of ordered/latencyMax/etc.
+			// interpret SUBSCRIBE_UPDATE as a reset of ordered/maxAge/etc.
 			const update = new SubscribeUpdate({
 				priority: current.priority ?? 0,
 				ordered: current.ordered,
-				latencyMax: current.latencyMax,
+				maxAge: current.maxAge,
 				startGroup: current.startGroup,
 				endGroup: current.endGroup,
 			});
@@ -713,7 +713,7 @@ export class Subscriber {
 		return (
 			(a.priority ?? 0) === (b.priority ?? 0) &&
 			(a.ordered ?? false) === (b.ordered ?? false) &&
-			(a.latencyMax ?? 0) === (b.latencyMax ?? 0) &&
+			(a.maxAge ?? 0) === (b.maxAge ?? 0) &&
 			a.startGroup === b.startGroup &&
 			a.endGroup === b.endGroup
 		);

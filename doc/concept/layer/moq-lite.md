@@ -70,6 +70,12 @@ The [moq-relay clustering](/bin/relay/cluster) feature actually uses this to dis
 The peer first replies with the set of broadcasts that are currently live, then streams updates as they change.
 This initial set is a discrete batch: the latest draft reports how many entries to expect up front, so a freshly connected session can wait until that snapshot has fully arrived before listing what's available, rather than racing the gossip.
 
+Each announcement also describes the route it took: the chain of relay identities it passed through (which is how forwarding loops are caught) and what pulling the broadcast via that route would cost.
+The cost comes in two magnitudes, compared in order.
+The *warm* cost is what one more subscription would cost the mesh right now, so it collapses to zero at any relay already carrying the broadcast; that is what lets a cluster deduplicate onto a warm copy instead of opening a second ingest.
+The *cold* cost prices the same path as if nothing were cached, so when two warm relays tie at zero it still says which of them sits closer to the publisher.
+Subscribers route to the lowest warm cost and break ties on cold; [moq-relay clustering](/bin/relay/cluster) covers how relays use this to pick an aggregation point.
+
 ### Subscriptions
 
 All data transfers are initiated by subscriptions.
@@ -114,10 +120,16 @@ Each Subscription consists of a few properties:
 
 - **Track Priority**: A value between 0 and 255. Tracks with higher priority will be delivered first.
 - **Group Order**: The order in which groups are delivered. Defaults to descending; higher IDs are delivered first.
-- **Subscriber Max Latency**: The maximum age of a non-latest group before it is skipped. Defaults to zero, so stale groups are skipped immediately.
+- **Subscriber Max Age**: How old a non-latest group may get before it is skipped. Defaults to zero, so stale groups are skipped immediately.
 
-The publisher also keeps old groups around for a best-effort **Publisher Max Latency** cache window so relays and late subscribers can still fetch them. This defaults to 5 seconds.
-The subscriber's maximum latency is bounded by this window: a group can't be waited for longer than it's actually kept around.
+That age is measured both on the media timeline (a group's first timestamp against the newest stamped one) and by wall-clock arrival time, and either limit can expire the group.
+The media timeline keeps a backlog delivered as a burst old, while wall-clock time backstops stalled or empty groups that have no timestamp.
+Both ends apply it: the publisher skips a group rather than sending it, and the subscriber skips it again as it reads.
+The publisher only ever sees the most tolerant budget across its subscribers, which is why the subscriber applies it too.
+Asking for old groups with `Group Start` does not exempt them: a start bounds what you are sent, and a subscriber that wants history has to raise its budget to match.
+
+The publisher also keeps old groups around for a best-effort **Publisher Max Age** cache window so relays and late subscribers can still fetch them. This defaults to 5 seconds.
+The subscriber's max age is bounded by this window: a group can't be waited for longer than it's actually kept around.
 
 It is declared per track, so a publisher raises it on the tracks that are read as history rather than followed at the live edge.
 hang media tracks ask for 30 seconds on that basis: a segmented egress (HLS/DASH) may only advertise segments a fetch can still reach, and a standard player starts several segments behind the live edge.
@@ -162,7 +174,7 @@ On the receiving side:
 
 A moq-transport client sends an empty URI: only a server can tell a peer where to reconnect. The URI is capped at 8,192 bytes on both wires, and a second GOAWAY on a session is a protocol violation that closes it.
 
-Native clients get step 3 for free from `moq_native::Client::connect`, which dials the replacement while the old session keeps serving and hands over at a group boundary. `--goaway-redirect` chooses how far to trust the URI and `--goaway-handover` bounds how long the old session lingers.
+Native clients get step 3 for free from `moq_tokio::Client::connect`, which dials the replacement while the old session keeps serving and hands over at a group boundary. `--goaway-redirect` chooses how far to trust the URI and `--goaway-handover` bounds how long the old session lingers.
 
 `moq-relay` uses this in both directions: on shutdown it drains its own downstream sessions (see [`--drain-timeout`](/bin/relay/config#drain-timeout)), and on a GOAWAY from a cluster peer the reconnect loop migrates transparently.
 

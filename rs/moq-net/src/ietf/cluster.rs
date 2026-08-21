@@ -169,12 +169,21 @@ impl Advert {
 	///
 	/// The addition saturates rather than wraps, so an absurd upstream value ranks last
 	/// instead of overflowing to best.
+	///
+	/// The Cluster extension carries one cost, which is the warm one: a relay already
+	/// carrying the broadcast advertises zero here just as it does on lite-06. There
+	/// is nowhere to put the cold path, so it stays [`Cost::UNKNOWN`] and this route
+	/// never outranks one whose cold cost is actually known.
 	pub fn route(&self, link_cost: u64) -> crate::broadcast::Route {
+		let advertised = crate::broadcast::Cost {
+			warm: self.cost,
+			..crate::broadcast::Cost::UNKNOWN
+		};
 		let mut route = crate::broadcast::Route::new()
 			.with_hops(self.hops.hops().clone())
-			.with_cost(self.cost.saturating_add(link_cost))
+			.with_cost(advertised.charged(link_cost))
 			.with_announce(true);
-		route.advertised = self.cost;
+		route.advertised = advertised;
 		route
 	}
 }
@@ -217,46 +226,6 @@ impl Peer {
 /// reprice our mesh unilaterally. Falls back to [`DEFAULT_COST`] when neither priced it.
 pub fn link_cost(local: Option<u64>, peer: &Peer) -> u64 {
 	local.or(peer.cost).unwrap_or(DEFAULT_COST)
-}
-
-/// Shared slot for the peer's cluster options, filled when its SETUP is read.
-///
-/// The publisher blocks on this before its first advertisement: the extension changes
-/// the NAMESPACE encoding, so nothing can be sent until we know whether the peer speaks
-/// it. Cheap to clone; every handle shares the same slot.
-#[derive(Clone, Default)]
-pub(crate) struct PeerSetup(kio::Shared<Option<Peer>>);
-
-impl PeerSetup {
-	/// Record what the peer declared. A SETUP carrying neither option records the
-	/// default (not negotiated), which is what unblocks a waiter.
-	///
-	/// First write wins. The announce loops read this once and hold it for their
-	/// lifetime while subscription serving re-reads it, so letting a later SETUP
-	/// overwrite the identity would advertise under one exclusion and serve under
-	/// another, which is how a routing loop gets back in.
-	pub fn set(&self, peer: Peer) {
-		let mut slot = self.0.lock();
-		if slot.is_none() {
-			*slot = Some(peer);
-		}
-	}
-
-	/// Await the peer's SETUP.
-	///
-	/// The peer MUST send exactly one, so this resolves once that stream is read. Waits
-	/// forever if it never does; the caller is a session task, cancelled when the driver
-	/// drops.
-	pub async fn get(&self) -> Peer {
-		let slot = self
-			.0
-			.wait(|peer| match peer.is_some() {
-				true => std::task::Poll::Ready(()),
-				false => std::task::Poll::Pending,
-			})
-			.await;
-		(*slot).expect("waited for Some")
-	}
 }
 
 /// Read the cluster Setup Options out of a decoded SETUP parameter block.
@@ -443,7 +412,7 @@ mod tests {
 			cost: 4,
 		};
 		let route = advert.route(3);
-		assert_eq!(route.cost, 7);
+		assert_eq!(route.cost.warm, 7);
 		assert_eq!(&route.hops, hop_path(&[1, 2]).hops());
 		assert!(route.announce);
 
@@ -451,7 +420,7 @@ mod tests {
 			hops: hop_path(&[1]),
 			cost: u64::MAX,
 		};
-		assert_eq!(absurd.route(10).cost, u64::MAX);
+		assert_eq!(absurd.route(10).cost.warm, crate::broadcast::MAX_COST);
 	}
 
 	#[test]
@@ -509,26 +478,6 @@ mod tests {
 			assert_eq!(peer.origin, Some(self_origin));
 			assert_eq!(peer.cost, cost);
 		}
-	}
-
-	/// The announce loops read the peer's declaration once and hold it, while
-	/// subscription serving re-reads it. A second SETUP overwriting the identity would
-	/// split those two apart, so the first write is the one that counts.
-	#[tokio::test]
-	async fn peer_setup_first_write_wins() {
-		let slot = PeerSetup::default();
-		slot.set(Peer {
-			origin: Some(origin(42)),
-			cost: Some(3),
-		});
-		slot.set(Peer {
-			origin: Some(origin(99)),
-			cost: Some(0),
-		});
-
-		let peer = slot.get().await;
-		assert_eq!(peer.origin, Some(origin(42)));
-		assert_eq!(peer.cost, Some(3));
 	}
 
 	#[test]

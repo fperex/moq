@@ -5,7 +5,7 @@ authors = ["Luke Curley <kixelated@gmail.com>"]
 repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.9.5"
+version = "0.9.7"
 edition = "2024"
 rust-version.workspace = true
 
@@ -36,6 +36,7 @@ thiserror = "2"
 tokio = { workspace = true, features = ["macros"] }
 tracing = "0.1"
 url = "2"
+web-async = { workspace = true }
 webm-iterable = "0.6"
 
 [dev-dependencies]

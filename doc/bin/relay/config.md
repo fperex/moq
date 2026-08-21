@@ -45,6 +45,54 @@ Logging configuration.
 level = "info"
 ```
 
+### \[runtime]
+
+How the relay lays its QUIC work out over threads. By default one work-stealing
+runtime serves every connection off one UDP socket.
+
+```toml
+[runtime]
+# Serve QUIC from this many single-threaded workers instead of the shared
+# runtime. Each worker is a thread with its own socket on the listen address
+# (SO_REUSEPORT), and a connection is handled start to finish by one worker, so
+# its packets never cross threads. Everything else (HTTP, WebSocket, tcp/unix,
+# clustering) stays on the shared runtime. Omit to keep QUIC there too.
+#
+# Packets are steered to their worker by connection ID, not by address, so a
+# client that migrates (a NAT rebinding, a network change) stays with the worker
+# that owns its connection.
+#
+# Linux only. Needs a backend whose connection IDs can name the owning worker,
+# so listen.backend must be quinn (the default) or noq; quiche refuses to start.
+# Cannot be combined with listen.quic_lb_id, which wants the same bytes of the
+# connection ID.
+#
+# The listen address needs an explicit non-zero port: an ephemeral bind gives
+# each worker a port of its own instead of a shared one.
+#
+# Incompatible with listen.tls.generate, since each worker would generate a
+# certificate of its own. Point at real certificate files instead. Each worker
+# loads and watches those files itself, so a rotation is not atomic across the
+# group: for as long as the reloads take, two workers can be serving different
+# certificates. See https://github.com/moq-dev/moq/issues/2924.
+workers = 8
+
+# Pin each worker to a CPU core. Default: true.
+pin = true
+```
+
+The shared runtime is still there for everything that is not QUIC, and it still
+sizes its thread pool to the machine. Set `TOKIO_WORKER_THREADS` in the
+environment to bound it, so the workers are not competing with a full second
+pool for the same cores.
+
+Load is not perfectly even across workers. A connection is assigned to a worker
+by the kernel's hash of its first packet and stays there for life, so worker
+load carries the binomial spread of that assignment: with ~100 connections on 4
+workers, expect the busiest to carry 1.1-1.6x the idlest. Size `workers`
+expecting somewhat less than one full core of capacity per worker; the spread
+narrows as connection counts grow.
+
 ### \[listen]
 
 QUIC/WebTransport server settings. Optionally add plaintext qmux stream
@@ -57,6 +105,11 @@ certificate, and Unix sockets add optional peer-credential gating.
 # QUIC (UDP) bind. Omit to run stream-only (no QUIC) when a tcp/unix listener
 # is configured below.
 bind = "[::]:443"
+
+# MoQ versions accepted by QUIC, WebTransport, and WebSocket listeners.
+# TCP and Unix stream listeners also accept moq-lite-05 because it carries
+# their request path in SETUP. Omit to accept every supported version.
+version = ["moq-transport-16"]
 
 # Plaintext qmux over TCP (no TLS, carries no peer identity). Trusted networks
 # only; a non-loopback bind logs a warning. Requires the `tcp` build feature.
@@ -96,11 +149,14 @@ generate = ["localhost", "127.0.0.1"]
 # Optional: root CAs to accept for mTLS peer authentication.
 # Clients that present a cert signed by one of these CAs are granted
 # full access (publish/subscribe/cluster). Intended for relay clustering.
-# Supported by the quinn and noq backends.
 root = ["/path/to/peer-ca.pem"]
 ```
 
-For production, use certificates from Let's Encrypt or another CA.
+For production, use certificates from Let's Encrypt or another CA. The Quinn
+and Noq backends watch certificate, key, and root CA files and reload them for
+new connections. Existing connections keep the identity established by their
+original handshake. The Quiche backend reloads outbound client roots but
+requires a relay restart after rotating its inbound TLS files.
 
 ### \[web.http]
 
@@ -142,7 +198,13 @@ listen = "0.0.0.0:443"
 # TLS certificates (can be the same as listen.tls)
 cert = "cert.pem"
 key = "key.pem"
+
+# Optional root CAs for HTTPS/WSS client certificate authentication.
+root = ["/path/to/peer-ca.pem"]
 ```
+
+HTTPS/WSS certificate, key, and root CA files are watched and reloaded for new
+connections. A failed reload retains the last valid configuration.
 
 ### \[auth]
 
@@ -182,12 +244,14 @@ node = "us-west.example.com:4443"
 mesh = true
 
 # Optional. Fetch the peer list from an HTTP(S) endpoint or local file (a JSON
-# array of hostnames) and reconcile it at runtime, no restart needed.
+# array of peer URLs) and reconcile it at runtime, replacing sessions when URL
+# configuration such as ?cost= or ?jwt= changes.
 connect_api = "https://api.example.com/cluster/connect"
 
 # JWT for outbound cluster dials (alternative to mTLS), applied to any peer
-# whose URL has no inline ?jwt=. Required to authenticate gossip / connect_api
-# discovered peers; for static `connect` peers, prefer an inline ?jwt=.
+# whose URL has no inline ?jwt=. An inline token works for static and
+# connect_api-discovered peers. Gossip must use this shared token or mTLS because
+# the advertised cluster.node URL is public.
 token = "cluster.jwt"
 
 [cluster.lan]
@@ -243,12 +307,27 @@ goaway.handover = "10s"
 # fails outright), and the first connection to complete wins. "0s" dials every
 # address at once. Defaults to 250ms, RFC 8305's Connection Attempt Delay.
 # race = "250ms"
+
+# Delay before dialing an IPv4 address while the full DNS answer is outstanding.
+# A dial runs the usual all-families lookup alongside an IPv4-only one that
+# answers without waiting for the AAAA record, and starts on the first answer, so
+# a slow or dropped AAAA query no longer delays it. The full answer is
+# authoritative, including which family to try first, so this is how long the
+# IPv4-only one waits for it before going ahead alone. "0s" dials as soon as any
+# address resolves. Defaults to 50ms, RFC 8305's Resolution Delay.
+# resolution_delay = "50ms"
 ```
 
+Custom client root files are watched and reloaded for new outbound connections.
+If a changed file is temporarily missing, empty, or invalid, the relay retains
+the last valid roots.
+
 The connect timeout is also available as `--connect-timeout` or
-`MOQ_CONNECT_TIMEOUT`, and the address race as `--connect-race` or
-`MOQ_CONNECT_RACE`. The two compose: the race staggers the attempts within one
-dial, and the timeout bounds that dial as a whole.
+`MOQ_CONNECT_TIMEOUT`, the address race as `--connect-race` or
+`MOQ_CONNECT_RACE`, and the resolution delay as `--connect-resolution-delay` or
+`MOQ_CONNECT_RESOLUTION_DELAY`. They compose: the resolution delay picks which
+family goes first, the race staggers the attempts within one dial, and the
+timeout bounds that dial as a whole.
 
 Pinning the source port (a non-zero port in `--connect-bind`) disables address
 racing on the `quiche` backend, which binds a fresh socket per attempt and so
@@ -369,14 +448,16 @@ counterpart no traffic can flow, so the entry is dropped:
     "broadcasts": 1, "broadcasts_closed": 0,
     "subscriptions": 5, "subscriptions_closed": 2,
     "fetches": 3,
-    "bytes": 12345, "frames": 678, "groups": 9, "datagrams": 2
+    "bytes": 12345, "frames": 678, "groups": 9, "datagrams": 2,
+    "stale": { "bytes": 456, "frames": 23, "groups": 4, "datagrams": 0 }
   },
   "anon/foo": {
     "announced": 1, "announced_closed": 0, "announced_bytes": 8,
     "broadcasts": 1, "broadcasts_closed": 0,
     "subscriptions": 2, "subscriptions_closed": 0,
     "fetches": 0,
-    "bytes": 234, "frames": 12, "groups": 1, "datagrams": 0
+    "bytes": 234, "frames": 12, "groups": 1, "datagrams": 0,
+    "stale": { "bytes": 0, "frames": 0, "groups": 0, "datagrams": 0 }
   }
 }
 ```
@@ -386,6 +467,7 @@ Field semantics:
 - `announced` / `announced_closed`: cumulative count of every broadcast
   announce/unannounce event on this `(tier, role)` slot, regardless of
   whether any subscription happened. Use this for "all known broadcasts".
+
 - `announced_bytes`: cumulative broadcast-name length summed over each
   model-visible announce and unannounce of this broadcast. It counts the name,
   not the encoded message size, so a broadcast isn't charged for hop chains or
@@ -393,6 +475,7 @@ Field semantics:
   Separate from `bytes`, which is media payload. Announce control traffic that
   never enters the model (auth-rejected or unmatched-prefix announcements) is
   not counted.
+
 - `broadcasts` / `broadcasts_closed`: per-(broadcast, session)
   subscription sentinel. The first active subscription a peer session
   opens for a broadcast bumps `broadcasts`; the last one it closes bumps
@@ -400,13 +483,16 @@ Field semantics:
   broadcasts_closed` is the number of distinct sessions currently
   subscribed to the broadcast (i.e. viewers on the egress side), which is
   typically what billing and UI want.
+
 - `subscriptions` / `subscriptions_closed`: cumulative count of
   track-level subscriptions opened and dropped.
+
 - `fetches`: cumulative one-shot group fetches requested by a calling session,
   counted once per coalesced fetch when the request is issued, so a fetch that
   resolves to "not found" still counts. It is separate from `subscriptions` and
   the viewer sentinel; the fetched payload still flows into `bytes` / `frames` /
   `groups`.
+
 - `bytes` / `frames` / `groups`: cumulative payload counters, bumped as
   groups/frames are read out of the model on the egress side and written into
   it on the ingress side. Egress bytes are counted when read out of the model
@@ -414,11 +500,20 @@ Field semantics:
   still count. For a fan-out egress reader (e.g. an HLS/DASH muxer) this is
   bytes read once per segment at the broadcast origin, not per downstream HTTP
   client.
+
 - `datagrams`: cumulative single-frame groups delivered over an unreliable QUIC
   datagram (moq-lite-05+ on a datagram-capable transport). A subset of `groups`:
   each datagram also counts there, and its payload in `frames` / `bytes`. Counted
   when the datagram enters or leaves the model, so an egress datagram dropped by
   congestion or an oversized body still counts.
+
+- `stale`: cumulative `{ bytes, frames, groups, datagrams }` skipped because the
+  content drifted further behind the live edge than the subscriber's latency
+  budget allows, so the relay never put it on the wire. These are disjoint from
+  the top-level payload counters, which remain the backwards-compatible shape for
+  delivered content. A steady rate here means subscribers are consistently behind
+  the live edge, which is normal for a real-time subscription during congestion
+  and a problem for one that asked to tolerate more.
 
 The session tracks (`sessions.json` and any `<tier>/sessions.json`) instead map
 each auth root to a `{ sessions, sessions_closed }` snapshot. `sessions`
@@ -514,16 +609,50 @@ All three flags also accept CLI arguments (`--cache-capacity`,
 
 ### \[iroh]
 
-Experimental P2P support via iroh.
+Experimental P2P support via [iroh](/concept/layer/iroh). Clients dial the relay's
+endpoint id (`iroh://<endpoint-id>/<path>`) instead of a hostname. An n0 relay carries the
+connection from the start and hole punching moves it onto a direct path, or fails and leaves
+it there.
+
+Prefer `https://` for anything off this relay's own network. A client reaching this relay
+over the internet gains nothing from iroh (this process is already the public address, and it
+caches and fans out, which an n0 relay forwarding opaque packets does not), and there's no
+automatic relationship between the two: `iroh://` and `https://` are separate MoQ connections
+to this relay, and dialing one never falls back to the other. That choice belongs to whoever
+writes the URL.
+
+`disable_relay = true` keeps an n0 relay out of the media path entirely. Read
+[Connectivity](/concept/layer/iroh#connectivity) first: it also removes hole punching and the
+probes an endpoint uses to learn its own public address, so it suits a relay meeting peers on
+its own network and breaks one that clients dial over `iroh://` from elsewhere. On a cloud VM
+behind 1:1 NAT it is the difference between advertising your public address and advertising a
+private one nobody can route to.
+
+Either way, discovery still publishes this endpoint's addresses to n0's `iroh.link` DNS
+server, so enabling iroh at all is visible off the network.
 
 ```toml
 [iroh]
 # Enable iroh for P2P connections
 enabled = false
 
-# Path to persist the iroh secret key
+# Path to persist the iroh secret key, so the endpoint id survives a restart.
+# Generated on first run if the file does not exist.
 secret = "./relay-iroh-secret.key"
+
+# UDP bind addresses. Default to an ephemeral port on both families.
+# bind_v4 = "0.0.0.0:4444"
+# bind_v6 = "[::]:4444"
+
+# Uncomment for direct addresses only: no n0 relay, and no hole
+# punching either. Right for peers on this relay's own network; see
+# the note above before enabling it on a relay that clients dial
+# over iroh:// from the internet.
+# disable_relay = true
 ```
+
+The endpoint id is logged at startup (`iroh listening endpoint_id=...`). Without `secret`
+a fresh key is generated on every start, so the id changes each restart.
 
 ## Example Configurations
 

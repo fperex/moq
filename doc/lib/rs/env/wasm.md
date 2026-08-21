@@ -30,7 +30,7 @@ poll-based transport interface.
   `@moq/wasm` package); depend on `moq-wasm` from git until
   `web-transport-wasm` implements the poll interface natively.
 
-On wasm you skip [`moq-native`](/lib/rs/crate/moq-native) entirely (it's
+On wasm you skip [`moq-tokio`](/lib/rs/crate/moq-tokio) entirely (it's
 quinn-only).
 
 ::: warning No `Send` on wasm
@@ -75,8 +75,10 @@ let url = url::Url::parse("https://cdn.moq.dev/anon")?;
 // (see "How it fits together" above).
 let transport = moq_wasm::transport::connect(url, Default::default()).await?;
 
-// Hand the transport to moq-net and run the MoQ handshake.
-let origin = moq_net::Origin::random().produce();
+// Hand the transport to moq-net and run the MoQ handshake. The origin's driver
+// runs its lifecycle work; spawn it like the session driver below.
+let (origin, origin_driver) = moq_net::origin::Producer::new(moq_net::Origin::random().into());
+wasm_bindgen_futures::spawn_local(origin_driver);
 let mut consumer = origin.consume();
 let (session, driver) = moq_net::Client::new()
     .with_subscriber(origin)

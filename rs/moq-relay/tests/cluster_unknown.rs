@@ -56,10 +56,10 @@ async fn spawn_relay(
 	(port, handle)
 }
 
-fn client(version: Option<moq_net::Version>) -> moq_native::Client {
-	let mut config = moq_native::connect::Config::default();
+fn client(version: Option<moq_net::Version>) -> moq_tokio::Client {
+	let mut config = moq_tokio::connect::Config::default();
 	config.tls.insecure = Some(true);
-	config.websocket.delay = Some(std::time::Duration::ZERO);
+	config.websocket.delay = Some(Duration::ZERO);
 	config.bind = Some("127.0.0.1:0".parse().expect("parse bind"));
 	config.version.extend(version);
 	config.init(Default::default()).expect("client init")
@@ -67,7 +67,7 @@ fn client(version: Option<moq_net::Version>) -> moq_native::Client {
 
 struct Publisher {
 	_broadcast: moq_net::broadcast::Producer,
-	_session: moq_native::Connection,
+	_session: moq_tokio::Connection,
 	streamer: tokio::task::AbortHandle,
 }
 
@@ -82,7 +82,7 @@ impl Drop for Publisher {
 
 async fn publish_version(port: u16, version: &str) -> Publisher {
 	let url: Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
-	let origin = Origin::random().produce();
+	let origin = moq_tokio::origin::spawn(Origin::random());
 	let mut broadcast = origin
 		.create_broadcast(PATH, moq_net::broadcast::Route::new().with_announce(true))
 		.expect("create broadcast");
@@ -133,22 +133,32 @@ async fn publish_unknown(port: u16) -> Publisher {
 /// broke rather than just "no frame".
 async fn read_first_frame(port: u16) -> Result<Vec<u8>, String> {
 	let url: Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
-	let origin = Origin::random().produce();
+	let origin = moq_tokio::origin::spawn(Origin::random());
 	let consumer = origin.consume();
 	let session = tokio::time::timeout(TIMEOUT, client(None).with_subscriber(origin).connect(url).established())
 		.await
 		.map_err(|_| "subscriber connect timeout".to_string())?
 		.map_err(|err| format!("subscriber connect failed: {err}"))?;
 
-	let broadcast = tokio::time::timeout(TIMEOUT, consumer.request_broadcast(PATH))
+	// Wait for the announcement rather than asking the moment the session connects:
+	// `request_broadcast` answers on the spot, so it would race the announcement that
+	// makes the path routable.
+	let broadcast = tokio::time::timeout(TIMEOUT, consumer.announced_broadcast(PATH))
 		.await
-		.map_err(|_| "request_broadcast timed out".to_string())?
-		.map_err(|err| format!("request_broadcast failed: {err}"))?;
+		.map_err(|_| "announced_broadcast timed out".to_string())?
+		.ok_or_else(|| "origin closed before the broadcast was announced".to_string())?;
 
-	let mut track = tokio::time::timeout(TIMEOUT, broadcast.track("video").expect("track handle").subscribe(None))
-		.await
-		.map_err(|_| "subscribe timed out".to_string())?
-		.map_err(|err| format!("subscribe failed: {err}"))?;
+	// This verifies route propagation rather than real-time backlog skipping. Give
+	// every hop enough tolerance for the next 100ms group to arrive while the
+	// selected group's frame is still crossing the redundant mesh.
+	let subscription = moq_net::track::Subscription::default().with_max_age(Duration::from_secs(1));
+	let mut track = tokio::time::timeout(
+		TIMEOUT,
+		broadcast.track("video").expect("track handle").subscribe(subscription),
+	)
+	.await
+	.map_err(|_| "subscribe timed out".to_string())?
+	.map_err(|err| format!("subscribe failed: {err}"))?;
 
 	let mut group = tokio::time::timeout(TIMEOUT, track.recv_group())
 		.await
@@ -169,7 +179,7 @@ async fn read_first_frame(port: u16) -> Result<Vec<u8>, String> {
 
 async fn watch_announces(port: u16, window: Duration) -> Vec<(String, bool)> {
 	let url: Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
-	let origin = Origin::random().produce();
+	let origin = moq_tokio::origin::spawn(Origin::random());
 	let mut announced = origin.consume().announced();
 	let _session = tokio::time::timeout(TIMEOUT, client(None).with_subscriber(origin).connect(url).established())
 		.await

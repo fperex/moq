@@ -1,6 +1,6 @@
 import { type Dispose, Effect, type Getter, Signal } from "@moq/signals";
 import * as Announce from "../announced.ts";
-import { error, RemoteError, SessionCode } from "../error.ts";
+import { error, SessionCode, SessionError } from "../error.ts";
 import type { Consumer as OriginConsumer, Producer as OriginProducer } from "../origin.ts";
 import type * as Path from "../path.ts";
 import { empty as emptyPath } from "../path.ts";
@@ -161,7 +161,7 @@ export class Reload {
 	#url: Getter<string | undefined>;
 	constructor(props?: ReloadProps) {
 		this.url = Signal.from(props?.url);
-		this.enabled = Signal.from(props?.enabled ?? false);
+		this.enabled = Signal.from(props?.enabled ?? true);
 		this.delay = props?.delay ?? {};
 		this.webtransport = props?.webtransport;
 		this.websocket = props?.websocket;
@@ -301,8 +301,12 @@ export class Reload {
 		// An auth rejection is terminal however long the session lived. UNAUTHORIZED is a
 		// specified code rather than one we guessed at, so this is the peer saying these
 		// credentials will never work; retrying them just burns the window. Matches
-		// moq-native's reconnect loop, which stops on the same close.
-		if (cause instanceof RemoteError && cause.code === SessionCode.Unauthorized) {
+		// moq-tokio's reconnect loop, which stops on the same close.
+		//
+		// Only a session close says that. The stream registry gives 2 to DELIVERY_TIMEOUT,
+		// so a stream reset during the SETUP exchange would otherwise suppress reconnect
+		// for good.
+		if (cause instanceof SessionError && cause.code === SessionCode.Unauthorized) {
 			console.warn("session rejected as unauthorized, not retrying");
 			this.#expected?.();
 			this.#closedReject(cause);

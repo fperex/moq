@@ -47,7 +47,7 @@ const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 pub struct Export<S: Stream> {
 	source: crate::Source,
 	catalog: Option<S>,
-	latency: crate::Latency,
+	max_age: Duration,
 	fragment_duration: Option<Duration>,
 
 	tracks: HashMap<String, MkvTrack>,
@@ -162,7 +162,7 @@ impl<S: Stream> Export<S> {
 		Self {
 			source,
 			catalog: Some(catalog),
-			latency: crate::Latency::REAL_TIME,
+			max_age: Duration::ZERO,
 			fragment_duration: None,
 			tracks: HashMap::new(),
 			catalog_snapshot: None,
@@ -171,13 +171,13 @@ impl<S: Stream> Export<S> {
 		}
 	}
 
-	/// Set the latency tolerance for each per-track source.
+	/// Set the max age for each per-track source.
 	///
-	/// See [`Consumer::with_latency`](crate::container::Consumer::with_latency) for the
-	/// per-track skip behavior. Defaults to
-	/// [`Latency::REAL_TIME`](crate::Latency::REAL_TIME) (skip aggressively).
-	pub fn with_latency(mut self, latency: crate::Latency) -> Self {
-		self.latency = latency;
+	/// See [`Consumer`](crate::container::Consumer) for the per-track skip behavior.
+	/// Defaults to
+	/// [`Duration::ZERO`] (skip aggressively).
+	pub fn with_max_age(mut self, max_age: Duration) -> Self {
+		self.max_age = max_age;
 		self
 	}
 
@@ -223,15 +223,21 @@ impl<S: Stream> Export<S> {
 		// without the header anyway, and parking them would stop us from
 		// polling for the next SPS/PPS-bearing frame.
 		let waiting_for_header = !self.header_emitted;
-		for track in self.tracks.values_mut() {
+		for (name, track) in &mut self.tracks {
 			if track.pending.is_some() || track.finished {
 				continue;
 			}
 			loop {
 				match track.source.poll_read(waiter) {
 					Poll::Ready(Ok(Some(frame))) => {
-						if waiting_for_header && !track.source.header_ready() {
-							// Drop this slice and keep polling for SPS/PPS.
+						let geometry_ready = track.kind == TrackKind::Audio
+							|| self
+								.catalog_snapshot
+								.as_ref()
+								.and_then(|catalog| catalog.video.renditions.get(name))
+								.is_some_and(|config| track.source.video_geometry_ready(config));
+						if waiting_for_header && (!track.source.header_ready() || !geometry_ready) {
+							// Drop this slice and keep polling for codec configuration or geometry.
 							continue;
 						}
 						track.pending = Some(frame);
@@ -300,7 +306,9 @@ impl<S: Stream> Export<S> {
 		Poll::Pending
 	}
 
-	fn update_catalog(&mut self, catalog: Catalog) -> Result<()> {
+	fn update_catalog(&mut self, mut catalog: Catalog) -> Result<()> {
+		self.source.retain_valid_media(&mut catalog);
+
 		let mut active: HashMap<String, ()> = HashMap::new();
 		for name in catalog.video.renditions.keys() {
 			active.insert(name.clone(), ());
@@ -333,7 +341,9 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "video", name)?;
-			let source = ExportSource::for_video(&self.source, name, config, self.latency)?;
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age)? else {
+				continue;
+			};
 			self.tracks.insert(
 				name.clone(),
 				MkvTrack {
@@ -352,7 +362,9 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "audio", name)?;
-			let source = ExportSource::for_audio(&self.source, name, config, self.latency)?;
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age)? else {
+				continue;
+			};
 			self.tracks.insert(
 				name.clone(),
 				MkvTrack {
@@ -379,9 +391,16 @@ impl<S: Stream> Export<S> {
 	/// catalog arrives `tracks` is empty, and `all()` would otherwise be
 	/// vacuously true and send us into `build_header` with no snapshot.
 	fn header_ready(&self) -> bool {
-		self.catalog_snapshot.is_some()
-			&& !self.tracks.is_empty()
+		let Some(catalog) = self.catalog_snapshot.as_ref() else {
+			return false;
+		};
+		!self.tracks.is_empty()
 			&& self.tracks.values().all(|t| t.source.header_ready())
+			&& catalog.video.renditions.iter().all(|(name, config)| {
+				self.tracks
+					.get(name)
+					.is_some_and(|track| track.source.video_geometry_ready(config))
+			})
 	}
 
 	fn build_header(&self) -> Result<Bytes> {
@@ -406,9 +425,10 @@ impl<S: Stream> Export<S> {
 				.tracks
 				.get(name)
 				.ok_or_else(|| Error::MissingVideoTrack(name.clone()))?;
+			let config = track.source.video_config(config).unwrap_or_else(|| config.clone());
 			entries.push(build_video_track_entry(
 				track.track_number,
-				config,
+				&config,
 				track.source.description(),
 			)?);
 		}

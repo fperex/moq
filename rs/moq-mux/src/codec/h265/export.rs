@@ -19,7 +19,7 @@ use crate::container::ExportSource;
 pub struct Export<S: Stream> {
 	source: crate::Source,
 	catalog: Option<S>,
-	latency: crate::Latency,
+	max_age: std::time::Duration,
 	track: Option<H265Track>,
 }
 
@@ -52,18 +52,18 @@ impl<S: Stream> Export<S> {
 		Self {
 			source,
 			catalog: Some(catalog),
-			latency: crate::Latency::REAL_TIME,
+			max_age: std::time::Duration::ZERO,
 			track: None,
 		}
 	}
 
-	/// Set the latency tolerance for the per-track source.
+	/// Set the max age for the per-track source.
 	///
-	/// See [`Consumer::with_latency`](crate::container::Consumer::with_latency) for the
-	/// per-track skip behavior. Defaults to
-	/// [`Latency::REAL_TIME`](crate::Latency::REAL_TIME) (skip aggressively).
-	pub fn with_latency(mut self, latency: crate::Latency) -> Self {
-		self.latency = latency;
+	/// See [`Consumer`](crate::container::Consumer) for the per-track skip behavior.
+	/// Defaults to
+	/// [`std::time::Duration::ZERO`](std::time::Duration::ZERO) (skip aggressively).
+	pub fn with_max_age(mut self, max_age: std::time::Duration) -> Self {
+		self.max_age = max_age;
 		self
 	}
 
@@ -116,6 +116,9 @@ impl<S: Stream> Export<S> {
 	}
 
 	fn update_catalog(&mut self, catalog: &Catalog) -> crate::Result<()> {
+		let mut catalog = catalog.clone();
+		self.source.retain_valid_media(&mut catalog);
+
 		let picked = catalog
 			.video
 			.renditions
@@ -144,7 +147,9 @@ impl<S: Stream> Export<S> {
 			return Ok(());
 		}
 
-		let source = ExportSource::for_video_raw(&self.source, name, config, self.latency)?;
+		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age)? else {
+			unreachable!("invalid broadcast references were removed above");
+		};
 		let convert = match config.description.as_ref().filter(|d| !d.is_empty()) {
 			None => None,
 			Some(hvcc) => {
@@ -274,7 +279,10 @@ mod tests {
 		track.finish().unwrap();
 
 		let consumer = broadcast.consume();
-		let mut export = Export::new(crate::source::announced(&consumer), Once(Some(catalog)));
+		// The whole track is written before the exporter runs, so it needs a budget
+		// wide enough to read it: the default skips everything but the live edge.
+		let mut export = Export::new(crate::source::announced(&consumer), Once(Some(catalog)))
+			.with_max_age(std::time::Duration::from_secs(30));
 
 		let frame0 = export.next().await.unwrap().expect("first frame");
 		let frame1 = export.next().await.unwrap().expect("second frame");

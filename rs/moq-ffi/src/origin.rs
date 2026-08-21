@@ -23,7 +23,9 @@ pub struct MoqRoute {
 	/// Origin ids of the relay hops the broadcast traversed, oldest first.
 	#[uniffi(default = [])]
 	pub hops: Vec<u64>,
-	/// Preference among routes serving the same broadcast: lower wins.
+	/// Preference among routes serving the same broadcast: lower wins. A publisher
+	/// sets its production cost here: zero for content it is already producing,
+	/// larger for content it would have to start producing on demand.
 	#[uniffi(default = 0)]
 	pub cost: u64,
 	/// Whether the broadcast is announced: advertised to subscribers via the origin.
@@ -36,7 +38,9 @@ impl From<moq_net::broadcast::Route> for MoqRoute {
 	fn from(route: moq_net::broadcast::Route) -> Self {
 		Self {
 			hops: route.hops.iter().map(|origin| origin.id()).collect(),
-			cost: route.cost,
+			// The relay mesh prices a route twice (see `broadcast::Cost`); an
+			// application only ever wants what pulling it costs today.
+			cost: route.cost.warm,
 			announce: route.announce,
 		}
 	}
@@ -86,6 +90,9 @@ pub struct MoqBroadcastRequest {
 
 struct Announced {
 	inner: moq_net::announce::Consumer,
+	/// The same rooted cursor `inner` was drawn from, so an announced broadcast can resolve a
+	/// catalog reference to a sibling under that root.
+	origin: moq_net::origin::Consumer,
 }
 
 struct OriginDynamic {
@@ -112,7 +119,7 @@ impl Announced {
 					};
 					return Ok(Some(Arc::new(MoqAnnouncement {
 						path: path.to_string(),
-						broadcast: Arc::new(MoqBroadcastConsumer::new(broadcast)),
+						broadcast: Arc::new(MoqBroadcastConsumer::routed(broadcast, self.origin.clone())),
 					})));
 				}
 				None => return Ok(None),
@@ -130,7 +137,7 @@ struct AnnouncedBroadcast {
 impl AnnouncedBroadcast {
 	async fn available(&mut self) -> Result<Arc<MoqBroadcastConsumer>, MoqError> {
 		match self.origin.announced_broadcast(&self.path).await {
-			Some(broadcast) => Ok(Arc::new(MoqBroadcastConsumer::new(broadcast))),
+			Some(broadcast) => Ok(Arc::new(MoqBroadcastConsumer::routed(broadcast, self.origin.clone()))),
 			None => Err(MoqError::Closed),
 		}
 	}
@@ -166,8 +173,15 @@ impl MoqOriginProducer {
 			info = info.with_pool(moq_net::cache::Pool::new(capacity));
 		}
 
-		Self { inner: info.produce() }
+		Self { inner: spawn(info) }
 	}
+}
+
+/// Build an origin producer, spawning its driver on the FFI runtime.
+pub(crate) fn spawn(info: moq_net::origin::Info) -> moq_net::origin::Producer {
+	let (producer, driver) = moq_net::origin::Producer::new(info);
+	crate::ffi::spawn(driver);
+	producer
 }
 
 impl MoqOriginConsumer {
@@ -187,14 +201,14 @@ pub(crate) fn resolve_pair(
 ) -> (moq_net::origin::Producer, moq_net::origin::Producer) {
 	if publish.is_none() && consume.is_none() {
 		// Clones of a Producer share the underlying origin, so this is one origin, not two.
-		let shared = moq_net::Origin::random().produce();
+		let shared = spawn(moq_net::Origin::random().into());
 		return (shared.clone(), shared);
 	}
 
 	let resolve = |origin: Option<&Arc<MoqOriginProducer>>| {
 		origin
 			.map(|o| o.inner().clone())
-			.unwrap_or_else(|| moq_net::Origin::random().produce())
+			.unwrap_or_else(|| spawn(moq_net::Origin::random().into()))
 	};
 	(resolve(publish), resolve(consume))
 }
@@ -204,13 +218,13 @@ impl MoqOriginProducer {
 	/// Create a new origin for publishing and/or consuming broadcasts.
 	#[uniffi::constructor]
 	pub fn new(options: MoqOriginOptions) -> Arc<Self> {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		Arc::new(Self::from_options(options))
 	}
 
 	/// Create a consumer for this origin.
 	pub fn consume(&self) -> Arc<MoqOriginConsumer> {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		Arc::new(MoqOriginConsumer {
 			inner: self.inner.consume(),
 		})
@@ -221,7 +235,7 @@ impl MoqOriginProducer {
 	/// Hold the returned object while missing broadcast requests should be accepted.
 	/// Dropping it makes future requests to unknown broadcasts fail.
 	pub fn dynamic(&self) -> Arc<MoqOriginDynamic> {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		Arc::new(MoqOriginDynamic {
 			task: Task::new(OriginDynamic {
 				inner: self.inner.dynamic(),
@@ -240,7 +254,7 @@ impl MoqOriginProducer {
 	/// without finishing also unpublishes, but subscribers observe the end as a
 	/// failure rather than a deliberate one.
 	pub fn create_broadcast(&self, path: String) -> Result<Arc<MoqBroadcastProducer>, MoqError> {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		// Surfaces Error::Unauthorized (out of scope) via the MoqError::Protocol conversion.
 		let broadcast = self
 			.inner
@@ -253,18 +267,22 @@ impl MoqOriginProducer {
 impl MoqOriginConsumer {
 	/// Subscribe to all broadcast announcements under a prefix.
 	pub fn announced(&self, prefix: String) -> Result<Arc<MoqAnnounced>, MoqError> {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		let origin = self.inner.with_root(prefix).ok_or(MoqError::Unauthorized)?;
 		Ok(Arc::new(MoqAnnounced {
 			task: Task::new(Announced {
 				inner: origin.announced(),
+				origin,
 			}),
 		}))
 	}
 
 	/// Wait for a specific broadcast to be announced by path.
+	///
+	/// This is how you resolve a path right after connecting: announcements arrive over the
+	/// session after it opens, so `request_broadcast` on its own races them.
 	pub fn announced_broadcast(&self, path: String) -> Result<Arc<MoqAnnouncedBroadcast>, MoqError> {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		let path = moq_net::Path::new(&path).to_owned();
 
 		// Probe the permission eagerly so an unreachable path fails here, rather than
@@ -290,9 +308,12 @@ impl MoqOriginConsumer {
 	/// errors if nothing can serve it. Unlike `announced_broadcast`, this does *not* wait
 	/// indefinitely for a future announcement: it resolves or fails based on what is
 	/// announced now plus any dynamic fallback. Drop the returned future to cancel.
+	///
+	/// Calling this straight after connecting therefore races the session's announcements
+	/// and can report a live broadcast as unroutable. Await `announced_broadcast` first.
 	pub async fn request_broadcast(&self, path: String) -> Result<Arc<MoqBroadcastConsumer>, MoqError> {
 		let broadcast = self.inner.request_broadcast(path.as_str()).await?;
-		Ok(Arc::new(MoqBroadcastConsumer::new(broadcast)))
+		Ok(Arc::new(MoqBroadcastConsumer::routed(broadcast, self.inner.clone())))
 	}
 }
 
@@ -311,6 +332,9 @@ impl MoqOriginDynamic {
 	}
 
 	/// Cancel all current and future `requested_broadcast()` calls.
+	///
+	/// Terminal: the dynamic origin is released here, not when the handle is, so any pending
+	/// request is rejected.
 	pub fn cancel(&self) {
 		self.task.cancel();
 	}
@@ -341,7 +365,7 @@ impl MoqBroadcastRequest {
 
 	/// Accept the request with an unannounced broadcast.
 	pub fn accept(&self, broadcast: &MoqBroadcastProducer) -> Result<(), MoqError> {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		let consumer = broadcast.consume_inner()?;
 		let request = self.take()?;
 		request.accept(&consumer);
@@ -350,7 +374,7 @@ impl MoqBroadcastRequest {
 
 	/// Abort the request with an application error code.
 	pub fn abort(&self, error_code: u16) -> Result<(), MoqError> {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		let request = self.take()?;
 		request.reject(moq_net::Error::App(error_code));
 		Ok(())
@@ -369,6 +393,8 @@ impl MoqAnnounced {
 	}
 
 	/// Cancel all current and future `next()` calls.
+	///
+	/// Terminal: the announcement stream is released here, not when the handle is.
 	pub fn cancel(&self) {
 		self.task.cancel();
 	}
@@ -399,6 +425,8 @@ impl MoqAnnouncedBroadcast {
 	}
 
 	/// Cancel all current and future `available()` calls.
+	///
+	/// Terminal: the announcement watch is released here, not when the handle is.
 	pub fn cancel(&self) {
 		self.task.cancel();
 	}

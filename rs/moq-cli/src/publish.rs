@@ -220,13 +220,13 @@ impl Publish {
 	pub fn new(
 		mut broadcast: moq_net::broadcast::Producer,
 		format: &PublishFormat,
-		latency_max: Option<std::time::Duration>,
+		max_age: Option<std::time::Duration>,
 	) -> anyhow::Result<Self> {
 		// TS carries undecoded elementary streams (SCTE-35, teletext, DVB AC-3, ...)
 		// verbatim, so it uses the `mpegts` catalog extension rather than the media-only
 		// `()`. The catalog producer owns the broadcast's catalog tracks, so each broadcast
 		// gets exactly one; TS builds its `Ext` catalog here instead of the shared `()` below.
-		let config = moq_mux::catalog::Config::default().with_latency_max(latency_max);
+		let config = moq_mux::catalog::Config::default().with_max_age(max_age);
 
 		if let PublishFormat::Ts = format {
 			let config = config.with_catalog(moq_mux::catalog::hang::Catalog::<ts::Ext>::default());
@@ -274,9 +274,9 @@ impl Publish {
 		mut broadcast: moq_net::broadcast::Producer,
 		args: &CaptureArgs,
 		bandwidth: Option<moq_net::bandwidth::Consumer>,
-		latency_max: Option<std::time::Duration>,
+		max_age: Option<std::time::Duration>,
 	) -> anyhow::Result<Self> {
-		let config = moq_mux::catalog::Config::default().with_latency_max(latency_max);
+		let config = moq_mux::catalog::Config::default().with_max_age(max_age);
 		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
 
 		let video = (!args.no_video).then(|| (args.video_config(), args.video_encode(bandwidth)));
@@ -495,7 +495,7 @@ mod tests {
 
 	async fn manufacture_input() -> Vec<u8> {
 		// Create the broadcast on a throwaway origin so the exporter can resolve it by path.
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 		let mut broadcast = origin
 			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
 			.unwrap();
@@ -560,10 +560,17 @@ mod tests {
 			Export::with_ts(moq_mux::Source::new(origin.consume(), "cli"), CatalogFormat::Hang)
 				.await
 				.unwrap()
-				.with_latency(moq_mux::Latency::REAL_TIME),
+				.with_max_age(RECORDING_MAX_AGE),
 		)
 		.await
 	}
+
+	/// The media track's full retention window, so an exporter started after publishing
+	/// can still read every retained group. These tests publish a whole feed before
+	/// exporting it, which the default
+	/// [`Duration::ZERO`] collapses to the live edge:
+	/// completeness has to be asked for, exactly as a real recorder does.
+	const RECORDING_MAX_AGE: std::time::Duration = Duration::from_secs(30);
 
 	/// Full CLI round-trip: a TS feed with undecoded streams goes through `Publish`
 	/// (which selects the `mpegts` catalog) and the subscribe-side `Export::with_ts`,
@@ -578,7 +585,7 @@ mod tests {
 		// Publish side: `Publish::new(Ts)` builds a `ts::Import<Ext>`, so the verbatim
 		// streams land in the broadcast instead of being dropped by the media-only path.
 		// The broadcast is created on a throwaway origin so the exporter can resolve it by path.
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
 		let broadcast = origin
 			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
 			.unwrap();
@@ -597,7 +604,7 @@ mod tests {
 			Export::with_ts(moq_mux::Source::new(origin.consume(), "cli"), CatalogFormat::Hang)
 				.await
 				.unwrap()
-				.with_latency(moq_mux::Latency::REAL_TIME),
+				.with_max_age(RECORDING_MAX_AGE),
 		)
 		.await;
 
@@ -656,7 +663,7 @@ mod tests {
 	/// Read the first frame of a verbatim track back as raw bytes.
 	async fn read_frame(consumer: &moq_net::broadcast::Consumer, name: &str) -> Vec<u8> {
 		let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
-		let mut reader = Consumer::new(track, Container::Legacy).with_latency(moq_mux::Latency::REAL_TIME);
+		let mut reader = Consumer::new(track, Container::Legacy);
 		let frame = tokio::time::timeout(Duration::from_secs(1), reader.read())
 			.await
 			.expect("verbatim read timed out")

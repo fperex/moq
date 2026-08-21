@@ -33,11 +33,11 @@ impl Publisher {
 	/// Create the broadcast on `origin` at `path` and wire up the TS importer +
 	/// catalog.
 	///
-	/// `latency_max` is the retention declared on the media tracks the importer mints: how
+	/// `max_age` is the retention declared on the media tracks the importer mints: how
 	/// long relays keep a non-latest group fetchable, or `None` for hang's own default.
-	pub fn new(origin: &origin::Producer, path: &str, latency_max: Option<Duration>) -> Result<Self> {
+	pub fn new(origin: &origin::Producer, path: &str, max_age: Option<Duration>) -> Result<Self> {
 		let mut broadcast = origin.create_broadcast(path, broadcast::Route::new().with_announce(true))?;
-		let config = moq_mux::catalog::Config::default().with_latency_max(latency_max);
+		let config = moq_mux::catalog::Config::default().with_max_age(max_age);
 		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
 		let handle = broadcast.clone();
 		let importer = ts::Import::new(broadcast, catalog.reserve());
@@ -107,9 +107,7 @@ impl Subscriber {
 		}
 
 		let source = moq_mux::Source::new(origin.consume(), path);
-		let export = ts::Export::new(source)
-			.await?
-			.with_latency(moq_mux::Latency::max(latency));
+		let export = ts::Export::new(source).await?.with_max_age(latency);
 		Ok(Some(Self { export }))
 	}
 
@@ -122,6 +120,19 @@ impl Subscriber {
 
 #[cfg(test)]
 mod tests {
+	/// Build an origin producer, spawning its driver on the ambient runtime.
+	fn produce_origin() -> moq_net::origin::Producer {
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::Origin::random().into());
+		if tokio::runtime::Handle::try_current().is_ok() {
+			tokio::spawn(driver);
+		} else {
+			// A sync test: nothing polls the driver, and dropping it would tear
+			// the origin down, so leak it and rely on the synchronous half.
+			std::mem::forget(driver);
+		}
+		producer
+	}
+
 	use super::*;
 
 	/// One payload-only TS packet carrying a complete PSI section (PUSI + pointer_field
@@ -172,7 +183,7 @@ mod tests {
 	/// mints off the PMT, not stop at the catalog producer it was set on.
 	#[tokio::test]
 	async fn publisher_declares_the_configured_retention() {
-		let origin = moq_net::Origin::random().produce();
+		let origin = produce_origin();
 		let mut publisher = Publisher::new(&origin, "live/cam0", Some(Duration::from_secs(3))).unwrap();
 
 		let mut ts = psi_packet(0x0000, &pat(0x0100));
@@ -181,6 +192,6 @@ mod tests {
 
 		let broadcast = origin.consume().announced_broadcast("live/cam0").await.unwrap();
 		let info = broadcast.track("0.avc3").unwrap().info().await.unwrap();
-		assert_eq!(info.latency_max, Duration::from_secs(3));
+		assert_eq!(info.max_age, Duration::from_secs(3));
 	}
 }

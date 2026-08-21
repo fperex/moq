@@ -1,7 +1,7 @@
 import * as announce from "../announced.ts";
 import * as broadcast from "../broadcast.ts";
 import { BroadcastCache } from "../consume.ts";
-import { error, reason } from "../error.ts";
+import { error, ProtocolViolation, reason } from "../error.ts";
 import * as netGroup from "../group.ts";
 import * as Path from "../path.ts";
 import type { Reader, Stream } from "../stream.ts";
@@ -10,10 +10,16 @@ import type * as track from "../track.ts";
 import { withTimeout } from "../util/timeout.ts";
 import type { Session } from "./adapter.ts";
 import { TrackAliases } from "./aliases.ts";
+import * as Cluster from "./cluster.ts";
 import { Frame, type Group as GroupMessage } from "./object.ts";
 import { toWire } from "./priority.ts";
 import { type Publish, PublishError } from "./publish.ts";
-import { type PublishNamespace, PublishNamespaceError, PublishNamespaceOk } from "./publish_namespace.ts";
+import {
+	PublishNamespace,
+	PublishNamespaceDone,
+	PublishNamespaceError,
+	PublishNamespaceOk,
+} from "./publish_namespace.ts";
 import { RequestError, RequestOk } from "./request.ts";
 import { Subscribe, SubscribeError, SubscribeOk, Unsubscribe } from "./subscribe.ts";
 import {
@@ -49,6 +55,11 @@ type SubscribeSetupState = {
 export class Subscriber {
 	#session: Session;
 
+	// The Hop IDs this session declared; see {@link Cluster}. What the peer declared is what
+	// says whether an advertisement carries a hop path, and ours is what a path looping back
+	// to us contains.
+	#cluster?: Cluster.Hops;
+
 	// Publisher-chosen aliases used by incoming group streams.
 	#aliases = new TrackAliases<track.Producer>();
 
@@ -60,28 +71,63 @@ export class Subscriber {
 	// Dedup consumed broadcasts per path: repeat consume() calls share one subscription.
 	#consumes = new BroadcastCache();
 
-	// Any currently active announcements.
-	#announced = new Set<Path.Valid>();
+	// Paths with a legacy PUBLISH_NAMESPACE request in flight, reserved synchronously.
+	// The count below is only taken once the OK is written, and two requests that both
+	// got past the duplicate check before either attached would both take one.
+	#legacyRequests = new Set<Path.Valid>();
+
+	// Every announced path, counted by how many live advertisements reference it.
+	//
+	// A peer may advertise one namespace twice on a session: an unsolicited
+	// PUBLISH_NAMESPACE and an inline NAMESPACE answering our own SUBSCRIBE_NAMESPACE are
+	// two messages about one source, which the MoQ Solicit draft requires us to tolerate.
+	// Counting them is what keeps the second from duplicating the announce and the first
+	// to end from retracting what the other still holds.
+	#announced = new Map<Path.Valid, number>();
 
 	// Any consumers that want each new announcement.
 	#announcedConsumers = new Set<announce.Producer>();
 
 	/**
 	 * Creates a new Subscriber instance.
-	 * @param session - The session abstraction for bidi streams and request IDs
 	 *
 	 * @internal
 	 */
-	constructor(session: Session) {
+	constructor({
+		session,
+		cluster,
+	}: {
+		/** The session abstraction for bidi streams and request IDs. */
+		session: Session;
+		/** The Hop IDs the SETUP exchange settled (MoQ Cluster). */
+		cluster?: Cluster.Hops;
+	}) {
 		this.#session = session;
+		this.#cluster = cluster;
+	}
+
+	/**
+	 * Whether an advertisement is ours coming back: its hop path already ran through us, so
+	 * subscribing via it would route us back to ourselves.
+	 *
+	 * A conforming peer withholds these (it knows our Hop ID), so this is the backstop that
+	 * keeps a mesh working when one member does not. A session that negotiated nothing
+	 * carries no path, and there is nothing to check.
+	 */
+	#reflected(advert: Cluster.Advert | undefined): boolean {
+		return advert !== undefined && this.#cluster !== undefined && Cluster.loops(advert, this.#cluster.self);
 	}
 
 	/**
 	 * Gets an announced reader for the specified prefix.
+	 *
+	 * The peer is asked with SUBSCRIBE_NAMESPACE regardless of what it declared, and an
+	 * unsolicited PUBLISH_NAMESPACE lands here too, so a peer that only tells and one
+	 * that only answers are both discovered.
 	 */
 	announced(prefix = Path.empty()): announce.Consumer {
 		const announced = new announce.Producer(prefix);
-		for (const active of this.#announced) {
+		for (const active of this.#announced.keys()) {
 			const suffix = Path.stripPrefix(prefix, active);
 			if (suffix === null) continue;
 			announced.append({ path: suffix, active: true });
@@ -96,8 +142,65 @@ export class Subscriber {
 		return announced.consume();
 	}
 
+	/**
+	 * Record one more advertisement for a path, telling consumers only when it is the
+	 * first. A second one is the same namespace said twice, not news.
+	 */
+	#attachAnnounce(path: Path.Valid) {
+		const count = this.#announced.get(path) ?? 0;
+		this.#announced.set(path, count + 1);
+		if (count > 0) return;
+
+		console.debug(`announced: broadcast=${path} active=true`);
+		for (const consumer of this.#announcedConsumers) {
+			const suffix = Path.stripPrefix(consumer.prefix, path);
+			if (suffix === null) continue;
+			consumer.append({ path: suffix, active: true });
+		}
+	}
+
+	/**
+	 * Drop one advertisement for a path, retracting it only once the last one goes.
+	 */
+	#detachAnnounce(path: Path.Valid) {
+		const count = this.#announced.get(path);
+		if (count === undefined) return;
+		if (count > 1) {
+			this.#announced.set(path, count - 1);
+			return;
+		}
+
+		this.#announced.delete(path);
+
+		// The path is gone, so stop sharing its broadcast: a holder outliving the publisher
+		// would otherwise hand the dead generation to whoever consumes the path next.
+		this.#consumes.evict(path);
+		console.debug(`announced: broadcast=${path} active=false`);
+
+		for (const consumer of this.#announcedConsumers) {
+			const suffix = Path.stripPrefix(consumer.prefix, path);
+			if (suffix === null) continue;
+			try {
+				consumer.append({ path: suffix, active: false });
+			} catch {
+				// Consumer already closed, will be cleaned up
+			}
+		}
+	}
+
 	async #runAnnounced(announced: announce.Producer, prefix: Path.Valid) {
 		const version = this.#session.version;
+
+		// Suffixes live on this stream, so a repeat is recognized as an update to the
+		// advertisement rather than a second one, which would leak the count.
+		const live = new Set<Path.Valid>();
+
+		// Set once the teardown below has given back everything this stream held. The read
+		// loop is not awaited when the local consumer closes first, and closing the stream
+		// cancels the transport without discarding what the reader already buffered, so a
+		// fully buffered entry can still decode afterwards. Attaching one then would take a
+		// reference nobody is left to release, pinning the path for the session.
+		let released = false;
 
 		// v14/v15: SubscribeNamespace on control stream (via adapter virtual stream)
 		// v16+: SubscribeNamespace on its own real bidi stream
@@ -149,27 +252,35 @@ export class Subscriber {
 
 						const msgType = await stream.reader.u53();
 						if (msgType === SubscribeNamespaceEntry.id) {
-							const entry = await SubscribeNamespaceEntry.decode(stream.reader, version);
+							const entry = await SubscribeNamespaceEntry.decode(
+								stream.reader,
+								version,
+								Cluster.negotiated(this.#cluster),
+							);
+							if (released) break;
 							const path = Path.join(prefix, entry.suffix);
-							console.debug(`announced: broadcast=${path} active=true`);
 
-							this.#announced.add(path);
-							for (const consumer of this.#announcedConsumers) {
-								const suffix = Path.stripPrefix(consumer.prefix, path);
-								if (suffix === null) continue;
-								consumer.append({ path: suffix, active: true });
+							// A repeat updates the advertisement in place, so one that now
+							// loops back through us has taken a route we can't subscribe
+							// over: the path is gone even though the message says active.
+							if (this.#reflected(entry.cluster)) {
+								console.debug(`dropping reflected namespace: broadcast=${path}`);
+								if (live.delete(path)) this.#detachAnnounce(path);
+								continue;
+							}
+
+							// A repeat updates the advertisement; only the first is news.
+							if (!live.has(path)) {
+								live.add(path);
+								this.#attachAnnounce(path);
 							}
 						} else if (msgType === SubscribeNamespaceEntryDone.id) {
 							const entry = await SubscribeNamespaceEntryDone.decode(stream.reader, version);
+							if (released) break;
 							const path = Path.join(prefix, entry.suffix);
-							console.debug(`announced: broadcast=${path} active=false`);
 
-							this.#announced.delete(path);
-							this.#consumes.evict(path);
-							for (const consumer of this.#announcedConsumers) {
-								const suffix = Path.stripPrefix(consumer.prefix, path);
-								if (suffix === null) continue;
-								consumer.append({ path: suffix, active: false });
+							if (live.delete(path)) {
+								this.#detachAnnounce(path);
 							}
 						} else if (msgType === PublishBlocked.id && version === Version.DRAFT_17) {
 							const blocked = await PublishBlocked.decode(stream.reader, version);
@@ -181,6 +292,15 @@ export class Subscriber {
 						}
 					}
 				})();
+
+				// The race below can end through the consumer's close while a message that
+				// already arrived is still decoding, which leaves the loop with nothing
+				// awaiting it: a violation decoded after that would land nowhere, and its
+				// rejection would go unhandled. Idempotent with the catch below, which is
+				// what runs when the loop is the one that ends the race.
+				readLoop.catch((err: unknown) => {
+					if (err instanceof ProtocolViolation) this.#session.close();
+				});
 
 				// Wait for either the read loop or the announced to close
 				await Promise.race([readLoop, announced.closed]);
@@ -205,11 +325,27 @@ export class Subscriber {
 			const e = error(err);
 			console.warn(`subscribe_namespace error: ${reason(e)}`);
 
+			// An advertisement is decoded here rather than in the session dispatch, so this
+			// is the only place a malformed one surfaces. The cluster draft requires closing
+			// the session over those, and the stream alone is not enough: the peer would
+			// just repeat it on the next SUBSCRIBE_NAMESPACE.
+			if (e instanceof ProtocolViolation) this.#session.close();
+
 			// Abort the stream rather than letting the caller's `finally` close it cleanly.
 			// A rejected namespace subscription is a failure, and a consumer that can't tell
 			// it from "nothing is published under this prefix" waits forever on a broadcast
 			// that will never be announced. Matches the lite subscriber.
 			announced.close(e);
+		} finally {
+			// The stream owns every advertisement it carried, so release them however it
+			// ends: a clean close, a decode error, or the peer resetting it. Without this
+			// each namespace keeps its count and the source never detaches, which would
+			// pin the path for the session even after the other source withdrew.
+			released = true;
+			for (const path of live) {
+				this.#detachAnnounce(path);
+			}
+			live.clear();
 		}
 	}
 
@@ -400,30 +536,55 @@ export class Subscriber {
 		const version = this.#session.version;
 		const path = msg.trackNamespace;
 
-		if (this.#announced.has(path)) {
+		// A path that already ran through us looped back. Refuse it rather than holding an
+		// advertisement we could never subscribe through. The peer knows our Hop ID, so a
+		// conforming one never offers it; 0 as the retry interval says not to come back.
+		if (this.#reflected(msg.cluster)) {
+			console.debug(`dropping reflected publish_namespace: broadcast=${path}`);
+			await stream.writer.u53(RequestError.id);
+			await new RequestError({
+				requestId: msg.requestId,
+				errorCode: 400,
+				reasonPhrase: "route loops back",
+			}).encode(stream.writer, version);
+			stream.close();
+			return;
+		}
+
+		// Draft-14/15 key their namespace-scoped messages by name, not request ID, so the
+		// adapter can hold only one request per namespace: a second would overwrite the
+		// first, and the withdrawals would then close the wrong stream and fail to find
+		// the other. Nothing is lost by refusing it, because the case that makes a second
+		// reference legitimate (an inline NAMESPACE for a path a PUBLISH_NAMESPACE already
+		// carried) needs a message those drafts do not have.
+		const legacy = version === Version.DRAFT_14 || version === Version.DRAFT_15;
+		if (legacy && (this.#announced.has(path) || this.#legacyRequests.has(path))) {
 			console.warn("duplicate PublishNamespace");
 			if (version === Version.DRAFT_14) {
 				await stream.writer.u53(PublishNamespaceError.id);
-				const err = new PublishNamespaceError({
+				await new PublishNamespaceError({
 					requestId: msg.requestId,
 					errorCode: 409,
 					reasonPhrase: "duplicate namespace",
-				});
-				await err.encode(stream.writer, version);
+				}).encode(stream.writer, version);
 			} else {
 				await stream.writer.u53(RequestError.id);
-				const err = new RequestError({
-					requestId: version === Version.DRAFT_15 || version === Version.DRAFT_16 ? msg.requestId : undefined,
+				await new RequestError({
+					requestId: msg.requestId,
 					errorCode: 409,
 					reasonPhrase: "duplicate namespace",
-				});
-				await err.encode(stream.writer, version);
+				}).encode(stream.writer, version);
 			}
 			stream.close();
 			return;
 		}
 
-		this.#announced.add(path);
+		// Everywhere else a path this session already knows is not refused: the same
+		// namespace can reach us twice, and the count is what tells the second apart from
+		// news. This request owns exactly one of those references and gives it back when
+		// the stream ends.
+		if (legacy) this.#legacyRequests.add(path);
+		let attached = false;
 
 		try {
 			// Send OK first. This must complete before notifying consumers,
@@ -441,34 +602,63 @@ export class Subscriber {
 				await ok.encode(stream.writer, version);
 			}
 
-			console.debug(`announced: broadcast=${path} active=true`);
+			// Only now is the advertisement ours to announce, for the reason above: a
+			// consumer reacting with a SUBSCRIBE must not interleave with that OK.
+			attached = true;
+			this.#attachAnnounce(path);
 
-			// Notify consumers after OK is written
-			for (const consumer of this.#announcedConsumers) {
-				const suffix = Path.stripPrefix(consumer.prefix, path);
-				if (suffix === null) continue;
-				consumer.append({ path: suffix, active: true });
-			}
+			// An advertisement is updated in place, by repeating PUBLISH_NAMESPACE on the
+			// stream that already carries it, so read until the stream ends rather than
+			// waiting on the close. Nothing else would deliver a re-parented route.
+			const done = version === Version.DRAFT_16 || legacy;
+			for (;;) {
+				if (await stream.reader.done()) break;
 
-			// Wait for stream close (= PublishNamespaceDone)
-			console.debug(`runPublishNamespace: awaiting stream.reader.closed for ${path}`);
-			await stream.reader.closed;
-			console.debug(`runPublishNamespace: stream.reader.closed resolved for ${path}`);
-		} finally {
-			this.#announced.delete(path);
-			// The path is gone, so stop sharing its broadcast: a holder outliving the publisher
-			// would otherwise hand the dead generation to whoever consumes the path next.
-			this.#consumes.evict(path);
-			console.debug(`announced: broadcast=${path} active=false`);
-
-			for (const consumer of this.#announcedConsumers) {
-				const suffix = Path.stripPrefix(consumer.prefix, path);
-				if (suffix === null) continue;
-				try {
-					consumer.append({ path: suffix, active: false });
-				} catch {
-					// Consumer already closed, will be cleaned up
+				const typeId = await stream.reader.u53();
+				if (done && typeId === PublishNamespaceDone.id) {
+					await PublishNamespaceDone.decode(stream.reader, version);
+					break;
 				}
+				if (typeId !== PublishNamespace.id) {
+					throw new ProtocolViolation(
+						`unexpected message on publish_namespace stream: 0x${typeId.toString(16)}`,
+					);
+				}
+
+				const update = await PublishNamespace.decode(stream.reader, version, Cluster.negotiated(this.#cluster));
+
+				// The stream is the advertisement, so an update on it must name the same
+				// one. Applying a mismatched update would retarget this path with metadata
+				// meant for a different request.
+				if (update.requestId !== msg.requestId || update.trackNamespace !== path) {
+					throw new ProtocolViolation("publish_namespace update does not match its stream");
+				}
+
+				// A path that now runs through us is unusable, so give it back. Keep
+				// reading: this stream is the advertisement's only channel, so a later
+				// clean path arrives here or nowhere.
+				if (this.#reflected(update.cluster)) {
+					if (attached) {
+						attached = false;
+						console.debug(`publish_namespace now loops back, detaching: broadcast=${path}`);
+						this.#detachAnnounce(path);
+					}
+					continue;
+				}
+
+				// Re-attach: a clean path replaced the reflected one we detached from.
+				if (!attached) {
+					attached = true;
+					this.#attachAnnounce(path);
+				}
+			}
+		} finally {
+			if (legacy) this.#legacyRequests.delete(path);
+
+			// Give back exactly what was taken: a request that never got its OK out never
+			// referenced the path, and retracting there would drop someone else's count.
+			if (attached) {
+				this.#detachAnnounce(path);
 			}
 		}
 	}

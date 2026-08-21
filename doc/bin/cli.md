@@ -5,7 +5,7 @@ description: Command-line tools for MoQ media
 
 # FFmpeg / moq-cli
 
-`moq-cli` is a media router: it wires one endpoint onto a shared MoQ Origin. It
+`moq-cli` is a media router: it wires endpoints onto a shared MoQ Origin. It
 moves media into MoQ from a source, out of MoQ to a sink, or plays a broadcast
 locally, bridging stdin/stdout (via FFmpeg), HLS, RTMP, SRT, and WebRTC.
 
@@ -74,6 +74,7 @@ Each signal writes a numbered `/tmp/moq.heap.*.heap` profile for analysis with
 
 ```
 moq <MoQ side>  <import|export>  <endpoint> [endpoint options]
+moq <MoQ side>  <stage>  [-- <stage>]...
 moq <MoQ side>  play [playback options]
 ```
 
@@ -83,22 +84,33 @@ moq <MoQ side>  play [playback options]
   - `--connect <url>` dials a relay. The URL path is the relay auth path
     (e.g. `/anon`), `?jwt=<token>` supplies a token, and `--broadcast` names the
     broadcast.
-  - `--listen <addr>` hosts MoQ sessions directly (with `--listen-tls-generate` /
-    `--listen-tls-cert` + `--listen-tls-key`).
+  - `--listen <addr>` hosts encrypted QUIC/WebTransport sessions directly (with
+    `--listen-tls-generate` / `--listen-tls-cert` + `--listen-tls-key`).
+  - `--listen-tcp-bind <addr>` hosts plaintext qmux over TCP. Bind it only to
+    loopback or a trusted private network.
+  - `--listen-unix-bind <path>` hosts qmux over a Unix socket. The socket is
+    created with mode `0666`, so restrict access through its parent directory or
+    an explicit peer-credential allowlist.
   - `--cluster-lan` meshes with every other participating process on the LAN via
     mDNS, no relay or internet needed. See [LAN Cluster](#lan-cluster-mdns).
 
-  Any combination may be given at once (e.g. dial a relay *and* accept incoming
-  sessions). `--origin <id>` pins the process's origin id (default: fresh and
-  random per run); see [Redundant Publishers](#redundant-publishers-11).
+Any combination may be given at once (e.g. dial a relay *and* accept incoming
+sessions). `--origin <id>` pins the process's origin id (default: fresh and
+random per run); see [Redundant Publishers](#redundant-publishers-11).
+
 - **`import`** routes media INTO MoQ (a source fills the Origin); **`export`**
   routes it OUT (a sink drains the Origin). The verb fixes the data direction.
+
 - **`play`** subscribes to a broadcast and plays its audio and video locally.
+
 - **endpoint** is one subcommand: a container format (`avc3`, `fmp4`, `ts`, `flv`
   read from stdin on import; `fmp4`, `mkv`, `ts`, `flv` written to stdout on
   export), or a gateway (`hls`, `rtmp`, `srt`, `rtc`). For the bidirectional
   gateways, `--connect` dials out and `--listen` binds a socket; the parent verb
   decides whether that pushes or pulls.
+
+- **`--`** starts another stage, where a stage is one `import` or `export` with
+  its endpoint. See [Multiple Stages](#multiple-stages).
 
 Run `moq import --help` / `moq export --help` to see the endpoints, and
 `moq import rtmp --help` for a specific one.
@@ -222,6 +234,14 @@ https://relay.example.com/anon` serves viewers on the same network directly
 while the relay serves external ones, all from one process and one set of
 broadcasts. With `--cluster-lan` alone nothing leaves the local network.
 
+That pairing is the recommended shape, and the split is deliberate. Peer-to-peer
+is a local network feature: peers are on one link, so a direct session is the
+shortest path there is and no third party sees anything. A viewer somewhere else
+should come through a [relay](/bin/relay/), which has an address both sides can
+already reach and which caches and fans out, so the second viewer costs nothing
+extra. Punching a hole to a peer across the internet buys you the same hop
+without any of that.
+
 By default anyone who can reach the listener joins, exactly like a bare
 `--listen`, so use it on networks you trust. On a network you don't
 control, generate a key and give the same one to every peer:
@@ -244,6 +264,75 @@ the network, and peers with different keys (or none) are mutually invisible.
 Because the proofs are HMACs over a public nonce, a weak key can be brute-forced
 offline by anyone watching the network. Generate 32 random bytes as above rather
 than choosing something memorable.
+
+#### Firewalls
+
+Both halves of the mesh need inbound packets, and a host firewall that drops
+them fails in ways worth recognizing.
+
+mDNS is inbound multicast UDP on port 5353. A host that blocks it still
+multicasts its own announcements out, so peers discover *it* while it discovers
+nobody. Startup won't catch this: readiness waits for an interface to announce,
+which proves the socket opened, not that anything answered.
+
+The session itself is one dial per pair, and only one side makes it. Both peers
+see each other and a MoQ session carries both directions, so the lower peer id
+dials and the higher one waits, which means the higher one has to accept an
+inbound QUIC connection on its `--listen` port. If that side is the one behind
+the firewall, the dial retries until the peer stops advertising and the pair
+never meshes, even though a dial in the other direction would have worked.
+Which side waits is a coin flip on a random id, so the same two machines can
+mesh on one run and not the next.
+
+If a pair won't come up, check the firewall on *both* hosts, not just the one
+that looks stuck. Pass `--listen` yourself first: the port it fills in is
+ephemeral and changes every run, so there is nothing stable to allow until you
+pin it. Then allow that port and UDP 5353 on both.
+
+### Multiple Stages
+
+One `moq` process bridges one broadcast by default. Separate stages with `--` to
+bridge several over a single connection, each naming its own `--broadcast`:
+
+```bash
+moq --connect https://relay.example.com/anon \
+    import --broadcast cam1.hang rtmp --listen 0.0.0.0:1935 \
+    -- import --broadcast cam2.hang rtmp --listen 0.0.0.0:1936
+```
+
+Stages may run in opposite directions, so one process can ingest and re-publish
+without a second connection or a second copy of the media:
+
+```bash
+moq --connect https://relay.example.com/anon \
+    import --broadcast event.hang srt --listen 0.0.0.0:9000 \
+    -- export --broadcast event.hang hls --listen 0.0.0.0:8080
+```
+
+Every stage shares one connection, one origin id, and one Origin, and each keeps
+its own `--help` (`moq import rtmp --help`). A stage without `--broadcast` falls
+back to the process-wide one, so a single-stage command can keep naming the
+broadcast before the verb.
+
+Rules worth knowing:
+
+- The first stage to finish (stdin EOF, Ctrl-C, or an error) ends the process,
+  taking the others with it.
+- stdin and stdout are one resource each, so at most one stage may read a
+  container from stdin, and at most one may write one to stdout.
+- The MoQ side belongs to the invocation, not a stage: `--connect` and
+  friends go before the first stage and are rejected after a `--`.
+- `moq` reads every `--` as a stage separator, so it can't double as the usual
+  end-of-options marker. The one place that matters is a local playlist path
+  starting with `-`; write it as `./-playlist.m3u8`.
+- `play`, `transcode`, `token`, and `devices` own the process and can't be
+  staged; run those on their own.
+- `import capture` encodes to fit the connection's bandwidth estimate over
+  `--connect`, and rate control assumes it's the only publisher on that
+  connection, so it can't share a process with another `import`. Run those as
+  separate processes, or publish over `--listen`, which has no estimate.
+  (An audio-only `--no-video` capture never reads the estimate, so it doesn't
+  count.)
 
 ### Redundant Publishers (1+1)
 
@@ -282,8 +371,11 @@ may publish where.
 
 The `capture` subcommand captures and encodes from local devices directly, no
 external FFmpeg process required. It publishes the camera as an H.264 video
-track and the microphone as an Opus audio track on the same broadcast. It is
-gated behind the `capture` feature:
+track and the microphone as an Opus audio track on the same broadcast. Video is
+encoded strictly on demand: the camera is opened once at startup to read the
+mode it negotiates, which is what lets the catalog describe the track exactly
+before anything is encoded, and is then released until someone watches (no CPU,
+LED off in between). It is gated behind the `capture` feature:
 
 Build (or run) with the feature enabled:
 
@@ -577,13 +669,18 @@ cues, teletext, DVB subtitles, ...) are carried verbatim too, one MoQ track per
 PID, described in the catalog `mpegts` section, and survive `import ts` /
 `export ts` end-to-end.
 
-The service layer rides the same `mpegts` section. The program identity
-(transport stream ID, service number, PMT PID) is captured from the PAT and used to
-rebuild a matching PAT/PMT, while the standalone SI tables (SDT, NIT) are carried as
-opaque sections and re-emitted byte-for-byte on their original PIDs, each at its own
-repetition interval. So the service name, provider, type, and network survive the
-round-trip without being parsed. Regenerated tables (TDT/TOT) and EPG (EIT) are not
-captured: they are live or bulky rather than static identity.
+The service layer survives too. The program identity (transport stream ID,
+service number, PMT PID) is captured from the PAT into the catalog `mpegts`
+section and used to rebuild a matching PAT/PMT. The standalone SI tables (SDT,
+NIT, BAT, EIT now/next and schedule, and any table the CLI does not recognize)
+are carried as opaque sections on dedicated snapshot tracks, one per PID and
+table, and re-emitted byte-for-byte on their original PIDs, each at its own
+repetition interval. So the service name, provider, type, network, and EPG
+survive the round-trip without being parsed, and only TS exporters pay for
+them. TDT/TOT rides along as a latest-value slot, each tick replacing the
+last: the EPG's event times are on the source's clock, so the source's own
+time table is the one that stays consistent with it, and TOT's local-time
+offsets (DST transitions) are operator data no exporter could invent.
 
 ### FLV
 

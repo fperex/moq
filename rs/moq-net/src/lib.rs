@@ -56,6 +56,12 @@
 //! [`Session`] clone drops (or on [`Session::abort`]), which in turn finishes the
 //! driver.
 //!
+//! Origins follow the same pattern: [`origin::Producer::new`] returns a
+//! `(Producer, Driver)` pair, and the [`origin::Driver`] runs the origin's
+//! lifecycle work (route changes, track serving, teardown). Native tokio
+//! applications can use `moq_tokio::origin::spawn` instead of spawning the
+//! driver by hand.
+//!
 //! The crate has no direct tokio dependency: every future is built on [`kio`]
 //! (plain [`std::task::Waker`] plumbing) and `futures`, so any executor can poll
 //! them, and the `poll_xxx` counterparts can be stepped synchronously with a
@@ -80,11 +86,9 @@ mod coding;
 mod error;
 pub mod goaway;
 mod ietf;
-mod latency;
 mod lite;
 mod model;
 mod path;
-mod poll_set;
 mod server;
 mod session;
 mod setup;
@@ -97,7 +101,6 @@ pub mod transport;
 pub use client::*;
 pub use coding::{BoundsExceeded, DecodeError, EncodeError, VarInt};
 pub use error::*;
-pub use latency::Latency;
 /// The session direction a client advertises in its SETUP (moq-lite-05+).
 pub use lite::Role;
 pub use model::*;

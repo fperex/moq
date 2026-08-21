@@ -1,4 +1,5 @@
 export * from "./adapter.ts";
+export * as Cluster from "./cluster.ts";
 export * from "./connection.ts";
 export * from "./control.ts";
 export * from "./fetch.ts";
@@ -10,6 +11,7 @@ export * from "./publish_namespace.ts";
 export * from "./publisher.ts";
 export * from "./request.ts";
 export * from "./setup.ts";
+export * from "./solicit.ts";
 export * from "./subscribe.ts";
 export * from "./subscribe_namespace.ts";
 export * from "./subscriber.ts";

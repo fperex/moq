@@ -24,13 +24,17 @@ Use the Nix dev shell for project commands so local runs match CI tooling. If Ni
 
 To force a base, `just check origin/dev` and `just fix origin/dev` take it positionally. `just test` can't: it's a module, so `just test origin/dev` looks for a *recipe* named `origin/dev`. Name the recipe to get past that: `just test default origin/dev`.
 
-**CI runs exactly these recipes: `just check` then `just test`, with `MOQ_STRICT=1`.** There is no separate `just ci`, so there is no second definition of "checked" to drift from this one. The split is by cost, not by environment: `check` lints and compiles (plus `tsc -b` and the Python docs, which catch what `--noEmit` and autodoc can't), while `test` links and runs the test binaries, which is the expensive half.
+**CI runs exactly these recipes: `just check` and `just test`, with `MOQ_STRICT=1`.** There is no separate `just ci`, so there is no second definition of "checked" to drift from this one. The split is by cost, not by environment: `check` lints and compiles (plus `tsc -b` and the Python docs, which catch what `--noEmit` and autodoc can't), while `test` links and runs the test binaries, which is the expensive half. They run as concurrent jobs in `check.yml`, because clippy emits rmeta without codegen while nextest codegens and links, so there is nearly nothing for one to reuse from the other.
+
+The Rust build cache is written by `main` and read by pull requests, never the other way around (`.github/workflows/cache.yml`). Actions scopes cache reads to the current branch plus the default branch, so a PR-only workflow can never leave anything a *later* PR can restore. Both jobs in `check.yml` therefore restore under `shared-key: rust` with `save-if: false`. Don't add a save to a PR job: each one is gigabytes, the repository budget is 10 GB, and PR-scoped entries evict each other while remaining unreadable to everyone else.
 
 `MOQ_STRICT` is the one thing CI does differently. Every tool the checks use is guarded with `command -v` so an incomplete local toolchain checks less instead of failing; in CI that would be a green run that silently checked nothing, so the variable turns the required set into an up-front precondition (`_tools` in the root justfile). Required is per scope, mirroring what the diff actually dispatches, so a docs-only PR doesn't have to have gradle.
 
-Two tools stay unrequired: `swift` exists only on macOS (swift.yml is its gate), and **`go`/`uniffi-bindgen-go` are not in the dev shell**, so `just go check` skips itself in CI exactly as it always has. `uniffi-bindgen-go` isn't in nixpkgs (it installs from a NordSecurity git tag), so closing that hole means packaging it in the flake.
+One tool stays unrequired: `swift` exists only on macOS, so swift.yml is its gate rather than the PR path.
 
-Two gates live outside the PR path, in `.github/workflows/nightly.yml`: `just rs audit` (cargo-deny) because an advisory lands without this repo changing, and `just rs features` (the `--all-features` and `--no-default-features` compiles) because each is a full extra workspace compile that shares almost nothing with the default one. A break there lands on `main` rather than being caught in review, which is the accepted trade; anything that must block a merge belongs in `check`.
+Two path-filtered workflows run recipes of their own alongside `check.yml`, each for something the Linux `just check` can't reach: swift.yml (`swift/scripts/check.sh`, on a Mac) and obs.yml (`just obs ci`, which links the OBS plugin against nixpkgs' libobs/Qt6 -- Linux is the only platform where that needs no obs-deps download).
+
+Three gates live outside the PR path, in `.github/workflows/nightly.yml`: `just rs audit` (cargo-deny) because an advisory lands without this repo changing, `just rs features` (the `--all-features` and `--no-default-features` compiles) because each is a full extra workspace compile that shares almost nothing with the default one, and `just obs ci` because obs.yml's path filter can't be complete (a build script can change what linking `libmoq.a` needs without touching a manifest). A break there lands on `main` rather than being caught in review, which is the accepted trade; anything that must block a merge belongs in `check`.
 
 ## Architecture
 
@@ -58,9 +62,9 @@ Top-level layout only. Per-crate and per-package detail lives in the nested guid
 - `/rs/` - Rust crates: core networking (`moq-net`), native helpers, the relay, CLIs, media muxing/codecs, and the FFI/C bindings. See `rs/CLAUDE.md`.
 - `/js/` - TypeScript/JavaScript packages for the browser, published as `@moq/*`. See `js/CLAUDE.md`.
 - `/py/`, `/swift/`, `/kt/`, `/go/` - language wrappers over `rs/moq-ffi` (see [Language Bindings](#language-bindings)). `/py/` has `py/CLAUDE.md`; the others defer to their `README.md`.
-- `/cpp/` - C/C++ consumers of `libmoq`. `cpp/obs/` is the OBS Studio plugin (CMake; links `libmoq` via `MOQ_LOCAL`), licensed GPL-2.0-or-later because it links `libobs`. PR CI never compiles it, so `just obs build` and `just obs test` (the latter runs `cpp/obs/test/` against stubbed libobs/libmoq under ThreadSanitizer) are manual gates, like `just rs macos`. See `doc/bin/obs.md`.
+- `/cpp/` - C/C++ consumers of `libmoq`. `cpp/obs/` is the OBS Studio plugin (CMake; links `libmoq` via `MOQ_LOCAL`), licensed GPL-2.0-or-later because it links `libobs`. `just check` type-checks it via `just obs compile`, which needs headers rather than an obs-deps download, and obs.yml links it on Linux for `cpp/obs/` and `rs/libmoq/` PRs. Still manual, like `just rs macos`: `just obs build` (a loadable plugin, and the only path on macOS/Windows) and `just obs test` (`cpp/obs/test/` against stubbed libobs/libmoq under ThreadSanitizer). See `doc/bin/obs.md`.
 - `/demo/` - demos and test media: relay configs, the web demo, MoQ Boy, media hosting, and a network throttle script.
-- `/test/` - cross-language interop smoke tests (`test/smoke/`), run via `just test smoke[-full]`.
+- `/test/` - test harnesses that span more than one language or need a server. `test/smoke/` is the cross-language interop matrix (`just test smoke[-full]`); `test/wasm/` runs the `@moq/wasm` bindings in headless Chromium against a real relay (`just test wasm`), which is the only behavioral coverage `rs/moq-wasm` has.
 - `/doc/` - documentation site (VitePress, deployed via Cloudflare). The `/draft/` section is generated from `drafts/` by `doc/.vitepress/drafts.ts`.
 - `/drafts/` - IETF Internet-Drafts (kramdown-rfc) for the MoQ protocols implemented here. Built and published to the datatracker via `just drafts`. See `drafts/CLAUDE.md`.
 
@@ -85,6 +89,10 @@ This root file holds only cross-cutting rules that apply everywhere (writing sty
 - When adding new dependencies, always use the **newest stable version** available.
 - **Prefer a maintained third-party crate over hand-rolling non-core functionality** (standard container/codec parsers, compression, serialization, etc.). Reserve bespoke code for the wire/protocol layers where we need full control or no suitable crate exists.
 
+## Package Versions
+
+**Do not bump package versions unless the user explicitly asks for a version bump or release.** Feature and fix work must leave version fields and matching lockfile version metadata unchanged. Periodic release work owns those bumps.
+
 ## Writing Style
 
 - **No em dashes (—)** in code, comments, doc comments, commit messages, or any prose. Use a period and start a new sentence, or use a comma/parenthesis if the clauses are tightly bound.
@@ -105,6 +113,10 @@ Don't document deprecated flags, options, or APIs. User-facing docs (`/doc`), `-
 - Remove the example invocations and prose that mention it from `/doc`.
 
 The rename/removal rationale lives in the commit message and PR description, not in docs that users read. Warning someone who *uses* the deprecated path is not just fine but encouraged -- at compile time (Rust's `#[deprecated(note = "...")]`) or at runtime (a log line). Those fire on use, so they reach the one person who needs them and nobody else; they aren't documentation. A standing note in the docs that advertises the dead name is what's banned.
+
+**A runtime warning is only ever an addition to honoring the old spelling, never a substitute for it.** Each deprecated setting is either supported, in which case the value takes effect and a warning is optional, or refused, in which case the process fails immediately and prints the migration. Accepting a setting, naming it in a warning, and then not applying it is the one thing that is not allowed: the warning reads as advisory, so the deployment keeps running and stops working, and the message is exactly what convinces the reader nothing is wrong. When in doubt, refuse. An operator who has to edit a command line loses a minute; one who is silently running on defaults loses whatever the setting was protecting.
+
+Refusing means keeping the old spelling *parsable* -- a hidden arg, a still-deserialized field -- so the error can name its replacement. Dropping it outright gets you "unexpected argument `--client-connect`", which tells nobody what to write instead. The same goes for the environment variable behind a renamed flag: without it, a deployment configured through the environment slips past the check and lands in the silent case above.
 
 ## Retries
 
@@ -171,7 +183,7 @@ Changes in one area usually need matching updates elsewhere, including docs. If 
 
 | Change in | Also update |
 |---|---|
-| `rs/moq-ffi` | `rs/libmoq`, `{py,swift,kt}/`, `go/wrapper/moq/*.go` (the `go/ffi` bindings regenerate automatically, but a new method needs a hand-written wrapper too, like `py/moq-rs`), `doc/lib/{py,swift,kt,go,c}` |
+| `rs/moq-ffi` | `rs/libmoq`, `{py,swift,kt}/`, `go/wrapper/*.go` (the `go/ffi` bindings regenerate automatically, but a new method needs a hand-written wrapper too, like `py/moq-rs`), `doc/lib/{py,swift,kt,go,c}` |
 | `rs/moq-net` wire/API | `js/net`, `doc/concept`, `drafts/draft-lcurley-moq-lite.md` (if the wire spec changes) |
 | `rs/hang` catalog/container | `js/hang`, `doc/concept`, `drafts/draft-lcurley-moq-hang.md` (if the format spec changes) |
 | `rs/moq-token` | `js/token` |

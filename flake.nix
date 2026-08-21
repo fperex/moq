@@ -219,11 +219,9 @@
             gzip
           ];
 
-        # Developer workflow tooling not needed for builds: the GitHub CLI
-        # for opening/reviewing PRs, plus jq to read `cargo metadata` in
-        # `just rs check-changed`.
+        # Developer workflow tooling not needed for builds: jq reads
+        # `cargo metadata` in `just rs check-changed`.
         devTools = with pkgs; [
-          gh
           jq
         ];
 
@@ -250,19 +248,104 @@
           gradle_8
         ];
 
-        # Dependencies for building the OBS plugin (`just obs build`).
-        # Linux-only: nixpkgs marks obs-studio broken on Darwin, so macOS
-        # and Windows fetch libobs/Qt6 via the OBS buildspec instead (see
-        # cpp/obs/buildspec.json and doc/bin/obs.md). ffmpeg + cmake come from
-        # rustDeps. clang-tools/gersemi back `just obs check`.
+        # uniffi-bindgen-go renders rs/moq-ffi into the generated half of
+        # go/ffi. Not in nixpkgs, so build it from NordSecurity's fork; without
+        # it `just go check` skips itself, which reads as a pass in CI.
+        #
+        # The tag pairs the generator's own version with the uniffi release it
+        # targets (v0.7.1+v0.31.0 -> uniffi 0.31), and it only understands
+        # metadata emitted by that uniffi, so it moves with the `uniffi`
+        # dependency in rs/moq-ffi/Cargo.toml. Three other places name the same
+        # tag and must be bumped together: UNIFFI_BINDGEN_GO_TAG in
+        # release-go-ffi.yml, and the `cargo install` line in go/ffi/README.md
+        # and go/scripts/check.sh.
+        uniffi-bindgen-go = pkgs.rustPlatform.buildRustPackage rec {
+          pname = "uniffi-bindgen-go";
+          version = "0.7.1+v0.31.0";
+
+          src = pkgs.fetchFromGitHub {
+            owner = "NordSecurity";
+            repo = "uniffi-bindgen-go";
+            rev = "v${version}";
+            hash = "sha256-ZoGxEWJKriGhe/nMpSbJF6pyyZQZLzdVervUrBzUM5k=";
+          };
+
+          cargoHash = "sha256-ctDBz0oE8+mkn7SJn2KGSb6P4LF8S5UC3XcjVHWApg4=";
+
+          # The tag is a virtual workspace whose other members are uniffi test
+          # fixtures. Building from the root would compile all of them, and CI
+          # has no Nix binary cache, so it would pay for that on every run.
+          buildAndTestSubdir = "bindgen";
+
+          # The upstream test suite generates fixtures and compiles them with a
+          # Go toolchain, which is a lot of build for a binary we only invoke.
+          doCheck = false;
+        };
+
+        # Go toolchain (go/) so `just go check` regenerates the bindings and
+        # runs `go test -race` on the wrapper instead of skipping. Cross-platform:
+        # the check builds moq-ffi for the host and runs on Linux and macOS.
+        goDeps = [
+          pkgs.go
+          uniffi-bindgen-go
+        ];
+
+        # The libobs headers, unpacked from the same OBS release
+        # cpp/obs/buildspec.json downloads. Headers only: nothing here links, so
+        # it works on Darwin even though obs-studio itself does not build there,
+        # and it costs ~2 MB of store instead of the multi-hundred-MB obs-deps
+        # bundle. `just obs compile` type-checks the plugin against it.
+        #
+        # Keep `version` equal to buildspec.json's obs-studio version; `just obs
+        # check` fails when the two drift.
+        obs-headers = pkgs.stdenvNoCC.mkDerivation rec {
+          pname = "libobs-headers";
+          version = "31.1.1";
+
+          src = pkgs.fetchzip {
+            url = "https://github.com/obsproject/obs-studio/archive/refs/tags/${version}.tar.gz";
+            hash = "sha256-ycfROxgm3wUVyC2d1r3vIr7yWb6ErYIoDZX8xZrc+Vk=";
+          };
+
+          dontBuild = true;
+
+          # The layout matches a real OBS install (everything flat under
+          # include/obs, frontend API included), so a plugin's include paths are
+          # the same here as against the system package on Linux.
+          installPhase = ''
+            runHook preInstall
+            (cd libobs && find . \( -name '*.h' -o -name '*.hpp' \) -exec install -Dm444 {} $out/include/obs/{} \;)
+            install -Dm444 frontend/api/obs-frontend-api.h $out/include/obs/obs-frontend-api.h
+            # obs.h includes obsconfig.h, which the OBS build generates. Only the
+            # two version macros have to hold a value; everything else it
+            # configures is internal to libobs, so leave the #cmakedefines unset.
+            sed -e 's/^#cmakedefine.*$//' -e 's/@OBS_RELEASE_CANDIDATE@/0/' -e 's/@OBS_BETA@/0/' \
+              libobs/obsconfig.h.in > $out/include/obs/obsconfig.h
+            runHook postInstall
+          '';
+        };
+
+        # Dependencies for the OBS plugin (`just obs build`, `just obs compile`,
+        # `just obs check`). ffmpeg + cmake come from rustDeps.
+        #
+        # Only the *build* is Linux-only: nixpkgs marks obs-studio broken on
+        # Darwin, so macOS and Windows link libobs/Qt6 from the OBS buildspec
+        # bundle instead (see cpp/obs/buildspec.json and doc/bin/obs.md).
+        # Type-checking needs headers rather than libraries, and those are
+        # cross-platform -- obs-headers above, plus qt6.qtbase, which does build
+        # on Darwin. So `just obs compile` and the lints run everywhere while
+        # `just obs build` stays native.
         obsDeps =
           with pkgs;
-          lib.optionals (!stdenv.isDarwin) [
-            obs-studio
+          [
+            obs-headers
             qt6.qtbase
-            ninja
             clang-tools
             gersemi
+          ]
+          ++ lib.optionals (!stdenv.isDarwin) [
+            obs-studio
+            ninja
           ];
 
         # Apply our overlay to get the package definitions
@@ -323,13 +406,20 @@
             ++ lintDeps
             ++ obsDeps
             ++ ktDeps
+            ++ goDeps
             ++ devTools;
 
           # jemalloc's configure uses -O0 test builds, which conflict with
           # Nix's _FORTIFY_SOURCE hardening (requires -O).
           hardeningDisable = [ "fortify" ];
 
-          env = pkgs.lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
+          env = {
+            # Where `just obs compile` and `just obs test` look for libobs. Set
+            # on every platform so the plugin type-checks against the pinned OBS
+            # release everywhere, rather than whatever the host happens to have.
+            OBS_INCLUDE_DIR = "${obs-headers}/include/obs";
+          }
+          // pkgs.lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
             ALSA_PLUGIN_DIR = "${alsaPlugins}/lib/alsa-lib";
           };
         };

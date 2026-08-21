@@ -1,6 +1,18 @@
 //! Transcoder configuration: the rung ladder and catalog wiring.
 
-use moq_net::PathRelativeOwned;
+use moq_net::{AsPath, PathRelativeOwned};
+
+#[doc(hidden)]
+#[deprecated(note = "use moq_net::Path::relative")]
+pub fn source_reference(source: impl AsPath, output: impl AsPath) -> Option<PathRelativeOwned> {
+	let source = source.as_path();
+	let output = output.as_path();
+	if output.strip_prefix(&source)?.is_empty() {
+		return None;
+	}
+
+	source.relative(&output)
+}
 
 /// One candidate output rendition: a target resolution (by height) and bitrate.
 ///
@@ -39,7 +51,7 @@ pub struct Config {
 	pub rungs: Vec<Rung>,
 
 	/// Where the source broadcast lives relative to the output broadcast, e.g.
-	/// `".."` when the output is published at `<source>/transcode.hang`. When
+	/// `"."` when the output is published at `<source>/transcode.hang`. When
 	/// set, the derivative catalog references the source renditions (all video
 	/// and audio) through this path so players fetch them from the source
 	/// directly; the transcoder never proxies or subscribes them. `None` omits
@@ -77,5 +89,27 @@ impl Default for Config {
 			decoder: moq_video::decode::Kind::default(),
 			resize: moq_video::resize::Config::default(),
 		}
+	}
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn source_reference_normalizes_and_counts_output_depth() {
+		assert_eq!(source_reference("a/b", "a/b/transcode.hang").unwrap().as_str(), ".");
+		assert_eq!(source_reference("/a//b/", "a/b/dir/").unwrap().as_str(), ".");
+		assert_eq!(
+			source_reference("a/b", "a/b/dir/transcode.hang").unwrap().as_str(),
+			".."
+		);
+		assert_eq!(
+			source_reference("a/b", "a/b/one/two/transcode.hang").unwrap().as_str(),
+			"../.."
+		);
+		assert!(source_reference("a/b", "other/transcode.hang").is_none());
+		assert!(source_reference("a/b", "a/b").is_none());
 	}
 }

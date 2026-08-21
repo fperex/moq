@@ -3,16 +3,16 @@
  *
  * @module
  */
-import { type GetPromise, type Getter, Once, Signal } from "@moq/signals";
+import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
 import type { Datagram } from "./datagram.ts";
 import { type Frame, type Consumer as GroupConsumer, Producer as GroupProducer, Lagged } from "./group.ts";
-import { hooks } from "./internal.ts";
+import { hooks, type Recv } from "./internal.ts";
 import { Timescale, type Timestamp } from "./time.ts";
 
 export type { Datagram } from "./datagram.ts";
 
-/** Default {@link Info.latencyMax} window (milliseconds) when the publisher does not set one. */
-export const DEFAULT_LATENCY_MAX_MS = 5000;
+/** Default {@link Info.maxAge} window (milliseconds) when the publisher does not set one. */
+export const DEFAULT_MAX_AGE_MS = 5000;
 
 /**
  * How long (milliseconds) a datagram stays in the per-subscriber buffer before it is dropped.
@@ -48,11 +48,11 @@ export interface Info {
 	 */
 	timescale: Timescale;
 	/**
-	 * Publisher Max Latency: the maximum age (milliseconds) of a non-latest group before
+	 * Publisher Max Age: the maximum age (milliseconds) of a non-latest group before
 	 * the publisher evicts it. Reported in TRACK_INFO (Lite05+) so relays re-serve with the
 	 * same bound. The publisher-side half of the budget a subscriber sets for itself.
 	 */
-	latencyMax: number;
+	maxAge: number;
 	/** Tie-break priority between subscriptions of equal subscriber priority. */
 	priority: number;
 	/**
@@ -66,7 +66,7 @@ export interface Info {
 export function infoDefaults(info: Partial<Info> = {}): Info {
 	return {
 		timescale: info.timescale ?? Timescale.MILLI,
-		latencyMax: info.latencyMax ?? DEFAULT_LATENCY_MAX_MS,
+		maxAge: info.maxAge ?? DEFAULT_MAX_AGE_MS,
 		priority: info.priority ?? 0,
 		ordered: info.ordered ?? false,
 	};
@@ -82,7 +82,7 @@ export interface Subscription {
 	/** Whether groups are prioritized in sequence order. Defaults to `false` (newest-first). */
 	ordered?: boolean;
 	/** Maximum age (milliseconds) of a non-latest group before it is skipped. Defaults to `0`. */
-	latencyMax?: number;
+	maxAge?: number;
 	/** First group the publisher should deliver, or omit to start at the latest group. */
 	startGroup?: number;
 	/** Last group the publisher should deliver (inclusive), or omit for no end. */
@@ -95,7 +95,7 @@ function subscriptionDefaults(subscription: Subscription = {}): Subscription {
 	return {
 		priority: subscription.priority ?? 0,
 		ordered: subscription.ordered ?? false,
-		latencyMax: subscription.latencyMax ?? 0,
+		maxAge: subscription.maxAge ?? 0,
 		startGroup: subscription.startGroup,
 		endGroup: subscription.endGroup,
 	};
@@ -114,7 +114,7 @@ function combineSubscriptions(states: Iterable<TrackState>): Subscription | unde
 
 		combined.priority = Math.max(combined.priority ?? 0, subscription.priority ?? 0);
 		combined.ordered = (combined.ordered ?? false) && (subscription.ordered ?? false);
-		combined.latencyMax = Math.max(combined.latencyMax ?? 0, subscription.latencyMax ?? 0);
+		combined.maxAge = Math.max(combined.maxAge ?? 0, subscription.maxAge ?? 0);
 
 		if (subscription.startGroup !== undefined) {
 			combined.startGroup =
@@ -295,7 +295,7 @@ let makeSubscriber: (name: string, state: TrackState) => Subscriber;
  * subscription the publisher serves from it) gets an independent
  * {@link Subscriber} that receives a full copy of the groups, each with its own
  * read cursor. Groups are mirrored into every live subscriber and retained for the
- * track's `latencyMax` window so a late subscriber replays the recent groups.
+ * track's `maxAge` window so a late subscriber replays the recent groups.
  *
  * Obtained from {@link Request.accept} (the wire asks the application for a track to
  * serve) or constructed directly for an in-process track.
@@ -470,8 +470,8 @@ export class Producer {
 
 	// Evict cached groups that are closed and older than the cache window.
 	#prune(): void {
-		const latencyMaxMs = this.#state.info.peek()?.latencyMax ?? DEFAULT_LATENCY_MAX_MS;
-		const cutoff = Date.now() - latencyMaxMs;
+		const maxAgeMs = this.#state.info.peek()?.maxAge ?? DEFAULT_MAX_AGE_MS;
+		const cutoff = Date.now() - maxAgeMs;
 
 		const retained: CachedGroup[] = [];
 		for (const entry of this.#cache) {
@@ -651,6 +651,8 @@ export class Subscriber {
 
 	static {
 		makeSubscriber = (name, state) => new Subscriber(name, state);
+		hooks.tryRecvGroup = (subscriber) => subscriber.#tryRecvGroup();
+		hooks.groupChanged = (subscriber, fn) => subscriber.#groupChanged(fn);
 	}
 
 	/**
@@ -730,26 +732,51 @@ export class Subscriber {
 	 */
 	async recvGroup(): Promise<GroupConsumer | undefined> {
 		for (;;) {
-			const groups = this.#state.groups.peek();
-			const { start, end } = this.#cursor.peek();
-			while (groups.length > 0 && groups[0].sequence < start) groups.shift()?.close();
-
-			// The buffer is sequence-sorted, so an in-range group that arrives behind a
-			// beyond-cap one sorts in front of it and is never blocked by it.
-			const group = groups[0];
-			if (group && (end === undefined || group.sequence <= end)) {
-				groups.shift();
-				return group;
+			const recv = this.#tryRecvGroup();
+			switch (recv.kind) {
+				case "group":
+					return recv.group;
+				case "done":
+					return undefined;
+				case "error":
+					throw recv.error;
 			}
 
-			const closed = this.#state.closed.peek();
-			if (closed instanceof Error) throw closed;
-			// A group beyond the cap outlives a clean close: it becomes deliverable if
-			// the cap rises, so the track isn't over while any are held.
-			if (closed !== undefined && !group) return undefined;
-
+			// Idle, or parked at the boundary waiting for the cap to rise.
 			await Signal.race(this.#state.groups, this.#cursor, this.#state.closed);
 		}
+	}
+
+	// Package-internal synchronous half of recvGroup. The lite publisher uses this so applying
+	// control state, popping the group, and positioning its frames are one JavaScript turn.
+	#tryRecvGroup(): Recv {
+		const groups = this.#state.groups.peek();
+		const { start, end } = this.#cursor.peek();
+		while (groups.length > 0 && groups[0].sequence < start) groups.shift()?.close();
+
+		// The buffer is sequence-sorted, so an in-range group that arrives behind a
+		// beyond-cap one sorts in front of it and is never blocked by it.
+		const group = groups[0];
+		if (group && (end === undefined || group.sequence <= end)) {
+			groups.shift();
+			return { kind: "group", group };
+		}
+
+		const closed = this.#state.closed.peek();
+		if (closed instanceof Error) return { kind: "error", error: closed };
+		if (closed === undefined) return { kind: "idle" };
+		// A group beyond the cap outlives a clean close: it becomes deliverable if
+		// the cap rises, so the track isn't over while any are held.
+		return group ? { kind: "boundary" } : { kind: "done" };
+	}
+
+	// Package-internal readiness half of recvGroup. Each registration fires at most once, and
+	// the caller disposes the losers after whichever source wakes it.
+	#groupChanged(fn: () => void): Dispose {
+		const dispose = [this.#state.groups.changed(fn), this.#cursor.changed(fn), this.#state.closed.changed(fn)];
+		return () => {
+			for (const close of dispose) close();
+		};
 	}
 
 	/**

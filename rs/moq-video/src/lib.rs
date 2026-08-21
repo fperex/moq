@@ -24,8 +24,9 @@
 //!   Media Foundation / NVENC). Two entry points:
 //!   - `encode::publish_capture` captures a webcam and publishes it (turnkey).
 //!     It encodes strictly on demand: the track and catalog are advertised up
-//!     front, but the camera opens only while a subscriber is watching and is
-//!     released when the last one leaves. It requires the `capture` feature.
+//!     front (the camera opens once at startup so they can be exact), and the
+//!     encoder runs only while a subscriber is watching. Requires the `capture`
+//!     feature.
 //!   - [`encode::Encoder`] encodes [`Frame`]s you supply (from capture, a
 //!     decoder, or your own pixels via [`Surface::rgba`]) and
 //!     [`encode::Producer`] publishes the results.
@@ -83,6 +84,8 @@ mod mf;
 
 pub use color::Color;
 pub use error::Error;
+#[cfg(all(target_os = "linux", feature = "dmabuf"))]
+pub use frame::{DmaBuf, DmaBufExport, DmaBufPlane, DrmFormat};
 pub use frame::{Frame, I420, Surface};
 pub use size::Size;
 

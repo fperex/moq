@@ -324,37 +324,69 @@ impl<'a> Path<'a> {
 
 	/// Resolve a [`PathRelative`] against this path.
 	///
-	/// `..` segments in `rel` pop the last segment of the base; other segments are appended.
+	/// A non-empty reference replaces the last segment of the base, matching relative URL
+	/// resolution. `..` segments then pop another segment; other segments are appended.
+	/// Excess `..` is a no-op once the base is empty (subsequent named segments still append).
 	/// An empty `rel` returns this path as an owned copy.
 	///
-	/// Returns `None` when a `..` has nothing left to pop, i.e. the reference walks above the
-	/// root and names nothing. Popping to exactly the root is fine and yields the empty path,
-	/// which still names a broadcast. The alternative, clamping, would silently land
-	/// `../../../../x` on an unrelated `x`, so the caller decides what an out-of-range
-	/// reference means (the hang catalog rejects such a catalog outright).
-	///
-	/// [`PathRelative::new`] strips `.` and empty segments, so they are not handled here.
+	/// [`PathRelative::new`] strips empty and redundant `.` segments, but preserves a lone `.`
+	/// so it can reference the base's parent.
 	///
 	/// # Examples
 	/// ```
 	/// use moq_net::{Path, PathRelative};
 	///
 	/// let base = Path::new("a/b/c");
-	/// assert_eq!(base.resolve(&PathRelative::new("../d")).unwrap().as_str(), "a/b/d");
-	/// assert_eq!(base.resolve(&PathRelative::new("d")).unwrap().as_str(), "a/b/c/d");
-	/// assert_eq!(base.resolve(&PathRelative::new("../../..")).unwrap().as_str(), "");
-	/// assert_eq!(base.resolve(&PathRelative::new("../../../../x")), None);
+	/// assert_eq!(base.resolve(&PathRelative::new("./d")).as_str(), "a/b/d");
+	/// assert_eq!(base.resolve(&PathRelative::new(".")).as_str(), "a/b");
+	/// assert_eq!(base.resolve(&PathRelative::new("../d")).as_str(), "a/d");
 	/// ```
-	pub fn resolve(&self, rel: &PathRelative<'_>) -> Option<PathOwned> {
+	pub fn resolve(&self, rel: &PathRelative<'_>) -> PathOwned {
+		if rel.is_empty() {
+			return self.to_owned();
+		}
+
+		let mut segments: Vec<&str> = self.parts().collect();
+		segments.pop();
+
+		for seg in rel.as_str().split('/') {
+			if seg == "." {
+				continue;
+			} else if seg == ".." {
+				segments.pop();
+			} else {
+				segments.push(seg);
+			}
+		}
+
+		let path = segments.join("/");
+		if path.is_empty() {
+			Path::empty()
+		} else {
+			Path(Repr::Shared {
+				buf: path.into(),
+				start: 0,
+			})
+		}
+	}
+
+	/// Resolve a [`PathRelative`], returning `None` if it escapes above the root.
+	///
+	/// Unlike [`Path::resolve`], this distinguishes a valid reference to the empty root
+	/// path from excess `..` segments. Use it when an untrusted relative reference must
+	/// not be clamped to the root.
+	pub fn try_resolve(&self, rel: &PathRelative<'_>) -> Option<PathOwned> {
 		if rel.is_empty() {
 			return Some(self.to_owned());
 		}
 
 		let mut segments: Vec<&str> = self.parts().collect();
+		segments.pop();
 
 		for seg in rel.as_str().split('/') {
-			if seg == ".." {
-				// Nothing left to pop: the reference walks above the root.
+			if seg == "." {
+				continue;
+			} else if seg == ".." {
 				segments.pop()?;
 			} else {
 				segments.push(seg);
@@ -363,13 +395,79 @@ impl<'a> Path<'a> {
 
 		let path = segments.join("/");
 		if path.is_empty() {
-			return Some(Path::empty());
+			Some(Path::empty())
+		} else {
+			Some(Path(Repr::Shared {
+				buf: path.into(),
+				start: 0,
+			}))
+		}
+	}
+
+	/// Express this path relative to `base`: the inverse of [`Path::resolve`].
+	///
+	/// The result round-trips (`base.resolve(&rel) == self`) and never walks above the
+	/// root, so [`Path::try_resolve`] accepts it too.
+	///
+	/// A relative reference replaces the last segment of the base, matching relative URL
+	/// resolution, so a target nested under the base repeats the base's own last segment.
+	///
+	/// The empty reference names the base itself, so that is what a self-reference returns.
+	///
+	/// Returns `None` for a target no reference can name: a path segment may literally be
+	/// `.` or `..`, which resolution reads as navigation instead of as a name. Only the
+	/// segments past the shared prefix matter, since the rest are never emitted.
+	///
+	/// # Examples
+	/// ```
+	/// use moq_net::Path;
+	///
+	/// // The base names a broadcast, so its last segment is replaced, not descended into.
+	/// let base = Path::new("a/b");
+	/// assert_eq!(Path::new("a/b/c").relative(&base).unwrap().as_str(), "b/c");
+	/// assert_eq!(Path::new("a/c").relative(&base).unwrap().as_str(), "c");
+	/// assert_eq!(Path::new("c").relative(&base).unwrap().as_str(), "../c");
+	///
+	/// // The lone `.` names the base's parent, which the empty reference cannot.
+	/// assert_eq!(Path::new("a").relative(&base).unwrap().as_str(), ".");
+	///
+	/// // The base itself.
+	/// assert_eq!(Path::new("a/b").relative(&base).unwrap().as_str(), "");
+	///
+	/// // A segment named `..` is a legal path component but an unnameable target.
+	/// assert!(Path::new("a/..").relative(&base).is_none());
+	/// ```
+	pub fn relative(&self, base: impl AsPath) -> Option<PathRelativeOwned> {
+		let base = base.as_path();
+
+		// Only the empty reference can name a base whose last segment is itself `.` or `..`,
+		// since resolution replaces that segment rather than emitting it.
+		if *self == base {
+			return Some(PathRelative::empty());
 		}
 
-		Some(Path(Repr::Shared {
-			buf: path.into(),
-			start: 0,
-		}))
+		// Resolution replaces the base's last segment, so walk from its parent.
+		let mut dir: Vec<&str> = base.parts().collect();
+		dir.pop();
+
+		let target: Vec<&str> = self.parts().collect();
+		let common = dir.iter().zip(&target).take_while(|(a, b)| a == b).count();
+
+		let down = &target[common..];
+		if down.iter().any(|part| *part == "." || *part == "..") {
+			// Resolution would walk on these instead of naming them.
+			return None;
+		}
+
+		let mut rel: Vec<&str> = vec![".."; dir.len() - common];
+		rel.extend(down);
+
+		if rel.is_empty() {
+			// An empty reference resolves to the base itself, so name the parent explicitly.
+			return Some(PathRelative::new("."));
+		}
+
+		Some(PathRelativeOwned::from(rel.join("/")))
 	}
 }
 
@@ -482,30 +580,29 @@ pub type PathRelativeOwned = PathRelative<'static>;
 /// A relative broadcast path, used to reference one broadcast from another broadcast's content.
 ///
 /// Unlike [`Path`] (which is a complete reference within the broadcast namespace),
-/// `PathRelative` may contain `..` segments to walk up the namespace and is meaningful only
-/// when resolved against a base [`Path`] via [`Path::resolve`]. The hang catalog uses it to
-/// point a rendition at a track published in a sibling broadcast (e.g. `../source`).
+/// `PathRelative` may contain `.` and `..` segments to walk the namespace and is meaningful
+/// only when resolved against a base [`Path`] via [`Path::resolve`]. The hang catalog uses it
+/// to point a rendition at a track published in a sibling broadcast (e.g. `./source`).
 ///
 /// `PathRelative` has no `Encode`/`Decode` impl, so it never appears in announce/subscribe
 /// frames. It does serialize via serde for off-wire use (e.g. as a field inside a catalog
 /// JSON payload, which itself travels as a track).
 ///
 /// Normalization on creation: leading/trailing slashes are trimmed, consecutive internal
-/// slashes collapse to one, and `.` segments are stripped (treated as no-ops, matching
-/// POSIX). `..` is preserved and is interpreted at resolve time.
+/// slashes collapse to one, and redundant `.` segments are stripped. A reference made only
+/// of `.` segments normalizes to `.` rather than empty because `.` resolves to the base's
+/// parent while empty resolves to the base itself. `..` is preserved for resolve time.
 ///
 /// # Examples
 /// ```
 /// use moq_net::{Path, PathRelative};
 ///
-/// let rel = PathRelative::new("../source");
-/// assert_eq!(Path::new("a/b").resolve(&rel).unwrap().as_str(), "a/source");
+/// let rel = PathRelative::new("./source");
+/// assert_eq!(Path::new("a/b").resolve(&rel).as_str(), "a/source");
 ///
-/// // A reference that walks above the root names nothing.
-/// assert_eq!(Path::new("a").resolve(&PathRelative::new("../../b")), None);
-///
-/// // `.` segments are stripped on creation.
+/// // Redundant `.` segments are stripped on creation.
 /// assert_eq!(PathRelative::new("./a/./b").as_str(), "a/b");
+/// assert_eq!(PathRelative::new(".").as_str(), ".");
 /// ```
 #[derive(Debug, PartialEq, Eq, Hash, Clone, serde::Serialize)]
 pub struct PathRelative<'a>(Cow<'a, str>);
@@ -514,7 +611,7 @@ impl<'a> PathRelative<'a> {
 	/// Create a new `PathRelative` from a string slice.
 	///
 	/// Leading and trailing slashes are trimmed, consecutive internal slashes collapse to one,
-	/// and `.` segments are stripped. See the type-level doc for the full normalization rules.
+	/// and redundant `.` segments are stripped. See the type-level doc for the full rules.
 	pub fn new(s: &'a str) -> Self {
 		let trimmed = s.trim_start_matches('/').trim_end_matches('/');
 
@@ -592,11 +689,17 @@ fn needs_normalize_relative(trimmed: &str) -> bool {
 }
 
 fn normalize_relative_segments(trimmed: &str) -> String {
-	trimmed
+	let segments = trimmed
 		.split('/')
 		.filter(|seg| !seg.is_empty() && *seg != ".")
 		.collect::<Vec<_>>()
-		.join("/")
+		.join("/");
+
+	if segments.is_empty() && trimmed.split('/').any(|seg| seg == ".") {
+		".".to_string()
+	} else {
+		segments
+	}
 }
 
 impl Default for PathRelative<'_> {
@@ -1370,80 +1473,158 @@ mod tests {
 	}
 
 	#[test]
-	fn test_path_relative_strips_dot_segments() {
-		assert_eq!(PathRelative::new(".").as_str(), "");
+	fn test_path_relative_normalizes_dot_segments() {
+		assert_eq!(PathRelative::new(".").as_str(), ".");
+		assert_eq!(PathRelative::new("././").as_str(), ".");
 		assert_eq!(PathRelative::new("./foo").as_str(), "foo");
 		assert_eq!(PathRelative::new("foo/./bar").as_str(), "foo/bar");
 		assert_eq!(PathRelative::new("./../foo").as_str(), "../foo");
 		// From<String> takes the same normalization.
 		assert_eq!(PathRelative::from("./foo".to_string()).as_str(), "foo");
-		assert_eq!(PathRelative::from(".".to_string()).as_str(), "");
+		assert_eq!(PathRelative::from(".".to_string()).as_str(), ".");
 	}
 
 	#[test]
-	fn test_resolve_appends_and_pops() {
-		let base = Path::new("a/b/c");
-		assert_eq!(base.resolve(&PathRelative::new("d")).unwrap().as_str(), "a/b/c/d");
-		assert_eq!(base.resolve(&PathRelative::new("d/e")).unwrap().as_str(), "a/b/c/d/e");
-		assert_eq!(base.resolve(&PathRelative::new("../d")).unwrap().as_str(), "a/b/d");
-		assert_eq!(base.resolve(&PathRelative::new("..")).unwrap().as_str(), "a/b");
-		assert_eq!(base.resolve(&PathRelative::new("../../x/y")).unwrap().as_str(), "a/x/y");
+	fn test_resolve_replaces_base_name() {
+		let base = Path::new("a/b");
+		assert_eq!(base.resolve(&PathRelative::new("c")).as_str(), "a/c");
+		assert_eq!(base.resolve(&PathRelative::new("c/d")).as_str(), "a/c/d");
+		assert_eq!(
+			Path::new("foo.hang/catalog.pro")
+				.resolve(&PathRelative::new("./transcode.pro"))
+				.as_str(),
+			"foo.hang/transcode.pro"
+		);
 	}
 
 	#[test]
 	fn test_resolve_empty_rel_returns_base() {
 		let base = Path::new("a/b");
-		assert_eq!(base.resolve(&PathRelative::empty()).unwrap().as_str(), "a/b");
-		assert_eq!(Path::empty().resolve(&PathRelative::empty()).unwrap(), Path::empty());
+		assert_eq!(base.resolve(&PathRelative::new("")).as_str(), "a/b");
 	}
 
 	#[test]
-	fn test_resolve_rejects_escape() {
+	fn test_resolve_single_dotdot() {
 		let base = Path::new("a/b/c");
-		// One more `..` than the base has segments. Clamping would land this on "x".
-		assert_eq!(base.resolve(&PathRelative::new("../../../../x")), None);
-		assert_eq!(base.resolve(&PathRelative::new("../../../..")), None);
-		// A `..` that escapes mid-way is rejected even if later segments walk back down.
-		assert_eq!(base.resolve(&PathRelative::new("../../../../a/b/c")), None);
-		assert_eq!(Path::empty().resolve(&PathRelative::new("../x")), None);
+		assert_eq!(base.resolve(&PathRelative::new("../d")).as_str(), "a/d");
+		assert_eq!(base.resolve(&PathRelative::new("..")).as_str(), "a");
 	}
 
 	#[test]
-	fn test_resolve_allows_root() {
-		// Popping to exactly the root stops at it rather than walking above it, and the
-		// root still names a broadcast.
-		assert_eq!(Path::new("a").resolve(&PathRelative::new("..")).unwrap(), Path::empty());
-		assert_eq!(
-			Path::new("a/b").resolve(&PathRelative::new("../..")).unwrap(),
-			Path::empty()
-		);
-		assert_eq!(
-			Path::new("a/b")
-				.resolve(&PathRelative::new("../../x"))
-				.unwrap()
-				.as_str(),
-			"x"
-		);
-		assert_eq!(
-			Path::empty().resolve(&PathRelative::new("foo")).unwrap().as_str(),
-			"foo"
-		);
+	fn test_resolve_multiple_dotdot() {
+		let base = Path::new("a/b/c");
+		assert_eq!(base.resolve(&PathRelative::new("../../x")).as_str(), "x");
+		assert_eq!(base.resolve(&PathRelative::new("../../../x")).as_str(), "x");
 	}
 
 	#[test]
-	fn test_resolve_dot_is_noop() {
+	fn test_resolve_dotdot_clamps_at_root() {
+		let base = Path::new("a");
+		// Excess `..` clamps at the root instead of escaping it.
+		assert_eq!(base.resolve(&PathRelative::new("../../../foo")).as_str(), "foo");
+		assert_eq!(base.resolve(&PathRelative::new("..")).as_str(), "");
+	}
+
+	#[test]
+	fn test_resolve_empty_base() {
+		let base = Path::empty();
+		assert_eq!(base.resolve(&PathRelative::new("foo")).as_str(), "foo");
+		assert_eq!(base.resolve(&PathRelative::new("..")).as_str(), "");
+	}
+
+	#[test]
+	fn test_resolve_dot_names_parent() {
 		let base = Path::new("a/b");
-		// `.` is normalized away by PathRelative::new, so resolve ignores it.
-		assert_eq!(base.resolve(&PathRelative::new(".")).unwrap().as_str(), "a/b");
-		assert_eq!(base.resolve(&PathRelative::new("./c")).unwrap().as_str(), "a/b/c");
-		assert_eq!(base.resolve(&PathRelative::new("./../c")).unwrap().as_str(), "a/c");
+		assert_eq!(base.resolve(&PathRelative::new(".")).as_str(), "a");
+		assert_eq!(base.resolve(&PathRelative::new("./c")).as_str(), "a/c");
+		assert_eq!(base.resolve(&PathRelative::new("./../c")).as_str(), "c");
 	}
 
 	#[test]
-	fn test_resolve_self_reference_via_dotdot() {
-		// Walking `..` back to the same path yields the base unchanged, which lets the
+	fn test_resolve_self_reference_via_sibling_name() {
+		// Naming the base within its parent yields the base unchanged, which lets the
 		// caller compare resolved == base to detect a self-reference.
 		let base = Path::new("a/b");
-		assert_eq!(base.resolve(&PathRelative::new("../b")).unwrap().as_str(), "a/b");
+		assert_eq!(base.resolve(&PathRelative::new("./b")).as_str(), "a/b");
+	}
+
+	#[test]
+	fn test_try_resolve_distinguishes_root_from_escape() {
+		let base = Path::new("top");
+		assert_eq!(base.try_resolve(&PathRelative::new(".")).unwrap().as_str(), "");
+		assert!(base.try_resolve(&PathRelative::new("..")).is_none());
+
+		let nested = Path::new("a/b");
+		assert_eq!(nested.try_resolve(&PathRelative::new("..")).unwrap().as_str(), "");
+		assert!(nested.try_resolve(&PathRelative::new("../..")).is_none());
+	}
+
+	#[test]
+	fn test_relative() {
+		let rel = |target: &str, base: &str| Path::new(target).relative(base).unwrap();
+
+		// Nested under the base: the base's own last segment is replaced, so it repeats.
+		assert_eq!(rel("foo/bar/baz", "foo/bar").as_str(), "bar/baz");
+		// Sibling.
+		assert_eq!(rel("foo/baz", "foo/bar").as_str(), "baz");
+		// Different subtree.
+		assert_eq!(rel("foo/baz/bar", "foo/bar/baz").as_str(), "../baz/bar");
+		// The base's parent, which only `.` can name.
+		assert_eq!(rel("a/b", "a/b/transcode.hang").as_str(), ".");
+		assert_eq!(rel("a/b", "a/b/one/two/transcode.hang").as_str(), "../..");
+		// Roots.
+		assert_eq!(rel("foo/bar", "").as_str(), "foo/bar");
+		assert_eq!(rel("", "foo").as_str(), ".");
+		// The base itself, which only the empty reference names.
+		assert_eq!(rel("a/b", "a/b").as_str(), "");
+		assert_eq!(rel("", "").as_str(), "");
+		// Slashes are normalized first.
+		assert_eq!(rel("/a//b/", "//a/b/dir//").as_str(), ".");
+	}
+
+	#[test]
+	fn test_relative_rejects_unnameable_targets() {
+		// A segment literally named `.` or `..` is a legal path component, but resolution
+		// would walk on it instead of naming it.
+		assert!(Path::new("a/../b").relative("").is_none());
+		assert!(Path::new("x/./y").relative("x/z").is_none());
+		assert!(Path::new("a/..").relative("a/b").is_none());
+
+		// A base is always nameable by itself, however its last segment is spelled.
+		assert_eq!(Path::new("a/..").relative("a/..").unwrap().as_str(), "");
+
+		// Dot segments inside the shared prefix are never emitted, so they are fine.
+		let rel = Path::new("a/../b/x").relative("a/../b/c").unwrap();
+		assert_eq!(rel.as_str(), "x");
+		assert_eq!(Path::new("a/../b/c").resolve(&rel).as_str(), "a/../b/x");
+	}
+
+	#[test]
+	fn test_relative_round_trips() {
+		let paths = [
+			"", "a", "b", "a/b", "a/c", "a/b/c", "a/b/c/d", "x/y/z", "a/../b", "a/./b", "a/..", "a/.",
+		];
+
+		for base in paths {
+			for target in paths {
+				let base = Path::new(base);
+				let target = Path::new(target);
+				let Some(rel) = target.relative(&base) else {
+					// Only an unnameable target may be refused, and never the base itself.
+					assert!(
+						target != base && target.parts().any(|part| part == "." || part == ".."),
+						"{base} -> {target} refused a nameable target"
+					);
+					continue;
+				};
+
+				assert_eq!(base.resolve(&rel), target, "{base} -> {target} via {rel}");
+				// The reference is derived from a real target, so it never escapes the root.
+				assert!(
+					base.try_resolve(&rel).is_some(),
+					"{base} -> {target} via {rel} escaped the root"
+				);
+			}
+		}
 	}
 }
