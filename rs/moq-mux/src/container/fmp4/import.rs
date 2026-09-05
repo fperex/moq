@@ -97,6 +97,17 @@ enum TrackKind {
 	Audio,
 }
 
+impl TrackKind {
+	/// The publisher priority for this kind of media, so audio isn't stuck behind a
+	/// video backlog on a busy connection.
+	fn priority(&self) -> u8 {
+		match self {
+			Self::Video => hang::catalog::PRIORITY.video,
+			Self::Audio => hang::catalog::PRIORITY.audio,
+		}
+	}
+}
+
 struct Fmp4Track {
 	kind: TrackKind,
 
@@ -298,14 +309,14 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			let timescale = moq_net::Timescale::new(trak.mdia.mdhd.timescale as u64)?;
 			let track = self.broadcast.create_track(
 				self.broadcast.unique_name(suffix),
-				self.catalog.track_info().with_timescale(timescale),
+				self.catalog.track_info(kind.priority()).with_timescale(timescale),
 			)?;
 
 			// Enroll every track in the broadcast's timeline: passthrough writes groups by hand
 			// (no `container::Producer`), so the recorder is fed directly at each group open.
 			// Enrolling on the timeline directly rather than through `catalog::Producer::enroll`,
 			// because the catalog is already locked here; the root section is advertised below.
-			let recorder = timeline.track(track.name())?;
+			let recorder = timeline.pacing_track(track.name())?;
 
 			let detect_bitrate = match kind {
 				TrackKind::Video => {

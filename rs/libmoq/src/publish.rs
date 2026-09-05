@@ -70,8 +70,8 @@ pub struct Publish {
 }
 
 impl Publish {
-	/// Store an origin-created broadcast producer, attaching the catalog track every
-	/// libmoq broadcast carries.
+	/// Store an origin-created broadcast producer, attaching the catalog track
+	/// every libmoq broadcast carries.
 	pub fn create(&mut self, mut broadcast: moq_net::broadcast::Producer) -> Result<Id, Error> {
 		let catalog =
 			moq_mux::catalog::Producer::with_catalog(&mut broadcast, moq_mux::catalog::hang::Catalog::default())?;
@@ -85,12 +85,15 @@ impl Publish {
 		Ok(id)
 	}
 
-	/// Set whether the broadcast is announced (announced by its origin), keeping the rest
-	/// of its route (hops, cost).
+	/// Set whether the broadcast's exact path is announced as a route. The
+	/// broadcast itself stays reachable by exact path either way.
 	pub fn set_announce(&mut self, broadcast: Id, announce: bool) -> Result<(), Error> {
 		let broadcast = self.broadcasts.get_mut(broadcast).ok_or(Error::BroadcastNotFound)?;
-		let route = broadcast.producer.consume().route();
-		broadcast.producer.set_route(route.with_announce(announce))?;
+		if announce {
+			broadcast.producer.announce(moq_net::origin::Route::default())?;
+		} else {
+			broadcast.producer.unannounce();
+		}
 		Ok(())
 	}
 
@@ -129,6 +132,7 @@ impl Publish {
 			mut catalog,
 			video,
 			audio,
+			..
 		} = self.broadcasts.remove(broadcast).ok_or(Error::BroadcastNotFound)?;
 		// Retire the caller's renditions while the catalog track is still open, so their removal is
 		// published rather than warned about once `finish` has closed it.

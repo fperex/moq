@@ -5,14 +5,16 @@
  */
 import { type GetPromise, Once, Signal } from "@moq/signals";
 import type { Consumer as GroupConsumer } from "./group.ts";
-import { hooks } from "./internal.ts";
+import { hooks, type TrackSequence } from "./internal.ts";
 import * as track from "./track.ts";
 
 /** Reactive backing state shared by broadcast producers and consumers. */
 class BroadcastState {
 	requested = new Signal<track.Request[]>([]);
+	pending = new Set<track.Request>();
 	closed = new Once<Error | null>();
 	tracks = new Map<string, track.Producer>();
+	sequences = new Map<string, TrackSequence>();
 	// Live consumer handles sharing this state (see {@link Consumer.clone}). The broadcast
 	// closes once the last one closes, so a shared consumer can be handed to several callers.
 	consumers = 0;
@@ -33,8 +35,8 @@ function dequeueRequest(state: BroadcastState): track.Request | undefined {
 function closeState(state: BroadcastState, abort?: Error) {
 	if (state.closed.peek() !== undefined) return;
 	state.closed.set(abort ?? null);
+	for (const request of state.pending) request.reject(abort);
 	state.requested.mutate((requests) => {
-		for (const request of requests) request.reject(abort);
 		requests.length = 0;
 	});
 }
@@ -75,7 +77,7 @@ function subscribe(
 	}
 
 	state.requested.mutate((requested) => {
-		requested.push(hooks.makeRequest(name, producer));
+		requested.push(hooks.makeRequest({ name, producer, sequences: state.sequences, pending: state.pending }));
 	});
 
 	return subscriber;
@@ -93,7 +95,7 @@ async function resolveTrackInfo(state: BroadcastState, name: string): Promise<tr
 
 	const producer = new track.Producer(name);
 	state.requested.mutate((requested) => {
-		requested.push(hooks.makeRequest(name, producer));
+		requested.push(hooks.makeRequest({ name, producer, sequences: state.sequences, pending: state.pending }));
 	});
 
 	try {
@@ -113,6 +115,7 @@ async function fetchGroup(
 	options: track.FetchGroupOptions = {},
 ): Promise<GroupConsumer> {
 	const subscriber = subscribe(state, name, { priority: options.priority });
+	hooks.exemptFetch(subscriber);
 	try {
 		for (;;) {
 			const group = await subscriber.recvGroup();

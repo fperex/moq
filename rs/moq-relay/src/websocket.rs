@@ -21,6 +21,7 @@ pub(crate) async fn serve_ws(
 	OriginalUri(uri): OriginalUri,
 	headers: HeaderMap,
 	mtls: Option<Extension<MtlsPeer>>,
+	socket_stats: Option<Extension<crate::web::SocketStats>>,
 	Extension(versions): Extension<moq_net::Versions>,
 	State(state): State<Arc<WebState>>,
 ) -> axum::response::Result<Response> {
@@ -73,8 +74,11 @@ pub(crate) async fn serve_ws(
 			subscribe,
 			stats,
 			shutdown: state.shutdown.clone(),
+			socket_stats: socket_stats.map(|Extension(s)| s),
 		};
-		let _ = handle_socket(socket, session).await;
+		let auth = state.auth.clone();
+		let expired = async move { auth.expired(&token).await };
+		let _ = handle_socket(socket, session, expired).await;
 	}))
 }
 
@@ -93,10 +97,17 @@ struct SessionInputs {
 	subscribe: Option<origin::Producer>,
 	stats: Session,
 	shutdown: crate::Shutdown,
+	/// The kernel's view of the socket under the upgrade, captured at accept time.
+	socket_stats: Option<crate::web::SocketStats>,
 }
 
+/// Serve one upgraded WebSocket until it closes or its credential expires.
 #[tracing::instrument("ws", err, skip_all, fields(id = session.id))]
-async fn handle_socket<T>(socket: T, session: SessionInputs) -> anyhow::Result<()>
+async fn handle_socket<T>(
+	socket: T,
+	session: SessionInputs,
+	expired: impl Future<Output = crate::Expired>,
+) -> anyhow::Result<()>
 where
 	T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
 		+ futures::Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -112,6 +123,7 @@ where
 		subscribe,
 		stats,
 		mut shutdown,
+		socket_stats,
 	} = session;
 
 	// Wrap the WebSocket in a WebTransport compatibility layer. We have to
@@ -124,7 +136,14 @@ where
 	// broadcast it published stays announced for that entire window and the
 	// announce propagates to the rest of the cluster. QUIC gets this from its
 	// idle timeout; WebSocket has no equivalent of its own.
-	let upgraded = qmux::ws::Upgraded::new(socket).with_keep_alive(qmux::ws::KeepAlive::default());
+	let mut upgraded = qmux::ws::Upgraded::new(socket).with_keep_alive(qmux::ws::KeepAlive::default());
+	// Hand qmux the socket we captured before the upgrade erased it, so the session
+	// reports the kernel's RTT (and, on Linux, its delivery rate) from the start
+	// rather than only what QX_PING can measure a round trip later. This is what
+	// fills in the moq-lite PROBE for a WebSocket viewer.
+	if let Some(crate::web::SocketStats(stats)) = socket_stats {
+		upgraded = upgraded.with_socket_stats(stats);
+	}
 	let upgraded = match alpn.as_deref() {
 		Some(alpn) => upgraded.with_alpn(alpn),
 		None => upgraded,
@@ -140,11 +159,23 @@ where
 	if let Some(publish) = publish {
 		server = server.with_subscriber(publish);
 	}
-	// Hold the session so it doesn't close early; the driver serves it in place.
-	let (session, mut driver) = server.accept(moq_tokio::transport::Async::new(ws)).await?;
+	// Hold the session so it doesn't close early; the machine serves it in place
+	// (an Inline runtime hands it back instead of spawning), so its lifetime and
+	// teardown stay tied to this handler task.
+	let runtime = moq_tokio::runtime::Inline::new();
+	let session = server
+		.accept(runtime.clone(), moq_tokio::transport::Async::new(ws))
+		.await?;
+	let mut driver = runtime.take().expect("accept hands the machine to its runtime");
 
 	tokio::select! {
 		res = &mut driver => res.map_err(Into::into),
+		reason = expired => {
+			tracing::info!(%reason, "credential no longer valid, closing session");
+			session.abort(moq_net::Error::Unauthorized);
+			// Drive the teardown so the close reaches the peer.
+			driver.await.map_err(Into::into)
+		}
 		_ = shutdown.started() => {
 			tracing::info!("relay shutting down; draining session");
 			// Unlike QUIC sessions (whose driver is spawned), this driver runs
@@ -215,7 +246,7 @@ const QMUX_VERSIONS: &[qmux::Version] = &[qmux::Version::QMux01, qmux::Version::
 
 /// moq-transport-18 and -19 require qmux-01, so we never pair them with qmux-00.
 /// Mirrors `js/net`'s `connect.ts` and moq-tokio's `websocket_subprotocols`.
-const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19"];
+const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19", "moqt-20"];
 
 /// Subprotocols to advertise on the WebSocket upgrade.
 ///
@@ -301,14 +332,14 @@ fn map_axum_error(err: axum::Error) -> tungstenite::Error {
 
 fn axum_to_tungstenite(message: axum::extract::ws::Message) -> tungstenite::Message {
 	match message {
-		axum::extract::ws::Message::Text(text) => tungstenite::Message::Text(text.to_string().into()),
-		axum::extract::ws::Message::Binary(bin) => tungstenite::Message::Binary(Vec::from(bin).into()),
-		axum::extract::ws::Message::Ping(ping) => tungstenite::Message::Ping(Vec::from(ping).into()),
-		axum::extract::ws::Message::Pong(pong) => tungstenite::Message::Pong(Vec::from(pong).into()),
+		axum::extract::ws::Message::Text(text) => tungstenite::Message::Text(axum_text_to_tungstenite(text)),
+		axum::extract::ws::Message::Binary(bin) => tungstenite::Message::Binary(bin),
+		axum::extract::ws::Message::Ping(ping) => tungstenite::Message::Ping(ping),
+		axum::extract::ws::Message::Pong(pong) => tungstenite::Message::Pong(pong),
 		axum::extract::ws::Message::Close(close) => {
 			tungstenite::Message::Close(close.map(|c| tungstenite::protocol::CloseFrame {
 				code: c.code.into(),
-				reason: c.reason.to_string().into(),
+				reason: axum_text_to_tungstenite(c.reason),
 			}))
 		}
 	}
@@ -316,18 +347,30 @@ fn axum_to_tungstenite(message: axum::extract::ws::Message) -> tungstenite::Mess
 
 fn tungstenite_to_axum(message: tungstenite::Message) -> axum::extract::ws::Message {
 	match message {
-		tungstenite::Message::Text(text) => axum::extract::ws::Message::Text(text.to_string().into()),
-		tungstenite::Message::Binary(bin) => axum::extract::ws::Message::Binary(Vec::from(bin).into()),
-		tungstenite::Message::Ping(ping) => axum::extract::ws::Message::Ping(Vec::from(ping).into()),
-		tungstenite::Message::Pong(pong) => axum::extract::ws::Message::Pong(Vec::from(pong).into()),
+		tungstenite::Message::Text(text) => axum::extract::ws::Message::Text(tungstenite_text_to_axum(text)),
+		tungstenite::Message::Binary(bin) => axum::extract::ws::Message::Binary(bin),
+		tungstenite::Message::Ping(ping) => axum::extract::ws::Message::Ping(ping),
+		tungstenite::Message::Pong(pong) => axum::extract::ws::Message::Pong(pong),
 		tungstenite::Message::Frame(_frame) => unreachable!(),
 		tungstenite::Message::Close(close) => {
 			axum::extract::ws::Message::Close(close.map(|c| axum::extract::ws::CloseFrame {
 				code: c.code.into(),
-				reason: c.reason.to_string().into(),
+				reason: tungstenite_text_to_axum(c.reason),
 			}))
 		}
 	}
+}
+
+fn axum_text_to_tungstenite(text: axum::extract::ws::Utf8Bytes) -> tungstenite::Utf8Bytes {
+	axum::body::Bytes::from(text)
+		.try_into()
+		.expect("axum text is valid UTF-8")
+}
+
+fn tungstenite_text_to_axum(text: tungstenite::Utf8Bytes) -> axum::extract::ws::Utf8Bytes {
+	axum::body::Bytes::from(text)
+		.try_into()
+		.expect("tungstenite text is valid UTF-8")
 }
 
 #[cfg(test)]
@@ -382,6 +425,50 @@ mod tests {
 		assert!(matches!(close, Err(tungstenite::Error::ConnectionClosed)));
 	}
 
+	#[test]
+	fn websocket_binary_conversion_is_zero_copy() {
+		let payload = axum::body::Bytes::from(vec![1, 2, 3]);
+		let retained = payload.clone();
+		let tungstenite::Message::Binary(converted) = axum_to_tungstenite(axum::extract::ws::Message::Binary(payload))
+		else {
+			panic!("expected binary message");
+		};
+		assert_eq!(converted, retained);
+		assert_eq!(converted.as_ptr(), retained.as_ptr());
+
+		let payload = axum::body::Bytes::from(vec![4, 5, 6]);
+		let retained = payload.clone();
+		let axum::extract::ws::Message::Binary(converted) = tungstenite_to_axum(tungstenite::Message::Binary(payload))
+		else {
+			panic!("expected binary message");
+		};
+		assert_eq!(converted, retained);
+		assert_eq!(converted.as_ptr(), retained.as_ptr());
+	}
+
+	#[test]
+	fn websocket_text_conversion_is_zero_copy() {
+		let payload = axum::body::Bytes::from("hello from axum");
+		let retained = payload.clone();
+		let text = axum::extract::ws::Utf8Bytes::try_from(payload).expect("valid UTF-8");
+		let tungstenite::Message::Text(converted) = axum_to_tungstenite(axum::extract::ws::Message::Text(text)) else {
+			panic!("expected text message");
+		};
+		let converted = axum::body::Bytes::from(converted);
+		assert_eq!(converted, retained);
+		assert_eq!(converted.as_ptr(), retained.as_ptr());
+
+		let payload = axum::body::Bytes::from("hello from tungstenite");
+		let retained = payload.clone();
+		let text = tungstenite::Utf8Bytes::try_from(payload).expect("valid UTF-8");
+		let axum::extract::ws::Message::Text(converted) = tungstenite_to_axum(tungstenite::Message::Text(text)) else {
+			panic!("expected text message");
+		};
+		let converted = axum::body::Bytes::from(converted);
+		assert_eq!(converted, retained);
+		assert_eq!(converted.as_ptr(), retained.as_ptr());
+	}
+
 	#[tokio::test]
 	async fn websocket_auth_applies_subdomain_routing() {
 		let config: AuthConfig = serde_json::from_value(serde_json::json!({
@@ -420,7 +507,7 @@ mod tests {
 				.iter()
 				.map(|&a| moq_net::Version::from_alpn(a).map(|v| v.code()))
 				.collect::<Vec<_>>(),
-			vec![Some(0xff000012), Some(0xff000013)]
+			vec![Some(0xff000012), Some(0xff000013), Some(0xff000014)]
 		);
 
 		let list = supported_subprotocols(moq_net::ALPNS);
@@ -826,10 +913,14 @@ mod tests {
 			subscribe: None,
 			stats: Session::default(),
 			shutdown: crate::Shutdown::disabled(),
+			// No descriptor to hand over: this drives the transport directly rather
+			// than through an accepted socket.
+			socket_stats: None,
 		};
 		let server = tokio::spawn(handle_socket(
 			Pipe::new(server_incoming, server_to_client, frozen.clone()),
 			session,
+			std::future::pending::<crate::Expired>(),
 		));
 
 		// A real qmux peer, so the transport handshake completes and its 10s

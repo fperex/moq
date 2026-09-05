@@ -15,30 +15,32 @@ use crate::moq::{ImportTarget, notify_ready};
 /// RTMP endpoint args: exactly one of `--connect` (dial) / `--listen` (bind).
 /// The parent direction fixes whether that dial/bind pushes or pulls. Import uses
 /// this directly; export wraps it in [`ExportArgs`] for the egress-only knobs.
-#[derive(clap::Args, Clone)]
-#[command(group = clap::ArgGroup::new("rtmp-mode").required(true).multiple(false).args(["rtmp-connect", "rtmp-listen"]))]
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[usage(group("rtmp-mode", required))]
 pub struct Args {
 	/// Dial `rtmp://host[:1935]/<app>/<key>`.
-	#[arg(id = "rtmp-connect", long = "connect", value_name = "URL")]
+	#[usage(name = "rtmp-connect", long = "connect", value_name = "URL", group = "rtmp-mode")]
 	pub connect: Option<Url>,
 
 	/// Bind an RTMP listener, bridging the single `--broadcast` (the RTMP app/key
 	/// is accepted but not used for routing).
-	#[arg(id = "rtmp-listen", long = "listen", value_name = "ADDR")]
+	#[usage(name = "rtmp-listen", long = "listen", value_name = "ADDR", group = "rtmp-mode")]
 	pub listen: Option<SocketAddr>,
 }
 
 /// RTMP export args: the endpoint plus egress-only tuning. Split from the import
 /// side so the frame-drop knob only shows where it applies.
-#[derive(clap::Args, Clone)]
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub struct ExportArgs {
-	#[command(flatten)]
+	#[usage(flatten)]
 	pub endpoint: Args,
 
-	/// Maximum age before skipping a stalled group. RTMP is unpaced, so this
+	/// How stale a group may get before it is skipped. RTMP is unpaced, so this
 	/// bounds buffering, not the wire rate.
-	#[arg(long = "latency-max", default_value = "500ms", value_parser = humantime::parse_duration)]
-	pub max_age: Duration,
+	#[usage(long, alias = "latency-max", default = "500ms")]
+	pub max_age: moq_tokio::Duration,
 }
 
 /// Accept incoming RTMP publishes into the Origin as `target.name`; reject plays (import).
@@ -111,7 +113,8 @@ pub async fn listen_export(
 pub async fn connect_import(target: ImportTarget, url: Url) -> anyhow::Result<()> {
 	let (addr, app, key) = parse_url(&url).await?;
 	let name = &target.name;
-	tracing::info!(%url, %name, "RTMP client pulling");
+	// The stream key is the ingest credential, so log the dial target and app instead.
+	tracing::info!(%addr, %app, %name, "RTMP client pulling");
 	notify_ready();
 
 	let client = Client::connect(addr, &app).await?.with_import_max_age(target.max_age);
@@ -129,11 +132,12 @@ pub async fn connect_export(
 	// Confirm the broadcast is reachable (and wait for it to be announced) before dialing;
 	// the FLV export re-resolves it (and any referenced sibling broadcast) through the origin.
 	origin
-		.announced_broadcast(&name)
+		.routed(&name)
 		.await
 		.with_context(|| format!("origin closed before broadcast `{name}` was announced"))?;
 
-	tracing::info!(%url, %name, "RTMP client pushing");
+	// The stream key is the ingest credential, so log the dial target and app instead.
+	tracing::info!(%addr, %app, %name, "RTMP client pushing");
 	notify_ready();
 
 	let client = Client::connect(addr, &app).await?.with_export_max_age(max_age);

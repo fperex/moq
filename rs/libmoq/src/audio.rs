@@ -221,9 +221,17 @@ impl Audio {
 			let frame = tokio::select! {
 				biased;
 				_ = &mut close => return Ok(()),
-				frame = consumer.read() => match frame? {
-					Some(frame) => frame,
-					None => return Ok(()),
+				frame = consumer.read() => match frame {
+					Ok(Some(frame)) => frame,
+					Ok(None) => return Ok(()),
+					// One packet the codec rejected is that packet's problem: the
+					// decoder stays usable, so drop it and keep the subscription rather
+					// than ending the caller's stream over a single bad frame.
+					Err(moq_audio::Error::Decode(err)) => {
+						tracing::warn!(%err, "dropping an audio frame");
+						continue;
+					}
+					Err(err) => return Err(err.into()),
 				},
 			};
 
@@ -309,7 +317,7 @@ pub unsafe extern "C" fn moq_encode_audio(
 			.map_err(|_| Error::UnknownFormat(codec_str.to_string()))?;
 		options.sample_rate = zeroable(raw_output.sample_rate);
 		options.channels = zeroable(raw_output.channels);
-		options.bitrate = zeroable(raw_output.bitrate);
+		options.bitrate = zeroable(raw_output.bitrate).map(|bps| moq_net::bandwidth::Rate::from_bps(bps.into()));
 		options.frame_duration = Duration::from_millis(raw_output.frame_duration_ms.into());
 
 		let mut state = State::lock();
@@ -341,11 +349,9 @@ pub unsafe extern "C" fn moq_encode_audio_frame(producer: u32, frame: *const moq
 		let frame = unsafe { frame.as_ref() }.ok_or(Error::InvalidPointer)?;
 		let data = unsafe { ffi::parse_slice(frame.data, frame.data_size)? };
 
-		let owned = moq_audio::Frame {
-			// The C ABI carries plain microseconds; scale them at the boundary.
-			timestamp: moq_net::Timestamp::from_micros(frame.timestamp_us).map_err(moq_audio::Error::from)?,
-			data: Bytes::copy_from_slice(data),
-		};
+		// The C ABI carries plain microseconds; scale them at the boundary.
+		let timestamp = moq_net::Timestamp::from_micros(frame.timestamp_us).map_err(moq_audio::Error::from)?;
+		let owned = moq_audio::Frame::new(Bytes::copy_from_slice(data), timestamp);
 
 		let producer = State::lock().audio.producer(producer)?;
 		producer.lock().as_mut().ok_or(Error::MediaNotFound)?.write(&owned)?;
@@ -380,6 +386,9 @@ pub extern "C" fn moq_encode_audio_finish(producer: u32) -> i32 {
 /// the terminal (`<= 0`) callback, `on_frame` is never called again and
 /// `user_data` is never touched again, so release `user_data` there. The
 /// terminal callback fires even after [`moq_decode_audio_close`].
+///
+/// A packet the codec cannot decode is logged and skipped rather than ending
+/// the subscription, so a single bad frame costs that frame and not the stream.
 ///
 /// # Safety
 /// - `output` must point to a valid [`moq_audio_decoder_output`].

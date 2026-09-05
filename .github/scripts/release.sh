@@ -4,7 +4,7 @@
 # Usage:
 #   release.sh parse-version <prefix>          — extract SemVer from GITHUB_REF given a tag prefix
 #   release.sh prev-tag <prefix>               — find the tag immediately before the current one
-#   release.sh create <artifacts_dir>          — create or update a GitHub release with artifacts
+#   release.sh create <artifacts_dir>          — create or update a GitHub release with artifacts + SHA256SUMS
 #   release.sh git-tag-exists <repo> <tag>     — check whether a tag exists on a remote repo
 #   release.sh read-version <pyproject.toml>   — read `version = "x.y.z"` from a manifest
 #   release.sh pypi-exists <dist> <version>    — check whether <dist>==<version> is already on PyPI
@@ -15,6 +15,9 @@
 #   GITHUB_REF        — set by GitHub Actions (e.g. refs/tags/moq-relay-v1.2.3)
 #   GITHUB_OUTPUT     — set by GitHub Actions (for writing step outputs)
 #   GH_TOKEN          — required for `create` subcommand
+#   RELEASE_CHECKSUMS — manifest filename for `create` (default SHA256SUMS). Set
+#                       it when more than one workflow publishes into the same
+#                       release, so each writes its own manifest.
 
 set -euo pipefail
 
@@ -48,7 +51,40 @@ prev_tag() {
     echo "Previous tag: ${prev:-none}"
 }
 
-# Create or update a GitHub release with artifacts.
+# Write a checksum manifest for every file in <artifacts_dir>, in
+# `sha256sum -c` format. The name comes from $RELEASE_CHECKSUMS so that
+# workflows sharing a release each own a manifest: a single shared name would
+# make the last uploader's partial manifest replace everyone else's.
+# Args: <artifacts_dir>
+write_checksums() {
+    local artifacts_dir="$1"
+    local manifest="${RELEASE_CHECKSUMS:-SHA256SUMS}"
+    local names=()
+    local path
+    for path in "$artifacts_dir"/*; do
+        if [[ -f "$path" && "$(basename "$path")" != SHA256SUMS* ]]; then
+            names+=("$(basename "$path")")
+        fi
+    done
+    if [[ ${#names[@]} -eq 0 ]]; then
+        echo "No artifacts in $artifacts_dir to checksum" >&2
+        exit 1
+    fi
+    (cd "$artifacts_dir" && sha256 "${names[@]}" >"$manifest")
+    echo "Wrote $artifacts_dir/$manifest:"
+    cat "$artifacts_dir/$manifest"
+}
+
+# sha256sum is coreutils; macOS ships shasum instead.
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$@"
+    else
+        shasum -a 256 "$@"
+    fi
+}
+
+# Create or update a GitHub release with artifacts and their SHA256SUMS.
 # Args: <artifacts_dir>
 # Reads tag/title/prev_tag from environment or step outputs.
 create_release() {
@@ -57,29 +93,30 @@ create_release() {
     local title="${RELEASE_TITLE:?RELEASE_TITLE must be set}"
     local prev_tag="${RELEASE_PREV_TAG:-}"
 
-    if gh release view "$tag" >/dev/null 2>&1; then
-        echo "Release exists, updating assets and metadata..."
-        gh release upload "$tag" "$artifacts_dir"/* --clobber
-        if [ -n "$prev_tag" ]; then
-            gh release edit "$tag" --title "$title" --notes-start-tag "$prev_tag"
-        else
-            gh release edit "$tag" --title "$title"
-        fi
-    else
+    write_checksums "$artifacts_dir"
+
+    # Several language workflows fire on the same moq-ffi-v* tag and publish
+    # into one release, so this can run concurrently with itself. Losing the
+    # create race is expected: fall back to uploading this job's assets.
+    if ! gh release view "$tag" >/dev/null 2>&1; then
         echo "Creating new release..."
+        local -a notes=(--generate-notes)
         if [ -n "$prev_tag" ]; then
-            gh release create "$tag" \
-                --title "$title" \
-                --generate-notes \
-                --notes-start-tag "$prev_tag" \
-                "$artifacts_dir"/*
-        else
-            gh release create "$tag" \
-                --title "$title" \
-                --generate-notes \
-                "$artifacts_dir"/*
+            notes+=(--notes-start-tag "$prev_tag")
         fi
+
+        if gh release create "$tag" \
+            --title "$title" \
+            "${notes[@]}" \
+            "$artifacts_dir"/*; then
+            return
+        fi
+        echo "Create failed; another job likely won the race." >&2
     fi
+
+    echo "Release exists, updating assets and metadata..."
+    gh release upload "$tag" "$artifacts_dir"/* --clobber
+    gh release edit "$tag" --title "$title"
 }
 
 # Check whether a bare-semver tag already exists on a remote repo. This is the

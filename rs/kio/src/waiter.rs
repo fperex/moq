@@ -17,7 +17,40 @@ use crate::{
 };
 
 /// Number of slots stored inline before spilling to the heap.
-const INLINE_WAITERS: usize = 32;
+///
+/// Sized for the common list, not the worst one. The array lives inside the
+/// enclosing `Arc<Mutex<State<T>>>`, so every list pays it whether or not
+/// anything ever parks, and a state cell holds three lists. At 32 that was 840 B
+/// of mostly-empty slots on every channel; downstream in moq-net a broadcast
+/// holds four to five cells and a cached group holds one, so it dominated their
+/// footprint.
+///
+/// It cannot go to zero, because `take()` moves the entries out to be woken
+/// outside the lock: a spilled list hands its heap buffer to the snapshot, which
+/// frees it, so the capacity does not survive a wake and the next registration
+/// re-allocates. Inline slots have no such cost. That makes this the count of
+/// waiters a list can hold without allocating once per wake, measured per
+/// take/wake cycle:
+///
+/// | inline | `WaiterList` | allocs/cycle at 2 / 4 / 8 waiters |
+/// |---|---|---|
+/// | 32 | 296 B | 0 / 0 / 0 |
+/// | 8 | 104 B | 0 / 0 / 0 |
+/// | 4 | 72 B | 0 / 0 / 1 |
+/// | 2 | 56 B | 0 / 1 / 2 |
+///
+/// Sizes are the layout without `smallvec/union`; a build where something else
+/// turns that on (glib, wgpu-hal) is 8 B smaller per list.
+///
+/// 4 keeps the steady state allocation-free for the small lists that dominate
+/// while giving back most of the memory. A genuinely hot fan-out list spills
+/// under any of these; it did at 32 too. `tests/waiter_allocs.rs` pins both halves
+/// of that trade, and `the_list_stays_small` pins the size.
+///
+/// One inline slot plus a `Vec` for the rest reaches the same 56 B as 2 inline
+/// slots, but allocates from the *second* waiter rather than the third, so it is
+/// strictly worse than the row it ties.
+const INLINE_WAITERS: usize = 4;
 
 /// Registrations remembered per waiter identity for O(1) dedup. A poll typically
 /// parks on a small handful of lists; a poll cycling through more than this many
@@ -176,16 +209,16 @@ impl Clone for Waiter {
 }
 
 /// Source of unique [`WaiterList`] ids, so a waiter's recorded registrations can
-/// never confuse two lists (ids are handed out once and never reused). Exhausting
-/// it would take 2^64 list creations, centuries at one per nanosecond, so wraparound
-/// is unreachable in any process lifetime.
+/// never confuse two lists (ids are handed out once and never reused). IDs are
+/// assigned lazily on first registration: most channel lists never receive a waiter,
+/// so construction need not touch this process-wide cache line. Exhausting it would
+/// take 2^64 registered lists, centuries at one per nanosecond, so wraparound is
+/// unreachable in any process lifetime.
 static NEXT_LIST_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The id of a list that opts out of record-keeping: [`WaiterList::take`] snapshots,
-/// which exist to be woken, not registered with. Never handed out by
-/// [`NEXT_LIST_ID`], so no record can ever match one, and registering into such a
-/// list just uses the scan fallback.
-const UNTRACKED: u64 = 0;
+/// A list that has not received a registration yet. Never handed out by
+/// [`NEXT_LIST_ID`].
+const UNASSIGNED: u64 = 0;
 
 /// A list of weak wakers waiting for notification.
 ///
@@ -198,6 +231,7 @@ pub struct WaiterList {
 	/// Rotating cursor for opportunistic GC on `register`.
 	cursor: usize,
 	/// Never-reused identity for this list, paired with `epoch` in waiter records.
+	/// Assigned lazily on the first registration.
 	id: u64,
 	/// Bumped on every drain. A waiter whose record carries the current epoch is
 	/// still registered: live entries only ever leave through a drain.
@@ -205,11 +239,28 @@ pub struct WaiterList {
 }
 
 impl WaiterList {
-	/// Create an empty list, allocating nothing until the first [`register`](Self::register).
+	/// Create an empty list with inline entry storage.
+	///
+	/// Registration requires no list-storage growth allocation until the inline
+	/// capacity is exceeded.
 	pub fn new() -> Self {
+		Self {
+			entries: SmallVec::new(),
+			cursor: 0,
+			id: UNASSIGNED,
+			epoch: 0,
+		}
+	}
+
+	/// Return this list's stable identity, assigning one on first registration.
+	fn id(&mut self) -> u64 {
+		if self.id != UNASSIGNED {
+			return self.id;
+		}
+
 		// A CAS loop rather than fetch_add, so exhaustion fails closed instead of
 		// wrapping into reissued ids (a reissued id could fake presence). List
-		// creation is cold, and the loop is contention-free in practice.
+		// registration is normally contention-free in practice.
 		let mut id = NEXT_LIST_ID.load(std::sync::atomic::Ordering::Relaxed);
 		loop {
 			assert_ne!(id, u64::MAX, "waiter list id space exhausted");
@@ -224,12 +275,8 @@ impl WaiterList {
 			}
 		}
 
-		Self {
-			entries: SmallVec::new(),
-			cursor: 0,
-			id,
-			epoch: 0,
-		}
+		self.id = id;
+		id
 	}
 
 	/// Register a waiter. Idempotent: a waiter already in the list stays as one entry.
@@ -248,11 +295,8 @@ impl WaiterList {
 	/// advances on each append so the probe window covers the whole list over time.
 	pub fn register(&mut self, waiter: &Waiter) {
 		let shared = waiter.shared();
-
-		let presence = match self.id {
-			UNTRACKED => Presence::Unknown,
-			id => shared.presume(id, self.epoch),
-		};
+		let id = self.id();
+		let presence = shared.presume(id, self.epoch);
 
 		match presence {
 			// Still registered since the last drain: nothing to do. This is what
@@ -299,10 +343,9 @@ impl WaiterList {
 			entries: std::mem::take(&mut self.entries),
 			cursor: 0,
 			// This runs on every notification, so the snapshot must not touch the
-			// global id counter (a shared cache line across all channels). It is
-			// untracked instead: it exists to be woken, and registering into it
-			// falls back to the scan rather than impersonating this list.
-			id: UNTRACKED,
+			// global id counter (a shared cache line across all channels). It exists
+			// to be woken and will assign its own id if it is registered with instead.
+			id: UNASSIGNED,
 			epoch: 0,
 		}
 	}
@@ -864,6 +907,24 @@ mod tests {
 		assert_sync::<crate::Shared<u32>>();
 	};
 
+	/// Three lists sit inside every kio channel's state cell, and that cell is paid
+	/// per announced broadcast and per cached group in moq-net whether or not
+	/// anything ever parks. Growing either is invisible at the call site, so bound
+	/// them: a diff that has to raise these numbers should say why.
+	///
+	/// A bound and not an equality, because `SmallVec` stores its inline array in a
+	/// union or a tagged enum depending on whether anything else in the build graph
+	/// enabled `smallvec/union` (glib and wgpu-hal both do). That moves the list
+	/// between 64 B and 72 B for reasons that have nothing to do with kio.
+	#[test]
+	#[cfg(target_pointer_width = "64")]
+	fn the_list_stays_small() {
+		let list = std::mem::size_of::<WaiterList>();
+		let state = std::mem::size_of::<crate::State<()>>();
+		assert!(list <= 72, "WaiterList grew to {list} B");
+		assert!(state <= 224, "State<()> grew to {state} B");
+	}
+
 	#[test]
 	fn park_survives_a_poll_that_returns_early() {
 		let waker = Waker::noop().clone();
@@ -988,14 +1049,14 @@ mod tests {
 		let mut list = WaiterList::new();
 		waiter.register(&mut list);
 
-		// The snapshot inherits the entries but no identity of its own, so a
-		// register against it must settle membership by scan: the entry moved with
-		// the snapshot, so this dedups rather than stacking.
+		// The snapshot inherits the entries but no identity of its own. Its first
+		// registration assigns a fresh identity, then settles the unknown membership
+		// by scan: the entry moved with the snapshot, so this dedups rather than stacking.
 		let mut taken = list.take();
 		waiter.register(&mut taken);
 		assert_eq!(taken.entries.len(), 1, "the snapshot register stacked a duplicate");
 
-		// And a second waiter still gets in; untracked means unproven, not closed.
+		// And a second waiter still gets in.
 		let other = Waiter::new(Waker::noop().clone());
 		other.register(&mut taken);
 		assert_eq!(taken.entries.len(), 2);

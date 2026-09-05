@@ -67,7 +67,7 @@ async fn dropping_the_workers_releases_the_port() {
 
 	// Serving first is the case that used to strand the threads.
 	for (server, spawner) in workers.split() {
-		spawner.run(async move {
+		spawner.run(|| async move {
 			let _ = server.listen().await;
 		});
 	}
@@ -77,6 +77,126 @@ async fn dropping_the_workers_releases_the_port() {
 	// succeeds only if every worker's socket is really gone.
 	let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 	moq_tokio::bind::udp(moq_tokio::bind::Udp::new(addr)).expect("workers left the port bound");
+}
+
+/// The future factory runs on the worker, so the future may hold local state
+/// across an await without making that state thread-safe, and spawn more of it
+/// onto the same task set.
+#[tokio::test]
+async fn spawner_runs_a_send_less_future() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(1)).expect("bind worker");
+
+	let task = {
+		let mut split = workers.split();
+		let (_server, spawner) = split.pop().expect("one worker");
+		spawner.run(|| async move {
+			let value = std::rc::Rc::new(std::cell::Cell::new(1));
+			tokio::task::yield_now().await;
+			value.set(value.get() + 1);
+
+			// A nested `!Send` task, which panics outside a local task set.
+			let shared = value.clone();
+			tokio::task::spawn_local(async move { shared.set(shared.get() + 1) })
+				.await
+				.expect("local spawn");
+
+			value.get()
+		})
+	};
+
+	assert_eq!(task.await.expect("local task"), 3);
+	workers.shutdown().await;
+}
+
+/// A factory that panics while building its future takes the task down, not the
+/// worker thread: the group keeps running and the next future still starts.
+#[tokio::test]
+async fn spawner_contains_a_factory_panic() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(1)).expect("bind worker");
+
+	let (panicked, survived) = {
+		let mut split = workers.split();
+		let (_server, spawner) = split.pop().expect("one worker");
+		let panicked = spawner.run(|| -> std::future::Pending<()> { panic!("factory") });
+		let survived = spawner.run(|| async { "still here" });
+		(panicked, survived)
+	};
+
+	assert!(panicked.await.expect_err("factory panic").is_panic());
+	assert_eq!(survived.await.expect("worker survived"), "still here");
+	workers.shutdown().await;
+}
+
+/// Aborting the returned handle stops the worker-local future, rather than
+/// detaching it to run unreachable until the group stops.
+#[tokio::test]
+async fn spawner_abort_reaches_the_worker() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(1)).expect("bind worker");
+
+	// Dropped when the future is, so it reports the cancellation from the worker.
+	let (dropped, was_dropped) = tokio::sync::oneshot::channel::<()>();
+	let (started, has_started) = tokio::sync::oneshot::channel::<()>();
+
+	let task = {
+		let mut split = workers.split();
+		let (_server, spawner) = split.pop().expect("one worker");
+		spawner.run(move || async move {
+			let _dropped = dropped;
+			let _ = started.send(());
+			std::future::pending::<()>().await;
+		})
+	};
+
+	has_started.await.expect("future started");
+	task.abort();
+
+	let waited = tokio::time::timeout(std::time::Duration::from_secs(5), was_dropped).await;
+	assert!(waited.expect("abort reached the worker").is_err());
+	workers.shutdown().await;
+}
+
+/// The same, but aborting before the factory has even reached its worker. The
+/// task is owned from the moment it is spawned, so no handoff window detaches
+/// it: a caller that aborts while the handle is still in flight cancels it.
+#[tokio::test]
+async fn spawner_abort_races_the_handoff() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut workers = Workers::bind(listen_config(&cert, &key, 0), Default::default(), config(1)).expect("bind worker");
+
+	// Dropped with the future, whether or not it was ever polled.
+	let (dropped, was_dropped) = tokio::sync::oneshot::channel::<()>();
+
+	let task = {
+		let mut split = workers.split();
+		let (_server, spawner) = split.pop().expect("one worker");
+		spawner.run(move || async move {
+			let _dropped = dropped;
+			std::future::pending::<()>().await;
+		})
+	};
+
+	// No wait: the closure may still be in the channel, or its handle buffered in
+	// the oneshot the forwarding task has yet to read.
+	task.abort();
+
+	let waited = tokio::time::timeout(std::time::Duration::from_secs(5), was_dropped).await;
+	assert!(waited.expect("abort reached the worker").is_err());
+	workers.shutdown().await;
 }
 
 /// Never splitting them has to release the port too, or a failure between bind
@@ -114,6 +234,117 @@ async fn an_ephemeral_port_is_refused() {
 		matches!(err, moq_tokio::Error::WorkerPortMismatch { .. }),
 		"unexpected error: {err}"
 	);
+}
+
+/// `SO_REUSEPORT` groups by address and UID, so a second group on a served
+/// address would silently join the first, as two relays overlapping in a rolling
+/// restart do: the old group's filter keeps steering every packet to the old
+/// process while the new one reports ready and serves nothing. The group locks
+/// its address for its lifetime, which turns the overlap back into the loud
+/// startup failure it is without workers.
+#[tokio::test]
+async fn an_occupied_port_is_refused() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let port = free_udp_port();
+
+	let workers =
+		Workers::bind(listen_config(&cert, &key, port), Default::default(), config(WORKERS)).expect("bind workers");
+
+	let err = Workers::bind(listen_config(&cert, &key, port), Default::default(), config(WORKERS))
+		.expect_err("a second group must not join the first");
+	assert!(
+		matches!(err, moq_tokio::Error::WorkerOverlap { .. }),
+		"unexpected error: {err}"
+	);
+
+	// The lock and the probe must be gone with the group: a second group takes
+	// the same address cleanly once the first shuts down.
+	workers.shutdown().await;
+	let again = Workers::bind(listen_config(&cert, &key, port), Default::default(), config(WORKERS))
+		.expect("the released address must be bindable again");
+	drop(again);
+}
+
+/// A dual-stack `[::]` group and a `0.0.0.0` group overlap on IPv4, so both
+/// spellings must share one lock: constructing them concurrently under
+/// different locks would silently strip the dual-stack group's IPv4 side. The
+/// lock has to catch this, not the probe, so the error is asserted exactly.
+#[tokio::test]
+async fn the_other_wildcard_spelling_is_refused() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let port = free_udp_port();
+
+	let mut v4 = listen_config(&cert, &key, port);
+	v4.bind = Some(format!("0.0.0.0:{port}"));
+	let workers = Workers::bind(v4, Default::default(), config(WORKERS)).expect("bind v4 wildcard workers");
+
+	let mut v6 = listen_config(&cert, &key, port);
+	v6.bind = Some(format!("[::]:{port}"));
+	let err = Workers::bind(v6, Default::default(), config(WORKERS))
+		.expect_err("the overlapping wildcard spelling must be refused");
+	assert!(
+		matches!(err, moq_tokio::Error::WorkerOverlap { .. }),
+		"unexpected error: {err}"
+	);
+
+	drop(workers);
+}
+
+/// The lock is keyed by port alone, so a group on a *different* address sharing
+/// the port is refused too. Deliberate over-exclusion: wildcard and specific
+/// addresses overlap in ways a per-address lock cannot serialize, and this
+/// failure is loud and names the port, while the failure it prevents was
+/// silent traffic loss. Asserted exactly so the lock, not the probe, catches it
+/// (the probe would let two specific addresses coexist).
+#[tokio::test]
+async fn a_shared_port_is_refused_across_addresses() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let port = free_udp_port();
+
+	let workers =
+		Workers::bind(listen_config(&cert, &key, port), Default::default(), config(WORKERS)).expect("bind workers");
+
+	// A distinct loopback address: no bind conflict with 127.0.0.1, only the
+	// shared port.
+	let mut other = listen_config(&cert, &key, port);
+	other.bind = Some(format!("127.0.0.2:{port}"));
+	let err = Workers::bind(other, Default::default(), config(WORKERS))
+		.expect_err("a second group sharing the port must be refused");
+	assert!(
+		matches!(err, moq_tokio::Error::WorkerOverlap { .. }),
+		"unexpected error: {err}"
+	);
+
+	drop(workers);
+}
+
+/// The lifetime lock only excludes groups that take it, so a reuseport member
+/// bound by something else entirely, a relay predating the lock or an unrelated
+/// same-UID process, is caught by the first member's plain-bind probe instead:
+/// a plain bind refuses a port any socket holds, reuseport or not.
+#[tokio::test]
+async fn a_foreign_reuseport_group_is_refused() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+
+	// A reuseport socket bound outside any worker group, holding no lock.
+	let foreign = moq_tokio::bind::udp(moq_tokio::bind::Udp::new("127.0.0.1:0".parse().unwrap()).with_reuse_port(true))
+		.expect("bind foreign reuseport socket");
+	let port = foreign.local_addr().expect("local addr").port();
+
+	Workers::bind(listen_config(&cert, &key, port), Default::default(), config(WORKERS))
+		.expect_err("a group must not join a foreign reuseport member");
 }
 
 /// A bind that fails midway drops the members it already spawned, and the error

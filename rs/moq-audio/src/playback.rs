@@ -1,9 +1,9 @@
 //! Play decoded PCM out a speaker, via [`cpal`] (CoreAudio / WASAPI / ALSA).
 //!
 //! The playback counterpart to `capture`, and where a
-// `capture` is deliberately not a doc link: the module is behind the
-// off-by-default `capture` feature, so a link to it fails the `-D warnings`
-// rustdoc build of a playback-only build (what `moq-cli`'s `play` enables).
+// `capture` is deliberately not a doc link: the module is behind its own
+// feature, so a link to it fails the `-D warnings` rustdoc build of a
+// playback-only build (what `moq-cli`'s `play` enables).
 //! [`decode::Consumer`](crate::decode::Consumer) ends up:
 //!
 //! ```no_run
@@ -40,7 +40,6 @@ mod mixer;
 mod sink;
 
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 
 pub use device::{Device, devices};
 pub use sink::{Control, Input, Sink};
@@ -78,20 +77,20 @@ pub struct Engine {
 /// [`Sink`]. Dropping the last one shuts the thread down and closes the device,
 /// which is why a `Sink` outliving its `Engine` still plays.
 pub(crate) struct Handle {
-	commands: Sender<driver::Command>,
+	commands: driver::Commands,
 }
 
 impl Handle {
 	/// Nudge the driver to collect retired sinks and retry anything the mixer's
 	/// command queue was too full to take.
 	pub(crate) fn wake(&self) {
-		let _ = self.commands.send(driver::Command::Sync);
+		self.commands.sync();
 	}
 }
 
 impl Drop for Handle {
 	fn drop(&mut self) {
-		let _ = self.commands.send(driver::Command::Shutdown);
+		self.commands.shutdown();
 	}
 }
 
@@ -102,7 +101,7 @@ impl Engine {
 	/// driver's problem, not the caller's: it reopens the device with backoff
 	/// and existing sinks pick up where they left off.
 	pub async fn open(config: Config) -> Result<Self, Error> {
-		let (commands, requests) = std::sync::mpsc::channel();
+		let (commands, requests) = driver::channel();
 		let (opened, ready) = tokio::sync::oneshot::channel();
 
 		let shared = Arc::new(driver::Shared::default());
@@ -118,8 +117,8 @@ impl Engine {
 			shared: shared.clone(),
 		};
 
-		// cpal streams are `!Send`, so the device has to live on the thread that
-		// opens it.
+		// Everything slow or fallible about the device happens here, off the async
+		// runtime: opening it, switching it, and rebuilding it after an error.
 		std::thread::Builder::new()
 			.name("moq-audio-playback".into())
 			.spawn(move || driver::run(requests, commands, shared, config.device, opened))
@@ -172,16 +171,11 @@ impl Engine {
 	///
 	/// Sinks survive the move: they keep the same handles and resample to the
 	/// new device's rate. Returns an error, and stays on no device, if the
-	/// requested one can't be opened.
+	/// requested one can't be opened. Also returns immediately with an error if
+	/// the driver already has its bounded maximum of switches waiting.
 	pub async fn switch(&self, config: Config) -> Result<(), Error> {
 		let (reply, response) = tokio::sync::oneshot::channel();
-		self.handle
-			.commands
-			.send(driver::Command::Switch {
-				device: config.device,
-				reply,
-			})
-			.map_err(|_| Error::Playback("the playback thread stopped".into()))?;
+		self.handle.commands.switch(config.device, reply)?;
 
 		response
 			.await

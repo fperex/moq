@@ -37,6 +37,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `publish_media` and `publish_media_stream` reject a `MoqInit` label or video hint on a container
   format, and an audio format rejects a video hint, instead of silently dropping either.
 
+## [0.3.16](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.15...moq-ffi-v0.3.16) - 2026-09-02
+
+### Added
+
+- *(moq-audio)* expose Opus DTX classification ([#3238](https://github.com/moq-dev/moq/pull/3238))
+- *(dart)* add native Flutter bindings ([#3215](https://github.com/moq-dev/moq/pull/3215))
+
+## [0.3.15](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.14...moq-ffi-v0.3.15) - 2026-09-01
+
+### Added
+
+- *(py)* add ergonomic route update iterator ([#3229](https://github.com/moq-dev/moq/pull/3229))
+
+### Fixed
+
+- *(ffi)* default optional record fields ([#3227](https://github.com/moq-dev/moq/pull/3227))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.3.14](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.13...moq-ffi-v0.3.14) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-native, moq-video, hang, moq-json, moq-audio
+
+## [0.3.13](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.12...moq-ffi-v0.3.13) - 2026-08-24
+
+### Added
+
+- *(moq-ffi)* expose raw audio track demand ([#3020](https://github.com/moq-dev/moq/pull/3020))
+- *(moq-ffi)* expose raw video track demand ([#3013](https://github.com/moq-dev/moq/pull/3013))
+- *(audio)* decode AAC-LC ([#2968](https://github.com/moq-dev/moq/pull/2968))
+
+### Fixed
+
+- *(moq-ffi)* bump uniffi to 0.32 so Python copies payloads with memmove ([#2949](https://github.com/moq-dev/moq/pull/2949))
+
+## [0.3.12](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.11...moq-ffi-v0.3.12) - 2026-08-20
+
+### Added
+
+- *(video)* give the bindings the NVIDIA codecs, and warn when Auto falls to software ([#2950](https://github.com/moq-dev/moq/pull/2950))
+- *(moq-ffi)* compile for wasm32 ([#2911](https://github.com/moq-dev/moq/pull/2911))
+- *(hang)* signal stalled video renditions ([#2865](https://github.com/moq-dev/moq/pull/2865))
+
 ## [0.3.11](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.10...moq-ffi-v0.3.11) - 2026-08-14
 
 ### Added

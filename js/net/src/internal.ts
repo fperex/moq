@@ -5,8 +5,9 @@
  *
  * @module
  */
-import type { Dispose } from "@moq/signals";
-import type { Consumer as GroupConsumer } from "./group.ts";
+import type { Dispose, Getter } from "@moq/signals";
+import type { Frame, Consumer as GroupConsumer } from "./group.ts";
+import type { Timestamp } from "./time.ts";
 import type { Producer, Request, Subscriber } from "./track.ts";
 
 /**
@@ -25,10 +26,40 @@ export type Recv =
 	/** The track aborted. */
 	| { kind: "error"; error: Error };
 
+/** A package-internal frame read the wire publisher completes once written. */
+export interface ReadGroupFrame {
+	/** Frame sequence within the group. */
+	sequence: number;
+	/** Frame returned to the publisher. */
+	frame: Frame;
+	/** Mark the frame delivered or deliberately skipped by the wire publisher. */
+	complete(): void;
+}
+
+/** The next group or datagram sequence shared by dynamic producers of one broadcast track. */
+export interface TrackSequence {
+	next: number;
+}
+
+/** Per-track sequence namespaces owned by one broadcast generation. */
+export type TrackSequences = Map<string, TrackSequence>;
+
+/** Inputs for creating a package-internal track request. */
+export interface TrackRequestOptions {
+	/** The requested track name. */
+	name: string;
+	/** The producer that will serve the request. */
+	producer: Producer;
+	/** Sequence namespaces shared by the broadcast generation. */
+	sequences: TrackSequences;
+	/** Requests not yet accepted or rejected by the publisher. */
+	pending: Set<Request>;
+}
+
 /** Hooks assigned in static blocks by the owning class. */
 export const hooks: {
 	/** Mint a track {@link Request}; assigned by `track.ts`. */
-	makeRequest: (name: string, producer: Producer) => Request;
+	makeRequest: (options: TrackRequestOptions) => Request;
 	/**
 	 * Take the next group the subscriber's cursor allows, without waiting; assigned by `track.ts`.
 	 *
@@ -38,6 +69,26 @@ export const hooks: {
 	tryRecvGroup: (subscriber: Subscriber) => Recv;
 	/** Wake once a subscriber's group cursor may read differently; assigned by `track.ts`. */
 	groupChanged: (subscriber: Subscriber, fn: () => void) => Dispose;
+	/**
+	 * Exempt a subscriber from live-delivery policy for a one-shot FETCH scan: it names one
+	 * old group explicitly, so it is neither late against the live edge nor bound by the start
+	 * a live subscription resolves to.
+	 */
+	exemptFetch: (subscriber: Subscriber) => void;
+	/** Return a group's first timestamp, retained even after its first frame is read. */
+	groupTimestamp: (group: GroupConsumer) => Timestamp | undefined;
+	groupLatest: (group: GroupConsumer) => Timestamp | undefined;
+	/** Keep applying a subscription's drift policy after it hands a group out. */
+	expireGroup: (
+		group: GroupConsumer,
+		expiry: { expired: () => boolean; changed: readonly Getter<unknown>[] },
+	) => void;
+	/** Stop an in-flight group operation if the handed-out group expires. */
+	guardGroup: <T>(group: GroupConsumer, operation: Promise<T>) => Promise<T>;
+	/** Read a frame the wire publisher completes (or skips) once written. */
+	readGroupFrame: (group: GroupConsumer, from?: number) => Promise<ReadGroupFrame | undefined>;
+	/** Make an evicted mirror terminal while its track timeline still contains it. */
+	evictGroup: (group: GroupConsumer) => void;
 } = {
 	makeRequest: () => {
 		throw new Error("track.ts not loaded");
@@ -47,5 +98,26 @@ export const hooks: {
 	},
 	groupChanged: () => {
 		throw new Error("track.ts not loaded");
+	},
+	exemptFetch: () => {
+		throw new Error("track.ts not loaded");
+	},
+	groupTimestamp: () => {
+		throw new Error("group.ts not loaded");
+	},
+	groupLatest: () => {
+		throw new Error("group.ts not loaded");
+	},
+	expireGroup: () => {
+		throw new Error("group.ts not loaded");
+	},
+	guardGroup: () => {
+		throw new Error("group.ts not loaded");
+	},
+	readGroupFrame: () => {
+		throw new Error("group.ts not loaded");
+	},
+	evictGroup: () => {
+		throw new Error("group.ts not loaded");
 	},
 };

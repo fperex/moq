@@ -1,4 +1,4 @@
-use std::task::Poll;
+use std::task::{Poll, ready};
 
 use crate::container::{Container as ContainerTrait, Frame, fmp4, legacy, loc};
 
@@ -49,6 +49,14 @@ pub(crate) fn supported(rendition: &str, container: &hang::catalog::Container) -
 impl ContainerTrait for Container {
 	type Error = crate::Error;
 
+	fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
+		match self {
+			Self::Legacy => legacy::Wire.end(frame),
+			Self::Cmaf(cmaf) => cmaf.end(frame),
+			Self::Loc => loc::Wire.end(frame),
+		}
+	}
+
 	fn write(&self, group: &mut moq_net::group::Producer, frames: &[Frame]) -> Result<(), Self::Error> {
 		match self {
 			Self::Legacy => legacy::Wire.write(group, frames),
@@ -64,7 +72,7 @@ impl ContainerTrait for Container {
 	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>> {
 		match self {
 			Self::Legacy => legacy::Wire.poll_read(group, waiter),
-			Self::Cmaf(cmaf) => cmaf.poll_read(group, waiter).map(|r| r.map_err(Into::into)),
+			Self::Cmaf(cmaf) => Poll::Ready(Ok(ready!(cmaf.poll_read(group, waiter))?)),
 			Self::Loc => loc::Wire.poll_read(group, waiter),
 		}
 	}

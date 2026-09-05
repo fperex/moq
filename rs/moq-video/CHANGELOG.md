@@ -12,6 +12,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `encode::Producer` carries a rendition's `label` into the catalog. It copied the config into hints
   field by field and had no case for the new field.
 
+## [0.0.22](https://github.com/moq-dev/moq/compare/moq-video-v0.0.21...moq-video-v0.0.22) - 2026-09-02
+
+### Fixed
+
+- *(video)* compile the PipeWire render test ([#3341](https://github.com/moq-dev/moq/pull/3341))
+
+## [0.0.21](https://github.com/moq-dev/moq/compare/moq-video-v0.0.20...moq-video-v0.0.21) - 2026-09-01
+
+### Added
+
+- *(video)* complete native screen capture ([#3244](https://github.com/moq-dev/moq/pull/3244))
+- *(video)* add packed RGBA surface exit ([#3236](https://github.com/moq-dev/moq/pull/3236))
+
+### Fixed
+
+- *(moq-video)* mark capture idle gaps ([#3214](https://github.com/moq-dev/moq/pull/3214))
+
+### Other
+
+- *(video)* exercise PipeWire DMA-BUF rendering ([#3228](https://github.com/moq-dev/moq/pull/3228))
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.0.20](https://github.com/moq-dev/moq/compare/moq-video-v0.0.19...moq-video-v0.0.20) - 2026-08-26
+
+### Added
+
+- *(moq-gst)* select media container for sink pads ([#2997](https://github.com/moq-dev/moq/pull/2997))
+
+### Fixed
+
+- *(video)* warn when Auto selects software encoding ([#3054](https://github.com/moq-dev/moq/pull/3054))
+
+## [0.0.19](https://github.com/moq-dev/moq/compare/moq-video-v0.0.18...moq-video-v0.0.19) - 2026-08-24
+
+### Added
+
+- *(moq-ffi)* expose raw video track demand ([#3013](https://github.com/moq-dev/moq/pull/3013))
+
+## [0.0.18](https://github.com/moq-dev/moq/compare/moq-video-v0.0.17...moq-video-v0.0.18) - 2026-08-20
+
+### Added
+
+- *(video)* give the bindings the NVIDIA codecs, and warn when Auto falls to software ([#2950](https://github.com/moq-dev/moq/pull/2950))
+- *(video)* render PipeWire DMA-BUF frames ([#2839](https://github.com/moq-dev/moq/pull/2839))
+
+### Fixed
+
+- *(video)* validate PipeWire chunk ranges and accept NV12 ([#2871](https://github.com/moq-dev/moq/pull/2871))
+
 ## [0.0.17](https://github.com/moq-dev/moq/compare/moq-video-v0.0.16...moq-video-v0.0.17) - 2026-08-14
 
 ### Added

@@ -50,6 +50,8 @@ pub(crate) struct Rung {
 	pub decoder: moq_video::decode::Kind,
 	/// How to resize decoded frames.
 	pub resize: moq_video::resize::Config,
+	/// Where to report that this rung is encoding.
+	pub active: crate::active::Producer,
 }
 
 impl Rung {
@@ -92,7 +94,7 @@ pub(crate) async fn serve(rung: Rung, request: moq_net::track::Request) -> Resul
 	// Grab the group-request handle before accepting: a Request is dynamic from
 	// birth, so a fetch racing the acceptance queues instead of failing.
 	let dynamic = request.dynamic();
-	let info = hang::container::track_info();
+	let info = hang::container::track_info(hang::catalog::PRIORITY.video);
 	let mut producer = request.accept(info);
 
 	let result = tokio::select! {
@@ -124,6 +126,11 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<()
 				return Ok(());
 			}
 		}
+
+		// Attach the meter here rather than at the first frame: it counts nothing
+		// until this pipeline encodes one, so a subscriber waiting on a stalled
+		// source is not billed for a session that produced nothing.
+		let active = rung.active.attach(&rung.info);
 
 		// One listener + encoder per demand session: rate control persists
 		// across groups, while every group still opens with a forced IDR.
@@ -213,14 +220,14 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<()
 							encoder.insert(opened)
 						}
 					};
-					write(output, encoder.encode(frame).await?)?;
+					write(output, &active, encoder.encode(frame).await?)?;
 				}
 				Some(Item::End) => {
 					if let Some(mut output) = current.take() {
 						// The source group is complete, so this one has to be too: a
 						// hardware encoder is still holding its last frames.
 						if let Some(encoder) = &mut encoder {
-							write(&mut output, encoder.flush().await?)?;
+							write(&mut output, &active, encoder.flush().await?)?;
 						}
 						output.finish()?;
 					}
@@ -324,20 +331,25 @@ async fn fetch(rung: Rung, request: moq_net::track::GroupRequest) -> Result<(), 
 		Ok(output) => output,
 		Err(err) => return Err(err.into()),
 	};
-	transcode_group(pipeline, &container, &mut source, output).await?;
+	// A fetch builds its own pipeline, so it is billable work even when the
+	// live path is idle. Reference counted, so overlapping the live session
+	// bills the rendition once rather than twice.
+	let active = rung.active.attach(&rung.info);
+	transcode_group(pipeline, &container, &mut source, output, &active).await?;
 	Ok(())
 }
 
 /// Transcode one fetched source group to completion into one output group,
-/// draining the encoder at the end. (The live path rides the shared feed
-/// instead; see [`live`].)
+/// draining the decoder and encoder at the end. (The live path rides the shared
+/// feed instead; see [`live`].)
 async fn transcode_group(
 	pipeline: Pipeline,
 	container: &moq_mux::catalog::hang::Container,
 	source: &mut moq_net::group::Consumer,
 	mut output: moq_net::group::Producer,
+	active: &crate::active::Guard,
 ) -> Result<(), Error> {
-	match transcode_group_inner(pipeline, container, source, &mut output).await {
+	match transcode_group_inner(pipeline, container, source, &mut output, active).await {
 		Ok(()) => {
 			output.finish()?;
 			Ok(())
@@ -354,6 +366,7 @@ async fn transcode_group_inner(
 	container: &moq_mux::catalog::hang::Container,
 	source: &mut moq_net::group::Consumer,
 	output: &mut moq_net::group::Producer,
+	active: &crate::active::Guard,
 ) -> Result<(), Error> {
 	let mut first = true;
 
@@ -371,26 +384,50 @@ async fn transcode_group_inner(
 			let keyframe = frame.keyframe || first;
 			first = false;
 
-			write(output, pipeline.process(frame.payload, timestamp, keyframe).await?)?;
+			write(
+				output,
+				active,
+				pipeline.process(frame.payload, timestamp, keyframe).await?,
+			)?;
 		}
 	}
 
-	// One-shot group: drain whatever the encoder still buffers. Each packet keeps
-	// the timestamp of the frame it was encoded from, so the tail stays in step.
-	write(output, pipeline.finish().await?)?;
+	// One-shot group: drain both codec stages. Each packet keeps the timestamp of
+	// the frame it was encoded from, so the tail stays in step.
+	write(output, active, pipeline.finish().await?)?;
 	Ok(())
 }
 
-/// Append encoded frames to the output group in the legacy hang framing.
-fn write(output: &mut moq_net::group::Producer, encoded: Vec<moq_video::encode::Encoded>) -> Result<(), Error> {
-	for encoded in encoded {
-		let frame = hang::container::Frame {
-			timestamp: encoded.timestamp,
-			payload: encoded.payload,
-		};
-		frame.write_to(output)?;
-	}
-	Ok(())
+/// Append encoded frames to the output group in the legacy hang framing, metering
+/// what reached the track.
+///
+/// The frames written before a failure are banked anyway: they are on the group
+/// and a consumer may already have read them, so dropping them from the meters
+/// would understate the bill exactly when something went wrong.
+fn write(
+	output: &mut moq_net::group::Producer,
+	active: &crate::active::Guard,
+	encoded: Vec<moq_video::encode::Encoded>,
+) -> Result<(), Error> {
+	let mut frames = 0;
+	let mut bytes = 0;
+
+	let result: Result<(), Error> = (|| {
+		for encoded in encoded {
+			let size = encoded.payload.len() as u64;
+			let frame = hang::container::Frame {
+				timestamp: encoded.timestamp,
+				payload: encoded.payload,
+			};
+			frame.write_to(output)?;
+			frames += 1;
+			bytes += size;
+		}
+		Ok(())
+	})();
+
+	active.produced(frames, bytes);
+	result
 }
 
 /// Decode -> resize -> encode for one fetched group of one rung.
@@ -449,35 +486,44 @@ impl Pipeline {
 
 		let mut encoded = Vec::new();
 		for raw in self.decoder.decode(payload, timestamp, keyframe).await? {
-			// Already at the rung size (the decoder scaled): feed the frame through
-			// as-is, keeping a GPU frame on the GPU.
-			let raw = match raw.size() == self.size {
-				true => raw,
-				false => raw.resize_with(self.size, &self.rung.resize)?,
-			};
-			if self.encoder.is_none() {
-				let mut opened = self.rung.encode(raw.surface.color()).await?;
-				if std::mem::take(&mut self.pending_keyframe) {
-					opened.keyframe();
-				}
-				self.encoder = Some(opened);
-			}
-			let encoder = self.encoder.as_mut().expect("just opened");
-			encoded.extend(encoder.encode(raw).await?);
+			encoded.extend(self.encode_frame(raw).await?);
 		}
 		Ok(encoded)
 	}
 
-	/// Drain the encoder, keeping each buffered packet's own timestamp.
-	///
-	/// Consumes the pipeline, since flushing the encoder consumes it: a one-shot
-	/// group's pipeline is done once drained.
-	async fn finish(self) -> Result<Vec<moq_video::encode::Encoded>, Error> {
-		// No encoder means no frame ever decoded, so there is nothing buffered.
-		match self.encoder {
-			Some(encoder) => encoder.finish().await.map_err(Into::into),
-			None => Ok(Vec::new()),
+	/// Resize and encode one decoded frame.
+	async fn encode_frame(&mut self, raw: moq_video::Frame) -> Result<Vec<moq_video::encode::Encoded>, Error> {
+		// Already at the rung size (the decoder scaled): feed the frame through
+		// as-is, keeping a GPU frame on the GPU.
+		let raw = match raw.size() == self.size {
+			true => raw,
+			false => raw.resize_with(self.size, &self.rung.resize)?,
+		};
+		if self.encoder.is_none() {
+			let mut opened = self.rung.encode(raw.surface.color()).await?;
+			if std::mem::take(&mut self.pending_keyframe) {
+				opened.keyframe();
+			}
+			self.encoder = Some(opened);
 		}
+		let encoder = self.encoder.as_mut().expect("just opened");
+		Ok(encoder.encode(raw).await?)
+	}
+
+	/// Drain the decoder and then the encoder, keeping every frame's timestamp.
+	///
+	/// Consumes the pipeline, since finishing the encoder consumes it: a one-shot
+	/// group's pipeline is done once both codec stages are drained.
+	async fn finish(mut self) -> Result<Vec<moq_video::encode::Encoded>, Error> {
+		let mut encoded = Vec::new();
+		for raw in self.decoder.flush().await? {
+			encoded.extend(self.encode_frame(raw).await?);
+		}
+
+		if let Some(encoder) = self.encoder {
+			encoded.extend(encoder.finish().await?);
+		}
+		Ok(encoded)
 	}
 }
 
@@ -488,7 +534,7 @@ fn decoder_resize(size: moq_video::Size, acceleration: moq_video::resize::Accele
 
 #[cfg(test)]
 mod tests {
-	use super::decoder_resize;
+	use super::*;
 	use moq_video::resize::Acceleration;
 
 	/// A fetched NVDEC group reaches `Frame::resize_with` at native size when
@@ -500,5 +546,47 @@ mod tests {
 		assert_eq!(decoder_resize(size, Acceleration::Cpu), None);
 		assert_eq!(decoder_resize(size, Acceleration::Auto), Some(size));
 		assert_eq!(decoder_resize(size, Acceleration::Gpu), Some(size));
+	}
+
+	/// A frame that reached the group is billable even when a later frame in the
+	/// same batch fails: it is on the track and a consumer may already have read
+	/// it, so the meters must not lose it with the error.
+	#[test]
+	fn write_banks_the_frames_that_reached_the_group() {
+		let rung = Resolved {
+			name: "video/120p".to_string(),
+			size: moq_video::Size::new(160, 120),
+			bitrate: moq_net::bandwidth::Rate::from_bps(100_000),
+			framerate: 30,
+		};
+
+		let active = crate::active::Producer::default();
+		active.declare(std::slice::from_ref(&rung));
+		let mut cursor = active.consume();
+		let rendition = cursor.try_next().expect("ladder").rendition;
+
+		let mut broadcast = moq_net::broadcast::Info::default().produce();
+		let mut track = broadcast
+			.create_track("video/120p", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
+		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		let guard = active.attach(&rung);
+
+		// The second frame cannot be expressed in the container's timescale, so it
+		// fails to write while the first is already on the group.
+		let good = moq_video::encode::Encoded::new(
+			Bytes::from_static(b"hello"),
+			moq_net::Timestamp::from_micros(0).unwrap(),
+		);
+		let bad = moq_video::encode::Encoded::new(
+			Bytes::from_static(b"world"),
+			moq_net::Timestamp::from_secs(1 << 60).unwrap(),
+		);
+
+		assert!(write(&mut group, &guard, vec![good, bad]).is_err());
+		assert_eq!(rendition.frames(), 1);
+		assert_eq!(rendition.bytes(), 5);
+		// One frame is still a start, so the rendition reads as encoding.
+		assert!(cursor.try_next().expect("edge").encoding);
 	}
 }

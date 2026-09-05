@@ -2,7 +2,7 @@ import { type Dispose, type Getter, Signal } from "@moq/signals";
 import type * as broadcast from "../broadcast.ts";
 import { error, reason, StreamCode, toTransport } from "../error.ts";
 import type * as group from "../group.ts";
-import type { Origin } from "../hop.ts";
+import type { Hop } from "../hop.ts";
 import { hooks } from "../internal.ts";
 import type { Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
@@ -25,11 +25,12 @@ import {
 	SubscribeUpdate,
 } from "./subscribe.ts";
 import { TrackInfo as TrackInfoMessage, type Track as TrackMessage } from "./track.ts";
-import { hasAnnounceId, hasAnnounceOk, hasDatagrams, Version } from "./version.ts";
+import { hasAnnounceId, hasAnnounceOk, hasDatagrams, hasProbeRtt, resolvesStart, Version } from "./version.ts";
 
 const PROBE_INTERVAL = 100; // ms
 const PROBE_MAX_AGE = 10_000; // ms
 const PROBE_MAX_DELTA = 0.25;
+const PROBE_RTT_DELTA = 0.25;
 
 /** Map a signed delta to an unsigned zigzag varint value (mirrors Rust `VarInt::from_zigzag`). */
 function zigzag(delta: bigint): bigint {
@@ -261,6 +262,42 @@ function waitForSubscription(controls: SubscriptionControls, subscriber: track.S
 }
 
 /**
+ * The budget to serve a peer with, given what its wire could tell us.
+ *
+ * A version without the field decodes as `0`, which is indistinguishable from a peer
+ * genuinely asking for the live edge. Serving that as real time would discard backlog
+ * a legacy subscriber never declined, so fall back to a window wide enough not to drop
+ * and leave enforcement to the receiver, as the IETF path does for the same reason.
+ */
+function servingMaxAge(version: Version, requested: number | undefined): number {
+	return carriesMaxAge(version) ? (requested ?? 0) : Number.MAX_SAFE_INTEGER;
+}
+
+/** Whether this version's SUBSCRIBE carries Subscriber Max Age at all. */
+function carriesMaxAge(version: Version): boolean {
+	return version !== Version.DRAFT_01 && version !== Version.DRAFT_02;
+}
+
+/**
+ * Position a subscription's read cursor for the wire serving it.
+ *
+ * On lite-06 there is nothing to do: the cursor is floored at the group the subscription
+ * named (or 0), and its Max Age decides what above the floor is worth delivering.
+ *
+ * Pre-06 wires are the exception: their drafts define an absent `Group Start` as the
+ * latest group, so say so explicitly rather than letting the budget reach back. Lite-03/04/05
+ * carry a Max Age, but there it is a staleness tolerance only; lite-01/02 additionally get
+ * an unbounded budget so nothing is dropped under them (see {@link servingMaxAge}), which
+ * must not read as a request to replay the whole cache on join.
+ */
+function positionCursor(track: track.Subscriber, version: Version, startGroup: number | undefined) {
+	if (resolvesStart(version) || startGroup !== undefined) return;
+
+	const latest = track.latest();
+	if (latest !== undefined) track.startAt(latest);
+}
+
+/**
  * Handles publishing broadcasts and managing their lifecycle.
  *
  * @internal
@@ -273,7 +310,7 @@ export class Publisher {
 	// can detect loops and prefer shorter paths. Created by Connection and
 	// shared with Subscriber, which can optionally use it to filter out its
 	// own announcements.
-	readonly origin: Origin;
+	readonly hop: Hop;
 
 	#quic: WebTransport;
 
@@ -290,23 +327,25 @@ export class Publisher {
 
 	// TRACK_INFO is immutable per track, so resolve it from the application once
 	// (via a throwaway subscribe whose info() resolves when the app calls accept)
-	// and reuse it for every later TRACK request of the same track. Keyed by
-	// `broadcast\0track`. A rejected lookup is evicted so a retry can re-probe.
-	#trackInfo = new Map<string, Promise<TrackInfoMessage>>();
+	// and reuse it for every later TRACK request of the same track. Keyed by the
+	// routing front rather than the path: immutability holds for one broadcast, and a
+	// republish puts a different one on the path, so its entries must not be reused.
+	// A rejected lookup is evicted so a retry can re-probe.
+	#trackInfo = new WeakMap<broadcast.Consumer, Map<string, Promise<TrackInfoMessage>>>();
 
 	/**
 	 * Creates a new Publisher instance.
 	 * @param quic - The WebTransport session to use
 	 * @param version - Negotiated protocol version
-	 * @param origin - Origin id shared with the Subscriber
+	 * @param origin - Hop id shared with the Subscriber
 	 * @param publish - The origin whose broadcasts this session serves; omit to publish nothing
 	 *
 	 * @internal
 	 */
-	constructor(quic: WebTransport, version: Version, origin: Origin, publish?: OriginConsumer) {
+	constructor(quic: WebTransport, version: Version, hop: Hop, publish?: OriginConsumer) {
 		this.#quic = quic;
 		this.version = version;
-		this.origin = origin;
+		this.hop = hop;
 		this.#broadcasts = publish?.broadcasts ?? new Signal(new Map());
 
 		// Grab the datagram writer up front when the transport carries datagrams (no group
@@ -359,16 +398,16 @@ export class Publisher {
 					for (const suffix of active.keys()) {
 						await encodeAnnounceBroadcast(
 							stream.writer,
-							{ status: "active", suffix, hops: [this.origin] },
+							{ status: "active", suffix, hops: [this.hop] },
 							this.version,
 						);
 					}
 					break;
 				}
 
-				// Report our origin id once via AnnounceOk and the count of initial announces
+				// Report our Hop ID once via AnnounceOk and the count of initial announces
 				// that follow; the subscriber stamps our origin onto each hop chain, so we omit it.
-				const ok = new AnnounceOk(this.origin, active.size);
+				const ok = new AnnounceOk(this.hop, active.size);
 				await ok.encode(stream.writer, this.version);
 				for (const suffix of active.keys()) {
 					if (hasAnnounceId(this.version)) {
@@ -424,7 +463,7 @@ export class Publisher {
 			for (const [added, front] of newActive) {
 				if (active.get(added) === front) continue;
 				console.debug(`announce: broadcast=${added} active=true`);
-				const hops = hasAnnounceOk(this.version) ? [] : [this.origin];
+				const hops = hasAnnounceOk(this.version) ? [] : [this.hop];
 				if (hasAnnounceId(this.version)) {
 					announceIds.set(added, nextAnnounceId++);
 				}
@@ -443,22 +482,20 @@ export class Publisher {
 	 * @internal
 	 */
 	async runSubscribe(msg: Subscribe, stream: Stream) {
-		const broadcast = this.#broadcasts.peek()?.get(msg.broadcast);
-		if (!broadcast) {
+		const front = this.#broadcasts.peek()?.get(msg.broadcast);
+		if (!front) {
 			console.debug(`publish unknown: broadcast=${msg.broadcast}`);
 			stream.writer.reset(new Error("not found"));
 			return;
 		}
 
-		const track = broadcast.subscribe(msg.track, {
+		const track = front.subscribe(msg.track, {
 			priority: msg.priority,
-			ordered: msg.ordered,
-			maxAge: msg.maxAge,
+			maxAge: servingMaxAge(this.version, msg.maxAge),
 			startGroup: msg.startGroup,
 			endGroup: msg.endGroup,
 		});
-		const startGroup = msg.startGroup ?? track.latest();
-		if (startGroup !== undefined) track.startAt(startGroup);
+		positionCursor(track, this.version, msg.startGroup);
 		track.endAt(msg.endGroup);
 
 		// The best-effort datagram loop, started once serving begins. It parks when the
@@ -486,7 +523,6 @@ export class Publisher {
 				// Older drafts acknowledge with SUBSCRIBE_OK and stream frames verbatim.
 				const ok = new SubscribeOk({
 					priority: msg.priority,
-					ordered: msg.ordered,
 					maxAge: msg.maxAge,
 					startGroup: msg.startGroup,
 					endGroup: msg.endGroup,
@@ -509,8 +545,7 @@ export class Publisher {
 				apply: (update) => {
 					track.update({
 						priority: update.priority,
-						ordered: update.ordered,
-						maxAge: update.maxAge,
+						maxAge: servingMaxAge(this.version, update.maxAge),
 						startGroup: update.startGroup,
 						endGroup: update.endGroup,
 					});
@@ -553,8 +588,8 @@ export class Publisher {
 			return;
 		}
 
-		const broadcast = this.#broadcasts.peek()?.get(msg.broadcast);
-		if (!broadcast) {
+		const front = this.#broadcasts.peek()?.get(msg.broadcast);
+		if (!front) {
 			console.debug(`fetch unknown: broadcast=${msg.broadcast}`);
 			stream.writer.reset(new Error("not found"));
 			return;
@@ -566,9 +601,10 @@ export class Publisher {
 
 		let group: group.Consumer | undefined;
 		try {
-			// The timescale is immutable, so serve exactly what TRACK_INFO advertised.
-			const info = await this.#resolveTrackInfo(msg.broadcast, msg.track);
-			group = await broadcast.track(msg.track).fetchGroup(msg.group, { priority: msg.priority });
+			// The timescale is immutable, so serve exactly what TRACK_INFO advertised. Both
+			// come off the same front, so the metadata and the frames are one generation.
+			const info = await this.#resolveTrackInfo(front, msg.track);
+			group = await front.fetchGroup(msg.track, msg.group, { priority: msg.priority });
 			await this.#runFetchGroup(group, stream.writer, {
 				timescale: Timescale(info.timescale),
 				start: msg.startFrame,
@@ -741,7 +777,10 @@ export class Publisher {
 	 */
 	async runTrackInfo(msg: TrackMessage, stream: Stream) {
 		try {
-			const info = await this.#resolveTrackInfo(msg.broadcast, msg.track);
+			const front = this.#broadcasts.peek()?.get(msg.broadcast);
+			if (!front) throw new Error("not found");
+
+			const info = await this.#resolveTrackInfo(front, msg.track);
 			await info.encode(stream.writer, this.version);
 			console.debug(`track info: broadcast=${msg.broadcast} track=${msg.track}`);
 			stream.close();
@@ -752,23 +791,23 @@ export class Publisher {
 	}
 
 	// Resolve (and cache) a track's immutable TRACK_INFO by asking the application.
-	// `broadcast.track(name).info()` triggers a TrackRequest the app answers with
-	// accept(TrackInfo); only the immutable properties are needed (not the groups).
-	// Cached because they're fixed for the track's lifetime. Rejects if the broadcast
-	// or track is unavailable.
-	#resolveTrackInfo(broadcast: Path.Valid, track: string): Promise<TrackInfoMessage> {
-		const key = `${broadcast}\0${track}`;
-		const cached = this.#trackInfo.get(key);
+	// `resolveTrackInfo` triggers a TrackRequest the app answers with accept(TrackInfo);
+	// only the immutable properties are needed (not the groups). Cached because they're
+	// fixed for the track's lifetime. Rejects if the track is unavailable.
+	#resolveTrackInfo(front: broadcast.Consumer, track: string): Promise<TrackInfoMessage> {
+		let tracks = this.#trackInfo.get(front);
+		if (!tracks) {
+			tracks = new Map();
+			this.#trackInfo.set(front, tracks);
+		}
+
+		const cached = tracks.get(track);
 		if (cached) return cached;
 
 		const pending = (async () => {
-			const published = this.#broadcasts.peek()?.get(broadcast);
-			if (!published) throw new Error("not found");
-
-			const info = await published.track(track).info();
+			const info = await front.resolveTrackInfo(track);
 			return new TrackInfoMessage({
 				priority: info.priority,
-				ordered: info.ordered,
 				// Publisher Max Age: the publisher's retention bound, advertised so
 				// relays re-serve with the same window.
 				maxAge: info.maxAge,
@@ -779,8 +818,8 @@ export class Publisher {
 		})();
 
 		// Don't poison the cache on failure: a later request may succeed.
-		pending.catch(() => this.#trackInfo.delete(key));
-		this.#trackInfo.set(key, pending);
+		pending.catch(() => tracks.delete(track));
+		tracks.set(track, pending);
 		return pending;
 	}
 
@@ -886,8 +925,13 @@ export class Publisher {
 				// follows it too rather than keeping a stale rank until it finishes.
 				priority.add(stream, group.sequence);
 
-				await stream.u53(0); // stream type
-				await msg.encode(stream, this.version);
+				await hooks.guardGroup(
+					group,
+					(async () => {
+						await stream.u53(0); // stream type
+						await msg.encode(stream, this.version);
+					})(),
+				);
 
 				// Lite05+ prefixes every frame with a zigzag-delta timestamp at the track's
 				// advertised timescale; older drafts omit it.
@@ -898,8 +942,8 @@ export class Publisher {
 				let reached = startFrame === 0;
 
 				for (;;) {
-					const frame = await Promise.race([group.readFrameSequence(), stream.closed]);
-					if (!frame) {
+					const read = await Promise.race([hooks.readGroupFrame(group), stream.closed]);
+					if (!read) {
 						// The group ended before the frame the subscriber asked to start
 						// at, so this publisher can't serve the range at all. FINning here
 						// would claim an empty group under that index; reset so it reads
@@ -908,21 +952,25 @@ export class Publisher {
 						break;
 					}
 
-					// Frames below the requested start were excluded, and the receiver
-					// numbers what it gets from `startFrame`.
-					if (frame.sequence < startFrame) continue;
-					if (endFrame !== undefined && frame.sequence > endFrame) break;
-					reached = true;
+					try {
+						// Frames below the requested start were excluded, and the receiver
+						// numbers what it gets from `startFrame`.
+						if (read.sequence < startFrame) continue;
+						if (endFrame !== undefined && read.sequence > endFrame) break;
+						reached = true;
 
-					if (timestamps) {
-						// Convert each frame to the track's advertised timescale.
-						const ts = BigInt(Math.round(frame.timestamp.as(timescale)));
-						await stream.u62(zigzag(ts - prevTs));
-						prevTs = ts;
+						if (timestamps) {
+							// Convert each frame to the track's advertised timescale.
+							const ts = BigInt(Math.round(read.frame.timestamp.as(timescale)));
+							await hooks.guardGroup(group, stream.u62(zigzag(ts - prevTs)));
+							prevTs = ts;
+						}
+
+						await hooks.guardGroup(group, stream.u53(read.frame.payload.byteLength));
+						await hooks.guardGroup(group, stream.write(read.frame.payload));
+					} finally {
+						read.complete();
 					}
-
-					await stream.u53(frame.payload.byteLength);
-					await stream.write(frame.payload);
 				}
 
 				stream.close();
@@ -949,7 +997,7 @@ export class Publisher {
 	async runProbe(stream: Stream) {
 		// getStats is not yet in the TypeScript WebTransport type definitions.
 		const quic = this.#quic as unknown as {
-			getStats?: () => Promise<{ estimatedSendRate: number | null }>;
+			getStats?: () => Promise<{ estimatedSendRate: number | null; smoothedRtt?: number | null }>;
 		};
 		if (!quic.getStats) {
 			// Best-effort: we can't supply bandwidth estimates, so close the
@@ -958,8 +1006,17 @@ export class Publisher {
 			return;
 		}
 
-		let lastSentBitrate: number | undefined;
+		let lastSent: Probe | undefined;
 		let lastSentTime: number | undefined;
+
+		// Whether a metric moved enough to be worth another report. Gaining or
+		// losing a value always counts; both unknown never does.
+		const moved = (prev?: number, next?: number, threshold = 0): boolean => {
+			if (prev === undefined && next === undefined) return false;
+			if (prev === undefined || next === undefined) return true;
+			if (prev === 0) return next !== 0;
+			return Math.abs(next - prev) / prev >= threshold;
+		};
 
 		try {
 			for (;;) {
@@ -969,27 +1026,48 @@ export class Publisher {
 				const result = await Promise.race([timeout, stream.reader.closed]);
 				if (result !== "timeout") break;
 
+				// The two fields are independent on the wire, each using 0 for
+				// unknown, so a transport exposing only one still has something to
+				// report. Anything this version can't carry is dropped here rather
+				// than by the encoder, so it reads as unknown to every check below.
 				const stats = await quic.getStats();
-				const bitrate = stats.estimatedSendRate;
-				if (bitrate == null) continue;
+				// `smoothedRtt` is a DOMHighResTimeStamp, i.e. a double, but the wire
+				// carries whole milliseconds and the varint encoder throws on a
+				// fractional value. Round before it ever reaches `Probe`.
+				const rtt = stats.smoothedRtt != null ? Math.round(stats.smoothedRtt) : undefined;
+				const report = new Probe({
+					bitrate: stats.estimatedSendRate ?? undefined,
+					rtt: hasProbeRtt(this.version) ? rtt : undefined,
+				});
+
+				// Nothing left to report. Say so once if it retracts a value the peer
+				// is still holding, then stay quiet rather than repeating "unknown"
+				// every time the max age comes around.
+				if (report.bitrate === undefined && report.rtt === undefined) {
+					const retracts =
+						lastSent !== undefined && (lastSent.bitrate !== undefined || lastSent.rtt !== undefined);
+					if (!retracts) continue;
+				}
 
 				let shouldSend: boolean;
-				if (lastSentBitrate === undefined || lastSentTime === undefined) {
+				if (lastSent === undefined || lastSentTime === undefined) {
 					shouldSend = true;
-				} else if (lastSentBitrate === 0) {
-					shouldSend = bitrate > 0;
 				} else {
 					const elapsed = performance.now() - lastSentTime;
+					// The bitrate threshold decays to zero as the last report ages: a
+					// stale estimate is worth refreshing for a smaller move.
 					const t = Math.max(PROBE_INTERVAL, Math.min(PROBE_MAX_AGE, elapsed));
 					const range = PROBE_MAX_AGE - PROBE_INTERVAL;
 					const threshold = (PROBE_MAX_DELTA * (PROBE_MAX_AGE - t)) / range;
-					const change = Math.abs(bitrate - lastSentBitrate) / lastSentBitrate;
-					shouldSend = change >= threshold;
+					shouldSend =
+						elapsed >= PROBE_MAX_AGE ||
+						moved(lastSent.bitrate, report.bitrate, threshold) ||
+						moved(lastSent.rtt, report.rtt, PROBE_RTT_DELTA);
 				}
 
 				if (shouldSend) {
-					await new Probe(bitrate).encode(stream.writer, this.version);
-					lastSentBitrate = bitrate;
+					await report.encode(stream.writer, this.version);
+					lastSent = report;
 					lastSentTime = performance.now();
 				}
 			}

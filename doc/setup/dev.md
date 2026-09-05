@@ -1,132 +1,66 @@
 ---
-title: Development Guide
-description: Set up the rest of the stuff.
+title: Development
+description: Build, test, and debug the MoQ repository
 ---
 
 # Development
 
-Still here? You must be a Big Buck Bunny fan.
+The repository uses [Just](https://github.com/casey/just) as its command
+runner. Run commands inside the Nix dev shell (`nix develop`) so your tools
+match CI.
 
-This guide covers the rest of the stuff you can run locally.
+| Command | Purpose |
+| --- | --- |
+| `just` | Start the local relay, test publisher, and web demo. |
+| `just --list` | List every recipe. |
+| `just fix` | Format and lint the packages this branch changed. |
+| `just check` | Compile and lint the same scope. This is what CI runs. |
+| `just test` | Run tests for the same scope. |
+| `just fix-all`, `just check-all`, `just test all` | The same, over every package. |
+| `just pub bbb <url>` | Publish Big Buck Bunny (also `tos`, `clock`, `gst`, `hls`). |
+| `just sub gst bbb <url>` | Play a broadcast through GStreamer. |
+| `just relay` | Run a local relay on its own. |
+| `just boy` | Run the [MoQ Boy](/bin/demo) demo. |
 
-## Just
-
-We use [Just](https://github.com/casey/just) to run helper commands.
-It's *just* a fancier `Makefile` so you don't have to remember all the commands.
-
-### Common Commands
-
-```bash
-# Run the demo (default)
-just
-
-# List all available commands
-just --list
-
-# This is equivalent to 3 terminal tabs:
-# just relay
-# just web
-# just pub bbb
-
-# Make sure the code you changed compiles and passes linting
-just check
-
-# Run the tests for the code you changed
-just test
-
-# Auto-fix linting errors, same scope
-just fix
-
-# Same as the above, over every package
-just check-all
-just test all
-just fix-all
-
-# Publish a HLS broadcast (CMAF) over MoQ
-just pub hls tos
-```
-
-Want more? See the [justfile](https://github.com/moq-dev/moq/blob/main/justfile) for all commands.
-
-### The Internet
-
-Most of the commands default to `http://localhost:4443`.
-That's pretty lame.
-
-If you want to do a real test of how MoQ works over the internet, you're going to need a remote server.
-Fortunately I'm hosting a small cluster on Linode for just the occasion: `https://cdn.moq.dev`
-
-::: warning
-All of these commands are unauthenticated, hence the `/anon`.
-Anything you publish is public and discoverable... so be careful and don't abuse it.
-[Setup your own relay](/setup/prod) or contact `@kixelated` for an auth token.
-:::
-
-```bash
-# Run the web server, pointing to the public relay
-# NOTE: The `bbb` demo on moq.dev uses a different path so it won't show up.
-just web serve https://cdn.moq.dev/anon
-
-# Publish Tears of Steel, watch it via https://moq.dev/watch?name=tos
-just pub tos https://cdn.moq.dev/anon
-
-# Publish a clock broadcast
-just pub clock publish https://cdn.moq.dev/anon
-
-# Subscribe to said clock broadcast (different tab)
-just pub clock subscribe https://cdn.moq.dev/anon
-
-# Publish an authentication broadcast
-just pub bbb https://cdn.moq.dev/?jwt=not_a_real_token_ask_for_one
-```
+Recipes default to the local relay at `http://localhost:4443`. Pass
+`https://cdn.moq.dev/anon` to use the public relay instead.
 
 ## Debugging
 
-### Rust
-
-You can set the logging level with the `RUST_LOG` environment variable.
-
 ```bash
-# Print the most verbose logs
-RUST_LOG=trace just
+RUST_LOG=debug just            # structured logs
+RUST_LOG=moq_net=trace just    # one crate
+RUST_BACKTRACE=1 just          # panic backtraces
 ```
 
-If you're getting a panic, use `RUST_BACKTRACE=1` to get a backtrace.
+The relay's [HTTP endpoints](/bin/relay/http) list announced broadcasts and
+fetch groups with `curl`, which is the quickest way to see what a relay holds.
 
-```bash
-# Print a backtrace on panic.
-RUST_BACKTRACE=1 just
+## Windows
+
+Nix isn't available on Windows, so `setup.bat` installs the toolchain with
+winget: Git, Rust, Bun, Node, just, CMake, and the Visual Studio Build Tools.
+Run it from an Administrator terminal on a fresh machine, and re-run it after
+reopening the terminal if it reports tools missing from `PATH`.
+
+Run `just` recipes from **Git Bash**, not PowerShell or `cmd`: they need
+`bash` and `cygpath`. Only one `just dev` can run at a time on Windows, because
+the free-port probe needs `lsof`. If a rebuild fails with "Access is denied",
+a previous relay is still running:
+
+```bat
+taskkill /IM moq-relay.exe /F
+taskkill /IM moq.exe /F
 ```
 
-## IDE Setup
+## Before opening a pull request
 
-I use [Cursor](https://www.cursor.com/), but anything works.
+```bash
+just fix
+just check
+just test
+```
 
-Recommended extensions:
-
-- [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
-- [Biome](https://marketplace.visualstudio.com/items?itemName=biomejs.biome)
-- [EditorConfig](https://marketplace.visualstudio.com/items?itemName=EditorConfig.EditorConfig)
-- [direnv](https://marketplace.visualstudio.com/items?itemName=mkhl.direnv)
-
-## Contributing
-
-Run `just fix` before pushing your changes, otherwise CI will yell at you.
-CI runs `just check` and then `just test`, so running those two locally is the easiest way to debug any issues.
-All three only touch the packages your branch changed (plus anything depending on them), measured against the branch's upstream; `just check-all`, `just test all`, and `just fix-all` cover everything.
-
-Please don't submit a vibe coded PR unless you understand it.
-`You're absolutely right!` is not always good enough.
-
-## Onwards
-
-`just` runs three processes that normally, should run on separate hosts.
-Learn how to run them [in production](/setup/prod).
-
-Or take a detour and:
-
-- Brush up on the [concepts](/concept/).
-- Discover the other [apps](/bin/).
-- `use` the [Rust crates](/lib/rs/).
-- `import` the [Typescript packages](/lib/js/).
-- or IDK, go take a shower or something while Claude parses the docs.
+See [CONTRIBUTING.md](https://github.com/moq-dev/moq/blob/main/CONTRIBUTING.md)
+for branch targeting, commit messages, and reviews, and [Agent setup](/setup/agent)
+if an AI coding agent is doing the work.

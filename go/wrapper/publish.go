@@ -80,16 +80,9 @@ func (b *BroadcastProducer) Dynamic() (*BroadcastDynamic, error) {
 	return &BroadcastDynamic{inner: inner}, nil
 }
 
-// SetRoute sets the broadcast's route: the hop chain, cost, and liveness it
-// advertises. Use it as conditions shift (e.g. a standby transcoder lowering
-// its cost once warm); consumers observe the change via RouteUpdates.
-func (b *BroadcastProducer) SetRoute(route Route) error {
-	return b.inner.SetRoute(route)
-}
-
-// SetAnnounce sets whether the broadcast is announced, keeping the rest of its route.
+// SetAnnounce sets whether the broadcast's exact path is announced as a route.
 //
-// The origin announces the path only while the broadcast is announced; a unannounced
+// The origin announces the path only while the broadcast is announced; an unannounced
 // broadcast stays reachable by exact path for subscribes and fetches. This is
 // how a publisher goes on and off the air without tearing down the broadcast.
 func (b *BroadcastProducer) SetAnnounce(live bool) error {
@@ -189,10 +182,9 @@ func (b *BroadcastProducer) EncodeAudio(name string, input AudioEncoderInput, ou
 // EncodeVideo publishes a raw-video track with an in-process H.264/H.265
 // encoder.
 //
-// The track is named after the codec (.avc3 / .hev1) and its catalog rendition
-// is published immediately, read out of the encoder itself, so subscribers
-// discover it through the catalog rather than a name you pick, and can find it
-// before the first frame exists.
+// Set output.Track to choose the track name; otherwise one is derived from the
+// codec (.avc3 / .hev1). The catalog rendition is published immediately so
+// subscribers can discover it before the first frame exists.
 func (b *BroadcastProducer) EncodeVideo(input VideoEncoderInput, output VideoEncoderOutput) (*VideoProducer, error) {
 	inner, err := b.inner.EncodeVideo(input, output)
 	if err != nil {
@@ -247,7 +239,7 @@ type BroadcastDynamic struct {
 
 // RequestedTrack waits for the next subscriber-requested track.
 func (d *BroadcastDynamic) RequestedTrack(ctx context.Context) (*TrackRequest, error) {
-	inner, err := runCancellable(ctx, d.inner.Cancel, d.inner.RequestedTrack)
+	inner, err := runHandle(ctx, d.inner.Cancel, d.inner.RequestedTrack)
 	if err != nil {
 		return nil, err
 	}
@@ -307,17 +299,14 @@ func (m *MediaProducer) Name() (string, error) {
 	return m.inner.Name()
 }
 
-// Used blocks until the track has at least one active subscriber. There is no
-// underlying cancel, so a cancelled ctx returns ctx.Err() while the wait
-// unwinds when the track is finished or dropped.
+// Used blocks until the track has at least one active subscriber.
 func (m *MediaProducer) Used(ctx context.Context) error {
-	return runErr(ctx, nil, m.inner.Used)
+	return runOperationErr(ctx, func(cancel *ffi.MoqCancel) error { return m.inner.Used(&cancel) })
 }
 
-// Unused blocks until the track has no active subscribers. See Used regarding
-// cancellation.
+// Unused blocks until the track has no active subscribers.
 func (m *MediaProducer) Unused(ctx context.Context) error {
-	return runErr(ctx, nil, m.inner.Unused)
+	return runOperationErr(ctx, func(cancel *ffi.MoqCancel) error { return m.inner.Unused(&cancel) })
 }
 
 // WriteFrame appends frame to the media track. The importer derives keyframe status from
@@ -422,16 +411,14 @@ func (t *TrackProducer) Name() (string, error) {
 	return t.inner.Name()
 }
 
-// Used blocks until the track has at least one active subscriber. See
-// MediaProducer.Used regarding cancellation.
+// Used blocks until the track has at least one active subscriber.
 func (t *TrackProducer) Used(ctx context.Context) error {
-	return runErr(ctx, nil, t.inner.Used)
+	return runOperationErr(ctx, func(cancel *ffi.MoqCancel) error { return t.inner.Used(&cancel) })
 }
 
-// Unused blocks until the track has no active subscribers. See
-// MediaProducer.Used regarding cancellation.
+// Unused blocks until the track has no active subscribers.
 func (t *TrackProducer) Unused(ctx context.Context) error {
-	return runErr(ctx, nil, t.inner.Unused)
+	return runOperationErr(ctx, func(cancel *ffi.MoqCancel) error { return t.inner.Unused(&cancel) })
 }
 
 // Dynamic serves fetches for groups that are not currently cached.
@@ -478,7 +465,7 @@ func (t *TrackProducer) Abort(errorCode uint16) error {
 }
 
 // Consume reads directly from this producer's track. subscription tunes delivery
-// (delivery priority, group ordering priority, group range); pass nil for defaults.
+// (delivery priority, group range); pass nil for defaults.
 func (t *TrackProducer) Consume(subscription *Subscription) (*TrackConsumer, error) {
 	inner, err := t.inner.Consume(subscription)
 	if err != nil {
@@ -539,7 +526,7 @@ type TrackDynamic struct {
 
 // RequestedGroup waits for the next uncached group request.
 func (d *TrackDynamic) RequestedGroup(ctx context.Context) (*GroupRequest, error) {
-	inner, err := runCancellable(ctx, d.inner.Cancel, d.inner.RequestedGroup)
+	inner, err := runHandle(ctx, d.inner.Cancel, d.inner.RequestedGroup)
 	if err != nil {
 		return nil, err
 	}
@@ -590,6 +577,26 @@ type AudioProducer struct {
 	inner *ffi.MoqAudioProducer
 }
 
+// Name returns the audio track's name.
+func (a *AudioProducer) Name() (string, error) {
+	return a.inner.Name()
+}
+
+// Used blocks until the audio track has at least one active subscriber.
+func (a *AudioProducer) Used(ctx context.Context) error {
+	return runOperationErr(ctx, func(cancel *ffi.MoqCancel) error { return a.inner.Used(&cancel) })
+}
+
+// Unused blocks until the audio track has no active subscribers.
+func (a *AudioProducer) Unused(ctx context.Context) error {
+	return runOperationErr(ctx, func(cancel *ffi.MoqCancel) error { return a.inner.Unused(&cancel) })
+}
+
+// ResetEpoch re-anchors the timeline to the next frame after an idle gap.
+func (a *AudioProducer) ResetEpoch() error {
+	return a.inner.ResetEpoch()
+}
+
 // Write pushes one frame of PCM in the configured input format.
 func (a *AudioProducer) Write(frame AudioFrame) error {
 	return a.inner.Write(frame)
@@ -604,6 +611,21 @@ func (a *AudioProducer) Finish() error {
 // the way out.
 type VideoProducer struct {
 	inner *ffi.MoqVideoProducer
+}
+
+// Name returns the video track's name.
+func (v *VideoProducer) Name() (string, error) {
+	return v.inner.Name()
+}
+
+// Used blocks until the video track has at least one active subscriber.
+func (v *VideoProducer) Used(ctx context.Context) error {
+	return runOperationErr(ctx, func(cancel *ffi.MoqCancel) error { return v.inner.Used(&cancel) })
+}
+
+// Unused blocks until the video track has no active subscribers.
+func (v *VideoProducer) Unused(ctx context.Context) error {
+	return runOperationErr(ctx, func(cancel *ffi.MoqCancel) error { return v.inner.Unused(&cancel) })
 }
 
 // Write encodes and publishes one frame in the configured input format. A

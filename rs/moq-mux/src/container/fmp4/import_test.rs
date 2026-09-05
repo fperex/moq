@@ -87,6 +87,29 @@ fn test_bbb_catalog() {
 	assert!(matches!(audio.container, Container::Cmaf { .. }));
 }
 
+/// fMP4 is passthrough: it republishes the fragments its source already produced, so it exposes no
+/// container selection (unlike the demuxers, which decode to elementary payloads) and every
+/// rendition it publishes carries the CMAF init it parsed.
+#[test]
+fn every_rendition_is_cmaf() {
+	let data = include_bytes!("test_data/bbb.mp4");
+	let mut cursor = std::io::Cursor::new(data.as_slice());
+	mp4_atom::Ftyp::decode(&mut cursor).unwrap();
+	mp4_atom::Moov::decode(&mut cursor).unwrap();
+	let init = &data[..cursor.position() as usize];
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut import = super::Import::new(broadcast, catalog.reserve());
+	import.decode(init).unwrap();
+	import.finish().unwrap();
+
+	let snapshot = catalog.snapshot();
+	let video = snapshot.video.renditions.values().next().expect("a video rendition");
+	assert!(matches!(video.container, Container::Cmaf { .. }));
+	let audio = snapshot.audio.renditions.values().next().expect("an audio rendition");
+	assert!(matches!(audio.container, Container::Cmaf { .. }));
+}
+
 #[test]
 fn aac_without_decoder_specific_info_is_rejected() {
 	let data = include_bytes!("test_data/bbb.mp4");
@@ -431,11 +454,14 @@ async fn import_populates_the_broadcast_timeline() {
 	catalog.finish().unwrap();
 
 	// The first record indexes both renditions from their first group (sequence 0).
-	let first = timeline
+	let event = timeline
 		.next()
 		.await
 		.unwrap()
 		.expect("a segment should be recorded in the timeline");
+	let crate::timeline::Event::Push { entry: first, .. } = event else {
+		panic!("the first timeline event was not a segment");
+	};
 	assert_eq!(first.segment, 0);
 	let video_ranges = first.tracks.get(&video_name).expect("video is indexed");
 	assert_eq!(video_ranges[0].start, 0, "the first video group is sequence 0");
@@ -726,8 +752,10 @@ async fn segmented_source_indexes_one_group_range_per_track() {
 	catalog.finish().unwrap();
 
 	let mut records = Vec::new();
-	while let Some(record) = timeline.next().await.unwrap() {
-		records.push(record);
+	while let Some(event) = timeline.next().await.unwrap() {
+		if let crate::timeline::Event::Push { entry, .. } = event {
+			records.push(entry);
+		}
 	}
 	assert_eq!(records.len(), 3, "one record per declared segment");
 
@@ -808,11 +836,13 @@ async fn segment_ranges_with_skew(
 	catalog.finish().unwrap();
 
 	let mut out = Vec::new();
-	while let Some(record) = timeline.next().await.unwrap() {
-		out.push((
-			record.tracks.get(&video_name).cloned().unwrap_or_default(),
-			record.tracks.get(&audio_name).cloned().unwrap_or_default(),
-		));
+	while let Some(event) = timeline.next().await.unwrap() {
+		if let crate::timeline::Event::Push { entry, .. } = event {
+			out.push((
+				entry.tracks.get(&video_name).cloned().unwrap_or_default(),
+				entry.tracks.get(&audio_name).cloned().unwrap_or_default(),
+			));
+		}
 	}
 	out
 }

@@ -1,74 +1,67 @@
 ---
 title: Production Deployment
-description: Deploying moq-relay to production
+description: Run moq-relay publicly with TLS, authentication, and host tuning
 ---
 
 # Production Deployment
 
-Here's a guide on how to get moq-relay running in production.
+A public relay needs a reachable UDP port, a trusted certificate, and an
+explicit access policy. Start from the local config and change these:
 
-## Overview
+1. Give the relay a stable hostname and forward its UDP port (QUIC and WebTransport). Forward TCP too if you enable HTTPS or the WebSocket fallback.
+2. Install a publicly trusted certificate. Generated certificates and disabled verification are for development.
+3. Configure [authentication](/bin/relay/auth). Leave nothing anonymous unless you mean to.
+4. Keep the operational endpoints (`/metrics`, `/nodes`) on the `[internal]` listener, bound to loopback or a private network.
+5. Raise Linux UDP socket buffers (below).
 
-[moq-relay](/bin/relay/) is the core of the MoQ stack.
-It's responsible for routing live tracks (payload agnostic) from 1 client to N clients.
-The relay accepts WebTransport connections from clients, but it can also connect to other relays to fetch upstream.
-Think of the relay as a HTTP web server like [Nginx](https://nginx.org/), but for live content.
+```toml
+[listen]
+bind = "[::]:443"
 
-There are multiple companies working on MoQ CDNs (like [Cloudflare](https://moq.dev/blog/first-cdn)) so eventually it won't be necessary to self-host.
-However, you do unlock some powerful features by self-hosting, such as running relays within your internal network.
+[listen.tls]
+cert = "/etc/letsencrypt/live/relay.example.com/fullchain.pem"
+key = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
 
-## QUIC Requirements
+# HTTPS and WebSocket fallback on TCP. The same certificate works.
+[web.https]
+listen = "[::]:443"
+cert = "/etc/letsencrypt/live/relay.example.com/fullchain.pem"
+key = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
 
-Before we get carried away, we need to cover the QUIC requirements:
+[auth]
+key = "/etc/moq/public.jwk"
 
-1. QUIC is a client-server protocol, so you **MUST** have a server with a static IP address.
-2. QUIC requires TLS, so you **MUST** have a TLS certificate, even if it's self-signed.
-3. QUIC uses UDP, so you **MUST** configure your firewall to allow UDP traffic.
-4. QUIC load balancers don't exist yet, so you **MUST** design your own load balancer.
-
-These make it a bit more difficult to deploy, but don't worry we have you covered.
-
-## Self-Hosting
-
-MoQ should work just fine inside your own network or infrastructure provided you understand the QUIC requirements.
-
-You need at least one server with some way to discover its IP address.
-DNS is the easiest way to do this, but some other way of getting an IP address should also work.
-QUIC also has really awesome anycast support but that's a bit more advanced; reach out if you're interested.
-
-TLS is where most people get stuck.
-[See my blog post](https://moq.dev/blog/tls-and-quic) for more details, but here's the important bits:
-
-- QUIC uses the same TLS certificate as HTTPS.
-- However, TLS load balancers currently don't support QUIC, so you need to provision your own TLS certificates.
-- You can disable TLS verification if you don't care about MITM attacks, but only for native clients.
-- Web browsers can support self-signed certificates via [fingerprint verification](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport/WebTransport#servercertificatehashes), but it's limited to ephemeral certificates (<2 weeks).
-
-And of course, make sure UDP is allowed on your firewall.
-The default WebTransport port is UDP/443 but anything will work if you put it in the URL.
-
-## Tuning
-
-A relay multiplexes every connection over a single UDP socket, so a burst that doesn't fit in the kernel's socket buffer is dropped before the relay ever sees it, and QUIC congestion control reads those drops as congestion.
-
-`moq-relay` and `moq-cli` request an 8 MiB socket buffer in each direction, but Linux silently clamps the request to `net.core.rmem_max` and `net.core.wmem_max`, which default to 208 KiB.
-You'll get a warning on startup when that happens:
-
-```text
-WARN moq_native::bind: UDP receive buffer is smaller than requested; raise `net.core.rmem_max` or expect packet loss under load wanted=8388608 granted=212992
+[internal]
+listen = "127.0.0.1:9101"
 ```
 
-Raise both limits, persisting them across reboots:
+Certificate files are watched and reloaded for new connections. See the
+[configuration reference](/bin/relay/config) for every section.
+
+## Socket buffers
+
+The relay asks for 8 MiB UDP buffers and logs a warning when the kernel clamps
+them. On Linux, raise the limits and persist them:
 
 ```bash
 printf 'net.core.rmem_max = 8388608\nnet.core.wmem_max = 8388608\n' | sudo tee /etc/sysctl.d/60-moq.conf
 sudo sysctl --system
 ```
 
-macOS caps both directions with `kern.ipc.maxsockbuf` instead, and Windows sizes each socket on its own so there's nothing to raise.
+macOS uses `kern.ipc.maxsockbuf`; Windows sizes each socket directly.
 
-## Next Steps
+## Scaling out
 
-- Set up [Authentication](/bin/relay/auth)
-- Configure [Clustering](/bin/relay/cluster)
-- Learn about [Concepts](/concept/)
+Connect relays into a [cluster](/bin/relay/cluster) to serve multiple regions
+or add redundancy. Clustering routes broadcasts between relays; how clients
+pick an entry relay (DNS, anycast, a load balancer) is up to you. `/health`
+is the liveness probe.
+
+If you would rather not run infrastructure, [moq.pro](https://moq.pro) hosts
+relays behind an API.
+
+## Verify
+
+- Connect with [moq-cli](/bin/cli) from outside the network and publish with a test token.
+- Watch it with the [web player](/lib/js/watch) or `moq play`.
+- Check [`/health` and `/metrics`](/bin/relay/http), and confirm the startup log shows the expected listeners, certificate, and buffer sizes.

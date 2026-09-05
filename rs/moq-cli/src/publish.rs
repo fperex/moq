@@ -1,3 +1,4 @@
+use anyhow::Context;
 use hang::moq_net;
 use moq_mux::container::{flv, fmp4, ts};
 
@@ -14,9 +15,9 @@ pub enum PublishFormat {
 	Flv,
 }
 
-/// `clap` adapter for [`moq_video::encode::Codec`].
+/// Command-line adapter for [`moq_video::encode::Codec`].
 #[cfg(feature = "capture")]
-#[derive(clap::ValueEnum, Clone, Copy, Default)]
+#[derive(usage::ValueEnum, Clone, Copy, Default)]
 pub enum VideoCodec {
 	/// H.264 / AVC (the default; widest support).
 	#[default]
@@ -44,88 +45,113 @@ impl From<VideoCodec> for moq_video::encode::Codec {
 /// the default camera and microphone. Run `moq devices` to list the ids each one
 /// takes.
 #[cfg(feature = "capture")]
-#[derive(clap::Args, Clone)]
-#[command(group = clap::ArgGroup::new("video-source").multiple(false))]
-#[command(group = clap::ArgGroup::new("audio-source").multiple(false))]
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[usage(group("video-source"))]
+#[usage(group("audio-source"))]
 pub struct CaptureArgs {
 	/// Capture a camera, by the id `moq devices` reports (an AVFoundation
 	/// `uniqueID`, `/dev/videoN` path, or Media Foundation symbolic link).
 	/// Bare `--camera`, or no source flag at all, opens the default camera.
-	#[arg(long, num_args = 0..=1, group = "video-source")]
+	#[usage(long, group = "video-source")]
 	pub camera: Option<Option<String>>,
 
 	/// Capture a whole display, by the id `moq devices` reports. Bare
-	/// `--display` captures the main display. On Linux the desktop portal opens a
-	/// picker dialog and the id is ignored.
-	#[arg(long, num_args = 0..=1, group = "video-source", alias = "screen")]
+	/// `--display` captures the main display. On Wayland the desktop portal opens
+	/// a picker dialog; X11 accepts the listed monitor id.
+	#[usage(long, group = "video-source", alias = "screen")]
 	pub display: Option<Option<String>>,
 
-	/// Capture a single window, by the id `moq devices` reports. macOS only.
-	#[arg(long, group = "video-source")]
+	/// Capture a single window, by the id `moq devices` reports. Supported on
+	/// macOS, Windows, and X11.
+	#[usage(long, group = "video-source")]
 	pub window: Option<String>,
 
 	/// Capture every window of an application, by the bundle id `moq devices`
 	/// reports. Windows opened later are included. macOS only.
-	#[arg(long, group = "video-source")]
+	#[usage(long, group = "video-source")]
 	pub app: Option<String>,
 
 	/// Hide the mouse cursor. Display/window/app capture only.
-	#[arg(long)]
+	#[usage(long)]
 	pub no_cursor: bool,
 
 	/// Requested capture width. The source snaps to its nearest supported mode.
-	#[arg(long)]
+	#[usage(long)]
 	pub width: Option<u32>,
 
 	/// Requested capture height.
-	#[arg(long)]
+	#[usage(long)]
 	pub height: Option<u32>,
 
 	/// Capture/encode framerate. Omit to use the source's reported rate.
-	#[arg(long)]
+	#[usage(long)]
 	pub fps: Option<u32>,
 
 	/// Maximum video bitrate in bits per second. Omit to derive one from the resolution.
 	///
 	/// When publishing to a relay, the encoder backs off below this while the uplink is
 	/// congested and climbs back afterwards; it never encodes above it.
-	#[arg(long)]
+	#[usage(long)]
 	pub bitrate: Option<u64>,
 
 	/// Video codec to encode. H.265 is hardware-only (VideoToolbox on macOS).
-	#[arg(long, value_enum, default_value_t)]
+	#[usage(long, value_enum, default = "h264")]
 	pub codec: VideoCodec,
 
 	/// Force a hardware encoder (error if none is available).
-	#[arg(long, conflicts_with = "software")]
+	#[usage(long, conflicts = "--software")]
 	pub hardware: bool,
 
 	/// Force the software encoder (openh264).
-	#[arg(long)]
+	#[usage(long)]
 	pub software: bool,
 
 	/// Capture a microphone, by the id `moq devices` reports. Bare
 	/// `--microphone`, or no audio source flag, opens the default input.
-	#[arg(long, num_args = 0..=1, group = "audio-source")]
+	#[usage(long, group = "audio-source")]
 	pub microphone: Option<Option<String>>,
 
 	/// Capture the system (desktop) audio instead of a microphone: everything the
 	/// machine is playing, minus this process. macOS only, and it needs the Screen
 	/// Recording permission.
-	#[arg(long, group = "audio-source")]
+	#[usage(long, group = "audio-source")]
 	pub system_audio: bool,
 
 	/// Target audio bitrate in bits per second (Opus). Omit for the codec default.
-	#[arg(long)]
+	#[usage(long)]
 	pub audio_bitrate: Option<u32>,
 
 	/// Capture audio only (no camera).
-	#[arg(long, conflicts_with = "no_audio", conflicts_with = "video-source")]
+	#[usage(long, conflicts("--no-audio", "--camera", "--display", "--window", "--app"))]
 	pub no_video: bool,
 
 	/// Capture video only (no microphone).
-	#[arg(long, conflicts_with = "audio-source")]
+	#[usage(long, conflicts("--microphone", "--system-audio"))]
 	pub no_audio: bool,
+}
+
+/// Report the streams whose frame-sync counters moved since `previous`, one line each.
+///
+/// The importer already warns on each individual resync; this is the running total, which is
+/// what an operator turns into a rate.
+fn log_stats(latest: Option<&ts::Stats>, previous: Option<&ts::Stats>) {
+	let Some(latest) = latest else {
+		return;
+	};
+	for (pid, stream) in &latest.streams {
+		if previous.and_then(|previous| previous.streams.get(pid)) == Some(stream) {
+			continue;
+		}
+		tracing::info!(
+			pid = *pid,
+			track = stream.track,
+			resyncs = stream.resyncs,
+			discarded = stream.discarded,
+			unconfirmed = stream.unconfirmed,
+			"audio frame sync lost"
+		);
+	}
 }
 
 enum PublishDecoder {
@@ -155,6 +181,15 @@ impl PublishDecoder {
 			Self::Flv(d) => d.decode(chunk)?,
 		}
 		Ok(())
+	}
+
+	/// Audio frame sync the decoder has lost so far, for the formats that scan for it.
+	/// `None` where the container frames audio explicitly and so can't lose sync.
+	fn stats(&self) -> Option<ts::Stats> {
+		match self {
+			Self::Ts(d) => Some(d.stats()),
+			Self::Avc3 { .. } | Self::Fmp4(_) | Self::Flv(_) => None,
+		}
 	}
 
 	/// Flush any buffered trailing frame and close the tracks at end of input.
@@ -216,7 +251,9 @@ pub struct Publish {
 
 impl Publish {
 	/// Build a publisher decoding the given container format from stdin into
-	/// `broadcast` (typically created on the origin that announces it).
+	/// `broadcast`. Announce the broadcast afterwards: this constructor creates
+	/// the catalog tracks, so announcing after it lands the advertisement with
+	/// the tracks already in place.
 	pub fn new(
 		mut broadcast: moq_net::broadcast::Producer,
 		format: &PublishFormat,
@@ -241,7 +278,7 @@ impl Publish {
 		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
 		let source = match format {
 			PublishFormat::Avc3 => {
-				let track = broadcast.unique_track(".avc3", catalog.track_info())?;
+				let track = broadcast.unique_track(".avc3", catalog.track_info(hang::catalog::PRIORITY.video))?;
 				let import = moq_mux::codec::h264::Import::new(track, catalog.reserve(), Default::default())?;
 				let split = Box::new(moq_mux::codec::h264::Split::new());
 				Source::Stream(PublishDecoder::Avc3 {
@@ -266,21 +303,24 @@ impl Publish {
 	/// Build a publisher capturing local devices (camera/screen and microphone).
 	///
 	/// `bandwidth` is the uplink's send estimate, when there is one: the video
-	/// encoder follows it down while the link is congested rather than
+	/// encoder follows its share down while the link is congested rather than
 	/// overshooting a pipe that can't carry it. Pass `None` to encode at the
 	/// configured bitrate regardless.
+	///
+	/// Audio and video share one allocator, so the video encoder targets what's
+	/// left after audio's reservation rather than the whole uplink.
 	#[cfg(feature = "capture")]
 	pub fn capture(
 		mut broadcast: moq_net::broadcast::Producer,
 		args: &CaptureArgs,
-		bandwidth: Option<moq_net::bandwidth::Consumer>,
+		bandwidth: moq_net::bandwidth::Allocator,
 		max_age: Option<std::time::Duration>,
 	) -> anyhow::Result<Self> {
 		let config = moq_mux::catalog::Config::default().with_max_age(max_age);
 		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
 
-		let video = (!args.no_video).then(|| (args.video_config(), args.video_encode(bandwidth)));
-		let audio = (!args.no_audio).then(|| (args.audio_config(), args.audio_encode()));
+		let video = (!args.no_video).then(|| (args.video_config(), args.video_encode(bandwidth.clone())));
+		let audio = (!args.no_audio).then(|| (args.audio_config(), args.audio_encode(bandwidth)));
 		anyhow::ensure!(video.is_some() || audio.is_some(), "nothing to capture");
 
 		Ok(Self {
@@ -289,12 +329,24 @@ impl Publish {
 		})
 	}
 
+	/// Advertise the broadcast's path, now that the catalog tracks are in place.
+	pub fn announce(&self) -> anyhow::Result<()> {
+		self.broadcast
+			.announce(Default::default())
+			.context("failed to announce broadcast")
+	}
+
 	/// Drive the source until stdin EOF (or the capture devices stop).
 	pub async fn run(self) -> anyhow::Result<()> {
 		match self.source {
 			Source::Stream(mut decoder) => {
 				let mut stdin = tokio::io::stdin();
 				let mut buffer = bytes::BytesMut::new();
+
+				// Damage reported so far, so only the change is logged. A live feed is
+				// diagnosed by the rate at which these climb, and stdin may never end, so
+				// they have to surface as they accumulate rather than at exit.
+				let mut reported = decoder.stats();
 
 				// Run the read/decode loop so an error surfaces here rather than
 				// dropping the decoder (and its tracks) with a bare Error::Dropped.
@@ -306,6 +358,12 @@ impl Publish {
 							return Ok(()); // EOF
 						}
 						decoder.decode_chunk(&buffer)?;
+
+						let latest = decoder.stats();
+						if latest != reported {
+							log_stats(latest.as_ref(), reported.as_ref());
+							reported = latest;
+						}
 					}
 				}
 				.await;
@@ -314,6 +372,9 @@ impl Publish {
 				// itself) abort with the real cause so subscribers see it instead of
 				// a bare Error::Dropped.
 				let outcome = result.and_then(|()| decoder.finish());
+				// The drain at end of input can publish a frame nothing vouched for, so the
+				// final snapshot is only complete after `finish`.
+				log_stats(decoder.stats().as_ref(), reported.as_ref());
 				if let Err(err) = &outcome {
 					decoder.abort(moq_net::Error::Transport(err.to_string()));
 				}
@@ -325,8 +386,9 @@ impl Publish {
 				// broadcast + catalog. A single shared clock keeps the audio and
 				// video timelines aligned even though the devices open at
 				// different times. Video encodes on demand (camera opens only
-				// while subscribed); audio (cpal) is blocking, so it runs on a
-				// dedicated thread.
+				// while subscribed). Both run on this task rather than a spawn:
+				// on macOS the audio future holds ObjC handles across an await,
+				// so it is `!Send`.
 				let clock = moq_mux::Clock::new();
 				let video_fut = {
 					let broadcast = self.broadcast.clone();
@@ -392,9 +454,9 @@ impl CaptureArgs {
 		config
 	}
 
-	fn video_encode(&self, bandwidth: Option<moq_net::bandwidth::Consumer>) -> moq_video::encode::Options {
+	fn video_encode(&self, bandwidth: moq_net::bandwidth::Allocator) -> moq_video::encode::Options {
 		let mut options = moq_video::encode::Options::default();
-		options.bitrate = self.bitrate;
+		options.bitrate = self.bitrate.map(moq_net::bandwidth::Rate::from_bps);
 		options.codec = self.codec.into();
 		options.kind = if self.software {
 			moq_video::encode::Kind::Software
@@ -428,9 +490,12 @@ impl CaptureArgs {
 	/// The audio counterpart to [`video_encode`](Self::video_encode). `track` is
 	/// left unset so the name derives from the codec, the way the video side
 	/// names its track; consumers find it through the catalog either way.
-	fn audio_encode(&self) -> moq_audio::encode::Options {
+	fn audio_encode(&self, bandwidth: moq_net::bandwidth::Allocator) -> moq_audio::encode::Options {
 		let mut options = moq_audio::encode::Options::default();
-		options.bitrate = self.audio_bitrate;
+		options.bitrate = self
+			.audio_bitrate
+			.map(|bps| moq_net::bandwidth::Rate::from_bps(bps.into()));
+		options.bandwidth = bandwidth;
 		options
 	}
 }
@@ -495,17 +560,16 @@ mod tests {
 
 	async fn manufacture_input() -> Vec<u8> {
 		// Create the broadcast on a throwaway origin so the exporter can resolve it by path.
-		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
-		let mut broadcast = origin
-			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
-			.unwrap();
+		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+		let mut broadcast = origin.create_broadcast("cli").unwrap();
+		broadcast.announce(Default::default()).unwrap();
 		settle().await;
 		let mut catalog =
 			moq_mux::catalog::Producer::with_catalog(&mut broadcast, Catalog::<tscat::Ext>::default()).unwrap();
 
 		// Section-framed verbatim stream (SCTE-35, stream_type 0x86).
 		let section = broadcast
-			.unique_track(".scte35", hang::container::track_info())
+			.unique_track(".scte35", hang::container::track_info(hang::catalog::PRIORITY.text))
 			.unwrap();
 		let mut section_track = tscat::Track::new(SECTION_PID);
 		section_track.verbatim = Some(tscat::Verbatim::new(0x86, tscat::Framing::Section));
@@ -531,7 +595,9 @@ mod tests {
 
 		// PES-framed verbatim stream (undecoded private data, stream_type 0x06), with
 		// an explicit PES stream_id to round-trip.
-		let pes = broadcast.unique_track(".data", hang::container::track_info()).unwrap();
+		let pes = broadcast
+			.unique_track(".data", hang::container::track_info(hang::catalog::PRIORITY.text))
+			.unwrap();
 		let mut verbatim = tscat::Verbatim::new(0x06, tscat::Framing::Pes);
 		verbatim.stream_id = Some(VERBATIM_PES_STREAM_ID);
 		let mut pes_track = tscat::Track::new(VERBATIM_PES_PID);
@@ -585,10 +651,8 @@ mod tests {
 		// Publish side: `Publish::new(Ts)` builds a `ts::Import<Ext>`, so the verbatim
 		// streams land in the broadcast instead of being dropped by the media-only path.
 		// The broadcast is created on a throwaway origin so the exporter can resolve it by path.
-		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
-		let broadcast = origin
-			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
-			.unwrap();
+		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+		let broadcast = origin.create_broadcast("cli").unwrap();
 		settle().await;
 		let mut publish = Publish::new(broadcast, &PublishFormat::Ts, None).unwrap();
 		#[allow(irrefutable_let_patterns)]

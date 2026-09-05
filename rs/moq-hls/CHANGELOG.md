@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.13](https://github.com/moq-dev/moq/compare/moq-hls-v0.4.12...moq-hls-v0.4.13) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.4.12](https://github.com/moq-dev/moq/compare/moq-hls-v0.4.11...moq-hls-v0.4.12) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.4.11](https://github.com/moq-dev/moq/compare/moq-hls-v0.4.10...moq-hls-v0.4.11) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang
+
+## [0.4.10](https://github.com/moq-dev/moq/compare/moq-hls-v0.4.9...moq-hls-v0.4.10) - 2026-08-24
+
+### Other
+
+- updated the following local packages: kio
+
+## [0.4.9](https://github.com/moq-dev/moq/compare/moq-hls-v0.4.8...moq-hls-v0.4.9) - 2026-08-20
+
+### Other
+
+- updated the following local packages: moq-mux
+
 ## [0.4.8](https://github.com/moq-dev/moq/compare/moq-hls-v0.4.7...moq-hls-v0.4.8) - 2026-08-14
 
 ### Fixed

@@ -25,7 +25,6 @@
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use clap::Parser;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,42 +42,45 @@ mod stats;
 mod status;
 mod video;
 
-#[derive(Parser, Clone)]
+#[derive(usage::Cli, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[usage(name = "moq-boy")]
+#[usage(completion)]
 pub struct Config {
 	/// Path to the Game Boy ROM file.
-	#[arg(long)]
+	#[usage(long, value_hint = usage::ValueHint::FilePath, extensions("gb", "gbc"))]
 	pub rom: PathBuf,
 
 	/// Session name (used in broadcast path). Defaults to ROM filename.
-	#[arg(long)]
+	#[usage(long)]
 	pub name: Option<String>,
 
 	/// Base path prefix. Used to derive --prefix-game and --prefix-viewer defaults.
-	#[arg(long, default_value = "boy")]
+	#[usage(long, default = "boy")]
 	pub prefix: String,
 
 	/// Path prefix for game broadcasts ("{prefix-game}/{name}"). Defaults to "{prefix}/game".
-	#[arg(long)]
+	#[usage(long)]
 	pub prefix_game: Option<String>,
 
 	/// Path prefix for viewer broadcasts ("{prefix-viewer}/{name}"). Defaults to "{prefix}/viewer".
-	#[arg(long)]
+	#[usage(long)]
 	pub prefix_viewer: Option<String>,
 
 	/// Location label shown in viewer stats (e.g. "Dallas, TX").
-	#[arg(long)]
+	#[usage(long)]
 	pub location: Option<String>,
 
 	/// The MoQ client configuration.
-	#[command(flatten)]
+	#[usage(flatten)]
 	pub client: moq_tokio::connect::Config,
 
 	/// QUIC transport tuning (`--quic-*`).
-	#[command(flatten)]
+	#[usage(flatten)]
 	pub quic: moq_tokio::quic::Config,
 
 	/// The log configuration.
-	#[command(flatten)]
+	#[usage(flatten)]
 	pub log: moq_tokio::Log,
 }
 
@@ -223,29 +225,31 @@ async fn run(config: &Config) -> Result<()> {
 	let client = config.client.clone().init(config.quic.clone())?;
 
 	// Publish origin: the game session broadcast.
-	let publish_origin = moq_tokio::origin::spawn(moq_net::Origin::random());
+	let publish_origin = moq_tokio::origin::spawn(moq_net::Hop::random());
 	let default_game_prefix = format!("{}/game", config.prefix);
 	let default_viewer_prefix = format!("{}/viewer", config.prefix);
 	let game_prefix = config.prefix_game.as_deref().unwrap_or(&default_game_prefix);
 	let viewer_prefix = config.prefix_viewer.as_deref().unwrap_or(&default_viewer_prefix);
 
-	// Create the broadcast on the publish origin; the live route announces it.
+	// Create the broadcast on the publish origin and announce its path.
 	let broadcast_path = format!("{game_prefix}/{name}");
 	let mut broadcast = publish_origin
-		.create_broadcast(&broadcast_path, moq_net::broadcast::Route::new().with_announce(true))
+		.create_broadcast(&broadcast_path)
 		.context("failed to create broadcast")?;
+	broadcast
+		.announce(Default::default())
+		.context("failed to announce broadcast")?;
 
 	// Consume origin: viewer broadcasts under the viewer prefix.
 	// JS publishes viewer feedback at "{viewer_prefix}/{name}/{viewerId}"
 	let viewer_path = format!("{viewer_prefix}/{name}");
-	let consume_origin = moq_tokio::origin::spawn(moq_net::Origin::random());
-	let mut viewer_consumer = consume_origin
+	let consume_origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+	let viewer_consumer = consume_origin
 		.with_root(&viewer_path)
 		.expect("viewer prefix should be valid")
-		.consume()
-		.announced();
+		.consume();
 
-	tracing::info!(%url, %name, broadcast = %broadcast_path, "connecting to relay");
+	tracing::info!(url = %moq_tokio::RedactedUrl::new(&url), %name, broadcast = %broadcast_path, "connecting to relay");
 
 	let reconnect = client
 		.with_publisher(&publish_origin)
@@ -298,7 +302,7 @@ async fn run(config: &Config) -> Result<()> {
 			Err(join) => Err(join.into()),
 		},
 		res = reconnect.closed() => res.map_err(Into::into),
-		res = input::handle_viewers(&mut viewer_consumer, &cmd_tx) => res,
+		res = input::handle_viewers(&viewer_consumer, &cmd_tx) => res,
 	};
 
 	// Cleanly close the broadcast so subscribers see a normal end rather than
@@ -502,14 +506,13 @@ mod tests {
 	/// land where `run` reads it. A second required flag would leave it inert.
 	#[test]
 	fn matches_demo_invocation() {
-		let config = Config::try_parse_from([
-			"moq-boy",
-			"--connect",
-			"http://localhost:4443",
-			"--rom",
-			"rom/big2small.gb",
-			"--location",
-			"localhost",
+		let config = Config::parse_from(&[
+			std::ffi::OsStr::new("--connect"),
+			std::ffi::OsStr::new("http://localhost:4443"),
+			std::ffi::OsStr::new("--rom"),
+			std::ffi::OsStr::new("rom/big2small.gb"),
+			std::ffi::OsStr::new("--location"),
+			std::ffi::OsStr::new("localhost"),
 		])
 		.expect("demo/boy/justfile invocation should parse");
 		config.check_deprecated().expect("the demo uses current spellings");
@@ -521,16 +524,15 @@ mod tests {
 	}
 
 	/// The spelling the demo used to pass. It still parses, so the process can name
-	/// `--connect` rather than leave clap reporting an unexpected argument, but it
+	/// `--connect` rather than leave the parser reporting an unexpected argument, but it
 	/// configures nothing and must stop the run.
 	#[test]
 	fn the_released_connect_spelling_is_refused() {
-		let config = Config::try_parse_from([
-			"moq-boy",
-			"--client-connect",
-			"http://localhost:4443",
-			"--rom",
-			"rom/big2small.gb",
+		let config = Config::parse_from(&[
+			std::ffi::OsStr::new("--client-connect"),
+			std::ffi::OsStr::new("http://localhost:4443"),
+			std::ffi::OsStr::new("--rom"),
+			std::ffi::OsStr::new("rom/big2small.gb"),
 		])
 		.expect("the released spelling still parses");
 		assert_eq!(config.client.url, None);

@@ -9,7 +9,7 @@ import { type Timescale, Timestamp } from "../time.ts";
 import type * as track from "../track.ts";
 import { withTimeout } from "../util/timeout.ts";
 import type { Session } from "./adapter.ts";
-import { TrackAliases } from "./aliases.ts";
+import { DuplicateTrackAlias, RetiredTrackAlias, TrackAliases } from "./aliases.ts";
 import * as Cluster from "./cluster.ts";
 import { Frame, type Group as GroupMessage } from "./object.ts";
 import { toWire } from "./priority.ts";
@@ -21,7 +21,7 @@ import {
 	PublishNamespaceOk,
 } from "./publish_namespace.ts";
 import { RequestError, RequestOk } from "./request.ts";
-import { Subscribe, SubscribeError, SubscribeOk, Unsubscribe } from "./subscribe.ts";
+import { joinFilter, Subscribe, SubscribeError, SubscribeOk, Unsubscribe } from "./subscribe.ts";
 import {
 	PublishBlocked,
 	SubscribeNamespace,
@@ -44,6 +44,24 @@ const SUBSCRIBE_OK_TIMEOUT_MS = 10_000;
 type SubscribeSetupState = {
 	stream?: Stream;
 	registeredAlias?: bigint;
+	/**
+	 * Whether the caller has given up. Setup checks this once the stream exists so a request
+	 * opened after the timeout still unwinds: nothing else settles setup if the peer has
+	 * gone quiet, and the cleanup that fired first saw no stream to tear down.
+	 */
+	cancelled?: boolean;
+	/**
+	 * Whether the SUBSCRIBE reached the wire. From that moment the publisher may be serving,
+	 * even before it answers, so abandoning owes it a cancellation regardless of whether we
+	 * ever saw the SUBSCRIBE_OK.
+	 */
+	sent?: boolean;
+	/**
+	 * Whether the publisher answered with an error. It has torn the request down already, so
+	 * there is nothing left to cancel and naming the dead request id at it risks being read
+	 * as a protocol violation.
+	 */
+	rejected?: boolean;
 };
 
 /**
@@ -130,7 +148,7 @@ export class Subscriber {
 		for (const active of this.#announced.keys()) {
 			const suffix = Path.stripPrefix(prefix, active);
 			if (suffix === null) continue;
-			announced.append({ path: suffix, active: true });
+			announced.append({ prefix: suffix, active: true });
 		}
 		this.#announcedConsumers.add(announced);
 
@@ -155,7 +173,7 @@ export class Subscriber {
 		for (const consumer of this.#announcedConsumers) {
 			const suffix = Path.stripPrefix(consumer.prefix, path);
 			if (suffix === null) continue;
-			consumer.append({ path: suffix, active: true });
+			consumer.append({ prefix: suffix, active: true });
 		}
 	}
 
@@ -181,7 +199,7 @@ export class Subscriber {
 			const suffix = Path.stripPrefix(consumer.prefix, path);
 			if (suffix === null) continue;
 			try {
-				consumer.append({ path: suffix, active: false });
+				consumer.append({ prefix: suffix, active: false });
 			} catch {
 				// Consumer already closed, will be cleaned up
 			}
@@ -377,7 +395,6 @@ export class Subscriber {
 	}
 
 	async #runSubscribe(broadcast: Path.Valid, request: track.Request) {
-		const version = this.#session.version;
 		const requestId = await this.#session.nextRequestId();
 		if (requestId === undefined) {
 			request.reject(new Error("session closed"));
@@ -386,12 +403,12 @@ export class Subscriber {
 
 		console.debug(`subscribe start: id=${requestId} broadcast=${broadcast} track=${request.name}`);
 
-		// IETF negotiates group order in SUBSCRIBE_OK; this implementation only
-		// supports descending (newest-first), so commit ordered: false. (There's no
-		// per-frame timescale, so the rest stay at their defaults.) This
-		// resolves the consumer's track.info() and gives us the write side that
-		// incoming object streams are routed into.
-		const producer = request.accept({ ordered: false });
+		// IETF negotiates group order in SUBSCRIBE_OK; this implementation only supports
+		// descending (newest-first), which is what moq-lite fixes group order to, so the
+		// mapping needs nothing here. (There's no per-frame timescale either, so every
+		// property stays at its default.) This resolves the consumer's track.info() and
+		// gives us the write side that incoming object streams are routed into.
+		const producer = request.accept({});
 
 		// Open the stream and wait for SUBSCRIBE_OK under a timeout. State
 		// flows back via `state` so the timeout path can clean up the stream
@@ -399,14 +416,30 @@ export class Subscriber {
 		const state: SubscribeSetupState = {};
 		const setup = this.#openSubscribe(state, broadcast, request, producer, requestId);
 
+		// The publisher can be serving before it answers, so waiting only on the response
+		// would miss the local side going away and leave it serving a track nobody reads.
+		// Demand returning before we commit is not abandonment, matching the serving loop.
+		const waitAbandoned = async (): Promise<null> => {
+			for (;;) {
+				await producer.unused();
+				if (producer.closed.peek() !== undefined || !producer.used.peek()) return null;
+			}
+		};
+
 		let stream: Stream;
 		let trackAlias: bigint;
 		try {
-			const result = await withTimeout(
-				setup,
-				SUBSCRIBE_OK_TIMEOUT_MS,
-				`subscribe timed out after ${SUBSCRIBE_OK_TIMEOUT_MS}ms waiting for SUBSCRIBE_OK (browser stream limit reached?)`,
-			);
+			const result = await Promise.race([
+				withTimeout(
+					setup,
+					SUBSCRIBE_OK_TIMEOUT_MS,
+					`subscribe timed out after ${SUBSCRIBE_OK_TIMEOUT_MS}ms waiting for SUBSCRIBE_OK (browser stream limit reached?)`,
+				),
+				waitAbandoned(),
+			]);
+
+			if (result === null) throw new Error("subscribe abandoned before it was accepted");
+
 			stream = result.stream;
 			trackAlias = result.alias;
 			console.debug(`subscribe ok: id=${requestId} broadcast=${broadcast} track=${request.name}`);
@@ -416,43 +449,75 @@ export class Subscriber {
 			console.warn(
 				`subscribe error: id=${requestId} broadcast=${broadcast} track=${request.name} error=${reason(e)}`,
 			);
-			// If setup eventually settles after the timeout, abort the stream
-			// and drop any registration so we don't leak. Cover both branches:
-			// setup may resolve late, or reject (e.g. SUBSCRIBE error) after the
-			// stream is already open.
-			const cleanup = () => {
-				if (state.registeredAlias !== undefined) this.#aliases.delete(state.registeredAlias, producer);
-				state.stream?.abort(e);
+			// Runs now for whatever is already open, and again if `setup` settles late.
+			// Retirement is repeated because a late SUBSCRIBE_OK can register an alias after
+			// the first pass; the stream is torn down once.
+			let torn = false;
+			const cleanup = async (afterSetup: boolean) => {
+				state.cancelled = true;
+
+				if (state.registeredAlias !== undefined && this.#aliases.retire(state.registeredAlias, producer)) {
+					this.#timescales.delete(state.registeredAlias);
+				}
+
+				if (!state.stream || torn) return;
+
+				// A SUBSCRIBE still being written must not be torn down from here. Aborting a
+				// Web Stream waits for the in-flight write, so the request can still reach the
+				// peer while the abort destroys the stream we would have cancelled on. Setup
+				// unwinds on the cancelled flag once that write lands, and its pass below has
+				// the finished picture.
+				if (!state.sent && !afterSetup) return;
+				torn = true;
+
+				// Once the SUBSCRIBE is out the publisher may be serving, whether or not it has
+				// answered yet: data streams are independent of the request stream. Aborting says
+				// nothing on v14-16, where the request rides a virtual stream whose reset is
+				// local, so the UNSUBSCRIBE has to go out explicitly.
+				if (state.sent && !state.rejected) await this.#cancelSubscribe(state.stream, requestId);
+				state.stream.abort(e);
 			};
-			setup.then(cleanup, cleanup);
+
+			// Tear down what is already open rather than waiting on `setup`. A peer that
+			// opened the stream and then went quiet never settles it, and deferring would
+			// leave the request outstanding for the life of the session -- which is the
+			// timeout case, not a rare one.
+			void cleanup(false);
+			setup.then(
+				() => cleanup(true),
+				() => cleanup(true),
+			);
 			return;
 		}
 
 		try {
+			// Which terminal fired decides whether we owe the publisher a cancellation, so
+			// tag them rather than racing bare promises.
+			const publisherEnded = Symbol("publisher");
+			const localEnded = Symbol("local");
+			const idle = Symbol("idle");
+
 			// Terminal conditions settle at most once (stream close = PublishDone, track close =
 			// local unsubscribe); race them once so the demand loop doesn't re-subscribe each pass.
-			const done = Promise.race([stream.reader.closed, producer.closed]);
+			const done = Promise.race([
+				stream.reader.closed.then(() => publisherEnded),
+				producer.closed.then(() => localEnded),
+			]);
 
 			// Serve until a terminal condition fires or the last local subscriber leaves. The unused
 			// wake is level-triggered: re-check demand so a subscriber that returns before we tear
 			// down resumes on the same stream.
-			const idle = Symbol("idle");
+			let terminal = localEnded;
 			for (;;) {
 				const reason = await Promise.race([done, producer.unused().then(() => idle)]);
 				if (reason === idle && producer.closed.peek() === undefined && producer.used.peek()) continue;
+				terminal = reason;
 				break;
 			}
 
-			// For v14-v16: send Unsubscribe before closing (removed in v17+)
-			if (version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16) {
-				try {
-					await stream.writer.u53(Unsubscribe.id);
-					const unsub = new Unsubscribe({ requestId });
-					await unsub.encode(stream.writer, version);
-				} catch {
-					// Stream might already be closed
-				}
-			}
+			// The publisher already ended the request, so there is nothing to cancel. Sending
+			// UNSUBSCRIBE here would name a request it has already torn down.
+			if (terminal !== publisherEnded) await this.#cancelSubscribe(stream, requestId);
 
 			producer.close();
 			stream.close();
@@ -465,8 +530,30 @@ export class Subscriber {
 				`subscribe error: id=${requestId} broadcast=${broadcast} track=${request.name} error=${reason(e)}`,
 			);
 		} finally {
-			this.#aliases.delete(trackAlias, producer);
-			this.#timescales.delete(trackAlias);
+			// Only the owner tears down the alias metadata: a later subscription may have
+			// reclaimed the alias and installed its own timescale.
+			if (this.#aliases.retire(trackAlias, producer)) this.#timescales.delete(trackAlias);
+		}
+	}
+
+	/**
+	 * Tell the publisher to stop serving a subscription we are walking away from.
+	 *
+	 * v14-16 cancel with UNSUBSCRIBE (draft-16 section 9.12), which is what lets the
+	 * publisher destroy the subscription (section 5.1.1); v17+ removed the message and
+	 * rely on the stream reset instead. Every path that abandons an Established
+	 * subscription goes through here, because those versions carry the request over a
+	 * virtual stream whose reset never reaches the peer.
+	 */
+	async #cancelSubscribe(stream: Stream, requestId: bigint) {
+		const version = this.#session.version;
+		if (version !== Version.DRAFT_14 && version !== Version.DRAFT_15 && version !== Version.DRAFT_16) return;
+
+		try {
+			await stream.writer.u53(Unsubscribe.id);
+			await new Unsubscribe({ requestId }).encode(stream.writer, version);
+		} catch {
+			// The stream may already be gone; there is nothing further to tell the peer.
 		}
 	}
 
@@ -485,14 +572,32 @@ export class Subscriber {
 
 		state.stream = await this.#session.openBi();
 
+		// The timeout can fire while the open is still in flight, in which case cleanup ran
+		// with nothing to release. Bail now that the stream is recorded, so settling this
+		// promise hands it back to be torn down.
+		if (state.cancelled) throw new Error("subscribe cancelled before it was sent");
+
 		await state.stream.writer.u53(Subscribe.id);
 		const msg = new Subscribe({
 			requestId,
 			trackNamespace: broadcast,
 			trackName: request.name,
 			subscriberPriority: toWire(request.priority),
+			// No fill is requested: the fill's fetch stream and the live subscription split
+			// the group across two streams, and this subscriber does not reassemble them into
+			// one group yet. A lenient publisher (like ours) replays the whole in-range group
+			// on the subscription instead; a strict one only delivers from the next published
+			// object, and that mid-group stream is dropped, degrading the join to the next
+			// group boundary.
+			filter: joinFilter(version),
 		});
 		await msg.encode(state.stream.writer, version);
+		state.sent = true;
+
+		// The caller may have given up while that write was in flight. It deliberately left
+		// the stream alone, so unwind here and let its cleanup send the cancellation now that
+		// the SUBSCRIBE has actually reached the peer.
+		if (state.cancelled) throw new Error("subscribe cancelled while it was being sent");
 		console.debug(`subscribe written: id=${requestId} broadcast=${broadcast} track=${request.name}`);
 
 		const respTypeId = await state.stream.reader.u53();
@@ -509,17 +614,23 @@ export class Subscriber {
 			} catch {
 				// Decoding error response failed, use default message
 			}
+			state.rejected = true;
 			throw new Error(`SUBSCRIBE error: ${reasonPhrase}`);
 		}
 
 		const ok = await SubscribeOk.decode(state.stream.reader, version);
+
 		try {
-			this.#aliases.set(ok.trackAlias, producer);
-			if (ok.timescale !== undefined) {
-				this.#timescales.set(ok.trackAlias, ok.timescale);
+			this.#aliases.set(ok.trackAlias, producer, { broadcast, name: request.name });
+			const timescale = ok.properties.timescale;
+			if (timescale !== undefined) {
+				this.#timescales.set(ok.trackAlias, timescale);
 			}
 		} catch (err) {
-			this.#session.close();
+			// Only one alias naming two different tracks is the session's problem. A publisher
+			// sharing an alias between subscriptions to one track is allowed to do that, and
+			// disconnecting over it would drop every other broadcast on the session.
+			if (err instanceof DuplicateTrackAlias) this.#session.close();
 			throw err;
 		}
 		state.registeredAlias = ok.trackAlias;
@@ -672,11 +783,18 @@ export class Subscriber {
 	async runPublish(msg: Publish, stream: Stream) {
 		const version = this.#session.version;
 
+		// NOT_SUPPORTED, from the PUBLISH error codes in draft-19 section 10.10. We decline
+		// the method itself rather than this particular track, which is UNINTERESTED (0x4).
+		//
+		// The alias the message carries is deliberately not recorded. Nothing will ever bind
+		// it, and a rejected request has no lifetime of ours to hang the cleanup on.
+		const NOT_SUPPORTED = 0x3;
+
 		if (version === Version.DRAFT_14) {
 			await stream.writer.u53(PublishError.id);
 			const err = new PublishError({
 				requestId: msg.requestId,
-				errorCode: 500,
+				errorCode: NOT_SUPPORTED,
 				reasonPhrase: "publish not supported",
 			});
 			await err.encode(stream.writer, version);
@@ -684,7 +802,7 @@ export class Subscriber {
 			await stream.writer.u53(RequestError.id);
 			const err = new RequestError({
 				requestId: version === Version.DRAFT_15 || version === Version.DRAFT_16 ? msg.requestId : undefined,
-				errorCode: 500,
+				errorCode: NOT_SUPPORTED,
 				reasonPhrase: "publish not supported",
 			});
 			await err.encode(stream.writer, version);
@@ -698,11 +816,27 @@ export class Subscriber {
 	 * @internal
 	 */
 	async handleGroup(group: GroupMessage, stream: Reader) {
-		const producer = new netGroup.Producer(group.groupId);
-
 		if (group.subGroupId !== 0) {
 			throw new Error("subgroups are not supported");
 		}
+
+		// FIRST_OBJECT clear says this stream starts partway through the group, which the
+		// draft lets a publisher do to answer a filter. Nothing above here can use it: the
+		// objects that would arrive are not decodable without the missing head, and a group
+		// is the unit an application resyncs on. Drop it and pick up at the next group, the
+		// same degradation as a publisher that no longer holds the head.
+		//
+		// This only saves reading a stream we would throw away. The bit is the publisher's
+		// claim, so what is enforced is the object ids themselves: `Frame.decode` holds every
+		// object to starting at 0 and incrementing by 1, whatever the header said and on the
+		// drafts that have no such bit to read.
+		if (!group.flags.firstObject) {
+			console.debug(`dropping a group with no head: alias=${group.trackAlias} group=${group.groupId}`);
+			stream.stop(new Error("a group must start at object 0"));
+			return;
+		}
+
+		const producer = new netGroup.Producer(group.groupId);
 
 		try {
 			// The control message establishing this alias can arrive after the data stream.
@@ -728,6 +862,12 @@ export class Subscriber {
 			producer.close();
 		} catch (err: unknown) {
 			const e = error(err);
+			// Ours: we cancelled the subscription and the publisher has not stopped yet.
+			// Anything else on this alias is the publisher sending data for a track it never
+			// acknowledged, which is worth seeing.
+			if (e instanceof RetiredTrackAlias) {
+				console.debug(`dropping group for a cancelled subscription: alias=${group.trackAlias}`);
+			}
 			producer.close(e);
 			stream.stop(e);
 		}

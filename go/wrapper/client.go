@@ -228,7 +228,7 @@ func Dial(ctx context.Context, url string, opts ...ClientOption) (*Client, error
 	}
 	c.inner = inner
 
-	session, err := runCancellable(ctx, inner.Cancel, func() (*ffi.MoqSession, error) {
+	session, err := runHandle(ctx, inner.Cancel, func() (*ffi.MoqSession, error) {
 		return inner.Connect(url)
 	})
 	if err != nil {
@@ -252,21 +252,23 @@ func (c *Client) CreateBroadcast(path string) (*BroadcastProducer, error) {
 	return c.publisher.CreateBroadcast(path)
 }
 
-// Announced streams broadcasts announced by the remote under prefix.
+// Announced streams routes announced by the remote under prefix.
 func (c *Client) Announced(prefix string) (*Announced, error) {
 	return c.consumer.Announced(prefix)
 }
 
-// AnnouncedBroadcast resolves a single announced broadcast at path.
+// AnnouncedBroadcast waits for a route covering path, then resolves the
+// broadcast there.
 func (c *Client) AnnouncedBroadcast(path string) (*AnnouncedBroadcast, error) {
 	return c.consumer.AnnouncedBroadcast(path)
 }
 
-// RequestBroadcast resolves a broadcast at path as soon as it can be served: the
-// announced broadcast if present, otherwise a dynamic fallback on the origin, or an
-// error. Unlike AnnouncedBroadcast, it does not wait for a future announcement.
-func (c *Client) RequestBroadcast(path string) (*BroadcastConsumer, error) {
-	return c.consumer.RequestBroadcast(path)
+// RequestBroadcast resolves a broadcast at path as soon as it can be served: an
+// existing exact-path broadcast, a covering announced route, or a dynamic
+// fallback on the origin, or an error. Unlike AnnouncedBroadcast, it does not wait
+// for a future announcement.
+func (c *Client) RequestBroadcast(ctx context.Context, path string) (*BroadcastConsumer, error) {
+	return c.consumer.RequestBroadcast(ctx, path)
 }
 
 // Session returns the underlying session. Hold the client (or session) to keep

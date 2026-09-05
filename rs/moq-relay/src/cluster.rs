@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::Context;
 use moq_net::origin;
-use moq_net::{Origin, Path, stats::Tier};
+use moq_net::{Hop, Path, stats::Tier};
 use reqwest_middleware::ClientWithMiddleware;
 use tokio::task::AbortHandle;
 use tracing::Instrument as _;
@@ -380,11 +380,11 @@ impl DialMap {
 ///
 /// Hop-based routing on broadcasts prevents announcement loops regardless of topology.
 #[serde_with::serde_as]
-#[derive(clap::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(usage::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde_with::skip_serializing_none]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-#[group(id = "cluster-config")]
 pub struct ClusterConfig {
 	/// Fixed origin (hop) id for this relay, identifying it in the hop chains
 	/// carried on each broadcast for loop detection and shortest-path routing.
@@ -394,7 +394,7 @@ pub struct ClusterConfig {
 	/// (the wire varint limit); an out-of-range value errors at startup. Keep it
 	/// below 2^53 for compatibility with older `@moq/lite` JS clients, which
 	/// decode hop ids as a `u53` and reject anything larger.
-	#[arg(id = "cluster-id", long = "cluster-id", env = "MOQ_CLUSTER_ID")]
+	#[usage(name = "cluster-id", long = "cluster-id", env = "MOQ_CLUSTER_ID")]
 	pub id: Option<u64>,
 
 	/// Connect to one or more other cluster nodes. Each peer is a full URL, e.g.
@@ -409,11 +409,11 @@ pub struct ClusterConfig {
 	/// reproduces plain hop counting. The param is consumed by this relay, not
 	/// sent to the peer.
 	#[serde(alias = "connect")]
-	#[arg(
-		id = "cluster-connect",
+	#[usage(
+		name = "cluster-connect",
 		long = "cluster-connect",
 		env = "MOQ_CLUSTER_CONNECT",
-		value_delimiter = ','
+		delimiter = ','
 	)]
 	#[serde_as(as = "serde_with::OneOrMany<_>")]
 	pub connect: Vec<String>,
@@ -429,8 +429,8 @@ pub struct ClusterConfig {
 	/// [`Self::node`] value, when set, is sent as a `?node=` query param so the
 	/// server can return this node's peers. The relay keeps the last good list if
 	/// a fetch fails. Composes with [`Self::connect`] and [`Self::mesh`].
-	#[arg(
-		id = "cluster-connect-api",
+	#[usage(
+		name = "cluster-connect-api",
 		long = "cluster-connect-api",
 		env = "MOQ_CLUSTER_CONNECT_API"
 	)]
@@ -440,7 +440,7 @@ pub struct ClusterConfig {
 	/// [`Self::connect_api`] as a `?node=` query param so the endpoint can return
 	/// this node's peers, and advertised to other relays when [`Self::mesh`] gossip
 	/// is enabled. On its own it neither opens nor accepts a connection.
-	#[arg(id = "cluster-node", long = "cluster-node", env = "MOQ_CLUSTER_NODE")]
+	#[usage(name = "cluster-node", long = "cluster-node", env = "MOQ_CLUSTER_NODE")]
 	pub node: Option<String>,
 
 	/// Enable gossip discovery: advertise this relay's [`Self::node`] URL on the
@@ -452,11 +452,11 @@ pub struct ClusterConfig {
 	/// this relay's URL. A non-boolean value is treated as a legacy [`Self::node`]
 	/// (with a deprecation warning), or an error if it conflicts with an explicit
 	/// `--cluster-node`. Accepts a TOML boolean or string.
-	#[arg(
-		id = "cluster-mesh",
+	#[usage(
+		name = "cluster-mesh",
 		long = "cluster-mesh",
 		env = "MOQ_CLUSTER_MESH",
-		default_missing_value = "true",
+		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
 	)]
@@ -465,7 +465,7 @@ pub struct ClusterConfig {
 
 	/// LAN discovery over mDNS (`[cluster.lan]`).
 	#[cfg(feature = "cluster-lan")]
-	#[command(flatten)]
+	#[usage(flatten)]
 	#[serde(default)]
 	pub lan: LanConfig,
 
@@ -474,26 +474,24 @@ pub struct ClusterConfig {
 	/// any peer whose URL has no inline token). An inline `?jwt=` can provide a
 	/// per-peer credential for static or `connect_api` peers. Gossip should use
 	/// this shared token or mTLS because the advertised node URL is public.
-	#[arg(id = "cluster-token", long = "cluster-token", env = "MOQ_CLUSTER_TOKEN")]
+	#[usage(name = "cluster-token", long = "cluster-token", env = "MOQ_CLUSTER_TOKEN")]
 	pub token: Option<PathBuf>,
 
 	/// Billing tier label that cluster-peer (relay-to-relay) traffic records
 	/// stats under. Defaults to the unprefixed tier.
-	#[arg(id = "cluster-tier", long = "cluster-tier", env = "MOQ_CLUSTER_TIER")]
+	#[usage(name = "cluster-tier", long = "cluster-tier", env = "MOQ_CLUSTER_TIER")]
 	pub tier: Option<String>,
 	// Accepted so existing configs keep parsing (`deny_unknown_fields`), but
 	// ignored: a broadcast now closes as soon as its last publisher is lost.
 	#[doc(hidden)]
 	#[deprecated(note = "ignored; a broadcast closes as soon as its last publisher is lost")]
-	#[arg(
-		id = "cluster-linger",
+	#[usage(
+		name = "cluster-linger",
 		long = "cluster-linger",
 		env = "MOQ_CLUSTER_LINGER",
-		value_parser = humantime::parse_duration,
-		hide = true,
+		hide = true
 	)]
-	#[serde(default, with = "humantime_serde")]
-	pub linger: Option<Duration>,
+	pub linger: Option<moq_tokio::Duration>,
 }
 
 /// LAN discovery configuration (`[cluster.lan]`).
@@ -502,24 +500,30 @@ pub struct ClusterConfig {
 /// relays advertise, so a rack or a home lab meshes with no seed list and no
 /// shared rendezvous. mDNS only replaces *how* peers are found: they are dialed
 /// and authenticated exactly like any other cluster peer.
-#[derive(clap::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(usage::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde_with::skip_serializing_none]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-#[group(id = "cluster-lan-config")]
 #[cfg(feature = "cluster-lan")]
 pub struct LanConfig {
 	/// Enable mDNS discovery. Requires [`ClusterConfig::node`], so there is an
 	/// address to advertise, and [`Self::secret`]. Boolean flag: pass
 	/// `--cluster-lan` (or `=true` / `=false`).
-	#[arg(
-		id = "cluster-lan",
+	/// `Option` rather than a materialized default: Usage reads a standing `false`
+	/// as an empty boolean, so `update_from` would refill it from the environment
+	/// (or a declared default) over whatever the TOML file said. An `Option` is
+	/// empty only when nothing set it. A bare `Vec<T>` has the same hazard, since
+	/// an empty list also reads as absent; see moq-dev/moq#3051.
+	#[usage(
+		name = "cluster-lan",
 		long = "cluster-lan",
 		env = "MOQ_CLUSTER_LAN",
-		default_missing_value = "true",
+		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
 	)]
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub enabled: Option<bool>,
 
 	/// The shared key admitting a peer to the LAN mesh, as 64 hexadecimal
@@ -531,8 +535,8 @@ pub struct LanConfig {
 	/// key, this relay would dial that URL and hand it
 	/// [`ClusterConfig::token`]. So the key is mandatory rather than optional,
 	/// and only peers that prove they hold it are ever dialed.
-	#[arg(
-		id = "cluster-lan-secret",
+	#[usage(
+		name = "cluster-lan-secret",
 		long = "cluster-lan-secret",
 		env = "MOQ_CLUSTER_LAN_SECRET",
 		value_name = "HEX_OR_PATH"
@@ -595,7 +599,7 @@ struct Work {
 ///
 /// Local sessions and remote cluster connections all publish into the same
 /// origin. Loop prevention and route preference come from the hop list carried
-/// on each broadcast's route (see [`moq_net::broadcast::Route`]).
+/// on each announced route (see [`moq_net::origin::Route`]).
 ///
 /// Construct with [`Cluster::new`], then attach a QUIC client and (optionally)
 /// a [`stats::Registry`](moq_net::stats::Registry) with the `with_*` builder
@@ -660,8 +664,8 @@ impl Cluster {
 			Some(id) if id >= 1 << 62 => {
 				anyhow::bail!("--cluster-id must be below 2^62 (wire varint limit), got {id}")
 			}
-			Some(id) => Origin::new(id).expect("cluster id already validated"),
-			None => Origin::random(),
+			Some(id) => Hop::new(id).expect("cluster id already validated"),
+			None => Hop::random(),
 		};
 		#[allow(deprecated)]
 		if config.linger.is_some() {
@@ -672,7 +676,7 @@ impl Cluster {
 		let info = origin::Info::new(id);
 		let origin = moq_tokio::origin::spawn(info.clone());
 		let nodes = crate::nodes::Nodes::new(origin.clone());
-		tracing::info!(origin_id = %origin.id(), configured = config.id.is_some(), "cluster initialized");
+		tracing::info!(hop_id = %origin.id(), configured = config.id.is_some(), "cluster initialized");
 		Ok(Cluster {
 			config,
 			client: None,
@@ -987,14 +991,18 @@ impl Cluster {
 		// Held in scope so the registration stays announced until `run` exits.
 		// Discovery is paired with it: a gossip-only relay (passive rendezvous) has
 		// nothing to discover, so we only run it when we also have an outbound peer.
-		let self_registration: Option<moq_net::broadcast::Producer> = if gossip {
+		// The path itself is the advertisement: an empty broadcast, announced.
+		let mut self_registration: Option<moq_net::broadcast::Producer> = if gossip {
 			// Checked above: gossip requires `node`.
 			let node = node.as_deref().expect("gossip requires --cluster-node");
 			let path = Path::new(MESH_PREFIX).join(node);
-			let broadcast = self
+			let registration = self
 				.origin
-				.create_broadcast(&path, moq_net::broadcast::Route::new().with_announce(true))
+				.create_broadcast(&path)
 				.expect(".internal/origins is within the relay origin's root");
+			registration
+				.announce(moq_net::origin::Route::default())
+				.expect("the origin driver outlives the cluster");
 			tracing::info!(%node, %path, "advertising cluster node URL");
 
 			if can_dial {
@@ -1008,7 +1016,7 @@ impl Cluster {
 				});
 			}
 
-			Some(broadcast)
+			Some(registration)
 		} else {
 			None
 		};
@@ -1030,9 +1038,8 @@ impl Cluster {
 			}
 		}
 
-		// Deliberate shutdown: finish the registration rather than dropping it, so
-		// there is no dropped-without-finish warning.
-		if let Some(mut registration) = self_registration {
+		// Deliberate shutdown: finishing the registration retracts the route.
+		if let Some(registration) = self_registration.as_mut() {
 			registration.finish();
 		}
 		Ok(())
@@ -1063,7 +1070,8 @@ impl Cluster {
 		loop {
 			tokio::select! {
 				ann = announced.next() => {
-					let Some(moq_net::announce::Update { path: relative, broadcast }) = ann else { return; };
+					let Some(update) = ann else { return; };
+					let relative = update.prefix.as_path();
 					// The address to dial, which keeps its query: `run_remote` reads
 					// `?cost=` and `?jwt=` off it. The key is only its identity.
 					let peer = advertised_node_url(relative.as_str());
@@ -1080,8 +1088,8 @@ impl Cluster {
 						continue;
 					}
 					let advertisement = relative.as_str().to_owned();
-					match broadcast {
-						Some(_) => {
+					match update.active {
+						true => {
 							let target = live.announce(advertisement, target);
 							let mut spawn = |target: DialTarget| {
 								tracing::info!(peer = %target.key, "discovered cluster peer; dialing");
@@ -1092,7 +1100,7 @@ impl Cluster {
 								tracing::debug!(peer = %key, "reannounce within sweep window; keeping dial");
 							}
 						}
-						None => match live.unannounce(&advertisement, &target.key) {
+						false => match live.unannounce(&advertisement, &target.key) {
 							GossipUpdate::Current(target) => {
 								let mut spawn = |target: DialTarget| {
 									tracing::info!(peer = %target.key, "cluster peer advertisement changed; redialing");
@@ -1381,9 +1389,10 @@ impl Cluster {
 	}
 
 	async fn run_remote_session(&self, id: u64, url: &Url, cost: Option<u64>) -> anyhow::Result<()> {
-		let mut log_url = url.clone();
-		log_url.set_query(None);
-		tracing::info!(url = %log_url, "dialing cluster peer");
+		// The peer URL carries the cluster JWT in its query, so neither the log line
+		// nor the node label below may show the raw URL.
+		let redacted = moq_tokio::RedactedUrl::new(url);
+		tracing::info!(url = %redacted, "dialing cluster peer");
 
 		// Checked at the start of `run`; per-peer tasks inherit that guarantee.
 		let client = self
@@ -1417,7 +1426,7 @@ impl Cluster {
 		loop {
 			match reconnect.status().await? {
 				moq_tokio::Status::Connected if connection.is_none() => {
-					connection = Some(self.nodes.connect_outbound(id, log_url.to_string()));
+					connection = Some(self.nodes.connect_outbound(id, redacted.to_string()));
 				}
 				moq_tokio::Status::Disconnected => connection = None,
 				moq_tokio::Status::Migrating => {}
@@ -1638,25 +1647,23 @@ mod tests {
 		let cluster = cluster.with_stats(stats);
 
 		let path = moq_net::Path::new(".stats").join("node").join("test");
-		let broadcast = tokio::time::timeout(
-			std::time::Duration::from_secs(5),
-			cluster.origin.consume().announced_broadcast(&path),
-		)
-		.await
-		.expect("stats broadcast announced within 5s")
-		.expect("stats broadcast present");
+		let consumer = cluster.origin.consume();
+		tokio::time::timeout(std::time::Duration::from_secs(5), consumer.routed(&path))
+			.await
+			.expect("stats broadcast announced within 5s")
+			.expect("stats broadcast present");
+		let broadcast = consumer
+			.request_broadcast(&path)
+			.await
+			.expect("stats broadcast resolves");
 
 		// Several publish intervals (1s each by default) after the handle went out
 		// of scope, the task is still running and its broadcast still open. The
 		// re-check is bounded: without the keepalive the broadcast is gone and
-		// `announced_broadcast` waits forever, which must read as a failure rather
+		// `routed` waits forever, which must read as a failure rather
 		// than a hung test.
 		tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
-		let still_live = tokio::time::timeout(
-			std::time::Duration::from_secs(2),
-			cluster.origin.consume().announced_broadcast(&path),
-		)
-		.await;
+		let still_live = tokio::time::timeout(std::time::Duration::from_secs(2), consumer.routed(&path)).await;
 		assert!(
 			matches!(still_live, Ok(Some(_))),
 			"stats broadcast unannounced after the producer handle was dropped: \
@@ -2093,7 +2100,7 @@ mod tests {
 		assert!(msg.contains("--cluster-mesh"), "missing --cluster-mesh in: {msg}");
 	}
 
-	/// A valid `cluster.id` is used verbatim as the relay's origin id, giving the
+	/// A valid `cluster.id` is used verbatim as the relay's Hop ID, giving the
 	/// node a stable identity across restarts.
 	#[tokio::test]
 	async fn cluster_id_sets_origin() {
@@ -2143,11 +2150,13 @@ mod tests {
 		// Give the runtime a moment to execute the synchronous setup work.
 		tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-		// The self-registration broadcast must be visible on the origin.
-		let moq_net::announce::Update { path, broadcast } =
-			watcher.try_next().expect("self-registration must be published");
-		assert_eq!(path.as_str(), ".internal/origins/rendezvous.example.com:4443");
-		assert!(broadcast.is_some());
+		// The self-registration route must be visible on the origin.
+		let update = watcher.try_next().expect("self-registration must be published");
+		assert_eq!(
+			update.prefix.as_path().as_str(),
+			".internal/origins/rendezvous.example.com:4443"
+		);
+		assert!(update.active);
 
 		// run() must NOT have returned: dropping the broadcast (via run returning)
 		// would unannounce the registration immediately. Use a short timeout to
@@ -2162,10 +2171,10 @@ mod tests {
 
 	/// `cluster.node` (identity) and `cluster.mesh` (gossip toggle) round-trip
 	/// through TOML and survive the CLI re-parse when no flags override them.
-	/// `mesh` is a string (clobber-safe) that accepts a TOML boolean.
+	/// `mesh` is a string that accepts a TOML boolean for compatibility.
 	#[test]
 	fn cluster_node_and_mesh_round_trip() {
-		// clap reads the environment while parsing, so serialize with the tests
+		// Usage reads the environment while parsing, so serialize with the tests
 		// that mutate it.
 		let _env = crate::test_env::EnvGuard::lock();
 
@@ -2375,15 +2384,11 @@ mod tests {
 		assert!(format!("{err}").contains("conflicts with"), "got: {err}");
 	}
 
-	/// `cluster.connect_api` set in TOML must survive the CLI re-parse when no
-	/// `--cluster-connect-api` flag is passed (same clap+TOML clobber pitfall the
-	/// config tests guard, which is why the field is `Option<String>`).
-	/// The nested `[cluster.lan]` table survives the TOML -> CLI merge, the
-	/// footgun that `Option<T>` fields exist to avoid.
+	/// The nested `[cluster.lan]` table survives the TOML-to-CLI merge.
 	#[cfg(feature = "cluster-lan")]
 	#[test]
 	fn cluster_lan_survives_toml_merge() {
-		// clap reads the environment while parsing, so serialize with the tests
+		// Usage reads the environment while parsing, so serialize with the tests
 		// that mutate it.
 		let _env = crate::test_env::EnvGuard::clear(&["MOQ_CLUSTER_LAN", "MOQ_CLUSTER_LAN_SECRET"]);
 
@@ -2493,7 +2498,7 @@ mod tests {
 
 	#[test]
 	fn cluster_connect_api_survives_toml_merge() {
-		// clap reads the environment while parsing, so serialize with the tests
+		// Usage reads the environment while parsing, so serialize with the tests
 		// that mutate it.
 		let _env = crate::test_env::EnvGuard::lock();
 

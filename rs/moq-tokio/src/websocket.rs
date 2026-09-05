@@ -6,12 +6,13 @@
 //! through. Servers accept it on a separate TCP port via [`Listener`].
 
 use qmux::ws::tokio_tungstenite;
-use qmux::ws::tokio_tungstenite::tungstenite::{self, http};
+use qmux::ws::tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, http};
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::{net, time};
 use url::Url;
 
+use crate::Duration as CliDuration;
 /// Errors specific to the WebSocket fallback backend.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -35,28 +36,56 @@ pub enum Error {
 
 	/// The qmux handshake failed while dialing, including a non-101 upgrade response
 	/// from the server.
-	#[error("failed to connect WebSocket")]
-	Connect(#[source] qmux::Error),
+	#[error("failed to connect WebSocket: {message}")]
+	Connect {
+		/// What qmux reported.
+		message: String,
+		/// The HTTP status the server answered the upgrade with, when it answered with one.
+		///
+		/// Read at conversion time rather than kept as a qmux error, so the classification
+		/// survives without qmux appearing in this crate's public API.
+		status: Option<u16>,
+	},
 
 	/// The URL couldn't be turned into a valid WebSocket handshake request.
-	#[error("failed to build WebSocket request")]
-	BuildRequest(#[source] tungstenite::Error),
+	#[error("failed to build WebSocket request: {0}")]
+	BuildRequest(String),
 
 	/// An ALPN contained bytes that aren't legal in the `Sec-WebSocket-Protocol` header.
-	#[error("failed to build WebSocket protocols header")]
-	ProtocolHeader(#[source] http::header::InvalidHeaderValue),
+	#[error("failed to build WebSocket protocols header: {0}")]
+	ProtocolHeader(String),
 
 	/// The TCP/TLS connection or the WebSocket upgrade itself failed.
-	#[error("failed to connect WebSocket")]
-	WebSocketConnect(#[source] tungstenite::Error),
+	#[error("failed to connect WebSocket: {0}")]
+	WebSocketConnect(String),
 
 	/// The server refused the connection outright, so retrying won't help.
 	#[error(transparent)]
 	ConnectRejected(#[from] crate::ConnectError),
 
 	/// The qmux handshake failed while accepting an incoming connection.
-	#[error("WebSocket accept failed")]
-	Accept(#[source] qmux::Error),
+	#[error("WebSocket accept failed: {0}")]
+	Accept(String),
+}
+
+impl Error {
+	/// A failed dial, keeping the upgrade status qmux reported.
+	fn connect(err: qmux::Error) -> Self {
+		let status = match err {
+			qmux::Error::Http(status) => Some(status),
+			_ => None,
+		};
+
+		Self::Connect {
+			message: crate::error::message(err),
+			status,
+		}
+	}
+
+	/// A failed accept.
+	fn accept(err: qmux::Error) -> Self {
+		Self::Accept(crate::error::message(err))
+	}
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -65,77 +94,83 @@ type Result<T> = std::result::Result<T, Error>;
 static WEBSOCKET_WON: LazyLock<Mutex<HashSet<(String, u16)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// WebSocket configuration for the client.
-#[derive(Clone, Debug, clap::Args, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, usage::Args, serde::Serialize, serde::Deserialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(default, deny_unknown_fields)]
-#[group(id = "websocket-client")]
 #[non_exhaustive]
-#[derive(Default)]
 pub struct Config {
 	/// Whether to enable the WebSocket fallback. Defaults to true.
 	///
-	/// `Option` with the default resolved in code rather than a clap `default_value`,
-	/// which a config file could not override: the CLI is re-parsed after the file is
-	/// read, so a materialized default would win.
-	#[arg(
-		id = "connect-websocket-enabled",
+	/// `Option` with the default resolved by [`Self::resolved_enabled`] rather than
+	/// a Usage `default`, which a config file could not override: Usage reads a
+	/// standing `false` as an empty boolean, so the re-parse over the CLI args
+	/// would refill it with the declared `true`. An `Option` is empty only when
+	/// nothing set it.
+	#[usage(
+		name = "connect-websocket-enabled",
 		long = "connect-websocket-enabled",
 		env = "MOQ_CONNECT_WEBSOCKET_ENABLED",
-		default_missing_value = "true",
+		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
-		value_parser = clap::value_parser!(bool),
 	)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub enabled: Option<bool>,
 
 	/// Head start given to the QUIC dial before the WebSocket fallback joins the
 	/// race. Defaults to 200ms, and drops to zero for a server WebSocket already won.
-	#[arg(
-		id = "connect-websocket-delay",
+	#[usage(
+		name = "connect-websocket-delay",
 		long = "connect-websocket-delay",
 		env = "MOQ_CONNECT_WEBSOCKET_DELAY",
-		value_parser = humantime::parse_duration,
+		default = "200ms"
 	)]
-	#[serde(default, with = "humantime_serde::option")]
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub delay: Option<time::Duration>,
+	pub delay: CliDuration,
 
 	/// The released `MOQ_CLIENT_WEBSOCKET_*` env vars, folded in by [`Config::resolved`].
-	#[command(flatten)]
+	#[usage(flatten)]
 	#[serde(skip)]
 	pub(crate) legacy: Legacy,
+}
+
+impl Default for Config {
+	fn default() -> Self {
+		Self {
+			enabled: None,
+			delay: DEFAULT_DELAY.into(),
+			legacy: Default::default(),
+		}
+	}
 }
 
 /// The released spellings for this section, which moved to `--connect-websocket-*`
 /// and `MOQ_CONNECT_WEBSOCKET_*` with the rest of the dial side.
 ///
-/// Separate args rather than clap aliases, since an alias renames the flag but
+/// Separate args rather than Usage aliases, since an alias renames the flag but
 /// leaves its env var behind.
-#[derive(Clone, Debug, Default, clap::Args)]
-#[group(id = "websocket-legacy")]
+#[derive(Clone, Debug, Default, usage::Args)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub(crate) struct Legacy {
-	#[arg(
-		id = "websocket-enabled",
+	#[usage(
+		name = "websocket-enabled",
 		long = "websocket-enabled",
 		alias = "client-websocket-enabled",
 		env = "MOQ_CLIENT_WEBSOCKET_ENABLED",
 		hide = true,
-		default_missing_value = "true",
+		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
-		value_parser = clap::value_parser!(bool),
 	)]
 	enabled: Option<bool>,
 
-	#[arg(
-		id = "websocket-delay",
+	#[usage(
+		name = "websocket-delay",
 		long = "websocket-delay",
 		alias = "client-websocket-delay",
 		env = "MOQ_CLIENT_WEBSOCKET_DELAY",
-		hide = true,
-		value_parser = humantime::parse_duration,
+		hide = true
 	)]
-	delay: Option<time::Duration>,
+	delay: Option<CliDuration>,
 }
 
 /// The QUIC head start when `--connect-websocket-delay` is unset.
@@ -170,7 +205,7 @@ impl Config {
 
 	/// The head start a QUIC dial gets, resolving the default.
 	pub fn resolved_delay(&self) -> time::Duration {
-		self.delay.unwrap_or(DEFAULT_DELAY)
+		self.delay.into_std()
 	}
 }
 
@@ -180,6 +215,7 @@ impl Config {
 pub(crate) async fn race_handle(
 	config: &Config,
 	tls: &rustls::ClientConfig,
+	tls_host_name: Option<&str>,
 	url: Url,
 	alpns: &[&str],
 ) -> Option<Result<qmux::Session>> {
@@ -194,7 +230,7 @@ pub(crate) async fn race_handle(
 		_ => return None,
 	}
 
-	let res = connect(config, tls, url, alpns).await;
+	let res = connect(config, tls, tls_host_name, url, alpns).await;
 	if let Err(err) = &res {
 		tracing::warn!(%err, "WebSocket connection failed");
 	}
@@ -204,6 +240,7 @@ pub(crate) async fn race_handle(
 pub(crate) async fn connect(
 	config: &Config,
 	tls: &rustls::ClientConfig,
+	tls_host_name: Option<&str>,
 	mut url: Url,
 	alpns: &[&str],
 ) -> Result<qmux::Session> {
@@ -217,7 +254,7 @@ pub(crate) async fn connect(
 		"http" | "ws" => 80,
 		_ => 443,
 	});
-	let key = (host, port);
+	let key = (host.clone(), port);
 
 	// Apply a small penalty to WebSocket to improve odds for QUIC to connect first,
 	// unless we've already had to fall back to WebSockets for this server.
@@ -248,25 +285,30 @@ pub(crate) async fn connect(
 
 	tracing::debug!(peer = %crate::connect::Endpoint(&url), "connecting via WebSocket");
 
-	// Use the existing TLS config (which respects tls-disable-verify) for secure connections.
-	let connector = if needs_tls {
-		tokio_tungstenite::Connector::Rustls(Arc::new(tls.clone()))
-	} else {
-		tokio_tungstenite::Connector::Plain
-	};
+	let session = match (needs_tls, tls_host_name) {
+		(true, Some(tls_host_name)) => connect_tls_override(tls, tls_host_name, &url, &host, port, alpns).await?,
+		_ => {
+			// Use the existing TLS config (which respects tls-disable-verify) for secure connections.
+			let connector = if needs_tls {
+				tokio_tungstenite::Connector::Rustls(Arc::new(tls.clone()))
+			} else {
+				tokio_tungstenite::Connector::Plain
+			};
 
-	// Most moq ALPNs can ride on any QMux draft (`&[]` lets the polyfill expand
-	// to every version it knows). `qmux_versions_for` pins the few that the spec
-	// restricts. qmux also offers the bare ALPNs (`qmux-01`, `qmux-00`,
-	// `webtransport`) by default so we still interop with relays that only know a
-	// wire-format version.
-	let session = qmux::ws::Client::new()
-		.with_protocols(alpns.iter().map(|&a| (a, qmux_versions_for(a))))
-		.with_connector(connector)
-		.with_keep_alive(qmux::ws::KeepAlive::default()) // 5s ping / 30s deadline, parity with QUIC
-		.connect(url.as_str())
-		.await
-		.map_err(Error::Connect)?;
+			// Most moq ALPNs can ride on any QMux draft (`&[]` lets the polyfill expand
+			// to every version it knows). `qmux_versions_for` pins the few that the spec
+			// restricts. qmux also offers the bare ALPNs (`qmux-01`, `qmux-00`,
+			// `webtransport`) by default so we still interop with relays that only know a
+			// wire-format version.
+			qmux::ws::Client::new()
+				.with_protocols(alpns.iter().map(|&a| (a, qmux_versions_for(a))))
+				.with_connector(connector)
+				.with_keep_alive(qmux::ws::KeepAlive::default()) // 5s ping / 30s deadline, parity with QUIC
+				.connect(url.as_str())
+				.await
+				.map_err(Error::connect)?
+		}
+	};
 
 	tracing::warn!(peer = %crate::connect::Endpoint(&url), "using WebSocket fallback");
 	WEBSOCKET_WON.lock().unwrap().insert(key);
@@ -274,12 +316,67 @@ pub(crate) async fn connect(
 	Ok(session)
 }
 
+/// Dial the URL address while using a different server name for the TLS layer.
+async fn connect_tls_override(
+	tls: &rustls::ClientConfig,
+	tls_host_name: &str,
+	url: &Url,
+	host: &str,
+	port: u16,
+	alpns: &[&str],
+) -> Result<qmux::Session> {
+	let original_request = url
+		.as_str()
+		.into_client_request()
+		.map_err(|err| Error::BuildRequest(crate::error::message(err)))?;
+	let original_host = original_request
+		.headers()
+		.get(http::header::HOST)
+		.cloned()
+		.ok_or(Error::MissingHostname)?;
+	let mut tls_url = url.clone();
+	tls_url
+		.set_host(Some(tls_host_name))
+		.map_err(|_| Error::connect(qmux::Error::InvalidServerName))?;
+	let mut request = tls_url
+		.as_str()
+		.into_client_request()
+		.map_err(|err| Error::BuildRequest(crate::error::message(err)))?;
+	request.headers_mut().insert(http::header::HOST, original_host);
+	let protocols = supported_subprotocols(alpns).join(", ");
+	request.headers_mut().insert(
+		http::header::SEC_WEBSOCKET_PROTOCOL,
+		http::HeaderValue::from_str(&protocols).map_err(|err| Error::ProtocolHeader(crate::error::message(err)))?,
+	);
+
+	let host = host
+		.strip_prefix('[')
+		.and_then(|host| host.strip_suffix(']'))
+		.unwrap_or(host);
+	let stream = tokio::net::TcpStream::connect((host, port)).await?;
+	let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls.clone()));
+	let (websocket, response) = tokio_tungstenite::client_async_tls_with_config(request, stream, None, Some(connector))
+		.await
+		.map_err(qmux::Error::from)
+		.map_err(Error::connect)?;
+
+	let negotiated = response
+		.headers()
+		.get(http::header::SEC_WEBSOCKET_PROTOCOL)
+		.and_then(|value| value.to_str().ok());
+	let upgraded = qmux::ws::Upgraded::new(websocket).with_keep_alive(qmux::ws::KeepAlive::default());
+	Ok(match negotiated {
+		Some(protocol) => upgraded.with_alpn(protocol).connect(),
+		None => upgraded.connect(),
+	})
+}
+
 /// The QMux drafts a moq ALPN is allowed to ride on, for `qmux::ws::Client::with_protocols`.
 ///
 /// moq-transport-18 and -19 require qmux-01, so we never pair them with qmux-00.
 /// This mirrors the policy in `js/net`'s `connect.ts`. Every other ALPN returns
 /// `&[]`, which qmux expands to every draft it knows about.
-const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19"];
+const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19", "moqt-20"];
 
 fn qmux_versions_for(alpn: &str) -> &'static [qmux::Version] {
 	if QMUX01_ONLY_ALPNS.contains(&alpn) {
@@ -293,9 +390,11 @@ impl Error {
 	pub(crate) fn connect_error(&self) -> Option<crate::ConnectError> {
 		match self {
 			Self::ConnectRejected(err) => Some(*err),
-			// qmux surfaces a non-101 WebSocket upgrade response as `Http(status)`;
+			// qmux surfaces a non-101 WebSocket upgrade response as a status;
 			// map an auth rejection (401/403) so the caller sees it as terminal.
-			Self::Connect(qmux::Error::Http(status)) => crate::ConnectError::from_status_u16(*status),
+			Self::Connect {
+				status: Some(status), ..
+			} => crate::ConnectError::from_status_u16(*status),
 			_ => None,
 		}
 	}
@@ -306,7 +405,7 @@ impl Error {
 	/// [`crate::Error::status`].
 	pub(crate) fn status(&self) -> Option<u16> {
 		match self {
-			Self::Connect(qmux::Error::Http(status)) => Some(*status),
+			Self::Connect { status, .. } => *status,
 			_ => None,
 		}
 	}
@@ -333,7 +432,7 @@ impl Listener {
 		let listener = tokio::net::TcpListener::bind(addr).await?;
 		let protocols = supported_subprotocols(alpns);
 		for protocol in &protocols {
-			http::HeaderValue::from_str(protocol).map_err(Error::ProtocolHeader)?;
+			http::HeaderValue::from_str(protocol).map_err(|err| Error::ProtocolHeader(crate::error::message(err)))?;
 		}
 		Ok(Self {
 			listener,
@@ -414,7 +513,7 @@ impl Listener {
 		let websocket = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, None)
 			.await
 			.map_err(qmux::Error::from)
-			.map_err(Error::Accept);
+			.map_err(Error::accept);
 		Some(websocket.map(|websocket| {
 			let (protocol, url) = accepted
 				.lock()
@@ -497,6 +596,7 @@ fn supported_subprotocols(alpns: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 	#[test]
 	fn subprotocol_selection_preserves_legacy_clients() {
@@ -527,6 +627,77 @@ mod tests {
 		drop(websocket);
 	}
 
+	#[tokio::test]
+	async fn tls_host_name_override_dials_url_address() {
+		let rcgen::CertifiedKey { cert, signing_key } =
+			rcgen::generate_simple_self_signed(["relay.example".to_string()]).unwrap();
+		let cert = CertificateDer::from(cert);
+		let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+		let provider = crate::crypto::provider();
+		let server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+			.with_safe_default_protocol_versions()
+			.unwrap()
+			.with_no_client_auth()
+			.with_single_cert(vec![cert.clone()], key)
+			.unwrap();
+
+		let mut roots = rustls::RootCertStore::empty();
+		roots.add(cert).unwrap();
+		let client_tls = rustls::ClientConfig::builder_with_provider(provider)
+			.with_safe_default_protocol_versions()
+			.unwrap()
+			.with_root_certificates(roots)
+			.with_no_client_auth();
+
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let accepted = tokio::spawn(async move {
+			let (stream, _) = listener.accept().await.unwrap();
+			let tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls))
+				.accept(stream)
+				.await
+				.unwrap();
+			let server_name = tls.get_ref().1.server_name().map(str::to_string);
+			let host = Arc::new(Mutex::new(None));
+			let request_host = host.clone();
+			#[allow(clippy::result_large_err)]
+			let callback = move |request: &tungstenite::handshake::server::Request,
+			            mut response: tungstenite::handshake::server::Response| {
+				*request_host.lock().unwrap() = request
+					.headers()
+					.get(http::header::HOST)
+					.and_then(|value| value.to_str().ok())
+					.map(str::to_string);
+				if let Some(protocol) = request
+					.headers()
+					.get(http::header::SEC_WEBSOCKET_PROTOCOL)
+					.and_then(|value| value.to_str().ok())
+					.and_then(|value| value.split(',').next())
+					.map(str::trim)
+				{
+					response.headers_mut().insert(
+						http::header::SEC_WEBSOCKET_PROTOCOL,
+						http::HeaderValue::from_str(protocol).unwrap(),
+					);
+				}
+				Ok(response)
+			};
+			let _websocket = tokio_tungstenite::accept_hdr_async(tls, callback).await.unwrap();
+			let host = host.lock().unwrap().take();
+			(server_name, host)
+		});
+
+		let config = Config::default();
+		let url = Url::parse(&format!("wss://127.0.0.1:{}/anon", addr.port())).unwrap();
+		let session = connect(&config, &client_tls, Some("relay.example"), url, moq_net::ALPNS)
+			.await
+			.unwrap();
+		drop(session);
+		let (server_name, host) = accepted.await.unwrap();
+		assert_eq!(server_name.as_deref(), Some("relay.example"));
+		assert_eq!(host.as_deref(), Some(format!("127.0.0.1:{}", addr.port()).as_str()));
+	}
+
 	#[test]
 	fn moqt_18_and_19_pin_to_qmux01() {
 		// The literals in `qmux_versions_for` must stay the IETF draft ALPNs;
@@ -536,7 +707,7 @@ mod tests {
 				.iter()
 				.map(|&a| moq_net::Version::from_alpn(a).map(|v| v.code()))
 				.collect::<Vec<_>>(),
-			vec![Some(0xff000012), Some(0xff000013)]
+			vec![Some(0xff000012), Some(0xff000013), Some(0xff000014)]
 		);
 		for &alpn in QMUX01_ONLY_ALPNS {
 			assert_eq!(qmux_versions_for(alpn), &[qmux::Version::QMux01]);
@@ -554,18 +725,16 @@ mod tests {
 #[cfg(test)]
 mod legacy_tests {
 	use super::*;
-	use clap::Parser;
-
-	#[derive(Parser)]
+	#[derive(usage::Cli)]
+	#[usage(unknown_flags = "error", args_override_self = false)]
 	struct Cli {
-		#[command(flatten)]
+		#[usage(flatten)]
 		websocket: Config,
 	}
 
 	fn parse(args: &[&str]) -> Config {
-		let mut argv = vec!["test"];
-		argv.extend_from_slice(args);
-		Cli::parse_from(argv).websocket
+		let argv = args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>();
+		Cli::parse_from(&argv).unwrap().websocket
 	}
 
 	/// The released env vars have hidden flags of their own, so they are recognized
@@ -591,9 +760,9 @@ mod legacy_tests {
 		assert!(!config.resolved_enabled());
 		assert_eq!(config.resolved_delay(), time::Duration::from_secs(2));
 
-		// Neither given: the defaults, which no config file can be clobbered out of.
+		// Neither given: the typed defaults.
 		let config = parse(&[]);
-		assert_eq!(config.delay, None);
+		assert_eq!(config.delay, DEFAULT_DELAY);
 		assert_eq!(config.resolved_delay(), DEFAULT_DELAY);
 	}
 }

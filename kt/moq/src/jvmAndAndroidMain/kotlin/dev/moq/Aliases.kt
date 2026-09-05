@@ -21,26 +21,26 @@ typealias Request = uniffi.moq.MoqRequest
 typealias OriginProducer = uniffi.moq.MoqOriginProducer
 /** Options for creating an origin, such as its total cache budget. */
 typealias OriginOptions = uniffi.moq.MoqOriginOptions
-/** The subscribe side of an origin: discover and request announced broadcasts. */
+/** The subscribe side of an origin: discover and request published broadcasts. */
 typealias OriginConsumer = uniffi.moq.MoqOriginConsumer
-/** A stream of broadcasts requested by subscribers, for serving unannounced paths on demand. */
+/** A stream of broadcasts requested by subscribers, for serving paths nothing publishes on demand, under the root or an announced prefix. */
 typealias OriginDynamic = uniffi.moq.MoqOriginDynamic
 /** A requested broadcast not yet accepted: fulfill it with a producer or abort it. */
 typealias BroadcastRequest = uniffi.moq.MoqBroadcastRequest
-/** A stream of broadcast announcements under a prefix. */
+/** A stream of route announcements and retractions under a prefix. */
 typealias Announced = uniffi.moq.MoqAnnounced
-/** A pending wait for a specific broadcast path to be announced. */
+/** A pending wait for a route to cover a specific path. */
 typealias AnnouncedBroadcast = uniffi.moq.MoqAnnouncedBroadcast
-/** A single broadcast announcement: its path plus a consumer. */
+/** A single route announcement or retraction: its path, route metadata, and active flag. */
 typealias Announcement = uniffi.moq.MoqAnnouncement
+/** A live route advertisement: hold it while the route should stay announced. */
+typealias Announce = uniffi.moq.MoqAnnounce
 
 // Broadcast / track / group producers and consumers.
 /** The write side of a broadcast: publish tracks into it. */
 typealias BroadcastProducer = uniffi.moq.MoqBroadcastProducer
 /** The read side of a broadcast: subscribe to its catalog and tracks. */
 typealias BroadcastConsumer = uniffi.moq.MoqBroadcastConsumer
-/** Watches a broadcast's route: yields the current route first, then every change. */
-typealias RouteWatch = uniffi.moq.MoqRouteWatch
 /** Receives tracks requested from a dynamically served broadcast. */
 typealias BroadcastDynamic = uniffi.moq.MoqBroadcastDynamic
 /** The write side of a raw track: append groups of frames. */
@@ -71,7 +71,7 @@ typealias ContainerStreamProducer = uniffi.moq.MoqContainerStreamProducer
 typealias MediaConsumer = uniffi.moq.MoqMediaConsumer
 /** A finite fetched media group: yields container-decoded frames until the group ends. */
 typealias MediaGroupConsumer = uniffi.moq.MoqMediaGroupConsumer
-/** The write side of a raw-audio track; PCM written here is encoded inside the FFI boundary. */
+/** A demand-observable raw-audio track producer with explicit timeline re-anchoring after idle gaps. */
 typealias AudioProducer = uniffi.moq.MoqAudioProducer
 /** The read side of a raw-audio track: yields decoded PCM frames. */
 typealias AudioConsumer = uniffi.moq.MoqAudioConsumer
@@ -121,7 +121,7 @@ typealias ContainerInit = uniffi.moq.MoqContainerInit
 typealias Audio = uniffi.moq.MoqAudio
 /** A width and height pair, in pixels. */
 typealias Dimensions = uniffi.moq.MoqDimensions
-/** The route a broadcast takes to reach this origin: relay hop ids (oldest first), advertised cost (lower wins), and whether it's announced. */
+/** A path-prefix route: the prefix it covers, relay hop ids (oldest first), and advertised cost (lower wins). */
 typealias Route = uniffi.moq.MoqRoute
 /** Tunes how a track subscription is delivered: priority, group ordering, and range. */
 typealias Subscription = uniffi.moq.MoqSubscription
@@ -153,7 +153,7 @@ typealias VideoCodec = uniffi.moq.MoqVideoCodec
 typealias VideoPixelFormat = uniffi.moq.MoqVideoPixelFormat
 /** The pixel layout, resolution, and framerate the caller feeds a [VideoProducer]. */
 typealias VideoEncoderInput = uniffi.moq.MoqVideoEncoderInput
-/** The codec-side encoder configuration: codec, bitrate, keyframe interval, and backend preference. */
+/** The video track name, codec, bitrate, keyframe interval, and backend preference. */
 typealias VideoEncoderOutput = uniffi.moq.MoqVideoEncoderOutput
 /** Which encoder implementation to use: automatic, hardware, software, or one named backend. */
 typealias VideoEncoderKind = uniffi.moq.MoqVideoEncoderKind

@@ -21,13 +21,17 @@ if ! command -v go >/dev/null 2>&1; then
     echo "go check: no go on PATH, skipping" >&2
     exit 0
 fi
+# The publish state machine needs neither cargo nor generated bindings, so it
+# runs ahead of the gates that skip a partial toolchain.
+bash "$SCRIPT_DIR/publish-wrapper.test.sh"
+
 if ! command -v cargo >/dev/null 2>&1; then
     echo "go check: no cargo on PATH, skipping" >&2
     exit 0
 fi
 if ! command -v uniffi-bindgen-go >/dev/null 2>&1; then
     echo "go check: uniffi-bindgen-go not on PATH, skipping" >&2
-    echo "  install: cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.7.1+v0.31.0" >&2
+    echo "  install: cargo install uniffi-bindgen-go --git https://github.com/kixelated/uniffi-bindgen-go --rev 4f79e52bd8f518e5fa4d7acff9e586aee21e12a0 --locked" >&2
     exit 0
 fi
 
@@ -46,7 +50,7 @@ CARGO_PROFILE=()
 [[ "$PROFILE" == "release" ]] && CARGO_PROFILE=(--release)
 
 echo "go check: building moq-ffi for $HOST_TARGET..."
-cargo build ${CARGO_PROFILE[@]+"${CARGO_PROFILE[@]}"} --package moq-ffi \
+"${RUST_CARGO:-cargo}" build --locked ${CARGO_PROFILE[@]+"${CARGO_PROFILE[@]}"} --package moq-ffi \
     --manifest-path "$WORKSPACE_DIR/Cargo.toml"
 
 TARGET_BASE=$(cargo metadata --format-version 1 --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-deps |
@@ -106,6 +110,12 @@ uniffi-bindgen-go --library "$CDYLIB" --out-dir "$STAGE_BINDINGS"
 if [[ -d "$STAGE_BINDINGS/uniffi/moq" && ! -d "$STAGE_BINDINGS/moq" ]]; then
     cp -R "$STAGE_BINDINGS/uniffi/moq" "$STAGE_BINDINGS/moq"
 fi
+
+echo "go check: checking error sentinels..."
+bash "$SCRIPT_DIR/check-errors.sh" \
+    "$STAGE_BINDINGS/moq/moq.go" \
+    "$GO_DIR/wrapper/errors.go" \
+    "$GO_DIR/wrapper/errors_test.go"
 
 echo "go check: assembling ffi module..."
 # --skip-size-check because the lib above is a plain host build, unrelated to

@@ -251,17 +251,14 @@ impl Client {
 		}
 		.map_err(|err| MoqError::Connect(format!("{err}")))?;
 
-		let (session, driver) = moq_net::Client::new()
+		// The runtime spawns the protocol machine on the microtask queue. The machine
+		// holds no session clone, so dropping the last handle still closes the
+		// transport and ends that task.
+		let session = moq_net::Client::new()
 			.with_publisher(&publish)
 			.with_subscriber(subscribe.clone())
-			.connect(transport)
+			.connect(crate::runtime::Runtime, transport)
 			.await?;
-
-		// The session only progresses while the driver runs. The driver holds no session
-		// clone, so dropping the last handle still closes the transport and ends this task.
-		web_async::spawn(async move {
-			let _ = driver.await;
-		});
 
 		Ok(Arc::new(MoqSession::accepted(session, publish, subscribe)))
 	}
@@ -479,10 +476,10 @@ impl MoqClient {
 	pub fn set_backoff(&self, backoff: MoqBackoff) {
 		if let Some(mut state) = self.task.lock() {
 			let mut out = moq_tokio::Backoff::default();
-			out.initial = Some(std::time::Duration::from_millis(backoff.initial_ms));
-			out.multiplier = Some(backoff.multiplier);
-			out.max = Some(std::time::Duration::from_millis(backoff.max_ms));
-			out.timeout = Some(std::time::Duration::from_millis(backoff.timeout_ms));
+			out.initial = std::time::Duration::from_millis(backoff.initial_ms).into();
+			out.multiplier = backoff.multiplier;
+			out.max = std::time::Duration::from_millis(backoff.max_ms).into();
+			out.timeout = std::time::Duration::from_millis(backoff.timeout_ms).into();
 			state.config.backoff = out;
 		}
 	}

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.15...moq-transcode-v0.0.16) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, moq-video, hang, moq-mux
+
+## [0.0.15](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.14...moq-transcode-v0.0.15) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.0.14](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.13...moq-transcode-v0.0.14) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-video, hang
+
+## [0.0.13](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.12...moq-transcode-v0.0.13) - 2026-08-24
+
+### Other
+
+- updated the following local packages: moq-video
+
+## [0.0.12](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.11...moq-transcode-v0.0.12) - 2026-08-20
+
+### Added
+
+- *(video)* give the bindings the NVIDIA codecs, and warn when Auto falls to software ([#2950](https://github.com/moq-dev/moq/pull/2950))
+- *(moq-net)* add Path::relative, replacing moq_transcode::source_reference ([#2906](https://github.com/moq-dev/moq/pull/2906))
+
 ## [0.0.11](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.10...moq-transcode-v0.0.11) - 2026-08-14
 
 ### Fixed

@@ -4,7 +4,7 @@
 //! Each test is gated with `#[cfg(feature = "...")]` so it only compiles when the
 //! corresponding backend is enabled. Running `cargo test --all-features` exercises all.
 
-use moq_tokio::moq_net::{self, Origin};
+use moq_tokio::moq_net::Hop;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,9 +104,10 @@ async fn connect_test(config: ConnectTest<'_>) {
 	} = config;
 
 	// ── publisher (server) ──────────────────────────────────────────
-	let pub_origin = moq_tokio::origin::spawn(Origin::random());
-	let mut broadcast = pub_origin
-		.create_broadcast("test", moq_net::broadcast::Route::new().with_announce(true))
+	let pub_origin = moq_tokio::origin::spawn(Hop::random());
+	let mut broadcast = pub_origin.create_broadcast("test").expect("failed to create broadcast");
+	broadcast
+		.announce(Default::default())
 		.expect("failed to create broadcast");
 	let mut track = broadcast.create_track("video", None).expect("failed to create track");
 
@@ -128,8 +129,9 @@ async fn connect_test(config: ConnectTest<'_>) {
 	let addr = server.local_addr().expect("failed to get local addr");
 
 	// ── subscriber (client) ─────────────────────────────────────────
-	let sub_origin = moq_tokio::origin::spawn(Origin::random());
-	let mut announcements = sub_origin.consume().announced();
+	let sub_origin = moq_tokio::origin::spawn(Hop::random());
+	let sub_consumer = sub_origin.consume();
+	let mut announcements = sub_consumer.announced();
 
 	let mut client_config = moq_tokio::connect::Config::default();
 	client_config.tls.insecure = Some(true);
@@ -171,14 +173,16 @@ async fn connect_test(config: ConnectTest<'_>) {
 		.expect("client connect timed out")
 		.expect("client connect failed");
 
-	let moq_tokio::moq_net::announce::Update { path, broadcast: bc } =
-		tokio::time::timeout(TIMEOUT, announcements.next())
-			.await
-			.expect("announce timed out")
-			.expect("origin closed");
-
-	assert_eq!(path.as_str(), "test");
-	let bc = bc.expect("expected announce, got unannounce");
+	let update = tokio::time::timeout(TIMEOUT, announcements.next())
+		.await
+		.expect("announce timed out")
+		.expect("origin closed");
+	assert_eq!(update.prefix.as_path().as_str(), "test");
+	assert!(update.active, "expected announce, got retraction");
+	let bc = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast("test"))
+		.await
+		.expect("request timed out")
+		.expect("announced broadcast resolves");
 
 	let mut track_sub = bc
 		.track("video")
@@ -206,6 +210,177 @@ async fn connect_test(config: ConnectTest<'_>) {
 		.await
 		.expect("server task panicked")
 		.expect("server task failed");
+}
+
+/// Write a self-signed PEM cert + key for `name` to `dir`, prefixed by `stem`.
+///
+/// Returns the two paths, in the order the `cert` and `key` lists want them.
+#[cfg(any(feature = "quinn", feature = "quiche", feature = "noq"))]
+fn write_self_signed(dir: &std::path::Path, stem: &str, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+	use std::io::Write;
+
+	let key = rcgen::KeyPair::generate().expect("key");
+	let params = rcgen::CertificateParams::new(vec![name.to_string()]).expect("params");
+	let cert = params.self_signed(&key).expect("cert");
+
+	let write = |name: String, contents: String| {
+		let path = dir.join(name);
+		let mut file = std::fs::File::create(&path).expect("create pem file");
+		file.write_all(contents.as_bytes()).expect("write pem file");
+		path
+	};
+
+	(
+		write(format!("{stem}.pem"), cert.pem()),
+		write(format!("{stem}.key"), key.serialize_pem()),
+	)
+}
+
+/// Serve two certificates for different names and assert the one matching the
+/// client's SNI is the one presented, by pinning its fingerprint.
+///
+/// Pinning skips CA and hostname verification, so the handshake succeeds exactly
+/// when the server picked the certificate the SNI asked for. Without SNI
+/// selection every client would get the first configured certificate, so the
+/// `alt.localhost` pin below would never match.
+#[cfg(any(feature = "quinn", feature = "quiche", feature = "noq"))]
+async fn sni_test(backend: moq_tokio::QuicBackend) {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (first_cert, first_key) = write_self_signed(dir.path(), "first", "localhost");
+	let (second_cert, second_key) = write_self_signed(dir.path(), "second", "alt.localhost");
+
+	let mut server_config = moq_tokio::listen::Config::default();
+	server_config.bind = Some("127.0.0.1:0".to_string());
+	server_config.tls.cert = vec![first_cert, second_cert];
+	server_config.tls.key = vec![first_key, second_key];
+	server_config.backend = Some(backend.clone());
+
+	let server = server_config
+		.init(moq_tokio::quic::Config::default())
+		.expect("failed to init server");
+	let server = server.listen().await.expect("failed to listen");
+	let addr = server.local_addr().expect("failed to get local addr");
+
+	// Both pairs are loaded, not just the first: index 0 alone would report one.
+	let fingerprints = server.certificates().fingerprints();
+	assert_eq!(fingerprints.len(), 2, "expected both certificates to be served");
+
+	// Keep accepting so the client handshakes complete, then drop the server.
+	let server_handle = tokio::spawn(async move {
+		let mut server = server;
+		while server.accept().await.is_some() {}
+	});
+
+	let dial = |host_name: &str, fingerprint: &str| {
+		let mut client_config = moq_tokio::connect::Config::default();
+		client_config.tls.fingerprint = vec![fingerprint.to_string()];
+		client_config.tls.host_name = Some(host_name.to_string());
+		client_config.backend = Some(backend.clone());
+		client_config.bind = Some("0.0.0.0:0".parse().unwrap());
+		let client = client_config
+			.init(moq_tokio::quic::Config::default())
+			.expect("failed to init client");
+		let url: url::Url = format!("moqt://127.0.0.1:{}", addr.port()).parse().unwrap();
+		connect_once(client, url)
+	};
+
+	// The SNI names the second certificate, so that is the one to pin. Hold the
+	// connection: dropping it would tear the session down mid-assertion.
+	let _matched = tokio::time::timeout(TIMEOUT, dial("alt.localhost", &fingerprints[1]))
+		.await
+		.expect("client connect timed out")
+		.expect("client connect failed");
+
+	// The same pin with the other SNI must fail: the server serves the first
+	// certificate there, whose fingerprint the client does not accept.
+	let wrong = tokio::time::timeout(TIMEOUT, dial("localhost", &fingerprints[1]))
+		.await
+		.expect("client connect timed out");
+	assert!(wrong.is_err(), "pinning the wrong certificate must fail the handshake");
+
+	server_handle.abort();
+}
+
+/// A generated certificate joins the file-backed ones rather than replacing them.
+#[cfg(any(feature = "quinn", feature = "quiche", feature = "noq"))]
+async fn cert_sources_test(backend: moq_tokio::QuicBackend) {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = write_self_signed(dir.path(), "server", "localhost");
+
+	let mut server_config = moq_tokio::listen::Config::default();
+	server_config.bind = Some("127.0.0.1:0".to_string());
+	server_config.tls.cert = vec![cert];
+	server_config.tls.key = vec![key];
+	server_config.tls.generate = vec!["generated.localhost".into()];
+	server_config.backend = Some(backend);
+
+	let server = server_config
+		.init(moq_tokio::quic::Config::default())
+		.expect("failed to init server");
+	let server = server.listen().await.expect("failed to listen");
+
+	assert_eq!(
+		server.certificates().fingerprints().len(),
+		2,
+		"expected the file-backed and generated certificates to both be served"
+	);
+}
+
+/// Rotate the certificate files under a running listener and assert the served
+/// set follows, without the listener being rebuilt.
+#[cfg(any(feature = "quinn", feature = "quiche", feature = "noq"))]
+async fn reload_test(backend: moq_tokio::QuicBackend) {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = write_self_signed(dir.path(), "server", "localhost");
+
+	let mut server_config = moq_tokio::listen::Config::default();
+	server_config.bind = Some("127.0.0.1:0".to_string());
+	server_config.tls.cert = vec![cert.clone()];
+	server_config.tls.key = vec![key.clone()];
+	server_config.backend = Some(backend);
+
+	let server = server_config
+		.init(moq_tokio::quic::Config::default())
+		.expect("failed to init server");
+	let server = server.listen().await.expect("failed to listen");
+	let certificates = server.certificates();
+	let before = certificates.fingerprints();
+	assert_eq!(before.len(), 1);
+
+	// The reload task is spawned while the listener is built and registers its
+	// watcher the first time the runtime polls it, which may be after this point.
+	// Rotating before then would replace the files with nothing watching them.
+	tokio::time::sleep(Duration::from_millis(200)).await;
+
+	// Rotate in place, the way cert-manager or a secret mount would.
+	let (new_cert, new_key) = write_self_signed(dir.path(), "rotated", "localhost");
+	std::fs::rename(&new_cert, &cert).expect("rotate cert");
+	std::fs::rename(&new_key, &key).expect("rotate key");
+
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert!(
+		tracing_test::internal::logs_with_scope_contain("moq_tokio", "reloading server certificates"),
+		"no reload log"
+	);
+	assert!(
+		!tracing_test::internal::logs_with_scope_contain("moq_tokio", "hot reload disabled"),
+		"watcher failed"
+	);
+
+	let reloaded = tokio::time::timeout(TIMEOUT, async {
+		loop {
+			let now = certificates.fingerprints();
+			if now != before {
+				return now;
+			}
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	})
+	.await
+	.expect("certificate reload timed out");
+
+	assert_eq!(reloaded.len(), 1);
+	drop(server);
 }
 
 /// Generate a CA, a server cert + key, and a client cert + key (all PEM, the
@@ -279,7 +454,7 @@ struct MtlsPaths {
 async fn mtls_test(scheme: &str, backend: moq_tokio::QuicBackend, reject: bool) {
 	let (_dir, paths) = generate_mtls_certs();
 
-	let pub_origin = moq_tokio::origin::spawn(Origin::random());
+	let pub_origin = moq_tokio::origin::spawn(Hop::random());
 
 	let mut server_config = moq_tokio::listen::Config::default();
 	server_config.bind = Some("127.0.0.1:0".to_string());
@@ -290,7 +465,7 @@ async fn mtls_test(scheme: &str, backend: moq_tokio::QuicBackend, reject: bool) 
 	// One shared tuning, handed to both roles the way a binary would.
 	let mut quic = moq_tokio::quic::Config::default();
 	quic.gso = Some(false);
-	quic.keep_alive = Some(Duration::from_secs(1));
+	quic.keep_alive = Duration::from_secs(1).into();
 
 	let server = server_config.init(quic.clone()).expect("failed to init server");
 	let mut server = server.listen().await.expect("failed to listen");
@@ -388,6 +563,29 @@ async fn quinn_webtransport_path() {
 	path_test("https", moq_tokio::QuicBackend::Quinn).await;
 }
 
+/// The same certificate semantics the quiche backend now shares, checked here so
+/// the two can't drift apart.
+#[cfg(feature = "quinn")]
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn quinn_sni_certificate() {
+	sni_test(moq_tokio::QuicBackend::Quinn).await;
+}
+
+#[cfg(feature = "quinn")]
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn quinn_cert_sources() {
+	cert_sources_test(moq_tokio::QuicBackend::Quinn).await;
+}
+
+#[cfg(feature = "quinn")]
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn quinn_cert_reload() {
+	reload_test(moq_tokio::QuicBackend::Quinn).await;
+}
+
 #[cfg(feature = "quinn")]
 #[tracing_test::traced_test]
 #[tokio::test]
@@ -438,6 +636,27 @@ async fn quiche_dual_stack_ipv4() {
 #[cfg(feature = "quiche")]
 #[tracing_test::traced_test]
 #[tokio::test]
+async fn quiche_sni_certificate() {
+	sni_test(moq_tokio::QuicBackend::Quiche).await;
+}
+
+#[cfg(feature = "quiche")]
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn quiche_cert_sources() {
+	cert_sources_test(moq_tokio::QuicBackend::Quiche).await;
+}
+
+#[cfg(feature = "quiche")]
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn quiche_cert_reload() {
+	reload_test(moq_tokio::QuicBackend::Quiche).await;
+}
+
+#[cfg(feature = "quiche")]
+#[tracing_test::traced_test]
+#[tokio::test]
 async fn quiche_mtls() {
 	// Avoid waiting on the separately tracked quiche WebTransport teardown bug.
 	mtls_test("https", moq_tokio::QuicBackend::Quiche, true).await;
@@ -466,9 +685,10 @@ async fn iroh_connect() {
 	use moq_tokio::iroh::EndpointConfig;
 
 	// ── publisher (server) ──────────────────────────────────────────
-	let pub_origin = moq_tokio::origin::spawn(Origin::random());
-	let mut broadcast = pub_origin
-		.create_broadcast("test", moq_net::broadcast::Route::new().with_announce(true))
+	let pub_origin = moq_tokio::origin::spawn(Hop::random());
+	let mut broadcast = pub_origin.create_broadcast("test").expect("failed to create broadcast");
+	broadcast
+		.announce(Default::default())
 		.expect("failed to create broadcast");
 	let mut track = broadcast.create_track("video", None).expect("failed to create track");
 
@@ -505,8 +725,9 @@ async fn iroh_connect() {
 	let mut server = server.listen().await.expect("failed to listen");
 
 	// ── subscriber (client) ─────────────────────────────────────────
-	let sub_origin = moq_tokio::origin::spawn(Origin::random());
-	let mut announcements = sub_origin.consume().announced();
+	let sub_origin = moq_tokio::origin::spawn(Hop::random());
+	let sub_consumer = sub_origin.consume();
+	let mut announcements = sub_consumer.announced();
 
 	// Create client iroh endpoint
 	let mut client_iroh_config = EndpointConfig::default();
@@ -556,14 +777,16 @@ async fn iroh_connect() {
 		.expect("client connect timed out")
 		.expect("client connect failed");
 
-	let moq_tokio::moq_net::announce::Update { path, broadcast: bc } =
-		tokio::time::timeout(TIMEOUT, announcements.next())
-			.await
-			.expect("announce timed out")
-			.expect("origin closed");
-
-	assert_eq!(path.as_str(), "test");
-	let bc = bc.expect("expected announce, got unannounce");
+	let update = tokio::time::timeout(TIMEOUT, announcements.next())
+		.await
+		.expect("announce timed out")
+		.expect("origin closed");
+	assert_eq!(update.prefix.as_path().as_str(), "test");
+	assert!(update.active, "expected announce, got retraction");
+	let bc = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast("test"))
+		.await
+		.expect("request timed out")
+		.expect("announced broadcast resolves");
 
 	let mut track_sub = bc
 		.track("video")

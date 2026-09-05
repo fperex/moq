@@ -40,6 +40,7 @@ impl web_transport_trait::Error for SinkError {
 pub struct Log {
 	pub writes: Arc<Mutex<Vec<u8>>>,
 	pub resets: Arc<Mutex<Vec<u32>>>,
+	stops: Arc<Mutex<Vec<u32>>>,
 	closes: Arc<Mutex<Vec<(u32, String)>>>,
 	bi_opens: Arc<AtomicUsize>,
 	priorities: Arc<Mutex<Vec<u8>>>,
@@ -48,6 +49,16 @@ pub struct Log {
 impl Log {
 	pub fn resets(&self) -> Vec<u32> {
 		self.resets.lock().unwrap().clone()
+	}
+
+	/// The STOP_SENDING codes sent on the session's receive streams, in call order.
+	/// Cancelling a request is a reset of what we send plus one of these on what we
+	/// receive, so a test for a cancellation has to be able to see them.
+	///
+	/// Only [`ScriptedRecv`] records them. The other receive streams here discard the code,
+	/// so an empty result on those is not evidence that nothing was sent.
+	pub fn stops(&self) -> Vec<u32> {
+		self.stops.lock().unwrap().clone()
 	}
 
 	/// Every value handed to the transport's `set_priority`, in call order. These are
@@ -302,7 +313,7 @@ impl poll::Session for DeadStreamSession {
 	}
 
 	fn stats(&self) -> impl web_transport_trait::Stats {
-		SinkStats
+		SinkStats::default()
 	}
 }
 
@@ -313,6 +324,9 @@ pub struct SinkSession {
 	/// Set by [`Self::gated_bi`]. `None` parks `open_bi` itself forever, which is all
 	/// a test driving only uni streams needs.
 	bi_gate: Option<kio::Consumer<bool>>,
+	/// Set by [`Self::accepted_bi`]. `None` parks `accept_bi` forever, which is what
+	/// every session that only ever opens its own streams expects.
+	accept_gate: Option<kio::Consumer<bool>>,
 	/// Set by [`Self::gated_uni`] to hold unidirectional stream writes.
 	uni_gate: Option<kio::Consumer<bool>>,
 	/// Set by [`Self::gated_open_uni`] to withhold unidirectional stream credit.
@@ -321,6 +335,10 @@ pub struct SinkSession {
 	/// The ALPN to report, for a test that needs a specific negotiated version rather
 	/// than the SETUP-negotiated fallback an absent one selects.
 	protocol: Option<&'static str>,
+	/// What the transport claims to measure. Defaults to nothing, like a transport
+	/// with no congestion controller exposed. Shared and mutable so a test can
+	/// change it mid-session, the way a real transport's figures move.
+	stats: Arc<Mutex<SinkStats>>,
 }
 
 impl SinkSession {
@@ -328,11 +346,24 @@ impl SinkSession {
 		Self {
 			log,
 			bi_gate: None,
+			accept_gate: None,
 			uni_gate: None,
 			uni_open_gate: None,
 			uni_open_park: kio::Park::default(),
 			protocol: None,
+			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
+	}
+
+	/// Report these connection statistics, as a real transport would.
+	pub fn with_stats(self, stats: SinkStats) -> Self {
+		self.set_stats(stats);
+		self
+	}
+
+	/// Change what the transport reports, mid-session.
+	pub fn set_stats(&self, stats: SinkStats) {
+		*self.stats.lock().unwrap() = stats;
 	}
 
 	/// Report `protocol` as the negotiated ALPN.
@@ -350,10 +381,30 @@ impl SinkSession {
 		Self {
 			log: Log::default(),
 			bi_gate: Some(gate),
+			accept_gate: None,
 			uni_gate: None,
 			uni_open_gate: None,
 			uni_open_park: kio::Park::default(),
 			protocol: None,
+			stats: Arc::new(Mutex::new(SinkStats::default())),
+		}
+	}
+
+	/// Accept bidi streams from the peer, holding every write until `gate` flips to true.
+	///
+	/// The accepted half of a control stream carries the answers (track info,
+	/// subscribe responses), so a test of what must be true before the first byte of
+	/// a reply reaches the wire needs a session that hands out accepted streams.
+	pub fn accepted_bi(gate: kio::Consumer<bool>) -> Self {
+		Self {
+			log: Log::default(),
+			bi_gate: None,
+			accept_gate: Some(gate),
+			uni_gate: None,
+			uni_open_gate: None,
+			uni_open_park: kio::Park::default(),
+			protocol: None,
+			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
 	}
 
@@ -362,10 +413,12 @@ impl SinkSession {
 		Self {
 			log: Log::default(),
 			bi_gate: None,
+			accept_gate: None,
 			uni_gate: Some(gate),
 			uni_open_gate: None,
 			uni_open_park: kio::Park::default(),
 			protocol: None,
+			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
 	}
 
@@ -374,10 +427,12 @@ impl SinkSession {
 		Self {
 			log: Log::default(),
 			bi_gate: None,
+			accept_gate: None,
 			uni_gate: None,
 			uni_open_gate: Some(gate),
 			uni_open_park: kio::Park::default(),
 			protocol: None,
+			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
 	}
 }
@@ -392,7 +447,17 @@ impl poll::Session for SinkSession {
 	}
 
 	fn poll_accept_bi(&mut self, _cx: &mut Context<'_>) -> Poll<Result<poll::BiStreams<Self>, Self::Error>> {
-		Poll::Pending
+		let Some(gate) = self.accept_gate.clone() else {
+			return Poll::Pending;
+		};
+
+		let send = SinkSend {
+			log: self.log.clone(),
+			gate: Some(gate),
+			park: kio::Park::default(),
+			finished: false,
+		};
+		Poll::Ready(Ok((send, PendingRecv)))
 	}
 
 	fn poll_open_bi(&mut self, _cx: &mut Context<'_>) -> Poll<Result<poll::BiStreams<Self>, Self::Error>> {
@@ -449,15 +514,39 @@ impl poll::Session for SinkSession {
 	}
 
 	fn stats(&self) -> impl web_transport_trait::Stats {
-		SinkStats
+		*self.stats.lock().unwrap()
 	}
 }
 
-pub struct SinkStats;
+/// Connection statistics a test can dictate. Every metric defaults to unknown,
+/// matching a transport that exposes no congestion controller.
+#[derive(Default, Clone, Copy)]
+pub struct SinkStats {
+	pub estimated_send_rate: Option<u64>,
+	pub rtt: Option<std::time::Duration>,
+}
+
+impl SinkStats {
+	/// Report a send-rate estimate, in bits per second.
+	pub fn with_send_rate(mut self, rate: u64) -> Self {
+		self.estimated_send_rate = Some(rate);
+		self
+	}
+
+	/// Report a round-trip time.
+	pub fn with_rtt(mut self, rtt: std::time::Duration) -> Self {
+		self.rtt = Some(rtt);
+		self
+	}
+}
 
 impl web_transport_trait::Stats for SinkStats {
 	fn estimated_send_rate(&self) -> Option<u64> {
-		None
+		self.estimated_send_rate
+	}
+
+	fn rtt(&self) -> Option<std::time::Duration> {
+		self.rtt
 	}
 }
 
@@ -471,6 +560,7 @@ pub struct ScriptedRecv {
 	/// Report EOF once the script is exhausted rather than parking, so a test can drive
 	/// a read loop all the way through its exit path. See [`ScriptedSession::eof`].
 	eof: bool,
+	log: Log,
 }
 
 impl poll::RecvStream for ScriptedRecv {
@@ -496,7 +586,9 @@ impl poll::RecvStream for ScriptedRecv {
 		}
 	}
 
-	fn stop(&mut self, _code: u32) {}
+	fn stop(&mut self, code: u32) {
+		self.log.stops.lock().unwrap().push(code);
+	}
 
 	fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		Poll::Pending
@@ -561,6 +653,15 @@ impl ScriptedSession {
 		}
 	}
 
+	/// Like [`Self::per_stream`], but an exhausted script closes the stream instead of
+	/// parking, for a test that drives each stream to its end.
+	pub fn per_stream_eof(scripts: Vec<Vec<u8>>) -> Self {
+		Self {
+			eof: true,
+			..Self::per_stream(scripts)
+		}
+	}
+
 	/// Answer each stream from `scripts`, but only once the gate opens: a peer that
 	/// replies normally and is simply out of stream credit until then.
 	pub fn gated_open(scripts: Vec<Vec<u8>>, gate: kio::Consumer<bool>) -> Self {
@@ -604,7 +705,11 @@ impl poll::Session for ScriptedSession {
 		};
 		Poll::Ready(Ok((
 			SinkSend::new(self.log.clone()),
-			ScriptedRecv { script, eof: self.eof },
+			ScriptedRecv {
+				script,
+				eof: self.eof,
+				log: self.log.clone(),
+			},
 		)))
 	}
 
@@ -637,6 +742,6 @@ impl poll::Session for ScriptedSession {
 	}
 
 	fn stats(&self) -> impl web_transport_trait::Stats {
-		SinkStats
+		SinkStats::default()
 	}
 }

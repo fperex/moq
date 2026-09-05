@@ -23,15 +23,17 @@ pub(crate) async fn dial(client: &Client, url: Url, broadcast: moq_net::broadcas
 	let (socket, candidates) = session::bind_udp(&client.config().ice_candidates).await?;
 	let mut rtc = Rtc::new(Instant::now());
 	for addr in &candidates {
-		let cand = Candidate::host(*addr, "udp").map_err(str0m::RtcError::from)?;
+		let cand = Candidate::host(*addr, "udp").map_err(Error::rtc)?;
 		rtc.add_local_candidate(cand);
 	}
 
 	// Ask for both audio and video, recvonly. The remote answer can decline
 	// either by signaling inactive on that m-line.
 	let mut api = rtc.sdp_api();
-	api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
-	api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+	let mids = [
+		api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None),
+		api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None),
+	];
 	let (offer, pending) = api
 		.apply()
 		.ok_or_else(|| Error::Other(anyhow::anyhow!("no SDP changes to apply")))?;
@@ -56,14 +58,17 @@ pub(crate) async fn dial(client: &Client, url: Url, broadcast: moq_net::broadcas
 		.map_err(|err| Error::Other(anyhow::anyhow!("reading WHEP answer body: {err}")))?;
 	let answer = SdpAnswer::from_sdp_string(&body).map_err(|err| Error::InvalidSdp(err.to_string()))?;
 
-	rtc.sdp_api().accept_answer(pending, answer).map_err(Error::Rtc)?;
+	rtc.sdp_api().accept_answer(pending, answer).map_err(Error::rtc)?;
 	tracing::info!(%url, "whep client connected");
 
 	// 1:1 socket (no demux on the client): pump its datagrams into the session.
 	// The session tags each datagram with the advertised candidate matching its
 	// family (str0m matches the destination against a host candidate, not the bind).
 	let inbound = session::spawn_socket_reader(socket.clone());
-	let session = session::Session::ingest(rtc, socket, candidates, inbound, sink);
+	let mut session = session::Session::ingest(rtc, socket, candidates, inbound, sink);
+	for mid in mids {
+		session.open_media(mid)?;
+	}
 	tokio::spawn(async move {
 		let result = session.run().await;
 		session::log_session_end("whep client", &result);

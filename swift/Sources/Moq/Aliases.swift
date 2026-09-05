@@ -56,7 +56,7 @@ public typealias AudioCodec = MoqFFI.MoqAudioCodec
 public typealias VideoFrame = MoqFFI.MoqVideoFrame
 /// The pixel layout, resolution, and framerate written to a `VideoProducer`.
 public typealias VideoEncoderInput = MoqFFI.MoqVideoEncoderInput
-/// The encoder-side config for a published video track: codec, bitrate,
+/// The encoder-side config for a published video track: name, codec, bitrate,
 /// keyframe interval, and backend preference.
 public typealias VideoEncoderOutput = MoqFFI.MoqVideoEncoderOutput
 /// A raw pixel layout (I420 or RGBA) fed to a `VideoProducer`.
@@ -71,8 +71,8 @@ public typealias VideoEncoderKind = MoqFFI.MoqVideoEncoderKind
 public typealias Container = MoqFFI.MoqContainer
 /// A best-effort raw-track datagram as received: sequence, timestamp, and payload.
 public typealias Datagram = MoqFFI.MoqDatagram
-/// The route a broadcast takes to reach this origin: relay hop ids (oldest
-/// first), the publisher's advertised cost (lower wins), and whether it's announced.
+/// A path-prefix route: the prefix it covers, relay hop ids (oldest first),
+/// and the advertised cost (lower wins).
 public typealias Route = MoqFFI.MoqRoute
 /// Per-subscription delivery preferences: priority, group ordering, latency
 /// budget, and group range.

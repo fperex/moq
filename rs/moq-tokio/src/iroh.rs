@@ -17,10 +17,7 @@ pub use web_transport_iroh;
 
 /// The congestion control family to install, defaulting to loss-based.
 ///
-/// Unlike the other backends we don't default to BBR here: noq's BBRv3 subtracts
-/// without a floor when computing the inflight bytes at the loss event, so a single
-/// packet loss can underflow and panic, taking the whole process with it. Delay-based
-/// stays reachable, but only when an operator asks for it by name.
+/// iroh uses loss-based congestion control unless delay-based is requested.
 fn congestion_control(quic: &crate::quic::Resolved) -> CongestionControl {
 	quic.congestion_control.unwrap_or(CongestionControl::Loss)
 }
@@ -50,40 +47,40 @@ pub enum Error {
 	Deprecated(crate::Deprecated),
 
 	/// The configured secret was neither a valid hex key nor a readable key file.
-	#[error("invalid iroh secret key")]
-	Secret(#[source] iroh::KeyParsingError),
+	#[error("invalid iroh secret key: {0}")]
+	Secret(String),
 
 	/// The endpoint could not bind its UDP socket.
-	#[error(transparent)]
-	Bind(#[from] iroh::endpoint::BindError),
+	#[error("{0}")]
+	Bind(String),
 
 	/// A configured bind address was rejected by iroh.
-	#[error(transparent)]
-	BindAddr(#[from] iroh::endpoint::InvalidSocketAddr),
+	#[error("{0}")]
+	BindAddr(String),
 
 	/// Dialing the peer failed before a connection was started.
-	#[error(transparent)]
-	Connect(#[from] iroh::endpoint::ConnectWithOptsError),
+	#[error("{0}")]
+	Connect(String),
 
 	/// The QUIC handshake failed while connecting.
-	#[error(transparent)]
-	Connecting(#[from] iroh::endpoint::ConnectingError),
+	#[error("{0}")]
+	Connecting(String),
 
 	/// The peer never settled on an ALPN.
-	#[error(transparent)]
-	Alpn(#[from] iroh::endpoint::AlpnError),
+	#[error("{0}")]
+	Alpn(String),
 
 	/// An established connection was lost or closed.
-	#[error(transparent)]
-	Connection(#[from] iroh::endpoint::ConnectionError),
+	#[error("{0}")]
+	Connection(String),
 
 	/// The client side of the WebTransport handshake failed.
-	#[error(transparent)]
-	Client(#[from] web_transport_iroh::ClientError),
+	#[error("{0}")]
+	Client(String),
 
 	/// The server side of the WebTransport handshake failed.
-	#[error(transparent)]
-	Server(#[from] web_transport_iroh::ServerError),
+	#[error("{0}")]
+	Server(String),
 
 	/// The negotiated ALPN was not valid UTF-8.
 	#[error("failed to decode ALPN")]
@@ -98,69 +95,80 @@ pub enum Error {
 	MissingHost,
 
 	/// The URL host was not an iroh endpoint id. Unlike QUIC, iroh dials a public key, not a hostname.
-	#[error("Invalid URL: host is not an iroh endpoint id")]
-	InvalidEndpointId(#[source] iroh::KeyParsingError),
+	#[error("Invalid URL: host is not an iroh endpoint id: {0}")]
+	InvalidEndpointId(String),
 
 	/// The URL could not be rewritten to the `https` scheme for the H3 request.
 	#[error("invalid URL")]
 	InvalidUrl,
 
 	/// The rewritten URL failed to parse.
-	#[error(transparent)]
-	Url(#[from] url::ParseError),
+	#[error("{0}")]
+	Url(String),
 
 	/// The client connected but never sent a valid WebTransport CONNECT request.
-	#[error("failed to receive WebTransport request")]
-	RecvRequest(#[source] web_transport_iroh::ServerError),
+	#[error("failed to receive WebTransport request: {0}")]
+	RecvRequest(String),
 
 	/// GSO is always on for iroh, so `--quic-gso=false` cannot be honored.
 	#[error("the iroh backend cannot disable GSO; drop --quic-gso=false or use the quinn backend")]
 	GsoUnsupported,
 }
 
+crate::error::from_message! {
+	iroh::endpoint::BindError => Bind,
+	iroh::endpoint::InvalidSocketAddr => BindAddr,
+	iroh::endpoint::ConnectWithOptsError => Connect,
+	iroh::endpoint::ConnectingError => Connecting,
+	iroh::endpoint::AlpnError => Alpn,
+	iroh::endpoint::ConnectionError => Connection,
+	web_transport_iroh::ClientError => Client,
+	web_transport_iroh::ServerError => Server,
+	url::ParseError => Url,
+}
+
 type Result<T> = std::result::Result<T, Error>;
 
 /// Settings for the shared iroh endpoint, used by both the client and server.
-#[derive(clap::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(usage::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub struct EndpointConfig {
 	/// Whether to enable iroh support.
-	#[arg(
-		id = "iroh-enabled",
+	#[usage(
+		name = "iroh-enabled",
 		long = "iroh-enabled",
 		env = "MOQ_IROH_ENABLED",
-		default_missing_value = "true",
+		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
-		value_parser = clap::value_parser!(bool),
 	)]
 	pub enabled: Option<bool>,
 
 	/// Secret key for the iroh endpoint, either a hex-encoded string or a path to a file.
 	/// If the file does not exist, a random key will be generated and written to the path.
-	#[arg(id = "iroh-secret", long = "iroh-secret", env = "MOQ_IROH_SECRET")]
+	#[usage(name = "iroh-secret", long = "iroh-secret", env = "MOQ_IROH_SECRET")]
 	pub secret: Option<String>,
 
 	/// Listen for UDP packets on the given address.
 	/// Defaults to `0.0.0.0:0` if not provided.
-	#[arg(id = "iroh-bind-v4", long = "iroh-bind-v4", env = "MOQ_IROH_BIND_V4")]
+	#[usage(name = "iroh-bind-v4", long = "iroh-bind-v4", env = "MOQ_IROH_BIND_V4")]
 	pub bind_v4: Option<net::SocketAddrV4>,
 
 	/// Listen for UDP packets on the given address.
 	/// Defaults to `[::]:0` if not provided.
-	#[arg(id = "iroh-bind-v6", long = "iroh-bind-v6", env = "MOQ_IROH_BIND_V6")]
+	#[usage(name = "iroh-bind-v6", long = "iroh-bind-v6", env = "MOQ_IROH_BIND_V6")]
 	pub bind_v6: Option<net::SocketAddrV6>,
 
 	/// Disable the iroh relay, using only direct P2P connections.
-	#[arg(
-		id = "iroh-disable-relay",
+	#[usage(
+		name = "iroh-disable-relay",
 		long = "iroh-disable-relay",
 		env = "MOQ_IROH_DISABLE_RELAY",
-		default_missing_value = "true",
+		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
-		value_parser = clap::value_parser!(bool),
 	)]
 	pub disable_relay: Option<bool>,
 }
@@ -205,7 +213,7 @@ impl EndpointConfig {
 			} else {
 				// Otherwise, read the secret from a file.
 				let key_str = tokio::fs::read_to_string(&path).await?;
-				SecretKey::from_str(&key_str).map_err(Error::Secret)?
+				SecretKey::from_str(&key_str).map_err(|err| Error::Secret(crate::error::message(err)))?
 			}
 		} else {
 			// Otherwise, generate a new random secret.
@@ -268,14 +276,17 @@ pub(crate) async fn accept(
 		web_transport_iroh::ALPN_H3 => {
 			let request = web_transport_iroh::H3Request::accept(conn)
 				.await
-				.map_err(Error::RecvRequest)?;
+				.map_err(|err| Error::RecvRequest(crate::error::message(err)))?;
 			let url = Some(request.url.clone());
 
 			let mut response = ConnectResponse::OK;
 			if let Some(protocol) = request.protocols.first() {
 				response = response.with_protocol(protocol);
 			}
-			let session = request.respond(response).await.map_err(Error::Server)?;
+			let session = request
+				.respond(response)
+				.await
+				.map_err(|err| Error::Server(crate::error::message(err)))?;
 			Ok((session, url, None))
 		}
 		// Raw QUIC carries no request URL; the path rides the SETUP.
@@ -306,7 +317,9 @@ pub(crate) async fn connect(
 	addrs: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> Result<(web_transport_iroh::Session, Binding)> {
 	let host = url.host().ok_or(Error::MissingHost)?.to_string();
-	let endpoint_id: iroh::EndpointId = host.parse().map_err(Error::InvalidEndpointId)?;
+	let endpoint_id: iroh::EndpointId = host
+		.parse()
+		.map_err(|err| Error::InvalidEndpointId(crate::error::message(err)))?;
 
 	// Build an EndpointAddr with any direct IP addresses provided.
 	let mut endpoint_addr = iroh::EndpointAddr::new(endpoint_id);
@@ -382,15 +395,16 @@ mod tests {
 	/// endpoint is the accepted-and-ignored failure in miniature.
 	#[tokio::test]
 	async fn bind_refuses_a_released_quic_spelling() {
-		use clap::Parser;
-
-		#[derive(Parser)]
+		#[derive(usage::Cli)]
+		#[usage(unknown_flags = "error", args_override_self = false)]
 		struct Cli {
-			#[command(flatten)]
+			#[usage(flatten)]
 			quic: crate::quic::Config,
 		}
 
-		let quic = Cli::parse_from(["test", "--client-quic-gso=false"]).quic;
+		let quic = Cli::parse_from(&[std::ffi::OsStr::new("--client-quic-gso=false")])
+			.unwrap()
+			.quic;
 		let config = EndpointConfig {
 			enabled: Some(true),
 			..Default::default()
@@ -418,8 +432,7 @@ mod tests {
 		assert!(delay.into_any().downcast::<noq_proto::congestion::Bbr3>().is_ok());
 	}
 
-	/// noq's BBRv3 panics on loss, so an unset knob must land on CUBIC here even
-	/// though every other backend defaults to BBR.
+	/// An unset knob lands on CUBIC, while an explicit delay request gets BBRv3.
 	#[test]
 	fn congestion_control_defaults_to_loss() {
 		let mut quic = crate::quic::Config::default();

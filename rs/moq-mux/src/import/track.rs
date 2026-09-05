@@ -23,9 +23,11 @@ fn video_hint(init: &VideoInit, default_codec: Option<hang::catalog::VideoCodec>
 	hint
 }
 
-/// The codec parser fills everything from the init bytes, so the label is all the caller adds.
-fn with_label(init: &AudioInit, mut config: hang::catalog::AudioConfig) -> hang::catalog::AudioConfig {
+/// The codec parser fills everything from the init bytes, so the label and container are all the
+/// caller adds.
+fn with_init(init: &AudioInit, mut config: hang::catalog::AudioConfig) -> hang::catalog::AudioConfig {
 	config.label = init.label.clone();
+	config.container = init.container.clone();
 	config
 }
 
@@ -197,24 +199,24 @@ impl<E: CatalogExt> Track<E> {
 	) -> Result<Self> {
 		// Accept at the legacy microsecond timescale, matching the frame timestamps the container
 		// stamps. A codec-specific timescale (e.g. the opus sample rate) would be chosen here.
-		let track = request.accept(reserved.track_info());
+		let track = request.accept(reserved.track_info(hang::catalog::PRIORITY.audio));
 		let data = init.data.as_ref();
 		let kind = match init.format {
 			AudioFormat::Aac => {
-				let config = with_label(&init, crate::codec::aac::config(data)?);
+				let config = with_init(&init, crate::codec::aac::config(data)?);
 				TrackKind::Aac(crate::codec::aac::Import::new(track, reserved, config)?)
 			}
 			AudioFormat::Opus => {
-				let config = with_label(&init, crate::codec::opus::config(data)?);
+				let config = with_init(&init, crate::codec::opus::config(data)?);
 				TrackKind::Opus(crate::codec::opus::Import::new(track, reserved, config)?)
 			}
 			AudioFormat::Flac => {
 				// `data` is a FLAC header: the `fLaC` marker plus the STREAMINFO block.
-				let config = with_label(&init, crate::codec::flac::config(data)?);
+				let config = with_init(&init, crate::codec::flac::config(data)?);
 				TrackKind::Flac(crate::codec::flac::Import::new(track, reserved, config)?)
 			}
 			AudioFormat::Mp3 => {
-				let config = with_label(&init, crate::codec::mp3::config(data)?);
+				let config = with_init(&init, crate::codec::mp3::config(data)?);
 				TrackKind::Mp3(crate::codec::mp3::Import::new(track, reserved, config)?)
 			}
 		};
@@ -234,7 +236,7 @@ impl<E: CatalogExt> Track<E> {
 	) -> Result<Self> {
 		use hang::catalog::VideoCodec;
 
-		let track = request.accept(reserved.track_info());
+		let track = request.accept(reserved.track_info(hang::catalog::PRIORITY.video));
 		let data = init.data.as_ref();
 		let kind = match init.format {
 			VideoFormat::Avc1 => {
@@ -559,7 +561,7 @@ impl<E: CatalogExt> TrackStream<E> {
 		reserved: crate::catalog::Reserved<E>,
 		init: VideoInit,
 	) -> Result<Self> {
-		let track = request.accept(reserved.track_info());
+		let track = request.accept(reserved.track_info(hang::catalog::PRIORITY.video));
 		let hint = video_hint(&init, None);
 		// Only the self-delimiting codecs can be recovered from a raw byte stream.
 		let kind = match init.format {
@@ -837,6 +839,28 @@ mod tests {
 		assert_eq!(audio.label.as_deref(), Some("English"));
 	}
 
+	/// The audio counterpart to [`VideoInit::hint`]'s container: the caller's selection has to reach
+	/// the published rendition, since the codec parser resolves everything else from the init bytes.
+	#[tokio::test(start_paused = true)]
+	async fn an_audio_init_publishes_its_container() {
+		let (mut broadcast, catalog) = new_broadcast();
+		let request = broadcast.reserve_track("audio").unwrap();
+
+		let _import = Track::audio(
+			request,
+			catalog.reserve(),
+			AudioInit {
+				container: hang::catalog::Container::Loc,
+				..AudioInit::new(AudioFormat::Opus, opus_head())
+			},
+		)
+		.unwrap();
+
+		let snapshot = catalog.snapshot();
+		let audio = snapshot.audio.renditions.get("audio").unwrap();
+		assert_eq!(audio.container, hang::catalog::Container::Loc);
+	}
+
 	#[tokio::test(start_paused = true)]
 	async fn unique_track_opus_attaches_catalog_and_retires_on_drop() {
 		let (mut broadcast, catalog) = new_broadcast();
@@ -867,7 +891,9 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn opus_import_delivers_frames() {
 		let (mut broadcast, catalog) = new_broadcast();
-		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
 		let subscriber = track.subscribe(None);
 
 		let config = crate::codec::opus::Config::new(48_000, 2);
@@ -909,7 +935,9 @@ mod tests {
 		broadcast: &mut moq_net::broadcast::Producer,
 		catalog: &crate::catalog::Producer,
 	) -> (crate::codec::opus::Import, moq_net::track::Subscriber) {
-		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
 		// Every group is written before anything reads, which the default
 		// REAL_TIME budget would collapse to the live edge.
 		let subscriber = track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(30)));
@@ -1065,6 +1093,33 @@ mod tests {
 		assert_eq!(audio.codec.to_string(), "opus");
 		assert_eq!(audio.sample_rate, 48_000);
 		assert_eq!(audio.channel_count, 2);
+	}
+
+	/// Each constructor stamps its own kind's priority, so an audio track never goes
+	/// out at the video priority and queues behind a video backlog.
+	#[tokio::test(start_paused = true)]
+	async fn each_kind_ranks_as_itself() {
+		use hang::catalog::PRIORITY;
+
+		let (mut broadcast, catalog) = new_broadcast();
+		let consumer = broadcast.consume();
+
+		let request = broadcast.reserve_track("audio").unwrap();
+		let _audio = Track::audio(
+			request,
+			catalog.reserve(),
+			AudioInit::new(AudioFormat::Opus, opus_head()),
+		)
+		.unwrap();
+
+		let request = broadcast.reserve_track("video").unwrap();
+		let _video = Track::video(request, catalog.reserve(), VideoInit::new(VideoFormat::Vp8, Vec::new())).unwrap();
+
+		let audio = consumer.track("audio").unwrap().info().await.unwrap();
+		assert_eq!(audio.priority, PRIORITY.audio);
+
+		let video = consumer.track("video").unwrap().info().await.unwrap();
+		assert_eq!(video.priority, PRIORITY.video);
 	}
 
 	/// An audio format with no init bytes errors up front (audio can't resolve its config from frames),

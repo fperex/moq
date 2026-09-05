@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.7...moq-srt-v0.2.8) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux
+
+## [0.2.7](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.6...moq-srt-v0.2.7) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.2.6](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.5...moq-srt-v0.2.6) - 2026-08-26
+
+### Fixed
+
+- *(moq-srt)* preserve SCTE-35 through the SRT gateway ([#3075](https://github.com/moq-dev/moq/pull/3075))
+
+## [0.2.5](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.4...moq-srt-v0.2.5) - 2026-08-24
+
+### Fixed
+
+- *(moq-cli)* pace the TS stdout export on each frame's timestamp ([#3006](https://github.com/moq-dev/moq/pull/3006))
+- *(moq-srt)* preserve egress frame pacing timestamps ([#2990](https://github.com/moq-dev/moq/pull/2990))
+
+## [0.2.4](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.3...moq-srt-v0.2.4) - 2026-08-20
+
+### Other
+
+- updated the following local packages: moq-mux
+
 ## [0.2.3](https://github.com/moq-dev/moq/compare/moq-srt-v0.2.2...moq-srt-v0.2.3) - 2026-07-27
 
 ### Other

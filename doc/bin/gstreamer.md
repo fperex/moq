@@ -1,287 +1,67 @@
 ---
 title: GStreamer Plugin
-description: GStreamer plugin for MoQ
+description: moqsink and moqsrc elements
 ---
 
 # GStreamer Plugin
 
-A GStreamer plugin for publishing and consuming MoQ streams.
-
-::: warning Work in Progress
-This plugin is currently under development, but it works okay.
-:::
-
-## Overview
-
-The GStreamer plugin provides two elements:
-
-- **moqsink** - Publish media to a MoQ relay
-- **moqsrc** - Subscribe to MoQ broadcasts
-
-Both elements support the following properties:
-
-| Property             | Type   | Description                                                       |
-| -------------------- | ------ | ----------------------------------------------------------------- |
-| `url`                | string | The relay URL to connect to                                       |
-| `broadcast`          | string | The broadcast name                                                |
-| `tls-disable-verify` | bool   | Disable TLS certificate validation (rarely needed, default false) |
-
-::: info
-For `http://` URLs, `moq-tokio` automatically fetches the server's certificate fingerprint from `/certificate.sha256` and verifies TLS against it. You don't need `tls-disable-verify` for local development.
-:::
-
-`moqsink` additionally exposes these read-only properties for monitoring. Each emits a `notify`
-signal when it changes, so you can poll it via `g_object_get` or connect to `notify::<property>`:
-
-| Property                 | Type   | Description                                                  |
-| ------------------------ | ------ | ----------------------------------------------------------- |
-| `status`                 | enum   | Publish connection lifecycle: `disconnected` (retrying), `connected`, or `failed` (gave up) |
-| `connected`              | bool   | Whether the publish session is currently connected (`status == connected`) |
-| `moq-version`            | string | The negotiated MoQ protocol version; null when disconnected |
-| `estimated-send-bitrate` | uint64 | Estimated send bitrate in bits per second (congestion controller); 0 when unavailable |
-| `estimated-recv-bitrate` | uint64 | Estimated receive bitrate in bits per second; 0 when unavailable |
-
-`status` distinguishes a drop the reconnect loop is still retrying (`disconnected`) from a permanent
-give-up (`failed`), which a bare `connected` bool cannot. The sink retries for as long as the
-pipeline runs, so a relay outage of any length is ridden out; it goes `failed` only on an answer the
-relay actually gave that redialing cannot change: a rejected token, or a CONNECT answered with a
-status that isn't an invitation to retry. Everything else keeps retrying, so watch the logs when a
-sink stays `disconnected` from the very first attempt: a pipeline that has never connected once is
-far more likely misconfigured than waiting out an outage.
-
-## Prerequisites
-
-The plugin requires GStreamer development libraries. It is **not** built by default since most users don't have them installed.
-
-If you're using Nix, GStreamer is included in the dev shell automatically. Otherwise, install manually:
-
-- **macOS:** `brew install gstreamer`
-- **Debian/Ubuntu:** `apt install libgstreamer1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad`
-- **Arch:** `pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad`
-
-## Quick start with Nix
-
-On Linux or Apple Silicon macOS, Nix avoids a manual build and environment variables. The `moq-gst` flake output bundles the plugin with wrappers around `gst-inspect-1.0` / `gst-launch-1.0` that preload moq alongside `gst-plugins-{base,good,bad}`, so the standard tools find `moqsink` / `moqsrc` automatically.
-
-### Inspect the plugin
+Two elements: **moqsink** publishes a pipeline to a relay, **moqsrc**
+subscribes to a broadcast and exposes one source pad per rendition.
 
 ```bash
+# Inspect (Nix bundles the plugin with gst-launch)
 nix shell github:moq-dev/moq#moq-gst --command gst-inspect-1.0 moq
-```
 
-Lists `moqsink` and `moqsrc`. As a one-liner: `nix run github:moq-dev/moq#moq-gst -- moq`.
-
-### Subscribe to the public test broadcast
-
-`cdn.moq.dev/demo` hosts an always-on `bbb.hang` broadcast (looping Big Buck Bunny). Render it to a window:
-
-```bash
-nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
+# Play the public test broadcast
+nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -e \
   moqsrc name=s url=https://cdn.moq.dev/demo broadcast=bbb.hang \
   s.video_0 ! queue ! decodebin3 ! videoconvert ! autovideosink \
   s.audio_0 ! queue ! decodebin3 ! audioconvert ! autoaudiosink
+
+# Publish a test pattern
+gst-launch-1.0 -e videotestsrc is-live=true ! x264enc tune=zerolatency ! h264parse \
+  ! video/x-h264,stream-format=byte-stream,alignment=au ! mux.sink_0 \
+  moqsink name=mux url=https://cdn.moq.dev/anon broadcast=<your-name>.hang
 ```
 
-`bbb.hang` carries both video and audio, so each is linked by pad name (`video_0` /
-`audio_0`). For video only, drop the `s.audio_0` branch; the audio pad simply stays
-unlinked. The terse `moqsrc ! decodebin3 ! ...` form links just the first pad GStreamer
-offers, which on a multi-track broadcast may be the audio one, so prefer naming the pad.
+Install via `apt install gstreamer1.0-moq` or `dnf install gstreamer1-moq`
+([Install](/setup/install)), or build with `cargo build -p moq-gst` and point
+`GST_PLUGIN_PATH_1_0` at the output. `http://` URLs pin the relay's
+certificate fingerprint automatically, so local development needs no TLS setup.
+That scheme is for localhost only: the fingerprint is fetched unauthenticated
+and the WebSocket fallback runs as cleartext `ws://`, so use `https://` for
+anything else.
 
-### Publish your own broadcast
+## moqsink
 
-`cdn.moq.dev/anon` accepts publishers without auth. Pick a name, publish, then subscribe to that same name (in another terminal or from another machine).
+| Codec | Caps |
+| --- | --- |
+| H.264, H.265, AV1, VP8, VP9 | `video/x-h264`, `video/x-h265`, `video/x-av1`, `video/x-vp8`, `video/x-vp9` |
+| AAC, MP3, Opus | `audio/mpeg`, `audio/x-opus` |
+| Captions | `text/x-raw` (one WebVTT cue per buffer, PTS is the cue start and the buffer duration its end) |
+| Opaque data | `application/octet-stream` (raw bytes on a named track, one group per buffer) |
 
-```bash
-# Download a pre-fragmented CMAF test file (one time).
-curl -fsSL https://vid.moq.dev/bbb.mp4 -o bbb.mp4
+A `text/x-raw` pad is how captions get in: ffmpeg cannot mux a subtitle track
+into fragmented MP4, so `moq import fmp4` can't carry one, while a demuxer that
+resolves timed text (`qtdemux` on a 3GPP timed-text track) can feed the pad
+directly. A cue with no duration is dropped rather than left on screen.
 
-# Terminal 1: loop the file as a broadcast named `<your-name>.hang`.
-nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
-  multifilesrc location=bbb.mp4 loop=true ! parsebin name=parse \
-    parse. ! queue ! identity sync=true ! mux.sink_0 \
-    parse. ! queue ! identity sync=true ! mux.sink_1 \
-    moqsink name=mux url=https://cdn.moq.dev/anon broadcast=<your-name>.hang
-```
+Each `sink_%u` request pad is one track. Pad properties: `track` names it
+(default: after the codec), `container=loc` publishes it as
+[LOC](/concept/standard#loc) instead of the legacy hang container, and
+`track-status`/`track-error` report its lifecycle. Element properties:
+`url`, `broadcast`, `tls-disable-verify`, `quic-idle-timeout`,
+`quic-keep-alive`, and read-only `status`, `connected`, `moq-version`, and
+`estimated-send-bitrate`. The sink reconnects for as long as the pipeline
+runs and only reports `failed` on an answer redialing can't change, such as a
+rejected token.
 
-```bash
-# Terminal 2: render it.
-nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
-  moqsrc url=https://cdn.moq.dev/anon broadcast=<your-name>.hang \
-  ! decodebin3 ! videoconvert ! autovideosink
-```
+## moqsrc
 
-### Local relay
+Pads are named by kind and appear as the catalog announces renditions:
+`video_0`, `video_1`, `audio_0`. Link the pad you want by name; the terse
+`moqsrc ! decodebin3` form links only the first pad offered, which may be
+audio. Each pad sends EOS when its rendition ends. Properties: `url`,
+`broadcast`, `tls-disable-verify`.
 
-If you'd rather run a relay yourself, the [relay binary](/bin/relay/) is in the same flake:
-
-```bash
-# Terminal 1: start a relay on localhost:4443.
-nix run github:moq-dev/moq#moq-relay -- demo/relay/localhost.toml
-
-# Terminal 2: publish.
-nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
-  multifilesrc location=bbb.mp4 loop=true ! parsebin name=parse \
-    parse. ! queue ! identity sync=true ! mux.sink_0 \
-    parse. ! queue ! identity sync=true ! mux.sink_1 \
-    moqsink name=mux url=http://localhost:4443 broadcast=bbb.hang
-
-# Terminal 3: subscribe.
-nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
-  moqsrc url=http://localhost:4443 broadcast=bbb.hang \
-  ! decodebin3 ! videoconvert ! autovideosink
-```
-
-::: tip
-`http://` URLs auto-verify TLS via `/certificate.sha256` fingerprint pinning, so localhost development needs no certificate setup.
-:::
-
-## Building
-
-```bash
-cargo build -p moq-gst
-```
-
-This produces a shared library (cdylib) in `target/debug/`. GStreamer needs to find this plugin via the `GST_PLUGIN_PATH_1_0` environment variable — the `just` commands below handle this automatically.
-
-## Running Locally
-
-Start a [relay server](/bin/relay/) first:
-
-```bash
-just relay
-```
-
-### Publishing
-
-Use the `just` shortcut to publish a test video via GStreamer:
-
-```bash
-# Publish Big Buck Bunny (downloads automatically)
-just pub gst bbb
-
-# Publish to a remote relay
-just pub gst bbb https://cdn.moq.dev/anon
-```
-
-Or run `gst-launch-1.0` directly:
-
-```bash
-# Point GST_PLUGIN_PATH_1_0 at the build output
-export GST_PLUGIN_PATH_1_0="$PWD/target/debug${GST_PLUGIN_PATH_1_0:+:$GST_PLUGIN_PATH_1_0}"
-
-# Publish a fragmented MP4 file
-gst-launch-1.0 -v -e \
-  multifilesrc location=demo/pub/media/bbb.mp4 loop=true ! parsebin name=parse \
-    parse. ! queue ! identity sync=true ! mux.sink_0 \
-    parse. ! queue ! identity sync=true ! mux.sink_1 \
-    moqsink name=mux url="http://localhost:4443" broadcast="bbb"
-```
-
-::: tip
-The input video must be a fragmented MP4 (CMAF). The `just pub download` helper fetches pre-fragmented test videos from `vid.moq.dev`. To fragment your own video:
-
-```bash
-ffmpeg -i input.mp4 -c copy \
-  -f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer+frag_every_frame \
-  output.mp4
-```
-
-:::
-
-### Subscribing
-
-```bash
-# Subscribe and render to the screen
-just sub gst bbb
-
-# Subscribe from a remote relay
-just sub gst bbb https://cdn.moq.dev/anon
-```
-
-Or directly:
-
-```bash
-export GST_PLUGIN_PATH_1_0="$PWD/target/debug${GST_PLUGIN_PATH_1_0:+:$GST_PLUGIN_PATH_1_0}"
-
-gst-launch-1.0 -v -e \
-  moqsrc url="http://localhost:4443" broadcast="bbb" \
-    ! decodebin3 ! videoconvert ! autovideosink
-```
-
-::: warning
-`moqsrc` exposes one source pad per rendition: `video_0`, `audio_0`, and so on
-(see [moqsrc pads](#moqsrc-subscribe)). The single-branch `moqsrc ! decodebin3 ...`
-above only links the *first* pad GStreamer offers, so on a broadcast with both video
-and audio it may pick up the audio pad and a video-only sink chain then renders nothing.
-Link the pad you want by name, and route the rest to a sink so they don't stall:
-
-```bash
-gst-launch-1.0 -v -e moqsrc name=s url="http://localhost:4443" broadcast="bbb" \
-  s.video_0 ! queue ! decodebin3 ! videoconvert ! autovideosink \
-  s.audio_0 ! queue ! decodebin3 ! audioconvert ! autoaudiosink
-```
-
-The first pad of each kind is always `video_0` / `audio_0` regardless of catalog order.
-:::
-
-## Supported Codecs
-
-### moqsink (publish)
-
-| Media | Codec | GStreamer caps        |
-| ----- | ----- | --------------------- |
-| Video | H.264 | `video/x-h264`        |
-| Video | H.265 | `video/x-h265`        |
-| Video | AV1   | `video/x-av1`         |
-| Video | VP8   | `video/x-vp8`         |
-| Video | VP9   | `video/x-vp9`         |
-| Audio | AAC   | `audio/mpeg` (v4)     |
-| Audio | MP3   | `audio/mpeg` (v1/v2, layer 3) |
-| Audio | Opus  | `audio/x-opus`        |
-| Text  | Captions | `text/x-raw` (utf8) |
-
-#### Captions
-
-A `text/x-raw` pad is published as a hang text rendition, one WebVTT cue per group. Each buffer is
-one decoded cue: the PTS is the cue's start on the same clock as audio and video, and the buffer
-duration is its end, so a cue without a duration is dropped rather than left on screen forever.
-
-This is where captions come from, because ffmpeg cannot mux a subtitle track into fragmented MP4
-and so the `moq import fmp4` path can't carry one. A demuxer that resolves timed text for you
-(`qtdemux` on a 3GPP timed-text track, for example) can feed the pad directly:
-
-```sh
-gst-launch-1.0 -e filesrc location=input.mp4 ! qtdemux name=demux \
-    demux.video_0 ! queue ! h264parse ! identity sync=true ! mux.sink_0 \
-    demux.audio_0 ! queue ! aacparse ! identity sync=true ! mux.sink_1 \
-    demux.subtitle_0 ! queue ! identity sync=true ! mux.sink_2 \
-    moqsink name=mux url="http://localhost:4443" broadcast="example.hang"
-```
-
-Cue text is escaped before it goes on the wire, so markup in the source shows as literal text
-rather than opening a WebVTT tag. Note that `gst-launch` builds every named branch up front: point
-`demux.subtitle_0` at a file with no text track and that branch never links, leaving its queue
-without EOS so the pipeline will not shut down.
-
-### moqsrc (subscribe)
-
-Outputs the same caps based on the catalog, compatible with `decodebin3`.
-
-One source pad is created per rendition, named after its kind: `video_0`, `video_1`,
-`audio_0`, and so on. The first pad of each kind is always numbered `0`, so a
-`gst-launch` pipeline can link the stream it wants by name (`moqsrc name=s s.video_0 ! ...`)
-no matter which rendition the catalog announces first. Pads appear once their rendition
-shows up in the catalog (sometimes-pads), so an application links them from a
-`pad-added` handler.
-
-## Debugging
-
-Enable GStreamer debug output:
-
-```bash
-# GStreamer debug (verbose)
-GST_DEBUG=*:4 just pub gst bbb
-
-# Rust logging
-RUST_LOG=debug just pub gst bbb
-```
+Debug with `GST_DEBUG=*:4` for GStreamer and `RUST_LOG=debug` for the plugin.

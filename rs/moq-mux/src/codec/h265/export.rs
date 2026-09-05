@@ -5,7 +5,7 @@
 //! hvcC) source and emits a raw Annex-B elementary stream. Timestamps are
 //! dropped.
 
-use std::task::Poll;
+use std::task::{Poll, ready};
 
 use bytes::Bytes;
 use hang::Catalog;
@@ -91,8 +91,8 @@ impl<S: Stream> Export<S> {
 				return Poll::Pending;
 			};
 
-			match track.source.poll_read(waiter) {
-				Poll::Ready(Ok(Some(frame))) => {
+			match ready!(track.source.poll_read(waiter))? {
+				Some(frame) => {
 					let bytes = match &track.convert {
 						None => frame.payload,
 						Some(convert) => {
@@ -105,12 +105,10 @@ impl<S: Stream> Export<S> {
 					}
 					return Poll::Ready(Ok(Some(bytes)));
 				}
-				Poll::Ready(Ok(None)) => {
+				None => {
 					self.track = None;
 					continue;
 				}
-				Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-				Poll::Pending => return Poll::Pending,
 			}
 		}
 	}
@@ -266,7 +264,7 @@ mod tests {
 		let catalog = hvc1_catalog("video.hvc1", hvcc(vps, sps, pps));
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut track = broadcast
-			.create_track("video.hvc1", hang::container::track_info())
+			.create_track("video.hvc1", hang::container::track_info(hang::catalog::PRIORITY.video))
 			.unwrap();
 
 		let mut g0 = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();

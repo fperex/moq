@@ -14,33 +14,34 @@
 
 use anyhow::Context;
 use chrono::prelude::*;
-use clap::Parser;
 use moq_net::*;
 
-#[derive(Parser, Clone)]
+#[derive(usage::Cli, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[usage(name = "clock")]
 struct Config {
 	/// The name of the broadcast to publish or subscribe to.
-	#[arg(long)]
+	#[usage(long)]
 	broadcast: String,
 
 	/// The MoQ client configuration.
-	#[command(flatten)]
+	#[usage(flatten)]
 	client: moq_tokio::connect::Config,
 
 	/// The name of the clock track.
-	#[arg(long, default_value = "seconds")]
+	#[usage(long, default = "seconds")]
 	track: String,
 
 	/// The log configuration.
-	#[command(flatten)]
+	#[usage(flatten)]
 	log: moq_tokio::Log,
 
 	/// Whether to publish the clock or consume it.
-	#[command(subcommand)]
+	#[usage(subcommand)]
 	role: Command,
 }
 
-#[derive(Parser, Clone)]
+#[derive(usage::Subcommands, Clone)]
 enum Command {
 	Publish,
 	Subscribe,
@@ -54,18 +55,23 @@ async fn main() -> anyhow::Result<()> {
 	let url = config.client.url.clone().context("--connect is required")?;
 	let client = config.client.init(Default::default())?;
 
-	tracing::info!(%url, "connecting to server");
+	tracing::info!(url = %moq_tokio::RedactedUrl::new(&url), "connecting to server");
 
 	let track = config.track;
 
-	let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
+	let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
 
 	match config.role {
 		Command::Publish => {
 			let mut broadcast = origin
-				.create_broadcast(&config.broadcast, moq_net::broadcast::Route::new().with_announce(true))
+				.create_broadcast(&config.broadcast)
 				.context("failed to create broadcast")?;
 			let track = broadcast.create_track(track, None)?;
+			// Announced once the track exists, so a subscriber acting on the
+			// announcement finds it.
+			broadcast
+				.announce(Default::default())
+				.context("failed to announce broadcast")?;
 			let clock = Publisher::new(track);
 
 			let reconnect = client.with_publisher(&origin).connect(url);
@@ -91,25 +97,27 @@ async fn main() -> anyhow::Result<()> {
 			tracing::info!(broadcast = %config.broadcast, "waiting for broadcast to be online");
 
 			let path: moq_net::Path<'_> = config.broadcast.into();
-			let mut origin = origin
+			let consumer = origin
 				.scope(&[path])
 				.context("not allowed to consume broadcast")?
-				.consume()
-				.announced();
+				.consume();
+			let mut announced = consumer.announced();
 
 			let mut clock: Option<Subscriber> = None;
 
 			loop {
 				tokio::select! {
-					Some(moq_net::announce::Update { path, broadcast }) = origin.next() => match broadcast {
-						Some(broadcast) => {
+					Some(update) = announced.next() => match update.active {
+						true => {
+							let path = update.prefix.as_path().to_owned();
 							tracing::info!(broadcast = %path, "broadcast is online, subscribing to track");
+							let broadcast = consumer.request_broadcast(&path).await?;
 							let track = broadcast
 								.track(&track)?.subscribe(None).await?;
 							clock = Some(Subscriber::new(track));
 						}
-						None => {
-							tracing::warn!(broadcast = %path, "broadcast is offline, waiting...");
+						false => {
+							tracing::warn!(broadcast = %update.prefix, "broadcast is offline, waiting...");
 						}
 					},
 					res = reconnect.closed() => return Ok(res?),

@@ -1,13 +1,16 @@
 import { expect, test } from "bun:test";
 import type * as announce from "../announced.ts";
-import { type Origin, OriginSchema } from "../hop.ts";
+import { type Hop, HopSchema } from "../hop.ts";
 import { createMockTransportPair } from "../mock.ts";
 import * as Path from "../path.ts";
-import { Stream } from "../stream.ts";
-import { NativeSession } from "./adapter.ts";
+import { Reader, Stream } from "../stream.ts";
+import type * as track from "../track.ts";
+import { ControlStreamAdapter, NativeSession } from "./adapter.ts";
 import type * as Cluster from "./cluster.ts";
+import { type GroupFlags, Group as GroupMessage } from "./object.ts";
 import { PublishNamespace } from "./publish_namespace.ts";
 import { RequestError, RequestOk } from "./request.ts";
+import { Subscribe, SubscribeOk, Unsubscribe } from "./subscribe.ts";
 import { SubscribeNamespace, SubscribeNamespaceEntry, SubscribeNamespaceEntryDone } from "./subscribe_namespace.ts";
 import { Subscriber } from "./subscriber.ts";
 import { ALPN, Version } from "./version.ts";
@@ -81,7 +84,7 @@ test("an unsolicited announcement lands", async () => {
 	);
 
 	const next = await announced.next();
-	expect(next?.path).toBe(Path.from("surprise"));
+	expect(next?.prefix).toBe(Path.from("surprise"));
 	expect(next?.active).toBe(true);
 
 	// The handler holds the request open until the peer drops it, and withdraws the
@@ -90,7 +93,7 @@ test("an unsolicited announcement lands", async () => {
 	if (!peer) throw new Error("no PUBLISH_NAMESPACE stream to close");
 	peer.close();
 	await handler;
-	expect(await announced.next()).toMatchObject({ path: Path.from("surprise"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("surprise"), active: false });
 });
 
 /**
@@ -123,7 +126,7 @@ async function inlineNamespace(stream: Stream, path: Path.Valid, cluster?: Clust
  */
 async function syncInline(stream: Stream, announced: announce.Consumer, cluster?: Cluster.Advert): Promise<void> {
 	await inlineNamespace(stream, Path.from("sentinel"), cluster);
-	expect(await announced.next()).toMatchObject({ path: Path.from("sentinel"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("sentinel"), active: true });
 }
 
 /**
@@ -148,7 +151,7 @@ test("an announcement survives the first of its two sources ending", async () =>
 		new PublishNamespace({ requestId: 0n, trackNamespace: Path.from("both") }),
 		request,
 	);
-	expect(await announced.next()).toMatchObject({ path: Path.from("both"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("both"), active: true });
 
 	await inlineNamespace(subscription, Path.from("both"));
 	await syncInline(subscription, announced);
@@ -184,7 +187,7 @@ test("an announcement ends once its last source does", async () => {
 		new PublishNamespace({ requestId: 0n, trackNamespace: Path.from("both") }),
 		request,
 	);
-	expect(await announced.next()).toMatchObject({ path: Path.from("both"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("both"), active: true });
 
 	await inlineNamespace(subscription, Path.from("both"));
 	await syncInline(subscription, announced);
@@ -198,7 +201,7 @@ test("an announcement ends once its last source does", async () => {
 	await subscription.writer.u53(SubscribeNamespaceEntryDone.id);
 	await new SubscribeNamespaceEntryDone({ suffix: Path.from("both") }).encode(subscription.writer, VERSION);
 
-	expect(await announced.next()).toMatchObject({ path: Path.from("both"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("both"), active: false });
 });
 
 /**
@@ -219,13 +222,13 @@ test("a subscription that dies releases what it advertised", async () => {
 	await acceptSubscribeNamespace(pair.client);
 
 	await inlineNamespace(streamA, Path.from("orphan"));
-	expect(await doomed.next()).toMatchObject({ path: Path.from("orphan"), active: true });
-	expect(await survivor.next()).toMatchObject({ path: Path.from("orphan"), active: true });
+	expect(await doomed.next()).toMatchObject({ prefix: Path.from("orphan"), active: true });
+	expect(await survivor.next()).toMatchObject({ prefix: Path.from("orphan"), active: true });
 
 	// The stream that advertised it goes away without a NAMESPACE_DONE.
 	streamA.writer.close();
 
-	expect(await survivor.next()).toMatchObject({ path: Path.from("orphan"), active: false });
+	expect(await survivor.next()).toMatchObject({ prefix: Path.from("orphan"), active: false });
 });
 
 /**
@@ -247,7 +250,7 @@ test("a duplicate legacy publish_namespace is still refused", async () => {
 		new PublishNamespace({ requestId: 0n, trackNamespace: Path.from("twice") }),
 		first,
 	);
-	expect(await announced.next()).toMatchObject({ path: Path.from("twice"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("twice"), active: true });
 
 	// The same namespace again, on its own request.
 	const second = await Stream.open(pair.server, { version: Version.DRAFT_15 });
@@ -262,7 +265,7 @@ test("a duplicate legacy publish_namespace is still refused", async () => {
 	peer.close();
 	await handler;
 
-	expect(await announced.next()).toMatchObject({ path: Path.from("twice"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("twice"), active: false });
 });
 
 /**
@@ -321,7 +324,7 @@ test("concurrent legacy publish_namespace requests take one reference", async ()
 		second,
 	);
 
-	expect(await announced.next()).toMatchObject({ path: Path.from("raced"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("raced"), active: true });
 	await two;
 
 	// Only one reference was taken, so the surviving request ending retracts the path.
@@ -330,12 +333,12 @@ test("concurrent legacy publish_namespace requests take one reference", async ()
 	peer.close();
 	await one;
 
-	expect(await announced.next()).toMatchObject({ path: Path.from("raced"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("raced"), active: false });
 });
 
 /** The Hop IDs a cluster-negotiated session declared, ours first. */
-const SELF: Origin = OriginSchema.parse(7n);
-const PEER: Origin = OriginSchema.parse(9n);
+const SELF: Hop = HopSchema.parse(7n);
+const PEER: Hop = HopSchema.parse(9n);
 
 /**
  * A peer that knows our Hop ID never advertises a path that already ran through us, so
@@ -369,10 +372,10 @@ test("an inline NAMESPACE that starts looping back is retracted", async () => {
 	const subscription = await acceptSubscribeNamespace(pair.client);
 
 	await inlineNamespace(subscription, Path.from("theirs"), { hops: [PEER], cost: 0n });
-	expect(await announced.next()).toMatchObject({ path: Path.from("theirs"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("theirs"), active: true });
 
 	await inlineNamespace(subscription, Path.from("theirs"), { hops: [SELF, PEER], cost: 0n });
-	expect(await announced.next()).toMatchObject({ path: Path.from("theirs"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("theirs"), active: false });
 });
 
 /** The same rule on the other kind of advertisement, which is a request we can refuse. */
@@ -440,7 +443,7 @@ test("a PUBLISH_NAMESPACE update that starts looping back is detached", async ()
 	const announced = subscriber.announced(Path.empty());
 	await acceptSubscribeNamespace(pair.client);
 
-	const advert = (hops: Origin[]) =>
+	const advert = (hops: Hop[]) =>
 		new PublishNamespace({
 			requestId: 0n,
 			trackNamespace: Path.from("theirs"),
@@ -449,7 +452,7 @@ test("a PUBLISH_NAMESPACE update that starts looping back is detached", async ()
 
 	const request = await Stream.open(pair.server, { version: VERSION });
 	const handler = subscriber.runPublishNamespace(advert([PEER]), request);
-	expect(await announced.next()).toMatchObject({ path: Path.from("theirs"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("theirs"), active: true });
 
 	// The peer re-parents the namespace onto a route that runs back through us.
 	const peer = await nextStream(pair.client);
@@ -457,8 +460,209 @@ test("a PUBLISH_NAMESPACE update that starts looping back is detached", async ()
 	await peer.writer.u53(PublishNamespace.id);
 	await advert([SELF, PEER]).encode(peer.writer, VERSION);
 
-	expect(await announced.next()).toMatchObject({ path: Path.from("theirs"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("theirs"), active: false });
 
 	peer.close();
 	await handler;
+});
+
+/**
+ * Drafts 14-16 carry every request over the control stream adapter's virtual streams,
+ * whose abort is local. UNSUBSCRIBE is the only cancellation that reaches the peer there,
+ * so a cancelled subscription is only really cancelled if that message lands on the real
+ * control stream.
+ */
+test("a legacy cancel reaches the control stream", async () => {
+	const LEGACY = Version.DRAFT_16;
+	const pair = createMockTransportPair(ALPN.DRAFT_16);
+
+	// The one real bidi everything is multiplexed onto.
+	const controlStream = await Stream.open(pair.server, { version: LEGACY });
+	const session = new ControlStreamAdapter(pair.server, controlStream, LEGACY, 100n, true);
+	const subscriber = new Subscriber({ session });
+
+	// The peer's view of that control stream.
+	const peer = await nextStream(pair.client);
+	expect(peer).toBeDefined();
+
+	// Ask for a track, which writes SUBSCRIBE, then drop the only consumer.
+	const broadcast = subscriber.consume(Path.from("room"));
+	const track = broadcast.subscribe("video");
+
+	// Let the SUBSCRIBE reach the control stream before walking away.
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	track.close();
+
+	// Everything the subscriber actually put on the wire.
+	const seen: bigint[] = [];
+	const deadline = Date.now() + STREAM_WAIT;
+	while (Date.now() < deadline) {
+		const type = await Promise.race([
+			// biome-ignore lint/style/noNonNullAssertion: guarded by the expect above
+			peer!.reader.u53().catch(() => undefined),
+			new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 100)),
+		]);
+		if (type === undefined) break;
+
+		seen.push(BigInt(type));
+		// biome-ignore lint/style/noNonNullAssertion: guarded by the expect above
+		const size = await peer!.reader.u16();
+		// biome-ignore lint/style/noNonNullAssertion: guarded by the expect above
+		if (size > 0) await peer!.reader.read(size);
+		if (BigInt(type) === BigInt(Unsubscribe.id)) break;
+	}
+
+	expect(seen).toContain(BigInt(Unsubscribe.id));
+});
+
+/**
+ * A publisher that rejects a SUBSCRIBE has torn the request down before answering, so there
+ * is nothing left to cancel. Naming a dead request id back at it is what a strict peer can
+ * read as a protocol violation and close an otherwise healthy session over.
+ */
+test("a rejected subscribe is not unsubscribed", async () => {
+	const LEGACY = Version.DRAFT_16;
+	const pair = createMockTransportPair(ALPN.DRAFT_16);
+
+	const controlStream = await Stream.open(pair.server, { version: LEGACY });
+	const session = new ControlStreamAdapter(pair.server, controlStream, LEGACY, 100n, true);
+	// The mux read loop, which is what routes a response back to its virtual stream.
+	void session.run().catch(() => void 0);
+	const subscriber = new Subscriber({ session });
+
+	const peer = await nextStream(pair.client);
+	expect(peer).toBeDefined();
+	// biome-ignore lint/style/noNonNullAssertion: guarded above
+	const wire = peer!;
+
+	const broadcast = subscriber.consume(Path.from("room"));
+	const track = broadcast.subscribe("video");
+
+	// Read the SUBSCRIBE, then reject it the way a publisher that cannot serve it would.
+	const subscribeType = await wire.reader.u53();
+	const subscribeSize = await wire.reader.u16();
+	await wire.reader.read(subscribeSize);
+	expect(subscribeType).toBe(3);
+
+	await wire.writer.u53(RequestError.id);
+	await new RequestError({
+		requestId: 0n,
+		errorCode: 404,
+		reasonPhrase: "not found",
+		retryInterval: 0n,
+	}).encode(wire.writer, LEGACY);
+
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	track.close();
+	await new Promise((resolve) => setTimeout(resolve, 100));
+
+	// Nothing further belongs on the control stream: the request is already gone.
+	const next = await Promise.race([
+		wire.reader.u53().catch(() => undefined),
+		new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 200)),
+	]);
+
+	expect(next).toBeUndefined();
+});
+
+/** The alias the group streams below are published on. */
+const ALIAS = 9n;
+
+/** Group flags for a plain subgroup stream: no extensions, no subgroup id, no properties. */
+function groupFlags(firstObject: boolean): GroupFlags {
+	return {
+		hasExtensions: false,
+		hasSubgroup: false,
+		hasSubgroupObject: false,
+		hasEnd: true,
+		hasPriority: true,
+		firstObject,
+	};
+}
+
+/**
+ * The objects of a subgroup stream, written by hand.
+ *
+ * `deltas` are the raw Object ID Deltas, which is the whole point: a publisher trimming a
+ * group's head puts the first object's absolute id there, and nothing on our side will
+ * encode that.
+ */
+function encodeObjects(deltas: number[]): Uint8Array {
+	const bytes: number[] = [];
+	for (const delta of deltas) {
+		const payload = new TextEncoder().encode(`object ${delta}`);
+		// Every field here is under 64, so each is a one-byte varint.
+		bytes.push(delta, payload.byteLength, ...payload);
+	}
+	return new Uint8Array(bytes);
+}
+
+/**
+ * A subscriber with one track subscribed and answered, which is what registers {@link ALIAS}
+ * and lets a group stream naming it be handled.
+ */
+async function subscribeTrack(): Promise<{ subscriber: Subscriber; track: track.Subscriber }> {
+	const pair = createMockTransportPair(ALPN.DRAFT_19);
+	const session = new NativeSession(pair.server, VERSION, true);
+	const subscriber = new Subscriber({ session });
+
+	const track = subscriber.consume(Path.from("room")).subscribe("video");
+
+	const peer = await nextStream(pair.client);
+	if (!peer) throw new Error("the subscriber never opened a subscribe stream");
+
+	expect(await peer.reader.u53()).toBe(Subscribe.id);
+	const request = await Subscribe.decode(peer.reader, VERSION);
+	await peer.writer.u53(SubscribeOk.id);
+	await new SubscribeOk({ requestId: request.requestId, trackAlias: ALIAS }).encode(peer.writer, VERSION);
+
+	return { subscriber, track };
+}
+
+/**
+ * A group is the unit an application resyncs on, so one served from partway through is
+ * unusable: the objects on the stream do not decode without the head the filter excluded,
+ * and moq-lite cannot represent the hole at all. Delivering it would pass the group's sixth
+ * frame off as the keyframe it opens with, so the group is dropped and the track resumes at
+ * the next one. Our own publisher never opens such a stream; a draft-20 peer may.
+ */
+test("a group served from partway through is dropped", async () => {
+	const { subscriber, track } = await subscribeTrack();
+
+	// FIRST_OBJECT clear, and the first object's delta is its absolute id.
+	const flags = groupFlags(false);
+	const header = new GroupMessage({ trackAlias: ALIAS, groupId: 3, subGroupId: 0, publisherPriority: 0, flags });
+	await subscriber.handleGroup(header, new Reader(undefined, encodeObjects([5, 0, 0]), VERSION));
+
+	// The next group is served whole, and it is the one the track delivers.
+	const whole = groupFlags(true);
+	await subscriber.handleGroup(
+		new GroupMessage({ trackAlias: ALIAS, groupId: 4, subGroupId: 0, publisherPriority: 0, flags: whole }),
+		new Reader(undefined, encodeObjects([0, 0]), VERSION),
+	);
+
+	const group = await track.ordered().nextGroup();
+	expect(group?.sequence).toBe(4);
+
+	track.close();
+});
+
+/**
+ * FIRST_OBJECT is the publisher's claim, and the object ids are what actually happened. A
+ * peer that sets the bit and then starts at object 5 is contradicting itself, so the group
+ * is aborted rather than delivered with a hole the header said was not there.
+ */
+test("a group that claims its first object must start at zero", async () => {
+	const { subscriber, track } = await subscribeTrack();
+
+	const flags = groupFlags(true);
+	const header = new GroupMessage({ trackAlias: ALIAS, groupId: 3, subGroupId: 0, publisherPriority: 0, flags });
+	await subscriber.handleGroup(header, new Reader(undefined, encodeObjects([5, 0, 0]), VERSION));
+
+	const group = await track.ordered().nextGroup();
+	expect(group).toBeDefined();
+	if (!group) return;
+	await expect(group.readFrameSequence()).rejects.toThrow(/object IDs must start at 0/);
+
+	track.close();
 });

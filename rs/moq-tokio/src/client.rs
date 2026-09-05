@@ -1,7 +1,53 @@
-use crate::{Addrs, Backoff, Connection, Error, GoawayConfig, QuicBackend};
+//! Dialing peers: the [`Client`] and the [`Config`] it is built from.
+//!
+//! [`Config`] pairs the dial half of an endpoint ([`crate::connect::Config`]) with the
+//! QUIC settings ([`crate::quic::Config`]) a binary shares with its accept half. The
+//! accept side is [`crate::server`].
+
+#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche"))]
+use crate::QuicBackend;
+use crate::{Addrs, Backoff, Connection, Error, GoawayConfig};
 #[cfg(all(feature = "websocket", any(feature = "noq", feature = "quinn", feature = "quiche")))]
 use std::future::Future;
 use url::Url;
+
+/// Everything a [`Client`] is built from.
+///
+/// Distinct from [`crate::connect::Config`], which is only the dial half of an endpoint:
+/// this pairs that half with the [`quic::Config`](crate::quic::Config) a binary shares
+/// between dialing and listening, because a `Client` needs both and neither owns the
+/// other. Grouping them here is what lets a future knob land as a field rather than as
+/// another [`Client::new`] parameter.
+///
+/// Most callers want the [`crate::connect::Config::init`] shorthand instead.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct Config {
+	/// The dial side of the endpoint: where to connect and how to be trusted.
+	pub connect: crate::connect::Config,
+
+	/// QUIC socket and transport settings, shared with [`crate::Server`].
+	pub quic: crate::quic::Config,
+}
+
+impl Config {
+	/// Set the dial side, returning `self` for chaining.
+	pub fn with_connect(mut self, connect: crate::connect::Config) -> Self {
+		self.connect = connect;
+		self
+	}
+
+	/// Set the QUIC settings, returning `self` for chaining.
+	pub fn with_quic(mut self, quic: crate::quic::Config) -> Self {
+		self.quic = quic;
+		self
+	}
+
+	/// Build the [`Client`] this config describes.
+	pub fn init(self) -> crate::Result<Client> {
+		Client::new(self)
+	}
+}
 
 /// Client for establishing MoQ connections over QUIC, WebTransport, or WebSocket.
 ///
@@ -38,6 +84,9 @@ pub struct Client {
 	resolution_delay: std::time::Duration,
 	#[cfg(feature = "websocket")]
 	websocket: crate::websocket::Config,
+	/// The TLS server name override used by the WebSocket fallback.
+	#[cfg(feature = "websocket")]
+	tls_host_name: Option<String>,
 	/// Only the rustls-based dials read this. quiche builds its own TLS stack, and the
 	/// plaintext qmux transports have none.
 	#[cfg(any(feature = "noq", feature = "quinn", feature = "websocket"))]
@@ -67,7 +116,7 @@ impl Client {
 		feature = "tcp",
 		feature = "uds"
 	)))]
-	pub fn new(_config: crate::connect::Config, _quic: crate::quic::Config) -> crate::Result<Self> {
+	pub fn new(_config: Config) -> crate::Result<Self> {
 		Err(Error::NoBackend(
 			"no backend compiled; enable noq, quinn, quiche, iroh, websocket, tcp, or uds feature",
 		))
@@ -83,7 +132,11 @@ impl Client {
 		feature = "tcp",
 		feature = "uds"
 	))]
-	pub fn new(config: crate::connect::Config, quic: crate::quic::Config) -> crate::Result<Self> {
+	pub fn new(config: Config) -> crate::Result<Self> {
+		let Config {
+			connect: config, quic, ..
+		} = config;
+
 		// Refuse here rather than in `init`, so a caller that skipped its own check
 		// can't reach a dial that quietly ignored half of what it was given.
 		let mut deprecated = config.deprecated();
@@ -129,6 +182,8 @@ impl Client {
 		let failover_delay = config.resolved_race();
 		#[cfg(feature = "tcp")]
 		let resolution_delay = config.resolved_resolution_delay();
+		#[cfg(feature = "websocket")]
+		let tls_host_name = config.tls.host_name.clone();
 		let timeout = config.resolved_timeout();
 
 		Ok(Self {
@@ -153,6 +208,8 @@ impl Client {
 			resolution_delay,
 			#[cfg(feature = "websocket")]
 			websocket: config.websocket,
+			#[cfg(feature = "websocket")]
+			tls_host_name,
 			#[cfg(any(feature = "noq", feature = "quinn", feature = "websocket"))]
 			tls,
 			#[cfg(feature = "noq")]
@@ -214,9 +271,9 @@ impl Client {
 	}
 
 	/// Assign an origin (hop) id to the peers this client dials, used whenever a
-	/// peer doesn't declare one itself; see [`moq_net::Client::with_peer_origin`].
-	pub fn with_peer_origin(mut self, origin: moq_net::Origin) -> Self {
-		self.moq = self.moq.with_peer_origin(origin);
+	/// peer doesn't declare one itself; see [`moq_net::Client::with_peer_hop`].
+	pub fn with_peer_hop(mut self, hop: moq_net::Hop) -> Self {
+		self.moq = self.moq.with_peer_hop(hop);
 		self
 	}
 
@@ -309,7 +366,7 @@ impl Client {
 		// The deadline covers the dial AND the handshake, for every transport: it is the
 		// only bound some of them have. Dropping `attempt` on expiry cancels whichever
 		// arm was still pending.
-		let pair = match self.timeout.is_zero() {
+		let session = match self.timeout.is_zero() {
 			true => attempt.await?,
 			false => match tokio::time::timeout(self.timeout, attempt).await {
 				Ok(res) => res?,
@@ -317,8 +374,8 @@ impl Client {
 			},
 		};
 
-		tracing::info!(version = %pair.0.version(), "connected");
-		Ok(crate::spawn_session(pair))
+		tracing::info!(version = %session.version(), "connected");
+		Ok(session)
 	}
 
 	/// The moq client builder, advertising `path` in the SETUP when there is one.
@@ -347,7 +404,7 @@ impl Client {
 		feature = "tcp",
 		feature = "uds"
 	))]
-	async fn connect_inner(&self, url: Url) -> crate::Result<(moq_net::Session, moq_net::Driver)> {
+	async fn connect_inner(&self, url: Url) -> crate::Result<moq_net::Session> {
 		// Transports with no request URI of their own advertise the request target in the
 		// SETUP instead; `setup_path` returns `None` for the ones that carry a URI, where
 		// sending it again is a protocol violation. An iroh-only build reads none of this:
@@ -361,7 +418,9 @@ impl Client {
 		if url.scheme() == "tcp" {
 			let session =
 				crate::tcp::connect(url, &self.versions.alpns(), self.failover_delay, self.resolution_delay).await?;
-			return Ok(moq.connect(crate::transport::Async::new(session)).await?);
+			return Ok(moq
+				.connect(crate::runtime::Runtime::new(), crate::transport::Async::new(session))
+				.await?);
 		}
 
 		// Unix domain socket (qmux, no TLS). Same-host only; the server can
@@ -369,7 +428,9 @@ impl Client {
 		#[cfg(all(feature = "uds", unix))]
 		if url.scheme() == "unix" {
 			let session = crate::unix::connect(url, &self.versions.alpns()).await?;
-			return Ok(moq.connect(crate::transport::Async::new(session)).await?);
+			return Ok(moq
+				.connect(crate::runtime::Runtime::new(), crate::transport::Async::new(session))
+				.await?);
 		}
 
 		// iroh offers the moq ALPNs ahead of H3, so two moq endpoints normally land on raw
@@ -387,7 +448,9 @@ impl Client {
 				crate::iroh::Binding::H3 => self.moq.clone(),
 			};
 
-			return Ok(moq.connect(crate::transport::Async::new(session)).await?);
+			return Ok(moq
+				.connect(crate::runtime::Runtime::new(), crate::transport::Async::new(session))
+				.await?);
 		}
 
 		#[cfg(feature = "noq")]
@@ -409,7 +472,7 @@ impl Client {
 			#[cfg(not(feature = "websocket"))]
 			{
 				let session = quic_handle.await?;
-				return Ok(moq.connect(session).await?);
+				return Ok(moq.connect(crate::runtime::Runtime::new(), session).await?);
 			}
 		}
 
@@ -427,7 +490,7 @@ impl Client {
 			#[cfg(not(feature = "websocket"))]
 			{
 				let session = quic_handle.await?;
-				return Ok(moq.connect(session).await?);
+				return Ok(moq.connect(crate::runtime::Runtime::new(), session).await?);
 			}
 		}
 
@@ -444,15 +507,19 @@ impl Client {
 			#[cfg(not(feature = "websocket"))]
 			{
 				let session = quic_handle.await?;
-				return Ok(moq.connect(session).await?);
+				return Ok(moq.connect(crate::runtime::Runtime::new(), session).await?);
 			}
 		}
 
 		#[cfg(feature = "websocket")]
 		{
 			let alpns = self.versions.alpns();
-			let session = crate::websocket::connect(&self.websocket, &self.tls, url, &alpns).await?;
-			return Ok(moq.connect(crate::transport::Async::new(session)).await?);
+			let session =
+				crate::websocket::connect(&self.websocket, &self.tls, self.tls_host_name.as_deref(), url, &alpns)
+					.await?;
+			return Ok(moq
+				.connect(crate::runtime::Runtime::new(), crate::transport::Async::new(session))
+				.await?);
 		}
 
 		#[cfg(not(feature = "websocket"))]
@@ -468,30 +535,27 @@ impl Client {
 	/// Only compiled when there is a QUIC dial to race: a WebSocket-only build connects
 	/// over the fallback directly.
 	#[cfg(all(feature = "websocket", any(feature = "noq", feature = "quinn", feature = "quiche")))]
-	async fn race_moq_connect<Q, S>(
-		&self,
-		moq: &moq_net::Client,
-		url: Url,
-		quic: Q,
-	) -> crate::Result<(moq_net::Session, moq_net::Driver)>
+	async fn race_moq_connect<Q, S>(&self, moq: &moq_net::Client, url: Url, quic: Q) -> crate::Result<moq_net::Session>
 	where
 		Q: Future<Output = crate::Result<S>>,
-		S: moq_net::transport::poll::Session,
+		S: moq_net::transport::poll::Boxable,
 	{
 		let alpns = self.versions.alpns();
 		let ws_config = self.websocket.clone();
 		let ws_tls = self.tls.clone();
+		let ws_tls_host_name = self.tls_host_name.clone();
 		let websocket = async move {
-			crate::websocket::race_handle(&ws_config, &ws_tls, url, &alpns)
+			crate::websocket::race_handle(&ws_config, &ws_tls, ws_tls_host_name.as_deref(), url, &alpns)
 				.await
 				.map(|res| res.map_err(Error::from))
 		};
 
 		match race_transport_connect(quic, websocket).await? {
-			TransportRace::Quic(quic) => Ok(moq.connect(quic).await?),
-			TransportRace::WebSocket(websocket) => {
-				Ok(self.moq.connect(crate::transport::Async::new(websocket)).await?)
-			}
+			TransportRace::Quic(quic) => Ok(moq.connect(crate::runtime::Runtime::new(), quic).await?),
+			TransportRace::WebSocket(websocket) => Ok(self
+				.moq
+				.connect(crate::runtime::Runtime::new(), crate::transport::Async::new(websocket))
+				.await?),
 		}
 	}
 }
@@ -625,14 +689,13 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use clap::Parser;
-
 	/// A parser wrapping the config, since it derives `Args` (a flattened `Parser`
 	/// registers an implicit group named after the struct, which collides once two
 	/// role configs are flattened together).
-	#[derive(Parser)]
+	#[derive(usage::Cli)]
+	#[usage(unknown_flags = "error", args_override_self = false)]
 	struct Cli {
-		#[command(flatten)]
+		#[usage(flatten)]
 		config: crate::connect::Config,
 	}
 
@@ -642,7 +705,9 @@ mod tests {
 			I: IntoIterator<Item = T>,
 			T: Into<std::ffi::OsString> + Clone,
 		{
-			Cli::parse_from(args).config
+			let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+			let args: Vec<_> = args.iter().map(std::ffi::OsString::as_os_str).collect();
+			Cli::try_parse_from(&args).expect("valid test arguments").config
 		}
 	}
 
@@ -737,7 +802,7 @@ mod tests {
 
 		// Simulate: TOML loaded, then CLI args re-applied (no --connect-tls-insecure flag).
 		let mut cli = Cli { config };
-		clap::Parser::update_from(&mut cli, ["test"]);
+		cli.update_from(&[]);
 		let config = cli.config;
 		assert_eq!(config.tls.insecure, Some(true));
 	}
@@ -809,7 +874,7 @@ mod tests {
 	#[test]
 	fn building_a_client_refuses_a_released_spelling() {
 		let config = Cli::config_from(["test", "--client-connect", "https://relay.example.com/anon"]);
-		let Err(err) = crate::Client::new(config, crate::quic::Config::default()) else {
+		let Err(err) = crate::client::Config::default().with_connect(config).init() else {
 			panic!("building a client must refuse a released spelling");
 		};
 		assert!(matches!(err, Error::Deprecated(_)), "{err}");
@@ -829,19 +894,19 @@ mod tests {
 		"#;
 
 		let config: crate::connect::Config = toml::from_str(toml).unwrap();
-		assert_eq!(config.race, Some(std::time::Duration::from_secs(1)));
+		assert_eq!(config.race, std::time::Duration::from_secs(1));
 
 		// Simulate: TOML loaded, then CLI args re-applied (no --client-failover-delay flag).
 		let mut cli = Cli { config };
-		clap::Parser::update_from(&mut cli, ["test"]);
+		cli.update_from(&[]);
 		let config = cli.config;
-		assert_eq!(config.race, Some(std::time::Duration::from_secs(1)));
+		assert_eq!(config.race, std::time::Duration::from_secs(1));
 	}
 
 	#[test]
 	fn test_cli_failover_delay() {
 		let config = Cli::config_from(["test", "--connect-race", "50ms"]);
-		assert_eq!(config.race, Some(std::time::Duration::from_millis(50)));
+		assert_eq!(config.race, std::time::Duration::from_millis(50));
 	}
 
 	#[test]
@@ -851,25 +916,25 @@ mod tests {
 		"#;
 
 		let config: crate::connect::Config = toml::from_str(toml).unwrap();
-		assert_eq!(config.resolution_delay, Some(std::time::Duration::from_millis(10)));
+		assert_eq!(config.resolution_delay, std::time::Duration::from_millis(10));
 
 		// Simulate: TOML loaded, then CLI args re-applied (no --connect-resolution-delay flag).
 		let mut cli = Cli { config };
-		cli.update_from(["test"]);
-		assert_eq!(cli.config.resolution_delay, Some(std::time::Duration::from_millis(10)));
+		cli.update_from(&[]);
+		assert_eq!(cli.config.resolution_delay, std::time::Duration::from_millis(10));
 	}
 
 	#[test]
 	fn test_cli_resolution_delay() {
 		let config = Cli::config_from(["test", "--connect-resolution-delay", "0s"]);
-		assert_eq!(config.resolution_delay, Some(std::time::Duration::ZERO));
+		assert_eq!(config.resolution_delay, std::time::Duration::ZERO);
 		assert_eq!(config.resolved_resolution_delay(), std::time::Duration::ZERO);
 	}
 
 	#[test]
 	fn resolution_delay_defaults_to_the_rfc_value() {
 		let config = Cli::config_from(["test"]);
-		assert_eq!(config.resolution_delay, None);
+		assert_eq!(config.resolution_delay, std::time::Duration::from_millis(50));
 		assert_eq!(config.resolved_resolution_delay(), std::time::Duration::from_millis(50));
 	}
 
@@ -884,7 +949,7 @@ mod tests {
 
 		// Simulate: TOML loaded, then CLI args re-applied (no --client-tls-fingerprint flag).
 		let mut cli = Cli { config };
-		clap::Parser::update_from(&mut cli, ["test"]);
+		cli.update_from(&[]);
 		let config = cli.config;
 		assert_eq!(config.tls.fingerprint, vec!["abcd1234", "ef567890"]);
 	}
@@ -916,7 +981,7 @@ mod tests {
 
 		// Simulate: TOML loaded, then CLI args re-applied (no --client-version flag).
 		let mut cli = Cli { config };
-		clap::Parser::update_from(&mut cli, ["test"]);
+		cli.update_from(&[]);
 		let config = cli.config;
 		assert_eq!(config.version, vec!["moq-lite-02".parse::<moq_net::Version>().unwrap()]);
 	}
@@ -929,9 +994,7 @@ mod tests {
 
 	#[test]
 	fn test_cli_version_help_lists_every_parseable_name() {
-		let help = <crate::connect::Config as clap::Args>::augment_args(clap::Command::new("test"))
-			.render_long_help()
-			.to_string();
+		let help = Cli::render_help(Cli::command(), true).expect("long help");
 		for name in moq_net::Version::names() {
 			assert!(help.contains(name), "missing {name} from --connect-version help");
 		}
@@ -948,7 +1011,7 @@ mod tests {
 
 		// Simulate: TOML loaded, then CLI args re-applied (no --client-connect flag).
 		let mut cli = Cli { config };
-		clap::Parser::update_from(&mut cli, ["test"]);
+		cli.update_from(&[]);
 		let config = cli.config;
 		assert_eq!(config.url.as_ref().unwrap().as_str(), "https://relay.example.com/anon");
 	}
@@ -970,7 +1033,7 @@ mod tests {
 
 		// Simulate: TOML loaded, then CLI args re-applied (no --connect-once flag).
 		let mut cli = Cli { config };
-		clap::Parser::update_from(&mut cli, ["test"]);
+		cli.update_from(&[]);
 		let config = cli.config;
 		assert_eq!(config.once, Some(true));
 	}
@@ -990,8 +1053,7 @@ mod tests {
 		assert!(reported.contains("inverted"), "{reported}");
 	}
 
-	/// An explicit canonical bind wins even when it equals the default, which a
-	/// `default_value` would have made indistinguishable from "unset".
+	/// An explicit canonical bind remains distinguishable from an omitted bind.
 	#[test]
 	fn test_cli_bind_prefers_canonical() {
 		let config = Cli::config_from(["test"]);
@@ -1006,15 +1068,14 @@ mod tests {
 		);
 	}
 
-	/// A config file's bind survives the CLI re-parse, which a clap `default_value`
-	/// would have clobbered.
+	/// A config file's bind survives when the CLI omits it.
 	#[test]
 	fn test_toml_bind_survives_update_from() {
 		let config: crate::connect::Config = toml::from_str(r#"bind = "127.0.0.1:1234""#).unwrap();
 		assert_eq!(config.bind, Some("127.0.0.1:1234".parse().unwrap()));
 
 		let mut cli = Cli { config };
-		clap::Parser::update_from(&mut cli, ["test"]);
+		cli.update_from(&[]);
 		assert_eq!(cli.config.bind, Some("127.0.0.1:1234".parse().unwrap()));
 	}
 
@@ -1060,7 +1121,7 @@ mod tests {
 
 		// Simulate: TOML loaded, then CLI args re-applied (no --client-tls-host-name flag).
 		let mut cli = Cli { config };
-		clap::Parser::update_from(&mut cli, ["test"]);
+		cli.update_from(&[]);
 		let config = cli.config;
 		assert_eq!(config.tls.host_name.as_deref(), Some("example.host"));
 	}
@@ -1124,7 +1185,7 @@ mod tests {
 	#[test]
 	fn race_defaults_to_the_rfc_8305_stagger() {
 		let config = crate::connect::Config::default();
-		assert_eq!(config.race, None);
+		assert_eq!(config.race, std::time::Duration::from_millis(250));
 		assert_eq!(config.resolved_race(), std::time::Duration::from_millis(250));
 	}
 
@@ -1142,7 +1203,7 @@ mod tests {
 	#[test]
 	fn connect_timeout_defaults_to_thirty_seconds() {
 		let config = Cli::config_from(["test"]);
-		assert_eq!(config.timeout, None);
+		assert_eq!(config.timeout, crate::connect::DEFAULT_TIMEOUT);
 		assert_eq!(config.resolved_timeout(), crate::connect::DEFAULT_TIMEOUT);
 	}
 
@@ -1161,10 +1222,10 @@ mod tests {
 
 		let timeout = crate::connect::DEFAULT_TIMEOUT;
 		let mut config = crate::connect::Config {
-			timeout: Some(timeout),
+			timeout: timeout.into(),
 			..Default::default()
 		};
-		config.websocket.delay = Some(std::time::Duration::ZERO);
+		config.websocket.delay = std::time::Duration::ZERO.into();
 		let client = config.init(Default::default()).unwrap();
 
 		// Nothing is listening on UDP, so the QUIC arm fails and leaves the WebSocket

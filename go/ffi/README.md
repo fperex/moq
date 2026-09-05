@@ -20,17 +20,20 @@ The published module ships prebuilt `libmoq_ffi.a` for `linux/amd64`, `linux/arm
 
 ## Local development
 
-`go/scripts/check.sh` builds `moq-ffi` for the host, runs `uniffi-bindgen-go` to regenerate `moq.go`, stages this module plus the wrapper into `dist/`, and runs `go build`/`go vet`/`go test`. Run via `just go check`. Skips cleanly without `cargo`, `go`, or `uniffi-bindgen-go`.
+`go/scripts/check.sh` builds `moq-ffi` for the host, runs `uniffi-bindgen-go` to regenerate `moq.go`, stages this module plus the wrapper into `dist/`, and runs `go build`/`go vet`/`go test`. It also runs `publish-wrapper.test.sh`, which drives the wrapper publisher against a scratch bare repo (no cargo, no network). Run via `just go check`. Skips cleanly without `cargo`, `go`, or `uniffi-bindgen-go`.
 
 The dev shell provides both `go` and `uniffi-bindgen-go`, so `nix develop --command just go check` needs no setup. Without Nix, install `uniffi-bindgen-go` once:
 
 ```bash
 cargo install uniffi-bindgen-go \
-    --git https://github.com/NordSecurity/uniffi-bindgen-go \
-    --tag v0.7.1+v0.31.0
+    --git https://github.com/kixelated/uniffi-bindgen-go \
+    --rev 4f79e52bd8f518e5fa4d7acff9e586aee21e12a0 \
+    --locked
 ```
 
-The tag pins the generator to the `uniffi` version `rs/moq-ffi` depends on; `flake.nix` pins the same one.
+`--locked` matters: `uniffi_bindgen` depends on `toml` across a `>=0.9, <2` range, so a fresh resolve can pick a different `toml` than the generator was built against.
+
+The revision is the commit behind `v0.8.0+v0.32.0`, matching the `uniffi` version `rs/moq-ffi` depends on; `flake.nix` pins the same source. It points at a fork because upstream has no uniffi 0.32 release yet; `flake.nix` carries the details.
 
 ## Layout
 

@@ -58,6 +58,67 @@ struct Reservations {
 	published: bool,
 }
 
+/// The built-in catalog's enrollment in the broadcast timeline.
+struct CatalogTimeline {
+	recorder: crate::timeline::Recorder,
+	last_sequence: Option<u64>,
+}
+
+impl CatalogTimeline {
+	/// Report a newly published plaintext catalog group once.
+	fn record(&mut self, track: &moq_net::track::Producer) {
+		let Some(sequence) = track.latest() else {
+			return;
+		};
+		if self.last_sequence == Some(sequence) {
+			return;
+		}
+
+		self.last_sequence = Some(sequence);
+		self.recorder.record(sequence, moq_net::Timestamp::now(), true);
+	}
+}
+
+/// The catalog tracks and the timeline enrollment updated with them.
+struct Outputs<E: CatalogExt> {
+	hang: moq_json::snapshot::Producer<Catalog<E>>,
+	hang_track: moq_net::track::Producer,
+	hangz: moq_json::snapshot::Producer<Catalog<E>>,
+	msf_track: moq_net::track::Producer,
+	catalog_timeline: Arc<Mutex<CatalogTimeline>>,
+}
+
+impl<E: CatalogExt> Clone for Outputs<E> {
+	fn clone(&self) -> Self {
+		Self {
+			hang: self.hang.clone(),
+			hang_track: self.hang_track.clone(),
+			hangz: self.hangz.clone(),
+			msf_track: self.msf_track.clone(),
+			catalog_timeline: self.catalog_timeline.clone(),
+		}
+	}
+}
+
+impl<E: CatalogExt> Outputs<E> {
+	/// Emit the catalog to hang, compressed hang, MSF, and the broadcast timeline.
+	fn emit(&mut self, catalog: &Catalog<E>) -> crate::Result<()> {
+		// One snapshot per group while deltas are disabled; the `.z` track carries the identical catalog.
+		self.hang.update(catalog)?;
+		self.catalog_timeline.lock().unwrap().record(&self.hang_track);
+		self.hangz.update(catalog)?;
+
+		// The MSF catalog is derived from our own types, so a serialize failure means an extension broke
+		// the shape; report it like any other JSON failure rather than panicking.
+		let msf = to_msf(&catalog.media()).to_json().map_err(moq_json::Error::from)?;
+		let mut group = self.msf_track.append_group()?;
+		group.write_frame(moq_net::Timestamp::now(), msf)?;
+		group.finish()?;
+
+		Ok(())
+	}
+}
+
 /// Produces both a hang and MSF catalog track for a broadcast.
 ///
 /// Generic over the application extension `E` (defaulting to `()` for none). The catalog is a
@@ -74,9 +135,7 @@ struct Reservations {
 /// group (deltas disabled). This routes catalog publishing through the JSON merge-patch helper
 /// so deltas can be enabled later without changing the wire format used today.
 pub struct Producer<E: CatalogExt = ()> {
-	hang: moq_json::snapshot::Producer<Catalog<E>>,
-	hangz: moq_json::snapshot::Producer<Catalog<E>>,
-	msf_track: moq_net::track::Producer,
+	outputs: Outputs<E>,
 
 	current: Arc<Mutex<State<E>>>,
 
@@ -89,7 +148,6 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// onto, and the track those segment records are published on. See
 	/// [`timeline`](Self::timeline).
 	timeline: crate::timeline::Producer,
-
 	/// Retention override for the media tracks minted under this catalog, or `None` to keep
 	/// hang's default. Fixed at construction, so every clone and every
 	/// [`Reserved`](super::Reserved) mints tracks under one policy. See
@@ -101,9 +159,7 @@ pub struct Producer<E: CatalogExt = ()> {
 impl<E: CatalogExt> Clone for Producer<E> {
 	fn clone(&self) -> Self {
 		Self {
-			hang: self.hang.clone(),
-			hangz: self.hangz.clone(),
-			msf_track: self.msf_track.clone(),
+			outputs: self.outputs.clone(),
 			current: self.current.clone(),
 			clock: self.clock,
 			timeline: self.timeline.clone(),
@@ -189,33 +245,48 @@ impl<E: CatalogExt> Producer<E> {
 		let hang_track = broadcast.create_track(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info())?;
 		let hangz_track =
 			broadcast.create_track(hang::Catalog::COMPRESSED_NAME, hang::Catalog::default_track_info())?;
-		let msf_track = broadcast.create_track(moq_msf::DEFAULT_NAME, None)?;
+		// The MSF track is the same catalog in another encoding, so it takes the same
+		// priority. Leaving it at the default would rank a subscriber reading MSF
+		// below every media track on a relay's upstream leg.
+		let msf_info = moq_net::track::Info::default().with_priority(hang::catalog::PRIORITY.catalog);
+		let msf_track = broadcast.create_track(moq_msf::DEFAULT_NAME, msf_info)?;
 
 		// Disable deltas for now to stay byte-compatible with consumers that only read snapshots.
 		let mut json_config = moq_json::snapshot::ProducerConfig::default();
 		json_config.delta_ratio = 0;
-		let hang = moq_json::snapshot::Producer::new(hang_track, json_config.clone());
+		let hang = moq_json::snapshot::Producer::new(hang_track.clone(), json_config.clone());
 
 		// The `.z` track carries the same catalog, DEFLATE-compressed. Deltas stay off for parity
 		// with the plaintext track; only the per-group compression differs.
 		json_config.compression = true;
 		let hangz = moq_json::snapshot::Producer::new(hangz_track, json_config);
 
+		let timeline = crate::timeline::Producer::new(broadcast, crate::timeline::Config::default());
+		#[allow(clippy::arc_with_non_send_sync)]
+		let catalog_timeline = Arc::new(Mutex::new(CatalogTimeline {
+			recorder: timeline.track(hang::Catalog::DEFAULT_NAME),
+			last_sequence: None,
+		}));
+
 		// The contents are `Send + Sync` natively; on wasm moq-net's handles are
 		// `Rc`-backed, so clippy sees a pointlessly atomic `Arc`. Keeping one type for
 		// both targets is worth the unused atomics on the single-threaded one.
 		#[allow(clippy::arc_with_non_send_sync)]
 		Ok(Self {
-			hang,
-			hangz,
-			msf_track,
+			outputs: Outputs {
+				hang,
+				hang_track,
+				hangz,
+				msf_track,
+				catalog_timeline,
+			},
 			current: Arc::new(Mutex::new(State {
 				catalog: config.catalog,
 				owned: BTreeSet::new(),
 				reservations: Reservations::default(),
 			})),
 			clock: crate::Clock::new(),
-			timeline: crate::timeline::Producer::new(broadcast, crate::timeline::Config::default()),
+			timeline,
 			max_age: config.max_age,
 		})
 	}
@@ -223,10 +294,11 @@ impl<E: CatalogExt> Producer<E> {
 	/// Track properties for a media track under this catalog: hang's media defaults, plus any
 	/// [`Config::with_max_age`] override.
 	///
-	/// Chain [`with_timescale`](moq_net::track::Info::with_timescale) for a container that
-	/// carries the source's own scale (CMAF and Matroska both do).
-	pub fn track_info(&self) -> moq_net::track::Info {
-		let info = hang::container::track_info();
+	/// `priority` should come from [`PRIORITY`](hang::catalog::PRIORITY) for the kind of media
+	/// the track carries. Chain [`with_timescale`](moq_net::track::Info::with_timescale) for a
+	/// container that carries the source's own scale (CMAF and Matroska both do).
+	pub fn track_info(&self, priority: u8) -> moq_net::track::Info {
+		let info = hang::container::track_info(priority);
 		match self.max_age {
 			Some(max_age) => info.with_max_age(max_age),
 			None => info,
@@ -252,9 +324,7 @@ impl<E: CatalogExt> Producer<E> {
 	pub fn lock(&mut self) -> Guard<'_, E> {
 		Guard {
 			state: take(&self.current),
-			hang: &mut self.hang,
-			hangz: &mut self.hangz,
-			msf_track: &mut self.msf_track,
+			outputs: &mut self.outputs,
 			updated: false,
 		}
 	}
@@ -269,8 +339,13 @@ impl<E: CatalogExt> Producer<E> {
 	/// Call it before any track enrolls (the timeline's own track doesn't exist until then, so
 	/// this replaces it wholesale); afterwards the pacing is fixed for the broadcast, since the
 	/// catalog has advertised what it promises.
+	#[allow(clippy::arc_with_non_send_sync)]
 	pub fn with_timeline(mut self, broadcast: &moq_net::broadcast::Producer, config: crate::timeline::Config) -> Self {
 		self.timeline = crate::timeline::Producer::new(broadcast, config);
+		self.outputs.catalog_timeline = Arc::new(Mutex::new(CatalogTimeline {
+			recorder: self.timeline.track(hang::Catalog::DEFAULT_NAME),
+			last_sequence: None,
+		}));
 		self
 	}
 
@@ -284,6 +359,20 @@ impl<E: CatalogExt> Producer<E> {
 	/// Producers that don't reserve publish incrementally as before.
 	pub fn reserve(&self) -> super::Reserved<E> {
 		super::Reserved::new(self.clone())
+	}
+
+	/// Take a rendition name without withholding the catalog's initial snapshot.
+	///
+	/// Use this for a long-lived incremental producer whose config may arrive
+	/// later or never arrive. The returned handle owns the name immediately,
+	/// publishes the config on [`set`](super::Rendition::set), and retires it on
+	/// drop. Use [`reserve`](Self::reserve) when the initial catalog must wait for
+	/// the complete track set instead.
+	pub fn rendition<C: super::RenditionConfig<E>>(
+		&self,
+		name: impl Into<String>,
+	) -> crate::Result<super::Rendition<E, C>> {
+		super::Rendition::live(self.clone(), name.into())
 	}
 
 	/// Take `name` in `C`'s section for a new [`Rendition`](super::Rendition), which owns it until
@@ -336,7 +425,7 @@ impl<E: CatalogExt> Producer<E> {
 			r.published = true;
 			state.catalog.clone()
 		};
-		if let Err(err) = emit(&mut self.hang, &mut self.hangz, &mut self.msf_track, &catalog) {
+		if let Err(err) = self.outputs.emit(&catalog) {
 			tracing::warn!(%err, "failed to publish the catalog");
 		}
 	}
@@ -363,7 +452,7 @@ impl<E: CatalogExt> Producer<E> {
 	/// that isn't built through a [`container::Producer`](crate::container::Producer) (an fMP4
 	/// passthrough writing groups by hand).
 	pub fn enroll(&mut self, track: &str) -> crate::Result<crate::timeline::Recorder> {
-		let recorder = self.timeline.track(track)?;
+		let recorder = self.timeline.pacing_track(track)?;
 
 		let section = self.timeline.section();
 		let mut catalog = self.lock();
@@ -386,16 +475,85 @@ impl<E: CatalogExt> Producer<E> {
 		self.timeline.clone()
 	}
 
+	/// Publish `track` as a latest-value JSON track, advertising it in the catalog.
+	///
+	/// The caller creates the track on the broadcast, as it does for a media track
+	/// ([`media_producer`](Self::media_producer)); this writes its catalog entry and removes the
+	/// entry when the returned handle drops. The catalog key is [`track.name()`](moq_net::track::Producer::name)
+	/// verbatim, with no `.z` suffix even when compressed, since the entry's compression flag is
+	/// what a consumer reads.
+	///
+	/// Errors if the catalog already carries an entry under that name, for example one seeded
+	/// through [`Config::with_catalog`] or one pointing at a sibling broadcast.
+	pub fn json_snapshot<T: serde::Serialize>(
+		&self,
+		track: moq_net::track::Producer,
+		config: crate::json::Config,
+	) -> crate::Result<crate::json::Snapshot<T, E>> {
+		let rendition = self.data_entry(track.name())?;
+		Ok(crate::json::Snapshot::new(track, rendition, &config))
+	}
+
+	/// Publish `track` as an append-log JSON track, advertising it in the catalog.
+	///
+	/// See [`json_snapshot`](Self::json_snapshot) for the lifecycle; this differs only in that every
+	/// record is preserved rather than superseded.
+	pub fn json_stream<T: serde::Serialize>(
+		&self,
+		track: moq_net::track::Producer,
+		config: crate::json::Config,
+	) -> crate::Result<crate::json::Stream<T, E>> {
+		let rendition = self.data_entry(track.name())?;
+		Ok(crate::json::Stream::new(track, rendition, &config))
+	}
+
+	/// Publish `track` as a latest-value binary track, advertising it in the catalog.
+	///
+	/// See [`json_snapshot`](Self::json_snapshot) for the lifecycle; this differs only in that the
+	/// payloads are opaque bytes.
+	pub fn binary_snapshot(
+		&self,
+		track: moq_net::track::Producer,
+		config: crate::binary::Config,
+	) -> crate::Result<crate::binary::Snapshot<E>> {
+		let rendition = self.data_entry(track.name())?;
+		Ok(crate::binary::Snapshot::new(track, rendition, &config))
+	}
+
+	/// Publish `track` as an append-log binary track, advertising it in the catalog.
+	///
+	/// See [`json_snapshot`](Self::json_snapshot) for the lifecycle; this differs only in that the
+	/// payloads are opaque bytes and every one is preserved rather than superseded.
+	pub fn binary_stream(
+		&self,
+		track: moq_net::track::Producer,
+		config: crate::binary::Config,
+	) -> crate::Result<crate::binary::Stream<E>> {
+		let rendition = self.data_entry(track.name())?;
+		Ok(crate::binary::Stream::new(track, rendition, &config))
+	}
+
+	/// Reserve the catalog entry a data producer owns, keyed by its track name.
+	///
+	/// The rendition is reserved but not yet set, so the caller fills it in with the config for the
+	/// mode it is about to publish. Reserving is what rejects a name the catalog already carries,
+	/// including an entry with no local track behind it (seeded through
+	/// [`Config::with_catalog`], or pointing at a sibling broadcast), which publishing over would
+	/// silently replace and then retire when this handle drops.
+	fn data_entry<C: super::RenditionConfig<E>>(&self, name: &str) -> crate::Result<super::Rendition<E, C>> {
+		self.reserve().init(name)
+	}
+
 	/// Create a consumer for this catalog, receiving updates as they're published.
 	pub fn consume(&self) -> Result<Consumer<E>, moq_net::Error> {
-		Ok(Consumer::new(self.hang.consume()))
+		Ok(Consumer::new(self.outputs.hang.consume()))
 	}
 
 	/// Finish publishing to this catalog.
 	pub fn finish(&mut self) -> crate::Result<()> {
-		self.hang.finish()?;
-		self.hangz.finish()?;
-		self.msf_track.finish()?;
+		self.outputs.hang.finish()?;
+		self.outputs.hangz.finish()?;
+		self.outputs.msf_track.finish()?;
 		self.timeline.finish()?;
 		Ok(())
 	}
@@ -411,9 +569,7 @@ impl<E: CatalogExt> Producer<E> {
 /// logs a warning; call [`commit`](Self::commit) instead to handle the error.
 pub struct Guard<'a, E: CatalogExt = ()> {
 	state: MutexGuard<'a, State<E>>,
-	hang: &'a mut moq_json::snapshot::Producer<Catalog<E>>,
-	hangz: &'a mut moq_json::snapshot::Producer<Catalog<E>>,
-	msf_track: &'a mut moq_net::track::Producer,
+	outputs: &'a mut Outputs<E>,
 	updated: bool,
 }
 
@@ -445,7 +601,7 @@ impl<E: CatalogExt> Guard<'_, E> {
 			r.published = true;
 		}
 
-		emit(self.hang, self.hangz, self.msf_track, &self.state.catalog)
+		self.outputs.emit(&self.state.catalog)
 	}
 
 	/// Release a name taken by [`Producer::acquire`], along with the entry it owns.
@@ -512,28 +668,6 @@ impl<E: CatalogExt> Drop for Guard<'_, E> {
 	}
 }
 
-/// Emit the catalog to all tracks: hang (`catalog.json`), its DEFLATE-compressed `.z` sibling, and
-/// the MSF catalog (`catalog`) derived from the base media sections.
-fn emit<E: CatalogExt>(
-	hang: &mut moq_json::snapshot::Producer<Catalog<E>>,
-	hangz: &mut moq_json::snapshot::Producer<Catalog<E>>,
-	msf_track: &mut moq_net::track::Producer,
-	catalog: &Catalog<E>,
-) -> crate::Result<()> {
-	// One snapshot per group while deltas are disabled; the `.z` track carries the identical catalog.
-	hang.update(catalog)?;
-	hangz.update(catalog)?;
-
-	// The MSF catalog is derived from our own types, so a serialize failure means an extension broke
-	// the shape; report it like any other JSON failure rather than panicking.
-	let msf = to_msf(&catalog.media()).to_json().map_err(moq_json::Error::from)?;
-	let mut group = msf_track.append_group()?;
-	group.write_frame(moq_net::Timestamp::now(), msf)?;
-	group.finish()?;
-
-	Ok(())
-}
-
 /// Determine the SAP starting type for a given video codec.
 ///
 /// SAP type 1: closed GOP with no leading pictures (IDR at every SAP).
@@ -554,15 +688,30 @@ fn video_sap_type(codec: &hang::catalog::VideoCodec) -> Option<u8> {
 	}
 }
 
+/// The MSF packaging that announces `container`, or `None` to leave the rendition out of the catalog.
+///
+/// Exhaustive on purpose: a catch-all is what announced LOC as legacy, and it would do the same to the
+/// next container added. hang says an unrecognized one must be ignored, so it keeps its wire kind (no
+/// MSF consumer claims one it does not know) and is dropped when it does not even name one.
+fn packaging_of(container: &hang::catalog::Container) -> Option<moq_msf::Packaging> {
+	match container {
+		hang::catalog::Container::Cmaf { .. } => Some(moq_msf::Packaging::Cmaf),
+		hang::catalog::Container::Loc => Some(moq_msf::Packaging::Loc),
+		hang::catalog::Container::Legacy => Some(moq_msf::Packaging::Legacy),
+		hang::catalog::Container::Unknown(unknown) => {
+			unknown.kind().map(|kind| moq_msf::Packaging::Unknown(kind.to_string()))
+		}
+	}
+}
+
 /// Convert a hang catalog to an MSF catalog.
 fn to_msf(catalog: &hang::Catalog) -> moq_msf::Catalog {
 	let mut tracks = Vec::new();
 
 	let has_multiple_video = catalog.video.renditions.len() > 1;
 	for (name, config) in &catalog.video.renditions {
-		let packaging = match &config.container {
-			hang::catalog::Container::Cmaf { .. } => moq_msf::Packaging::Cmaf,
-			_ => moq_msf::Packaging::Legacy,
+		let Some(packaging) = packaging_of(&config.container) else {
+			continue;
 		};
 
 		let init_data = match &config.container {
@@ -594,9 +743,8 @@ fn to_msf(catalog: &hang::Catalog) -> moq_msf::Catalog {
 
 	let has_multiple_audio = catalog.audio.renditions.len() > 1;
 	for (name, config) in &catalog.audio.renditions {
-		let packaging = match &config.container {
-			hang::catalog::Container::Cmaf { .. } => moq_msf::Packaging::Cmaf,
-			_ => moq_msf::Packaging::Legacy,
+		let Some(packaging) = packaging_of(&config.container) else {
+			continue;
 		};
 
 		let init_data = match &config.container {
@@ -637,6 +785,33 @@ mod test {
 
 	use super::*;
 
+	/// The catalog, its MSF twin, and the timeline all rank above media. They're the
+	/// index a player reads before any media is useful, and they're small enough that
+	/// sitting above media can't starve it. Regression: the MSF and timeline tracks
+	/// were minted with no `Info` at all, so one broadcast advertised its hang catalog
+	/// at 100 and the same catalog in MSF at 0.
+	#[tokio::test]
+	async fn non_media_tracks_rank_above_media() {
+		use hang::catalog::PRIORITY;
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = Producer::new(&mut broadcast).unwrap();
+		// Pacing enrollment is what mints the timeline track; a passive one publishes none.
+		catalog.timeline().pacing_track("video").unwrap();
+
+		let consumer = broadcast.consume();
+		for name in [
+			hang::Catalog::DEFAULT_NAME,
+			hang::Catalog::COMPRESSED_NAME,
+			moq_msf::DEFAULT_NAME,
+			hang::timeline::DEFAULT_NAME,
+		] {
+			let track = consumer.track(name).expect("track");
+			let info = track.info().await.expect("info");
+			assert_eq!(info.priority, PRIORITY.catalog, "{name} should rank with the catalog");
+		}
+	}
+
 	#[test]
 	fn media_tracks_inherit_the_catalogs_declared_retention() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
@@ -644,8 +819,11 @@ mod test {
 		// Unset, a catalog mints hang's media defaults, sized so a segmented egress can serve a
 		// full playlist window rather than moq-net's live-edge default.
 		let catalog = Producer::new(&mut broadcast).unwrap();
-		assert_eq!(catalog.track_info().max_age, hang::container::track_info().max_age);
-		assert!(catalog.track_info().max_age > moq_net::track::DEFAULT_MAX_AGE);
+		assert_eq!(
+			catalog.track_info(hang::catalog::PRIORITY.video).max_age,
+			hang::container::track_info(hang::catalog::PRIORITY.video).max_age
+		);
+		assert!(catalog.track_info(hang::catalog::PRIORITY.video).max_age > moq_net::track::DEFAULT_MAX_AGE);
 
 		// An override reaches every media track this catalog mints, and does NOT disturb the
 		// timescale hang pins (or survive a retimescale for a source-scale container).
@@ -653,7 +831,7 @@ mod test {
 		let config = Config::default().with_max_age(std::time::Duration::from_secs(3));
 		let catalog = Producer::with_config(&mut broadcast, config).unwrap();
 
-		let info = catalog.track_info();
+		let info = catalog.track_info(hang::catalog::PRIORITY.video);
 		assert_eq!(info.max_age, std::time::Duration::from_secs(3));
 		assert_eq!(info.timescale, hang::container::TIMESCALE);
 
@@ -664,10 +842,13 @@ mod test {
 		// Every handle mints under the same policy, whatever order it was taken in: the codec
 		// paths hold a reservation and the container paths hold a clone.
 		assert_eq!(
-			catalog.reserve().track_info().max_age,
+			catalog.reserve().track_info(hang::catalog::PRIORITY.video).max_age,
 			std::time::Duration::from_secs(3)
 		);
-		assert_eq!(catalog.clone().track_info().max_age, std::time::Duration::from_secs(3));
+		assert_eq!(
+			catalog.clone().track_info(hang::catalog::PRIORITY.video).max_age,
+			std::time::Duration::from_secs(3)
+		);
 	}
 
 	#[test]
@@ -675,8 +856,8 @@ mod test {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut catalog = Producer::new(&mut broadcast).unwrap();
 
-		let mut plain = Consumer::new(catalog.hang.consume());
-		let mut compressed = Consumer::compressed(catalog.hangz.consume());
+		let mut plain = Consumer::new(catalog.outputs.hang.consume());
+		let mut compressed = Consumer::compressed(catalog.outputs.hangz.consume());
 
 		{
 			let mut guard = catalog.lock();
@@ -721,7 +902,7 @@ mod test {
 	fn commit_publishes_once() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut catalog = Producer::new(&mut broadcast).unwrap();
-		let track = catalog.hang.consume();
+		let track = catalog.outputs.hang.consume();
 
 		let mut guard = catalog.lock();
 		guard
@@ -779,7 +960,7 @@ mod test {
 	fn reservation_gates_until_all_renditions_resolve() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = Producer::new(&mut broadcast).unwrap();
-		let mut consumer: Consumer = Consumer::new(catalog.hang.consume());
+		let mut consumer: Consumer = Consumer::new(catalog.outputs.hang.consume());
 		let waiter = kio::Waiter::noop();
 
 		let reserved = catalog.reserve();
@@ -808,13 +989,36 @@ mod test {
 		);
 	}
 
+	#[test]
+	fn live_rendition_owns_its_name_without_gating_the_catalog() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = Producer::new(&mut broadcast).unwrap();
+		let mut consumer: Consumer = Consumer::new(catalog.outputs.hang.consume());
+		let waiter = kio::Waiter::noop();
+
+		let _unresolved = catalog.rendition::<VideoConfig>("video0").unwrap();
+		assert!(
+			catalog.rendition::<VideoConfig>("video0").is_err(),
+			"the unresolved live rendition owns its name"
+		);
+		let mut audio = catalog.rendition::<AudioConfig>("audio0").unwrap();
+		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2));
+
+		let snapshot = match consumer.poll_next(&waiter) {
+			Poll::Ready(Ok(Some(c))) => c,
+			other => panic!("expected the incremental audio catalog, got {other:?}"),
+		};
+		assert!(snapshot.audio.renditions.contains_key("audio0"));
+		assert!(!snapshot.video.renditions.contains_key("video0"));
+	}
+
 	// Dropping a reservation without fulfilling it (a stream that never produced a config) still opens
 	// the gate, publishing whatever did resolve.
 	#[test]
 	fn reservation_gate_opens_when_unresolved_reservation_is_dropped() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = Producer::new(&mut broadcast).unwrap();
-		let mut consumer: Consumer = Consumer::new(catalog.hang.consume());
+		let mut consumer: Consumer = Consumer::new(catalog.outputs.hang.consume());
 		let waiter = kio::Waiter::noop();
 
 		let reserved = catalog.reserve();
@@ -842,7 +1046,7 @@ mod test {
 	fn staged_change_waits_for_a_held_reservation() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = Producer::new(&mut broadcast).unwrap();
-		let mut consumer: Consumer = Consumer::new(catalog.hang.consume());
+		let mut consumer: Consumer = Consumer::new(catalog.outputs.hang.consume());
 		let waiter = kio::Waiter::noop();
 
 		// A deferred importer grabs a reservation up front and holds it until it can resolve.
@@ -937,6 +1141,69 @@ mod test {
 		assert_eq!(audio.max_grp_sap_starting_type, Some(1));
 		assert_eq!(audio.max_obj_sap_starting_type, Some(1));
 		assert_eq!(audio.jitter, None);
+	}
+
+	// A LOC rendition must advertise `packaging: loc`. MSF-01 has no legacy packaging, so falling into
+	// the legacy arm published a catalog that named a container the receiver would not find on the wire.
+	#[test]
+	fn convert_video_loc_container() {
+		let mut video_config = VideoConfig::new(H264 {
+			profile: 0x64,
+			constraints: 0x00,
+			level: 0x1f,
+			inline: true,
+		});
+		video_config.container = Container::Loc;
+
+		let mut video_renditions = BTreeMap::new();
+		video_renditions.insert("video0.avc3".to_string(), video_config);
+
+		let mut catalog = hang::Catalog::default();
+		catalog.video.renditions = video_renditions;
+
+		let msf = to_msf(&catalog);
+		assert_eq!(msf.tracks.len(), 1);
+		assert_eq!(msf.tracks[0].packaging, moq_msf::Packaging::Loc);
+	}
+
+	#[test]
+	fn convert_audio_loc_container() {
+		let mut audio_config = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
+		audio_config.container = Container::Loc;
+
+		let mut audio_renditions = BTreeMap::new();
+		audio_renditions.insert("audio0".to_string(), audio_config);
+
+		let mut catalog = hang::Catalog::default();
+		catalog.audio.renditions = audio_renditions;
+
+		let msf = to_msf(&catalog);
+		assert_eq!(msf.tracks.len(), 1);
+		assert_eq!(msf.tracks[0].packaging, moq_msf::Packaging::Loc);
+	}
+
+	// An unrecognized container keeps its wire kind instead of posing as legacy: hang says such a
+	// rendition must be ignored, and no MSF consumer claims an unknown packaging.
+	#[test]
+	fn convert_unknown_container_keeps_its_kind() {
+		let container: Container = serde_json::from_value(serde_json::json!({ "kind": "future" })).unwrap();
+		assert!(matches!(container, Container::Unknown(_)));
+
+		let mut audio_config = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
+		audio_config.container = container;
+
+		let mut audio_renditions = BTreeMap::new();
+		audio_renditions.insert("audio0".to_string(), audio_config);
+
+		let mut catalog = hang::Catalog::default();
+		catalog.audio.renditions = audio_renditions;
+
+		let msf = to_msf(&catalog);
+		assert_eq!(msf.tracks.len(), 1);
+		assert_eq!(
+			msf.tracks[0].packaging,
+			moq_msf::Packaging::Unknown("future".to_string())
+		);
 	}
 
 	#[test]

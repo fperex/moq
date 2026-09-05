@@ -11,6 +11,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Track suffixes derive from the typed import format, so the suffix and the codec cannot disagree.
 
+## [0.3.9](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.8...moq-gst-v0.3.9) - 2026-09-02
+
+### Fixed
+
+- *(packaging)* render nfpm environment variables ([#3340](https://github.com/moq-dev/moq/pull/3340))
+
+## [0.3.8](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.7...moq-gst-v0.3.8) - 2026-09-01
+
+### Added
+
+- *(moq-gst)* expose sink-pad publication lifecycle ([#2998](https://github.com/moq-dev/moq/pull/2998))
+
+### Fixed
+
+- *(moq-gst)* keep one rendition's subscribe off the catalog loop ([#3130](https://github.com/moq-dev/moq/pull/3130))
+- *(moq-gst)* tie the session's lifetime to the state transition ([#3101](https://github.com/moq-dev/moq/pull/3101))
+- *(moq-gst)* let a flush restart a pad that already sent EOS ([#3104](https://github.com/moq-dev/moq/pull/3104))
+- *(moq-gst)* scope a terminal session error to the session that earned it ([#3102](https://github.com/moq-dev/moq/pull/3102))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.3.7](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.6...moq-gst-v0.3.7) - 2026-08-24
+
+### Added
+
+- *(moq-gst)* publish opaque application data tracks
+- *(moq-gst)* let sink pads name the track they publish ([#2983](https://github.com/moq-dev/moq/pull/2983))
+
+### Fixed
+
+- *(moq-gst)* make startup properties READY-only ([#2982](https://github.com/moq-dev/moq/pull/2982))
+
+### Other
+
+- name release archives after their tag and publish SHA256SUMS ([#2995](https://github.com/moq-dev/moq/pull/2995))
+
+## [0.3.6](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.5...moq-gst-v0.3.6) - 2026-08-20
+
+### Other
+
+- updated the following local packages: moq-mux
+
 ## [0.3.5](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.4...moq-gst-v0.3.5) - 2026-08-07
 
 ### Other

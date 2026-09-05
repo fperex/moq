@@ -5,7 +5,7 @@ import type { Established } from "../connection/established.ts";
 import { type Probe, type Stats, transportStats } from "../connection/stats.ts";
 import { type Transport, transportOf } from "../connection/transport.ts";
 import { error, fromClose } from "../error.ts";
-import { type Origin, randomOrigin } from "../hop.ts";
+import { type Hop, randomHop } from "../hop.ts";
 import type { Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
 import { type Reader, Readers, Stream, Writer } from "../stream.ts";
@@ -20,7 +20,7 @@ import { DataType, StreamId } from "./stream.ts";
 import { Subscribe } from "./subscribe.ts";
 import { Subscriber } from "./subscriber.ts";
 import { Track as TrackMessage } from "./track.ts";
-import { hasDatagrams, hasSetupStream, type Version, versionName } from "./version.ts";
+import { hasDatagrams, hasProbeRtt, hasSetupStream, type Version, versionName } from "./version.ts";
 
 /**
  * Constructor options for {@link Connection}.
@@ -78,9 +78,9 @@ export class Connection implements Established {
 	/** The peer's PROBE estimates; see {@link Established.probe}. */
 	readonly probe: Getter<Probe>;
 
-	/** Random per-connection origin id. Shared by Publisher (for outbound hop
+	/** Random per-connection Hop ID. Shared by Publisher (for outbound hop
 	 * chains) and Subscriber (available for optional self-filtering on announces). */
-	readonly origin: Origin;
+	readonly hop: Hop;
 
 	// The peer's SETUP, recorded once its Setup stream is read (lite-05+). Streams whose
 	// encoding depends on a negotiated capability (e.g. PROBE) wait on this. undefined
@@ -123,9 +123,9 @@ export class Connection implements Established {
 
 		this.probe = this.#probe;
 
-		this.origin = randomOrigin();
-		this.#publisher = new Publisher(this.#quic, this.#version, this.origin, publish);
-		this.#subscriber = new Subscriber(this.#quic, this.#version, this.origin, this.#probe, this.#peerSetup);
+		this.hop = randomHop();
+		this.#publisher = new Publisher(this.#quic, this.#version, this.hop, publish);
+		this.#subscriber = new Subscriber(this.#quic, this.#version, this.hop, this.#probe, this.#peerSetup);
 
 		void this.#run();
 	}
@@ -204,17 +204,18 @@ export class Connection implements Established {
 
 	// Open the unidirectional Setup Stream, send our single SETUP, and FIN (lite-05+).
 	// The browser uses WebTransport, which carries the request URI, so we advertise no
-	// path and leave routing to the URL. We advertise probe = Report (we measure and
-	// report bitrate over the PROBE stream, but don't actively pad the connection).
+	// path and leave routing to the URL. The probe level reflects what this transport
+	// can actually measure; we never pad, so we never advertise Increase.
 	// Role stays Both: the publish origin starts empty and fills later, and consume is
-	// called after this point, so there is nothing to narrow yet. The origin id declares
-	// our session identity so the peer can filter reflected announcements (lite-06
-	// removed ANNOUNCE_REQUEST's exclude_hop for it).
+	// called after this point, so there is nothing to narrow yet. The origin declares
+	// our session identity so the peer can filter
+	// reflected announcements (lite-06 removed ANNOUNCE_REQUEST's exclude_hop for it).
 	async #sendSetup(): Promise<void> {
 		const writer = await Writer.open(this.#quic);
 		try {
 			await writer.u53(DataType.Setup);
-			await new Setup({ probe: ProbeLevel.Report, origin: this.origin }).encode(writer, this.#version);
+			const probe = await probeLevel(this.#quic, this.#version);
+			await new Setup({ probe, hop: this.hop }).encode(writer, this.#version);
 			writer.close();
 		} catch (err: unknown) {
 			writer.reset(err);
@@ -306,4 +307,39 @@ export class Connection implements Established {
 	get closed(): Promise<Error | null> {
 		return this.#quic.closed.then(fromClose, (err: unknown) => error(err));
 	}
+}
+
+/**
+ * The probe level to advertise in SETUP, from what the transport can measure.
+ *
+ * `Report` claims we can measure and periodically report, so it is only truthful
+ * when a metric this version can carry actually exists. The qmux/WebSocket fallback
+ * implements no `getStats()` at all, and even a transport that has one may report
+ * neither figure. Advertising `Report` and then holding the subscriber's PROBE
+ * stream open with nothing to send is the state this avoids; the subscriber's own
+ * gate then skips a stream it could not use.
+ *
+ * Mirrors `ProbeLevel::detect` in `moq-net`, including its limitation: a metric
+ * that only appears after SETUP reads as unsupported here.
+ *
+ * @internal
+ */
+export async function probeLevel(quic: WebTransport, version: Version): Promise<ProbeLevel> {
+	const getStats = (
+		quic as unknown as {
+			getStats?: () => Promise<{ estimatedSendRate: number | null; smoothedRtt?: number | null }>;
+		}
+	).getStats;
+	if (typeof getStats !== "function") return ProbeLevel.None;
+
+	// A transport that can't answer tells us nothing, which is itself an answer.
+	let stats: { estimatedSendRate: number | null; smoothedRtt?: number | null };
+	try {
+		stats = await getStats.call(quic);
+	} catch {
+		return ProbeLevel.None;
+	}
+
+	const rtt = hasProbeRtt(version) ? stats.smoothedRtt : undefined;
+	return stats.estimatedSendRate != null || rtt != null ? ProbeLevel.Report : ProbeLevel.None;
 }

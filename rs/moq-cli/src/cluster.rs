@@ -108,7 +108,7 @@ impl Lan {
 
 		// A peer that is still advertising is still wanted, however long it has
 		// been unreachable; mDNS expiry is what ends a dial, not a retry budget.
-		client.backoff.timeout = Some(std::time::Duration::ZERO);
+		client.backoff.timeout = std::time::Duration::ZERO.into();
 		// Whatever `--connect-once` means for the relay dial, a mesh dial has to keep
 		// redialing: the map is keyed on the advertisement, so a one-shot handle that
 		// stopped after the first session would sit there dead until mDNS expired the
@@ -366,19 +366,20 @@ struct Dial {
 }
 
 /// The `--cluster-lan` flags.
-#[derive(clap::Args, Clone, Default)]
+#[derive(usage::Args, Clone, Default)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub struct Args {
 	/// Discover and mesh with every other participating MoQ process on the LAN
 	/// via mDNS: no relay, internet, or certificate setup needed. Reuses the
 	/// --listen listener, defaulting it to an ephemeral port with a
 	/// generated certificate. Composes with --connect, e.g. mesh locally
 	/// while a relay serves external viewers.
-	#[arg(
-		id = "cluster-lan",
+	#[usage(
+		name = "cluster-lan",
 		long = "cluster-lan",
 		env = "MOQ_CLUSTER_LAN",
 		help_heading = "Cluster",
-		default_missing_value = "true",
+		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
 	)]
@@ -390,12 +391,12 @@ pub struct Args {
 	///
 	/// Without it, anyone who can reach the listener joins, so leave it unset only
 	/// on networks you trust. A missing file is an error, never generated.
-	#[arg(
-		id = "cluster-lan-secret",
+	#[usage(
+		name = "cluster-lan-secret",
 		long = "cluster-lan-secret",
 		env = "MOQ_CLUSTER_LAN_SECRET",
 		help_heading = "Cluster",
-		requires = "cluster-lan",
+		requires = "--cluster-lan",
 		value_name = "HEX_OR_PATH"
 	)]
 	pub secret: Option<String>,
@@ -455,7 +456,7 @@ mod tests {
 
 	fn lan(credential: &str) -> Lan {
 		Lan {
-			origin: moq_tokio::origin::spawn(moq_net::Origin::random()),
+			origin: moq_tokio::origin::spawn(moq_net::Hop::random()),
 			credential: credential.to_string(),
 			client: moq_tokio::connect::Config::default(),
 		}
@@ -597,12 +598,13 @@ mod tests {
 	/// so the test needs no multicast and stays CI-safe.
 	#[tokio::test]
 	async fn session_shares_origin_bidirectionally() {
-		let origin_a = moq_tokio::origin::spawn(moq_net::Origin::random());
-		let origin_b = moq_tokio::origin::spawn(moq_net::Origin::random());
+		let origin_a = moq_tokio::origin::spawn(moq_net::Hop::random());
+		let origin_b = moq_tokio::origin::spawn(moq_net::Hop::random());
 
 		// Published before the session exists; announcements flow once it connects.
-		let _from_a = origin_a
-			.create_broadcast("from-a", moq_net::broadcast::Route::new().with_announce(true))
+		let _from_a = origin_a.create_broadcast("from-a").expect("failed to create broadcast");
+		_from_a
+			.announce(Default::default())
 			.expect("failed to create broadcast");
 
 		let (server, peer) = listener();
@@ -631,12 +633,13 @@ mod tests {
 			.await
 			.expect("timed out waiting for announcement")
 			.expect("origin closed");
-		assert_eq!(update.path.as_str(), "from-a");
+		assert_eq!(update.prefix.as_path().as_str(), "from-a");
 
 		// And the reverse direction over the same session. This stream replays a's
 		// own "from-a" first, so read until the remote broadcast shows up.
-		let _from_b = origin_b
-			.create_broadcast("from-b", moq_net::broadcast::Route::new().with_announce(true))
+		let _from_b = origin_b.create_broadcast("from-b").expect("failed to create broadcast");
+		_from_b
+			.announce(Default::default())
 			.expect("failed to create broadcast");
 		let mut announced_on_a = origin_a.consume().announced();
 		loop {
@@ -644,7 +647,7 @@ mod tests {
 				.await
 				.expect("timed out waiting for announcement")
 				.expect("origin closed");
-			if update.path.as_str() == "from-b" {
+			if update.prefix.as_path().as_str() == "from-b" {
 				break;
 			}
 		}
@@ -654,10 +657,11 @@ mod tests {
 	/// origin is attached: reaching the listener is not membership.
 	#[tokio::test]
 	async fn mesh_rejects_a_dial_without_the_proof() {
-		let origin_a = moq_tokio::origin::spawn(moq_net::Origin::random());
-		let origin_b = moq_tokio::origin::spawn(moq_net::Origin::random());
-		let _from_b = origin_b
-			.create_broadcast("from-b", moq_net::broadcast::Route::new().with_announce(true))
+		let origin_a = moq_tokio::origin::spawn(moq_net::Hop::random());
+		let origin_b = moq_tokio::origin::spawn(moq_net::Hop::random());
+		let _from_b = origin_b.create_broadcast("from-b").expect("failed to create broadcast");
+		_from_b
+			.announce(Default::default())
 			.expect("failed to create broadcast");
 
 		let (server, peer) = listener();
@@ -695,9 +699,12 @@ mod tests {
 	/// user who passed `--listen` did ask to serve, so that case still does.
 	#[tokio::test]
 	async fn a_mesh_only_listener_refuses_ordinary_clients() {
-		let origin = moq_tokio::origin::spawn(moq_net::Origin::random());
+		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
 		let _published = origin
-			.create_broadcast("secret-stream", moq_net::broadcast::Route::new().with_announce(true))
+			.create_broadcast("secret-stream")
+			.expect("failed to create broadcast");
+		_published
+			.announce(Default::default())
 			.expect("failed to create broadcast");
 
 		let (server, peer) = listener();
@@ -721,7 +728,7 @@ mod tests {
 		config.tls = moq_tokio::tls::Connect::default();
 		config.tls.fingerprint = vec![peer.fingerprint.clone().expect("fingerprint")];
 		config.once = Some(true);
-		let stolen = moq_tokio::origin::spawn(moq_net::Origin::random());
+		let stolen = moq_tokio::origin::spawn(moq_net::Hop::random());
 		let url = peer.urls.into_iter().next().expect("an address");
 		let connection = config
 			.init(Default::default())

@@ -16,6 +16,11 @@ concurrency:
   group: release-kt-ffi
   cancel-in-progress: false
 
+# Pinned rather than "latest": `--locked` only fixes the tool's own
+# dependencies, not which version of the tool cargo selects.
+env:
+  CARGO_NDK_VERSION: 4.1.2
+
 jobs:
   parse-version:
     name: Parse version
@@ -69,7 +74,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Install cross-compilation tools (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -81,7 +86,7 @@ jobs:
 
       - name: Install cargo-ndk (Android)
         if: contains(matrix.target, 'android')
-        run: cargo install cargo-ndk
+        run: cargo install --locked "cargo-ndk@$CARGO_NDK_VERSION"
 
       - name: Build
         shell: bash
@@ -115,7 +120,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Generate bindings
         env:

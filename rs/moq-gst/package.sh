@@ -125,7 +125,7 @@ esac
 echo ">> Building moq-gst for $RUST_TARGET against system gstreamer..."
 (
     cd "$WORKSPACE_DIR"
-    cargo build --release --target "$RUST_TARGET" -p moq-gst
+    cargo build --locked --release --target "$RUST_TARGET" -p moq-gst
 )
 
 BUILT_SO="$WORKSPACE_DIR/target/$RUST_TARGET/release/libgstmoq.so"
@@ -145,10 +145,8 @@ mkdir -p "$OUTPUT_DIR"
 
 echo ">> Running nfpm ($PACKAGER)..."
 export VERSION ARCH="$PKG_ARCH" PKG_NAME PLUGIN_PATH="$BUILT_SO" PLUGIN_DIR
-nfpm pkg \
-    --packager "$PACKAGER" \
-    --config "$WORKSPACE_DIR/packaging/moq-gst/nfpm.yaml" \
-    --target "$OUTPUT_DIR/"
+"$WORKSPACE_DIR/rs/scripts/package-nfpm.sh" \
+    "$WORKSPACE_DIR/packaging/moq-gst/nfpm.yaml" "$PACKAGER" "$OUTPUT_DIR/"
 
 echo ">> Done. Artifacts in: $OUTPUT_DIR"
 ls -1 "$OUTPUT_DIR"

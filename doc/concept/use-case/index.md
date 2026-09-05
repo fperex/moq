@@ -1,12 +1,17 @@
 ---
 title: Use Cases
-description: How MoQ should be used in the wild
+description: Where MoQ fits, compared with what it replaces
 ---
 
 # Use Cases
 
-- [Contribution](/concept/use-case/contribution): A publisher (ex. OBS) sends data to a service (ex. Twitch).
-- [Distribution](/concept/use-case/distribution): A service (ex. Twitch) distributes data to viewers.
-- [Conferencing](/concept/use-case/conferencing): A service (ex. Zoom) facilitates a conference between multiple participants.
-- [AI](/concept/use-case/ai): Generative AI, overlays, voice agents, and more.
-- [Other](/concept/use-case/other): Some ideas for other use cases that might be viable.
+One protocol covers contribution, distribution, conferencing, and data. That
+is the point: sharing an implementation across all four is where the economies
+of scale come from.
+
+| Use case | Replaces | Why MoQ fits |
+| --- | --- | --- |
+| [Distribution](/concept/use-case/distribution) | HLS, DASH | Sub-second latency at CDN scale, with the viewer choosing its buffer. |
+| [Contribution](/concept/use-case/contribution) | RTMP, SRT | Pull-based delivery, optional on-demand encoding, and simple redundant ingest. |
+| [Conferencing](/concept/use-case/conferencing) | WebRTC | Bidirectional on one session, browser control of the pipeline, no SDP or TURN. |
+| [AI](/concept/use-case/ai) | WebRTC, WebSockets | Adjustable reliability, on-demand inference, media and prompts on one connection. |

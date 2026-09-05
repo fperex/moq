@@ -1,101 +1,68 @@
 ---
 title: Quick Start
-description: Get started with MoQ in seconds
+description: Run the MoQ demo locally or against the public relay
 ---
 
 # Quick Start
 
-We've got a few demos to show off MoQ in action.
-Everything runs on localhost in development, but in production of course you'll run these components across multiple hosts.
-
-Start by cloning the repo:
+The default demo starts a relay, publishes a test video, and opens the web
+player. Everything runs on your machine.
 
 ```bash
 git clone https://github.com/moq-dev/moq
 cd moq
 ```
 
-Then pick your poison: Nix or not.
+## With Nix (recommended)
 
-## Option 1: Using Nix (Recommended)
-
-The recommended approach is to use [Nix](https://nixos.org/download.html).
-It's like Docker but without the VM; all dependencies are pinned to specific versions.
-
-Install the following:
-
-- [Nix](https://nixos.org/download.html)
-- [Nix Flakes](https://nixos.wiki/wiki/Flakes)
-- (optional) [Nix Direnv](https://github.com/nix-community/nix-direnv)
-
-Then run the demo:
+Install [Nix](https://nixos.org/download.html) with flakes enabled, then:
 
 ```bash
-# Runs the demo using pinned dependencies
-nix develop -c just
+nix develop --command just
 ```
 
-If you install `direnv`, then the Nix shell will be loaded whenever you `cd` into the repo:
+The dev shell pins every tool the repository uses. With
+[nix-direnv](https://github.com/nix-community/nix-direnv), entering the
+directory loads the shell and the command becomes `just`.
+
+## Without Nix
+
+Install [Just](https://github.com/casey/just),
+[Rust](https://www.rust-lang.org/tools/install), [Bun](https://bun.sh/), and
+[FFmpeg](https://ffmpeg.org/download.html), then:
 
 ```bash
-# Run the demo... in 9 keystrokes
-just
-```
-
-## Option 2: Manual Installation
-
-::: tip On Windows?
-See [Windows Setup](/setup/windows) for a `winget`-based `setup.bat` and the `just` PATH caveats.
-:::
-
-If you don't like Nix or enjoy suffering with Windows, then you can manually install the dependencies:
-
-- [Just](https://github.com/casey/just)
-- [Rust](https://www.rust-lang.org/tools/install)
-- [Bun](https://bun.sh/)
-- [FFmpeg](https://ffmpeg.org/download.html)
-- ...more?
-
-Some workspace crates have additional system dependencies and are excluded from the default build:
-
-- **moq-gst** — requires [GStreamer](https://gstreamer.freedesktop.org/) development libraries
-- **libmoq** — requires a C toolchain
-- **moq-ffi** — requires Python and [maturin](https://www.maturin.rs/)
-
-These are all included in the Nix dev shell. To build them manually, install the deps and use `cargo build -p <crate>`.
-
-Then run:
-
-```bash
-# Install additional dependencies, usually linters
 just install
-
-# Run the demo
 just
 ```
 
-When in doubt, check the [Nix Flake](https://github.com/moq-dev/moq/blob/main/flake.nix) for the full list of dependencies.
+Windows users should run `setup.bat` first; see [Development](/setup/dev#windows).
 
-## What's Happening?
+## What starts
 
-The `just` command starts three components:
+1. [moq-relay](/bin/relay/) on `localhost:4443` with a generated certificate and anonymous access.
+2. [moq-cli](/bin/cli) publishing Big Buck Bunny through the relay.
+3. The [web demo](/bin/demo) at [localhost:5173](http://localhost:5173), where you can watch the stream or publish your camera.
 
-- [moq-relay](/bin/relay/): A server that routes live data between publishers and subscribers.
-- [moq-cli](/bin/cli): A CLI that publishes video content piped from `ffmpeg`.
-- [demo](/lib/js/@moq/demo): A web page with various demos.
+## Skip the relay
 
-Once everything compiles, it should open [localhost:5173](http://localhost:5173) in your browser.
+A public test relay runs at `https://cdn.moq.dev/anon`. Anything published
+there is public and discoverable, so pick a unique name and don't publish
+private media.
 
-::: warning
-The demo uses an insecure HTTP fetch for local development only. In production, you'll need a proper domain and TLS certificate via [LetsEncrypt](https://letsencrypt.org/docs/) or similar.
-:::
+```bash
+# Publish a file, then open https://moq.dev/watch?name=<your-name>
+ffmpeg -re -i video.mp4 -c copy -f mpegts - | \
+    moq --connect https://cdn.moq.dev/anon --broadcast <your-name>.hang import ts
+```
 
-### More Demos
+Every client, in every language, connects the same way: a relay URL whose path
+scopes [authentication](/bin/relay/auth), plus a broadcast name. Media
+broadcasts end in `.hang`.
 
-- [Web Demo](/setup/demo/web) — watch and publish live streams from a browser
-- [MoQ Boy](/setup/demo/boy) — crowd-controlled Game Boy Color streaming with live video, audio, and anarchy-mode input
+## Next steps
 
-Check out the full [development guide](/setup/dev) for more commands, or try publishing to the public relay:
-
-- [OBS](/bin/obs)
-- [GStreamer](/bin/gstreamer)
+- [Install](/setup/install) the relay and CLI as packages instead of building them.
+- Publish from [OBS](/bin/obs), [GStreamer](/bin/gstreamer), or [RTMP/SRT/WebRTC](/bin/cli).
+- Embed a player with the [web components](/lib/js/) or pick a [library](/lib/).
+- [Deploy](/setup/prod) a relay with real TLS and authentication.

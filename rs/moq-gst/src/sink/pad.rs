@@ -25,7 +25,7 @@ enum PadState {
 	Invalid,
 }
 
-/// Where a pad's buffers land: a codec importer, or a subtitle track written as WebVTT cues.
+/// Where a pad's buffers land: a codec importer, a subtitle track, or opaque data.
 ///
 /// Both payloads are large (a codec importer, a container producer), so each is boxed to keep the
 /// enum small.
@@ -39,6 +39,34 @@ enum Sink {
 		audio: bool,
 	},
 	Text(Box<Text>),
+	Opaque(moq_net::track::Producer),
+}
+
+/// Inputs used to build a producer after a pad observes caps.
+pub(super) struct ProducerOptions<'a> {
+	container: hang::catalog::Container,
+	caps: &'a gst::Caps,
+	requested: Option<&'a str>,
+}
+
+impl<'a> ProducerOptions<'a> {
+	pub(super) fn new(caps: &'a gst::Caps) -> Self {
+		Self {
+			container: hang::catalog::Container::default(),
+			caps,
+			requested: None,
+		}
+	}
+
+	pub(super) fn with_container(mut self, container: hang::catalog::Container) -> Self {
+		self.container = container;
+		self
+	}
+
+	pub(super) fn with_track(mut self, track: &'a str) -> Self {
+		self.requested = Some(track);
+		self
+	}
 }
 
 /// A subtitle pad. GStreamer hands us one decoded cue per buffer (`text/x-raw`, UTF-8) with the
@@ -124,12 +152,40 @@ fn escape_cue(text: &str) -> String {
 		.join("\n")
 }
 
-/// One sink pad's media producer plus its timeline policy.
+/// What a CAPS event did to the pad. Distinguishing "nothing to do" from "the build failed" is what
+/// lets the caller report a status instead of only logging one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapsOutcome {
+	/// Already publishing under these caps, or already failed: no producer was built.
+	Unchanged,
+	/// A producer was built, reserving this track name.
+	Active(String),
+	/// The build was rejected and only this pad is invalidated.
+	Failed(String),
+}
+
+/// What a buffer did. Returned rather than stored, like `CapsOutcome`: a mailbox the caller had to
+/// remember to empty is what let one failure hide another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+	/// The frame reached the producer.
+	Published,
+	/// Dropped without invalidating the pad. The reason is logged; it is not the pad's status.
+	Dropped,
+	/// The first buffer dropped for want of a TIME segment. Reported once per pad, because without a
+	/// timeline the pad can never publish and the caller should say so on the bus.
+	NoSegment,
+	/// The producer rejected the write, invalidating only this pad.
+	Failed(String),
+}
+
+/// One sink pad's producer plus its timeline policy.
 pub struct Pad {
 	track: Option<Sink>,
 	caps: Option<gst::Caps>,
 	/// Set once a producer build rejects this pad's caps or bitstream; further buffers are dropped and
-	/// the track stays finalized. Isolated to the pad, so the session and other pads keep going.
+	/// the track stays finalized. Isolated to the pad, so the session and other pads keep going. The
+	/// reason is not kept here: whichever call failed returns it.
 	failed: bool,
 	state: PadState,
 	segment_info: Option<SegmentInfo>,
@@ -159,21 +215,25 @@ impl Pad {
 		self.failed
 	}
 
-	/// (Re)build the producer when the pad's caps change. A build failure invalidates only this pad
-	/// (`failed` is set); the caller keeps the session and other pads alive. Identical caps re-sent as a
-	/// sticky event keep the live producer.
-	pub fn observe_caps(
+	/// (Re)build the producer when the pad's caps change, under `track` when the pad was given a name.
+	/// A build failure invalidates only this pad; the caller keeps the session and other pads alive.
+	/// Identical caps re-sent as a sticky event keep the live producer.
+	pub(super) fn observe_caps(
 		&mut self,
 		broadcast: &moq_net::broadcast::Producer,
 		catalog: &moq_mux::catalog::Producer,
-		caps: &gst::Caps,
-	) {
-		if self.failed || (self.track.is_some() && self.caps.as_deref() == Some(caps)) {
-			return;
+		options: ProducerOptions<'_>,
+	) -> CapsOutcome {
+		if self.failed || (self.track.is_some() && self.caps.as_deref() == Some(options.caps)) {
+			return CapsOutcome::Unchanged;
 		}
-		if let Err(err) = self.build(broadcast, catalog, caps) {
-			gst::warning!(CAT, "invalidating pad: {err:?}");
-			self.fail();
+		match self.build(broadcast, catalog, options) {
+			Ok(name) => CapsOutcome::Active(name),
+			Err(err) => {
+				gst::warning!(CAT, "invalidating pad: {err:?}");
+				self.fail();
+				CapsOutcome::Failed(format!("{err:#}"))
+			}
 		}
 	}
 
@@ -181,51 +241,109 @@ impl Pad {
 		&mut self,
 		broadcast: &moq_net::broadcast::Producer,
 		catalog: &moq_mux::catalog::Producer,
-		caps: &gst::Caps,
-	) -> Result<()> {
+		options: ProducerOptions<'_>,
+	) -> Result<String> {
+		let ProducerOptions {
+			container,
+			caps,
+			requested,
+		} = options;
 		let structure = caps.structure(0).context("empty caps")?;
 		// Renegotiation: finalize the previous producer before replacing it (closed once, not abandoned).
 		self.finalize()?;
+		// Opaque data has no codec importer and no catalog entry, so it never reaches the codec match.
+		if structure.name() == "application/octet-stream" {
+			// A generated name would leave the track unfindable: nothing advertises it.
+			let name = requested
+				.context("an opaque data pad requires a track name")?
+				.to_owned();
+			let mut broadcast = broadcast.clone();
+			let request = broadcast
+				.reserve_track(name.clone())
+				.with_context(|| format!("cannot reserve track {name}"))?;
+			// Followed at the live edge, so it keeps the default retention the media helper raises.
+			let info = moq_net::track::Info::default().with_timescale(moq_net::Timescale::MICRO);
+			self.track = Some(Sink::Opaque(request.accept(info)));
+			self.caps = Some(caps.clone());
+			return Ok(name);
+		}
 		let mut broadcast = broadcast.clone();
 		let catalog = catalog.clone();
 		// Every codec converges on one import::Track; only the caps -> importer construction differs. The
 		// pad template fixes the structural fields (h264/h265 byte-stream/au, AAC mpegversion=4/stream-format=raw),
 		// so negotiation rejects non-conforming caps before they reach here; only fields the template can't
-		// pin (the AAC codec_data) are checked below. The importer reserves a uniquely named track, which it
+		// pin (the AAC codec_data) are checked below. The importer reserves the pad's track, which it
 		// accepts (setting the timescale) inside `Track::new`.
 		// Subtitles skip the codec importers entirely: the demuxer already resolved each cue to UTF-8
 		// text with a presentation time, so there is nothing to parse, only a text rendition to declare.
 		if structure.name().as_str() == "text/x-raw" {
+			let name = Self::track_name(&broadcast, requested, ".vtt");
 			self.track = Some(Sink::Text(Box::new(Self::reserve_text(
 				&mut broadcast,
 				catalog,
+				name.clone(),
 				structure,
 			)?)));
 			self.caps = Some(caps.clone());
-			return Ok(());
+			return Ok(name);
 		}
 
-		let (track, audio): (import::Track, bool) = match structure.name().as_str() {
-			"video/x-h264" => (
-				Self::reserve_video(&mut broadcast, catalog, import::VideoFormat::Avc3, &[])?,
-				false,
-			),
-			"video/x-h265" => (
-				Self::reserve_video(&mut broadcast, catalog, import::VideoFormat::Hev1, &[])?,
-				false,
-			),
-			"video/x-av1" => (
-				Self::reserve_video(&mut broadcast, catalog, import::VideoFormat::Av01, &[])?,
-				false,
-			),
-			"video/x-vp8" => (
-				Self::reserve_video(&mut broadcast, catalog, import::VideoFormat::Vp8, &[])?,
-				false,
-			),
-			"video/x-vp9" => (
-				Self::reserve_video(&mut broadcast, catalog, import::VideoFormat::Vp9, &[])?,
-				false,
-			),
+		let (track, audio, name): (import::Track, bool, String) = match structure.name().as_str() {
+			"video/x-h264" => {
+				let (track, name) = Self::reserve_video(
+					&mut broadcast,
+					catalog,
+					requested,
+					import::VideoFormat::Avc3,
+					&[],
+					container,
+				)?;
+				(track, false, name)
+			}
+			"video/x-h265" => {
+				let (track, name) = Self::reserve_video(
+					&mut broadcast,
+					catalog,
+					requested,
+					import::VideoFormat::Hev1,
+					&[],
+					container,
+				)?;
+				(track, false, name)
+			}
+			"video/x-av1" => {
+				let (track, name) = Self::reserve_video(
+					&mut broadcast,
+					catalog,
+					requested,
+					import::VideoFormat::Av01,
+					&[],
+					container,
+				)?;
+				(track, false, name)
+			}
+			"video/x-vp8" => {
+				let (track, name) = Self::reserve_video(
+					&mut broadcast,
+					catalog,
+					requested,
+					import::VideoFormat::Vp8,
+					&[],
+					container,
+				)?;
+				(track, false, name)
+			}
+			"video/x-vp9" => {
+				let (track, name) = Self::reserve_video(
+					&mut broadcast,
+					catalog,
+					requested,
+					import::VideoFormat::Vp9,
+					&[],
+					container,
+				)?;
+				(track, false, name)
+			}
 			// MP3: no config blob to parse (the config lives in each frame header), so the importer is
 			// built straight from the caps rate/channels. Keyed on `layer == 3`, which positively
 			// identifies Layer III: AAC (`audio/mpeg`, no layer field) and MP2 (`layer=2`) fall through
@@ -241,12 +359,20 @@ impl Pad {
 				};
 				// MP3 builds its config from caps, so like Opus it constructs the codec importer
 				// directly and lifts it into a `Track` via `.into()`.
-				let name = broadcast.unique_name(".mp3");
-				let request = broadcast.reserve_track(name)?;
-				let producer = request.accept(hang::container::track_info());
+				let name = Self::track_name(&broadcast, requested, ".mp3");
+				let request = broadcast
+					.reserve_track(name.clone())
+					.with_context(|| format!("cannot reserve track {name}"))?;
+				let producer = request.accept(hang::container::track_info(hang::catalog::PRIORITY.audio));
 				(
-					moq_mux::codec::mp3::Import::new(producer, catalog.reserve(), config.into())?.into(),
+					moq_mux::codec::mp3::Import::new(
+						producer,
+						catalog.reserve(),
+						Self::audio_config(config.into(), container),
+					)?
+					.into(),
 					true,
+					name,
 				)
 			}
 			"audio/mpeg" => {
@@ -255,10 +381,15 @@ impl Pad {
 					.get::<gst::Buffer>("codec_data")
 					.context("AAC caps missing codec_data")?;
 				let map = codec_data.map_readable().context("failed to map AAC codec_data")?;
-				(
-					Self::reserve_audio(&mut broadcast, catalog, import::AudioFormat::Aac, map.as_slice())?,
-					true,
-				)
+				let (track, name) = Self::reserve_audio(
+					&mut broadcast,
+					catalog,
+					requested,
+					import::AudioFormat::Aac,
+					map.as_slice(),
+					container,
+				)?;
+				(track, true, name)
 			}
 			"audio/x-opus" => {
 				// Opus: GStreamer carries channels/rate in caps (not an OpusHead), and valid Opus caps
@@ -275,12 +406,20 @@ impl Pad {
 				let config = moq_mux::codec::opus::Config::new(rate as u32, channels as u32);
 				// Opus builds its config from caps (not an OpusHead init buffer), so it constructs the codec
 				// importer directly and lifts it into a `Track` via `.into()`.
-				let name = broadcast.unique_name(".opus");
-				let request = broadcast.reserve_track(name)?;
-				let producer = request.accept(hang::container::track_info());
+				let name = Self::track_name(&broadcast, requested, ".opus");
+				let request = broadcast
+					.reserve_track(name.clone())
+					.with_context(|| format!("cannot reserve track {name}"))?;
+				let producer = request.accept(hang::container::track_info(hang::catalog::PRIORITY.audio));
 				(
-					moq_mux::codec::opus::Import::new(producer, catalog.reserve(), config.into())?.into(),
+					moq_mux::codec::opus::Import::new(
+						producer,
+						catalog.reserve(),
+						Self::audio_config(config.into(), container),
+					)?
+					.into(),
 					true,
+					name,
 				)
 			}
 			other => anyhow::bail!("unsupported caps: {other}"),
@@ -290,7 +429,14 @@ impl Pad {
 			audio,
 		});
 		self.caps = Some(caps.clone());
-		Ok(())
+		Ok(name)
+	}
+
+	/// The name this pad publishes under: the one it was given, else a generated `0{suffix}`.
+	fn track_name(broadcast: &moq_net::broadcast::Producer, requested: Option<&str>, suffix: &str) -> String {
+		requested
+			.map(str::to_owned)
+			.unwrap_or_else(|| broadcast.unique_name(suffix))
 	}
 
 	/// Declare a subtitle rendition: a plain track plus its catalog entry. Unlike the codec paths there
@@ -299,11 +445,11 @@ impl Pad {
 	fn reserve_text(
 		broadcast: &mut moq_net::broadcast::Producer,
 		catalog: moq_mux::catalog::Producer,
+		name: String,
 		structure: &gst::StructureRef,
 	) -> Result<Text> {
-		let name = broadcast.unique_name(".vtt");
 		let request = broadcast.reserve_track(name.clone())?;
-		let producer = request.accept(hang::container::track_info());
+		let producer = request.accept(hang::container::track_info(hang::catalog::PRIORITY.text));
 
 		let mut config = hang::catalog::TextConfig::new(hang::catalog::TextFormat::Vtt);
 		// A demuxed text track is a subtitle track unless something says otherwise. Claiming
@@ -331,40 +477,61 @@ impl Pad {
 	fn reserve_video(
 		broadcast: &mut moq_net::broadcast::Producer,
 		catalog: moq_mux::catalog::Producer,
+		requested: Option<&str>,
 		format: import::VideoFormat,
 		init: &[u8],
-	) -> Result<import::Track> {
-		let name = broadcast.unique_name(&format!(".{format}"));
-		let request = broadcast.reserve_track(name)?;
-		Ok(import::Track::video(
-			request,
-			catalog.reserve(),
-			import::VideoInit::new(format, init.to_vec()),
-		)?)
+		container: hang::catalog::Container,
+	) -> Result<(import::Track, String)> {
+		let name = Self::track_name(broadcast, requested, &format!(".{format}"));
+		let request = broadcast
+			.reserve_track(name.clone())
+			.with_context(|| format!("cannot reserve track {name}"))?;
+		let mut video = import::VideoInit::new(format, init.to_vec());
+		video.hint.container = container;
+		let track = import::Track::video(request, catalog.reserve(), video)?;
+		Ok((track, name))
 	}
 
 	/// Reserve a track for a single audio codec. See [`reserve_video`](Self::reserve_video).
 	fn reserve_audio(
 		broadcast: &mut moq_net::broadcast::Producer,
 		catalog: moq_mux::catalog::Producer,
+		requested: Option<&str>,
 		format: import::AudioFormat,
 		init: &[u8],
-	) -> Result<import::Track> {
-		let name = broadcast.unique_name(&format!(".{format}"));
-		let request = broadcast.reserve_track(name)?;
-		Ok(import::Track::audio(
-			request,
-			catalog.reserve(),
-			import::AudioInit::new(format, init.to_vec()),
-		)?)
+		container: hang::catalog::Container,
+	) -> Result<(import::Track, String)> {
+		let name = Self::track_name(broadcast, requested, &format!(".{format}"));
+		let request = broadcast
+			.reserve_track(name.clone())
+			.with_context(|| format!("cannot reserve track {name}"))?;
+		let mut audio = import::AudioInit::new(format, init.to_vec());
+		audio.container = container;
+		let track = import::Track::audio(request, catalog.reserve(), audio)?;
+		Ok((track, name))
+	}
+
+	/// Stamp the pad's container onto an audio config built from caps.
+	fn audio_config(
+		mut config: hang::catalog::AudioConfig,
+		container: hang::catalog::Container,
+	) -> hang::catalog::AudioConfig {
+		config.container = container;
+		config
 	}
 
 	/// Drops the producer (closing its track) and marks the pad failed so further buffers are dropped.
+	/// The reason belongs to whichever call failed, which returns it.
 	fn fail(&mut self) {
 		if let Err(err) = self.finalize() {
 			gst::warning!(CAT, "finalize on failed pad: {err:?}");
 		}
 		self.failed = true;
+	}
+
+	/// Invalidate this producer after a failure detected outside the codec importer.
+	pub fn invalidate(&mut self) {
+		self.fail();
 	}
 
 	/// Record a SEGMENT, re-anchoring the timeline. An `Active` pad enforces continuity against its
@@ -431,19 +598,32 @@ impl Pad {
 	}
 
 	/// Import one buffer into the producer. A failed or producer-less pad drops the buffer; a timeline
-	/// drop is logged. A bad bitstream (or an oversized frame, rejected by moq-net) invalidates only this
-	/// pad.
-	/// Returns `true` the first time a buffer is dropped because the pad has no TIME segment, so the
-	/// caller can surface it once on the bus: without a timeline the pad can never publish.
-	pub fn push_buffer(&mut self, data: Bytes, pts: Option<gst::ClockTime>, duration: Option<gst::ClockTime>) -> bool {
+	/// drop is logged. Unstamped opaque data on an active timeline uses the element's current running
+	/// time. A bad bitstream (or an oversized frame, rejected by moq-net) invalidates only this pad and
+	/// says so in the returned outcome. Returns an error when an unstamped opaque buffer has no current
+	/// running time, so the caller fails the flow instead of silently dropping data.
+	pub fn push_buffer(
+		&mut self,
+		data: Bytes,
+		pts: Option<gst::ClockTime>,
+		duration: Option<gst::ClockTime>,
+		current_running_time: Option<gst::ClockTime>,
+	) -> std::result::Result<PushOutcome, &'static str> {
 		if self.failed {
-			return false;
+			return Ok(PushOutcome::Dropped);
 		}
-		let timestamp = self.frame_timestamp(pts);
 		if self.track.is_none() {
 			gst::warning!(CAT, "dropping buffer received before caps");
-			return false;
+			return Ok(PushOutcome::Dropped);
 		}
+		let opaque = matches!(self.track.as_ref(), Some(Sink::Opaque(_)));
+		let timestamp = if opaque && pts.is_none() && self.state == PadState::Active {
+			let running_time = current_running_time.ok_or("no current running time for unstamped opaque data")?;
+			let nanos = i64::try_from(running_time.nseconds()).map_err(|_| "current running time is out of range")?;
+			frame_micros(Some(nanos))
+		} else {
+			self.frame_timestamp(pts)
+		};
 		match timestamp {
 			Ok(micros) => {
 				let result: Result<()> = match self.track.as_mut().expect("track present") {
@@ -463,24 +643,39 @@ impl Pad {
 							Some(duration) => text.write(cue, micros, duration.useconds()),
 							None => {
 								gst::warning!(CAT, "dropping subtitle cue without a duration");
-								return false;
+								return Ok(PushOutcome::Dropped);
 							}
 						},
 						Err(err) => Err(anyhow::anyhow!("subtitle cue is not valid UTF-8: {err}")),
 					},
+					Sink::Opaque(producer) => {
+						let Some(ts) = hang::container::Timestamp::from_micros(micros).ok() else {
+							gst::warning!(CAT, "dropping frame: timestamp out of range");
+							return Ok(PushOutcome::Dropped);
+						};
+						producer.write_frame(ts, &data).map_err(Into::into)
+					}
 				};
-				if let Err(err) = result {
-					gst::warning!(CAT, "invalidating pad: {err}");
-					self.fail();
+				match result {
+					Ok(()) => Ok(PushOutcome::Published),
+					Err(err) => {
+						let reason = format!("{err:#}");
+						gst::warning!(CAT, "invalidating pad: {reason}");
+						self.fail();
+						Ok(PushOutcome::Failed(reason))
+					}
 				}
-				false
 			}
 			Err(reason) => {
 				gst::warning!(CAT, "dropping frame: {reason}");
 				// A pad stuck in NoSegment has no timeline and will never publish; report it once.
 				let first = self.state == PadState::NoSegment && !self.no_segment_reported;
 				self.no_segment_reported |= first;
-				first
+				Ok(if first {
+					PushOutcome::NoSegment
+				} else {
+					PushOutcome::Dropped
+				})
 			}
 		}
 	}
@@ -493,17 +688,26 @@ impl Pad {
 		let Some(track) = self.track.take() else {
 			return Ok(false);
 		};
-		match track {
-			Sink::Media { mut track, .. } => track.finish()?,
-			Sink::Text(mut text) => text.producer.finish()?,
+		let closed = match track {
+			Sink::Media { mut track, .. } => track.finish().map_err(anyhow::Error::from),
+			Sink::Text(mut text) => text.producer.finish().map_err(anyhow::Error::from),
+			Sink::Opaque(mut producer) => producer.finish().map_err(anyhow::Error::from),
+		};
+		if let Err(err) = closed {
+			// The producer is gone either way, so the pad publishes nothing from here: mark it failed so
+			// later buffers drop the way they do after any other failure, rather than looking pre-caps.
+			// The reason is not stored: the caller gets it from this `Err`.
+			self.failed = true;
+			return Err(err);
 		}
 		Ok(true)
 	}
 }
 
-/// Media types moqsink can build a producer for. Checked synchronously at the CAPS event so an
-/// unsupported type is rejected with NotNegotiated. The structural fields (byte-stream/au, AAC
-/// mpegversion/stream-format) are pinned by the pad template, so negotiation enforces them.
+/// Media types moqsink can build a producer for, plus `application/octet-stream` for opaque data.
+/// Checked synchronously at the CAPS event so an unsupported type is rejected with NotNegotiated. The
+/// structural fields (byte-stream/au, AAC mpegversion/stream-format) are pinned by the pad template,
+/// so negotiation enforces them.
 pub fn caps_supported(caps: &gst::CapsRef) -> bool {
 	let Some(s) = caps.structure(0) else { return false };
 	matches!(
@@ -516,6 +720,7 @@ pub fn caps_supported(caps: &gst::CapsRef) -> bool {
 			| "audio/mpeg"
 			| "audio/x-opus"
 			| "text/x-raw"
+			| "application/octet-stream"
 	)
 }
 
@@ -543,6 +748,23 @@ fn signed_nanos(running_time: gst::Signed<gst::ClockTime>) -> Option<i64> {
 	}
 }
 
+/// A real Annex-B AU (SPS + PPS + IDR) so tests can resolve a rendition and publish a frame.
+#[cfg(test)]
+pub(super) fn h264_keyframe_au() -> Bytes {
+	let sps: &[u8] = &[
+		0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
+		0x01, 0xd4, 0xc0, 0x80,
+	];
+	let pps: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+	let idr: &[u8] = &[0x65, 0x88, 0x84, 0x00, 0x21];
+	let mut au = Vec::new();
+	for nal in [sps, pps, idr] {
+		au.extend_from_slice(&[0, 0, 0, 1]);
+		au.extend_from_slice(nal);
+	}
+	Bytes::from(au)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -561,20 +783,16 @@ mod tests {
 			.build()
 	}
 
-	/// A real Annex-B AU (SPS + PPS + IDR) so the importer publishes a rendition and a frame.
-	fn h264_keyframe_au() -> Bytes {
-		let sps: &[u8] = &[
-			0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
-			0x01, 0xd4, 0xc0, 0x80,
-		];
-		let pps: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
-		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x00, 0x21];
-		let mut au = Vec::new();
-		for nal in [sps, pps, idr] {
-			au.extend_from_slice(&[0, 0, 0, 1]);
-			au.extend_from_slice(nal);
+	fn opaque_caps() -> gst::Caps {
+		gst::Caps::builder("application/octet-stream").build()
+	}
+
+	fn producer_options<'a>(caps: &'a gst::Caps, requested: Option<&'a str>) -> ProducerOptions<'a> {
+		let options = ProducerOptions::new(caps);
+		match requested {
+			Some(track) => options.with_track(track),
+			None => options,
 		}
-		Bytes::from(au)
 	}
 
 	fn time_segment() -> gst::Segment {
@@ -596,10 +814,89 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &h264_caps());
+		pad.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), None));
 		assert!(!pad.is_failed());
 		assert!(pad.finalize().unwrap(), "a producer was built");
 		assert!(!pad.finalize().unwrap(), "second finalize is a no-op");
+	}
+
+	// A named pad reserves that track instead of the generated one, and the catalog advertises the same
+	// name (the rendition resolves off the SPS, so it needs one AU).
+	#[test]
+	fn an_explicit_name_reaches_the_broadcast_and_the_catalog() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		assert_eq!(
+			pad.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), Some("camera")),),
+			CapsOutcome::Active("camera".to_string()),
+			"the reserved name is the requested one"
+		);
+		pad.observe_segment(time_segment());
+		pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None, None)
+			.unwrap();
+
+		let snapshot = catalog.snapshot();
+		let renditions: Vec<String> = snapshot.video.renditions.keys().map(|name| name.to_string()).collect();
+		assert_eq!(renditions, ["camera"], "the catalog advertises the explicit name");
+	}
+
+	// Without a name the generated one is kept, and it is reported so the element can publish it.
+	#[test]
+	fn a_generated_name_is_reported_too() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		assert_eq!(
+			pad.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), None)),
+			CapsOutcome::Active("0.avc3".to_string())
+		);
+	}
+
+	// A name another pad already holds invalidates only the second pad: the broadcast, the catalog and
+	// the first pad's producer survive.
+	#[test]
+	fn a_colliding_name_invalidates_only_that_pad() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut first = Pad::new();
+		let mut second = Pad::new();
+		assert_eq!(
+			first.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), Some("camera")),),
+			CapsOutcome::Active("camera".to_string())
+		);
+		assert_eq!(
+			second.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), Some("camera")),),
+			CapsOutcome::Failed("cannot reserve track camera: duplicate".to_string()),
+			"the duplicate reservation is rejected"
+		);
+		assert!(second.is_failed(), "the collision fails the second pad");
+		assert!(!first.is_failed(), "the first pad keeps its producer");
+		assert!(first.finalize().unwrap(), "the first producer is still live");
+	}
+
+	// Renegotiation re-reserves the same explicit name. `build` finalizes the old producer first and the
+	// broadcast reclaims closed entries on insert, so the pad does not collide with itself.
+	#[test]
+	fn renegotiation_keeps_the_explicit_name() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		assert_eq!(
+			pad.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), Some("camera")),),
+			CapsOutcome::Active("camera".to_string())
+		);
+		let renegotiated = gst::Caps::builder("video/x-h264")
+			.field("stream-format", "byte-stream")
+			.field("alignment", "au")
+			.field("width", 1280i32)
+			.build();
+		assert_eq!(
+			pad.observe_caps(&broadcast, &catalog, producer_options(&renegotiated, Some("camera")),),
+			CapsOutcome::Active("camera".to_string()),
+			"the same name is reserved again, not rejected as a duplicate"
+		);
+		assert!(!pad.is_failed());
 	}
 
 	// AAC carries its config in caps; without codec_data the producer cannot be built.
@@ -612,7 +909,7 @@ mod tests {
 			.field("mpegversion", 4i32)
 			.field("stream-format", "raw")
 			.build();
-		pad.observe_caps(&broadcast, &catalog, &caps);
+		pad.observe_caps(&broadcast, &catalog, producer_options(&caps, None));
 		assert!(pad.is_failed(), "AAC without codec_data fails the pad");
 	}
 
@@ -624,7 +921,7 @@ mod tests {
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
 		let caps = gst::Caps::builder("audio/x-opus").field("rate", 48_000i32).build();
-		pad.observe_caps(&broadcast, &catalog, &caps);
+		pad.observe_caps(&broadcast, &catalog, producer_options(&caps, None));
 		assert!(pad.is_failed(), "Opus without channels fails the pad");
 	}
 
@@ -635,14 +932,18 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &h264_caps());
+		pad.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), None));
 		// No observe_segment: the pad stays in NoSegment.
-		assert!(
-			pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None),
+		assert_eq!(
+			pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None, None)
+				.unwrap(),
+			PushOutcome::NoSegment,
 			"first no-segment buffer is reported"
 		);
-		assert!(
-			!pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None),
+		assert_eq!(
+			pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None, None)
+				.unwrap(),
+			PushOutcome::Dropped,
 			"subsequent no-segment buffers are not re-reported"
 		);
 	}
@@ -653,8 +954,241 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &gst::Caps::builder("video/x-raw").build());
+		pad.observe_caps(
+			&broadcast,
+			&catalog,
+			producer_options(&gst::Caps::builder("video/x-raw").build(), None),
+		);
 		assert!(pad.is_failed());
+	}
+
+	// An opaque track nobody can name is unfindable: it is absent from the catalog by design, so a
+	// generated name would publish bytes no consumer could ask for.
+	#[test]
+	fn an_opaque_pad_requires_a_name() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		assert_eq!(
+			pad.observe_caps(&broadcast, &catalog, producer_options(&opaque_caps(), None)),
+			CapsOutcome::Failed("an opaque data pad requires a track name".to_string())
+		);
+		assert!(
+			pad.is_failed(),
+			"an unnamed opaque pad fails instead of generating a name"
+		);
+	}
+
+	// MSF defines no packaging for raw bytes, so the opaque track is not advertised. The media pad's
+	// rendition still resolves, which also shows the opaque pad never reserved a catalog slot: an
+	// unresolved reservation would hold the snapshot back.
+	#[test]
+	fn an_opaque_pad_stays_out_of_the_catalog() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut video = Pad::new();
+		let mut data = Pad::new();
+		video.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), Some("camera")));
+		data.observe_caps(
+			&broadcast,
+			&catalog,
+			producer_options(&opaque_caps(), Some("audiolevels")),
+		);
+		assert!(!data.is_failed());
+		video.observe_segment(time_segment());
+		video
+			.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None, None)
+			.unwrap();
+
+		let snapshot = catalog.snapshot();
+		let renditions: Vec<String> = snapshot.video.renditions.keys().map(|name| name.to_string()).collect();
+		assert_eq!(renditions, ["camera"], "only the media pad is advertised");
+	}
+
+	// The data-track contract: bytes out untouched, one buffer per group, stamped with the PTS the TIME
+	// segment maps.
+	#[tokio::test]
+	async fn an_opaque_pad_ignores_the_media_container_and_publishes_raw_bytes() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		// Select LOC deliberately: opaque pads must still publish the original bytes.
+		assert_eq!(
+			pad.observe_caps(
+				&broadcast,
+				&catalog,
+				ProducerOptions::new(&opaque_caps())
+					.with_container(hang::catalog::Container::Loc)
+					.with_track("audiolevels"),
+			),
+			CapsOutcome::Active("audiolevels".to_string())
+		);
+		pad.observe_segment(time_segment());
+		// Opens with a zero byte and carries a non-UTF-8 one: nothing here may be reinterpreted.
+		pad.push_buffer(
+			Bytes::from_static(b"\x00\xffLEVELS"),
+			Some(gst::ClockTime::from_mseconds(40)),
+			None,
+			None,
+		)
+		.unwrap();
+		pad.push_buffer(
+			Bytes::from_static(b"second"),
+			Some(gst::ClockTime::from_mseconds(80)),
+			None,
+			None,
+		)
+		.unwrap();
+
+		let mut subscriber = broadcast
+			.consume()
+			.track("audiolevels")
+			.expect("the opaque track is published")
+			.subscribe(moq_net::track::Subscription::default().with_max_age(std::time::Duration::from_secs(1)))
+			.await
+			.expect("subscribe to the opaque track")
+			.ordered();
+
+		let mut group = subscriber.next_group().await.unwrap().expect("a first group");
+		let frame = group.read_frame().await.unwrap().expect("a frame in the first group");
+		assert_eq!(
+			frame.payload.as_ref(),
+			b"\x00\xffLEVELS",
+			"the payload goes out untouched"
+		);
+		assert_eq!(
+			std::time::Duration::from(frame.timestamp).as_micros(),
+			40_000,
+			"the frame carries the PTS mapped through the segment"
+		);
+		assert!(
+			group.read_frame().await.unwrap().is_none(),
+			"one buffer produces one group with one frame"
+		);
+
+		let mut group = subscriber.next_group().await.unwrap().expect("a second group");
+		let frame = group.read_frame().await.unwrap().expect("a frame in the second group");
+		assert_eq!(frame.payload.as_ref(), b"second");
+		assert_eq!(std::time::Duration::from(frame.timestamp).as_micros(), 80_000);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_loc_media_pad_reaches_the_wire_and_the_catalog() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		assert_eq!(
+			pad.observe_caps(
+				&broadcast,
+				&catalog,
+				ProducerOptions::new(&h264_caps())
+					.with_container(hang::catalog::Container::Loc)
+					.with_track("camera"),
+			),
+			CapsOutcome::Active("camera".to_string())
+		);
+		pad.observe_segment(time_segment());
+		pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None, None)
+			.unwrap();
+
+		let config = catalog.snapshot().video.renditions.get("camera").cloned().unwrap();
+		assert_eq!(config.container, hang::catalog::Container::Loc);
+		let subscriber = broadcast
+			.consume()
+			.track("camera")
+			.unwrap()
+			.subscribe(None)
+			.await
+			.unwrap();
+		let mut media = moq_mux::container::Consumer::new(subscriber, moq_mux::catalog::hang::Container::Loc);
+		let frame = tokio::time::timeout(std::time::Duration::from_secs(1), media.read())
+			.await
+			.expect("LOC media read timed out")
+			.unwrap();
+		assert!(frame.is_some());
+	}
+
+	// The opaque track declares microseconds so the PTS maps 1:1, and keeps moq-net's retention: the
+	// media helper raises it to 30s for a segmented egress reading history, which a data track never is.
+	#[tokio::test]
+	async fn an_opaque_track_declares_micros_and_the_default_retention() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		pad.observe_caps(
+			&broadcast,
+			&catalog,
+			producer_options(&opaque_caps(), Some("audiolevels")),
+		);
+
+		let subscriber = broadcast
+			.consume()
+			.track("audiolevels")
+			.expect("the opaque track is published")
+			.subscribe(None)
+			.await
+			.expect("subscribe to the opaque track");
+		assert_eq!(subscriber.info().timescale, moq_net::Timescale::MICRO);
+		assert_eq!(
+			subscriber.info().max_age,
+			moq_net::track::DEFAULT_MAX_AGE,
+			"an opaque track keeps the default retention"
+		);
+	}
+
+	// A buffer with no PTS uses the pipeline's current running time, preserving the data and the media
+	// timeline's epoch.
+	#[tokio::test]
+	async fn an_opaque_pad_stamps_a_buffer_without_pts_with_current_running_time() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		pad.observe_caps(
+			&broadcast,
+			&catalog,
+			producer_options(&opaque_caps(), Some("audiolevels")),
+		);
+		pad.observe_segment(time_segment());
+		pad.push_buffer(
+			Bytes::from_static(b"no pts"),
+			None,
+			None,
+			Some(gst::ClockTime::from_mseconds(25)),
+		)
+		.unwrap();
+		assert!(!pad.is_failed(), "a missing PTS uses the supplied running time");
+
+		let mut subscriber = broadcast
+			.consume()
+			.track("audiolevels")
+			.expect("the opaque track is published")
+			.subscribe(None)
+			.await
+			.expect("subscribe to the opaque track")
+			.ordered();
+		let mut group = subscriber.next_group().await.unwrap().expect("a group");
+		let frame = group.read_frame().await.unwrap().expect("a frame");
+		assert_eq!(frame.payload.as_ref(), b"no pts", "the unstamped buffer was published");
+		assert_eq!(std::time::Duration::from(frame.timestamp).as_micros(), 25_000);
+	}
+
+	#[test]
+	fn an_unstamped_opaque_buffer_requires_a_current_running_time() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		pad.observe_caps(
+			&broadcast,
+			&catalog,
+			producer_options(&opaque_caps(), Some("audiolevels")),
+		);
+		pad.observe_segment(time_segment());
+
+		assert!(
+			pad.push_buffer(Bytes::from_static(b"no timestamp"), None, None, None)
+				.is_err(),
+			"the caller gets a hard error instead of a silent drop"
+		);
 	}
 
 	// A failed pad drops further buffers (and never panics) instead of writing them.
@@ -663,10 +1197,15 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &gst::Caps::builder("video/x-raw").build());
+		pad.observe_caps(
+			&broadcast,
+			&catalog,
+			producer_options(&gst::Caps::builder("video/x-raw").build(), None),
+		);
 		assert!(pad.is_failed());
 		pad.observe_segment(time_segment());
-		pad.push_buffer(Bytes::from_static(b"x"), Some(gst::ClockTime::ZERO), None);
+		pad.push_buffer(Bytes::from_static(b"x"), Some(gst::ClockTime::ZERO), None, None)
+			.unwrap();
 	}
 
 	// A real IDR AU emits a frame to the published track (not just a rendition off the SPS).
@@ -675,9 +1214,10 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &h264_caps());
+		pad.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), None));
 		pad.observe_segment(time_segment());
-		pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None);
+		pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None, None)
+			.unwrap();
 
 		let snapshot = catalog.snapshot();
 		let track = snapshot.video.renditions.keys().next().expect("a video rendition");
@@ -822,7 +1362,7 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &h264_caps());
+		pad.observe_caps(&broadcast, &catalog, producer_options(&h264_caps(), None));
 		pad.observe_segment(time_segment());
 
 		pad.flush();
@@ -850,7 +1390,7 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &text_caps());
+		pad.observe_caps(&broadcast, &catalog, producer_options(&text_caps(), None));
 		assert!(!pad.is_failed());
 
 		let snapshot = catalog.snapshot();
@@ -868,7 +1408,7 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &text_caps());
+		pad.observe_caps(&broadcast, &catalog, producer_options(&text_caps(), None));
 		pad.observe_segment(time_segment());
 		assert_eq!(catalog.snapshot().text.renditions.len(), 1);
 
@@ -877,7 +1417,9 @@ mod tests {
 			Bytes::from_static(&[0xff, 0xfe]),
 			Some(gst::ClockTime::ZERO),
 			Some(gst::ClockTime::from_seconds(1)),
-		);
+			None,
+		)
+		.unwrap();
 		assert!(pad.is_failed());
 		assert!(
 			catalog.snapshot().text.renditions.is_empty(),
@@ -892,7 +1434,7 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &text_caps());
+		pad.observe_caps(&broadcast, &catalog, producer_options(&text_caps(), None));
 		pad.observe_segment(time_segment());
 
 		// Two cues 500ms apart: the estimator's minimum-gap heuristic would report 500ms here.
@@ -901,7 +1443,9 @@ mod tests {
 				Bytes::from_static(b"hello"),
 				Some(gst::ClockTime::from_mseconds(start_ms)),
 				Some(gst::ClockTime::from_mseconds(dur_ms)),
-			);
+				None,
+			)
+			.unwrap();
 		}
 		assert!(!pad.is_failed());
 
@@ -916,9 +1460,10 @@ mod tests {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
-		pad.observe_caps(&broadcast, &catalog, &text_caps());
+		pad.observe_caps(&broadcast, &catalog, producer_options(&text_caps(), None));
 		pad.observe_segment(time_segment());
-		pad.push_buffer(Bytes::from_static(b"hello"), Some(gst::ClockTime::ZERO), None);
+		pad.push_buffer(Bytes::from_static(b"hello"), Some(gst::ClockTime::ZERO), None, None)
+			.unwrap();
 		assert!(!pad.is_failed(), "a durationless cue drops the buffer, not the pad");
 	}
 

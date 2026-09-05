@@ -48,7 +48,7 @@ struct Feed {
 	targets: Vec<Weak<Rendition>>,
 	/// Recent records, replayed into a rendition created mid-broadcast so its playlist window
 	/// isn't empty until the next record. Evicted with the same policy as the windows.
-	history: VecDeque<Entry>,
+	history: VecDeque<(u64, Entry)>,
 	/// The timeline ended cleanly; late-created renditions start ended (`EXT-X-ENDLIST`).
 	ended: bool,
 	/// The timeline stream is over (cleanly or not); late-created renditions start closed.
@@ -177,12 +177,12 @@ impl Producer {
 
 impl Fanout {
 	/// Fan one timeline record out to every living rendition, and into the replay history.
-	pub fn push(&self, entry: Entry) {
+	pub fn push(&self, index: u64, entry: Entry) {
 		let mut feed = self.feed.lock().unwrap();
 
 		// Same eviction policy as the per-rendition windows, so a replay reconstructs the
 		// same window a live rendition would have.
-		if let Some(back) = feed.history.back()
+		if let Some((_, back)) = feed.history.back()
 			&& (Duration::from(entry.pts) < Duration::from(back.pts) || entry.segment <= back.segment)
 		{
 			feed.history.clear();
@@ -194,11 +194,11 @@ impl Fanout {
 			let end = Duration::from(entry.pts) + entry.duration;
 			feed.anchor = Some(SystemTime::now().checked_sub(end).unwrap_or(SystemTime::UNIX_EPOCH));
 		}
-		feed.history.push_back(entry.clone());
+		feed.history.push_back((index, entry.clone()));
 		while feed.history.len() >= 2 {
-			let newest = feed.history.back().unwrap();
+			let newest = &feed.history.back().unwrap().1;
 			let span =
-				(Duration::from(newest.pts) + newest.duration).saturating_sub(Duration::from(feed.history[1].pts));
+				(Duration::from(newest.pts) + newest.duration).saturating_sub(Duration::from(feed.history[1].1.pts));
 			if span < self.window {
 				break;
 			}
@@ -210,7 +210,33 @@ impl Fanout {
 			let Some(rendition) = target.upgrade() else {
 				return false;
 			};
-			rendition.push(&entry, window);
+			rendition.push(index, &entry, window);
+			true
+		});
+	}
+
+	/// Remove records that left the source timeline window from every rendition window.
+	pub fn pop(&self, range: std::ops::Range<u64>) {
+		let mut feed = self.feed.lock().unwrap();
+		feed.history.retain(|(index, _)| !range.contains(index));
+		feed.targets.retain(|target| {
+			let Some(rendition) = target.upgrade() else {
+				return false;
+			};
+			rendition.pop(range.clone());
+			true
+		});
+	}
+
+	/// Clear stale rows after source records were skipped before this reader saw them.
+	pub fn skip(&self) {
+		let mut feed = self.feed.lock().unwrap();
+		feed.history.clear();
+		feed.targets.retain(|target| {
+			let Some(rendition) = target.upgrade() else {
+				return false;
+			};
+			rendition.clear();
 			true
 		});
 	}
@@ -263,8 +289,8 @@ impl Producer {
 	/// (and the ended/closed markers) so its window matches its siblings'.
 	fn register(&self, rendition: &Arc<Rendition>) {
 		let mut feed = self.fanout.feed.lock().unwrap();
-		for entry in &feed.history {
-			rendition.push(entry, self.fanout.window);
+		for (index, entry) in &feed.history {
+			rendition.push(*index, entry, self.fanout.window);
 		}
 		if feed.ended {
 			rendition.end();
@@ -277,6 +303,11 @@ impl Producer {
 
 	/// Reconcile the rendition set with a complete catalog snapshot. Removed or reconfigured
 	/// renditions are closed (so cursors over them end) before replacements become visible.
+	///
+	/// "Reconfigured" means the media itself changed (see [`Rendition::matches_video`]). A
+	/// rendition whose entry only carries a revised estimate is kept as-is and just takes the
+	/// new advertised bitrate, since the publisher republishes the catalog every time its
+	/// measured bitrate or jitter moves.
 	///
 	/// Renditions are only servable when the catalog advertises the broadcast's timeline (its
 	/// root `timeline` section): without one there is nothing to render playlists from, so the
@@ -345,7 +376,10 @@ impl Producer {
 
 		for (name, video) in &catalog.video.renditions {
 			let key = (Kind::Video, name.clone());
-			if current.contains_key(&key) {
+			if let Some(rendition) = current.get(&key) {
+				// Survived the stale pass, so it decodes the same: keep its window, its cached
+				// init segment and its media sequence, and just take the new advertised bitrate.
+				rendition.refresh(video.bitrate);
 				continue;
 			}
 			let rendition = Arc::new(Rendition::video(name.clone(), video, upstream, section.clone()));
@@ -354,7 +388,8 @@ impl Producer {
 		}
 		for (name, audio) in &catalog.audio.renditions {
 			let key = (Kind::Audio, name.clone());
-			if current.contains_key(&key) {
+			if let Some(rendition) = current.get(&key) {
+				rendition.refresh(audio.bitrate);
 				continue;
 			}
 			let rendition = Arc::new(Rendition::audio(name.clone(), audio, upstream, section.clone()));

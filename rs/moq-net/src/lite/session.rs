@@ -1,9 +1,8 @@
 use crate::origin;
 use crate::{
-	Error, Origin, SessionError, bandwidth,
+	Error, Hop, SessionError, bandwidth,
 	coding::{Reader, Stream, Writer},
 	lite::SessionInfo,
-	util::{MaybeBoxedExt, MaybeSendBox},
 };
 
 use std::task::{Context, Poll, ready};
@@ -12,9 +11,11 @@ use super::{
 	DataType, PeerSetup, Publisher, PublisherConfig, Setup, Subscriber, SubscriberConfig, SubscriberDriver, Version,
 };
 
-pub(crate) struct SessionStart {
+pub(crate) struct SessionStart<S: crate::transport::poll::Session, R: crate::runtime::Runtime> {
 	pub recv_bandwidth: Option<bandwidth::Consumer>,
-	pub driver: MaybeSendBox<'static, Result<(), Error>>,
+	/// The session's protocol machine, named so its `Send`-ness stays inferred
+	/// from the transport instead of being fixed by a box.
+	pub driver: Driver<S, R>,
 	/// The session-side GOAWAY halves, stored on the public [`crate::Session`].
 	pub goaway: crate::goaway::Handle,
 }
@@ -49,7 +50,10 @@ pub async fn accept_setup<S: crate::transport::poll::Session>(
 }
 
 /// Everything one moq-lite session needs to start.
-pub struct Config<S: crate::transport::poll::Session> {
+pub struct Config<S: crate::transport::poll::Session, R: crate::runtime::Runtime> {
+	/// The runtime that arms the session's timers.
+	pub runtime: R,
+
 	/// The transport carrying the session. Cloned into every loop that outlives
 	/// [`start`], so the connection closes when the last of them drops.
 	pub session: S,
@@ -67,8 +71,8 @@ pub struct Config<S: crate::transport::poll::Session> {
 	pub subscribe: Option<origin::Producer>,
 
 	/// The origin (hop) id assigned to the peer, used whenever the peer doesn't
-	/// declare one itself. See `Client::with_peer_origin`.
-	pub peer_origin: Option<Origin>,
+	/// declare one itself. See `Client::with_peer_hop`.
+	pub peer_hop: Option<Hop>,
 
 	/// The version of the protocol to use.
 	pub version: Version,
@@ -87,13 +91,18 @@ pub struct Config<S: crate::transport::poll::Session> {
 /// Start a lite session.
 ///
 /// Returns the receive-bandwidth consumer (if any) plus the driver that runs the session.
-pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<SessionStart, Error> {
+pub fn start<S, R>(config: Config<S, R>) -> Result<SessionStart<S, R>, Error>
+where
+	S: crate::transport::poll::Session,
+	R: crate::runtime::Runtime,
+{
 	let Config {
-		mut session,
+		runtime,
+		session,
 		setup_stream,
 		publish,
 		subscribe,
-		peer_origin,
+		peer_hop,
 		version,
 		mut our_setup,
 		peer_setup,
@@ -111,18 +120,18 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 		_ => Some(recv_bw),
 	};
 
-	// Declare our origin (hop) id in SETUP so the peer can serve our
-	// subscriptions from a route that does not flow through us. Taken from the
-	// caller's real handles before the empty-half defaulting below, since those
-	// placeholders carry throwaway ids that never appear in a hop chain. The
-	// publish identity is what we stamp onto forwarded announcements, so it
-	// wins when both halves are wired (they share it in practice).
-	if our_setup.origin.is_none() {
-		our_setup.origin = publish
+	// Declare our Hop ID in SETUP so the peer can serve our subscriptions from a
+	// route that does not flow through us. Taken from the caller's real handles
+	// before the empty-half defaulting below, since those placeholders carry
+	// throwaway ids that never appear in a hop chain. The publish identity is what
+	// we stamp onto forwarded announcements, so it wins when both halves are wired
+	// (they share it in practice).
+	if our_setup.hop.is_none() {
+		our_setup.hop = publish
 			.as_deref()
 			.or(subscribe.as_deref())
 			.copied()
-			.filter(|origin| origin.id() != 0);
+			.filter(|hop| hop.id() != 0);
 	}
 
 	// Always run both loops so inbound control (Subscribe/Announce/Probe/Goaway)
@@ -130,8 +139,8 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 	// An unset half gets an empty origin: an empty publish origin announces nothing
 	// (and answers the peer's announce-interest with an empty set), and an empty
 	// subscribe origin issues no ANNOUNCE_PLEASE.
-	let publish = publish.unwrap_or_else(|| origin::Producer::empty(Origin::random()).consume());
-	let subscribe = subscribe.unwrap_or_else(|| origin::Producer::empty(Origin::random()));
+	let publish = publish.unwrap_or_else(|| origin::Producer::empty(Hop::random()).consume());
+	let subscribe = subscribe.unwrap_or_else(|| origin::Producer::empty(Hop::random()));
 
 	// Publisher and Subscriber each derive their identity from their own
 	// attached origin (publish.info / subscribe.info). This is what gets
@@ -157,12 +166,13 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 	let our_cost = our_setup.cost;
 
 	let publisher = Publisher::new(PublisherConfig {
+		runtime: runtime.clone(),
 		session: session.clone(),
 		origin: publish,
 		version,
 		peer_setup: peer_setup.clone(),
 		goaway: goaway.clone(),
-		peer_origin,
+		peer_hop,
 	});
 	let subscriber = Subscriber::new(SubscriberConfig {
 		session: session.clone(),
@@ -170,7 +180,7 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 		recv_bandwidth: recv_bw_for_sub,
 		version,
 		peer_setup,
-		peer_origin,
+		peer_hop,
 		// Local policy for what pulling from this peer costs. Set only when we
 		// configured a price; otherwise the subscriber charges what the peer declared
 		// for its own egress.
@@ -178,39 +188,16 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 		going_away: goaway.going_away.clone(),
 	});
 
-	let mut driver = Driver {
+	let driver = Driver {
 		setup: version
 			.has_setup_stream()
 			.then(|| SendSetup::new(session.clone(), our_setup, version)),
-		goaway: Some(SendGoaway::new(session.clone(), goaway, version)),
+		goaway: Some(SendGoaway::new(runtime, session.clone(), goaway, version)),
 		session_stream: setup_stream,
 		publisher,
 		subscriber: SubscriberDriver::new(subscriber),
+		session,
 	};
-
-	// The async block only owns the state; all the logic is in `Driver::poll`.
-	// (The closure borrows `driver` so it stays `Unpin` for any transport.)
-	let driver = async move {
-		let res = kio::wait(|waiter| driver.poll(waiter)).await;
-
-		match &res {
-			Err(Error::Transport(_)) => {
-				tracing::info!("session terminated");
-				session.close(SessionError::Internal.to_code(), "");
-			}
-			Err(err) => {
-				tracing::warn!(%err, "session error");
-				session.close(SessionError::from(err).to_code(), err.to_string().as_ref());
-			}
-			_ => {
-				tracing::info!("session closed");
-				session.close(SessionError::Cancel.to_code(), "");
-			}
-		}
-
-		res
-	}
-	.maybe_boxed();
 
 	Ok(SessionStart {
 		recv_bandwidth: recv_bw_consumer,
@@ -221,21 +208,48 @@ pub fn start<S: crate::transport::poll::Session>(config: Config<S>) -> Result<Se
 
 /// The lite session driver: one poll function racing every protocol arm, in
 /// place of a task set of boxed futures.
-struct Driver<S: crate::transport::poll::Session> {
+pub(crate) struct Driver<S: crate::transport::poll::Session, R: crate::runtime::Runtime> {
 	/// Advertising our capabilities, or `None` once sent (or on a version with no
 	/// Setup Stream).
 	setup: Option<SendSetup<S>>,
 	/// Sending our single GOAWAY if the drain trigger fires, or `None` once done.
-	goaway: Option<SendGoaway<S>>,
+	goaway: Option<SendGoaway<S, R>>,
 	/// The legacy session stream (pre-lite-03). Only its *error* ends the race, so
 	/// the publisher and subscriber keep running while it sits idle.
 	session_stream: Option<Stream<S, Version>>,
-	publisher: Publisher<S>,
+	publisher: Publisher<S, R>,
 	subscriber: SubscriberDriver<S>,
+	/// For the terminal close: the machine's last act reports the outcome to
+	/// the peer through the transport.
+	session: S,
 }
 
-impl<S: crate::transport::poll::Session> Driver<S> {
-	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
+impl<S, R> Driver<S, R>
+where
+	S: crate::transport::poll::Session,
+	R: crate::runtime::Runtime,
+{
+	pub(crate) fn poll(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
+		let res = std::task::ready!(self.poll_protocol(waiter));
+		match &res {
+			Err(Error::Transport(_)) => {
+				tracing::info!("session terminated");
+				self.session.close(SessionError::Internal.to_code(), "");
+			}
+			Err(err) => {
+				tracing::warn!(%err, "session error");
+				self.session
+					.close(SessionError::from(err).to_code(), err.to_string().as_ref());
+			}
+			_ => {
+				tracing::info!("session closed");
+				self.session.close(SessionError::Cancel.to_code(), "");
+			}
+		}
+		Poll::Ready(res)
+	}
+
+	fn poll_protocol(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		let mut cx = Context::from_waker(waiter.waker());
 
 		// The send-side machines never end the session; completion just retires them.
@@ -357,17 +371,18 @@ impl<S: crate::transport::poll::Session> SendSetup<S> {
 /// Runs on every version, including those with no GOAWAY message: the deadline is
 /// the sender's own timer, so a caller draining a lite-03 peer still gets the
 /// session closed on schedule; the peer just never learns why.
-struct SendGoaway<S: crate::transport::poll::Session> {
+struct SendGoaway<S: crate::transport::poll::Session, R: crate::runtime::Runtime> {
 	version: Version,
+	runtime: R,
 	goaway: crate::goaway::Protocol,
 	/// A dedicated handle for the trigger-phase close watch, since `session` opens
 	/// the Goaway stream and each pending operation needs its own handle.
 	closed: S,
 	session: S,
-	state: SendGoawayState<S>,
+	state: SendGoawayState<S, R>,
 }
 
-enum SendGoawayState<S: crate::transport::poll::Session> {
+enum SendGoawayState<S: crate::transport::poll::Session, R: crate::runtime::Runtime> {
 	/// Parked on the send trigger, racing the transport close so a parked trigger
 	/// never blocks the driver. The trigger fires at most once.
 	Waiting,
@@ -383,13 +398,14 @@ enum SendGoawayState<S: crate::transport::poll::Session> {
 		finished: bool,
 	},
 	/// The message is on the wire (or failed); enforce the local deadline.
-	Enforce(crate::goaway::Enforce<S>),
+	Enforce(crate::goaway::Enforce<S, R>),
 }
 
-impl<S: crate::transport::poll::Session> SendGoaway<S> {
-	fn new(session: S, goaway: crate::goaway::Protocol, version: Version) -> Self {
+impl<S: crate::transport::poll::Session, R: crate::runtime::Runtime> SendGoaway<S, R> {
+	fn new(runtime: R, session: S, goaway: crate::goaway::Protocol, version: Version) -> Self {
 		Self {
 			version,
+			runtime,
 			goaway,
 			closed: session.clone(),
 			session,
@@ -403,7 +419,11 @@ impl<S: crate::transport::poll::Session> SendGoaway<S> {
 	/// it to the peer is no reason to hold the session open.
 	fn enforce_after(&mut self, err: Error, timeout: Option<std::time::Duration>) {
 		tracing::warn!(%err, "failed to send goaway");
-		self.state = SendGoawayState::Enforce(crate::goaway::Enforce::new(self.session.clone(), timeout));
+		self.state = SendGoawayState::Enforce(crate::goaway::Enforce::new(
+			&self.runtime,
+			self.session.clone(),
+			timeout,
+		));
 	}
 
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
@@ -422,7 +442,11 @@ impl<S: crate::transport::poll::Session> SendGoaway<S> {
 					self.state = if self.version.has_goaway() {
 						SendGoawayState::Open { payload }
 					} else {
-						SendGoawayState::Enforce(crate::goaway::Enforce::new(self.session.clone(), payload.timeout))
+						SendGoawayState::Enforce(crate::goaway::Enforce::new(
+							&self.runtime,
+							self.session.clone(),
+							payload.timeout,
+						))
 					};
 				}
 				SendGoawayState::Open { payload } => {
@@ -474,13 +498,16 @@ impl<S: crate::transport::poll::Session> SendGoaway<S> {
 					};
 					match res {
 						Ok(()) => {
-							self.state =
-								SendGoawayState::Enforce(crate::goaway::Enforce::new(self.session.clone(), timeout));
+							self.state = SendGoawayState::Enforce(crate::goaway::Enforce::new(
+								&self.runtime,
+								self.session.clone(),
+								timeout,
+							));
 						}
 						Err(err) => self.enforce_after(err, timeout),
 					}
 				}
-				SendGoawayState::Enforce(enforce) => return enforce.poll(&mut cx),
+				SendGoawayState::Enforce(enforce) => return enforce.poll(waiter),
 			}
 		}
 	}

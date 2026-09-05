@@ -42,6 +42,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `catalog::VideoHint::label` is no longer public. `import::Init::label` is the single source of a
   rendition label, matching the hang draft, which classifies it as a common rendition field.
 
+## [0.9.13](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.12...moq-mux-v0.9.13) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-json, moq-loc
+
+## [0.9.12](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.11...moq-mux-v0.9.12) - 2026-09-01
+
+### Other
+
+- *(rs)* simplify poll propagation ([#3307](https://github.com/moq-dev/moq/pull/3307))
+
+## [0.9.11](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.10...moq-mux-v0.9.11) - 2026-09-01
+
+### Fixed
+
+- *(moq-mux)* wait for late groups within the latency budget ([#3271](https://github.com/moq-dev/moq/pull/3271))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.9.10](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.9...moq-mux-v0.9.10) - 2026-08-26
+
+### Added
+
+- *(moq-gst)* select media container for sink pads ([#2997](https://github.com/moq-dev/moq/pull/2997))
+
+### Fixed
+
+- *(net)* restore dynamic routing APIs ([#3038](https://github.com/moq-dev/moq/pull/3038))
+- *(net)* deprecate unsupported dynamic routing ([#3029](https://github.com/moq-dev/moq/pull/3029))
+
+## [0.9.9](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.8...moq-mux-v0.9.9) - 2026-08-24
+
+### Fixed
+
+- *(audio)* drain Opus lookahead on finish ([#3008](https://github.com/moq-dev/moq/pull/3008))
+- *(moq-cli)* pace the TS stdout export on each frame's timestamp ([#3006](https://github.com/moq-dev/moq/pull/3006))
+- *(moq-mux)* map containers onto MSF packaging one to one ([#2987](https://github.com/moq-dev/moq/pull/2987))
+- *(moq-mux)* emit the TS PCR as a uniform grid, not the per-unit decode clock ([#2967](https://github.com/moq-dev/moq/pull/2967))
+
+## [0.9.8](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.7...moq-mux-v0.9.8) - 2026-08-20
+
+### Added
+
+- *(hang)* signal stalled video renditions ([#2865](https://github.com/moq-dev/moq/pull/2865))
+
+### Fixed
+
+- *(moq-mux)* compile on wasm32, and gate it so it stays that way
+- *(moq-mux)* accept refreshed clocks on TS duplicates ([#2891](https://github.com/moq-dev/moq/pull/2891))
+
 ## [0.9.7](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.6...moq-mux-v0.9.7) - 2026-08-14
 
 ### Added

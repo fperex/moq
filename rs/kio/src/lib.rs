@@ -37,13 +37,6 @@ mod shared;
 mod task;
 mod weak;
 
-#[cfg(feature = "time")]
-pub mod time;
-
-#[cfg(feature = "tokio")]
-#[doc(hidden)]
-pub mod tokio;
-
 #[cfg(all(test, loom))]
 mod loom;
 #[cfg(all(test, not(loom)))]
@@ -56,7 +49,7 @@ pub use producer::{Mut, Producer, Ref};
 pub use queue::{PushError, Queue};
 pub use send::MaybeSend;
 pub use shared::Shared;
-pub use task::Tasks;
+pub use task::{Task, Tasks};
 pub use waiter::{Fan, Hold, Park, Waiter, WaiterList, wait};
 pub use weak::{ConsumerWeak, ProducerWeak, Weak};
 

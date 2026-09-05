@@ -11,7 +11,8 @@ import * as Moq from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
 import * as Audio from "./audio";
 import { Broadcast, type CatalogFormat, parseCatalogFormat } from "./broadcast";
-import { type Bound, type Latency, latencyBounds, latencyFromBounds, Sync } from "./sync";
+import { formatDuration, parseDuration } from "./duration";
+import { type Delay, Sync } from "./sync";
 import * as Text from "./text";
 import * as Video from "./video";
 
@@ -23,9 +24,13 @@ const OBSERVED = [
 	"muted",
 	"visible",
 	"reload",
+	"delay",
+	"buffer",
+	// Released spellings, kept parsing but off the documented surface. `latency-max` is absent
+	// deliberately: its old ceiling included the floor, so translating it faithfully would mean
+	// tracking the resolved delay reactively, which is the coupling `buffer` exists to remove.
 	"latency",
 	"latency-min",
-	"latency-max",
 	"jitter",
 	"catalog-format",
 	"captions",
@@ -43,6 +48,49 @@ function parseVisible(value: string | null): Video.Visible {
 	if (/^-?\d+(\.\d+)?$/.test(trimmed)) return `${trimmed}px`;
 	console.warn(`moq-watch: invalid visible="${value}", expected "never", "always", or a CSS length like "200px"`);
 	return "20%";
+}
+
+// Parse the `delay` attribute: "auto" (adaptive), "instant" (no buffer, no pacing), or a duration.
+function parseDelay(value: string | null): Delay {
+	const trimmed = value?.trim();
+	if (!trimmed || trimmed === "auto") return "auto";
+	if (trimmed === "instant") return "instant";
+	const parsed = parseDuration(trimmed);
+	if (parsed !== undefined) return parsed;
+	console.warn(`moq-watch: invalid delay="${value}", expected "auto", "instant", or a duration like "300ms"`);
+	return "auto";
+}
+
+// Parse the `buffer` attribute: a duration, or none when absent.
+function parseBuffer(value: string | null): Time.Milli {
+	const trimmed = value?.trim();
+	if (!trimmed) return Moq.Time.Milli.zero;
+	const parsed = parseDuration(trimmed);
+	if (parsed !== undefined) return parsed;
+	console.warn(`moq-watch: invalid buffer="${value}", expected a duration like "30s"`);
+	return Moq.Time.Milli.zero;
+}
+
+// The released `latency` / `latencyMin` property spellings, translated onto `delay`. The range
+// object is refused rather than half-applied: its ceiling included the floor, so it has no faithful
+// `buffer` without tracking the resolved delay, which is the coupling `buffer` exists to remove.
+function coerceLegacyDelay(value: unknown): Delay {
+	if (value === "instant") return "instant";
+	if (value === undefined || value === "auto" || value === "real-time") return "auto";
+	if (typeof value === "number" && Number.isFinite(value)) return Moq.Time.Milli(value);
+	throw new Error(
+		"moq-watch: the latency range is gone. Set `delay` (how far playback trails the live edge) and `buffer` (media held beyond it).",
+	);
+}
+
+// The released spellings of `delay`, in bare milliseconds. Kept unitless so pages still on them
+// behave exactly as they did; `delay` is the current surface and does require a unit.
+function parseLegacyDelay(value: string | null): Delay {
+	const trimmed = value?.trim();
+	if (!trimmed || trimmed === "real-time") return "auto";
+	if (trimmed === "instant") return "instant";
+	const parsed = Number.parseFloat(trimmed);
+	return Moq.Time.Milli(Number.isFinite(parsed) ? parsed : 100);
 }
 
 /**
@@ -93,7 +141,7 @@ export default class MoqWatch extends HTMLElement {
 	/** Renders caption cues into an overlay above the canvas. */
 	captionsRenderer: Text.Renderer;
 
-	/** Keeps audio and video playing at the target latency. */
+	/** Keeps audio and video playing at the configured delay. */
 	sync: Sync;
 
 	// The mutable user controls. As the top of the tree, this element owns the
@@ -105,7 +153,10 @@ export default class MoqWatch extends HTMLElement {
 		muted: new Signal(false),
 		// When video is downloaded relative to the canvas position. See {@link Video.Visible}.
 		visible: new Signal<Video.Visible>("20%"),
-		latency: new Signal<Latency>("real-time"),
+		// How far playback trails the live edge.
+		delay: new Signal<Delay>("auto"),
+		// Future-dated media held beyond the live edge before playback skips ahead.
+		buffer: new Signal<Time.Milli>(Moq.Time.Milli.zero),
 		// The desired video rendition (resolution/bitrate cap).
 		target: new Signal<Video.Target | undefined>(undefined),
 		// The selected caption track name, or undefined for off (the default; captions are opt-in).
@@ -190,8 +241,10 @@ export default class MoqWatch extends HTMLElement {
 		// The video decoder owns rendition handoffs but also needs Sync. Bridge its output through a
 		// parent-owned signal so Sync can be constructed first without exposing mutable wiring.
 		const videoJitter = new Signal<Time.Milli | undefined>(undefined);
+
 		this.sync = new Sync({
-			latency: this.controls.latency,
+			delay: this.controls.delay,
+			buffer: this.controls.buffer,
 			probe: this.connection.probe,
 			video: videoJitter,
 			audio: audioSource.out.jitter,
@@ -232,8 +285,21 @@ export default class MoqWatch extends HTMLElement {
 			this.#captionsEnabled.set(effect.get(this.#enabled) && !effect.get(this.controls.paused));
 		});
 
-		// Audio download follows the emitter's enable policy (paused/muted).
-		this.signals.proxy(this.#audioEnabled, this.emitter.out.enabled);
+		// Audio download follows the emitter's enable policy (paused/muted), except an instant
+		// delay turns it off outright: the ring needs a target depth to avoid underrunning, and
+		// unpaced video has nothing pulling it back toward the audio clock.
+		this.signals.run((effect) => {
+			const enabled = effect.get(this.emitter.out.enabled);
+			this.#audioEnabled.set(enabled && effect.get(this.controls.delay) !== "instant");
+		});
+
+		// Stopping the download leaves the ring holding a floor's worth of PCM, and the emitter
+		// stays connected to drain it. Flush on the way in so audio stops now instead of playing
+		// against video that just jumped to the live edge.
+		this.signals.run((effect) => {
+			if (effect.get(this.controls.delay) !== "instant") return;
+			this.audio.reset();
+		});
 
 		// Video downloads while playing and on-screen. When paused, keep downloading only
 		// until a frame is on the canvas, then stop: a cold paused start still shows a poster
@@ -330,18 +396,15 @@ export default class MoqWatch extends HTMLElement {
 			this.setAttribute("visible", visible);
 		});
 
+		// Each knob is 1:1 with its attribute, so the echo back through attributeChangedCallback
+		// parses to the value already held and the effect settles.
 		this.signals.run((effect) => {
-			const { min, max } = latencyBounds(effect.get(this.controls.latency));
-			// Only reflect the collapsed `latency` sugar attribute when the range is actually
-			// collapsed. An open range is expressed via latency-min/latency-max, and writing
-			// `latency` here would round-trip back through attributeChangedCallback and collapse it.
-			if (min !== max) return;
-			if (min === "real-time") {
-				this.setAttribute("latency", "real-time");
-			} else {
-				const jitter = Math.floor(effect.get(this.sync.out.jitter));
-				this.setAttribute("latency", jitter.toString());
-			}
+			const delay = effect.get(this.controls.delay);
+			this.setAttribute("delay", typeof delay === "number" ? formatDuration(delay) : delay);
+		});
+
+		this.signals.run((effect) => {
+			this.setAttribute("buffer", formatDuration(effect.get(this.controls.buffer)));
 		});
 
 		// Track the element's rendered size and feed it into the rendition picker,
@@ -396,13 +459,6 @@ export default class MoqWatch extends HTMLElement {
 		this.#enabled.set(false);
 	}
 
-	// Parse a single latency bound: absent or "real-time" is adaptive, otherwise a fixed ms value.
-	#parseBound(value: string | null): Bound {
-		if (!value || value === "real-time") return "real-time";
-		const parsed = Number.parseFloat(value);
-		return Moq.Time.Milli(Number.isFinite(parsed) ? parsed : 100);
-	}
-
 	attributeChangedCallback(name: Observed, oldValue: string | null, newValue: string | null) {
 		if (oldValue === newValue) {
 			return;
@@ -423,16 +479,12 @@ export default class MoqWatch extends HTMLElement {
 			this.controls.visible.set(parseVisible(newValue));
 		} else if (name === "reload") {
 			this.#reload.set(parseBoolean(newValue, true));
-		} else if (name === "latency") {
-			// Sugar: collapse the floor and ceiling to a single value.
-			this.latency = this.#parseBound(newValue);
-		} else if (name === "latency-min") {
-			this.latencyMin = this.#parseBound(newValue);
-		} else if (name === "latency-max") {
-			this.latencyMax = this.#parseBound(newValue);
-		} else if (name === "jitter") {
-			// Deprecated: use latency="<number>" instead.
-			this.latency = this.#parseBound(newValue);
+		} else if (name === "delay") {
+			this.controls.delay.set(parseDelay(newValue));
+		} else if (name === "buffer") {
+			this.controls.buffer.set(parseBuffer(newValue));
+		} else if (name === "latency" || name === "latency-min" || name === "jitter") {
+			this.controls.delay.set(parseLegacyDelay(newValue));
 		} else if (name === "catalog-format") {
 			this.#catalogFormat.set(parseCatalogFormat(newValue));
 		} else if (name === "captions") {
@@ -501,40 +553,58 @@ export default class MoqWatch extends HTMLElement {
 	}
 
 	/**
-	 * The latency target. Assign a scalar (or `"real-time"`) to minimize latency, or an object
-	 * `{ min, max }` to open a range and buffer future-dated frames. See {@link Latency}.
+	 * How far playback trails the live edge, in milliseconds. See {@link Delay}.
+	 *
+	 * `"auto"` (the default) sizes the jitter buffer from the connection RTT. `"instant"` drops the
+	 * clock instead: video paints the moment it decodes and audio is disabled.
 	 */
-	get latency(): Latency {
-		return this.controls.latency.peek();
+	get delay(): Delay {
+		return this.controls.delay.peek();
 	}
 
-	set latency(value: Latency) {
-		this.controls.latency.set(value);
-	}
-
-	/** The latency floor (jitter/startup buffer). Read-modify-writes `latency`, leaving the ceiling. */
-	get latencyMin(): Bound {
-		return latencyBounds(this.controls.latency.peek()).min;
-	}
-
-	set latencyMin(value: Bound) {
-		const { max } = latencyBounds(this.controls.latency.peek());
-		this.controls.latency.set(latencyFromBounds(value, max));
+	set delay(value: Delay) {
+		this.controls.delay.set(value);
 	}
 
 	/**
-	 * The latency ceiling: `"real-time"` (default) minimizes, a number caps at that many ms. A
-	 * ceiling above the floor enables buffered playback: build up a buffer from future-dated frames
-	 * (e.g. TTS written faster than real-time) and only skip ahead past the cap. Call `reset()` at
-	 * each utterance boundary. Read-modify-writes `latency`, leaving the floor untouched.
+	 * Future-dated media held beyond the live edge before playback skips ahead, in milliseconds.
+	 *
+	 * Zero (the default) minimizes latency. A larger value enables buffered playback: build up a
+	 * buffer from future-dated frames (e.g. TTS written faster than real-time) and only skip ahead
+	 * once they would sit further than `delay + buffer` past the playhead. Call `reset()` at each
+	 * utterance boundary.
 	 */
-	get latencyMax(): Bound {
-		return latencyBounds(this.controls.latency.peek()).max;
+	get buffer(): Time.Milli {
+		return this.controls.buffer.peek();
 	}
 
-	set latencyMax(value: Bound) {
-		const { min } = latencyBounds(this.controls.latency.peek());
-		this.controls.latency.set(latencyFromBounds(min, value));
+	set buffer(value: Time.Milli) {
+		this.controls.buffer.set(value);
+	}
+
+	/** @internal */
+	get latency(): Delay {
+		return this.controls.delay.peek();
+	}
+
+	set latency(value: unknown) {
+		this.controls.delay.set(coerceLegacyDelay(value));
+	}
+
+	/** @internal */
+	get latencyMin(): Delay {
+		return this.controls.delay.peek();
+	}
+
+	set latencyMin(value: unknown) {
+		this.controls.delay.set(coerceLegacyDelay(value));
+	}
+
+	/** @internal */
+	set latencyMax(_value: unknown) {
+		throw new Error(
+			"moq-watch: `latencyMax` is gone. Use `buffer`, the media held beyond the live edge; the old ceiling included the floor, so it is `latencyMax - delay`.",
+		);
 	}
 
 	/** The jitter buffer in milliseconds. */

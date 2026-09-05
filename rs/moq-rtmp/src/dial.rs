@@ -35,7 +35,7 @@ use crate::rml::sessions::{
 use crate::rml::time::RtmpTimestamp;
 use bytes::Bytes;
 use moq_mux::container::flv::{Export as FlvExport, Import as FlvImport};
-use moq_net::{broadcast, origin};
+use moq_net::origin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -65,6 +65,8 @@ pub struct Client<S = TcpStream> {
 	session: ClientSession,
 	/// Session results queued during connect, drained by the first publish/pull.
 	work: VecDeque<ClientSessionResult>,
+	/// The `<app>` this client connected to, logged in place of the stream key.
+	app: String,
 	/// How long [`publish`](Self::publish)'s FLV muxer waits for a stalled group
 	/// before skipping. Defaults to [`DEFAULT_MAX_AGE`](crate::DEFAULT_MAX_AGE).
 	export_max_age: Duration,
@@ -148,6 +150,7 @@ impl<S: Stream> Client<S> {
 			stream,
 			session,
 			work,
+			app: app.to_string(),
 			export_max_age: crate::DEFAULT_MAX_AGE,
 			import_max_age: None,
 		})
@@ -192,6 +195,7 @@ impl<S: Stream> Client<S> {
 		origin: origin::Consumer,
 		path: impl moq_net::AsPath,
 	) -> Result<()> {
+		let path = path.as_path();
 		let request = self
 			.session
 			.request_publishing(stream_key.to_string(), PublishRequestType::Live)
@@ -199,7 +203,9 @@ impl<S: Stream> Client<S> {
 		self.work.push_back(request);
 		self.await_event(Direction::Publish).await?;
 
-		tracing::info!(%stream_key, "rtmp publish accepted by remote");
+		// The stream key is the ingest credential (`rtmp://host/<app>/<key>`), so the
+		// app and broadcast path stand in for it.
+		tracing::info!(app = %self.app, %path, "rtmp publish accepted by remote");
 
 		// Flush anything queued alongside the publish-accepted event before streaming.
 		let queued = std::mem::take(&mut self.work);
@@ -268,7 +274,9 @@ impl<S: Stream> Client<S> {
 		self.work.push_back(request);
 		self.await_event(Direction::Play).await?;
 
-		tracing::info!(%stream_key, %path, "rtmp play accepted by remote");
+		// The stream key is the ingest credential (`rtmp://host/<app>/<key>`), so the
+		// app and broadcast path stand in for it.
+		tracing::info!(app = %self.app, %path, "rtmp play accepted by remote");
 
 		let mut publisher = Publisher::new(origin, path.as_str(), self.import_max_age)?;
 
@@ -469,8 +477,11 @@ struct Publisher {
 impl Publisher {
 	fn new(origin: &origin::Producer, path: &str, max_age: Option<Duration>) -> anyhow::Result<Self> {
 		let mut broadcast = origin
-			.create_broadcast(path, broadcast::Route::new().with_announce(true))
+			.create_broadcast(path)
 			.map_err(|err| anyhow::anyhow!("broadcast '{path}' could not be published: {err}"))?;
+		broadcast
+			.announce(moq_net::origin::Route::default())
+			.map_err(|err| anyhow::anyhow!("broadcast '{path}' could not be announced: {err}"))?;
 		let config = moq_mux::catalog::Config::default().with_max_age(max_age);
 		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
 		let handle = broadcast.clone();
@@ -535,10 +546,9 @@ mod tests {
 		let mut vframe = vec![0x17, 0x01, 0x00, 0x00, 0x00];
 		vframe.extend_from_slice(&[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x00]);
 
-		let server_origin = moq_tokio::origin::spawn(moq_net::Origin::random());
-		let mut broadcast = server_origin
-			.create_broadcast("live/cam0", broadcast::Route::new().with_announce(true))
-			.unwrap();
+		let server_origin = moq_tokio::origin::spawn(moq_net::Hop::random());
+		let mut broadcast = server_origin.create_broadcast("live/cam0").unwrap();
+		broadcast.announce(Default::default()).unwrap();
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 		let mut importer = FlvImport::new(broadcast, catalog.reserve());
 		importer.decode(&flv::file_header()).unwrap();
@@ -559,7 +569,7 @@ mod tests {
 		});
 
 		// Client: dial, connect(`live`), play(`cam0`), republish into our own origin.
-		let client_origin = moq_tokio::origin::spawn(moq_net::Origin::random());
+		let client_origin = moq_tokio::origin::spawn(moq_net::Hop::random());
 		let announced = client_origin.consume();
 		let pull_origin = client_origin.clone();
 		let pull = tokio::spawn(async move {
@@ -568,10 +578,11 @@ mod tests {
 		});
 
 		// The republished broadcast should show up in the client's origin.
-		let broadcast = tokio::time::timeout(Duration::from_secs(5), announced.announced_broadcast("pulled/cam0"))
+		tokio::time::timeout(Duration::from_secs(5), announced.routed("pulled/cam0"))
 			.await
 			.expect("client republish timed out")
 			.expect("broadcast announced in client origin");
+		let broadcast = announced.request_broadcast("pulled/cam0").await.unwrap();
 
 		// It should carry a hang catalog track (proof the FLV demux produced real
 		// media on the far side): subscribe to it and read one catalog frame.
@@ -580,10 +591,16 @@ mod tests {
 			.expect("catalog track")
 			.subscribe(None)
 			.await
-			.expect("subscribe catalog");
-		let frame = tokio::time::timeout(Duration::from_secs(5), catalog_track.read_frame())
+			.expect("subscribe catalog")
+			.ordered();
+		let mut group = tokio::time::timeout(Duration::from_secs(5), catalog_track.next_group())
 			.await
 			.expect("catalog read timed out")
+			.expect("catalog read")
+			.expect("a catalog group");
+		let frame = group
+			.read_frame()
+			.await
 			.expect("catalog read")
 			.expect("a catalog frame");
 		assert!(!frame.payload.is_empty(), "pulled broadcast should carry a catalog");

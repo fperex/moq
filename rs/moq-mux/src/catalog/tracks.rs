@@ -82,6 +82,30 @@ pub trait RenditionConfig<E: CatalogExt>: Sized + 'static {
 	fn set_estimate(&mut self, _estimate: Estimate) {}
 }
 
+impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::JsonConfig {
+	fn insert(self, catalog: &mut Catalog<E>, name: &str) {
+		catalog.json.tracks.insert(name.to_string(), self);
+	}
+	fn get_mut<'a>(catalog: &'a mut Catalog<E>, name: &str) -> Option<&'a mut Self> {
+		catalog.json.tracks.get_mut(name)
+	}
+	fn remove(catalog: &mut Catalog<E>, name: &str) {
+		catalog.json.tracks.remove(name);
+	}
+}
+
+impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::BinaryConfig {
+	fn insert(self, catalog: &mut Catalog<E>, name: &str) {
+		catalog.binary.tracks.insert(name.to_string(), self);
+	}
+	fn get_mut<'a>(catalog: &'a mut Catalog<E>, name: &str) -> Option<&'a mut Self> {
+		catalog.binary.tracks.get_mut(name)
+	}
+	fn remove(catalog: &mut Catalog<E>, name: &str) {
+		catalog.binary.tracks.remove(name);
+	}
+}
+
 /// Caller-provided catalog fields for a video track: a starting point for what the importer detects.
 ///
 /// Every field is optional and fills only a gap the stream leaves; a value the stream reveals (the
@@ -119,6 +143,11 @@ pub struct VideoHint {
 	pub optimize_for_latency: Option<bool>,
 	/// The maximum jitter before the next frame is emitted.
 	pub jitter: Option<Duration>,
+	/// The container wrapping each frame on the wire.
+	///
+	/// Unlike the other fields this is a choice, not a hint: the bitstream never reveals a
+	/// container, so it is applied to every config the importer publishes rather than filling a gap.
+	pub container: hang::catalog::Container,
 }
 
 /// Fill `slot` from `value` only when the slot is still empty, so a value the stream detected always
@@ -135,7 +164,7 @@ impl From<hang::catalog::VideoConfig> for VideoHint {
 	///
 	/// Total by construction: every field the hint can hold is taken from the config, so there is no
 	/// per-field copy for a caller to forget. Fields with no hint slot (`broadcast`, `description`,
-	/// `container`, `stalled`) are set through the catalog directly.
+	/// `stalled`) are set through the catalog directly.
 	fn from(config: hang::catalog::VideoConfig) -> Self {
 		Self {
 			label: config.label,
@@ -148,6 +177,7 @@ impl From<hang::catalog::VideoConfig> for VideoHint {
 			framerate: config.framerate,
 			optimize_for_latency: config.optimize_for_latency,
 			jitter: config.jitter,
+			container: config.container,
 		}
 	}
 }
@@ -169,6 +199,7 @@ impl VideoHint {
 		fill(&mut config.framerate, self.framerate);
 		fill(&mut config.optimize_for_latency, self.optimize_for_latency);
 		fill(&mut config.jitter, self.jitter);
+		config.container = self.container.clone();
 	}
 
 	/// Build a config from these fields alone, or `None` if the codec is missing. Used to publish
@@ -176,7 +207,6 @@ impl VideoHint {
 	pub fn to_config(&self) -> Option<hang::catalog::VideoConfig> {
 		let codec = self.codec.clone()?;
 		let mut config = hang::catalog::VideoConfig::new(codec);
-		config.container = hang::catalog::Container::Legacy;
 		self.apply(&mut config);
 		Some(config)
 	}
@@ -262,8 +292,8 @@ impl<E: CatalogExt> Reserved<E> {
 
 	/// Track properties for a media track under this catalog, carrying any retention it declares.
 	/// See [`Producer::track_info`](super::Producer::track_info).
-	pub fn track_info(&self) -> moq_net::track::Info {
-		self.catalog.track_info()
+	pub fn track_info(&self, priority: u8) -> moq_net::track::Info {
+		self.catalog.track_info(priority)
 	}
 
 	/// Reserve a rendition of config type `C` under `name`, returning the handle that owns it.
@@ -370,13 +400,21 @@ pub type TextTrack<E = ()> = Rendition<E, hang::catalog::TextConfig>;
 
 impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 	fn new(reserved: Reserved<E>, name: String) -> crate::Result<Self> {
+		Self::owned(reserved.catalog.clone(), Some(reserved), name)
+	}
+
+	pub(super) fn live(catalog: Producer<E>, name: String) -> crate::Result<Self> {
+		Self::owned(catalog, None, name)
+	}
+
+	fn owned(catalog: Producer<E>, gate: Option<Reserved<E>>, name: String) -> crate::Result<Self> {
 		// Take the name now, not at `set`: a lazily-configured importer (H.264 before its first SPS)
 		// has no catalog entry until much later, and the name has to be ours for that whole window.
-		reserved.catalog.acquire::<C>(&name)?;
+		catalog.acquire::<C>(&name)?;
 
 		Ok(Self {
-			catalog: reserved.catalog.clone(),
-			gate: Some(reserved),
+			catalog,
+			gate,
 			name,
 			present: false,
 			supplied: Estimate::default(),
@@ -513,6 +551,21 @@ mod tests {
 
 	fn ts(micros: u64) -> moq_net::Timestamp {
 		moq_net::Timestamp::from_micros(micros).unwrap()
+	}
+
+	// Legacy unless selected, and a clone (what an importer is handed) carries the selection.
+	#[test]
+	fn a_video_hint_applies_its_container_to_every_config() {
+		let mut config = hang::catalog::VideoConfig::new(hang::catalog::VideoCodec::VP8);
+		VideoHint::default().apply(&mut config);
+		assert_eq!(config.container, hang::catalog::Container::Legacy);
+
+		let hint = VideoHint {
+			container: hang::catalog::Container::Loc,
+			..Default::default()
+		};
+		hint.apply(&mut config);
+		assert_eq!(config.container, hang::catalog::Container::Loc);
 	}
 
 	/// Feed ~40ms 100 kB frames (one per group) over more than the bitrate window, as a

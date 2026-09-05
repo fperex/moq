@@ -36,7 +36,6 @@ from .types import (
     AudioEncoderOutput,
     AudioFrame,
     Frame,
-    Route,
     Subscription,
     TrackInfo,
     VideoEncoderInput,
@@ -262,7 +261,7 @@ class TrackProducer:
     def consume(self, subscription: Subscription | None = None) -> TrackConsumer:
         """Create a consumer that reads directly from this producer's track.
 
-        ``subscription`` tunes delivery priority, group ordering priority, and group range; omit for defaults.
+        ``subscription`` tunes delivery priority, group range, and staleness; omit for defaults.
         """
         from .subscribe import TrackConsumer
 
@@ -299,7 +298,7 @@ class TrackRequest:
     def accept(self, info: TrackInfo | None = None) -> TrackProducer:
         """Accept the request as a raw track.
 
-        ``info`` fixes the track's timescale, priority, ordering priority, and cache; omit for defaults.
+        ``info`` fixes the track's timescale, priority, and cache; omit for defaults.
         """
         return TrackProducer(self._inner.accept(info))
 
@@ -409,6 +408,23 @@ class AudioProducer:
     def __init__(self, inner: MoqAudioProducer) -> None:
         self._inner = inner
 
+    @property
+    def name(self) -> str:
+        """The audio track name."""
+        return self._inner.name()
+
+    async def used(self) -> None:
+        """Wait until this audio track has at least one active subscriber."""
+        await self._inner.used()
+
+    async def unused(self) -> None:
+        """Wait until this audio track has no active subscribers."""
+        await self._inner.unused()
+
+    def reset_epoch(self) -> None:
+        """Re-anchor the timeline to the next frame after an idle gap."""
+        self._inner.reset_epoch()
+
     def write(self, frame: AudioFrame) -> None:
         """Push one frame of PCM in the configured input format."""
         self._inner.write(frame)
@@ -428,6 +444,19 @@ class VideoProducer:
 
     def __init__(self, inner: MoqVideoProducer) -> None:
         self._inner = inner
+
+    @property
+    def name(self) -> str:
+        """The video track name."""
+        return self._inner.name()
+
+    async def used(self) -> None:
+        """Wait until this video track has at least one active subscriber."""
+        await self._inner.used()
+
+    async def unused(self) -> None:
+        """Wait until this video track has no active subscribers."""
+        await self._inner.unused()
 
     def write(self, frame: VideoFrame) -> None:
         """Encode and publish one frame in the configured input format.
@@ -506,17 +535,8 @@ class BroadcastProducer:
         """Accept subscriptions to tracks that are not published yet."""
         return BroadcastDynamic(self._inner.dynamic())
 
-    def set_route(self, route: Route) -> None:
-        """Update the broadcast's route: the hop chain, cost, and liveness it advertises.
-
-        Use this as conditions shift (e.g. a standby transcoder lowering its
-        ``cost`` once warm); consumers observe the change via
-        :meth:`BroadcastConsumer.route_changed`.
-        """
-        self._inner.set_route(route)
-
     def set_announce(self, announce: bool) -> None:
-        """Set whether the broadcast is announced, keeping the rest of its route.
+        """Set whether the broadcast's exact path is announced as a route.
 
         The origin advertises the path only while announced; an unannounced
         broadcast stays reachable by exact path for subscribes and fetches. This is
@@ -617,10 +637,10 @@ class BroadcastProducer:
     ) -> VideoProducer:
         """Publish a raw-video track with an in-process H.264/H.265 encoder.
 
-        The track is named after the codec (``.avc3`` / ``.hev1``) and its
-        catalog rendition is published immediately, read out of the encoder
-        itself, so subscribers discover it through the catalog rather than a
-        name you pick, and can find it before the first frame exists.
+        Set ``output.track`` to choose the track name; otherwise one is derived
+        from the codec (``.avc3`` / ``.hev1``). The catalog rendition is
+        published immediately so subscribers can discover it before the first
+        frame exists.
         """
         return VideoProducer(self._inner.encode_video(input, output))
 

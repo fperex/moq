@@ -9,7 +9,9 @@ mod parameters;
 mod adapter;
 pub mod cluster;
 mod control;
+mod error;
 mod fetch;
+mod filter;
 mod goaway;
 mod group;
 mod location;
@@ -32,6 +34,7 @@ mod version;
 
 use control::Control;
 pub use fetch::*;
+pub use filter::*;
 pub use goaway::*;
 pub use group::*;
 pub use location::*;

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.15](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.14...moq-relay-v0.14.15) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, moq-native, moq-stats
+
+## [0.14.14](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.13...moq-relay-v0.14.14) - 2026-09-01
+
+### Added
+
+- *(moq-net)* add moq-transport draft-20 (moqt-20) ([#3255](https://github.com/moq-dev/moq/pull/3255))
+
+### Other
+
+- *(relay)* avoid WebSocket message copies ([#3277](https://github.com/moq-dev/moq/pull/3277))
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.14.13](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.12...moq-relay-v0.14.13) - 2026-08-24
+
+### Added
+
+- *(moq-relay)* hand qmux the socket under a WebSocket upgrade ([#2963](https://github.com/moq-dev/moq/pull/2963))
+
+### Fixed
+
+- *(relay)* bound WebSocket sessions by their credential lifetime ([#2973](https://github.com/moq-dev/moq/pull/2973))
+
+## [0.14.12](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.11...moq-relay-v0.14.12) - 2026-08-20
+
+### Fixed
+
+- *(relay)* redial reconfigured cluster peers ([#2874](https://github.com/moq-dev/moq/pull/2874))
+
+### Other
+
+- *(deps)* bump the cargo group with 7 updates ([#2888](https://github.com/moq-dev/moq/pull/2888))
+
 ## [0.14.11](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.10...moq-relay-v0.14.11) - 2026-08-14
 
 ### Fixed

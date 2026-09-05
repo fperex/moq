@@ -1,195 +1,64 @@
 ---
 title: moq-relay
-description: A server that connects MoQ publishers and subscribers.
+description: The MoQ relay server
 ---
 
 # moq-relay
 
-A server that routes broadcasts between publishers and subscribers, performing caching, deduplication, and fan-out.
+`moq-relay` routes broadcasts from publishers to subscribers. It caches
+groups, merges duplicate subscriptions, and never parses the media, so one
+relay serves video, audio, and data alike.
 
-## Overview
+## Features
 
-`moq-relay` is designed to run in datacenters, relaying media across multiple hops to improve quality of service and enable massive scale.
+- **QUIC, WebTransport, and WebSocket** listeners, so browsers and native clients connect to one process.
+- **Path-scoped authentication** with JWTs, mTLS for peers, anonymous prefixes, and an optional auth API for dynamic policy. See [Authentication](/bin/relay/auth).
+- **Clustering** across hosts and regions with hop-list routing, per-link costs, gossip discovery, and dynamic peer lists. See [Clustering](/bin/relay/cluster).
+- **A group cache** with byte and age budgets, so late joiners and the HLS gateway can fetch recent history.
+- **HTTP endpoints** to list broadcasts, fetch groups, probe health, and scrape Prometheus metrics. See [HTTP](/bin/relay/http).
+- **Live stats** published as MoQ tracks per node and per tenant, split by billing tier.
+- **Plaintext TCP and Unix-socket listeners** for trusted local workers, and experimental [iroh](/concept/transport#iroh-peer-to-peer-experimental) peer-to-peer.
+- **Hot reload** of certificates and trust roots.
 
-**Features:**
-
-- Fan-out to multiple subscribers
-- Caching and deduplication
-- Cross-region clustering
-- JWT-based authentication
-- HTTP debugging endpoints
-
-## Installation
-
-### From Source
-
-```bash
-git clone https://github.com/moq-dev/moq
-cd moq
-cargo build --release --bin moq-relay
-```
-
-The binary will be in `target/release/moq-relay`.
-
-### Using Cargo
+## Run
 
 ```bash
-cargo install moq-relay
-```
-
-### Using winget (Windows)
-
-```powershell
-winget install moq-dev.moq-relay
-```
-
-### Using Nix
-
-```bash
-# Run directly
-nix run github:moq-dev/moq#moq-relay
-
-# Or build and find the binary in ./result/bin/
-nix build github:moq-dev/moq#moq-relay
-```
-
-### Using Docker
-
-```bash
-docker pull moqdev/moq-relay
-docker run -p 4443:4443/udp -v "$(pwd)/relay.toml:/app/relay.toml:ro" moqdev/moq-relay -- /app/relay.toml
-```
-
-Multi-arch images (`linux/amd64` and `linux/arm64`) are published to [Docker Hub](https://hub.docker.com/r/moqdev/moq-relay).
-
-## Configuration
-
-Create a `relay.toml` configuration file:
-
-```toml
-[listen]
-bind = "[::]:4443"  # Listen on all interfaces, port 4443
-
-[listen.tls]
-cert = "/path/to/cert.pem"  # TLS certificate
-key = "/path/to/key.pem"    # TLS private key
-
-[auth]
-public = "anon"     # Allow anonymous access to anon/**
-key = "root.jwk"    # JWT key for authenticated paths
-```
-
-See [localhost.toml](https://github.com/moq-dev/moq/blob/main/demo/relay/localhost.toml) for a complete example.
-
-## Running
-
-Pass the config path as the only positional argument:
-
-```bash
+cargo install moq-relay          # or brew, apt, dnf, winget, docker; see Install
 moq-relay relay.toml
 ```
 
-## HTTP Endpoints
-
-The relay exposes HTTP/HTTPS endpoints for debugging, health checks, and late-join. See [HTTP](/bin/relay/http) for details.
-
-## TLS Setup
-
-The relay requires TLS certificates. Use [Let's Encrypt](https://letsencrypt.org/):
-
-```bash
-# Install certbot
-sudo apt install certbot  # Ubuntu/Debian
-brew install certbot      # macOS
-
-# Generate certificate
-sudo certbot certonly --standalone -d relay.example.com
-```
-
-Update `relay.toml`:
+The relay takes one TOML file. A local development config:
 
 ```toml
-[listen.tls]
-cert = "/etc/letsencrypt/live/relay.example.com/fullchain.pem"
-key = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
+[listen]
+bind = "[::]:4443"
+tls.generate = ["localhost"]
+
+[web.http]
+listen = "[::]:4443"   # serves the certificate fingerprint for local browsers
+
+[auth]
+public = ""            # anonymous access to everything; development only
 ```
 
-## Monitoring
+Every option is also a `--flag` or `MOQ_*` environment variable, and
+`RUST_LOG` controls logging. The
+[configuration reference](/bin/relay/config) covers every section, and
+[`demo/relay/`](https://github.com/moq-dev/moq/tree/main/demo/relay) has
+working configs for development, production, and a cluster.
 
-### Logging
+## Operate
 
-Set log level via environment variable:
-
-```bash
-RUST_LOG=info moq-relay relay.toml
-RUST_LOG=debug moq-relay relay.toml
-RUST_LOG=moq_relay=trace moq-relay relay.toml
-```
-
-### Metrics
-
-Metrics (Prometheus format) are planned but not yet implemented.
-
-Current visibility:
-
-- Check logs for connection count
-- Use [HTTP endpoints](/bin/relay/http) for track inspection
-- Monitor system resources (CPU, memory, bandwidth)
-
-## Performance
-
-### Current Status
-
-- **Single-threaded** - Quinn uses one UDP receive thread
-- **In-memory caching** - Recent groups stored in RAM
-- **Mesh clustering** - All relays connect to all others
-
-### Scaling
-
-- **Vertical** - Fast CPU matters more than core count
-- **Horizontal** - Deploy multiple relays in different regions
-- **Cluster size** - 3-5 nodes optimal with current implementation
-
-### Future Improvements
-
-- Multi-threaded UDP processing
-- Tree-based clustering topology
-- Improved memory management
-- Metrics and observability
+| Task | Guide |
+| --- | --- |
+| Expose it publicly with TLS and host tuning | [Production deployment](/setup/prod) |
+| Decide who may publish and subscribe where | [Authentication](/bin/relay/auth) |
+| Add more relays | [Clustering](/bin/relay/cluster) |
+| Monitor, debug, fetch history | [HTTP endpoints](/bin/relay/http) |
 
 ## Troubleshooting
 
-### Port Already in Use
-
-```bash
-# Check what's using port 4443
-lsof -i :4443
-
-# Kill the process or use a different port
-```
-
-### Certificate Errors
-
-Ensure:
-
-- Certificate is valid and not expired
-- Certificate matches domain name
-- Private key has correct permissions
-- Certificate includes full chain
-
-### Connection Timeouts
-
-Check:
-
-- UDP port is open in firewall
-- Cloud provider allows UDP traffic
-- TLS certificate is valid
-- Relay is actually running
-
-## Next Steps
-
-- Set up [Authentication](/bin/relay/auth)
-- Configure [Clustering](/bin/relay/cluster)
-- Deploy to [Production](/bin/relay/prod)
-- Use [moq-net](/lib/rs/crate/moq-net) client library
-- Build media apps with [hang](/lib/rs/crate/hang)
+- **Address already in use**: something else holds the UDP or TCP port.
+- **Certificate errors**: the hostname must match the certificate. Local browsers need the fingerprint served over `[web.http]`.
+- **Connection timeout**: UDP isn't reaching the relay, or the client URL names the wrong port.
+- **Unauthorized / forbidden**: the token's paths don't cover the connection path. See [path matching](/bin/relay/auth#path-matching).

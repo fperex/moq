@@ -20,20 +20,51 @@ public final class OriginProducer: Sendable {
         OriginConsumer(ffi.consume())
     }
 
-    /// Serve broadcasts that consumers request without an announcement.
+    /// Serve broadcasts on request: paths nothing publishes, under the root or
+    /// under any prefix this origin announced.
     public func dynamic() -> OriginDynamic {
         OriginDynamic(ffi.dynamic())
     }
 
     /// Create a broadcast at `path`, returning the producer that feeds it.
     ///
-    /// The broadcast starts live: the origin announces the path so subscribers can
-    /// discover it, becoming visible shortly after this returns. Toggle
-    /// discoverability with `BroadcastProducer.setAnnounce(_:)`; `finish()` unpublishes
-    /// immediately, while releasing the producer without finishing also unpublishes
-    /// but reads to subscribers as a failure rather than a deliberate end.
+    /// The broadcast starts announced: the origin advertises the exact path as a
+    /// route so subscribers can discover it, becoming visible shortly after this
+    /// returns. Toggle discoverability with `BroadcastProducer.setAnnounce(_:)`;
+    /// `finish()` unpublishes immediately, while releasing the producer without
+    /// finishing also unpublishes but reads to subscribers as a failure rather
+    /// than a deliberate end.
     public func createBroadcast(path: String) throws -> BroadcastProducer {
         BroadcastProducer(try ffi.createBroadcast(path: path))
+    }
+
+    /// Advertise a route: a claim that paths under `prefix` can be served.
+    ///
+    /// Hold the returned `Announce` for as long as the route should stay
+    /// advertised. Announcing is independent of `createBroadcast(path:)`:
+    /// announce one short prefix and serve requests beneath it with `dynamic()`.
+    public func announce(prefix: String, route: Route = Route()) throws -> Announce {
+        Announce(try ffi.announce(prefix: prefix, route: route))
+    }
+}
+
+/// A live route advertisement. The route stays advertised until `cancel()`
+/// (or the handle is released).
+public final class Announce: Sendable {
+    let ffi: MoqAnnounce
+
+    init(_ ffi: MoqAnnounce) {
+        self.ffi = ffi
+    }
+
+    /// Re-price the route in place: replace its hops and cost.
+    public func update(route: Route) throws {
+        try ffi.update(route: route)
+    }
+
+    /// Retract the route.
+    public func cancel() {
+        ffi.cancel()
     }
 }
 
@@ -92,7 +123,7 @@ public final class OriginDynamic: AsyncSequence, Sendable {
     }
 }
 
-/// The subscribe side of an origin: discover announced broadcasts.
+/// The subscribe side of an origin: discover and request published broadcasts.
 public final class OriginConsumer: Sendable {
     let ffi: MoqOriginConsumer
 
@@ -100,26 +131,27 @@ public final class OriginConsumer: Sendable {
         self.ffi = ffi
     }
 
-    /// Stream every broadcast announced under a prefix.
+    /// Stream every route announced under a prefix.
     public func announced(prefix: String) throws -> Announced {
         Announced(try ffi.announced(prefix: prefix))
     }
 
-    /// Wait for a single broadcast announced at an exact path.
+    /// Wait for a route covering an exact path, then resolve the broadcast there.
     public func announcedBroadcast(path: String) throws -> AnnouncedBroadcast {
         AnnouncedBroadcast(try ffi.announcedBroadcast(path: path))
     }
 
-    /// Request a broadcast by path, resolving as soon as it can be served: the announced
-    /// broadcast if present, otherwise a dynamic fallback on the origin, or an error if
-    /// neither can serve it. Unlike `announcedBroadcast`, this does not wait for a future
-    /// announcement.
+    /// Request a broadcast by path, resolving as soon as it can be served: a local
+    /// broadcast at the exact path, then the best announced route covering the path
+    /// (served on demand by the session that announced it), then a dynamic fallback on
+    /// the origin, or an error if nothing can serve it. Unlike `announcedBroadcast`,
+    /// this does not wait for a future announcement.
     public func requestBroadcast(path: String) async throws -> BroadcastConsumer {
         BroadcastConsumer(try await ffi.requestBroadcast(path: path))
     }
 }
 
-/// A stream of broadcast announcements. Iterate directly:
+/// A stream of route announcements and retractions. Iterate directly:
 /// `for try await announcement in announced { ... }`. The sequence ends when the
 /// origin closes; cancelling the consuming task cancels the subscription.
 public final class Announced: AsyncSequence, Sendable {
@@ -150,7 +182,11 @@ public final class Announced: AsyncSequence, Sendable {
     }
 }
 
-/// A single broadcast announcement.
+/// A single route announcement or retraction.
+///
+/// A route claims that paths under `path` can be served; it carries no
+/// broadcast. Resolve a specific path with `OriginConsumer.requestBroadcast`.
+/// By convention a publisher announces each broadcast's exact path.
 public final class Announcement: Sendable {
     let ffi: MoqAnnouncement
 
@@ -158,14 +194,20 @@ public final class Announcement: Sendable {
         self.ffi = ffi
     }
 
-    /// The path of the announced broadcast.
+    /// The announced route's prefix, relative to the `announced` prefix.
     public var path: String {
         ffi.path()
     }
 
-    /// A consumer for the announced broadcast.
-    public var broadcast: BroadcastConsumer {
-        BroadcastConsumer(ffi.broadcast())
+    /// Whether the route is active (`true`) or was retracted (`false`). A
+    /// repeated active announcement for the same path is a metadata update.
+    public var active: Bool {
+        ffi.active()
+    }
+
+    /// The announced route: its prefix, relay hops, and cost.
+    public var route: Route {
+        ffi.route()
     }
 }
 
@@ -177,8 +219,8 @@ public final class AnnouncedBroadcast: Sendable {
         self.ffi = ffi
     }
 
-    /// Suspend until the broadcast is announced. Throws `Closed` if cancelled or
-    /// the origin closes first.
+    /// Suspend until a route covers the path, then resolve the broadcast there.
+    /// Throws `Closed` if cancelled or the origin closes first.
     public func available() async throws -> BroadcastConsumer {
         BroadcastConsumer(try await ffi.available())
     }

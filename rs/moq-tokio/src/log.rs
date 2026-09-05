@@ -6,16 +6,18 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use url::Url;
 
 /// Tracing log configuration.
 #[serde_with::serde_as]
-#[derive(Clone, clap::Parser, Serialize, Deserialize, Debug)]
+#[derive(Clone, usage::Args, Serialize, Deserialize, Debug)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub struct Log {
 	/// The level filter to use.
 	#[serde_as(as = "DisplayFromStr")]
-	#[arg(id = "log-level", long = "log-level", default_value = "info", env = "MOQ_LOG_LEVEL")]
+	#[usage(name = "log-level", long = "log-level", default = "info", env = "MOQ_LOG_LEVEL")]
 	pub level: Level,
 }
 
@@ -77,36 +79,93 @@ impl Log {
 
 		registry
 			.try_init()
-			.map_err(|e| crate::Error::SetSubscriber(std::sync::Arc::new(e)))?;
-
-		// Start deadlock detection thread (only in debug builds)
-		#[cfg(debug_assertions)]
-		std::thread::spawn(Self::deadlock_detector);
+			.map_err(|e| crate::Error::SetSubscriber(e.to_string()))?;
 
 		Ok(())
 	}
+}
 
-	#[cfg(debug_assertions)]
-	fn deadlock_detector() {
-		loop {
-			std::thread::sleep(std::time::Duration::from_secs(1));
+/// A URL rendered without its credentials, for logging.
+///
+/// A relay URL routinely carries an auth token in its query (`?jwt=...`), and any
+/// URL may carry HTTP userinfo (`https://user:pass@host/`). [`Display`] prints only
+/// the scheme, host, port, and path, so wrap every URL headed for a log line.
+///
+/// ```
+/// # use moq_tokio::RedactedUrl;
+/// let url = url::Url::parse("https://user:pass@relay.example.com/anon/demo?jwt=secret").unwrap();
+/// assert_eq!(RedactedUrl::new(&url).to_string(), "https://relay.example.com/anon/demo");
+/// ```
+///
+/// [`Display`]: std::fmt::Display
+#[derive(Clone, Copy)]
+pub struct RedactedUrl<'a>(&'a Url);
 
-			let deadlocks = parking_lot::deadlock::check_deadlock();
-			if deadlocks.is_empty() {
-				continue;
+impl<'a> RedactedUrl<'a> {
+	/// Borrow `url` for redacted display.
+	pub fn new(url: &'a Url) -> Self {
+		Self(url)
+	}
+}
+
+/// Delegates to [`Display`](std::fmt::Display) so `?redacted` in a log macro can't
+/// undo the redaction a derived impl would have printed straight through.
+impl std::fmt::Debug for RedactedUrl<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{self}")
+	}
+}
+
+impl std::fmt::Display for RedactedUrl<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}://", self.0.scheme())?;
+
+		// `host_str` brackets an IPv6 literal and `port` is `None` for the scheme's
+		// default, so both render the way `Url`'s own `Display` would.
+		if let Some(host) = self.0.host_str() {
+			f.write_str(host)?;
+			if let Some(port) = self.0.port() {
+				write!(f, ":{port}")?;
 			}
-
-			tracing::error!("DEADLOCK DETECTED");
-
-			for (i, threads) in deadlocks.iter().enumerate() {
-				tracing::error!("Deadlock #{}", i);
-				for t in threads {
-					tracing::error!("Thread Id {:#?}", t.thread_id());
-					tracing::error!("{:#?}", t.backtrace());
-				}
-			}
-
-			// Optionally: std::process::abort() to get a core dump
 		}
+
+		f.write_str(self.0.path())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::RedactedUrl;
+	use url::Url;
+
+	fn redact(url: &str) -> String {
+		RedactedUrl::new(&Url::parse(url).unwrap()).to_string()
+	}
+
+	#[test]
+	fn drops_query_and_userinfo() {
+		let rendered = redact("https://user:pass@relay.example.com/anon/demo?jwt=secret#frag");
+		assert_eq!(rendered, "https://relay.example.com/anon/demo");
+		for secret in ["jwt", "secret", "user", "pass", "frag"] {
+			assert!(!rendered.contains(secret), "{rendered} leaked {secret}");
+		}
+	}
+
+	#[test]
+	fn debug_matches_display() {
+		let url = Url::parse("https://user:pass@relay.example.com/anon/demo?jwt=secret").unwrap();
+		let redacted = RedactedUrl::new(&url);
+		assert_eq!(format!("{redacted:?}"), redacted.to_string());
+	}
+
+	#[test]
+	fn keeps_the_dial_target() {
+		assert_eq!(redact("https://relay.example.com/"), "https://relay.example.com/");
+		assert_eq!(
+			redact("tcp://relay.example.com:4443/anon"),
+			"tcp://relay.example.com:4443/anon"
+		);
+		assert_eq!(redact("https://[::1]:8443/anon"), "https://[::1]:8443/anon");
+		assert_eq!(redact("unix:///run/moq/internal.sock"), "unix:///run/moq/internal.sock");
 	}
 }

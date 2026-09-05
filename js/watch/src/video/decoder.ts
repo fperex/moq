@@ -14,6 +14,7 @@ import {
 	Signal,
 } from "@moq/signals";
 import { base64ToBytes } from "../base64";
+import { subscribeMedia } from "../media";
 
 import type { Sync } from "../sync";
 import {
@@ -31,7 +32,7 @@ import type { Source } from "./source";
 const BUFFERING = Time.Milli(500);
 
 export type DecoderInput = {
-	// Whether to download the video track. Defaults to true; the parent may wire it from the renderer's output.
+	/** Whether to download the video track. Defaults to true; the parent may wire it from the renderer's output. */
 	enabled: Getter<boolean>;
 };
 
@@ -296,8 +297,12 @@ class DecoderTrack {
 	}
 
 	#run(effect: Effect): void {
-		const sub = this.broadcast.track(this.track).subscribe({ priority: Catalog.PRIORITY.video });
-		effect.cleanup(() => sub.close());
+		const sub = subscribeMedia(effect, {
+			broadcast: this.broadcast,
+			track: this.track,
+			priority: Catalog.PRIORITY.video,
+			maxAge: this.sync.out.maxAge,
+		});
 
 		const decoder = new VideoDecoder({
 			output: async (frame: VideoFrame) => {
@@ -312,11 +317,18 @@ class DecoderTrack {
 						return;
 					}
 
+					// `received()` runs at submit, so a frame is anchored by the time it decodes.
+					// Reaching here unanchored means a rewind reset the clock after this frame's
+					// received(), so it predates the current timeline. Drop it: painting it would
+					// set `timestamp` from the old timeline and late-reject the whole rewind.
+					if (this.sync.out.reference.peek() === undefined) return;
+
 					if (this.frame.peek() === undefined) {
 						// Render something while we wait for the sync to catch up.
 						this.frame.set(frame.clone());
 					}
 
+					// Returns immediately when the latency is "instant".
 					const wait = this.sync.wait(timestamp).then(() => true);
 					const ok = await Promise.race([wait, effect.cancel]);
 					if (!ok) return;
@@ -365,7 +377,7 @@ class DecoderTrack {
 		// Create consumer that reorders groups/frames up to the provided latency.
 		const consumer = new Container.Consumer(sub, {
 			format,
-			latency: this.sync.out.buffer,
+			maxAge: this.sync.out.maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -441,7 +453,7 @@ class DecoderTrack {
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
-			latency: this.sync.out.buffer,
+			maxAge: this.sync.out.maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 

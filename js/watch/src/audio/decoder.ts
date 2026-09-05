@@ -5,18 +5,24 @@ import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import { base64ToBytes } from "../base64";
+import { subscribeMedia } from "../media";
 
 import type { Sync } from "../sync";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
-import { reanchorFloor } from "./latency";
+import { Handover } from "./handover";
+import { reanchorFloor, ringSamples } from "./latency";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
+import { type DecodedSpan, Terminal } from "./terminal";
 import { unlockOnGesture } from "./unlock";
+import { Warmup } from "./warmup";
 
 // How long the latency target must hold steady before a floor increase re-anchors. Coalesces a
 // slider drag (many small steps) into a single re-anchor once the user settles on a value.
 const LATENCY_REANCHOR_DEBOUNCE_MS = 150;
+
+const LEGACY_WARMUP_CALLBACKS = 3;
 
 export type DecoderInput = {
 	// Whether to download the audio track. Defaults to true.
@@ -82,25 +88,15 @@ export class Decoder {
 	// arrives we pre-build the graph from the catalog rate; if the real rate differs we rebuild it.
 	#decodedSampleRate = new Signal<number | undefined>(undefined);
 
-	// The last discontinuity count seen from the container consumer. A change means the
-	// publisher rewound the timeline (e.g. a voice agent interrupted) and we must flush.
-	#discontinuity = 0;
-
-	// How much buffered audio the container consumer retains before skipping
-	// ahead. This must be the latency CEILING (maxBuffer), not the floor
-	// (buffer): in buffered playback the producer writes faster than real-time
-	// with future PTS, so the group span legitimately exceeds the floor and
-	// would otherwise be skipped. When collapsed, maxBuffer equals the floor.
-	//
-	// Held in a plain Signal driven by a running effect (below) rather than a
-	// lazy `computed`: the container consumer only `.peek()`s this (it never
-	// subscribes), and an unsubscribed computed peeks as `undefined`, which
-	// would make the consumer's threshold NaN and skip every group.
-	#consumerLatency = new Signal<Time.Milli>(Time.Milli.zero);
+	// Ordered discontinuity and endpoint state from the container consumer.
+	#terminal = new Terminal();
 
 	// The latency floor as of the last settled change, to detect a floor *increase* (needs a deeper
 	// cushion) versus a decrease or a real-time RTT wiggle. See #runLatencyReanchor.
 	#prevFloor?: Time.Milli;
+
+	// Which subscription the ring's buffered samples came from. See #runDecoder.
+	#handover = new Handover();
 
 	#signals = new Effect();
 
@@ -111,10 +107,6 @@ export class Decoder {
 
 		this.source = source;
 		this.sync = sync;
-
-		this.#signals.run((effect) => {
-			this.#consumerLatency.set(effect.get(this.sync.out.maxBuffer));
-		});
 
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
@@ -172,9 +164,9 @@ export class Decoder {
 			});
 			effect.cleanup(() => worklet.disconnect());
 
-			// Initial target latency in samples.
-			const latency = this.sync.out.buffer.peek();
-			const latencySamples = Math.ceil(sampleRate * Time.Second.fromMilli(latency));
+			// Initial ring depth in samples.
+			const delay = this.sync.out.delay.peek();
+			const latencySamples = ringSamples(sampleRate, delay);
 			const buffered = this.sync.out.buffered.peek();
 
 			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
@@ -221,12 +213,11 @@ export class Decoder {
 		const ring = this.#ring;
 		if (!ring) return;
 
-		const latency = effect.get(this.sync.out.buffer);
-		const latencySamples = Math.ceil(ring.rate * Time.Second.fromMilli(latency));
-		ring.setLatency(latencySamples);
+		const delay = effect.get(this.sync.out.delay);
+		ring.setLatency(ringSamples(ring.rate, delay));
 	}
 
-	// Re-anchor when the latency floor *increases*. A larger floor needs a deeper cushion: video
+	// Re-anchor when the delay floor *increases*. A larger floor needs a deeper cushion: video
 	// rebuilds it implicitly (its per-frame sync.wait() reads the live buffer, so it just holds
 	// longer), but the audio ring keeps draining at its old depth -- resize() (via setLatency) only
 	// re-stalls an *empty* ring, so a mid-playback ring never refills to the new floor and audio runs
@@ -236,7 +227,7 @@ export class Decoder {
 	// natural catch-up.
 	#runLatencyReanchor(effect: Effect): void {
 		const floor = reanchorFloor({
-			latency: effect.get(this.sync.in.latency),
+			delay: effect.get(this.sync.in.delay),
 			audio: effect.get(this.sync.in.audio),
 			video: effect.get(this.sync.in.video),
 		});
@@ -272,8 +263,19 @@ export class Decoder {
 		const active = broadcast.relativeBroadcast(effect, config.broadcast);
 		if (!active) return;
 
-		const sub = active.track(track).subscribe({ priority: Catalog.PRIORITY.audio });
-		effect.cleanup(() => sub.close());
+		// The ring outlives this effect (it's keyed on the sample rate and channel count), so a
+		// replacement subscription (a rendition swap, a republished broadcast, a reconnect) inherits
+		// whatever its predecessor decoded. Samples are timestamp indexed, so the replacement
+		// overwrites the slots it lands on, but a publisher writing ahead of real-time leaves seconds
+		// of tail beyond them. Drop that once the replacement's first frame says where it starts.
+		this.#handover.opened();
+
+		const sub = subscribeMedia(effect, {
+			broadcast: active,
+			track,
+			priority: Catalog.PRIORITY.audio,
+			maxAge: this.sync.out.maxAge,
+		});
 
 		if (config.container.kind === "cmaf") {
 			this.#runCmafDecoder(effect, sub, config);
@@ -283,12 +285,15 @@ export class Decoder {
 	}
 
 	#runLegacyDecoder(effect: Effect, sub: Moq.Track.Subscriber, config: Catalog.AudioConfig): void {
+		const preSkip =
+			config.codec === "opus" && config.description ? Util.Opus.preSkip(Util.Hex.toBytes(config.description)) : 0;
+		this.#terminal.clear(preSkip);
 		const format = config.container.kind === "loc" ? new Container.Loc.Format() : new Container.Legacy.Format();
 		// Create consumer with slightly less latency than the render worklet to avoid underflowing.
 		// TODO include JITTER_UNDERHEAD
 		const consumer = new Container.Consumer(sub, {
 			format,
-			latency: this.#consumerLatency,
+			maxAge: this.sync.out.maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -303,17 +308,17 @@ export class Decoder {
 			const loaded = await Util.Libav.polyfill();
 			if (!loaded) return; // cancelled
 
-			let warmed = 0;
+			const warmup = new Warmup(LEGACY_WARMUP_CALLBACKS);
 
 			const decoder = new AudioDecoder({
 				output: (data) => {
-					warmed++;
-					if (warmed <= 3) {
-						// Drop the first 3 frames to prime the decoder.
+					const decoded = this.#terminal.span(data);
+					if (warmup.drop()) {
+						// Drop initial callbacks to prime the decoder.
 						data.close();
 						return;
 					}
-					this.#emit(data);
+					this.#emit(data, decoded);
 				},
 				error: (error) => console.error("audio decoder error", error),
 			});
@@ -328,17 +333,22 @@ export class Decoder {
 					: config.description
 						? Util.Hex.toBytes(config.description)
 						: undefined;
-			decoder.configure({
+			const decoderConfig: AudioDecoderConfig = {
 				...config,
 				description,
-			});
+			};
+			decoder.configure(decoderConfig);
 
 			for (;;) {
 				const next = await consumer.next();
 				if (!next) break;
-
-				// Publisher rewound the timeline: flush + re-anchor before decoding the new frame.
-				this.#onDiscontinuity(next.discontinuity);
+				if (this.#onNext(next)) {
+					decoder.reset();
+					decoder.configure(decoderConfig);
+				}
+				if (next.end !== undefined) {
+					continue;
+				}
 
 				const { frame } = next;
 				if (!frame) continue;
@@ -374,6 +384,9 @@ export class Decoder {
 
 		const initSegment = base64ToBytes(config.container.init);
 		const init = Container.Cmaf.decodeInitSegment(initSegment);
+		const opusDescription = config.description ? Util.Hex.toBytes(config.description) : init.description;
+		const preSkip = config.codec === "opus" && opusDescription ? Util.Opus.preSkip(opusDescription) : 0;
+		this.#terminal.clear(preSkip);
 		// Opus in CMAF uses raw packets (not OGG-wrapped), so description must be omitted.
 		// The dOps box from the init segment is not a valid OGG Identification Header.
 		const description =
@@ -385,7 +398,7 @@ export class Decoder {
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
-			latency: this.#consumerLatency,
+			maxAge: this.sync.out.maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -409,19 +422,23 @@ export class Decoder {
 			});
 
 			// Configure decoder with description from catalog
-			decoder.configure({
+			const decoderConfig: AudioDecoderConfig = {
 				codec: config.codec,
 				sampleRate: config.sampleRate,
 				numberOfChannels: config.numberOfChannels,
 				description,
-			});
+			};
+			decoder.configure(decoderConfig);
 
 			for (;;) {
 				const next = await consumer.next();
 				if (!next) break;
 
-				// Publisher rewound the timeline: flush + re-anchor before decoding the new frame.
-				this.#onDiscontinuity(next.discontinuity);
+				// Reset and re-anchor before decoding the first frame of a new codec epoch.
+				if (this.#onNext(next)) {
+					decoder.reset();
+					decoder.configure(decoderConfig);
+				}
 
 				const { frame } = next;
 				if (!frame) continue;
@@ -449,9 +466,13 @@ export class Decoder {
 		});
 	}
 
-	#emit(sample: AudioData) {
-		const timestamp = sample.timestamp as Time.Micro;
+	#emit(sample: AudioData, decoded: DecodedSpan = this.#terminal.span(sample)) {
+		const { timestamp, frameOffset, frames } = decoded;
 		const timestampMilli = Time.Milli.fromMicro(timestamp);
+		if (frames === 0) {
+			sample.close();
+			return;
+		}
 
 		const ring = this.#ring;
 		if (!ring) {
@@ -471,9 +492,16 @@ export class Decoder {
 		}
 
 		// Calculate end time from sample duration
-		const durationMicro = ((sample.numberOfFrames / sample.sampleRate) * 1_000_000) as Time.Micro;
+		const durationMicro = ((frames / sample.sampleRate) * 1_000_000) as Time.Micro;
 		const durationMilli = Time.Milli.fromMicro(durationMicro);
 		const end = Time.Milli.add(timestampMilli, durationMilli);
+
+		// A new subscription has taken over the timeline: drop the previous one's write-ahead tail
+		// rather than letting it play out after this frame. See #runDecoder.
+		if (this.#handover.takeover()) {
+			ring.truncate(timestamp);
+			this.#truncateDecodeBuffered(timestampMilli);
+		}
 
 		// Add to decode buffer
 		this.#addDecodeBuffered(timestampMilli, end);
@@ -483,8 +511,8 @@ export class Decoder {
 		const channels = Math.min(sample.numberOfChannels, ring.channels);
 		const channelData: Float32Array[] = [];
 		for (let channel = 0; channel < channels; channel++) {
-			const data = new Float32Array(sample.numberOfFrames);
-			sample.copyTo(data, { format: "f32-planar", planeIndex: channel });
+			const data = new Float32Array(frames);
+			sample.copyTo(data, { format: "f32-planar", planeIndex: channel, frameOffset, frameCount: frames });
 			channelData.push(data);
 		}
 
@@ -513,6 +541,15 @@ export class Decoder {
 		});
 	}
 
+	// Drop reported decode ranges at or after `timestamp`, mirroring a ring truncation.
+	#truncateDecodeBuffered(timestamp: Time.Milli): void {
+		this.#decodeBuffered.mutate((current) => {
+			while (current.length > 0 && current[current.length - 1].start >= timestamp) current.pop();
+			const last = current[current.length - 1];
+			if (last && last.end > timestamp) last.end = timestamp;
+		});
+	}
+
 	#trimDecodeBuffered(timestamp: Time.Milli): void {
 		this.#decodeBuffered.mutate((current) => {
 			while (current.length > 0) {
@@ -531,15 +568,13 @@ export class Decoder {
 		this.#ring?.reset();
 	}
 
-	// React to the container consumer's discontinuity counter. When it changes the publisher
-	// has rewound the timeline, so flush the queued PCM and re-anchor the shared clock before
-	// the first frame of the new utterance is decoded. This makes the wire signal trigger the
-	// same flush as a manual `reset()`, with no app involvement.
-	#onDiscontinuity(count: number): void {
-		if (count === this.#discontinuity) return;
-		this.#discontinuity = count;
+	// Apply ordered container metadata before handling the result. An endpoint that also
+	// starts a new epoch must survive the reset so its following drain is trimmed.
+	#onNext(next: { discontinuity: number; end?: Time.Micro; frame?: { timestamp: Time.Micro } }): boolean {
+		if (!this.#terminal.update(next)) return false;
 		this.#ring?.reset();
 		this.sync.reset();
+		return true;
 	}
 
 	close() {

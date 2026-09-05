@@ -70,7 +70,7 @@
           targets = [
             "wasm32-unknown-unknown"
           ]
-          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             "aarch64-apple-darwin"
           ];
         };
@@ -86,7 +86,7 @@
 
         tsduck = pkgs.tsduck.overrideAttrs (
           old:
-          pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+          pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
             makeFlags = old.makeFlags ++ [ "CXXFLAGS_WARNINGS=" ];
           }
         );
@@ -122,7 +122,7 @@
             wasm-bindgen-cli
           ]
           ++ gstreamerDeps
-          ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
+          ++ pkgs.lib.optionals (!pkgs.stdenv.hostPlatform.isDarwin) [
             # Marked broken on Darwin in nixpkgs, but builds fine on Linux.
             pkgs.release-plz
             # cpal's `alsa-sys` (moq-audio `capture` / `playback` features) links
@@ -210,7 +210,7 @@
         # in nixpkgs. The publish workflows only ever run on Linux runners.
         publishDeps =
           with pkgs;
-          lib.optionals (!stdenv.isDarwin) [
+          lib.optionals (!stdenv.hostPlatform.isDarwin) [
             apt
             createrepo_c
             rpm
@@ -249,28 +249,36 @@
         ];
 
         # uniffi-bindgen-go renders rs/moq-ffi into the generated half of
-        # go/ffi. Not in nixpkgs, so build it from NordSecurity's fork; without
-        # it `just go check` skips itself, which reads as a pass in CI.
+        # go/ffi. Not in nixpkgs, so build it from source; without it `just go
+        # check` skips itself, which reads as a pass in CI.
         #
         # The tag pairs the generator's own version with the uniffi release it
-        # targets (v0.7.1+v0.31.0 -> uniffi 0.31), and it only understands
+        # targets (v0.8.0+v0.32.0 -> uniffi 0.32), and it only understands
         # metadata emitted by that uniffi, so it moves with the `uniffi`
-        # dependency in rs/moq-ffi/Cargo.toml. Three other places name the same
-        # tag and must be bumped together: UNIFFI_BINDGEN_GO_TAG in
-        # release-go-ffi.yml, and the `cargo install` line in go/ffi/README.md
-        # and go/scripts/check.sh.
+        # dependency in rs/moq-ffi/Cargo.toml. Five other places name the same
+        # generator version and must be bumped together: the repo and revision
+        # in release-go-ffi.yml, and the `cargo install` line in
+        # rs/moq-ffi/build.sh, go/ffi/README.md, go/scripts/check.sh, and
+        # doc/lib/go/index.md.
+        #
+        # This points at a fork rather than NordSecurity because upstream has no
+        # uniffi 0.32 generator: the metadata encoding changed in 0.32 even
+        # though the contract version did not, so v0.7.1+v0.31.0 fails to read a
+        # 0.32-built cdylib at all. The fork carries the port, tracked upstream
+        # as NordSecurity/uniffi-bindgen-go#96. Move back to NordSecurity once
+        # they tag a 0.32 release.
         uniffi-bindgen-go = pkgs.rustPlatform.buildRustPackage rec {
           pname = "uniffi-bindgen-go";
-          version = "0.7.1+v0.31.0";
+          version = "0.8.0+v0.32.0";
 
           src = pkgs.fetchFromGitHub {
-            owner = "NordSecurity";
+            owner = "kixelated";
             repo = "uniffi-bindgen-go";
             rev = "v${version}";
-            hash = "sha256-ZoGxEWJKriGhe/nMpSbJF6pyyZQZLzdVervUrBzUM5k=";
+            hash = "sha256-BBa47Ib8dQb8GSSqaQv3xxR0RYjiseM3L7ND1HhQcVI=";
           };
 
-          cargoHash = "sha256-ctDBz0oE8+mkn7SJn2KGSb6P4LF8S5UC3XcjVHWApg4=";
+          cargoHash = "sha256-U7JLPB83CknoIf5nHoXBzqY6O2YveZ6HNOkYVKukY0Q=";
 
           # The tag is a virtual workspace whose other members are uniffi test
           # fixtures. Building from the root would compile all of them, and CI
@@ -290,6 +298,37 @@
           uniffi-bindgen-go
         ];
 
+        # uniffi-bindgen-dart renders rs/moq-ffi into dart/moq_ffi. The fork
+        # carries the uniffi 0.32 port and library-mode CLI while those changes
+        # remain open upstream.
+        uniffi-bindgen-dart = pkgs.rustPlatform.buildRustPackage rec {
+          pname = "uniffi-bindgen-dart";
+          version = "0.3.0+v0.32.0";
+
+          src = pkgs.fetchFromGitHub {
+            owner = "kixelated";
+            repo = "uniffi-dart";
+            rev = "v${version}";
+            hash = "sha256-jvVEZVZLorj+GPUXL6Y4riCLsbJcWWbQgIIUoK/ZSEo=";
+          };
+
+          # The upstream repository ignores Cargo.lock so cargo installs test
+          # the unlocked resolver. Nix still consumes committed lock data.
+          cargoLock.lockFile = ./nix/uniffi-dart-Cargo.lock;
+          postPatch = ''
+            cp ${./nix/uniffi-dart-Cargo.lock} Cargo.lock
+          '';
+          buildFeatures = [ "binary" ];
+          cargoBuildFlags = [ "--bin=uniffi_bindgen_dart" ];
+          doCheck = false;
+        };
+
+        # Dart bindings plus the pinned external generator.
+        dartDeps = [
+          pkgs.dart
+          uniffi-bindgen-dart
+        ];
+
         # The libobs headers, unpacked from the same OBS release
         # cpp/obs/buildspec.json downloads. Headers only: nothing here links, so
         # it works on Darwin even though obs-studio itself does not build there,
@@ -297,14 +336,15 @@
         # bundle. `just obs compile` type-checks the plugin against it.
         #
         # Keep `version` equal to buildspec.json's obs-studio version; `just obs
-        # check` fails when the two drift.
+        # check` fails when the two drift, and when either drifts a minor
+        # release from the nixpkgs obs-studio below.
         obs-headers = pkgs.stdenvNoCC.mkDerivation rec {
           pname = "libobs-headers";
-          version = "31.1.1";
+          version = "32.2.2";
 
           src = pkgs.fetchzip {
             url = "https://github.com/obsproject/obs-studio/archive/refs/tags/${version}.tar.gz";
-            hash = "sha256-ycfROxgm3wUVyC2d1r3vIr7yWb6ErYIoDZX8xZrc+Vk=";
+            hash = "sha256-miLe4MhiVhLlPvwzDjL31BwdcjVhgWvmcSzH9pgZV6U=";
           };
 
           dontBuild = true;
@@ -328,8 +368,8 @@
         # Dependencies for the OBS plugin (`just obs build`, `just obs compile`,
         # `just obs check`). ffmpeg + cmake come from rustDeps.
         #
-        # Only the *build* is Linux-only: nixpkgs marks obs-studio broken on
-        # Darwin, so macOS and Windows link libobs/Qt6 from the OBS buildspec
+        # Only the *build* is Linux-only: nixpkgs' obs-studio lists no Darwin
+        # platform, so macOS and Windows link libobs/Qt6 from the OBS buildspec
         # bundle instead (see cpp/obs/buildspec.json and doc/bin/obs.md).
         # Type-checking needs headers rather than libraries, and those are
         # cross-platform -- obs-headers above, plus qt6.qtbase, which does build
@@ -339,14 +379,29 @@
           with pkgs;
           [
             obs-headers
+            # libobs' public headers include <simde/x86/sse2.h> as of OBS 32,
+            # which used to be vendored under libobs/util/ and so travelled with
+            # obs-headers. obs-deps ships it beside libobs for the macOS and
+            # Windows builds, and nixpkgs' obs-studio propagates it for the
+            # Linux one; listed here so the header-only path has it on Darwin
+            # too. Same 0.8.2 that obs-deps carries.
+            simde
             qt6.qtbase
             clang-tools
             gersemi
           ]
-          ++ lib.optionals (!stdenv.isDarwin) [
+          ++ lib.optionals (!stdenv.hostPlatform.isDarwin) [
             obs-studio
             ninja
           ];
+
+        # The obs-studio `just obs ci` links against on Linux, which is a third
+        # version alongside buildspec.json and obs-headers and the only one this
+        # repo doesn't choose. Read the string on every platform, Darwin
+        # included, so `just obs check` compares it everywhere rather than only
+        # where the package builds. It moves when flake.lock does, so the guard
+        # fails on the nixpkgs bump that opens the gap.
+        obs-linked-version = pkgs.obs-studio.version;
 
         # Apply our overlay to get the package definitions
         overlayPkgs = pkgs.extend self.overlays.default;
@@ -373,6 +428,8 @@
             libmoq
             moq-gst
             ;
+
+          inherit uniffi-bindgen-dart;
 
           # Bundle of packaging + repo-publish tooling, pinned via flake.lock.
           # CI builds this and prepends its bin/ to $PATH so subsequent steps
@@ -407,49 +464,74 @@
             ++ obsDeps
             ++ ktDeps
             ++ goDeps
+            ++ dartDeps
             ++ devTools;
 
           # jemalloc's configure uses -O0 test builds, which conflict with
           # Nix's _FORTIFY_SOURCE hardening (requires -O).
           hardeningDisable = [ "fortify" ];
 
+          # The pinned Rust toolchain goes on PATH ahead of everything the
+          # host had, which shadows the Cargo shim `mbx setup` installs. Put it
+          # back in front, so a bare `cargo` in this shell reaches the same
+          # wrapper it reaches outside. `setup --status` is what knows where
+          # that shim lives; it exits non-zero when the host has none, which is
+          # every machine that made a different caching choice.
+          #
+          # Never in CI, where check.yml enters this shell and the `target/`
+          # the workflow restored is the one the job has to build in. A shim
+          # would silently move it into a machine-wide managed target instead,
+          # on whichever runner happens to have been set up that way.
+          shellHook = ''
+            if [ -z "''${CI:-}" ] && status=$(mbx setup --status 2>/dev/null); then
+              shim=$(printf '%s\n' "$status" | sed -n '1s/.*: //p')
+              if [ -x "$shim" ]; then
+                export PATH="$(dirname "$shim"):$PATH"
+              fi
+            fi
+          '';
+
           env = {
             # Where `just obs compile` and `just obs test` look for libobs. Set
             # on every platform so the plugin type-checks against the pinned OBS
             # release everywhere, rather than whatever the host happens to have.
             OBS_INCLUDE_DIR = "${obs-headers}/include/obs";
+
+            # What `just obs check` compares the two in-repo OBS pins against.
+            # Exported rather than read back out of nix, so the guard costs a
+            # variable lookup instead of a nested evaluation of this flake.
+            OBS_LINKED_VERSION = obs-linked-version;
           }
-          // pkgs.lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
+          // pkgs.lib.optionalAttrs (!pkgs.stdenv.hostPlatform.isDarwin) {
             ALSA_PLUGIN_DIR = "${alsaPlugins}/lib/alsa-lib";
           };
         };
 
         formatter = pkgs.nixfmt-tree;
 
-        # Heavy Rust CI (clippy / doc / test) runs as plain cargo via `just
-        # check` and `just test` (see rs/justfile), no longer through crane.
+        # Heavy Rust CI (clippy / doc / test) runs via `just check` and `just
+        # test` (see rs/justfile). CI and local commands default to plain Cargo;
+        # local development can select a compatible wrapper with RUST_CARGO.
+        # Neither path goes through crane.
         # `nix flake check` is kept -- it still validates flake eval + builds the
         # dev shell -- but no longer compiles the workspace, so it's cheap
         # enough that `just check` runs it on any Nix/Rust input change. Release
         # artifacts still build via crane `buildPackage` (see `packages` above /
         # release-*.yml).
         #
-        # On the self-hosted runner those cargo checks transparently reuse a
-        # per-crate compiler cache (rustc is wrapped by sccache via the runner
-        # environment), so a Cargo.lock change recompiles only the changed crate
-        # + its reverse-deps. That's a runner-side concern -- nothing here or in
-        # the workflows configures it.
+        # Which compiler cache those runs get is a workflow concern
+        # (`.github/actions/rust-cache`); nothing here configures it.
         checks = {
-          libmoq-source-assets = pkgs.runCommand "libmoq-source-assets" { } ''
+          package-source-assets = pkgs.runCommand "package-source-assets" { } ''
             for asset in \
               rs/libmoq/moq.pc.in \
               rs/libmoq/native-libs/apple.txt \
               rs/libmoq/native-libs/linux.txt \
-              rs/libmoq/native-libs/windows.txt \
-              rs/moq-video/src/frame/nv12_resize.ptx
+              rs/libmoq/native-libs/windows.txt
             do
               test -f "${overlayPkgs.libmoq.src}/$asset"
             done
+            test -f "${overlayPkgs.moq-boy.src}/rs/moq-video/src/frame/nv12_resize.ptx"
             touch "$out"
           '';
         };

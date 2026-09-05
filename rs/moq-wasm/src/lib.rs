@@ -9,10 +9,11 @@
 //! which is the highest-value target (the `@moq/watch` use case). The publish
 //! path follows the same shape and is left as the obvious next step.
 //!
-//! moq-net's timers and `Instant` go through `web_async::time` (tokio on native,
-//! wasmtimer on wasm), so the consume path runs in the browser. (`model/time.rs`
-//! has an unused wall-clock helper that isn't wasm-portable, but nothing calls
-//! it, so it never runs. See README.md.)
+//! moq-net's timers and spawning come from the `moq_net::Runtime` passed at
+//! connect; `runtime::Runtime` supplies both for the browser (wasmtimer-backed
+//! timers, microtask spawning), so the consume path runs in the browser.
+//! (`model/time.rs` has an unused wall-clock helper that isn't wasm-portable,
+//! but nothing calls it, so it never runs. See README.md.)
 
 // Browser-only crate. Empty on native so `cargo check --workspace` stays green.
 #![cfg(target_arch = "wasm32")]
@@ -23,6 +24,7 @@ use std::rc::Rc;
 use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 
+pub mod runtime;
 pub mod transport;
 
 /// Map any displayable error into a JS exception.
@@ -72,17 +74,14 @@ impl Session {
 	async fn handshake(transport: transport::Session) -> Result<Session, JsValue> {
 		// Wire a subscribe origin so the session has somewhere to insert the
 		// broadcasts the remote announces; keep a consumer to read them.
-		let (origin, origin_driver) = moq_net::origin::Producer::new(moq_net::Origin::random().into());
-		web_async::spawn(origin_driver);
+		let (origin, origin_driver) = moq_net::origin::Producer::new(moq_net::Hop::random().into());
+		web_async::spawn(origin_driver.run(runtime::Runtime));
 		let consumer = origin.consume();
 		let client = moq_net::Client::new().with_subscriber(origin);
-		let (inner, driver) = client.connect(transport).await.map_err(js_err)?;
-		// The session only makes progress while its driver runs. The driver holds no
-		// session clone, so dropping this `Session` still closes the transport, which
-		// in turn ends the spawned task.
-		web_async::spawn(async move {
-			let _ = driver.await;
-		});
+		// The runtime spawns the protocol machine on the microtask queue. The machine
+		// holds no session clone, so dropping this `Session` still closes the
+		// transport, which in turn ends the spawned task.
+		let inner = client.connect(runtime::Runtime, transport).await.map_err(js_err)?;
 		Ok(Session { inner, consumer })
 	}
 
@@ -98,10 +97,15 @@ impl Session {
 		Err(js_err(self.inner.closed().await))
 	}
 
-	/// Subscribe to a broadcast by path, waiting until it is announced.
+	/// Subscribe to a broadcast by path, waiting until a route covers it.
 	pub async fn consume(&self, path: String) -> Result<Option<Broadcast>, JsValue> {
-		let broadcast = self.consumer.announced_broadcast(path.as_str()).await;
-		Ok(broadcast.map(|inner| Broadcast { inner }))
+		if self.consumer.routed(path.as_str()).await.is_none() {
+			return Ok(None);
+		}
+		match self.consumer.request_broadcast(path.as_str()).await {
+			Ok(inner) => Ok(Some(Broadcast { inner })),
+			Err(_) => Ok(None),
+		}
 	}
 }
 
