@@ -8,6 +8,11 @@ import type { Broadcast } from "../broadcast";
 import type { AudioFrame, Capture, Format } from "./capture";
 import { Gain } from "./gain";
 import { Resampler } from "./resampler";
+
+// rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
+type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
+const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
+
 import type { CodecMime, Kind } from "./types";
 import { sourceKind } from "./types";
 
@@ -335,6 +340,8 @@ export class Encoder {
 						}
 
 						this.#setDecoderDescription(config, metadata?.decoderConfig?.description);
+						rtPush("pub.aud", { ts: frame.timestamp, bytes: frame.byteLength, q: encoder.encodeQueueSize });
+						const rtWrite0 = performance.now();
 
 						this.#out.stats.update((stats) => ({
 							frames: stats.frames + 1,
@@ -347,6 +354,7 @@ export class Encoder {
 							payload: Container.Legacy.encodeFrame(frame, frame.timestamp as Time.Micro),
 							timestamp: Time.Timestamp.fromMicros(frame.timestamp as Time.Micro),
 						});
+						rtPush("pub.wrote", { ts: frame.timestamp, ms: performance.now() - rtWrite0 });
 					},
 					error: (err) => {
 						console.error("encoder error", err);
@@ -386,6 +394,7 @@ export class Encoder {
 								transfer: [joined.buffer],
 							});
 
+							rtPush("pub.enc", { ts: frame.timestamp, q: encoder.encodeQueueSize });
 							encoder.encode(frame);
 							frame.close();
 						}

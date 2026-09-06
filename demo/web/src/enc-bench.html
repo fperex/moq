@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>opus encoder bench</title></head>
+<body style="background:#111;color:#ccc;font:12px monospace"><div id="info">starting</div>
+<script type="module">
+// Standalone WebCodecs AudioEncoder throughput/latency check, no moq code.
+// ?mode=realtime feeds one 20 ms AudioData every 20 ms for ?seconds; ?mode=burst feeds N at once.
+// ?opus=voip enables {application:"voip", signal:"voice", usedtx:true}; ?ch=1|2; ?rate=48000.
+const params = new URLSearchParams(location.search);
+const rate = Number(params.get("rate") ?? 48000);
+const ch = Number(params.get("ch") ?? 2);
+const seconds = Number(params.get("seconds") ?? 20);
+const mode = params.get("mode") ?? "realtime";
+const frames = Math.round(rate * 0.02);
+const info = document.getElementById("info");
+const cfg = { codec: "opus", sampleRate: rate, numberOfChannels: ch, bitrate: 32000 * ch };
+if (params.get("opus") === "voip") cfg.opus = { application: "voip", signal: "voice", usedtx: true, frameDuration: 20000 };
+const outs = [];
+const ins = new Map();
+const enc = new AudioEncoder({
+	output: (chunk) => { outs.push({ ts: chunk.timestamp, e: performance.now(), bytes: chunk.byteLength, q: enc.encodeQueueSize }); },
+	error: (e) => { info.textContent = "error " + e; },
+});
+const sup = await AudioEncoder.isConfigSupported(cfg);
+enc.configure(cfg);
+let n = 0;
+const t0 = performance.now();
+function feed() {
+	const data = new Float32Array(frames * ch);
+	for (let i = 0; i < data.length; i++) data[i] = Math.sin(i / 7) * 0.3; // audible, not silence (no DTX)
+	const ts = Math.round(t0 * 1000 + n * 20000);
+	const ad = new AudioData({ format: "f32-planar", sampleRate: rate, numberOfFrames: frames, numberOfChannels: ch, timestamp: ts, data });
+	ins.set(ts, performance.now());
+	enc.encode(ad);
+	n++;
+}
+function report(done) {
+	const lat = outs.map((o) => o.e - (ins.get(o.ts) ?? o.e)).sort((a, b) => a - b);
+	const p = (q) => lat.length ? Math.round(lat[Math.min(lat.length - 1, Math.floor(q * lat.length))] * 10) / 10 : null;
+	const o = { done, mode, rate, ch, supported: sup.supported, inputs: n, outputs: outs.length, backlog: n - outs.length, wallS: Math.round((performance.now() - t0) / 100) / 10, latencyMs: { p50: p(0.5), p90: p(0.9), max: p(1) }, queueMax: Math.max(0, ...outs.map((o) => o.q)), lastOutTs: outs.at(-1)?.ts, lastInTs: t0 * 1000 + (n - 1) * 20000 };
+	info.textContent = JSON.stringify(o);
+	return o;
+}
+if (mode === "burst") {
+	for (let i = 0; i < seconds * 50; i++) feed();
+	const iv = setInterval(() => { report(false); if (outs.length >= n) { clearInterval(iv); report(true); } }, 200);
+} else {
+	const iv = setInterval(() => { feed(); if (n % 25 === 0) report(false); if (n >= seconds * 50) { clearInterval(iv); setTimeout(() => report(true), 1500); } }, 20);
+}
+</script></body></html>

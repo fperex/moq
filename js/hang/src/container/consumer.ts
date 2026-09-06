@@ -5,6 +5,10 @@ import { Effect, type Getter, type GetterInit, getter, Signal } from "@moq/signa
 import type { Format } from "./format";
 import type { BufferedRanges, Frame } from "./types";
 
+// rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
+type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
+const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
+
 /** Options for constructing a {@link Consumer}. */
 export interface ConsumerProps {
 	/** The container format used to decode each MoQ frame. */
@@ -166,6 +170,7 @@ export class Consumer {
 		for (;;) {
 			const consumer = await this.#track.recvGroup();
 			if (!consumer) break;
+			rtPush("grp", { track: this.#track.name, seq: consumer.sequence });
 
 			// To improve TTV, we always start with the first group.
 			// For higher latencies we might need to figure something else out, as its racey.
@@ -235,6 +240,12 @@ export class Consumer {
 					if (!marker) index++;
 
 					group.frames.push(frame);
+					rtPush("frm", {
+						track: this.#track.name,
+						seq: group.consumer.sequence,
+						ts: frame.timestamp,
+						bytes: frame.payload.byteLength,
+					});
 
 					if (group.latest === undefined || frame.timestamp > group.latest) {
 						group.latest = frame.timestamp;
@@ -278,6 +289,7 @@ export class Consumer {
 				}
 			}
 		} catch (_err) {
+			rtPush("grp.err", { track: this.#track.name, seq: group.consumer.sequence, err: String(_err) });
 			// Stop reading the group but keep already-decoded frames.
 			// A decode error or stream RESET truncates the tail of the GoP;
 			// frames decoded before the error are still valid and playable.
@@ -370,6 +382,13 @@ export class Consumer {
 				`skipping slow group: track=${this.#track.name} ${first.consumer.sequence} -> ${this.#active}`,
 			);
 
+			rtPush("grp.skip", {
+				track: this.#track.name,
+				from: first.consumer.sequence,
+				to: this.#active,
+				age,
+				threshold,
+			});
 			if (first.empty) this.#markDiscontinuity();
 			first.consumer.close();
 			first.frames.length = 0;

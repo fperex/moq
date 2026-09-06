@@ -2,6 +2,10 @@ import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 
+// rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
+type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
+const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
+
 /**
  * How far playback trails the live edge.
  *
@@ -191,6 +195,7 @@ export class Sync {
 		// Otherwise, chained `wait()` calls would cause a false-positive during CPU starvation.
 		const delay = this.#out.delay.peek();
 		const sleep = Time.Milli.add(Time.Milli.sub(currentRef, ref), delay);
+		rtPush("sync", { label, ts: timestamp, sleep, ref, cur: currentRef, delay });
 		if (sleep < 0) {
 			const entry = this.#late.get(label);
 			if (entry) {
@@ -223,6 +228,7 @@ export class Sync {
 
 	#setReference(ref: Time.Milli): void {
 		this.#out.reference.set(ref);
+		rtPush("sync.ref", { ref });
 		this.#update.resolve();
 		this.#update = Promise.withResolvers();
 	}

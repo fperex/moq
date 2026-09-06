@@ -271,4 +271,45 @@ window.addEventListener("DOMContentLoaded", () => {
 	el.setAttribute("floating", "");
 	document.body.appendChild(el);
 });
+// rtprobe (throwaway): structured event sink + beacon drain, see debug-findings/.
+(() => {
+	const params = new URLSearchParams(location.search);
+	const tag = params.get("beacon");
+	const rt = {
+		ev: [],
+		seq: 0,
+		tag,
+		push(k, o) {
+			const e = Object.assign({ k, t: performance.now(), e: performance.timeOrigin + performance.now() }, o);
+			rt.ev.push(e);
+			if (rt.ev.length > 20000) rt.ev.splice(0, 5000);
+		},
+	};
+	window.__rt = rt;
+	sinks.add((entry) => rt.push("console", { level: entry.level, text: entry.text.slice(0, 400) }));
+	if (!tag) return;
+	const SINK = "http://127.0.0.1:18787/log";
+	const flush = () => {
+		if (rt.ev.length === 0) return;
+		const batch = rt.ev.splice(0, rt.ev.length);
+		for (let i = 0; i < batch.length; i += 200) {
+			const body = JSON.stringify({
+				tag,
+				page: location.pathname + location.search,
+				seq: rt.seq++,
+				e: performance.timeOrigin + performance.now(),
+				ev: batch.slice(i, i + 200),
+			});
+			try {
+				navigator.sendBeacon(SINK, body);
+			} catch {}
+		}
+	};
+	rt.push("hb", { text: "beacon-init", origin: performance.timeOrigin, ua: navigator.userAgent });
+	setInterval(() => {
+		rt.push("hb", { text: "heartbeat" });
+		flush();
+	}, 1000);
+	window.addEventListener("pagehide", flush);
+})();
 `;

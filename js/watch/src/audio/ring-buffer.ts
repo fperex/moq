@@ -15,6 +15,10 @@ export class AudioRingBuffer {
 	#latencySamples: number;
 	// Whether the read/write indices have been anchored to the first inserted sample.
 	#anchored = false;
+	// rtprobe (throwaway): skip accounting, read by the worklet.
+	skips = 0;
+	skipped = 0;
+	lastSkip?: { samples: number; buffered: number; latency: number };
 
 	constructor(props: {
 		rate: number;
@@ -48,6 +52,10 @@ export class AudioRingBuffer {
 		return this.#buffered ? latencySamples * 2 : latencySamples;
 	}
 
+	/** rtprobe: the current target depth in samples. */
+	get latency(): number {
+		return this.#latencySamples;
+	}
 	get stalled(): boolean {
 		return this.#stalled;
 	}
@@ -134,6 +142,13 @@ export class AudioRingBuffer {
 			// Discard old samples and exit stalled mode
 			this.#stalled = false;
 			this.#readIndex += overflow;
+			this.skips++;
+			this.skipped += overflow;
+			this.lastSkip = {
+				samples: overflow,
+				buffered: this.#writeIndex - this.#readIndex,
+				latency: this.#latencySamples,
+			};
 		}
 
 		// Fill gaps with zeros if there's a discontinuity

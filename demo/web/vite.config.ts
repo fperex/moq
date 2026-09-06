@@ -14,7 +14,9 @@ export default defineConfig({
 		tailwindcss(),
 		solidPlugin(),
 		workletInline(),
-		crossOriginIsolation(),
+		// rtprobe: MOQ_NO_ISOLATION=1 serves the demo without COOP/COEP, the way moq.watch is deployed,
+		// so the postMessage audio ring can be measured.
+		...(process.env.MOQ_NO_ISOLATION ? [] : [crossOriginIsolation()]),
 		consoleOverlay(),
 		// Open the stats, publish, and watch demos each in their own tab.
 		// Order matters: the browser focuses the last tab, so watch ends up in front.

@@ -3,6 +3,10 @@ import { Effect, type Getter, Signal } from "@moq/signals";
 import type { Data, InitPost, InitShared, Latency, Reset, State, Truncate } from "./render";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 
+// rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
+type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
+const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
+
 /**
  * Timestamp-based backpressure for buffered playback. The decoded PCM ring only holds the latency
  * floor; everything above it (the buffered lookahead, up to the ceiling) stays upstream as encoded
@@ -169,6 +173,12 @@ class SharedAudioBuffer implements AudioBuffer {
 		const msg: InitShared = { type: "init-shared", ...init };
 		worklet.port.postMessage(msg);
 
+		// rtprobe: worklet-side events (underruns, skips, window stats).
+		this.#signals.event(worklet.port, "message", (ev: Event) => {
+			const d = (ev as MessageEvent<{ type?: string; k?: string }>).data;
+			if (d?.type === "rt" && d.k) rtPush(`w.${d.k}`, d as Record<string, unknown>);
+		});
+		worklet.port.start();
 		// Poll the shared control array and reflect it into signals.
 		this.#signals.interval(() => {
 			const stalled = this.#ring.stalled;
@@ -182,7 +192,18 @@ class SharedAudioBuffer implements AudioBuffer {
 	}
 
 	insert(timestamp: Time.Micro, data: Float32Array[]): void {
+		const before = this.#ring.length;
+		const stalled = this.#ring.stalled;
 		this.#ring.insert(timestamp, data);
+		rtPush("ins", {
+			ts: timestamp,
+			n: data[0].length,
+			before,
+			after: this.#ring.length,
+			stalled,
+			lat: this.#ring.latency,
+			play: this.#ring.timestamp,
+		});
 	}
 
 	setLatency(samples: number): void {
@@ -253,6 +274,8 @@ class PostAudioBuffer implements AudioBuffer {
 		// Listen for state updates from the worklet.
 		this.#signals.event(worklet.port, "message", (ev: Event) => {
 			const data = (ev as MessageEvent<State>).data;
+			const rt = data as unknown as { type?: string; k?: string };
+			if (rt?.type === "rt" && rt.k) rtPush(`w.${rt.k}`, rt as Record<string, unknown>);
 			if (data?.type === "state") {
 				this.#timestamp.set(data.timestamp);
 				this.#stalled.set(data.stalled);
@@ -268,6 +291,7 @@ class PostAudioBuffer implements AudioBuffer {
 
 	insert(timestamp: Time.Micro, data: Float32Array[]): void {
 		const msg: Data = { type: "data", data, timestamp };
+		rtPush("ins", { ts: timestamp, n: data[0].length, post: true });
 		// Transfer the ArrayBuffers to avoid a copy. This is why samples can be dropped
 		// under load: the main thread loses access until the worklet drains the message queue.
 		this.#worklet.port.postMessage(

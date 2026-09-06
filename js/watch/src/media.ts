@@ -16,12 +16,12 @@ export function subscribeMedia(
 		maxAge: Getter<Time.Milli>;
 	},
 ): Moq.Track.Subscriber {
-	const subscription = () => ({ priority: props.priority, maxAge: props.maxAge.peek() });
+	const subscription = () => ({ priority: props.priority, maxAge: Math.ceil(props.maxAge.peek()) }); // rtprobe workaround
 	const subscriber = props.broadcast.track(props.track).subscribe(subscription());
 	effect.cleanup(() => subscriber.close());
 
 	effect.run((inner) => {
-		subscriber.update({ priority: props.priority, maxAge: inner.get(props.maxAge) });
+		subscriber.update({ priority: props.priority, maxAge: Math.ceil(inner.get(props.maxAge)) }); // rtprobe workaround
 	});
 
 	return subscriber;

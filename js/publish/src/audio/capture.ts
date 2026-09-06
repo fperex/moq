@@ -6,6 +6,11 @@ import { Fanout } from "../fanout";
 import CaptureWorklet from "./capture-worklet.ts?worklet";
 import { isSampleSource, normalizeSource, type SampleSource, type Source, type SourceConfig } from "./types";
 
+// rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
+type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
+const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
+let rtQuanta = 0;
+
 /** A chunk of planar PCM, timestamped against the shared wall clock. */
 export interface AudioFrame {
 	/** When the first sample was captured. */
@@ -202,6 +207,7 @@ export class Capture {
 					effect.event(worklet.port, "message", (event: Event) => {
 						const frame = (event as MessageEvent<AudioFrame>).data;
 						const channelCount = frame.channels.length;
+						if (++rtQuanta % 100 === 0) rtPush("pub.cap", { ts: frame.timestamp, quanta: 100 });
 						if (!channelCount) return;
 
 						// The channel count is unreliable on some platforms (Apple's Safari), so

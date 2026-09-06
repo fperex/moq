@@ -9,6 +9,10 @@ import { type Frame, type Consumer as GroupConsumer, Producer as GroupProducer, 
 import { hooks, type Recv, type TrackRequestOptions, type TrackSequence, type TrackSequences } from "./internal.ts";
 import { Timescale, type Timestamp } from "./time.ts";
 
+// rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
+type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
+const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
+
 export type { Datagram } from "./datagram.ts";
 
 // The largest delay setTimeout keeps: anything more truncates to a signed 32-bit int
@@ -1092,6 +1096,13 @@ export class Subscriber {
 			const group = groups[0];
 			if (!group || (end !== undefined && group.sequence > end)) break;
 			groups.shift();
+			rtPush(this.#isStale(group, drift) ? "net.stale" : "net.group", {
+				track: this.name,
+				seq: group.sequence,
+				budget: drift.budget,
+				edge: drift.presentation?.sequence,
+				edgeTs: drift.presentation?.timestamp.asMillis(),
+			});
 			if (this.#isStale(group, drift)) {
 				group.close();
 				continue;

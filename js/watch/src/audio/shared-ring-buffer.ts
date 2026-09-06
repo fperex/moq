@@ -136,6 +136,10 @@ export class SharedRingBuffer {
 	// 2^31 samples, which the 50ms poll in `buffer.ts` satisfies by six orders of magnitude.
 	#position = 0;
 	#lastRead = 0;
+	// rtprobe (throwaway): skip accounting, read by the worklet.
+	skips = 0;
+	skipped = 0;
+	lastSkip?: { samples: number; buffered: number; latency: number };
 
 	/**
 	 * Wrap the shared memory described by `init`.
@@ -335,7 +339,12 @@ export class SharedRingBuffer {
 		const buffered = (write - read) | 0;
 		if (!this.buffered && latency > 0 && buffered > latency) {
 			const skipTo = (write - latency) | 0;
-			if (((skipTo - read) | 0) > 0) read = skipTo;
+			if (((skipTo - read) | 0) > 0) {
+				this.skips++;
+				this.skipped += (skipTo - read) | 0;
+				this.lastSkip = { samples: (skipTo - read) | 0, buffered, latency };
+				read = skipTo;
+			}
 		}
 
 		const available = (write - read) | 0;
@@ -493,6 +502,10 @@ export class SharedRingBuffer {
 		return Time.Micro.fromSecond(((this.#anchor + this.#unwrapRead()) / this.rate) as Time.Second);
 	}
 
+	/** rtprobe: the current target depth in samples. */
+	get latency(): number {
+		return Atomics.load(this.#control, LATENCY);
+	}
 	/** Whether the buffer is stalled (waiting to fill). */
 	get stalled(): boolean {
 		return Atomics.load(this.#control, STALLED) === 1;

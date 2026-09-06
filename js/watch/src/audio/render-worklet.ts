@@ -7,6 +7,19 @@ class Render extends AudioWorkletProcessor {
 	#backend?: SharedRingBuffer | AudioRingBuffer;
 	#underflow = 0;
 	#stateCounter = 0;
+	// rtprobe (throwaway)
+	#rtQuanta = 0;
+	#rtUnder = 0;
+	#rtUnderQ = 0;
+	#rtStalledQ = 0;
+	#rtEp = 0;
+	#rtInUnder = false;
+	#rtLastSkips = 0;
+	#rtLastCall = 0;
+	#rtMaxGap = 0;
+	#rtBurst = 0;
+	#rtBurstMax = 0;
+	#rtBurstCur = 0;
 
 	constructor() {
 		super();
@@ -38,10 +51,79 @@ class Render extends AudioWorkletProcessor {
 		};
 	}
 
+	#rtPost(k: string, o: Record<string, unknown>) {
+		this.port.postMessage({ type: "rt", k, cf: currentFrame, ct: currentTime, ...o });
+	}
+
+	#rtProbe(backend: SharedRingBuffer | AudioRingBuffer | undefined, want: number, got: number) {
+		const shared = backend instanceof SharedRingBuffer ? backend : undefined;
+		const buffered = shared?.length ?? -1;
+		const stalled = backend?.stalled ?? true;
+		this.#rtQuanta++;
+		this.#rtCadence();
+		if (stalled) this.#rtStalledQ++;
+		this.#rtUnderrun(want - got, buffered, stalled);
+		if (shared && shared.skips !== this.#rtLastSkips) {
+			this.#rtLastSkips = shared.skips;
+			this.#rtPost("skip", { ...shared.lastSkip, stalled });
+		}
+		if (this.#rtQuanta % 100 !== 0) return;
+		this.#rtPost("wstat", {
+			quanta: 100,
+			maxGapMs: this.#rtMaxGap,
+			burstQuanta: this.#rtBurst,
+			burstMax: this.#rtBurstMax,
+			under: this.#rtUnder,
+			underQ: this.#rtUnderQ,
+			stalledQ: this.#rtStalledQ,
+			buffered,
+			latency: backend?.latency ?? -1,
+			skipped: backend?.skipped ?? -1,
+			post: backend instanceof AudioRingBuffer,
+		});
+		this.#rtUnder = 0;
+		this.#rtUnderQ = 0;
+		this.#rtStalledQ = 0;
+		this.#rtMaxGap = 0;
+		this.#rtBurst = 0;
+		this.#rtBurstMax = 0;
+	}
+
+	// Wall-clock cadence of process(): a device with a coarse buffer pulls several quanta back to
+	// back (gap < 1 ms) and then idles, which reads the ring in bursts.
+	#rtCadence() {
+		const now = Date.now();
+		const gap = this.#rtLastCall ? now - this.#rtLastCall : 0;
+		this.#rtLastCall = now;
+		if (gap > this.#rtMaxGap) this.#rtMaxGap = gap;
+		if (gap < 1) {
+			this.#rtBurst++;
+			this.#rtBurstCur++;
+			if (this.#rtBurstCur > this.#rtBurstMax) this.#rtBurstMax = this.#rtBurstCur;
+		} else this.#rtBurstCur = 0;
+	}
+
+	#rtUnderrun(short: number, buffered: number, stalled: boolean) {
+		if (short > 0) {
+			this.#rtUnder += short;
+			this.#rtUnderQ++;
+			this.#rtEp += short;
+			if (!this.#rtInUnder) {
+				this.#rtInUnder = true;
+				this.#rtPost("under.start", { buffered, stalled });
+			}
+			return;
+		}
+		if (!this.#rtInUnder) return;
+		this.#rtInUnder = false;
+		this.#rtPost("under.end", { samples: this.#rtEp, buffered, stalled });
+		this.#rtEp = 0;
+	}
 	process(_inputs: Float32Array[][], outputs: Float32Array[][], _parameters: Record<string, Float32Array>) {
 		const output = outputs[0];
 		const backend = this.#backend;
 		const samplesRead = backend?.read(output) ?? 0;
+		this.#rtProbe(backend, output[0].length, samplesRead);
 
 		if (samplesRead < output[0].length) {
 			this.#underflow += output[0].length - samplesRead;

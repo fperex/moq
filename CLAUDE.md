@@ -247,3 +247,7 @@ When making changes to the codebase:
 6. Walk the Cross-Package Sync table; update paired packages and docs in the same PR
 7. Add tests where they're easy to write; bug fixes need a regression test (see Root Cause First)
 8. Commit and push; follow [CONTRIBUTING.md](CONTRIBUTING.md) for commit messages, PR descriptions, and reviews
+
+## Complexity
+
+Maximum cyclomatic complexity is 10 for each function. This limit is always on. Do not disable it and do not increase it. If a function goes above 10, split it into smaller functions.

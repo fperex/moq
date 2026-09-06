@@ -14,6 +14,11 @@ import { reanchorFloor, ringSamples } from "./latency";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
+
+// rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
+type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
+const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
+
 import { type DecodedSpan, Terminal } from "./terminal";
 import { unlockOnGesture } from "./unlock";
 import { Warmup } from "./warmup";
@@ -167,6 +172,7 @@ export class Decoder {
 			// Initial ring depth in samples.
 			const delay = this.sync.out.delay.peek();
 			const latencySamples = ringSamples(sampleRate, delay);
+			rtPush("ring.create", { rate: sampleRate, channels: channelCount, latencySamples, delay });
 			const buffered = this.sync.out.buffered.peek();
 
 			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
@@ -214,7 +220,9 @@ export class Decoder {
 		if (!ring) return;
 
 		const delay = effect.get(this.sync.out.delay);
-		ring.setLatency(ringSamples(ring.rate, delay));
+		const samples = ringSamples(ring.rate, delay);
+		rtPush("ring.latency", { delay, samples });
+		ring.setLatency(samples);
 	}
 
 	// Re-anchor when the delay floor *increases*. A larger floor needs a deeper cushion: video
@@ -240,7 +248,10 @@ export class Decoder {
 		// this effect (tearing down the timer), so compare it against the pre-change baseline directly.
 		const baseline = this.#prevFloor;
 		effect.timer(() => {
-			if (floor > baseline) this.reset();
+			if (floor > baseline) {
+				rtPush("ring.reanchor", { floor, baseline });
+				this.reset();
+			}
 			this.#prevFloor = floor;
 		}, LATENCY_REANCHOR_DEBOUNCE_MS);
 	}
@@ -356,6 +367,7 @@ export class Decoder {
 				// Mark that we received this frame right now.
 				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
 				this.sync.received(timestamp, "audio");
+				rtPush("aud.frame", { ts: frame.timestamp, bytes: frame.payload.byteLength });
 
 				this.#out.stats.update((stats) => ({
 					bytesReceived: (stats?.bytesReceived ?? 0) + frame.payload.byteLength,
@@ -445,6 +457,7 @@ export class Decoder {
 
 				const timestamp = Time.Milli.fromMicro(frame.timestamp);
 				this.sync.received(timestamp, "audio");
+				rtPush("aud.frame", { ts: frame.timestamp, bytes: frame.payload.byteLength });
 
 				this.#out.stats.update((stats) => ({
 					bytesReceived: (stats?.bytesReceived ?? 0) + frame.payload.byteLength,

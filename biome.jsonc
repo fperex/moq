@@ -60,6 +60,31 @@
 	},
 	"overrides": [
 		{
+			// Local gate (worktree only): cognitive complexity capped at 10 for the files this
+			// investigation touches. Biome has no cyclomatic rule; this is the closest one.
+			"includes": [
+				"js/watch/src/audio/ring-buffer.ts",
+				"js/watch/src/audio/shared-ring-buffer.ts",
+				"js/watch/src/audio/source.ts",
+				"js/watch/src/audio/decoder.ts",
+				"js/watch/src/audio/buffer.ts",
+				"js/watch/src/audio/render-worklet.ts",
+				"js/watch/src/sync.ts",
+				"js/watch/src/media.ts",
+				"demo/web/src/harness.ts"
+			],
+			"linter": {
+				"rules": {
+					"complexity": {
+						"noExcessiveCognitiveComplexity": {
+							"level": "error",
+							"options": { "maxAllowedComplexity": 10 }
+						}
+					}
+				}
+			}
+		},
+		{
 			"includes": ["doc/.vitepress/theme/custom.css"],
 			"linter": {
 				"rules": {

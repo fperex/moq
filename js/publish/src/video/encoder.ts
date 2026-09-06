@@ -17,6 +17,10 @@ import type { Broadcast } from "../broadcast";
 import type { Capture } from "./capture";
 import { isStreamTrack, type Source } from "./types";
 
+// rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
+type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
+const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
+
 /** Cumulative encoder output totals, measured from the chunks the encoder produces. */
 export interface Stats {
 	/** Total frames encoded while serving. Monotonic; diff over an interval for a frame rate. */
@@ -198,6 +202,7 @@ export class Encoder {
 			const encoder = new VideoEncoder({
 				output: (frame: EncodedVideoChunk) => {
 					const key = frame.type === "key";
+					rtPush("pub.vid", { ts: frame.timestamp, bytes: frame.byteLength, key });
 					if (key) {
 						lastKeyframe = frame.timestamp as Time.Micro;
 					}
