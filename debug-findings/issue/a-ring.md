@@ -110,19 +110,31 @@ The public `bbb.hang` has the MPEG-TS importer's signature (`0.aac`, `0.avc3`, `
 
 ### What controls the artifacts (measured, same build, page-load switches)
 
-To confirm the mechanism rather than describe it, the instrumented branch carries three experimental switches and the matrix was repeated with each, same streams, same 60 s windows, arrival statistics identical across rows (cells: underrun episodes/min, share of time silent including refill stalls, audio trimmed by skip-aheads ms/min, at the resolved delay):
+To confirm the mechanism rather than describe it, the instrumented branch carries three experimental switches and the matrix was repeated with each: same streams, same 60 s windows, arrival statistics identical across the rows of each table. The switches are cumulative: "ring change" holds one chunk above the target and re-buffers after an underrun; "plus measured sizing" also sets the auto target to the measured p99 arrival lateness plus one chunk. "Time silent" counts underruns and re-buffering stalls together; "audio trimmed" is what skip-aheads discarded.
 
-| stream | ring | switch | auto ("Real-time") result |
-|---|---|---|---|
-| local fmp4 bbb | both | as shipped | 367-373/min, 1.4 %, ~800 ms at 46 ms |
-| local fmp4 bbb | both | ring holds one chunk above the target and re-buffers after an underrun | 0/min, 0.3 %, 135-198 ms at 46 ms |
-| local fmp4 bbb | both | plus auto target = measured p99 arrival lateness + one chunk | 0/min, 0 %, 0 at 100-104 ms |
-| local TS import, 7-frame bursts | postMessage | as shipped | 355/min, 73 %, 194 ms at 46 ms |
-| local TS import, 7-frame bursts | postMessage | ring change only | 0/min but 77 % of the time re-buffering, 1.5 s trimmed, at 46 ms |
-| local TS import, 7-frame bursts | postMessage | plus measured sizing | 0/min, 0.6 %, 536 ms at 230 ms |
-| `cdn.moq.pro/demo` bbb | postMessage (production) | as shipped | 368/min, 67 %, 36 s at 52 ms |
-| `cdn.moq.pro/demo` bbb | postMessage | ring change only | 0/min but 52 % re-buffering, 2.7 s at 62 ms |
-| `cdn.moq.pro/demo` bbb | postMessage | plus measured sizing | 0/min, 0 %, 0 at 270 ms |
+Local fmp4 bbb, smooth two-chunk pacing, same result on both rings:
+
+| switch | underrun episodes/min | time silent | audio trimmed ms/min | resolved delay |
+|---|---|---|---|---|
+| as shipped | 367 to 373 | 1.4 % | about 800 | 46 ms |
+| ring change | 0 | 0.3 % | 135 to 198 | 46 ms |
+| plus measured sizing | 0 | 0 % | 0 | 100 to 104 ms |
+
+Local `moq import ts` with ffmpeg's default packing, 7-frame bursts, postMessage ring:
+
+| switch | underrun episodes/min | time silent | audio trimmed ms/min | resolved delay |
+|---|---|---|---|---|
+| as shipped | 355 | 73 % | 194 | 46 ms |
+| ring change | 0 | 77 % (all of it re-buffering) | 1543 | 46 ms |
+| plus measured sizing | 0 | 0.6 % | 536 | 230 ms |
+
+`cdn.moq.pro/demo` bbb, the production DOM on the postMessage ring:
+
+| switch | underrun episodes/min | time silent | audio trimmed ms/min | resolved delay |
+|---|---|---|---|---|
+| as shipped | 368 | 67 % | 36028 | 52 ms |
+| ring change | 0 | 52 % (all of it re-buffering) | 2722 | 62 ms |
+| plus measured sizing | 0 | 0 % | 0 | 270 ms |
 
 Two facts follow. The ring's cap-without-hysteresis and no-refill behaviour is what turns ordinary two-chunk pacing into hundreds of glitches per minute at the auto target: with one chunk of slack and a refill they disappear at the same 46 ms. And no ring behaviour can fit a 162 ms burst into a 46-100 ms window: the artifacts on the public stream only stop once the target follows the measured arrival spread (270 ms there), i.e. the RTT term is not a measure of what arrives. A fixed 250 ms is clean in every configuration, which is why the 500 ms and 1 s presets have always sounded fine.
 
