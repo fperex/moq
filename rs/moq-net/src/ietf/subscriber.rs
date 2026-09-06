@@ -431,6 +431,23 @@ where
 		}
 	}
 
+	/// Leave `alias` in the state a cancelled subscription leaves behind: bound to a
+	/// subscription, then retired.
+	///
+	/// The alias table is private to this module and the loop that answers a group for a
+	/// retired alias lives in `session.rs`, so this is what lets that loop be driven end to
+	/// end from there.
+	#[cfg(test)]
+	pub(super) fn retire_alias(&self, alias: u64) {
+		// Which request owned the alias does not matter, only that retirement follows the
+		// same binding it does in production.
+		const REQUEST_ID: RequestId = RequestId(0);
+
+		let aliases = self.state.lock().aliases.clone();
+		insert_track_alias(&aliases, alias, REQUEST_ID).expect("bind the alias");
+		retire_track_alias(&aliases, alias, REQUEST_ID);
+	}
+
 	/// What the peer declared in its SETUP, or the default (extension off) on a version
 	/// that cannot negotiate it. See [`super::Publisher::peer`].
 	pub(super) async fn peer(&self) -> cluster::Peer {
@@ -1447,48 +1464,52 @@ where
 			BroadcastClosed(Error),
 		}
 
+		let track_name = track.name().to_owned();
 		let setup = {
 			let mut response = std::pin::pin!(self.read_subscribe_response(&mut stream));
-			kio::wait(|waiter| {
-				// An answer that has already arrived wins over the local terminals. Both can
-				// be ready in one poll, and taking abandonment there would discard a response
-				// the publisher has already sent: if it was a rejection, the request is gone
-				// and cancelling it names a dead id back at a peer entitled to object.
-				if let Poll::Ready(res) = waiter.poll_future(response.as_mut()) {
-					return Poll::Ready(Setup::Response(res));
+			loop {
+				let setup = kio::wait(|waiter| {
+					// An answer that has already arrived wins over the local terminals. Both can
+					// be ready in one poll, and taking abandonment there would discard a response
+					// the publisher has already sent: if it was a rejection, the request is gone
+					// and cancelling it names a dead id back at a peer entitled to object.
+					if let Poll::Ready(res) = waiter.poll_future(response.as_mut()) {
+						return Poll::Ready(Setup::Response(res));
+					}
+					if track.poll_unused(waiter).is_ready() {
+						return Poll::Ready(Setup::Unused);
+					}
+					if let Poll::Ready(err) = broadcast.poll_closed(waiter) {
+						return Poll::Ready(Setup::BroadcastClosed(err));
+					}
+					Poll::Pending
+				})
+				.await;
+
+				match setup {
+					Setup::Response(res) => break Some((res, track)),
+					Setup::Unused => match track.abort_unused(Error::Cancel) {
+						Ok(()) => break None,
+						Err(used) => track = used,
+					},
+					Setup::BroadcastClosed(err) => {
+						let _ = track.abort(err);
+						break None;
+					}
 				}
-				if track.poll_unused(waiter).is_ready() {
-					return Poll::Ready(Setup::Unused);
-				}
-				if let Poll::Ready(err) = broadcast.poll_closed(waiter) {
-					return Poll::Ready(Setup::BroadcastClosed(err));
-				}
-				Poll::Pending
-			})
-			.await
+			}
 		};
 
-		// Abandoned before the publisher answered. It may already be serving, so this still
-		// owes it a cancellation rather than a silent walk away.
-		let response = match setup {
-			Setup::Response(res) => res,
-			Setup::Unused | Setup::BroadcastClosed(_) => {
-				let err = match setup {
-					Setup::BroadcastClosed(err) => err,
-					_ => Error::Cancel,
-				};
-
-				tracing::info!(
-					broadcast = %self.origin.absolute(&broadcast_path),
-					track = %track.name(),
-					"subscribe abandoned before it was accepted"
-				);
-
-				let _ = track.abort(err);
-				self.remove_subscribe(request_id);
-				self.cancel_subscribe(stream, request_id).await;
-				return;
-			}
+		let Some((response, mut track)) = setup else {
+			tracing::info!(
+				broadcast = %self.origin.absolute(&broadcast_path),
+				track = %track_name,
+				"subscribe abandoned before it was accepted"
+			);
+			// The publisher may already be serving before it answers.
+			self.remove_subscribe(request_id);
+			self.cancel_subscribe(stream, request_id).await;
+			return;
 		};
 
 		// Read the response and register the alias mapping
@@ -1557,44 +1578,46 @@ where
 			StreamClosed(Result<(), Error>),
 		}
 
-		let end = kio::wait(|waiter| {
-			if track.poll_unused(waiter).is_ready() {
-				return Poll::Ready(End::Unused);
-			}
-			if let Poll::Ready(err) = broadcast.poll_closed(waiter) {
-				return Poll::Ready(End::BroadcastClosed(err));
-			}
-			let mut cx = std::task::Context::from_waker(waiter.waker());
-			stream.reader.poll_closed(&mut cx).map(End::StreamClosed)
-		})
-		.await;
-
-		// Whether we are walking away from a subscription the publisher still considers
-		// Established, which is what obliges us to cancel it rather than just close.
-		let cancelled = match end {
-			End::Unused => {
-				tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track.name(), "subscribe cancelled");
-				let _ = track.abort(Error::Cancel);
-				true
-			}
-			End::BroadcastClosed(err) => {
-				tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track.name(), "broadcast closed");
-				let _ = track.abort(err);
-				true
-			}
-			End::StreamClosed(res) => {
-				match res {
-					Ok(()) => {
-						tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track.name(), "subscribe complete");
-						let _ = track.finish();
-					}
-					Err(err) => {
-						tracing::debug!(%err, "subscribe stream closed with error");
-						let _ = track.abort(err);
-					}
+		let cancelled = loop {
+			let end = kio::wait(|waiter| {
+				if track.poll_unused(waiter).is_ready() {
+					return Poll::Ready(End::Unused);
 				}
-				// The publisher already ended the request, so there is nothing to cancel.
-				false
+				if let Poll::Ready(err) = broadcast.poll_closed(waiter) {
+					return Poll::Ready(End::BroadcastClosed(err));
+				}
+				let mut cx = std::task::Context::from_waker(waiter.waker());
+				stream.reader.poll_closed(&mut cx).map(End::StreamClosed)
+			})
+			.await;
+
+			match end {
+				End::Unused => match track.abort_unused(Error::Cancel) {
+					Ok(()) => {
+						tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track_name, "subscribe cancelled");
+						break true;
+					}
+					Err(used) => track = used,
+				},
+				End::BroadcastClosed(err) => {
+					tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track_name, "broadcast closed");
+					let _ = track.abort(err);
+					break true;
+				}
+				End::StreamClosed(res) => {
+					match res {
+						Ok(()) => {
+							tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track_name, "subscribe complete");
+							let _ = track.finish();
+						}
+						Err(err) => {
+							tracing::debug!(%err, "subscribe stream closed with error");
+							let _ = track.abort(err);
+						}
+					}
+					// The publisher already ended the request, so there is nothing to cancel.
+					break false;
+				}
 			}
 		};
 
@@ -1635,7 +1658,7 @@ where
 
 		// STOP_SENDING needs no acknowledgement, so it goes first and the wait below covers
 		// only what we still have to deliver.
-		reader.stop(super::error::CANCELLED);
+		reader.abort(&Error::Cancel);
 
 		// Finishing alone would leave the writer's Drop free to RESET_STREAM, and a stream
 		// that has sent its FIN is still retransmitting: the reset would discard the
@@ -2565,8 +2588,8 @@ mod tests {
 	/// what distorts its error handling.
 	///
 	/// Covers the error this path produces and the code it maps to, not the dispatch loop
-	/// that sends it: `run_unis` is private to `session`, and retiring an alias reaches into
-	/// state private to this module, so nothing here can drive one end to end. See #3002.
+	/// that sends it. `session::a_group_for_a_retired_alias_is_stopped_with_cancelled`
+	/// drives that loop over a real receive stream.
 	#[tokio::test(start_paused = true)]
 	async fn a_retired_alias_maps_to_the_cancelled_code() {
 		let aliases = TrackAliases::default();
@@ -2578,7 +2601,7 @@ mod tests {
 			.expect_err("a retired alias resolves to a cancellation");
 
 		assert_eq!(
-			crate::ietf::error::to_stream_code(&err),
+			crate::ietf::error::to_stream_code(&crate::StreamError::from(&err), Version::Draft20),
 			crate::ietf::error::CANCELLED,
 			"the code the dispatch loop maps this error onto",
 		);

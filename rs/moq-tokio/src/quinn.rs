@@ -68,7 +68,24 @@ fn apply_transport(transport: &mut quinn::TransportConfig, quic: &Resolved) {
 		transport.enable_segmentation_offload(gso);
 	}
 
+	apply_windows(transport, quic);
+
 	transport.congestion_controller_factory(congestion_factory(congestion_control(quic)));
+}
+
+/// Apply the flow-control windows, leaving each at the backend default when unset.
+fn apply_windows(transport: &mut quinn::TransportConfig, quic: &Resolved) {
+	// Saturating rather than erroring: `Config::validate` already rejects a window
+	// past the varint, so this only bites a `Resolved` built without it.
+	if let Some(window) = quic.receive_window {
+		transport.receive_window(quinn::VarInt::from_u64(window).unwrap_or(quinn::VarInt::MAX));
+	}
+	if let Some(window) = quic.stream_receive_window {
+		transport.stream_receive_window(quinn::VarInt::from_u64(window).unwrap_or(quinn::VarInt::MAX));
+	}
+	if let Some(window) = quic.send_window {
+		transport.send_window(window);
+	}
 }
 
 /// The congestion control family to install, defaulting to delay-based.
@@ -520,7 +537,7 @@ pub(crate) struct QuinnServer {
 }
 
 impl QuinnServer {
-	pub fn new(config: listen::Config, quic: &crate::quic::Config, shard: Option<listen::Shard>) -> Result<Self> {
+	pub fn new(config: listen::Config, quic: &crate::quic::Config, member: Option<listen::Member>) -> Result<Self> {
 		let quic = quic.resolve();
 		let mut transport = quinn::TransportConfig::default();
 		apply_transport(&mut transport, &quic);
@@ -578,7 +595,7 @@ impl QuinnServer {
 
 		// Configure connection ID generator with server ID if provided
 		let mut endpoint_config = quinn::EndpointConfig::default();
-		if let Some(shard) = shard {
+		if let Some(shard) = member.as_ref().map(listen::Member::shard) {
 			if config.lb_id.is_some() {
 				return Err(Error::ShardWithQuicLb);
 			}
@@ -607,7 +624,14 @@ impl QuinnServer {
 			endpoint_config.cid_generator(move || Box::new(ServerIdGenerator::new(server_id.clone(), nonce_len)));
 		}
 
-		let socket = moq_sock::shard::bind(listen, shard).map_err(Error::BindSocket)?;
+		// A group member binds the address its group holds, not the one this
+		// config resolved: the group is what guarantees every member shares one
+		// port, in the order the kernel steers by.
+		let socket = match member {
+			Some(member) => member.bind(),
+			None => crate::bind::udp(crate::bind::Udp::new(listen)),
+		}
+		.map_err(Error::BindSocket)?;
 
 		// Create the generic QUIC endpoint.
 		let quic = quinn::Endpoint::new(endpoint_config, Some(tls), socket, runtime).map_err(Error::CreateEndpoint)?;
@@ -817,6 +841,37 @@ mod tests {
 			connect_rejected(403).connect_error(),
 			Some(crate::ConnectError::Forbidden)
 		);
+	}
+
+	/// quinn exposes no getters for the flow-control windows, but its `Debug` prints
+	/// them, which is enough to prove each one reached the transport config and that
+	/// an unset knob leaves quinn's own default in place.
+	#[test]
+	fn apply_windows_writes_each_field() {
+		let defaults = format!("{:?}", quinn::TransportConfig::default());
+
+		let quic = crate::quic::Config {
+			receive_window: Some(64 << 20),
+			stream_receive_window: Some(8 << 20),
+			send_window: Some(32 << 20),
+			..Default::default()
+		};
+
+		let mut transport = quinn::TransportConfig::default();
+		apply_windows(&mut transport, &quic.resolve());
+		let applied = format!("{:?}", transport);
+
+		for field in [
+			format!("receive_window: {}", 64 << 20),
+			format!("stream_receive_window: {}", 8 << 20),
+			format!("send_window: {}", 32 << 20),
+		] {
+			assert!(applied.contains(&field), "{field} missing from {applied}");
+		}
+
+		let mut untouched = quinn::TransportConfig::default();
+		apply_windows(&mut untouched, &crate::quic::Config::default().resolve());
+		assert_eq!(format!("{:?}", untouched), defaults);
 	}
 
 	/// Build a controller from each family's factory and downcast it to the
