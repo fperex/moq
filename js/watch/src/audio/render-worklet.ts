@@ -1,4 +1,4 @@
-import type { Message, State } from "./render";
+import type { InitPost, InitShared, Message, State } from "./render";
 import { AudioRingBuffer } from "./ring-buffer";
 import { SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -24,33 +24,39 @@ class Render extends AudioWorkletProcessor {
 	constructor() {
 		super();
 
-		this.port.onmessage = (event: MessageEvent<Message>) => {
-			const msg = event.data;
-			if (msg.type === "init-shared") {
-				console.log("[audio-worklet] init-shared: using SharedArrayBuffer path");
-				const previous = this.#backend instanceof SharedRingBuffer ? this.#backend : undefined;
-				this.#backend = new SharedRingBuffer(msg, previous);
-				this.#underflow = 0;
-			} else if (msg.type === "init-post") {
-				console.log("[audio-worklet] init-post: using postMessage path");
-				this.#backend = new AudioRingBuffer(msg);
-				this.#underflow = 0;
-			} else if (msg.type === "data") {
-				// Only meaningful in post mode.
-				if (this.#backend instanceof AudioRingBuffer) this.#backend.write(msg.timestamp, msg.data);
-			} else if (msg.type === "latency") {
-				// Only meaningful in post mode.
-				if (this.#backend instanceof AudioRingBuffer) this.#backend.resize(msg.latency);
-			} else if (msg.type === "truncate") {
-				// Only meaningful in post mode; shared mode truncates via the control array.
-				if (this.#backend instanceof AudioRingBuffer) this.#backend.truncate(msg.timestamp);
-			} else if (msg.type === "reset") {
-				// Only meaningful in post mode; shared mode resets via the control array.
-				if (this.#backend instanceof AudioRingBuffer) this.#backend.reset();
-			}
-		};
+		this.port.onmessage = (event: MessageEvent<Message>) => this.#handle(event.data);
 	}
 
+	#handle(msg: Message): void {
+		if (msg.type === "init-shared") {
+			this.#initShared(msg);
+			return;
+		}
+		if (msg.type === "init-post") {
+			this.#initPost(msg);
+			return;
+		}
+		// The rest is only meaningful in post mode; shared mode drives the ring through Atomics.
+		const post = this.#backend instanceof AudioRingBuffer ? this.#backend : undefined;
+		if (!post) return;
+		if (msg.type === "data") post.write(msg.timestamp, msg.data);
+		else if (msg.type === "latency") post.resize(msg.latency);
+		else if (msg.type === "truncate") post.truncate(msg.timestamp);
+		else if (msg.type === "reset") post.reset();
+	}
+
+	#initShared(msg: InitShared): void {
+		console.log("[audio-worklet] init-shared: using SharedArrayBuffer path");
+		const previous = this.#backend instanceof SharedRingBuffer ? this.#backend : undefined;
+		this.#backend = new SharedRingBuffer(msg, previous);
+		this.#underflow = 0;
+	}
+
+	#initPost(msg: InitPost): void {
+		console.log("[audio-worklet] init-post: using postMessage path");
+		this.#backend = new AudioRingBuffer(msg);
+		this.#underflow = 0;
+	}
 	#rtPost(k: string, o: Record<string, unknown>) {
 		this.port.postMessage({ type: "rt", k, cf: currentFrame, ct: currentTime, ...o });
 	}

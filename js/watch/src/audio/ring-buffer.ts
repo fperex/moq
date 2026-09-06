@@ -15,6 +15,9 @@ export class AudioRingBuffer {
 	#latencySamples: number;
 	// Whether the read/write indices have been anchored to the first inserted sample.
 	#anchored = false;
+	// F2 (rtprobe prototype): mode bits and the largest write seen, the slack held above the target.
+	#mode = 0;
+	#slack = 0;
 	// rtprobe (throwaway): skip accounting, read by the worklet.
 	skips = 0;
 	skipped = 0;
@@ -25,6 +28,7 @@ export class AudioRingBuffer {
 		channels: number;
 		latency: Time.Milli;
 		buffered?: boolean;
+		mode?: number;
 	}) {
 		if (props.channels <= 0) throw new Error("invalid channels");
 		if (props.rate <= 0) throw new Error("invalid sample rate");
@@ -36,6 +40,7 @@ export class AudioRingBuffer {
 		this.rate = props.rate;
 		this.channels = props.channels;
 		this.#buffered = props.buffered ?? false;
+		this.#mode = props.mode ?? 0;
 
 		// The ring holds the latency floor as PCM. Buffered mode gives it headroom above the floor
 		// so the backpressure-paced decode loop (on the main thread) doesn't overflow-drop; the rest
@@ -49,7 +54,12 @@ export class AudioRingBuffer {
 	}
 
 	#capacityFor(latencySamples: number): number {
-		return this.#buffered ? latencySamples * 2 : latencySamples;
+		// With hysteresis the ring must hold the target plus a chunk of slack plus one write.
+		return this.#buffered || this.#hysteresis ? latencySamples * 2 : latencySamples;
+	}
+
+	get #hysteresis(): boolean {
+		return (this.#mode & 1) !== 0;
 	}
 
 	/** rtprobe: the current target depth in samples. */
@@ -109,91 +119,98 @@ export class AudioRingBuffer {
 	write(timestamp: Time.Micro, data: Float32Array[]): void {
 		if (data.length !== this.channels) throw new Error("wrong number of channels");
 
-		let start = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
-		let samples = data[0].length;
-
+		const absolute = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
 		// Anchor both indices to the first sample so we play from its timestamp instead of
 		// gap-filling silence from index 0 to a large timestamp, which would both waste the
 		// ring on zeros and report a playhead a floor behind the first real sample.
 		if (!this.#anchored) {
-			this.#readIndex = start;
-			this.#writeIndex = start;
+			this.#readIndex = absolute;
+			this.#writeIndex = absolute;
 			this.#anchored = true;
 		}
 
-		// Ignore samples that are too old (before the read index)
-		let offset = this.#readIndex - start;
-		if (offset > samples) {
-			// All samples are too old, ignore them
-			return;
-		} else if (offset > 0) {
-			// Some samples are too old, skip them
-			samples -= offset;
-			start += offset;
-		} else {
-			offset = 0;
-		}
-
+		const trimmed = this.#trimOld(absolute, data[0].length);
+		if (trimmed === undefined) return;
+		const { start, samples } = trimmed;
 		const end = start + samples;
 
-		// Check if we need to discard old samples to prevent overflow
+		this.#overflow(end);
+		this.#gapFill(start);
+		this.#copyIn(start, data, samples);
+
+		// Update write index, but only if we're moving forward
+		if (end > this.#writeIndex) this.#writeIndex = end;
+		this.#slack = Math.max(this.#slack, data[0].length);
+		this.#settle();
+	}
+
+	/** Ignore samples that are too old (before the read index). Undefined when nothing is left. */
+	#trimOld(start: number, samples: number): { start: number; samples: number } | undefined {
+		const offset = this.#readIndex - start;
+		if (offset > samples) return undefined;
+		if (offset > 0) return { start: start + offset, samples: samples - offset };
+		return { start, samples };
+	}
+
+	/** Discard old samples to prevent overflow, which also exits stalled mode (the legacy un-stall). */
+	#overflow(end: number): void {
 		const overflow = end - this.#readIndex - this.#buffer[0].length;
-		if (overflow >= 0) {
-			// Discard old samples and exit stalled mode
-			this.#stalled = false;
-			this.#readIndex += overflow;
-			this.skips++;
-			this.skipped += overflow;
-			this.lastSkip = {
-				samples: overflow,
-				buffered: this.#writeIndex - this.#readIndex,
-				latency: this.#latencySamples,
-			};
-		}
+		if (overflow < 0) return;
+		this.#stalled = false;
+		if (overflow === 0) return; // exactly full: nothing discarded
+		this.#readIndex += overflow;
+		this.skips++;
+		this.skipped += overflow;
+		this.lastSkip = {
+			samples: overflow,
+			buffered: this.#writeIndex - this.#readIndex,
+			latency: this.#latencySamples,
+		};
+	}
 
-		// Fill gaps with zeros if there's a discontinuity
-		if (start > this.#writeIndex) {
-			const gapSize = Math.min(start - this.#writeIndex, this.#buffer[0].length);
-			if (gapSize === 1) {
-				console.warn("floating point inaccuracy detected");
-			}
-
-			for (let channel = 0; channel < this.channels; channel++) {
-				const dst = this.#buffer[channel];
-				for (let i = 0; i < gapSize; i++) {
-					const writePos = (this.#writeIndex + i) % dst.length;
-					dst[writePos] = 0;
-				}
+	/** Fill gaps with zeros if there's a discontinuity. */
+	#gapFill(start: number): void {
+		if (start <= this.#writeIndex) return;
+		const gapSize = Math.min(start - this.#writeIndex, this.#buffer[0].length);
+		if (gapSize === 1) console.warn("floating point inaccuracy detected");
+		for (let channel = 0; channel < this.channels; channel++) {
+			const dst = this.#buffer[channel];
+			for (let i = 0; i < gapSize; i++) {
+				dst[(this.#writeIndex + i) % dst.length] = 0;
 			}
 		}
+	}
 
-		// Write the actual samples
+	#copyIn(start: number, data: Float32Array[], samples: number): void {
 		for (let channel = 0; channel < this.channels; channel++) {
 			let src = data[channel];
 			src = src.subarray(src.length - samples);
-
 			const dst = this.#buffer[channel];
 			if (src.length !== samples) throw new Error("mismatching number of samples");
-
 			for (let i = 0; i < samples; i++) {
-				const writePos = (start + i) % dst.length;
-				dst[writePos] = src[i];
+				dst[(start + i) % dst.length] = src[i];
 			}
-		}
-
-		// Update write index, but only if we're moving forward
-		if (end > this.#writeIndex) {
-			this.#writeIndex = end;
-		}
-
-		// Start playback once we've buffered the latency target. In buffered mode the cap
-		// is large, so we usually un-stall here rather than via the overflow path above.
-		if (this.#buffered && this.length >= this.#latencySamples) {
-			this.#stalled = false;
 		}
 	}
 
 	/**
+	 * Start playback once we've buffered the latency target, and with hysteresis (F2) skip ahead
+	 * only once more than target + one chunk is held. Buffered mode starts at the target too and
+	 * never skips. Without either, the legacy path relies on the overflow branch above.
+	 */
+	#settle(): void {
+		const length = this.length;
+		if (this.#buffered || this.#hysteresis) {
+			if (length >= this.#latencySamples) this.#stalled = false;
+		}
+		if (!this.#hysteresis || this.#buffered) return;
+		if (length <= this.#latencySamples + this.#slack) return;
+		const skip = length - this.#latencySamples;
+		this.#readIndex += skip;
+		this.skips++;
+		this.skipped += skip;
+		this.lastSkip = { samples: skip, buffered: length, latency: this.#latencySamples };
+	} /**
 	 * Drop buffered samples at or after `timestamp`, keeping whatever is already due.
 	 *
 	 * A successor track overwrites the slots its own samples land on, but anything the previous
@@ -219,6 +236,8 @@ export class AudioRingBuffer {
 		if (this.#stalled) return 0;
 
 		const samples = Math.min(this.#writeIndex - this.#readIndex, output[0].length);
+		// F2: an underrun re-stalls the ring so it refills to the target before resuming.
+		if (samples < output[0].length && this.#hysteresis) this.#stalled = true;
 		if (samples === 0) return 0;
 
 		for (let channel = 0; channel < this.channels; channel++) {

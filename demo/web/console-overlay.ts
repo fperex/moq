@@ -274,6 +274,8 @@ window.addEventListener("DOMContentLoaded", () => {
 // rtprobe (throwaway): structured event sink + beacon drain, see debug-findings/.
 (() => {
 	const params = new URLSearchParams(location.search);
+	// Prototype fix switches: ?rt=f2,f3,f4 turns on the F2/F3/F4 code paths for this page load.
+	window.__rtFlags = Object.fromEntries((params.get("rt") ?? "").split(",").filter(Boolean).map((f) => [f, true]));
 	const tag = params.get("beacon");
 	const rt = {
 		ev: [],

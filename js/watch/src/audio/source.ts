@@ -86,28 +86,33 @@ export class Source {
 		if (!supported) return;
 
 		effect.spawn(async () => {
-			const available: Record<string, Catalog.AudioConfig> = {};
-
-			// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
-			// waits for the tasks it spawned, so an unraced probe would hold the next run shut
-			// for good. Captured here so it stays this run's promise once we start awaiting.
-			const cancelled = effect.cancel.then(() => undefined);
-
-			for (const [name, config] of Object.entries(renditions)) {
-				const isSupported = await Promise.race([supported(config), cancelled]);
-
-				// Torn down: stop probing and publish nothing, since the rerun redoes this.
-				if (effect.abort.aborted) return;
-
-				if (isSupported) available[name] = config;
-			}
-
+			const available = await this.#probe(effect, renditions, supported);
+			// Torn down: publish nothing, since the rerun redoes this.
+			if (!available) return;
 			if (Object.keys(available).length === 0 && Object.keys(renditions).length > 0) {
 				console.warn("no supported audio renditions found:", renditions);
 			}
-
 			this.#out.available.set(available);
 		});
+	}
+
+	/** Probe every rendition for decoder support; undefined once the effect is torn down. */
+	async #probe(
+		effect: Effect,
+		renditions: Record<string, Catalog.AudioConfig>,
+		supported: (config: Catalog.AudioConfig) => Promise<boolean>,
+	): Promise<Record<string, Catalog.AudioConfig> | undefined> {
+		const available: Record<string, Catalog.AudioConfig> = {};
+		// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
+		// waits for the tasks it spawned, so an unraced probe would hold the next run shut
+		// for good. Captured here so it stays this run's promise once we start awaiting.
+		const cancelled = effect.cancel.then(() => undefined);
+		for (const [name, config] of Object.entries(renditions)) {
+			const isSupported = await Promise.race([supported(config), cancelled]);
+			if (effect.abort.aborted) return undefined;
+			if (isSupported) available[name] = config;
+		}
+		return available;
 	}
 
 	#runSelected(effect: Effect): void {
@@ -132,7 +137,7 @@ export class Source {
 
 		// Use catalog jitter if available, otherwise estimate from codec frame duration.
 		// Add the worklet render quantum so the ring buffer has margin between frame arrivals.
-		const codecJitter = selected.config.jitter ?? defaultAudioJitter(selected.config) ?? 0;
+		const codecJitter = advertisedJitter(selected.config) ?? defaultAudioJitter(selected.config) ?? 0;
 		const overhead = Math.ceil((WORKLET_QUANTUM / selected.config.sampleRate) * 1000);
 		const jitter = codecJitter + overhead;
 		effect.set(this.#out.jitter, Time.Milli(jitter));
@@ -171,6 +176,14 @@ export class Source {
 	close(): void {
 		this.#signals.close();
 	}
+}
+
+// F3 (rtprobe prototype): a catalog jitter of 0 cannot size anything (a frame always takes time),
+// so with ?rt=f3 it counts as absent and the codec default applies.
+function advertisedJitter(config: Catalog.AudioConfig): number | undefined {
+	const f3 = (globalThis as { __rtFlags?: { f3?: boolean } }).__rtFlags?.f3 === true;
+	if (f3 && config.jitter === 0) return undefined;
+	return config.jitter;
 }
 
 // Estimate the minimum jitter (frame duration) based on the audio codec.

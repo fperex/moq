@@ -6,7 +6,13 @@ const LATENCY = 1;
 const STALLED = 2;
 // Timeline identity changes only on re-anchor, independently of the packed mutation epoch.
 const TIMELINE = 3;
-const CONTROL_SLOTS = 4;
+// F2 (rtprobe prototype): the largest insert seen, used as skip slack, and a mode word.
+const SLACK = 4;
+const MODE = 5;
+const CONTROL_SLOTS = 6;
+
+/** MODE bit: skip only past target + slack, and re-stall on an underrun (the F2 prototype). */
+export const MODE_HYSTERESIS = 1;
 
 /**
  * The playhead and its mutation epoch, packed into one 64-bit word: epoch in the high
@@ -229,25 +235,8 @@ export class SharedRingBuffer {
 	insert(timestamp: Time.Micro, data: Float32Array[]): void {
 		if (data.length !== this.channels) throw new Error("wrong number of channels");
 
-		let start = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
-		const originalLength = data[0].length;
-		let offset = 0;
-
-		// Anchor to the first sample so playback starts at its timestamp rather than gap-filling
-		// from index 0.
-		if (!this.#anchored) {
-			this.#anchor = start;
-			// One store rebases both halves, so a reader's compare-exchange against the old word
-			// cannot land afterwards. Two, because odd epochs belong to `truncate`.
-			const epoch = epochOf(Atomics.load(this.#state, 0));
-			// Publish identity first so a handoff cannot apply an old cursor to the new state.
-			Atomics.add(this.#control, TIMELINE, 1);
-			Atomics.store(this.#state, 0, pack((epoch + 2) | 0, 0));
-			Atomics.store(this.#control, WRITE, 0);
-			this.#anchored = true;
-			this.#position = 0;
-			this.#lastRead = 0;
-		}
+		const absolute = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
+		if (!this.#anchored) this.#anchor_(absolute);
 
 		// Positions are relative to the anchor. READ/WRITE are Int32, so an absolute sample index
 		// wraps once a stream has been broadcasting a while, and the wrapped value reads as far
@@ -255,44 +244,65 @@ export class SharedRingBuffer {
 		// silent for good. Relative positions start at 0 instead. They still wrap, after ~13.5h at
 		// 44.1kHz, but nothing here reads them as magnitudes: the comparisons are modular, `slot`
 		// masks a power-of-two capacity, and `timestamp` keeps its own unwrapped position.
-		start = (start - this.#anchor) | 0;
-
-		const end = (start + originalLength) | 0;
-
-		// Trim old: discard samples before the read index
-		const read = readOf(Atomics.load(this.#state, 0));
-		const behind = (read - start) | 0;
-		if (behind > 0) {
-			if (behind >= originalLength) {
-				// All samples are too old
-				return;
-			}
-			offset = behind;
-			start = (start + behind) | 0;
-		}
-
-		const samples = originalLength - offset;
+		const trimmed = this.#trimOld((absolute - this.#anchor) | 0, data[0].length);
+		if (trimmed === undefined) return;
+		const { start, offset, samples } = trimmed;
+		const end = (start + samples) | 0;
 
 		// Overflow: if the write would exceed capacity from current READ, advance READ.
 		// Use CAS so a concurrent reader advance isn't clobbered backward.
-		if (((end - read) | 0) > this.capacity) {
-			this.#advance((end - this.capacity) | 0);
-		}
+		const read = readOf(Atomics.load(this.#state, 0));
+		if (((end - read) | 0) > this.capacity) this.#advance((end - this.capacity) | 0);
 
-		// Gap fill: zero-fill from current WRITE to start if there's a discontinuity
+		this.#gapFill(start);
+		this.#copyIn(start, data, offset, samples);
+
+		// Advance WRITE (only forward)
+		Atomics.store(this.#control, WRITE, i32Max(Atomics.load(this.#control, WRITE), end));
+		// The largest insert seen is the slack the reader may hold above the target (F2).
+		Atomics.store(this.#control, SLACK, Math.max(Atomics.load(this.#control, SLACK), data[0].length));
+		this.#unstall();
+	}
+
+	/** First insert: anchor the timeline at this sample so playback starts there. */
+	#anchor_(absolute: number): void {
+		this.#anchor = absolute;
+		// One store rebases both halves, so a reader's compare-exchange against the old word
+		// cannot land afterwards. Two, because odd epochs belong to `truncate`.
+		const epoch = epochOf(Atomics.load(this.#state, 0));
+		// Publish identity first so a handoff cannot apply an old cursor to the new state.
+		Atomics.add(this.#control, TIMELINE, 1);
+		Atomics.store(this.#state, 0, pack((epoch + 2) | 0, 0));
+		Atomics.store(this.#control, WRITE, 0);
+		this.#anchored = true;
+		this.#position = 0;
+		this.#lastRead = 0;
+	}
+
+	/** Trim old: discard samples before the read index. Undefined when nothing is left. */
+	#trimOld(start: number, length: number): { start: number; offset: number; samples: number } | undefined {
+		const read = readOf(Atomics.load(this.#state, 0));
+		const behind = (read - start) | 0;
+		if (behind <= 0) return { start, offset: 0, samples: length };
+		if (behind >= length) return undefined;
+		return { start: (start + behind) | 0, offset: behind, samples: length - behind };
+	}
+
+	/** Gap fill: zero-fill from current WRITE to start if there's a discontinuity. */
+	#gapFill(start: number): void {
 		const write = Atomics.load(this.#control, WRITE);
 		const gap = (start - write) | 0;
-		if (gap > 0) {
-			const gapSize = Math.min(gap, this.capacity);
-			for (let channel = 0; channel < this.channels; channel++) {
-				const dst = this.#samples[channel];
-				for (let i = 0; i < gapSize; i++) {
-					dst[slot((write + i) | 0, this.capacity)] = 0;
-				}
+		if (gap <= 0) return;
+		const gapSize = Math.min(gap, this.capacity);
+		for (let channel = 0; channel < this.channels; channel++) {
+			const dst = this.#samples[channel];
+			for (let i = 0; i < gapSize; i++) {
+				dst[slot((write + i) | 0, this.capacity)] = 0;
 			}
 		}
+	}
 
-		// Write sample data
+	#copyIn(start: number, data: Float32Array[], offset: number, samples: number): void {
 		for (let channel = 0; channel < this.channels; channel++) {
 			const src = data[channel];
 			const dst = this.#samples[channel];
@@ -300,15 +310,14 @@ export class SharedRingBuffer {
 				dst[slot((start + i) | 0, this.capacity)] = src[offset + i];
 			}
 		}
+	}
 
-		// Advance WRITE (only forward)
-		Atomics.store(this.#control, WRITE, i32Max(Atomics.load(this.#control, WRITE), end));
-
-		// Un-stall: if buffered data >= LATENCY
-		const currentRead = readOf(Atomics.load(this.#state, 0));
-		const currentWrite = Atomics.load(this.#control, WRITE);
+	/** Un-stall once buffered data reaches LATENCY. */
+	#unstall(): void {
+		const read = readOf(Atomics.load(this.#state, 0));
+		const write = Atomics.load(this.#control, WRITE);
 		const latency = Atomics.load(this.#control, LATENCY);
-		if (((currentWrite - currentRead) | 0) >= latency && latency > 0) {
+		if (((write - read) | 0) >= latency && latency > 0) {
 			Atomics.store(this.#control, STALLED, 0);
 		}
 	}
@@ -329,23 +338,9 @@ export class SharedRingBuffer {
 		// later exchange could not tell them apart. Render the quantum as silence instead.
 		if (retreating(state)) return 0;
 
-		let read = readOf(state);
 		const write = Atomics.load(this.#control, WRITE);
 		const latency = Atomics.load(this.#control, LATENCY);
-
-		// Latency skip: if buffered data exceeds LATENCY, skip ahead.
-		// CAS ensures we never step backward relative to a concurrent writer advance.
-		// Disabled in buffered mode, where we deliberately play through the whole buffer.
-		const buffered = (write - read) | 0;
-		if (!this.buffered && latency > 0 && buffered > latency) {
-			const skipTo = (write - latency) | 0;
-			if (((skipTo - read) | 0) > 0) {
-				this.skips++;
-				this.skipped += (skipTo - read) | 0;
-				this.lastSkip = { samples: (skipTo - read) | 0, buffered, latency };
-				read = skipTo;
-			}
-		}
+		const read = this.#skipAhead(readOf(state), write, latency);
 
 		const available = (write - read) | 0;
 		const count = Math.min(available, output[0].length);
@@ -354,17 +349,11 @@ export class SharedRingBuffer {
 			if (((read - readOf(state)) | 0) > 0) {
 				Atomics.compareExchange(this.#state, 0, state, pack(epochOf(state), read));
 			}
+			this.#restall(0, output[0].length);
 			return 0;
 		}
 
-		// Copy samples
-		for (let channel = 0; channel < this.channels; channel++) {
-			const src = this.#samples[channel];
-			const dst = output[channel];
-			for (let i = 0; i < count; i++) {
-				dst[i] = src[slot((read + i) | 0, this.capacity)];
-			}
-		}
+		this.#copyOut(output, read, count);
 
 		// Publish. The exchange fails if anything moved the word since the snapshot above, which
 		// covers both a rebase and a concurrent overflow, so these samples are only ever counted
@@ -376,13 +365,52 @@ export class SharedRingBuffer {
 			for (let channel = 0; channel < this.channels; channel++) output[channel].fill(0, 0, count);
 			return 0;
 		}
-
+		this.#restall(count, output[0].length);
 		return count;
 	}
 
+	/**
+	 * Latency skip: if buffered data exceeds the target, skip ahead to the target. With hysteresis
+	 * (F2) the excess is tolerated up to one chunk (SLACK) first, so an early chunk is held instead
+	 * of thrown away. Disabled in buffered mode, where we deliberately play through the whole buffer.
+	 */
+	#skipAhead(read: number, write: number, latency: number): number {
+		if (this.buffered || latency <= 0) return read;
+		const slack = Atomics.load(this.#control, MODE) & MODE_HYSTERESIS ? Atomics.load(this.#control, SLACK) : 0;
+		const buffered = (write - read) | 0;
+		if (buffered <= latency + slack) return read;
+		const skipTo = (write - latency) | 0;
+		if (((skipTo - read) | 0) <= 0) return read;
+		this.skips++;
+		this.skipped += (skipTo - read) | 0;
+		this.lastSkip = { samples: (skipTo - read) | 0, buffered, latency };
+		return skipTo;
+	}
+
+	/** F2: an underrun re-stalls the ring so it refills to the target before resuming. */
+	#restall(got: number, want: number): void {
+		if (got >= want) return;
+		if ((Atomics.load(this.#control, MODE) & MODE_HYSTERESIS) === 0) return;
+		Atomics.store(this.#control, STALLED, 1);
+	}
+
+	#copyOut(output: Float32Array[], read: number, count: number): void {
+		for (let channel = 0; channel < this.channels; channel++) {
+			const src = this.#samples[channel];
+			const dst = output[channel];
+			for (let i = 0; i < count; i++) {
+				dst[i] = src[slot((read + i) | 0, this.capacity)];
+			}
+		}
+	}
 	/** Update the target latency in samples. */
 	setLatency(samples: number): void {
 		Atomics.store(this.#control, LATENCY, samples);
+	}
+
+	/** Set the F2 mode bits (see MODE_HYSTERESIS). Main thread only. */
+	setMode(mode: number): void {
+		Atomics.store(this.#control, MODE, mode);
 	}
 
 	/**
@@ -463,6 +491,8 @@ export class SharedRingBuffer {
 		}
 
 		Atomics.store(dst.#control, TIMELINE, Atomics.load(this.#control, TIMELINE));
+		Atomics.store(dst.#control, SLACK, Atomics.load(this.#control, SLACK));
+		Atomics.store(dst.#control, MODE, Atomics.load(this.#control, MODE));
 		Atomics.store(dst.#state, 0, pack(epochOf(state), copyStart));
 		Atomics.store(dst.#control, WRITE, write);
 		Atomics.store(dst.#control, LATENCY, latency);

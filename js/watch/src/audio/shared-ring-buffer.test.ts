@@ -52,7 +52,7 @@ describe("initialization", () => {
 		expect(init.capacity).toBe(128);
 		expect(init.rate).toBe(1000);
 		expect(init.samples.byteLength).toBe(2 * 128 * 4); // 2 channels * 128 samples * Float32
-		expect(init.control.byteLength).toBe(4 * 4); // 4 control slots * Int32
+		expect(init.control.byteLength).toBe(6 * 4); // 6 control slots * Int32 (F2 prototype adds SLACK, MODE)
 		expect(init.state.byteLength).toBe(8); // packed epoch + read cursor
 	});
 
@@ -1057,5 +1057,53 @@ describe("re-anchor store ordering", () => {
 			played += worklet.read(out);
 		}
 		expect(played).toBe(320);
+	});
+});
+
+// F2 prototype (MODE_HYSTERESIS): skip only past target + slack, re-stall on underrun.
+describe("F2 hysteresis mode", () => {
+	const HYSTERESIS = 1;
+
+	it("keeps the legacy skip without the mode bit", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 20 });
+		insert(buffer, 0, 60, { channels: 1, value: 1.0 });
+		expect(read(buffer, 128, 1)[0].length).toBe(20); // skipped the first 40
+	});
+
+	it("holds one chunk of slack above the target before skipping", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 20 });
+		buffer.setMode(HYSTERESIS);
+		insert(buffer, 0, 30, { channels: 1, value: 1.0 }); // slack = 30 (largest insert)
+		// 30 buffered <= 20 + 30: nothing is thrown away.
+		expect(read(buffer, 128, 1)[0].length).toBe(30);
+		insert(buffer, 30, 30, { channels: 1, value: 1.0 });
+		insert(buffer, 60, 30, { channels: 1, value: 1.0 }); // 60 buffered > 20 + 30: trim back to 20
+		expect(read(buffer, 128, 1)[0].length).toBe(20);
+		expect(buffer.skips).toBe(1);
+		expect(buffer.skipped).toBe(40);
+	});
+
+	it("re-stalls on an underrun and refills to the target before resuming", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 20 });
+		buffer.setMode(HYSTERESIS);
+		insert(buffer, 0, 20, { channels: 1, value: 1.0 });
+		expect(read(buffer, 20, 1)[0].length).toBe(20);
+		// Nothing left: the short read re-stalls the ring.
+		expect(read(buffer, 20, 1)[0].length).toBe(0);
+		expect(buffer.stalled).toBe(true);
+		// Refilling below the target keeps it parked; reaching the target resumes.
+		insert(buffer, 20, 10, { channels: 1, value: 1.0 });
+		expect(buffer.stalled).toBe(true);
+		insert(buffer, 30, 10, { channels: 1, value: 1.0 });
+		expect(buffer.stalled).toBe(false);
+		expect(read(buffer, 20, 1)[0].length).toBe(20);
+	});
+
+	it("does not re-stall without the mode bit", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 20 });
+		insert(buffer, 0, 20, { channels: 1, value: 1.0 });
+		expect(read(buffer, 20, 1)[0].length).toBe(20);
+		expect(read(buffer, 20, 1)[0].length).toBe(0);
+		expect(buffer.stalled).toBe(false);
 	});
 });

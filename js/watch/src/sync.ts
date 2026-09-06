@@ -22,6 +22,27 @@ export type Delay = "instant" | "auto" | Time.Milli;
 const MIN_JITTER = Time.Milli(20);
 const FALLBACK_JITTER = Time.Milli(100);
 
+// F4 (rtprobe prototype): adaptive sizing from the measured arrival spread.
+const ADAPT_WINDOW = 256; // recent audio frames considered (about 5 s at 20 ms)
+const ADAPT_HEADROOM = Time.Milli(25); // one chunk above the p99 lateness
+const ADAPT_MAX = Time.Milli(1000);
+const ADAPT_SHRINK_AFTER_MS = 10_000; // a lower estimate must hold this long before it applies
+const adaptive = (): boolean => (globalThis as { __rtFlags?: { f4?: boolean } }).__rtFlags?.f4 === true;
+
+/** Sliding window of arrival lateness samples with a percentile read. */
+class Lateness {
+	#values: number[] = [];
+	push(ms: number): void {
+		this.#values.push(ms);
+		if (this.#values.length > ADAPT_WINDOW) this.#values.shift();
+	}
+	percentile(p: number): number | undefined {
+		if (this.#values.length < 20) return undefined;
+		const sorted = [...this.#values].sort((a, b) => a - b);
+		return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+	}
+}
+
 export type SyncInput = {
 	/** How far playback trails the live edge. See {@link Delay}. */
 	delay: Getter<Delay>;
@@ -99,6 +120,11 @@ export class Sync {
 	// Avoids inflating jitter due to bufferbloat.
 	#minRtt: number | undefined;
 
+	// F4: measured arrival lateness of audio frames and the adaptive jitter it currently justifies.
+	#lateness = new Lateness();
+	#adapted = new Signal<Time.Milli | undefined>(undefined);
+	#lowerSince: number | undefined;
+
 	#signals = new Effect();
 
 	constructor(props?: Inputs<SyncInput>) {
@@ -151,7 +177,10 @@ export class Sync {
 			this.#minRtt = this.#minRtt !== undefined ? Math.min(this.#minRtt, rtt) : rtt;
 
 			// Buffer enough for a retransmit (1 RTT for ACK + retransmit).
-			const jitter = Time.Milli(Math.max(MIN_JITTER, this.#minRtt * 1.25));
+			const rttJitter = Time.Milli(Math.max(MIN_JITTER, this.#minRtt * 1.25));
+			// F4: the measured arrival spread is a floor on top of the RTT term.
+			const measured = adaptive() ? effect.get(this.#adapted) : undefined;
+			const jitter = measured === undefined ? rttJitter : Time.Milli(Math.max(rttJitter, measured));
 			this.#out.jitter.set(jitter);
 			return;
 		}
@@ -195,24 +224,9 @@ export class Sync {
 		// Otherwise, chained `wait()` calls would cause a false-positive during CPU starvation.
 		const delay = this.#out.delay.peek();
 		const sleep = Time.Milli.add(Time.Milli.sub(currentRef, ref), delay);
+		if (label === "audio") this.#adapt(Time.Milli.sub(ref, currentRef));
 		rtPush("sync", { label, ts: timestamp, sleep, ref, cur: currentRef, delay });
-		if (sleep < 0) {
-			const entry = this.#late.get(label);
-			if (entry) {
-				entry.count++;
-				entry.maxMs = Math.max(entry.maxMs, -sleep);
-			} else {
-				this.#late.set(label, { count: 1, maxMs: -sleep });
-			}
-		} else {
-			const entry = this.#late.get(label);
-			if (entry) {
-				const prefix = label ? `sync[${label}]` : "sync";
-				const behind = Sync.#formatDuration(entry.maxMs);
-				console.debug(`${prefix}: ${entry.count} late frame(s), max ${behind} behind`);
-				this.#late.delete(label);
-			}
-		}
+		this.#trackLate(label, sleep);
 
 		// Frame isn't earlier than the anchor: it can't add lookahead, so keep the reference.
 		if (ref >= currentRef) return;
@@ -224,6 +238,51 @@ export class Sync {
 
 		// Over the cap: re-anchor down so the resulting lookahead is exactly the cap.
 		this.#setReference(Time.Milli.add(ref, Time.Milli.sub(cap, delay)));
+	}
+
+	// Accumulate late frames per label and log the streak once it ends.
+	#trackLate(label: string, sleep: number): void {
+		const entry = this.#late.get(label);
+		if (sleep < 0) {
+			if (entry) {
+				entry.count++;
+				entry.maxMs = Math.max(entry.maxMs, -sleep);
+			} else {
+				this.#late.set(label, { count: 1, maxMs: -sleep });
+			}
+			return;
+		}
+		if (!entry) return;
+		const prefix = label ? `sync[${label}]` : "sync";
+		const behind = Sync.#formatDuration(entry.maxMs);
+		console.debug(`${prefix}: ${entry.count} late frame(s), max ${behind} behind`);
+		this.#late.delete(label);
+	}
+
+	// F4: fold one audio frame's lateness (how far behind the earliest arrival it came) into the
+	// window and publish the jitter it justifies: raise at once, lower only after a quiet period.
+	#adapt(lateness: number): void {
+		if (!adaptive()) return;
+		this.#lateness.push(Math.max(0, lateness));
+		const p99 = this.#lateness.percentile(0.99);
+		if (p99 === undefined) return;
+		const want = Time.Milli(Math.min(ADAPT_MAX, Math.max(MIN_JITTER, p99 + ADAPT_HEADROOM)));
+		const current = this.#adapted.peek();
+		if (current !== undefined && want < current) {
+			this.#lower(want);
+			return;
+		}
+		if (current === undefined || want > current) this.#adapted.set(want);
+		this.#lowerSince = undefined;
+	}
+
+	// A lower estimate applies only once it has held for the quiet period.
+	#lower(want: Time.Milli): void {
+		const now = Time.Milli.now();
+		this.#lowerSince ??= now;
+		if (now - this.#lowerSince < ADAPT_SHRINK_AFTER_MS) return;
+		this.#adapted.set(want);
+		this.#lowerSince = undefined;
 	}
 
 	#setReference(ref: Time.Milli): void {
@@ -263,28 +322,32 @@ export class Sync {
 		}
 
 		for (;;) {
-			// Switching to "instant" resolves `#update`, so frames parked here wake and leave.
-			if (this.in.delay.peek() === "instant") return;
-
-			// Sleep until it's time to decode the next frame.
-			// NOTE: This function runs in parallel for each frame.
-			const now = Time.Milli.now();
-			const ref = Time.Milli.sub(now, timestamp);
-
-			const currentRef = this.#out.reference.peek();
-			if (currentRef === undefined) return;
-
-			const sleep = Time.Milli.add(Time.Milli.sub(currentRef, ref), this.#out.delay.peek());
-			if (sleep <= 0) return;
-
-			// Skip setTimeout for small sleeps; the timer resolution (~4ms) would overshoot.
-			if (sleep < 5) return;
+			const sleep = this.#sleepFor(timestamp);
+			if (sleep === undefined) return;
 
 			const wait = new Promise((resolve) => setTimeout(resolve, sleep)).then(() => true);
 
 			const ok = await Promise.race([this.#update.promise, wait]);
 			if (ok) return;
 		}
+	}
+
+	// How long the frame at `timestamp` still has to wait, or undefined to render it now.
+	// NOTE: `wait` runs in parallel for each frame.
+	#sleepFor(timestamp: Time.Milli): number | undefined {
+		// Switching to "instant" resolves `#update`, so frames parked here wake and leave.
+		if (this.in.delay.peek() === "instant") return undefined;
+
+		const now = Time.Milli.now();
+		const ref = Time.Milli.sub(now, timestamp);
+
+		const currentRef = this.#out.reference.peek();
+		if (currentRef === undefined) return undefined;
+
+		const sleep = Time.Milli.add(Time.Milli.sub(currentRef, ref), this.#out.delay.peek());
+		// Skip setTimeout for small sleeps; the timer resolution (~4ms) would overshoot.
+		if (sleep < 5) return undefined;
+		return sleep;
 	}
 
 	static #formatDuration(ms: number): string {

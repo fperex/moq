@@ -799,3 +799,51 @@ describe("latency increase re-anchor", () => {
 		expect(buffer.stalled).toBe(false);
 	});
 });
+
+// F2 prototype (mode bit 1): explicit un-stall at the target, skip only past target + one chunk,
+// re-stall on underrun.
+describe("F2 hysteresis mode", () => {
+	const ms = (v: number) => v as Time.Milli;
+	const us = (samples: number, rate: number) => Math.round((samples / rate) * 1_000_000) as Time.Micro;
+	const chunk = (n: number) => [new Float32Array(n).fill(0.5)];
+
+	it("starts at the target and tolerates one chunk above it", () => {
+		const rate = 1000;
+		const buffer = new AudioRingBuffer({ rate, channels: 1, latency: ms(20), mode: 1 });
+		buffer.write(us(0, rate), chunk(10));
+		expect(buffer.stalled).toBe(true);
+		buffer.write(us(10, rate), chunk(10));
+		expect(buffer.stalled).toBe(false); // 20 buffered = target
+		buffer.write(us(20, rate), chunk(10)); // 30 buffered <= 20 + slack 10: kept
+		expect(buffer.skips).toBe(0);
+		expect(buffer.length).toBe(30);
+		buffer.write(us(30, rate), chunk(10)); // 40 > 30: trim back to the target
+		expect(buffer.skips).toBe(1);
+		expect(buffer.length).toBe(20);
+	});
+
+	it("re-stalls on an underrun", () => {
+		const rate = 1000;
+		const buffer = new AudioRingBuffer({ rate, channels: 1, latency: ms(20), mode: 1 });
+		buffer.write(us(0, rate), chunk(20));
+		const out = [new Float32Array(20)];
+		expect(buffer.read(out)).toBe(20);
+		expect(buffer.read(out)).toBe(0);
+		expect(buffer.stalled).toBe(true);
+		buffer.write(us(20, rate), chunk(20));
+		expect(buffer.stalled).toBe(false);
+	});
+
+	it("keeps the legacy overflow un-stall without the mode bit", () => {
+		const rate = 1000;
+		const buffer = new AudioRingBuffer({ rate, channels: 1, latency: ms(20) });
+		buffer.write(us(0, rate), chunk(10));
+		expect(buffer.stalled).toBe(true); // legacy: only reaching capacity (the target) un-stalls
+		buffer.write(us(10, rate), chunk(10));
+		expect(buffer.stalled).toBe(false);
+		expect(buffer.skips).toBe(0); // exactly full discards nothing
+		buffer.write(us(20, rate), chunk(10)); // beyond capacity: the oldest 10 are discarded
+		expect(buffer.skips).toBe(1);
+		expect(buffer.length).toBe(20);
+	});
+});

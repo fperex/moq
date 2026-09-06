@@ -15,6 +15,8 @@ import { reanchorFloor, ringSamples } from "./latency";
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
 
+type Next = NonNullable<Awaited<ReturnType<Container.Consumer["next"]>>>;
+
 // rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
 type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
 const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
@@ -113,11 +115,25 @@ export class Decoder {
 		this.source = source;
 		this.sync = sync;
 
+		this.#signals.run(this.#runLayout.bind(this));
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
 		this.#signals.run(this.#runLatency.bind(this));
 		this.#signals.run(this.#runLatencyReanchor.bind(this));
 		this.#signals.run(this.#runDecoder.bind(this));
+	}
+
+	// F3 (rtprobe prototype): the audio graph depends on the rate and channel count only. Deep
+	// equality on this plain object means a catalog refinement that changes another field (the
+	// advertised jitter) no longer tears the AudioContext down.
+	#layout = new Signal<{ sampleRate: number; channelCount: number } | undefined>(undefined);
+
+	#runLayout(effect: Effect): void {
+		const config = effect.get(this.source.out.config);
+		if (!config) return;
+		const f3 = (globalThis as { __rtFlags?: { f3?: boolean } }).__rtFlags?.f3 === true;
+		if (!f3) return;
+		effect.set(this.#layout, { sampleRate: config.sampleRate, channelCount: config.numberOfChannels });
 	}
 
 	#runWorklet(effect: Effect): void {
@@ -127,14 +143,17 @@ export class Decoder {
 		//const enabled = effect.get(this.enabled);
 		//if (!enabled) return;
 
-		const config = effect.get(this.source.out.config);
+		const f3 = (globalThis as { __rtFlags?: { f3?: boolean } }).__rtFlags?.f3 === true;
+		const config = f3 ? effect.get(this.#layout) : effect.get(this.source.out.config);
 		if (!config) return;
 
 		// Pre-build the graph at the catalog rate so warm-up starts before the first frame arrives. The
 		// decoder's actual output rate is the source of truth (see #emit); if it differs, #emit sets
 		// #decodedSampleRate, which re-runs this effect and rebuilds the graph at the real rate.
 		const sampleRate = effect.get(this.#decodedSampleRate) ?? config.sampleRate;
-		const channelCount = config.numberOfChannels;
+		const channelCount = f3
+			? (config as { channelCount: number }).channelCount
+			: (config as Catalog.AudioConfig).numberOfChannels;
 
 		// Expose the rate the graph actually runs at.
 		effect.set(this.#out.sampleRate, sampleRate);
@@ -320,22 +339,7 @@ export class Decoder {
 			if (!loaded) return; // cancelled
 
 			const warmup = new Warmup(LEGACY_WARMUP_CALLBACKS);
-
-			const decoder = new AudioDecoder({
-				output: (data) => {
-					const decoded = this.#terminal.span(data);
-					if (warmup.drop()) {
-						// Drop initial callbacks to prime the decoder.
-						data.close();
-						return;
-					}
-					this.#emit(data, decoded);
-				},
-				error: (error) => console.error("audio decoder error", error),
-			});
-			effect.cleanup(() => {
-				if (decoder.state !== "closed") decoder.close();
-			});
+			const decoder = this.#createDecoder(effect, warmup);
 
 			// Opus in CMAF uses raw packets; dOps is not a valid OGG Identification Header.
 			const description =
@@ -349,46 +353,84 @@ export class Decoder {
 				description,
 			};
 			decoder.configure(decoderConfig);
-
-			for (;;) {
-				const next = await consumer.next();
-				if (!next) break;
-				if (this.#onNext(next)) {
-					decoder.reset();
-					decoder.configure(decoderConfig);
-				}
-				if (next.end !== undefined) {
-					continue;
-				}
-
-				const { frame } = next;
-				if (!frame) continue;
-
-				// Mark that we received this frame right now.
-				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
-				this.sync.received(timestamp, "audio");
-				rtPush("aud.frame", { ts: frame.timestamp, bytes: frame.payload.byteLength });
-
-				this.#out.stats.update((stats) => ({
-					bytesReceived: (stats?.bytesReceived ?? 0) + frame.payload.byteLength,
-				}));
-
-				// Backpressure: in buffered mode this holds the encoded frame until the playhead nears
-				// it, keeping the lookahead above the floor as Opus instead of decoded PCM. No-op live.
-				await this.#ring?.wait(frame.timestamp as Time.Micro);
-
-				const chunk = new EncodedAudioChunk({
-					type: frame.keyframe ? "key" : "delta",
-					data: frame.payload,
-					timestamp: frame.timestamp,
-				});
-
-				// A fatal decode error closes the decoder, so decoding again throws InvalidStateError out
-				// of this loop. Stop instead: the error callback already reported the real failure.
-				if (decoder.state === "closed") break;
-				decoder.decode(chunk);
-			}
+			await this.#decodeLoop(consumer, decoder, decoderConfig, true);
 		});
+	}
+
+	/** Build the WebCodecs decoder, closed with the effect. A warm-up drops its priming callbacks. */
+	#createDecoder(effect: Effect, warmup?: Warmup): AudioDecoder {
+		const decoder = new AudioDecoder({
+			output: (data) => this.#output(data, warmup),
+			error: (error) => console.error("audio decoder error", error),
+		});
+		effect.cleanup(() => {
+			if (decoder.state !== "closed") decoder.close();
+		});
+		return decoder;
+	}
+
+	#output(data: AudioData, warmup?: Warmup): void {
+		const decoded = this.#terminal.span(data);
+		if (warmup?.drop()) {
+			// Drop initial callbacks to prime the decoder.
+			data.close();
+			return;
+		}
+		this.#emit(data, decoded);
+	}
+
+	/**
+	 * Feed container frames to the decoder until the consumer ends or the decoder closes.
+	 * `skipEnd` ignores endpoint markers (the legacy container's behaviour).
+	 */
+	async #decodeLoop(
+		consumer: Container.Consumer,
+		decoder: AudioDecoder,
+		decoderConfig: AudioDecoderConfig,
+		skipEnd: boolean,
+	): Promise<void> {
+		for (;;) {
+			const next = await consumer.next();
+			if (!next) return;
+			this.#epoch(next, decoder, decoderConfig);
+			const frame = skipEnd && next.end !== undefined ? undefined : next.frame;
+			if (frame && !(await this.#decodeFrame(decoder, frame))) return;
+		}
+	}
+
+	/** Reset and re-anchor before decoding the first frame of a new codec epoch. */
+	#epoch(next: Next, decoder: AudioDecoder, decoderConfig: AudioDecoderConfig): void {
+		if (!this.#onNext(next)) return;
+		decoder.reset();
+		decoder.configure(decoderConfig);
+	}
+
+	/** One frame: account it, honour buffered-mode backpressure, decode. False once the decoder closed. */
+	async #decodeFrame(decoder: AudioDecoder, frame: Container.Frame): Promise<boolean> {
+		// Mark that we received this frame right now.
+		const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
+		this.sync.received(timestamp, "audio");
+		rtPush("aud.frame", { ts: frame.timestamp, bytes: frame.payload.byteLength });
+
+		this.#out.stats.update((stats) => ({
+			bytesReceived: (stats?.bytesReceived ?? 0) + frame.payload.byteLength,
+		}));
+
+		// Backpressure: in buffered mode this holds the encoded frame until the playhead nears
+		// it, keeping the lookahead above the floor as Opus instead of decoded PCM. No-op live.
+		await this.#ring?.wait(frame.timestamp as Time.Micro);
+
+		// A fatal decode error closes the decoder, so decoding again throws InvalidStateError out
+		// of this loop. Stop instead: the error callback already reported the real failure.
+		if (decoder.state === "closed") return false;
+		decoder.decode(
+			new EncodedAudioChunk({
+				type: frame.keyframe ? "key" : "delta",
+				data: frame.payload,
+				timestamp: frame.timestamp,
+			}),
+		);
+		return true;
 	}
 
 	#runCmafDecoder(effect: Effect, sub: Moq.Track.Subscriber, config: Catalog.AudioConfig): void {
@@ -425,13 +467,7 @@ export class Decoder {
 			const loaded = await Util.Libav.polyfill();
 			if (!loaded) return; // cancelled
 
-			const decoder = new AudioDecoder({
-				output: (data) => this.#emit(data),
-				error: (error) => console.error("audio decoder error", error),
-			});
-			effect.cleanup(() => {
-				if (decoder.state !== "closed") decoder.close();
-			});
+			const decoder = this.#createDecoder(effect);
 
 			// Configure decoder with description from catalog
 			const decoderConfig: AudioDecoderConfig = {
@@ -441,41 +477,7 @@ export class Decoder {
 				description,
 			};
 			decoder.configure(decoderConfig);
-
-			for (;;) {
-				const next = await consumer.next();
-				if (!next) break;
-
-				// Reset and re-anchor before decoding the first frame of a new codec epoch.
-				if (this.#onNext(next)) {
-					decoder.reset();
-					decoder.configure(decoderConfig);
-				}
-
-				const { frame } = next;
-				if (!frame) continue;
-
-				const timestamp = Time.Milli.fromMicro(frame.timestamp);
-				this.sync.received(timestamp, "audio");
-				rtPush("aud.frame", { ts: frame.timestamp, bytes: frame.payload.byteLength });
-
-				this.#out.stats.update((stats) => ({
-					bytesReceived: (stats?.bytesReceived ?? 0) + frame.payload.byteLength,
-				}));
-
-				// Backpressure: in buffered mode this holds the encoded frame until the playhead nears
-				// it, keeping the lookahead above the floor as Opus instead of decoded PCM. No-op live.
-				await this.#ring?.wait(frame.timestamp);
-
-				if (decoder.state === "closed") break;
-				decoder.decode(
-					new EncodedAudioChunk({
-						type: frame.keyframe ? "key" : "delta",
-						data: frame.payload,
-						timestamp: frame.timestamp,
-					}),
-				);
-			}
+			await this.#decodeLoop(consumer, decoder, decoderConfig, false);
 		});
 	}
 
@@ -613,27 +615,27 @@ async function supported(config: Catalog.AudioConfig): Promise<boolean> {
 		console.warn(`audio: opus advertised at ${config.sampleRate}Hz, which some browsers cannot decode`);
 	}
 
-	// Opus in CMAF uses raw packets; dOps is not a valid OGG Identification Header.
-	let description: Uint8Array | undefined;
-	if (config.codec !== "opus") {
-		if (config.description) {
-			description = Util.Hex.toBytes(config.description);
-		} else if (config.container.kind === "cmaf") {
-			try {
-				description = Container.Cmaf.decodeInitSegment(base64ToBytes(config.container.init)).description;
-			} catch (err) {
-				// A malformed init segment means we can't extract the codec
-				// description, so we can't probe support reliably. Reject the
-				// track rather than letting isConfigSupported pass on a
-				// description-less config and then having decode() fail later.
-				console.warn(`audio: malformed CMAF init segment for codec ${config.codec}`, err);
-				return false;
-			}
-		}
-	}
+	const description = describe(config);
+	if (description === null) return false;
 	const res = await AudioDecoder.isConfigSupported({
 		...config,
 		description,
 	});
 	return res.supported ?? false;
+}
+
+// The decoder description to probe with: none for Opus (raw packets; dOps is not a valid OGG
+// Identification Header), the catalog's or the CMAF init segment's otherwise. Null means the init
+// segment is malformed, so support cannot be probed and the track is rejected rather than letting
+// isConfigSupported pass on a description-less config and having decode() fail later.
+function describe(config: Catalog.AudioConfig): Uint8Array | undefined | null {
+	if (config.codec === "opus") return undefined;
+	if (config.description) return Util.Hex.toBytes(config.description);
+	if (config.container.kind !== "cmaf") return undefined;
+	try {
+		return Container.Cmaf.decodeInitSegment(base64ToBytes(config.container.init)).description;
+	} catch (err) {
+		console.warn(`audio: malformed CMAF init segment for codec ${config.codec}`, err);
+		return null;
+	}
 }

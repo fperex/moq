@@ -1,10 +1,12 @@
 import { Time } from "@moq/net";
 import { Effect, type Getter, Signal } from "@moq/signals";
 import type { Data, InitPost, InitShared, Latency, Reset, State, Truncate } from "./render";
-import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
+import { allocSharedRingBuffer, MODE_HYSTERESIS, SharedRingBuffer } from "./shared-ring-buffer";
 
 // rtprobe (throwaway diagnostics): the page defines globalThis.__rt; absent in tests.
 type RtSink = { push: (k: string, o: Record<string, unknown>) => void };
+// F2 prototype switch: the page sets globalThis.__rtFlags from ?rt=f2 (see console-overlay.ts).
+const rtMode = (): number => ((globalThis as { __rtFlags?: { f2?: boolean } }).__rtFlags?.f2 ? MODE_HYSTERESIS : 0);
 const rtPush = (k: string, o: Record<string, unknown>) => (globalThis as { __rt?: RtSink }).__rt?.push(k, o);
 
 /**
@@ -169,6 +171,7 @@ class SharedAudioBuffer implements AudioBuffer {
 		const init = allocSharedRingBuffer(channels, capacity, rate, buffered);
 		this.#ring = new SharedRingBuffer(init);
 		this.#ring.setLatency(latencySamples);
+		this.#ring.setMode(rtMode());
 
 		const msg: InitShared = { type: "init-shared", ...init };
 		worklet.port.postMessage(msg);
@@ -268,7 +271,7 @@ class PostAudioBuffer implements AudioBuffer {
 		this.#backpressure = new Backpressure(buffered, samplesToMicro(latencySamples, rate));
 
 		const latency = Time.Milli.fromSecond((latencySamples / rate) as Time.Second);
-		const msg: InitPost = { type: "init-post", channels, rate, latency, buffered };
+		const msg: InitPost = { type: "init-post", channels, rate, latency, buffered, mode: rtMode() };
 		worklet.port.postMessage(msg);
 
 		// Listen for state updates from the worklet.
