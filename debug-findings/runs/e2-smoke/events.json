@@ -1,0 +1,157 @@
+{
+ "meta": {
+  "tag": "e2-smoke",
+  "relay": "http://localhost:4443",
+  "name": "bbb.hang",
+  "presets": [
+   "auto"
+  ],
+  "holdMs": 20000,
+  "publisher": "cmd",
+  "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+  "branch": "debug/rt-audio",
+  "chrome": {
+   "Browser": "Chrome/152.0.7977.82",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+   "V8-Version": "15.2.124.21",
+   "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/97c0a476-7c58-423e-8ce6-85dbd67b2d8c"
+  },
+  "startedAt": "2026-09-06T14:55:17.293Z"
+ },
+ "events": [
+  {
+   "e": 1788706525307,
+   "event": "start",
+   "relayLogOffset": 7608,
+   "meta": {
+    "tag": "e2-smoke",
+    "relay": "http://localhost:4443",
+    "name": "bbb.hang",
+    "presets": [
+     "auto"
+    ],
+    "holdMs": 20000,
+    "publisher": "cmd",
+    "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+    "branch": "debug/rt-audio",
+    "chrome": {
+     "Browser": "Chrome/152.0.7977.82",
+     "Protocol-Version": "1.3",
+     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+     "V8-Version": "15.2.124.21",
+     "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+     "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/97c0a476-7c58-423e-8ce6-85dbd67b2d8c"
+    },
+    "startedAt": "2026-09-06T14:55:17.293Z"
+   }
+  },
+  {
+   "e": 1788706525309,
+   "event": "watch-open-auto",
+   "relayLogOffset": 7608,
+   "preset": "auto"
+  },
+  {
+   "e": 1788706525884,
+   "event": "watch-live-auto",
+   "relayLogOffset": 11983,
+   "preset": "auto",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -5603.113000001192,
+    "astalled": false,
+    "abufMs": 0.1,
+    "abytes": 14906,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 23,
+    "catalogAudio": "{\"renditions\":{\"1.m4s\":{\"codec\":\"mp4a.40.2\",\"container\":{\"kind\":\"cmaf\",\"init\":\"AAAAHGZ0eXBpc29tAAACAGlzb21pc282bXA0MQAAAqxtb292AAAAeG12aGQBAAAAAAAAAAAAAAAAAAAAAAAAAAA11UAAAAAAAAAAAAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAKG12ZXgAAAAgdHJleAAAAAAAAAACAAAAAQAAAAAAAAAAAAAAAAAAAgR0cmFrAAAAaHRraGQBAAAHAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAFwbWRpYQAAACxtZGhkAQAAAAAAAAAAAAAAAAAAAAAAAAAAAKxEAAAAAAAAAABVxAAAAAAAQmhkbHIAAAAAAAAAAHNvdW4AAAAAAAAAAAAAA",
+    "catalogVideo": "{\"renditions\":{\"0.m4s\":{\"codec\":\"avc1.64001f\",\"container\":{\"kind\":\"cmaf\",\"init\":\"AAAAHGZ0eXBpc29tAAACAGlzb21pc282bXA0MQAAAwVtb292AAAAeG12aGQBAAAAAAAAAAAAAAAAAAAAAAAAAAA11UAAAAAAAAAAAAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAKG12ZXgAAAAgdHJleAAAAAAAAAABAAAAAQAAAAAAAAAAAAAAAAAAAl10cmFrAAAAaHRraGQBAAAHAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAABQAAAALQAAAAAAG9bWRpYQAAACxtZGhkAQAAAAAAAAAAAAAAAAAAAAAAAAAAAF3AAAAAAAAAAABVxAAAAAAAQmhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAA"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788706535886,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 25984,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -5610.885000020266,
+    "astalled": false,
+    "abufMs": 0.1,
+    "abytes": 176613,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 263
+   }
+  },
+  {
+   "e": 1788706545888,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 39132,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -5610.885000020266,
+    "astalled": false,
+    "abufMs": 0,
+    "abytes": 337755,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 503
+   }
+  },
+  {
+   "e": 1788706545890,
+   "event": "watch-close-auto",
+   "relayLogOffset": 39132,
+   "preset": "auto",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -5610.885000020266,
+    "astalled": false,
+    "abufMs": 0,
+    "abytes": 337755,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 503
+   }
+  },
+  {
+   "e": 1788706548894,
+   "event": "done",
+   "relayLogOffset": 42638
+  }
+ ]
+}

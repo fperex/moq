@@ -1,0 +1,180 @@
+{
+ "tag": "e5-remote-auto-a",
+ "presets": {
+  "auto": {
+   "windowSec": 55.1,
+   "rate": 44100,
+   "ringTargetMs": 55.5,
+   "lastTargetMs": 51.8,
+   "chunkMs": 23.2,
+   "resolved": {
+    "jitter": 48.75,
+    "delay": 51.75,
+    "maxAge": 51.75,
+    "rtt": 39,
+    "ajitter": 3,
+    "transport": "webtransport",
+    "arate": 44100
+   },
+   "catalogAudio": "{\"renditions\":{\"0.aac\":{\"codec\":\"mp4a.40.2\",\"container\":{\"kind\":\"legacy\"},\"description\":\"1210\",\"sampleRate\":44100,\"numberOfChannels\":2,\"bitrate\":155803,\"jitter\":0}}}",
+   "worklet": {
+    "quanta": 19000,
+    "underrunMsPerMin": 39664.3,
+    "stalledQuantaFrac": 0.8,
+    "windowWallMs": {
+     "n": 189,
+     "p50": 288.2,
+     "p90": 297.5,
+     "p99": 305,
+     "max": 305.1,
+     "min": 276.3
+    }
+   },
+   "underruns": {
+    "perMin": 368.9,
+    "totalMsPerMin": 39600.6,
+    "episodeMs": {
+     "n": 339,
+     "p50": 105,
+     "p90": 151.4,
+     "p99": 174.6,
+     "max": 302.3,
+     "min": 2.9
+    }
+   },
+   "skips": {
+    "perMin": 406.9,
+    "totalMsPerMin": 36029.3,
+    "skipMs": {
+     "n": 374,
+     "p50": 105,
+     "p90": 110.8,
+     "p99": 134,
+     "max": 134,
+     "min": 0.5
+    }
+   },
+   "inserts": {
+    "n": 2155,
+    "driftMsPerS": -0.6,
+    "dryFrac": 14.8,
+    "bufferedBeforeMs": {
+     "n": 2155,
+     "p50": 63.9,
+     "p90": 133.5,
+     "p99": 139.3,
+     "max": 162.5,
+     "min": 0
+    },
+    "arrivalLatenessMs": {
+     "n": 2155,
+     "p50": 195.5,
+     "p90": 385.2,
+     "p99": 580.9,
+     "max": 668.4,
+     "min": 0
+    }
+   },
+   "network": {
+    "frames": 2236,
+    "driftMsPerS": 0.1,
+    "latenessMs": {
+     "n": 2236,
+     "p50": 112.5,
+     "p90": 174.2,
+     "p99": 206.9,
+     "max": 234.1,
+     "min": 0
+    },
+    "interArrivalMs": {
+     "n": 2235,
+     "p50": 1.6,
+     "p90": 131.9,
+     "p99": 199.4,
+     "max": 244.2,
+     "min": 0
+    },
+    "decodeLatencyMs": {
+     "n": 2056,
+     "p50": 14.3,
+     "p90": 283.6,
+     "p99": 486.2,
+     "max": 556.4,
+     "min": 0.1
+    },
+    "pubToWatchMs": {
+     "n": 0,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    },
+    "audioTrack": "0.aac",
+    "audioGroups": 2344,
+    "videoGroups": 23,
+    "groupSkips": 826,
+    "groupErrs": 0,
+    "netStale": 32
+   },
+   "sync": {
+    "videoLatePerMin": 731.2,
+    "videoLateMs": {
+     "n": 672,
+     "p50": 15.4,
+     "p90": 32.4,
+     "p99": 52.3,
+     "max": 82.8,
+     "min": 0
+    },
+    "audioLatePerMin": 1771.4,
+    "audioLateMs": {
+     "n": 1628,
+     "p50": 61.2,
+     "p90": 114,
+     "p99": 145.9,
+     "max": 173.6,
+     "min": 0.1
+    },
+    "refChanges": 213
+   },
+   "poll": {
+    "abufMs": {
+     "n": 221,
+     "p50": 0,
+     "p90": 116.1,
+     "p99": 162.6,
+     "max": 185.8,
+     "min": 0
+    },
+    "catalogChanges": 0,
+    "fps": 23.9,
+    "astalledPct": 1.4,
+    "vstalledPct": 0,
+    "lastStatus": "live"
+   },
+   "console": [
+    "skipping slow group: track=0.aac 28144141 -> 28144142",
+    "skipping slow group: track=0.aac 28144142 -> 28144143",
+    "skipping slow group: track=0.aac 28144147 -> 28144148",
+    "skipping slow group: track=0.aac 28144148 -> 28144149",
+    "skipping slow group: track=0.aac 28144149 -> 28144150",
+    "skipping slow group: track=0.aac 28144150 -> 28144151",
+    "skipping slow group: track=0.aac 28144156 -> 28144157",
+    "skipping slow group: track=0.aac 28144157 -> 28144160",
+    "skipping slow group: track=0.aac 28144168 -> 28144169",
+    "skipping slow group: track=0.aac 28144169 -> 28144170",
+    "skipping slow group: track=0.aac 28144170 -> 28144171",
+    "skipping slow group: track=0.aac 28144171 -> 28144172",
+    "skipping slow group: track=0.aac 28144176 -> 28144177",
+    "skipping slow group: track=0.aac 28144177 -> 28144178",
+    "skipping slow group: track=0.aac 28144178 -> 28144179",
+    "skipping slow group: track=0.aac 28144185 -> 28144186",
+    "skipping slow group: track=0.aac 28144189 -> 28144190",
+    "skipping slow group: track=0.aac 28144191 -> 28144192",
+    "skipping slow group: track=0.aac 28144196 -> 28144197",
+    "skipping slow group: track=0.aac 28144197 -> 28144198"
+   ]
+  }
+ }
+}

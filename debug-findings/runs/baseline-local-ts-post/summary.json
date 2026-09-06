@@ -1,0 +1,368 @@
+{
+ "tag": "baseline-local-ts-post",
+ "presets": {
+  "500ms": {
+   "windowSec": 55.2,
+   "rate": 44100,
+   "ringTargetMs": 526,
+   "lastTargetMs": null,
+   "chunkMs": 23.2,
+   "resolved": {
+    "jitter": 500,
+    "delay": 526,
+    "maxAge": 526,
+    "rtt": 1,
+    "ajitter": 26,
+    "transport": "webtransport",
+    "arate": 44100
+   },
+   "catalogAudio": "{\"renditions\":{\"0.aac\":{\"codec\":\"mp4a.40.2\",\"container\":{\"kind\":\"legacy\"},\"description\":\"1210\",\"sampleRate\":44100,\"numberOfChannels\":2,\"bitrate\":139212,\"jitter\":23}}}",
+   "worklet": {
+    "quanta": 19000,
+    "underrunMsPerMin": 0,
+    "stalledQuantaFrac": 0,
+    "windowWallMs": {
+     "n": 189,
+     "p50": 288.1,
+     "p90": 293.5,
+     "p99": 298.8,
+     "max": 298.8,
+     "min": 286.1
+    },
+    "readGapMs": {
+     "n": 190,
+     "p50": 6,
+     "p90": 11,
+     "p99": 11,
+     "max": 11,
+     "min": 6
+    },
+    "readBurstMax": {
+     "n": 190,
+     "p50": 1,
+     "p90": 1,
+     "p99": 1,
+     "max": 1,
+     "min": 1
+    },
+    "readBurstPct": 45.1
+   },
+   "underruns": {
+    "perMin": 0,
+    "totalMsPerMin": 0,
+    "episodeMs": {
+     "n": 0,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    }
+   },
+   "skips": {
+    "perMin": 0,
+    "totalMsPerMin": 6.3,
+    "skipMs": {
+     "n": 0,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    }
+   },
+   "inserts": {
+    "n": 2371,
+    "driftMsPerS": 0.1,
+    "dryFrac": 0,
+    "bufferedBeforeMs": {
+     "n": 2371,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    },
+    "arrivalLatenessMs": {
+     "n": 2371,
+     "p50": 96.3,
+     "p90": 157.8,
+     "p99": 179.6,
+     "max": 207.8,
+     "min": 0
+    }
+   },
+   "network": {
+    "frames": 2371,
+    "driftMsPerS": 0.1,
+    "latenessMs": {
+     "n": 2371,
+     "p50": 96.2,
+     "p90": 157.7,
+     "p99": 178.1,
+     "max": 207.3,
+     "min": 0
+    },
+    "interArrivalMs": {
+     "n": 2370,
+     "p50": 0,
+     "p90": 160.7,
+     "p99": 173.6,
+     "max": 211.3,
+     "min": 0
+    },
+    "decodeLatencyMs": {
+     "n": 2225,
+     "p50": 3416.2,
+     "p90": 3458.8,
+     "p99": 3476.9,
+     "max": 3502,
+     "min": 3205.4
+    },
+    "pubToWatchMs": {
+     "n": 0,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    },
+    "audioTrack": "0.aac",
+    "audioGroups": 2371,
+    "videoGroups": 23,
+    "groupSkips": 0,
+    "groupErrs": 0,
+    "netStale": 0
+   },
+   "sync": {
+    "videoLatePerMin": 0,
+    "videoLateMs": {
+     "n": 0,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    },
+    "audioLatePerMin": 0,
+    "audioLateMs": {
+     "n": 0,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    },
+    "refChanges": 2
+   },
+   "poll": {
+    "abufMs": {
+     "n": 220,
+     "p50": 418.6,
+     "p90": 485.4,
+     "p99": 508.6,
+     "max": 523.1,
+     "min": 325.8
+    },
+    "catalogChanges": 0,
+    "fps": 23.8,
+    "astalledPct": 0,
+    "vstalledPct": 0,
+    "lastStatus": "live"
+   },
+   "console": []
+  },
+  "auto": {
+   "windowSec": 55.2,
+   "rate": 44100,
+   "ringTargetMs": 46,
+   "lastTargetMs": null,
+   "chunkMs": 23.2,
+   "resolved": {
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "rtt": 1,
+    "ajitter": 26,
+    "transport": "webtransport",
+    "arate": 44100
+   },
+   "catalogAudio": "{\"renditions\":{\"0.aac\":{\"codec\":\"mp4a.40.2\",\"container\":{\"kind\":\"legacy\"},\"description\":\"1210\",\"sampleRate\":44100,\"numberOfChannels\":2,\"bitrate\":129906,\"jitter\":23}}}",
+   "worklet": {
+    "quanta": 18600,
+    "underrunMsPerMin": 43871.1,
+    "stalledQuantaFrac": 0.1,
+    "windowWallMs": {
+     "n": 185,
+     "p50": 288.1,
+     "p90": 293.6,
+     "p99": 796.9,
+     "max": 960.4,
+     "min": 286.3
+    },
+    "readGapMs": {
+     "n": 186,
+     "p50": 6,
+     "p90": 11,
+     "p99": 255,
+     "max": 257,
+     "min": 6
+    },
+    "readBurstMax": {
+     "n": 186,
+     "p50": 1,
+     "p90": 1,
+     "p99": 2,
+     "max": 3,
+     "min": 1
+    },
+    "readBurstPct": 45.2
+   },
+   "underruns": {
+    "perMin": 354.7,
+    "totalMsPerMin": 43722.2,
+    "episodeMs": {
+     "n": 326,
+     "p50": 119.4,
+     "p90": 148,
+     "p99": 258.8,
+     "max": 302.3,
+     "min": 61.4
+    }
+   },
+   "skips": {
+    "perMin": 0,
+    "totalMsPerMin": 194.4,
+    "skipMs": {
+     "n": 0,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    }
+   },
+   "inserts": {
+    "n": 600,
+    "driftMsPerS": 114.6,
+    "dryFrac": 0,
+    "bufferedBeforeMs": {
+     "n": 600,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    },
+    "arrivalLatenessMs": {
+     "n": 600,
+     "p50": 8857.9,
+     "p90": 18336.2,
+     "p99": 21280,
+     "max": 21562.9,
+     "min": 0
+    }
+   },
+   "network": {
+    "frames": 609,
+    "driftMsPerS": 0,
+    "latenessMs": {
+     "n": 609,
+     "p50": 33.4,
+     "p90": 145.1,
+     "p99": 171,
+     "max": 208.3,
+     "min": 0
+    },
+    "interArrivalMs": {
+     "n": 608,
+     "p50": 144.7,
+     "p90": 169.8,
+     "p99": 200.3,
+     "max": 342.6,
+     "min": 0
+    },
+    "decodeLatencyMs": {
+     "n": 137,
+     "p50": 8287.4,
+     "p90": 18724.6,
+     "p99": 21462.1,
+     "max": 21659,
+     "min": 330.9
+    },
+    "pubToWatchMs": {
+     "n": 0,
+     "p50": null,
+     "p90": null,
+     "p99": null,
+     "max": null,
+     "min": null
+    },
+    "audioTrack": "0.aac",
+    "audioGroups": 1010,
+    "videoGroups": 23,
+    "groupSkips": 402,
+    "groupErrs": 0,
+    "netStale": 0
+   },
+   "sync": {
+    "videoLatePerMin": 966.1,
+    "videoLateMs": {
+     "n": 888,
+     "p50": 7.9,
+     "p90": 11.8,
+     "p99": 14.8,
+     "max": 38.7,
+     "min": 0.1
+    },
+    "audioLatePerMin": 225.2,
+    "audioLateMs": {
+     "n": 207,
+     "p50": 7.8,
+     "p90": 118.2,
+     "p99": 133.8,
+     "max": 161.3,
+     "min": 0
+    },
+    "refChanges": 1
+   },
+   "poll": {
+    "abufMs": {
+     "n": 220,
+     "p50": 0,
+     "p90": 34.4,
+     "p99": 46.5,
+     "max": 46.5,
+     "min": 0
+    },
+    "catalogChanges": 2,
+    "fps": 23.8,
+    "astalledPct": 1.4,
+    "vstalledPct": 0,
+    "lastStatus": "live"
+   },
+   "console": [
+    "skipping slow group: track=0.aac 523 -> 527",
+    "skipping slow group: track=0.aac 532 -> 534",
+    "skipping slow group: track=0.aac 537 -> 541",
+    "skipping slow group: track=0.aac 547 -> 548",
+    "skipping slow group: track=0.aac 553 -> 555",
+    "skipping slow group: track=0.aac 558 -> 562",
+    "skipping slow group: track=0.aac 569 -> 570",
+    "skipping slow group: track=0.aac 570 -> 577",
+    "skipping slow group: track=0.aac 571 -> 576",
+    "skipping slow group: track=0.aac 583 -> 584",
+    "skipping slow group: track=0.aac 584 -> 591",
+    "skipping slow group: track=0.aac 586 -> 590",
+    "skipping slow group: track=0.aac 597 -> 598",
+    "skipping slow group: track=0.aac 598 -> 605",
+    "skipping slow group: track=0.aac 599 -> 604",
+    "skipping slow group: track=0.aac 611 -> 612",
+    "skipping slow group: track=0.aac 612 -> 619",
+    "skipping slow group: track=0.aac 613 -> 618",
+    "skipping slow group: track=0.aac 622 -> 626",
+    "skipping slow group: track=0.aac 628 -> 632"
+   ]
+  }
+ }
+}

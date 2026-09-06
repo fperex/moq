@@ -1,0 +1,589 @@
+{
+ "meta": {
+  "tag": "p4-local-faithful",
+  "relay": "http://localhost:4443",
+  "name": "rt/p4-local-faithful.hang",
+  "presets": [
+   "auto",
+   "100ms",
+   "500ms"
+  ],
+  "holdMs": 45000,
+  "publisher": "harness",
+  "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+  "branch": "debug/rt-audio",
+  "chrome": {
+   "Browser": "Chrome/152.0.7977.82",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+   "V8-Version": "15.2.124.21",
+   "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9226/devtools/browser/08130ae5-cf74-460f-90f9-6a0eb108662a"
+  },
+  "startedAt": "2026-09-06T15:24:22.564Z"
+ },
+ "events": [
+  {
+   "e": 1788708265582,
+   "event": "start",
+   "relayLogOffset": 685,
+   "meta": {
+    "tag": "p4-local-faithful",
+    "relay": "http://localhost:4443",
+    "name": "rt/p4-local-faithful.hang",
+    "presets": [
+     "auto",
+     "100ms",
+     "500ms"
+    ],
+    "holdMs": 45000,
+    "publisher": "harness",
+    "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+    "branch": "debug/rt-audio",
+    "chrome": {
+     "Browser": "Chrome/152.0.7977.82",
+     "Protocol-Version": "1.3",
+     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+     "V8-Version": "15.2.124.21",
+     "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+     "webSocketDebuggerUrl": "ws://127.0.0.1:9226/devtools/browser/08130ae5-cf74-460f-90f9-6a0eb108662a"
+    },
+    "startedAt": "2026-09-06T15:24:22.564Z"
+   }
+  },
+  {
+   "e": 1788708266990,
+   "event": "publisher-established",
+   "relayLogOffset": 1881
+  },
+  {
+   "e": 1788708266990,
+   "event": "watch-open-auto",
+   "relayLogOffset": 1881,
+   "preset": "auto"
+  },
+  {
+   "e": 1788708267579,
+   "event": "watch-live-auto",
+   "relayLogOffset": 14654,
+   "preset": "auto",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1408.9090000083447,
+    "astalled": true,
+    "abufMs": 60,
+    "abytes": 1807,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 7,
+    "catalogAudio": "{\"renditions\":{\"audio\":{\"codec\":\"opus\",\"container\":{\"kind\":\"legacy\"},\"description\":\"4f707573486561640102380180bb0000000000\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"jitter\":20}}}",
+    "catalogVideo": "{\"renditions\":{\"video\":{\"codec\":\"avc1.640028\",\"container\":{\"kind\":\"legacy\"},\"codedWidth\":1280,\"codedHeight\":720,\"framerate\":30.000030517578125,\"bitrate\":1935361,\"optimizeForLatency\":true,\"jitter\":34}},\"display\":{\"width\":1280,\"height\":720}}"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788708277581,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 241215,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1409.4639999964238,
+    "astalled": false,
+    "abufMs": 63,
+    "abytes": 83139,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 307
+   }
+  },
+  {
+   "e": 1788708287583,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 467977,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1409.4639999964238,
+    "astalled": false,
+    "abufMs": 68.33,
+    "abytes": 164269,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 607
+   }
+  },
+  {
+   "e": 1788708297584,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 695712,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1409.4639999964238,
+    "astalled": false,
+    "abufMs": 63,
+    "abytes": 245254,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 907
+   }
+  },
+  {
+   "e": 1788708307585,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 923447,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1409.4639999964238,
+    "astalled": false,
+    "abufMs": 63,
+    "abytes": 326685,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1207
+   }
+  },
+  {
+   "e": 1788708317587,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 1151182,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1409.4639999964238,
+    "astalled": false,
+    "abufMs": 63,
+    "abytes": 408006,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1507
+   }
+  },
+  {
+   "e": 1788708317588,
+   "event": "watch-close-auto",
+   "relayLogOffset": 1151182,
+   "preset": "auto",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1409.4639999964238,
+    "astalled": false,
+    "abufMs": 63,
+    "abytes": 408006,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1507
+   }
+  },
+  {
+   "e": 1788708320591,
+   "event": "watch-open-100ms",
+   "relayLogOffset": 1153605,
+   "preset": "100ms"
+  },
+  {
+   "e": 1788708321158,
+   "event": "watch-live-100ms",
+   "relayLogOffset": 1165568,
+   "preset": "100ms",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 100,
+    "delay": 123,
+    "maxAge": 123,
+    "ref": -55006.66900000953,
+    "astalled": true,
+    "abufMs": 60,
+    "abytes": 1687,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 46,
+    "catalogAudio": "{\"renditions\":{\"audio\":{\"codec\":\"opus\",\"container\":{\"kind\":\"legacy\"},\"description\":\"4f707573486561640102380180bb0000000000\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"jitter\":20}}}",
+    "catalogVideo": "{\"renditions\":{\"video\":{\"codec\":\"avc1.640028\",\"container\":{\"kind\":\"legacy\"},\"codedWidth\":1280,\"codedHeight\":720,\"framerate\":30.000030517578125,\"bitrate\":1935361,\"optimizeForLatency\":true,\"jitter\":34}},\"display\":{\"width\":1280,\"height\":720}}"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788708331159,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": 1393303,
+   "preset": "100ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 100,
+    "delay": 123,
+    "maxAge": 123,
+    "ref": -55007.21900001073,
+    "astalled": false,
+    "abufMs": 120.33,
+    "abytes": 83181,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 346
+   }
+  },
+  {
+   "e": 1788708341161,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": 1621038,
+   "preset": "100ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 100,
+    "delay": 123,
+    "maxAge": 123,
+    "ref": -55007.4240000143,
+    "astalled": false,
+    "abufMs": 120.33,
+    "abytes": 164369,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 646
+   }
+  },
+  {
+   "e": 1788708351162,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": 1848773,
+   "preset": "100ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 100,
+    "delay": 123,
+    "maxAge": 123,
+    "ref": -55007.4240000143,
+    "astalled": false,
+    "abufMs": 120.33,
+    "abytes": 245831,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 946
+   }
+  },
+  {
+   "e": 1788708361163,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": 2076508,
+   "preset": "100ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 100,
+    "delay": 123,
+    "maxAge": 123,
+    "ref": -55007.4240000143,
+    "astalled": false,
+    "abufMs": 120.33,
+    "abytes": 326567,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1246
+   }
+  },
+  {
+   "e": 1788708371164,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": 2304243,
+   "preset": "100ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 100,
+    "delay": 123,
+    "maxAge": 123,
+    "ref": -55007.4240000143,
+    "astalled": false,
+    "abufMs": 120.33,
+    "abytes": 406881,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1546
+   }
+  },
+  {
+   "e": 1788708371165,
+   "event": "watch-close-100ms",
+   "relayLogOffset": 2304243,
+   "preset": "100ms",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 100,
+    "delay": 123,
+    "maxAge": 123,
+    "ref": -55007.4240000143,
+    "astalled": false,
+    "abufMs": 120.33,
+    "abytes": 406881,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1546
+   }
+  },
+  {
+   "e": 1788708374166,
+   "event": "watch-open-500ms",
+   "relayLogOffset": 2306434,
+   "preset": "500ms"
+  },
+  {
+   "e": 1788708374754,
+   "event": "watch-live-500ms",
+   "relayLogOffset": 2320201,
+   "preset": "500ms",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -108583.33399999404,
+    "astalled": true,
+    "abufMs": 220,
+    "abytes": 139,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 18,
+    "catalogAudio": "{\"renditions\":{\"audio\":{\"codec\":\"opus\",\"container\":{\"kind\":\"legacy\"},\"description\":\"4f707573486561640102380180bb0000000000\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"jitter\":20}}}",
+    "catalogVideo": "{\"renditions\":{\"video\":{\"codec\":\"avc1.640028\",\"container\":{\"kind\":\"legacy\"},\"codedWidth\":1280,\"codedHeight\":720,\"framerate\":30.000030517578125,\"bitrate\":1935361,\"optimizeForLatency\":true,\"jitter\":34}},\"display\":{\"width\":1280,\"height\":720}}"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788708384756,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 2548189,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -108583.50899999404,
+    "astalled": false,
+    "abufMs": 531,
+    "abytes": 83013,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 318
+   }
+  },
+  {
+   "e": 1788708394758,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 2774769,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -108583.54900000239,
+    "astalled": false,
+    "abufMs": 471,
+    "abytes": 163442,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 618
+   }
+  },
+  {
+   "e": 1788708404761,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 3002504,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -108583.54900000239,
+    "astalled": false,
+    "abufMs": 471,
+    "abytes": 244139,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 918
+   }
+  },
+  {
+   "e": 1788708414766,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 3226631,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -108583.59899999286,
+    "astalled": false,
+    "abufMs": 300.33,
+    "abytes": 323602,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1218
+   }
+  },
+  {
+   "e": 1788708424768,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 3454366,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -108583.7440000012,
+    "astalled": false,
+    "abufMs": 300.33,
+    "abytes": 404107,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1518
+   }
+  },
+  {
+   "e": 1788708424768,
+   "event": "watch-close-500ms",
+   "relayLogOffset": 3454366,
+   "preset": "500ms",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -108583.7440000012,
+    "astalled": false,
+    "abufMs": 300.33,
+    "abytes": 404107,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1518
+   }
+  },
+  {
+   "e": 1788708427771,
+   "event": "publisher-close",
+   "relayLogOffset": 3456557,
+   "last": {
+    "transport": "webtransport",
+    "established": false,
+    "audioFrames": 7974,
+    "audioBytes": 1292194,
+    "videoFrames": 4792,
+    "keyframes": 80,
+    "audioCatalog": "{\"codec\":\"opus\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"container\":{\"kind\":\"legacy\"},\"jitter\":20,\"description\":\"4f707573486561640102380180bb0000000000\"}"
+   }
+  },
+  {
+   "e": 1788708427773,
+   "event": "done",
+   "relayLogOffset": 3456557
+  }
+ ]
+}

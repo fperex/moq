@@ -1,0 +1,321 @@
+{
+ "meta": {
+  "tag": "a3-site-remote",
+  "relay": "https://cdn.moq.pro/demo",
+  "name": "bbb.hang",
+  "presets": [
+   "auto",
+   "100ms",
+   "500ms"
+  ],
+  "holdMs": 60000,
+  "publisher": "none",
+  "worktree": "228a11199548251c2fab8b374b0f6344fd320b44",
+  "branch": "debug/rt-audio",
+  "chrome": {
+   "Browser": "Chrome/152.0.7977.82",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+   "V8-Version": "15.2.124.21",
+   "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/58735338-38bd-49e0-81b7-f7b8a1d42124"
+  },
+  "startedAt": "2026-09-06T17:03:17.859Z"
+ },
+ "events": [
+  {
+   "e": 1788714198362,
+   "event": "start",
+   "relayLogOffset": -1,
+   "meta": {
+    "tag": "a3-site-remote",
+    "relay": "https://cdn.moq.pro/demo",
+    "name": "bbb.hang",
+    "presets": [
+     "auto",
+     "100ms",
+     "500ms"
+    ],
+    "holdMs": 60000,
+    "publisher": "none",
+    "worktree": "228a11199548251c2fab8b374b0f6344fd320b44",
+    "branch": "debug/rt-audio",
+    "chrome": {
+     "Browser": "Chrome/152.0.7977.82",
+     "Protocol-Version": "1.3",
+     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+     "V8-Version": "15.2.124.21",
+     "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+     "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/58735338-38bd-49e0-81b7-f7b8a1d42124"
+    },
+    "startedAt": "2026-09-06T17:03:17.859Z"
+   }
+  },
+  {
+   "e": 1788714198366,
+   "event": "watch-open-auto",
+   "relayLogOffset": -1,
+   "preset": "auto"
+  },
+  {
+   "e": 1788714199701,
+   "event": "set-latency-auto",
+   "relayLogOffset": -1,
+   "value": "real-time",
+   "result": "real-time"
+  },
+  {
+   "e": 1788714199702,
+   "event": "inject-auto",
+   "relayLogOffset": -1,
+   "result": "installed"
+  },
+  {
+   "e": 1788714199702,
+   "event": "watch-live-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "first": {
+    "status": "live",
+    "abytes": 4882,
+    "actx": "running"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788714209705,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":10,\"plateausPerMin\":282,\"plateauMsPerMin\":19856,\"skipsPerMin\":324,\"skipMsPerMin\":23708,\"stalledPct\":0,\"silentPct\":55,\"delay\":60.5,\"jitter\":57.5,\"maxAge\":60.5,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714219707,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":20,\"plateausPerMin\":273,\"plateauMsPerMin\":20410,\"skipsPerMin\":327,\"skipMsPerMin\":22955,\"stalledPct\":0,\"silentPct\":67.8,\"delay\":60.5,\"jitter\":57.5,\"maxAge\":60.5,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714229709,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":30,\"plateausPerMin\":278,\"plateauMsPerMin\":20188,\"skipsPerMin\":322,\"skipMsPerMin\":22407,\"stalledPct\":0,\"silentPct\":63.3,\"delay\":60.5,\"jitter\":57.5,\"maxAge\":60.5,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714239712,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":40,\"plateausPerMin\":277,\"plateauMsPerMin\":20008,\"skipsPerMin\":310,\"skipMsPerMin\":21585,\"stalledPct\":0,\"silentPct\":65.9,\"delay\":60.5,\"jitter\":57.5,\"maxAge\":60.5,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714249715,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":50,\"plateausPerMin\":283,\"plateauMsPerMin\":19955,\"skipsPerMin\":313,\"skipMsPerMin\":22121,\"stalledPct\":0,\"silentPct\":67.9,\"delay\":60.5,\"jitter\":57.5,\"maxAge\":60.5,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714259718,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":283,\"plateauMsPerMin\":19979,\"skipsPerMin\":316,\"skipMsPerMin\":22058,\"stalledPct\":0,\"silentPct\":64.3,\"delay\":60.5,\"jitter\":57.5,\"maxAge\":60.5,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714259719,
+   "event": "watch-close-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "last": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":283,\"plateauMsPerMin\":19978,\"skipsPerMin\":316,\"skipMsPerMin\":22058,\"stalledPct\":0,\"silentPct\":64.3,\"delay\":60.5,\"jitter\":57.5,\"maxAge\":60.5,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714262721,
+   "event": "watch-open-100ms",
+   "relayLogOffset": -1,
+   "preset": "100ms"
+  },
+  {
+   "e": 1788714263305,
+   "event": "set-latency-100ms",
+   "relayLogOffset": -1,
+   "value": "100",
+   "result": "100"
+  },
+  {
+   "e": 1788714263306,
+   "event": "inject-100ms",
+   "relayLogOffset": -1,
+   "result": "installed"
+  },
+  {
+   "e": 1788714263306,
+   "event": "watch-live-100ms",
+   "relayLogOffset": -1,
+   "preset": "100ms",
+   "first": {
+    "status": "live",
+    "abytes": 400,
+    "actx": "running"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788714273314,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": -1,
+   "preset": "100ms",
+   "info": null,
+   "bb": "{\"seconds\":10,\"plateausPerMin\":306,\"plateauMsPerMin\":21608,\"skipsPerMin\":342,\"skipMsPerMin\":3957826885,\"stalledPct\":3,\"silentPct\":45.5,\"delay\":51,\"jitter\":48,\"maxAge\":51,\"rtt\":39,\"isolated\":false,\"latencyAttr\":\"48\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714283317,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": -1,
+   "preset": "100ms",
+   "info": null,
+   "bb": "{\"seconds\":20,\"plateausPerMin\":318,\"plateauMsPerMin\":22665,\"skipsPerMin\":345,\"skipMsPerMin\":1978756782,\"stalledPct\":1.5,\"silentPct\":51.8,\"delay\":51,\"jitter\":48,\"maxAge\":51,\"rtt\":39,\"isolated\":false,\"latencyAttr\":\"48\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714293319,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": -1,
+   "preset": "100ms",
+   "info": null,
+   "bb": "{\"seconds\":30,\"plateausPerMin\":314,\"plateauMsPerMin\":22899,\"skipsPerMin\":344,\"skipMsPerMin\":1319296523,\"stalledPct\":1,\"silentPct\":49.2,\"delay\":51,\"jitter\":48,\"maxAge\":51,\"rtt\":39,\"isolated\":false,\"latencyAttr\":\"48\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714303321,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": -1,
+   "preset": "100ms",
+   "info": null,
+   "bb": "{\"seconds\":40,\"plateausPerMin\":318,\"plateauMsPerMin\":23016,\"skipsPerMin\":340,\"skipMsPerMin\":989541958,\"stalledPct\":0.8,\"silentPct\":52.3,\"delay\":51,\"jitter\":48,\"maxAge\":51,\"rtt\":39,\"isolated\":false,\"latencyAttr\":\"48\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714313322,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": -1,
+   "preset": "100ms",
+   "info": null,
+   "bb": "{\"seconds\":50,\"plateausPerMin\":316,\"plateauMsPerMin\":23160,\"skipsPerMin\":337,\"skipMsPerMin\":791673448,\"stalledPct\":0.6,\"silentPct\":54.3,\"delay\":51,\"jitter\":48,\"maxAge\":51,\"rtt\":39,\"isolated\":false,\"latencyAttr\":\"48\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714323325,
+   "event": "watch-hold-100ms",
+   "relayLogOffset": -1,
+   "preset": "100ms",
+   "info": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":317,\"plateauMsPerMin\":23101,\"skipsPerMin\":331,\"skipMsPerMin\":659738229,\"stalledPct\":0.5,\"silentPct\":52,\"delay\":51,\"jitter\":48,\"maxAge\":51,\"rtt\":39,\"isolated\":false,\"latencyAttr\":\"48\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714323327,
+   "event": "watch-close-100ms",
+   "relayLogOffset": -1,
+   "preset": "100ms",
+   "last": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":317,\"plateauMsPerMin\":23100,\"skipsPerMin\":331,\"skipMsPerMin\":659711848,\"stalledPct\":0.5,\"silentPct\":52,\"delay\":51,\"jitter\":48,\"maxAge\":51,\"rtt\":39,\"isolated\":false,\"latencyAttr\":\"48\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714326330,
+   "event": "watch-open-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms"
+  },
+  {
+   "e": 1788714327167,
+   "event": "set-latency-500ms",
+   "relayLogOffset": -1,
+   "value": "500",
+   "result": "500"
+  },
+  {
+   "e": 1788714327169,
+   "event": "inject-500ms",
+   "relayLogOffset": -1,
+   "result": "installed"
+  },
+  {
+   "e": 1788714327169,
+   "event": "watch-live-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "first": {
+    "status": "live",
+    "abytes": 5240,
+    "actx": "running"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788714337174,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":10,\"plateausPerMin\":282,\"plateauMsPerMin\":19204,\"skipsPerMin\":312,\"skipMsPerMin\":3957730253,\"stalledPct\":1.5,\"silentPct\":39,\"delay\":60,\"jitter\":57,\"maxAge\":60,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"57\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714347177,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":20,\"plateausPerMin\":285,\"plateauMsPerMin\":19366,\"skipsPerMin\":321,\"skipMsPerMin\":1979143319,\"stalledPct\":0.8,\"silentPct\":38,\"delay\":60,\"jitter\":57,\"maxAge\":60,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"57\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714357180,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":30,\"plateausPerMin\":290,\"plateauMsPerMin\":19819,\"skipsPerMin\":324,\"skipMsPerMin\":1319495695,\"stalledPct\":0.5,\"silentPct\":38.8,\"delay\":60,\"jitter\":57,\"maxAge\":60,\"rtt\":47,\"isolated\":false,\"latencyAttr\":\"57\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714367183,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":40,\"plateausPerMin\":285,\"plateauMsPerMin\":19954,\"skipsPerMin\":331,\"skipMsPerMin\":989635192,\"stalledPct\":0.4,\"silentPct\":38.3,\"delay\":60,\"jitter\":57,\"maxAge\":60,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"57\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714377186,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":50,\"plateausPerMin\":287,\"plateauMsPerMin\":19983,\"skipsPerMin\":325,\"skipMsPerMin\":791714283,\"stalledPct\":0.3,\"silentPct\":39.9,\"delay\":60,\"jitter\":57,\"maxAge\":60,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"57\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714387189,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":288,\"plateauMsPerMin\":19899,\"skipsPerMin\":325,\"skipMsPerMin\":659778961,\"stalledPct\":0.3,\"silentPct\":42.7,\"delay\":60,\"jitter\":57,\"maxAge\":60,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"57\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714387192,
+   "event": "watch-close-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "last": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":288,\"plateauMsPerMin\":19898,\"skipsPerMin\":325,\"skipMsPerMin\":659750381,\"stalledPct\":0.3,\"silentPct\":42.7,\"delay\":60,\"jitter\":57,\"maxAge\":60,\"rtt\":46,\"isolated\":false,\"latencyAttr\":\"57\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714390197,
+   "event": "done",
+   "relayLogOffset": -1
+  }
+ ]
+}

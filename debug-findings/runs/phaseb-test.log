@@ -1,0 +1,1236 @@
+[0.12ms] ".env"
+bun install v1.4.2 (744846f84)
+
+Checked 705 installs across 858 packages (no changes) [47.00ms]
+moq-doc test: bun test v1.4.2 (744846f84)
+@moq/flate test: bun test v1.4.2 (744846f84)
+@moq/token test: bun test v1.4.2 (744846f84)
+@moq/signals test: bun test v1.4.2 (744846f84)
+@moq/signals test: 
+@moq/signals test: src/index.test.ts:
+@moq/signals test: Effect did not subscribe to any signals; it will never rerun. Error
+@moq/signals test:     at new Effect (<repo>/js/signals/src/index.ts:408:22)
+@moq/signals test:     at run (<repo>/js/signals/src/index.ts:683:22)
+@moq/signals test:     at <anonymous> (<repo>/js/signals/src/index.test.ts:406:26)
+@moq/signals test:     at #run (<repo>/js/signals/src/index.ts:505:9)
+@moq/signals test:     at <anonymous> (<repo>/js/signals/src/index.ts:425:9)
+@moq/signals test: Effect did not subscribe to any signals; it will never rerun. Error
+@moq/signals test:     at new Effect (<repo>/js/signals/src/index.ts:408:22)
+@moq/signals test:     at run (<repo>/js/signals/src/index.ts:683:22)
+@moq/signals test:     at <anonymous> (<repo>/js/signals/src/index.test.ts:406:26)
+@moq/signals test:     at #run (<repo>/js/signals/src/index.ts:505:9)
+@moq/signals test:     at <anonymous> (<repo>/js/signals/src/index.ts:425:9)
+@moq/signals test: 
+@moq/signals test:  61 pass
+@moq/signals test:  0 fail
+@moq/signals test:  123 expect() calls
+@moq/signals test: Ran 61 tests across 2 files. [39.00ms]
+@moq/signals test: Exited with code 0
+@moq/flate test: 
+@moq/flate test:  9 pass
+@moq/flate test:  0 fail
+@moq/flate test:  18 expect() calls
+@moq/flate test: Ran 9 tests across 1 file. [44.00ms]
+@moq/flate test: Exited with code 0
+@moq/net test: bun test v1.4.2 (744846f84)
+moq-doc test: 
+moq-doc test:  31 pass
+moq-doc test:  0 fail
+moq-doc test:  80 expect() calls
+moq-doc test: Ran 31 tests across 1 file. [296.00ms]
+moq-doc test: Exited with code 0
+@moq/token test: 
+@moq/token test:  94 pass
+@moq/token test:  0 fail
+@moq/token test:  203 expect() calls
+@moq/token test: Ran 94 tests across 6 files. [755.00ms]
+@moq/token test: Exited with code 0
+@moq/net test: 
+@moq/net test: src/integration.test.ts:
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=test active=true
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: announced: prefix=root
+@moq/net test: announce: prefix=root
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: announce: broadcast=test active=false
+@moq/net test: announce: broadcast=child active=false
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: announce: broadcast=root/child active=false
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=test active=true
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: announced: prefix=root
+@moq/net test: announce: prefix=root
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: announce: broadcast=test active=false
+@moq/net test: announce: broadcast=child active=false
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: announce: broadcast=root/child active=false
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-03
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=test active=true
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: announced: prefix=root
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: announce: prefix=root
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: announce: broadcast=test active=false
+@moq/net test: announce: broadcast=child active=false
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: announce: broadcast=root/child active=false
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=test active=true
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: announced: prefix=root
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: announce: prefix=root
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: announce: broadcast=test active=false
+@moq/net test: announce: broadcast=child active=false
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: announce: broadcast=root/child active=false
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: id=0 broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: subscribe update: id=0 broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=test active=true
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: announced: prefix=root
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: announce: prefix=root
+@moq/net test: announce: broadcast=root/child active=true
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: announce: broadcast=test active=false
+@moq/net test: announce: broadcast=child active=false
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: announce: broadcast=root/child active=false
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=first active=true
+@moq/net test: announced: broadcast=first active=true
+@moq/net test: announce: broadcast=second active=true
+@moq/net test: announced: broadcast=second active=true
+@moq/net test: announce: broadcast=second active=false
+@moq/net test: announced: broadcast=second active=false
+@moq/net test: announce: broadcast=second active=true
+@moq/net test: announced: broadcast=second active=true
+@moq/net test: announce: broadcast=first active=false
+@moq/net test: announce: broadcast=second active=false
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: datagram send disabled: WebTransport datagram writable stream is unavailable
+@moq/net test: datagram send disabled: WebTransport datagram writable stream is unavailable
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: datagram receive disabled: WebTransport datagrams.readable is unavailable
+@moq/net test: datagram receive disabled: WebTransport datagrams.readable is unavailable
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track unknown: broadcast=test track=video
+@moq/net test: subscribe error: id=0 broadcast=test track=video error=remote error: 32
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: fetch done: broadcast=test track=video group=0
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: fetch done: broadcast=test track=video group=0
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: fetch done: broadcast=test track=video group=0
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: fetch done: broadcast=test track=video group=0
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: fetch done: broadcast=test track=video group=0
+@moq/net test: https://localhost:4443/test negotiated ALPN: moqt-18
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: subscribe_namespace written: requestId=2
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=4 broadcast=test track=video
+@moq/net test: duplicate PublishNamespace
+@moq/net test: subscribe written: id=4 broadcast=test track=video
+@moq/net test: adapter: closing stream requestId=5
+@moq/net test: announce failed: broadcast=root/child error=PublishNamespace rejected: typeId=0x8
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=4 broadcast=test track=video
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: announced: broadcast=test active=false
+@moq/net test: announced: broadcast=root/child active=false
+@moq/net test: subscribe close: id=4 broadcast=test track=video
+@moq/net test: adapter: no announcement for namespace: test
+@moq/net test: adapter: no announcement for namespace: root/child
+@moq/net test: https://localhost:4443/test negotiated ALPN: moqt-15
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: subscribe_namespace written: requestId=2
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=4 broadcast=test track=video
+@moq/net test: duplicate PublishNamespace
+@moq/net test: adapter: closing stream requestId=5
+@moq/net test: subscribe written: id=4 broadcast=test track=video
+@moq/net test: announce failed: broadcast=root/child error=PublishNamespace rejected: 409 duplicate namespace
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=4 broadcast=test track=video
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: announced: broadcast=test active=false
+@moq/net test: announced: broadcast=root/child active=false
+@moq/net test: subscribe close: id=4 broadcast=test track=video
+@moq/net test: adapter: no announcement for namespace: test
+@moq/net test: adapter: no announcement for namespace: root/child
+@moq/net test: https://localhost:4443/test negotiated ALPN: moqt-16
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe_namespace written: requestId=2
+@moq/net test: subscribe start: id=4 broadcast=test track=video
+@moq/net test: subscribe written: id=4 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=4 broadcast=test track=video
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: announced: broadcast=test active=false
+@moq/net test: announced: broadcast=root/child active=false
+@moq/net test: subscribe close: id=4 broadcast=test track=video
+@moq/net test: subscribe_namespace stream error: remote error: 1
+@moq/net test: subscribe_namespace stream error: remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moqt-17
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: subscribe_namespace written: requestId=2
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=4 broadcast=test track=video
+@moq/net test: subscribe written: id=4 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=4 broadcast=test track=video
+@moq/net test: announced: broadcast=test active=false
+@moq/net test: announced: broadcast=root/child active=false
+@moq/net test: subscribe_namespace stream error: remote error: 1
+@moq/net test: subscribe_namespace stream error: remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moqt-18
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: subscribe_namespace written: requestId=2
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=4 broadcast=test track=video
+@moq/net test: subscribe written: id=4 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=4 broadcast=test track=video
+@moq/net test: announced: broadcast=test active=false
+@moq/net test: announced: broadcast=root/child active=false
+@moq/net test: subscribe_namespace stream error: remote error: 1
+@moq/net test: subscribe_namespace stream error: remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moqt-19
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: subscribe_namespace written: requestId=2
+@moq/net test: announced: broadcast=root/child active=true
+@moq/net test: subscribe start: id=4 broadcast=test track=video
+@moq/net test: subscribe written: id=4 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=4 broadcast=test track=video
+@moq/net test: announced: broadcast=test active=false
+@moq/net test: announced: broadcast=root/child active=false
+@moq/net test: subscribe_namespace stream error: remote error: 1
+@moq/net test: subscribe_namespace stream error: remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moqt-17
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: subscribe written: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: subscribe start: id=2 broadcast=test track=video
+@moq/net test: subscribe written: id=2 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=2 broadcast=test track=video
+@moq/net test: subscribe close: id=2 broadcast=test track=video
+@moq/net test: adapter: closing stream requestId=2
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: announced: broadcast=test active=false
+@moq/net test: adapter: no announcement for namespace: test
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: fetch error: broadcast=test track=video group=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: subscribe start: id=1 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=1 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=1 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=1 error=remote error: 1
+@moq/net test: subscribe start: id=2 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=2 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=2 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=2 error=remote error: 1
+@moq/net test: subscribe start: id=3 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=3 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=3 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=3 error=remote error: 1
+@moq/net test: subscribe start: id=4 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=4 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=4 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=4 error=remote error: 1
+@moq/net test: subscribe start: id=5 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=5 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=5 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=5 error=remote error: 1
+@moq/net test: subscribe start: id=6 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=6 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=6 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=6 error=remote error: 1
+@moq/net test: subscribe start: id=7 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=7 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=7 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=7 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: fetch error: broadcast=test track=video group=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: fetch done: broadcast=test track=video group=0
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: https://localhost:4443/test negotiated ALPN: moqt-17
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: subscribe written: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: subscribe written: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: subscribe written: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: subscribe start: id=0 broadcast=nonexistent track=video
+@moq/net test: subscribe written: id=0 broadcast=nonexistent track=video
+@moq/net test: adapter: closing stream requestId=0
+@moq/net test: subscribe error: id=0 broadcast=nonexistent track=video error=SUBSCRIBE error: code=404 reason=Broadcast not found
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: announced: prefix=late
+@moq/net test: announce: prefix=late
+@moq/net test: announce: broadcast= active=true
+@moq/net test: announced: broadcast=late active=true
+@moq/net test: subscribe start: id=0 broadcast=late track=video
+@moq/net test: track info: broadcast=late track=video
+@moq/net test: subscribe ok: id=0 broadcast=late track=video
+@moq/net test: publish ok: broadcast=late track=video
+@moq/net test: announce: broadcast= active=false
+@moq/net test: announced: broadcast=late active=false
+@moq/net test: announce: broadcast= active=true
+@moq/net test: announced: broadcast=late active=true
+@moq/net test: subscribe start: id=1 broadcast=late track=video
+@moq/net test: track info: broadcast=late track=video
+@moq/net test: subscribe ok: id=1 broadcast=late track=video
+@moq/net test: publish ok: broadcast=late track=video
+@moq/net test: announce: broadcast= active=false
+@moq/net test: subscribe close: id=0 broadcast=late track=video
+@moq/net test: subscribe close: id=1 broadcast=late track=video
+@moq/net test: publish error: broadcast=late track=video error=remote error: 1
+@moq/net test: publish error: broadcast=late track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: datagram send stopped: sub=1 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: relay does not support broadcast discovery; consuming without waiting.
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: announced: prefix=shared
+@moq/net test: announce: prefix=shared
+@moq/net test: announce: broadcast=shared active=true
+@moq/net test: announced: broadcast=shared active=true
+@moq/net test: subscribe start: id=0 broadcast=shared track=video
+@moq/net test: track info: broadcast=shared track=video
+@moq/net test: subscribe ok: id=0 broadcast=shared track=video
+@moq/net test: publish ok: broadcast=shared track=video
+@moq/net test: announce: broadcast= active=false
+@moq/net test: announced: broadcast=shared active=false
+@moq/net test: announce: broadcast= active=true
+@moq/net test: announced: broadcast=shared active=true
+@moq/net test: subscribe start: id=1 broadcast=shared track=video
+@moq/net test: track info: broadcast=shared track=video
+@moq/net test: subscribe ok: id=1 broadcast=shared track=video
+@moq/net test: publish ok: broadcast=shared track=video
+@moq/net test: announce: broadcast= active=false
+@moq/net test: subscribe close: id=0 broadcast=shared track=video
+@moq/net test: subscribe close: id=1 broadcast=shared track=video
+@moq/net test: publish error: broadcast=shared track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: datagram send stopped: sub=1 error=remote error: 1
+@moq/net test: publish error: broadcast=shared track=video error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: relay does not support broadcast discovery; consuming without waiting.
+@moq/net test: subscribe start: id=0 broadcast=later track=video
+@moq/net test: track unknown: broadcast=later track=video
+@moq/net test: subscribe error: id=0 broadcast=later track=video error=remote error: 32
+@moq/net test: subscribe start: id=1 broadcast=later track=video
+@moq/net test: track info: broadcast=later track=video
+@moq/net test: subscribe ok: id=1 broadcast=later track=video
+@moq/net test: publish ok: broadcast=later track=video
+@moq/net test: subscribe close: id=1 broadcast=later track=video
+@moq/net test: publish error: broadcast=later track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=1 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-06-wip
+@moq/net test: relay does not support broadcast discovery; consuming without waiting.
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: relay does not support broadcast discovery; consuming without waiting.
+@moq/net test: subscribe start: id=0 broadcast=later track=video
+@moq/net test: subscribe written: id=0 broadcast=later track=video
+@moq/net test: adapter: closing stream requestId=0
+@moq/net test: subscribe error: id=0 broadcast=later track=video error=SUBSCRIBE error: code=404 reason=Broadcast not found
+@moq/net test: subscribe start: id=2 broadcast=later track=video
+@moq/net test: subscribe written: id=2 broadcast=later track=video
+@moq/net test: publish ok: broadcast=later track=video
+@moq/net test: subscribe ok: id=2 broadcast=later track=video
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: publish done: broadcast=later track=video
+@moq/net test: subscribe close: id=2 broadcast=later track=video
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=test active=true
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: subscribe start: id=0 broadcast=test track=video
+@moq/net test: track info: broadcast=test track=video
+@moq/net test: subscribe ok: id=0 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: announce: broadcast=test active=false
+@moq/net test: announced: broadcast=test active=false
+@moq/net test: subscribe close: id=0 broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: (none)
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=test active=true
+@moq/net test: subscribe start: id=2 broadcast=test track=video
+@moq/net test: subscribe written: id=2 broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe ok: id=2 broadcast=test track=video
+@moq/net test: adapter: closing stream requestId=1
+@moq/net test: announced: broadcast=test active=false
+@moq/net test: adapter: close() called
+@moq/net test: adapter: close() called
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: subscribe close: id=2 broadcast=test track=video
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=remote active=true
+@moq/net test: announced: broadcast=remote active=true
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=from-server active=true
+@moq/net test: announced: broadcast=from-server active=true
+@moq/net test: announce: broadcast=from-client active=true
+@moq/net test: announce: broadcast=from-server active=false
+@moq/net test: announced: broadcast=from-client active=true
+@moq/net test: announced: broadcast=from-server active=false
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: relay does not support broadcast discovery; broadcasts resolve on request only.
+@moq/net test: subscribe start: id=0 broadcast=blind track=chat
+@moq/net test: track info: broadcast=blind track=chat
+@moq/net test: subscribe ok: id=0 broadcast=blind track=chat
+@moq/net test: publish ok: broadcast=blind track=chat
+@moq/net test: subscribe close: id=0 broadcast=blind track=chat
+@moq/net test: publish error: broadcast=blind track=chat error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://example.com/re-request connected via WebTransport
+@moq/net test: https://example.com/re-request negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: connection closed, reconnecting
+@moq/net test: https://example.com/re-request connected via WebTransport
+@moq/net test: https://example.com/re-request negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=show active=true
+@moq/net test: announced: broadcast=show active=true
+@moq/net test: announce: broadcast=show active=false
+@moq/net test: announce: broadcast=show active=true
+@moq/net test: announced: broadcast=show active=false
+@moq/net test: announced: broadcast=show active=true
+@moq/net test: announce: broadcast=show active=false
+@moq/net test: announced: broadcast=show active=false
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=redundant active=true
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=redundant active=true
+@moq/net test: announced: broadcast=redundant active=true
+@moq/net test: announced: broadcast=redundant active=true
+@moq/net test: subscribe start: id=0 broadcast=redundant track=chat
+@moq/net test: track info: broadcast=redundant track=chat
+@moq/net test: subscribe ok: id=0 broadcast=redundant track=chat
+@moq/net test: publish ok: broadcast=redundant track=chat
+@moq/net test: announce: broadcast=redundant active=false
+@moq/net test: subscribe close: id=0 broadcast=redundant track=chat
+@moq/net test: publish error: broadcast=redundant track=chat error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: relay does not support broadcast discovery; broadcasts resolve on request only.
+@moq/net test: https://localhost:4443/test negotiated ALPN: moq-lite-05
+@moq/net test: relay does not support broadcast discovery; broadcasts resolve on request only.
+@moq/net test: subscribe start: id=0 broadcast=blind track=chat
+@moq/net test: track info: broadcast=blind track=chat
+@moq/net test: subscribe ok: id=0 broadcast=blind track=chat
+@moq/net test: publish ok: broadcast=blind track=chat
+@moq/net test: subscribe close: id=0 broadcast=blind track=chat
+@moq/net test: publish error: broadcast=blind track=chat error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: 
+@moq/net test: src/connection/reload.test.ts:
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: connection closed, reconnecting
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: connection closed, reconnecting
+@moq/net test: reconnect timed out
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: connection closed, reconnecting
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: announced: prefix=late
+@moq/net test: announce: prefix=late
+@moq/net test: announce: broadcast=late active=true
+@moq/net test: announced: broadcast=late active=true
+@moq/net test: connection closed, reconnecting
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: announced: prefix=late
+@moq/net test: announce: prefix=late
+@moq/net test: announce: broadcast=late active=true
+@moq/net test: announced: broadcast=late active=true
+@moq/net test: announce: broadcast= active=false
+@moq/net test: announce: broadcast= active=false
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: announced: prefix=
+@moq/net test: connection closed, reconnecting
+@moq/net test: session rejected as unauthorized, not retrying
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: connection closed, reconnecting
+@moq/net test: session rejected as unauthorized, not retrying
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: (none)
+@moq/net test: connection error: SessionError: remote error: 2 (unauthorized)
+@moq/net test:  code: 2,
+@moq/net test: 
+@moq/net test:       at fromClose (<repo>/js/net/src/error.ts:354:13)
+@moq/net test: 
+@moq/net test: session rejected as unauthorized, not retrying
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: (none)
+@moq/net test: connection error: StreamError: remote error: 2
+@moq/net test:  code: 2,
+@moq/net test: 
+@moq/net test:       at fromTransport (<repo>/js/net/src/error.ts:307:13)
+@moq/net test:       at <repo>/js/net/src/stream.ts:207:10
+@moq/net test: 
+@moq/net test: warn: delivery timeout
+@moq/net test:      source: "stream",
+@moq/net test:  streamErrorCode: 2,
+@moq/net test: 
+@moq/net test:       at toTransport (<repo>/js/net/src/error.ts:342:27)
+@moq/net test:       at <anonymous> (<repo>/js/net/src/connection/reload.test.ts:413:40)
+@moq/net test: 
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: (none)
+@moq/net test: announced: prefix=
+@moq/net test: https://example.com/origins connected via WebTransport
+@moq/net test: https://example.com/origins negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=mine active=true
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=remote active=true
+@moq/net test: announced: broadcast=mine active=true
+@moq/net test: announced: broadcast=remote active=true
+@moq/net test: connection closed, reconnecting
+@moq/net test: announced: prefix=
+@moq/net test: https://example.com/origins connected via WebTransport
+@moq/net test: https://example.com/origins negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=mine active=true
+@moq/net test: announce: prefix=
+@moq/net test: announce: broadcast=remote active=true
+@moq/net test: announced: broadcast=mine active=true
+@moq/net test: announced: broadcast=remote active=true
+@moq/net test: 
+@moq/net test: src/connection/forward.test.ts:
+@moq/net test: broadcast discovery failed; broadcasts resolve on request only. warn: namespace rejected
+@moq/net test:       at <repo>/js/net/src/connection/forward.test.ts:87:30
+@moq/net test: 
+@moq/net test: broadcast discovery failed; broadcasts resolve on request only. warn: stream reset
+@moq/net test:       at <repo>/js/net/src/connection/forward.test.ts:127:30
+@moq/net test: 
+@moq/net test: relay does not support broadcast discovery; broadcasts resolve on request only.
+@moq/net test: 
+@moq/net test: src/connection/pool.test.ts:
+@moq/net test: https://example.com/pool connected via WebTransport
+@moq/net test: https://example.com/pool negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: https://example.com/pool connected via WebTransport
+@moq/net test: https://example.com/pool negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: https://example.com/pool connected via WebTransport
+@moq/net test: https://example.com/pool negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: https://example.com/pool connected via WebTransport
+@moq/net test: https://example.com/pool negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: https://example.com/pool connected via WebTransport
+@moq/net test: https://example.com/pool negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: https://example.com/pool connected via WebTransport
+@moq/net test: https://example.com/pool negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: https://example.com/other connected via WebTransport
+@moq/net test: https://example.com/other negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: connection error: warn: WebSocket connection error
+@moq/net test:       at <anonymous> (<repo>/node_modules/@moq/web-socket-stream/index.js:105:29)
+@moq/net test: warn: relay is down
+@moq/net test:       at StubWebTransport (<repo>/js/net/src/connection/pool.test.ts:149:26)
+@moq/net test:       at connectWebTransport (<repo>/js/net/src/connection/connect.ts:494:19)
+@moq/net test:       at connectInner (<repo>/js/net/src/connection/connect.ts:206:32)
+@moq/net test:       at connect (<repo>/js/net/src/connection/connect.ts:158:36)
+@moq/net test:       at <repo>/js/net/src/connection/reload.ts:229:30
+@moq/net test: 
+@moq/net test: https://example.com/pool connected via WebTransport
+@moq/net test: https://example.com/pool negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: https://example.com/pool connected via WebTransport
+@moq/net test: https://example.com/pool negotiated ALPN: moq-lite-05
+@moq/net test: announced: prefix=
+@moq/net test: announce: prefix=
+@moq/net test: 
+@moq/net test: src/connection/connect.test.ts:
+@moq/net test: https://example.com/test connected via WebTransport
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: https://example.com/test negotiated ALPN: moq-lite-05
+@moq/net test: 
+@moq/net test: src/connection/stats.test.ts:
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: https://example.com/ negotiated ALPN: moqt-18
+@moq/net test: https://example.com/ connected via WebTransport
+@moq/net test: https://example.com/ negotiated ALPN: moq-lite-06-wip
+@moq/net test: connection closed, reconnecting
+@moq/net test: 
+@moq/net test: src/lite/publisher.test.ts:
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: fetch done: broadcast=test track=video group=7
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: subscribe update: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=write failed
+@moq/net test: datagram send stopped: sub=0 error=write failed
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: datagram send stopped: sub=0 error=remote error: 1
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: publish error: broadcast=test track=video error=remote error: 1
+@moq/net test: 
+@moq/net test: src/lite/subscriber.test.ts:
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: broadcast=room rerouted
+@moq/net test: announced: broadcast=room active=false
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: broadcast=room active=false
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: broadcast=room rerouted
+@moq/net test: announced: broadcast=room active=false
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: broadcast=room rerouted
+@moq/net test: announced: broadcast=room active=false
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: broadcast=room active=false
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: prefix=
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: broadcast=room active=false
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=lobby active=true
+@moq/net test: announced: broadcast=lobby active=false
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: broadcast=room active=false
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx active=true
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: prefix=
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: announced: broadcast=room rerouted
+@moq/net test: announced: broadcast=room active=false
+@moq/net test: announced: broadcast=room active=true
+@moq/net test: 
+@moq/net test: src/lite/datagram_stream.test.ts:
+@moq/net test: datagram send disabled: failed to open WebTransport datagram writer warn: unsupported
+@moq/net test:       at createWritable (<repo>/js/net/src/lite/datagram_stream.test.ts:9:15)
+@moq/net test:       at datagramWriter (<repo>/js/net/src/lite/datagram_stream.ts:43:73)
+@moq/net test:       at <repo>/js/net/src/lite/datagram_stream.test.ts:14:24
+@moq/net test: 
+@moq/net test: 
+@moq/net test: src/ietf/publisher.test.ts:
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: announce failed: broadcast=first error=PublishNamespace rejected: 403 no
+@moq/net test: announce failed: broadcast=first error=no stream credit
+@moq/net test: announce failed: broadcast=lonely error=no stream credit
+@moq/net test: announce failed: broadcast=lonely error=no stream credit
+@moq/net test: announce failed: broadcast=lonely error=unexpected end of stream
+@moq/net test: announce failed: broadcast=lonely error=PublishNamespace rejected: 403 no
+@moq/net test: announce failed: broadcast=recycled error=PublishNamespace rejected: 403 no
+@moq/net test: announce failed: broadcast=recycled error=PublishNamespace rejected: 403 no
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=failed
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=failed
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=failed
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=failed
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=failed
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish error: broadcast=test track=video error=failed
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: fill complete: fill=7
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: fill failed, resetting its stream: fill=7 error=a fill spanning several groups is not supported
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: fill failed, resetting its stream: fill=7 error=unsubscribed before the fill finished
+@moq/net test: publish ok: broadcast=test track=video
+@moq/net test: fill complete: fill=7
+@moq/net test: publish done: broadcast=test track=video
+@moq/net test: 
+@moq/net test: src/ietf/adapter.test.ts:
+@moq/net test: adapter: closing stream requestId=1
+@moq/net test: adapter: no announcement for namespace: ghost
+@moq/net test: adapter: closing stream requestId=1
+@moq/net test: adapter: closing stream requestId=0
+@moq/net test: adapter: closing stream requestId=2
+@moq/net test: adapter: closing stream requestId=1
+@moq/net test: adapter: closing stream requestId=0
+@moq/net test: 
+@moq/net test: src/ietf/subscriber.test.ts:
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=surprise active=true
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=surprise active=false
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=both active=true
+@moq/net test: announced: broadcast=sentinel active=true
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=both active=true
+@moq/net test: announced: broadcast=sentinel active=true
+@moq/net test: announced: broadcast=both active=false
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: subscribe_namespace written: requestId=2
+@moq/net test: announced: broadcast=orphan active=true
+@moq/net test: announced: broadcast=orphan active=false
+@moq/net test: announced: broadcast=twice active=true
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: duplicate PublishNamespace
+@moq/net test: announced: broadcast=twice active=false
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=first active=true
+@moq/net test: announced: broadcast=first active=false
+@moq/net test: subscribe_namespace written: requestId=2
+@moq/net test: duplicate PublishNamespace
+@moq/net test: announced: broadcast=raced active=true
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=raced active=false
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: dropping reflected namespace: broadcast=mine
+@moq/net test: announced: broadcast=sentinel active=true
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=theirs active=true
+@moq/net test: dropping reflected namespace: broadcast=theirs
+@moq/net test: announced: broadcast=theirs active=false
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: dropping reflected publish_namespace: broadcast=mine
+@moq/net test: announced: broadcast=sentinel active=true
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: subscribe_namespace error: unexpected end of stream
+@moq/net test: subscribe_namespace written: requestId=0
+@moq/net test: announced: broadcast=theirs active=true
+@moq/net test: publish_namespace now loops back, detaching: broadcast=theirs
+@moq/net test: announced: broadcast=theirs active=false
+@moq/net test: subscribe start: id=0 broadcast=room track=video
+@moq/net test: subscribe written: id=0 broadcast=room track=video
+@moq/net test: subscribe error: id=0 broadcast=room track=video error=subscribe abandoned before it was accepted
+@moq/net test: subscribe start: id=0 broadcast=room track=video
+@moq/net test: subscribe written: id=0 broadcast=room track=video
+@moq/net test: adapter: closing stream requestId=0
+@moq/net test: subscribe error: id=0 broadcast=room track=video error=SUBSCRIBE error: unknown error
+@moq/net test: announce failed: broadcast=mine error=advertisement timed out after 5000ms waiting for the peer's answer
+@moq/net test: subscribe start: id=0 broadcast=room track=video
+@moq/net test: subscribe written: id=0 broadcast=room track=video
+@moq/net test: dropping a group with no head: alias=9 group=3
+@moq/net test: subscribe ok: id=0 broadcast=room track=video
+@moq/net test: subscribe close: id=0 broadcast=room track=video
+@moq/net test: subscribe start: id=0 broadcast=room track=video
+@moq/net test: subscribe written: id=0 broadcast=room track=video
+@moq/net test: subscribe ok: id=0 broadcast=room track=video
+@moq/net test: subscribe close: id=0 broadcast=room track=video
+@moq/net test: subscribe start: id=0 broadcast=room track=video
+@moq/net test: subscribe written: id=0 broadcast=room track=video
+@moq/net test: subscribe ok: id=0 broadcast=room track=video
+@moq/net test: subscribe start: id=2 broadcast=room track=video
+@moq/net test: subscribe close: id=0 broadcast=room track=video
+@moq/net test: adapter: close() called
+@moq/net test: subscribe error: id=2 broadcast=room track=video error=subscribe abandoned before it was accepted
+@moq/net test: 
+@moq/net test:  710 pass
+@moq/net test:  0 fail
+@moq/net test:  675187 expect() calls
+@moq/net test: Ran 710 tests across 43 files. [12.94s]
+@moq/net test: Exited with code 0
+@moq/json test: bun test v1.4.2 (744846f84)
+@moq/binary test: bun test v1.4.2 (744846f84)
+@moq/msf test: bun test v1.4.2 (744846f84)
+@moq/msf test: 
+@moq/msf test: src/catalog.test.ts:
+@moq/msf test: invalid MSF catalog {"version":2,"tracks":[]}
+@moq/msf test: 
+@moq/msf test:  12 pass
+@moq/msf test:  0 fail
+@moq/msf test:  33 expect() calls
+@moq/msf test: Ran 12 tests across 1 file. [33.00ms]
+@moq/msf test: Exited with code 0
+@moq/binary test: 
+@moq/binary test:  16 pass
+@moq/binary test:  0 fail
+@moq/binary test:  33 expect() calls
+@moq/binary test: Ran 16 tests across 2 files. [51.00ms]
+@moq/binary test: Exited with code 0
+@moq/json test: 
+@moq/json test:  130 pass
+@moq/json test:  0 fail
+@moq/json test:  260 expect() calls
+@moq/json test: Ran 130 tests across 9 files. [478.00ms]
+@moq/json test: Exited with code 0
+@moq/hang test: bun test v1.4.2 (744846f84)
+@moq/hang test: 
+@moq/hang test: src/container/consumer.test.ts:
+@moq/hang test: skipping slow group: track=test 0 -> 1
+@moq/hang test: skipping slow group: track=test 1 -> 2
+@moq/hang test: buffer reset: track=test group timestamps rewound (prevMax 0, group 1)
+@moq/hang test: skipping slow group: track=test 0 -> 1
+@moq/hang test: skipping slow group: track=test 1 -> 3
+@moq/hang test: skipping covered group: 0 -> 1
+@moq/hang test: skipping slow group: track=test 2000 -> 3000
+@moq/hang test: 
+@moq/hang test:  113 pass
+@moq/hang test:  0 fail
+@moq/hang test:  291 expect() calls
+@moq/hang test: Ran 113 tests across 13 files. [5.89s]
+@moq/hang test: Exited with code 0
+@moq/publish test: bun test v1.4.2 (744846f84)
+@moq/watch test: bun test v1.4.2 (744846f84)
+@moq/publish test: 
+@moq/publish test: src/fanout.test.ts:
+@moq/publish test: fanout source failed: 241 | 		control.enqueue(1);
+@moq/publish test: 242 | 		await flush();
+@moq/publish test: 243 | 		await expect(a.read().then((r) => r.value)).resolves.toBe(1);
+@moq/publish test: 244 | 		await expect(b.read().then((r) => r.value)).resolves.toBe(1);
+@moq/publish test: 245 | 
+@moq/publish test: 246 | 		control.error(new Error("capture died"));
+@moq/publish test:                           ^
+@moq/publish test: error: capture died
+@moq/publish test:       at <repo>/js/publish/src/fanout.test.ts:246:21
+@moq/publish test: 
+@moq/publish test: 
+@moq/publish test: src/video/processor.test.ts:
+@moq/publish test: Using MediaStreamTrackProcessor polyfill; performance might suffer.
+@moq/watch test: 
+@moq/watch test:  211 pass
+@moq/watch test:  0 fail
+@moq/watch test:  1611 expect() calls
+@moq/watch test: Ran 211 tests across 19 files. [253.00ms]
+@moq/watch test: Exited with code 0
+@moq/boy test: bun test v1.4.2 (744846f84)
+@moq/boy test: 
+@moq/boy test:  1 pass
+@moq/boy test:  0 fail
+@moq/boy test:  6 expect() calls
+@moq/boy test: Ran 1 test across 1 file. [38.00ms]
+@moq/boy test: Exited with code 0
+@moq/publish test: 
+@moq/publish test: src/source/retry.test.ts:
+@moq/publish test: no audio devices found
+@moq/publish test: no audio devices found
+@moq/publish test: no audio devices found
+@moq/publish test: no audio devices found
+@moq/publish test: no audio devices found
+@moq/publish test: no audio devices found
+@moq/publish test: no video devices found
+@moq/publish test: no audio devices found
+@moq/publish test: no audio devices found
+@moq/publish test: 
+@moq/publish test:  98 pass
+@moq/publish test:  0 fail
+@moq/publish test:  1659 expect() calls
+@moq/publish test: Ran 98 tests across 17 files. [12.82s]
+@moq/publish test: Exited with code 0

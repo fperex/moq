@@ -1,0 +1,503 @@
+[2m2026-09-06T17:10:08.716718Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T17:10:08.718862Z[0m [33m WARN[0m [2mmoq_tokio::quinn[0m[2m:[0m performing insecure HTTP request for certificate [3murl[0m[2m=[0mhttp://localhost:4443/certificate.sha256
+[2m2026-09-06T17:10:08.725619Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection 'Some("localhost")'
+[2m2026-09-06T17:10:08.725891Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to [::1]:4443
+[2m2026-09-06T17:10:08.726331Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to [::1]:4443
+[2m2026-09-06T17:10:08.727711Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("http", localhost:4443)
+[2m2026-09-06T17:10:08.732206Z[0m [34mDEBUG[0m [2mmoq_tokio::quinn[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttps://localhost:4443
+[2m2026-09-06T17:10:08.733939Z[0m [34mDEBUG[0m [2mmoq_tokio::resolve[0m[2m:[0m resolved [3mlookup[0m[2m=[0mFull [3mcount[0m[2m=[0m2
+[2m2026-09-06T17:10:08.734785Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m dialing [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T17:10:08.767822Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m connected [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T17:10:08.768159Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m sending SETTINGS frame [3msettings[0m[2m=[0mSettings({ENABLE_CONNECT_PROTOCOL: 1, ENABLE_DATAGRAM: 1, ENABLE_DATAGRAM_DEPRECATED: 1, WEBTRANSPORT_MAX_SESSIONS: 1, WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1, WEBTRANSPORT_ENABLE_DEPRECATED: 1})
+[2m2026-09-06T17:10:08.769337Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m received SETTINGS frame [3msettings[0m[2m=[0mSettings({ENABLE_DATAGRAM_DEPRECATED: 1, ENABLE_DATAGRAM: 1, ENABLE_CONNECT_PROTOCOL: 1, WEBTRANSPORT_MAX_SESSIONS: 1, WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1, WEBTRANSPORT_ENABLE_DEPRECATED: 1})
+[2m2026-09-06T17:10:08.769357Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m sending CONNECT request [3mrequest[0m[2m=[0mConnectRequest { url: Url { scheme: "https", cannot_be_a_base: false, username: "", password: None, host: Some(Domain("localhost")), port: Some(4443), path: "/", query: None, fragment: None }, protocols: ["moq-lite-05", "moq-lite-04", "moq-lite-03", "moql", "moqt-19", "moqt-18", "moqt-17", "moqt-16", "moqt-15", "moq-00"], headers: {} }
+[2m2026-09-06T17:10:08.773431Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m received CONNECT response [3mresponse[0m[2m=[0mConnectResponse { status: 200, protocol: Some("moq-lite-05") }
+[2m2026-09-06T17:10:08.775009Z[0m [32m INFO[0m [2mmoq_tokio::client[0m[2m:[0m connected [3mversion[0m[2m=[0mmoq-lite-05
+[2m2026-09-06T17:10:08.775049Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connected [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T17:10:08.776196Z[0m [34mDEBUG[0m [2mmoq_net::lite::session[0m[2m:[0m failed to send setup [3merr[0m[2m=[0mtransport: invalid STOP_SENDING: 0
+[2m2026-09-06T17:10:08.780737Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m announce [3mbroadcast[0m[2m=[0mbbb.hang
+[2m2026-09-06T17:10:08.781474Z[0m [34mDEBUG[0m [2mmoq_net::lite::subscriber[0m[2m:[0m received peer setup [3msetup[0m[2m=[0mSetup { probe: Report, path: None, role: None, cost: None, origin: Some(Origin { id: 6863627114494510 }) }
+[2m2026-09-06T17:10:15.390726Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info requested [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T17:10:15.391149Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info cancelled [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T17:10:15.391968Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m0 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T17:10:15.392075Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m0 [3mtrack[0m[2m=[0mcatalog.json [3msequence[0m[2m=[0m5
+[2m2026-09-06T17:10:15.392302Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m5
+[2m2026-09-06T17:10:15.400545Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info requested [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:10:15.400600Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info requested [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:10:15.400990Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info cancelled [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:10:15.401012Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info cancelled [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:10:15.401920Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m1 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:10:15.401995Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m2
+[2m2026-09-06T17:10:15.402615Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m2 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:10:15.402689Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m2
+[2m2026-09-06T17:10:16.115396Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m3
+[2m2026-09-06T17:10:16.115724Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m3
+[2m2026-09-06T17:10:16.116677Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m2
+[2m2026-09-06T17:10:16.116718Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m2
+[2m2026-09-06T17:10:18.628183Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m4
+[2m2026-09-06T17:10:18.628336Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m4
+[2m2026-09-06T17:10:18.628911Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m3
+[2m2026-09-06T17:10:18.628947Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m3
+[2m2026-09-06T17:10:20.522071Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m5
+[2m2026-09-06T17:10:20.522700Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m5
+[2m2026-09-06T17:10:20.524275Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m4
+[2m2026-09-06T17:10:20.524498Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m4
+[2m2026-09-06T17:10:23.036400Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m6
+[2m2026-09-06T17:10:23.038253Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m6
+[2m2026-09-06T17:10:23.038678Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m5
+[2m2026-09-06T17:10:23.038739Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m5
+[2m2026-09-06T17:10:24.382680Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m7
+[2m2026-09-06T17:10:24.383984Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m6
+[2m2026-09-06T17:10:24.389538Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m7
+[2m2026-09-06T17:10:24.389901Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m6
+[2m2026-09-06T17:10:26.902549Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m8
+[2m2026-09-06T17:10:26.902799Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m8
+[2m2026-09-06T17:10:26.903353Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m7
+[2m2026-09-06T17:10:26.903417Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m7
+[2m2026-09-06T17:10:29.405737Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m9
+[2m2026-09-06T17:10:29.405887Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m9
+[2m2026-09-06T17:10:29.406975Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m8
+[2m2026-09-06T17:10:29.407051Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m8
+[2m2026-09-06T17:10:31.744777Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m10
+[2m2026-09-06T17:10:31.744957Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m10
+[2m2026-09-06T17:10:31.746321Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m9
+[2m2026-09-06T17:10:31.746410Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m9
+[2m2026-09-06T17:10:34.207482Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m11
+[2m2026-09-06T17:10:34.207749Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m0 [3mtrack[0m[2m=[0mcatalog.json [3msequence[0m[2m=[0m6
+[2m2026-09-06T17:10:34.208587Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m11
+[2m2026-09-06T17:10:34.208648Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m6
+[2m2026-09-06T17:10:34.208677Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m10
+[2m2026-09-06T17:10:34.210418Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m10
+[2m2026-09-06T17:10:36.711705Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m12
+[2m2026-09-06T17:10:36.711869Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m12
+[2m2026-09-06T17:10:36.713710Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m11
+[2m2026-09-06T17:10:36.713760Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m11
+[2m2026-09-06T17:10:39.194965Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m13
+[2m2026-09-06T17:10:39.195099Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m13
+[2m2026-09-06T17:10:39.195716Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m12
+[2m2026-09-06T17:10:39.195820Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m12
+[2m2026-09-06T17:10:41.700055Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m14
+[2m2026-09-06T17:10:41.700466Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m14
+[2m2026-09-06T17:10:41.702337Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m13
+[2m2026-09-06T17:10:41.702392Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m13
+[2m2026-09-06T17:10:44.205353Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m15
+[2m2026-09-06T17:10:44.206309Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m15
+[2m2026-09-06T17:10:44.208119Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m14
+[2m2026-09-06T17:10:44.208177Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m14
+[2m2026-09-06T17:10:46.696289Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m16
+[2m2026-09-06T17:10:46.696451Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m16
+[2m2026-09-06T17:10:46.698660Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m15
+[2m2026-09-06T17:10:46.698793Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m15
+[2m2026-09-06T17:10:49.195189Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m17
+[2m2026-09-06T17:10:49.195361Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m17
+[2m2026-09-06T17:10:49.196170Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m16
+[2m2026-09-06T17:10:49.196337Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m16
+[2m2026-09-06T17:10:51.711889Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m18
+[2m2026-09-06T17:10:51.712048Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m18
+[2m2026-09-06T17:10:51.713812Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m17
+[2m2026-09-06T17:10:51.713880Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m17
+[2m2026-09-06T17:10:54.185399Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m19
+[2m2026-09-06T17:10:54.185730Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m19
+[2m2026-09-06T17:10:54.187058Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m18
+[2m2026-09-06T17:10:54.187104Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m18
+[2m2026-09-06T17:10:56.381192Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m20
+[2m2026-09-06T17:10:56.381328Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m20
+[2m2026-09-06T17:10:56.383384Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m19
+[2m2026-09-06T17:10:56.383487Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m19
+[2m2026-09-06T17:10:58.857431Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m21
+[2m2026-09-06T17:10:58.857601Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m21
+[2m2026-09-06T17:10:58.859005Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m20
+[2m2026-09-06T17:10:58.859069Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m20
+[2m2026-09-06T17:11:01.380008Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m22
+[2m2026-09-06T17:11:01.380153Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m22
+[2m2026-09-06T17:11:01.380806Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m21
+[2m2026-09-06T17:11:01.380926Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m21
+[2m2026-09-06T17:11:03.885742Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m23
+[2m2026-09-06T17:11:03.885880Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m23
+[2m2026-09-06T17:11:03.886751Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m22
+[2m2026-09-06T17:11:03.886809Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m22
+[2m2026-09-06T17:11:06.359545Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m24
+[2m2026-09-06T17:11:06.359710Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m24
+[2m2026-09-06T17:11:06.361270Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m23
+[2m2026-09-06T17:11:06.361337Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m23
+[2m2026-09-06T17:11:08.860962Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m25
+[2m2026-09-06T17:11:08.861137Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m25
+[2m2026-09-06T17:11:08.862302Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m24
+[2m2026-09-06T17:11:08.862365Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m24
+[2m2026-09-06T17:11:11.369085Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m26
+[2m2026-09-06T17:11:11.369215Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m26
+[2m2026-09-06T17:11:11.370658Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m25
+[2m2026-09-06T17:11:11.370735Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m25
+[2m2026-09-06T17:11:12.456709Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m27
+[2m2026-09-06T17:11:12.456848Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m27
+[2m2026-09-06T17:11:12.457248Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m26
+[2m2026-09-06T17:11:12.457407Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m26
+[2m2026-09-06T17:11:14.948539Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m28
+[2m2026-09-06T17:11:14.948827Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m28
+[2m2026-09-06T17:11:14.950185Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m27
+[2m2026-09-06T17:11:14.950677Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m27
+[2m2026-09-06T17:11:15.764989Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m1 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:11:15.765533Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m0 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T17:11:15.765865Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m2 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:11:18.947979Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m3 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T17:11:18.948095Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m3 [3mtrack[0m[2m=[0mcatalog.json [3msequence[0m[2m=[0m6
+[2m2026-09-06T17:11:18.948426Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m6
+[2m2026-09-06T17:11:18.956969Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m4 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:11:18.957114Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m29
+[2m2026-09-06T17:11:18.957270Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m5 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:11:18.957765Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m29
+[2m2026-09-06T17:11:19.950582Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m30
+[2m2026-09-06T17:11:19.951481Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m30
+[2m2026-09-06T17:11:19.951557Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m29
+[2m2026-09-06T17:11:19.952146Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m29
+[2m2026-09-06T17:11:22.120916Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m31
+[2m2026-09-06T17:11:22.122120Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m31
+[2m2026-09-06T17:11:22.122257Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m30
+[2m2026-09-06T17:11:22.122368Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m30
+[2m2026-09-06T17:11:24.202250Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m32
+[2m2026-09-06T17:11:24.202749Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m32
+[2m2026-09-06T17:11:24.202821Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m31
+[2m2026-09-06T17:11:24.203066Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m31
+[2m2026-09-06T17:11:26.695738Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m33
+[2m2026-09-06T17:11:26.695936Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m33
+[2m2026-09-06T17:11:26.697459Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m32
+[2m2026-09-06T17:11:26.697513Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m32
+[2m2026-09-06T17:11:28.607057Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m34
+[2m2026-09-06T17:11:28.607782Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m33
+[2m2026-09-06T17:11:28.626044Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m34
+[2m2026-09-06T17:11:28.626483Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m33
+[2m2026-09-06T17:11:31.107110Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m35
+[2m2026-09-06T17:11:31.107302Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m35
+[2m2026-09-06T17:11:31.108153Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m34
+[2m2026-09-06T17:11:31.108564Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m34
+[2m2026-09-06T17:11:33.620623Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m36
+[2m2026-09-06T17:11:33.621866Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m36
+[2m2026-09-06T17:11:33.622464Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m35
+[2m2026-09-06T17:11:33.622506Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m35
+[2m2026-09-06T17:11:36.130796Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m37
+[2m2026-09-06T17:11:36.131071Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m37
+[2m2026-09-06T17:11:36.131879Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m36
+[2m2026-09-06T17:11:36.131991Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m36
+[2m2026-09-06T17:11:38.409198Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m38
+[2m2026-09-06T17:11:38.409349Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m38
+[2m2026-09-06T17:11:38.411212Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m37
+[2m2026-09-06T17:11:38.411280Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m37
+[2m2026-09-06T17:11:40.075409Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m39
+[2m2026-09-06T17:11:40.075570Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m39
+[2m2026-09-06T17:11:40.077083Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m38
+[2m2026-09-06T17:11:40.077143Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m38
+[2m2026-09-06T17:11:42.584717Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m40
+[2m2026-09-06T17:11:42.584881Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m40
+[2m2026-09-06T17:11:42.586259Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m39
+[2m2026-09-06T17:11:42.586310Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m39
+[2m2026-09-06T17:11:45.067924Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m41
+[2m2026-09-06T17:11:45.068210Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m41
+[2m2026-09-06T17:11:45.070236Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m40
+[2m2026-09-06T17:11:45.070327Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m40
+[2m2026-09-06T17:11:47.570169Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m42
+[2m2026-09-06T17:11:47.570314Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m42
+[2m2026-09-06T17:11:47.570921Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m41
+[2m2026-09-06T17:11:47.571132Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m41
+[2m2026-09-06T17:11:50.106281Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m43
+[2m2026-09-06T17:11:50.106433Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m43
+[2m2026-09-06T17:11:50.109010Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m42
+[2m2026-09-06T17:11:50.109096Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m42
+[2m2026-09-06T17:11:52.553273Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m44
+[2m2026-09-06T17:11:52.554290Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m43
+[2m2026-09-06T17:11:52.558753Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m44
+[2m2026-09-06T17:11:52.584562Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m43
+[2m2026-09-06T17:11:55.062566Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m45
+[2m2026-09-06T17:11:55.062852Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m45
+[2m2026-09-06T17:11:55.064681Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m44
+[2m2026-09-06T17:11:55.065195Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m44
+[2m2026-09-06T17:11:57.563812Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m46
+[2m2026-09-06T17:11:57.563946Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m46
+[2m2026-09-06T17:11:57.564638Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m45
+[2m2026-09-06T17:11:57.564678Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m45
+[2m2026-09-06T17:12:00.071604Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m47
+[2m2026-09-06T17:12:00.073104Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m47
+[2m2026-09-06T17:12:00.074169Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m46
+[2m2026-09-06T17:12:00.075906Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m46
+[2m2026-09-06T17:12:01.327767Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m48
+[2m2026-09-06T17:12:01.327934Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m48
+[2m2026-09-06T17:12:01.329935Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m47
+[2m2026-09-06T17:12:01.329981Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m47
+[2m2026-09-06T17:12:03.844421Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m49
+[2m2026-09-06T17:12:03.844567Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m49
+[2m2026-09-06T17:12:03.845724Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m48
+[2m2026-09-06T17:12:03.846152Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m48
+[2m2026-09-06T17:12:06.332413Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m50
+[2m2026-09-06T17:12:06.334413Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m49
+[2m2026-09-06T17:12:06.335367Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m50
+[2m2026-09-06T17:12:06.335649Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m49
+[2m2026-09-06T17:12:08.822181Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m51
+[2m2026-09-06T17:12:08.822343Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m51
+[2m2026-09-06T17:12:08.822984Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m50
+[2m2026-09-06T17:12:08.823024Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m50
+[2m2026-09-06T17:12:11.323933Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m52
+[2m2026-09-06T17:12:11.324093Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m52
+[2m2026-09-06T17:12:11.324832Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m51
+[2m2026-09-06T17:12:11.324879Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m51
+[2m2026-09-06T17:12:13.831329Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m53
+[2m2026-09-06T17:12:13.833089Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m52
+[2m2026-09-06T17:12:13.833853Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m53
+[2m2026-09-06T17:12:13.834227Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m52
+[2m2026-09-06T17:12:15.528162Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m54
+[2m2026-09-06T17:12:15.528318Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m54
+[2m2026-09-06T17:12:15.529299Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m53
+[2m2026-09-06T17:12:15.529336Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m53
+[2m2026-09-06T17:12:18.043606Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m5 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m55
+[2m2026-09-06T17:12:18.045664Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m4 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m55
+[2m2026-09-06T17:12:18.045755Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m54
+[2m2026-09-06T17:12:18.045974Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m54
+[2m2026-09-06T17:12:19.368802Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m5 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:12:19.369301Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m4 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:12:19.369534Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m3 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T17:12:22.545724Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m6 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T17:12:22.545831Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m6 [3mtrack[0m[2m=[0mcatalog.json [3msequence[0m[2m=[0m6
+[2m2026-09-06T17:12:22.554828Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m7 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:12:22.554949Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m56
+[2m2026-09-06T17:12:22.555156Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m8 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:12:22.555598Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m56
+[2m2026-09-06T17:12:23.028193Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m57
+[2m2026-09-06T17:12:23.030037Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m57
+[2m2026-09-06T17:12:23.030838Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m56
+[2m2026-09-06T17:12:23.030951Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m56
+[2m2026-09-06T17:12:25.540171Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m58
+[2m2026-09-06T17:12:25.540324Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m58
+[2m2026-09-06T17:12:25.541149Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m57
+[2m2026-09-06T17:12:25.541944Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m57
+[2m2026-09-06T17:12:28.026706Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m59
+[2m2026-09-06T17:12:28.026866Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m59
+[2m2026-09-06T17:12:28.028979Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m58
+[2m2026-09-06T17:12:28.029140Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m58
+[2m2026-09-06T17:12:30.525226Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m60
+[2m2026-09-06T17:12:30.525374Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m60
+[2m2026-09-06T17:12:30.527300Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m59
+[2m2026-09-06T17:12:30.527367Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m59
+[2m2026-09-06T17:12:33.043168Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m61
+[2m2026-09-06T17:12:33.043319Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m61
+[2m2026-09-06T17:12:33.043983Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m60
+[2m2026-09-06T17:12:33.044298Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m60
+[2m2026-09-06T17:12:35.063821Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m62
+[2m2026-09-06T17:12:35.064113Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m62
+[2m2026-09-06T17:12:35.064887Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m61
+[2m2026-09-06T17:12:35.066328Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m61
+[2m2026-09-06T17:12:37.578330Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m63
+[2m2026-09-06T17:12:37.578491Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m63
+[2m2026-09-06T17:12:37.580509Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m62
+[2m2026-09-06T17:12:37.580618Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m62
+[2m2026-09-06T17:12:40.022373Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m64
+[2m2026-09-06T17:12:40.022527Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m64
+[2m2026-09-06T17:12:40.024234Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m63
+[2m2026-09-06T17:12:40.024328Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m63
+[2m2026-09-06T17:12:42.529234Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m65
+[2m2026-09-06T17:12:42.529400Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m65
+[2m2026-09-06T17:12:42.530862Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m64
+[2m2026-09-06T17:12:42.531048Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m64
+[2m2026-09-06T17:12:44.646427Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m66
+[2m2026-09-06T17:12:44.646627Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m66
+[2m2026-09-06T17:12:44.647320Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m65
+[2m2026-09-06T17:12:44.647507Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m65
+[2m2026-09-06T17:12:47.169635Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m67
+[2m2026-09-06T17:12:47.171247Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m67
+[2m2026-09-06T17:12:47.171812Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m66
+[2m2026-09-06T17:12:47.171847Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m66
+[2m2026-09-06T17:12:49.498963Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m68
+[2m2026-09-06T17:12:49.500435Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m67
+[2m2026-09-06T17:12:49.501882Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m68
+[2m2026-09-06T17:12:49.502245Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m67
+[2m2026-09-06T17:12:50.928785Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m69
+[2m2026-09-06T17:12:50.929937Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m68
+[2m2026-09-06T17:12:50.933086Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m69
+[2m2026-09-06T17:12:50.960900Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m68
+[2m2026-09-06T17:12:53.446050Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m70
+[2m2026-09-06T17:12:53.446930Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m70
+[2m2026-09-06T17:12:53.448292Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m69
+[2m2026-09-06T17:12:53.448594Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m69
+[2m2026-09-06T17:12:54.852708Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m71
+[2m2026-09-06T17:12:54.852882Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m71
+[2m2026-09-06T17:12:54.853426Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m70
+[2m2026-09-06T17:12:54.853479Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m70
+[2m2026-09-06T17:12:56.661327Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m72
+[2m2026-09-06T17:12:56.661481Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m72
+[2m2026-09-06T17:12:56.663313Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m71
+[2m2026-09-06T17:12:56.663394Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m71
+[2m2026-09-06T17:12:58.191537Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m73
+[2m2026-09-06T17:12:58.192207Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m72
+[2m2026-09-06T17:12:58.208352Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m73
+[2m2026-09-06T17:12:58.209403Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m72
+[2m2026-09-06T17:13:00.682457Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m74
+[2m2026-09-06T17:13:00.683151Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m74
+[2m2026-09-06T17:13:00.683711Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m73
+[2m2026-09-06T17:13:00.683794Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m73
+[2m2026-09-06T17:13:03.191696Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m75
+[2m2026-09-06T17:13:03.192553Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m75
+[2m2026-09-06T17:13:03.193648Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m74
+[2m2026-09-06T17:13:03.193706Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m74
+[2m2026-09-06T17:13:04.779899Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m76
+[2m2026-09-06T17:13:04.780188Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m76
+[2m2026-09-06T17:13:04.782559Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m75
+[2m2026-09-06T17:13:04.782671Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m75
+[2m2026-09-06T17:13:06.395211Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m77
+[2m2026-09-06T17:13:06.396173Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m77
+[2m2026-09-06T17:13:06.396374Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m76
+[2m2026-09-06T17:13:06.397735Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m76
+[2m2026-09-06T17:13:08.914809Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m78
+[2m2026-09-06T17:13:08.915396Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m78
+[2m2026-09-06T17:13:08.916042Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m77
+[2m2026-09-06T17:13:08.916121Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m77
+[2m2026-09-06T17:13:11.373748Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m79
+[2m2026-09-06T17:13:11.375171Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m78
+[2m2026-09-06T17:13:11.390908Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m7 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m79
+[2m2026-09-06T17:13:11.391645Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m78
+[2m2026-09-06T17:13:11.391704Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m6 [3mtrack[0m[2m=[0mcatalog.json [3msequence[0m[2m=[0m7
+[2m2026-09-06T17:13:11.392110Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m7
+[2m2026-09-06T17:13:11.400983Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m7 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:13:11.403309Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m9 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:13:11.403447Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m9 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m79
+[2m2026-09-06T17:13:13.900020Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m80
+[2m2026-09-06T17:13:13.900239Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m9 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m80
+[2m2026-09-06T17:13:13.901743Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m79
+[2m2026-09-06T17:13:13.902183Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m79
+[2m2026-09-06T17:13:16.401225Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m81
+[2m2026-09-06T17:13:16.401578Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m9 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m81
+[2m2026-09-06T17:13:16.402506Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m80
+[2m2026-09-06T17:13:16.402557Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m80
+[2m2026-09-06T17:13:17.986568Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m82
+[2m2026-09-06T17:13:17.986733Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m9 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m82
+[2m2026-09-06T17:13:17.988043Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m81
+[2m2026-09-06T17:13:17.988103Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m81
+[2m2026-09-06T17:13:20.511212Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m83
+[2m2026-09-06T17:13:20.511578Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m9 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m83
+[2m2026-09-06T17:13:20.514646Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m82
+[2m2026-09-06T17:13:20.515318Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m82
+[2m2026-09-06T17:13:22.980143Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m8 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m84
+[2m2026-09-06T17:13:22.981788Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m9 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m84
+[2m2026-09-06T17:13:22.984608Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m83
+[2m2026-09-06T17:13:22.984710Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m83
+[2m2026-09-06T17:13:22.985347Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m8 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:13:22.985414Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m9 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:13:22.985546Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m6 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T17:13:26.178204Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m10 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T17:13:26.178514Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m10 [3mtrack[0m[2m=[0mcatalog.json [3msequence[0m[2m=[0m7
+[2m2026-09-06T17:13:26.178856Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m7
+[2m2026-09-06T17:13:26.190143Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m11 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:13:26.190398Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m86
+[2m2026-09-06T17:13:26.190697Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m12 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:13:26.191259Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m86
+[2m2026-09-06T17:13:28.060822Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m87
+[2m2026-09-06T17:13:28.060973Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m87
+[2m2026-09-06T17:13:28.061896Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m86
+[2m2026-09-06T17:13:28.061942Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m86
+[2m2026-09-06T17:13:30.582166Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m88
+[2m2026-09-06T17:13:30.582370Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m88
+[2m2026-09-06T17:13:30.585416Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m87
+[2m2026-09-06T17:13:30.585622Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m87
+[2m2026-09-06T17:13:32.822864Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m89
+[2m2026-09-06T17:13:32.823497Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m89
+[2m2026-09-06T17:13:32.824774Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m88
+[2m2026-09-06T17:13:32.824877Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m88
+[2m2026-09-06T17:13:34.569710Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m90
+[2m2026-09-06T17:13:34.569862Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m90
+[2m2026-09-06T17:13:34.570721Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m89
+[2m2026-09-06T17:13:34.570781Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m89
+[2m2026-09-06T17:13:36.112464Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m91
+[2m2026-09-06T17:13:36.113654Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m90
+[2m2026-09-06T17:13:36.125980Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m91
+[2m2026-09-06T17:13:36.126853Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m90
+[2m2026-09-06T17:13:37.535590Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m92
+[2m2026-09-06T17:13:37.537219Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m91
+[2m2026-09-06T17:13:37.543725Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m92
+[2m2026-09-06T17:13:37.546655Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m91
+[2m2026-09-06T17:13:40.017319Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m93
+[2m2026-09-06T17:13:40.017686Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m93
+[2m2026-09-06T17:13:40.018634Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m92
+[2m2026-09-06T17:13:40.018707Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m92
+[2m2026-09-06T17:13:42.435340Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m94
+[2m2026-09-06T17:13:42.435666Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m94
+[2m2026-09-06T17:13:42.436788Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m93
+[2m2026-09-06T17:13:42.437029Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m93
+[2m2026-09-06T17:13:44.947703Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m95
+[2m2026-09-06T17:13:44.947875Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m95
+[2m2026-09-06T17:13:44.949169Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m94
+[2m2026-09-06T17:13:44.949216Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m94
+[2m2026-09-06T17:13:47.457528Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m96
+[2m2026-09-06T17:13:47.457803Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m96
+[2m2026-09-06T17:13:47.459594Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m95
+[2m2026-09-06T17:13:47.459657Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m95
+[2m2026-09-06T17:13:49.136416Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m97
+[2m2026-09-06T17:13:49.137460Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m96
+[2m2026-09-06T17:13:49.141250Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m97
+[2m2026-09-06T17:13:49.168652Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m96
+[2m2026-09-06T17:13:51.675154Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m98
+[2m2026-09-06T17:13:51.675296Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m98
+[2m2026-09-06T17:13:51.677342Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m97
+[2m2026-09-06T17:13:51.677392Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m97
+[2m2026-09-06T17:13:54.186926Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m99
+[2m2026-09-06T17:13:54.187085Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m99
+[2m2026-09-06T17:13:54.190378Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m98
+[2m2026-09-06T17:13:54.190453Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m98
+[2m2026-09-06T17:13:56.644952Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m100
+[2m2026-09-06T17:13:56.645138Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m100
+[2m2026-09-06T17:13:56.646369Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m99
+[2m2026-09-06T17:13:56.646465Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m99
+[2m2026-09-06T17:13:58.585030Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m101
+[2m2026-09-06T17:13:58.585229Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m101
+[2m2026-09-06T17:13:58.585909Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m100
+[2m2026-09-06T17:13:58.587746Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m100
+[2m2026-09-06T17:14:01.086994Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m102
+[2m2026-09-06T17:14:01.087238Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m102
+[2m2026-09-06T17:14:01.088298Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m101
+[2m2026-09-06T17:14:01.088420Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m101
+[2m2026-09-06T17:14:03.568441Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m103
+[2m2026-09-06T17:14:03.568602Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m103
+[2m2026-09-06T17:14:03.569962Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m102
+[2m2026-09-06T17:14:03.570016Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m102
+[2m2026-09-06T17:14:06.077380Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m104
+[2m2026-09-06T17:14:06.078621Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m104
+[2m2026-09-06T17:14:06.078764Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m103
+[2m2026-09-06T17:14:06.078966Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m103
+[2m2026-09-06T17:14:08.560343Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m105
+[2m2026-09-06T17:14:08.560701Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m105
+[2m2026-09-06T17:14:08.561718Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m104
+[2m2026-09-06T17:14:08.562203Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m104
+[2m2026-09-06T17:14:10.722218Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m106
+[2m2026-09-06T17:14:10.722358Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m106
+[2m2026-09-06T17:14:10.727189Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m105
+[2m2026-09-06T17:14:10.727422Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m105
+[2m2026-09-06T17:14:12.164778Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m107
+[2m2026-09-06T17:14:12.164966Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m107
+[2m2026-09-06T17:14:12.165637Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m106
+[2m2026-09-06T17:14:12.165681Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m106
+[2m2026-09-06T17:14:14.641106Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m108
+[2m2026-09-06T17:14:14.641314Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m108
+[2m2026-09-06T17:14:14.642530Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m107
+[2m2026-09-06T17:14:14.643073Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m107
+[2m2026-09-06T17:14:17.143025Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m109
+[2m2026-09-06T17:14:17.143187Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m109
+[2m2026-09-06T17:14:17.143851Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m108
+[2m2026-09-06T17:14:17.144388Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m108
+[2m2026-09-06T17:14:19.397973Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m110
+[2m2026-09-06T17:14:19.398237Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m110
+[2m2026-09-06T17:14:19.399134Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m109
+[2m2026-09-06T17:14:19.399255Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m109
+[2m2026-09-06T17:14:20.649625Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m111
+[2m2026-09-06T17:14:20.649776Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m111
+[2m2026-09-06T17:14:20.650471Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m110
+[2m2026-09-06T17:14:20.650509Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m110
+[2m2026-09-06T17:14:22.333276Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m112
+[2m2026-09-06T17:14:22.333906Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m111
+[2m2026-09-06T17:14:22.335504Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m112
+[2m2026-09-06T17:14:22.336121Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m111
+[2m2026-09-06T17:14:23.971072Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m113
+[2m2026-09-06T17:14:23.971896Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m112
+[2m2026-09-06T17:14:23.974798Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m113
+[2m2026-09-06T17:14:23.986401Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m112
+[2m2026-09-06T17:14:25.660139Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m12 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m114
+[2m2026-09-06T17:14:25.660357Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m11 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m114
+[2m2026-09-06T17:14:25.662273Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m113
+[2m2026-09-06T17:14:25.662346Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m113
+[2m2026-09-06T17:14:26.591795Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m11 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T17:14:26.592231Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m12 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T17:14:26.592291Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m10 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json

@@ -1,0 +1,176 @@
+{
+ "meta": {
+  "tag": "p0-focus-pub",
+  "relay": "http://localhost:4443",
+  "name": "rt/p0-focus-pub.hang",
+  "presets": [
+   "auto"
+  ],
+  "holdMs": 20000,
+  "publisher": "harness",
+  "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+  "branch": "debug/rt-audio",
+  "chrome": {
+   "Browser": "Chrome/152.0.7977.82",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+   "V8-Version": "15.2.124.21",
+   "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/97c0a476-7c58-423e-8ce6-85dbd67b2d8c"
+  },
+  "startedAt": "2026-09-06T14:51:09.864Z"
+ },
+ "events": [
+  {
+   "e": 1788706272880,
+   "event": "start",
+   "relayLogOffset": 5392,
+   "meta": {
+    "tag": "p0-focus-pub",
+    "relay": "http://localhost:4443",
+    "name": "rt/p0-focus-pub.hang",
+    "presets": [
+     "auto"
+    ],
+    "holdMs": 20000,
+    "publisher": "harness",
+    "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+    "branch": "debug/rt-audio",
+    "chrome": {
+     "Browser": "Chrome/152.0.7977.82",
+     "Protocol-Version": "1.3",
+     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+     "V8-Version": "15.2.124.21",
+     "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+     "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/97c0a476-7c58-423e-8ce6-85dbd67b2d8c"
+    },
+    "startedAt": "2026-09-06T14:51:09.864Z"
+   }
+  },
+  {
+   "e": 1788706274212,
+   "event": "publisher-established",
+   "relayLogOffset": 8150
+  },
+  {
+   "e": 1788706274213,
+   "event": "watch-open-auto",
+   "relayLogOffset": 8150,
+   "preset": "auto"
+  },
+  {
+   "e": 1788706274801,
+   "event": "watch-live-auto",
+   "relayLogOffset": 21571,
+   "preset": "auto",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1333.3200000214576,
+    "astalled": true,
+    "abufMs": 0.1,
+    "abytes": 883,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 5,
+    "catalogAudio": "{\"renditions\":{\"audio\":{\"codec\":\"opus\",\"container\":{\"kind\":\"legacy\"},\"description\":\"4f707573486561640102380180bb0000000000\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"jitter\":20}}}",
+    "catalogVideo": "{\"renditions\":{\"video\":{\"codec\":\"avc1.640028\",\"container\":{\"kind\":\"legacy\"},\"codedWidth\":1280,\"codedHeight\":720,\"framerate\":20,\"bitrate\":1612800,\"optimizeForLatency\":true,\"jitter\":50}},\"display\":{\"width\":1280,\"height\":720}}"
+   },
+   "focus": "pub"
+  },
+  {
+   "e": 1788706284803,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 222861,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1333.3200000214576,
+    "astalled": false,
+    "abufMs": 0,
+    "abytes": 39818,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 205
+   }
+  },
+  {
+   "e": 1788706294805,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 447043,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1333.3200000214576,
+    "astalled": false,
+    "abufMs": 0.1,
+    "abytes": 80708,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 405
+   }
+  },
+  {
+   "e": 1788706294806,
+   "event": "watch-close-auto",
+   "relayLogOffset": 447043,
+   "preset": "auto",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 43,
+    "maxAge": 43,
+    "ref": -1333.3200000214576,
+    "astalled": false,
+    "abufMs": 0.1,
+    "abytes": 80708,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 405
+   }
+  },
+  {
+   "e": 1788706297809,
+   "event": "publisher-close",
+   "relayLogOffset": 450817,
+   "last": {
+    "transport": "webtransport",
+    "established": false,
+    "audioFrames": 1023,
+    "audioBytes": 91428,
+    "videoFrames": 453,
+    "keyframes": 12,
+    "audioCatalog": "{\"codec\":\"opus\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"container\":{\"kind\":\"legacy\"},\"jitter\":20,\"description\":\"4f707573486561640102380180bb0000000000\"}"
+   }
+  },
+  {
+   "e": 1788706297810,
+   "event": "done",
+   "relayLogOffset": 450817
+  }
+ ]
+}

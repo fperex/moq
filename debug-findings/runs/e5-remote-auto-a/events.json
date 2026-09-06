@@ -1,0 +1,247 @@
+{
+ "meta": {
+  "tag": "e5-remote-auto-a",
+  "relay": "https://cdn.moq.pro/demo",
+  "name": "bbb.hang",
+  "presets": [
+   "auto"
+  ],
+  "holdMs": 60000,
+  "publisher": "none",
+  "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+  "branch": "debug/rt-audio",
+  "chrome": {
+   "Browser": "Chrome/152.0.7977.82",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+   "V8-Version": "15.2.124.21",
+   "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/97c0a476-7c58-423e-8ce6-85dbd67b2d8c"
+  },
+  "startedAt": "2026-09-06T15:17:29.164Z"
+ },
+ "events": [
+  {
+   "e": 1788707849667,
+   "event": "start",
+   "relayLogOffset": -1,
+   "meta": {
+    "tag": "e5-remote-auto-a",
+    "relay": "https://cdn.moq.pro/demo",
+    "name": "bbb.hang",
+    "presets": [
+     "auto"
+    ],
+    "holdMs": 60000,
+    "publisher": "none",
+    "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+    "branch": "debug/rt-audio",
+    "chrome": {
+     "Browser": "Chrome/152.0.7977.82",
+     "Protocol-Version": "1.3",
+     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+     "V8-Version": "15.2.124.21",
+     "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+     "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/97c0a476-7c58-423e-8ce6-85dbd67b2d8c"
+    },
+    "startedAt": "2026-09-06T15:17:29.164Z"
+   }
+  },
+  {
+   "e": 1788707849668,
+   "event": "watch-open-auto",
+   "relayLogOffset": -1,
+   "preset": "auto"
+  },
+  {
+   "e": 1788707851528,
+   "event": "watch-live-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 42,
+    "jitter": 52.5,
+    "delay": 55.5,
+    "maxAge": 55.5,
+    "ref": -653500384.765,
+    "astalled": true,
+    "abufMs": 0,
+    "abytes": 398,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 3,
+    "vstalled": false,
+    "vframes": 26
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788707861534,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 39,
+    "jitter": 48.75,
+    "delay": 51.75,
+    "maxAge": 51.75,
+    "ref": -653500397.3299999,
+    "astalled": false,
+    "abufMs": 8.22,
+    "abytes": 150366,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 3,
+    "vstalled": false,
+    "vframes": 292
+   }
+  },
+  {
+   "e": 1788707871537,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 39,
+    "jitter": 48.75,
+    "delay": 51.75,
+    "maxAge": 51.75,
+    "ref": -653500404.836,
+    "astalled": false,
+    "abufMs": 162.54,
+    "abytes": 302000,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 3,
+    "vstalled": false,
+    "vframes": 533
+   }
+  },
+  {
+   "e": 1788707881540,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 39,
+    "jitter": 48.75,
+    "delay": 51.75,
+    "maxAge": 51.75,
+    "ref": -653500394.03,
+    "astalled": false,
+    "abufMs": 0.01,
+    "abytes": 452590,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 3,
+    "vstalled": false,
+    "vframes": 773
+   }
+  },
+  {
+   "e": 1788707891542,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 39,
+    "jitter": 48.75,
+    "delay": 51.75,
+    "maxAge": 51.75,
+    "ref": -653500419.567,
+    "astalled": false,
+    "abufMs": 0.01,
+    "abytes": 608204,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 3,
+    "vstalled": false,
+    "vframes": 1013
+   }
+  },
+  {
+   "e": 1788707901543,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 39,
+    "jitter": 48.75,
+    "delay": 51.75,
+    "maxAge": 51.75,
+    "ref": -653500406.97,
+    "astalled": false,
+    "abufMs": 45.97,
+    "abytes": 764512,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 3,
+    "vstalled": false,
+    "vframes": 1252
+   }
+  },
+  {
+   "e": 1788707911545,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 39,
+    "jitter": 48.75,
+    "delay": 51.75,
+    "maxAge": 51.75,
+    "ref": -653500400.212,
+    "astalled": false,
+    "abufMs": 0.01,
+    "abytes": 912963,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 3,
+    "vstalled": false,
+    "vframes": 1493
+   }
+  },
+  {
+   "e": 1788707911545,
+   "event": "watch-close-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 39,
+    "jitter": 48.75,
+    "delay": 51.75,
+    "maxAge": 51.75,
+    "ref": -653500400.212,
+    "astalled": false,
+    "abufMs": 0.01,
+    "abytes": 912963,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 3,
+    "vstalled": false,
+    "vframes": 1493
+   }
+  },
+  {
+   "e": 1788707914547,
+   "event": "done",
+   "relayLogOffset": -1
+  }
+ ]
+}

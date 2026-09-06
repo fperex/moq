@@ -1,0 +1,17 @@
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - `__dirname` (vite.config.ts:12:18). Use `import.meta.dirname` instead
+  - import "../../js/common/vite-plugin-isolate" without a file extension (vite.config.ts:5:38). Add the file extension
+  - import "../../js/common/vite-plugin-worklet" without a file extension (vite.config.ts:6:31). Add the file extension
+  - import "./console-overlay" without a file extension (vite.config.ts:7:32). Add the file extension
+  - import "./open-tabs" without a file extension (vite.config.ts:8:26). Add the file extension
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+
+  VITE v8.2.2  ready in 408 ms
+
+  ➜  Local:   http://localhost:5174/
+  ➜  Network: use --host to expose
+11:35:30 AM [vite] (client) [console.warn] skipping covered group: 42 -> 43
+11:36:49 AM [vite] (client) [console.warn] skipping covered group: 77 -> 78
+11:36:51 AM [vite] (client) [console.warn] skipping slow group: track=1.m4s 78 -> 79
+11:37:22 AM [vite] (client) [console.warn] skipping covered group: 93 -> 94
+error: "vite" exited with code 143

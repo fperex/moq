@@ -1,0 +1,234 @@
+[0.12ms] ".env"
+bun install v1.4.2 (744846f84)
+
+Checked 705 installs across 858 packages (no changes) [118.00ms]
+@moq/flate check: Exited with code 0
+moq-doc check: bun test v1.4.2 (744846f84)
+@moq/signals check: Exited with code 0
+@moq/token check: Exited with code 0
+moq-doc check: 
+moq-doc check:  31 pass
+moq-doc check:  0 fail
+moq-doc check:  80 expect() calls
+moq-doc check: Ran 31 tests across 1 file. [331.00ms]
+@moq/net check: Exited with code 0
+@moq/clock check: Exited with code 0
+@moq/json check: Exited with code 0
+@moq/msf check: Exited with code 0
+@moq/binary check: Exited with code 0
+@moq/loc check: bun test v1.4.2 (744846f84)
+@moq/loc check: 
+@moq/loc check:  7 pass
+@moq/loc check:  0 fail
+@moq/loc check:  11 expect() calls
+@moq/loc check: Ran 7 tests across 1 file. [23.00ms]
+@moq/loc check: Exited with code 0
+moq-doc check: 
+moq-doc check:   vitepress v1.6.4
+moq-doc check: 
+moq-doc check: - building client + server bundles...
+@moq/hang check: Exited with code 0
+@moq/watch check: Exited with code 0
+@moq/publish check: Exited with code 0
+@moq/boy check: Exited with code 0
+@moq/demo check: Exited with code 0
+@moq/smoke-browser check: Exited with code 0
+moq-doc check: [32m✓[0m building client + server bundles...
+moq-doc check: - rendering pages...
+moq-doc check: [32m✓[0m rendering pages...
+moq-doc check: build complete in 3.36s.
+moq-doc check: Exited with code 0
+Checked 469 files in 1848ms. No fixes applied.
+bun run --filter='*' build
+@moq/flate build: ✍️  Rewriting package.json...
+@moq/flate build: 📄 Copying README.md...
+@moq/flate build: 🔍 Running publint...
+@moq/flate build: 📦 Package built successfully in dist/
+@moq/flate build: ✍️  Generating jsr.json...
+@moq/flate build: 📦 jsr.json written
+@moq/flate build: Exited with code 0
+@moq/token build: ✍️  Rewriting package.json...
+@moq/token build: 📄 Copying README.md...
+@moq/token build: 🔍 Running publint...
+@moq/token build: 📦 Package built successfully in dist/
+@moq/token build: ✍️  Generating jsr.json...
+@moq/token build: 📦 jsr.json written
+@moq/token build: Exited with code 0
+moq-doc build: 
+moq-doc build:   vitepress v1.6.4
+moq-doc build: 
+moq-doc build: - building client + server bundles...
+@moq/signals build: ✍️  Rewriting package.json...
+@moq/signals build: 📄 Copying README.md...
+@moq/signals build: 🔍 Running publint...
+@moq/signals build: 📦 Package built successfully in dist/
+@moq/signals build: ✍️  Generating jsr.json...
+@moq/signals build: 📦 jsr.json written
+@moq/signals build: Exited with code 0
+@moq/net build: ✍️  Rewriting package.json...
+@moq/net build: 🔗 Converted @moq/signals: workspace:* → ^0.2.3
+@moq/net build: 📄 Copying README.md...
+@moq/net build: 🔍 Running publint...
+@moq/net build: 📦 Package built successfully in dist/
+@moq/net build: ✍️  Generating jsr.json...
+@moq/net build: 📦 jsr.json written
+@moq/net build: Exited with code 0
+@moq/binary build: ✍️  Rewriting package.json...
+@moq/binary build: 🔗 Converted @moq/flate: workspace:^ → ^0.1.3
+@moq/binary build: 🔗 Converted @moq/net: workspace:^ → ^0.3.4
+@moq/binary build: 📄 Copying README.md...
+@moq/binary build: 🔍 Running publint...
+@moq/binary build: 📦 Package built successfully in dist/
+@moq/binary build: ✍️  Generating jsr.json...
+@moq/binary build: 📦 jsr.json written
+@moq/binary build: Exited with code 0
+@moq/loc build: ✍️  Rewriting package.json...
+@moq/loc build: 🔗 Converted @moq/net: workspace:^ → ^0.3.4
+@moq/loc build: 📄 Copying README.md...
+@moq/loc build: 🔍 Running publint...
+@moq/json build: ✍️  Rewriting package.json...
+@moq/json build: 🔗 Converted @moq/flate: workspace:^ → ^0.1.3
+@moq/json build: 🔗 Converted @moq/net: workspace:^ → ^0.3.4
+@moq/json build: 🔗 Converted @moq/signals: workspace:^ → ^0.2.3
+@moq/json build: 📄 Copying README.md...
+@moq/json build: 🔍 Running publint...
+@moq/loc build: 📦 Package built successfully in dist/
+@moq/loc build: ✍️  Generating jsr.json...
+@moq/loc build: 📦 jsr.json written
+@moq/loc build: Exited with code 0
+@moq/json build: 📦 Package built successfully in dist/
+@moq/json build: ✍️  Generating jsr.json...
+@moq/json build: 📦 jsr.json written
+@moq/json build: Exited with code 0
+@moq/msf build: ✍️  Rewriting package.json...
+@moq/msf build: 🔗 Converted @moq/net: workspace:^ → ^0.3.4
+@moq/msf build: 📄 Copying README.md...
+@moq/msf build: 🔍 Running publint...
+@moq/msf build: 📦 Package built successfully in dist/
+@moq/msf build: ✍️  Generating jsr.json...
+@moq/msf build: 📦 jsr.json written
+@moq/msf build: Exited with code 0
+@moq/hang build: ✍️  Rewriting package.json...
+@moq/hang build: 🔗 Converted @moq/json: workspace:^ → ^0.3.3
+@moq/hang build: 🔗 Converted @moq/loc: workspace:^ → ^0.2.2
+@moq/hang build: 🔗 Converted @moq/net: workspace:^ → ^0.3.4
+@moq/hang build: 🔗 Converted @moq/signals: workspace:^ → ^0.2.3
+@moq/hang build: 📄 Copying README.md...
+@moq/hang build: 🔍 Running publint...
+@moq/hang build: 📦 Package built successfully in dist/
+@moq/hang build: ✍️  Generating jsr.json...
+@moq/hang build: 📦 jsr.json written
+@moq/hang build: Exited with code 0
+@moq/watch build: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@moq/watch build:   - `__dirname` (vite.config.ts:10:20). Use `import.meta.dirname` instead
+@moq/watch build:   - import "../common/vite-plugin-worklet" without a file extension (vite.config.ts:3:31). Add the file extension
+@moq/watch build: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@moq/publish build: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@moq/publish build:   - `__dirname` (vite.config.ts:10:20). Use `import.meta.dirname` instead
+@moq/publish build:   - import "../common/vite-plugin-worklet" without a file extension (vite.config.ts:3:31). Add the file extension
+@moq/publish build: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@moq/watch build: vite v8.2.2 building client environment for production...
+@moq/publish build: vite v8.2.2 building client environment for production...
+@moq/watch build: transforming...
+@moq/publish build: transforming...
+@moq/publish build: ✓ 133 modules transformed.
+@moq/watch build: ✓ 82 modules transformed.
+@moq/watch build: rendering chunks...
+@moq/publish build: rendering chunks...
+@moq/watch build: computing gzip size...
+@moq/watch build: dist/srt-parser-BY4VSBOl.js    0.70 kB │ gzip:  0.44 kB │ map:   1.79 kB
+@moq/watch build: dist/index.js                  1.06 kB │ gzip:  0.59 kB │ map:   0.58 kB
+@moq/watch build: dist/support/index.js          1.50 kB │ gzip:  0.71 kB │ map:   4.32 kB
+@moq/watch build: dist/errors-ByUNYUBY.js        1.53 kB │ gzip:  0.47 kB │ map:   3.26 kB
+@moq/watch build: dist/support/element.js        4.86 kB │ gzip:  1.83 kB │ map:  13.41 kB
+@moq/watch build: dist/ssa-parser-B8Q1Lgie.js    5.90 kB │ gzip:  2.24 kB │ map:  15.89 kB
+@moq/watch build: dist/element.js               10.50 kB │ gzip:  3.06 kB │ map:  35.58 kB
+@moq/watch build: dist/ui/element.js            53.07 kB │ gzip: 12.92 kB │ map:  90.83 kB
+@moq/watch build: dist/source-D5p84Y4T.js      115.93 kB │ gzip: 32.20 kB │ map: 352.77 kB
+@moq/watch build: 
+@moq/watch build: ✓ built in 162ms
+@moq/publish build: computing gzip size...
+@moq/publish build: dist/index.js                 0.86 kB │ gzip:   0.46 kB │ map:     1.17 kB
+@moq/publish build: dist/support/index.js         1.66 kB │ gzip:   0.79 kB │ map:     5.14 kB
+@moq/publish build: dist/processor-LGNPe1ts.js    4.79 kB │ gzip:   1.94 kB │ map:    13.84 kB
+@moq/publish build: dist/support/element.js       4.79 kB │ gzip:   1.83 kB │ map:    13.26 kB
+@moq/publish build: dist/element.js               7.52 kB │ gzip:   2.25 kB │ map:    24.73 kB
+@moq/publish build: dist/ui/element.js           36.78 kB │ gzip:   9.34 kB │ map:    60.68 kB
+@moq/publish build: dist/encoder-Dc1meUPW.js    498.50 kB │ gzip: 116.22 kB │ map: 1,872.31 kB
+@moq/publish build: 
+@moq/publish build: ✓ built in 190ms
+@moq/watch build: ✍️  Rewriting package.json...
+@moq/watch build: 🔗 Converted @moq/hang: workspace:^ → ^0.4.2
+@moq/watch build: 🔗 Converted @moq/net: workspace:^ → ^0.3.4
+@moq/watch build: 🔗 Converted @moq/msf: workspace:^ → ^0.2.1
+@moq/watch build: 🔗 Converted @moq/signals: workspace:^ → ^0.2.3
+@moq/watch build: 📄 Copying README.md...
+@moq/watch build: 🔍 Running publint...
+@moq/watch build: 📦 Package built successfully in dist/
+@moq/watch build: Exited with code 0
+@moq/publish build: ✍️  Rewriting package.json...
+@moq/publish build: 🔗 Converted @moq/hang: workspace:^ → ^0.4.2
+@moq/publish build: 🔗 Converted @moq/net: workspace:^ → ^0.3.4
+@moq/publish build: 🔗 Converted @moq/signals: workspace:^ → ^0.2.3
+@moq/publish build: 📄 Copying README.md...
+@moq/publish build: 🔍 Running publint...
+@moq/publish build: 📦 Package built successfully in dist/
+@moq/publish build: Exited with code 0
+@moq/boy build: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@moq/boy build:   - `__dirname` (vite.config.ts:11:20). Use `import.meta.dirname` instead
+@moq/boy build:   - import "../common/vite-plugin-worklet" without a file extension (vite.config.ts:4:31). Add the file extension
+@moq/boy build: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@moq/demo build: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@moq/demo build:   - `__dirname` (vite.config.ts:12:18). Use `import.meta.dirname` instead
+@moq/demo build:   - import "../../js/common/vite-plugin-isolate" without a file extension (vite.config.ts:5:38). Add the file extension
+@moq/demo build:   - import "../../js/common/vite-plugin-worklet" without a file extension (vite.config.ts:6:31). Add the file extension
+@moq/demo build:   - import "./console-overlay" without a file extension (vite.config.ts:7:32). Add the file extension
+@moq/demo build:   - import "./open-tabs" without a file extension (vite.config.ts:8:26). Add the file extension
+@moq/demo build: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@moq/demo build: vite v8.2.2 building client environment for production...
+@moq/boy build: vite v8.2.2 building client environment for production...
+@moq/boy build: transforming...
+@moq/demo build: transforming...
+@moq/boy build: ✓ 126 modules transformed.
+@moq/boy build: rendering chunks...
+@moq/boy build: computing gzip size...
+@moq/boy build: dist/index.js           0.23 kB │ gzip:  0.16 kB
+@moq/boy build: dist/element.js        41.07 kB │ gzip: 12.21 kB │ map: 150.00 kB
+@moq/boy build: dist/game-CO4BnNrB.js  96.82 kB │ gzip: 25.13 kB │ map: 517.32 kB
+@moq/boy build: 
+@moq/boy build: ✓ built in 190ms
+@moq/demo build: ✓ 488 modules transformed.
+@moq/demo build: rendering chunks...
+@moq/demo build: computing gzip size...
+@moq/demo build: src/dist/assets/favicon-CGEMJmM0.svg         4.89 kB │ gzip:   2.35 kB
+@moq/demo build: src/dist/stats.html                          7.90 kB │ gzip:   2.02 kB
+@moq/demo build: src/dist/watch.html                          7.93 kB │ gzip:   2.55 kB
+@moq/demo build: src/dist/publish.html                       14.65 kB │ gzip:   3.57 kB
+@moq/demo build: src/dist/assets/pool-DQthNPOD.css           38.90 kB │ gzip:   6.96 kB
+@moq/demo build: src/dist/assets/srt-parser-eK3JHfz1.js       0.45 kB │ gzip:   0.31 kB
+@moq/demo build: src/dist/assets/errors-CSwrxq-d.js           1.13 kB │ gzip:   0.35 kB
+@moq/demo build: src/dist/assets/ssa-parser-BLVcidgM.js       4.63 kB │ gzip:   2.03 kB
+@moq/demo build: src/dist/assets/stats-BsDxZ99A.js           10.77 kB │ gzip:   3.91 kB
+@moq/demo build: src/dist/assets/libav-opus-af-Dk4Zpjn7.js   26.17 kB │ gzip:   7.37 kB
+@moq/demo build: src/dist/assets/main-BaaNpb6I.js            49.54 kB │ gzip:  11.40 kB
+@moq/demo build: src/dist/assets/viz-DltGYIVT.js             54.19 kB │ gzip:  17.95 kB
+@moq/demo build: src/dist/assets/watch-BHVJ2EKH.js          185.09 kB │ gzip:  54.77 kB
+@moq/demo build: src/dist/assets/pool-FQ-Q_TS7.js           337.51 kB │ gzip:  91.62 kB
+@moq/demo build: src/dist/assets/publish-CFM2t0Pf.js        448.44 kB │ gzip: 118.13 kB
+@moq/demo build: 
+@moq/demo build: ✓ built in 421ms
+@moq/demo build: Exited with code 0
+@moq/boy build: ✍️  Rewriting package.json...
+@moq/boy build: 🔗 Converted @moq/json: workspace:^ → ^0.3.3
+@moq/boy build: 🔗 Converted @moq/net: workspace:^ → ^0.3.4
+@moq/boy build: 🔗 Converted @moq/watch: workspace:^ → ^0.5.3
+@moq/boy build: 🔗 Converted @moq/signals: workspace:^ → ^0.2.3
+@moq/boy build: 📄 Copying README.md...
+@moq/boy build: 🔍 Running publint...
+@moq/boy build: 📦 Package built successfully in dist/
+@moq/boy build: Exited with code 0
+moq-doc build: [32m✓[0m building client + server bundles...
+moq-doc build: - rendering pages...
+moq-doc build: [32m✓[0m rendering pages...
+moq-doc build: build complete in 3.23s.
+moq-doc build: Exited with code 0

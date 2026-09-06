@@ -1,0 +1,8 @@
+http://localhost:5174/enc-bench.html?mode=realtime&seconds=20 
+ {"done":true,"mode":"realtime","rate":48000,"ch":2,"supported":true,"inputs":1000,"outputs":1000,"backlog":0,"wallS":21.5,"latencyMs":{"p50":0.4,"p90":0.6,"max":4.3},"queueMax":0,"lastOutTs":20065255,"lastInTs":20065254.99999523}
+http://localhost:5174/enc-bench.html?mode=realtime&opus=voip&seconds=20 
+ {"done":true,"mode":"realtime","rate":48000,"ch":2,"supported":true,"inputs":1000,"outputs":1000,"backlog":0,"wallS":21.5,"latencyMs":{"p50":0.8,"p90":1.4,"max":3.3},"queueMax":0,"lastOutTs":20041445,"lastInTs":20041445.00002265}
+http://localhost:5174/enc-bench.html?mode=burst&seconds=20 
+ {"done":true,"mode":"burst","rate":48000,"ch":2,"supported":true,"inputs":1000,"outputs":1000,"backlog":0,"wallS":0.2,"latencyMs":{"p50":42,"p90":65.9,"max":71.8},"queueMax":995,"lastOutTs":20044730,"lastInTs":20044729.99998927}
+http://localhost:5174/enc-bench.html?mode=realtime&opus=voip&ch=1&seconds=20 
+ {"done":true,"mode":"realtime","rate":48000,"ch":1,"supported":true,"inputs":1000,"outputs":1000,"backlog":0,"wallS":21.5,"latencyMs":{"p50":0.3,"p90":0.6,"max":1.9},"queueMax":0,"lastOutTs":20058875,"lastInTs":20058875}

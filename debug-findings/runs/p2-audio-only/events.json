@@ -1,0 +1,88 @@
+{
+ "meta": {
+  "tag": "p2-audio-only",
+  "relay": "http://localhost:4443",
+  "name": "rt/p2-audio-only.hang",
+  "presets": [
+   "auto"
+  ],
+  "holdMs": 20000,
+  "publisher": "harness",
+  "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+  "branch": "debug/rt-audio",
+  "chrome": {
+   "Browser": "Chrome/152.0.7977.82",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+   "V8-Version": "15.2.124.21",
+   "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/97c0a476-7c58-423e-8ce6-85dbd67b2d8c"
+  },
+  "startedAt": "2026-09-06T15:08:35.083Z"
+ },
+ "events": [
+  {
+   "e": 1788707318093,
+   "event": "start",
+   "relayLogOffset": 685,
+   "meta": {
+    "tag": "p2-audio-only",
+    "relay": "http://localhost:4443",
+    "name": "rt/p2-audio-only.hang",
+    "presets": [
+     "auto"
+    ],
+    "holdMs": 20000,
+    "publisher": "harness",
+    "worktree": "30ef2a3de1d469a591ee2c14ccdb81ded20857ec",
+    "branch": "debug/rt-audio",
+    "chrome": {
+     "Browser": "Chrome/152.0.7977.82",
+     "Protocol-Version": "1.3",
+     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+     "V8-Version": "15.2.124.21",
+     "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+     "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/97c0a476-7c58-423e-8ce6-85dbd67b2d8c"
+    },
+    "startedAt": "2026-09-06T15:08:35.083Z"
+   }
+  },
+  {
+   "e": 1788707319450,
+   "event": "publisher-established",
+   "relayLogOffset": 1877
+  },
+  {
+   "e": 1788707319450,
+   "event": "watch-open-auto",
+   "relayLogOffset": 1877,
+   "preset": "auto"
+  },
+  {
+   "e": 1788707379581,
+   "event": "watch-timeout-auto",
+   "relayLogOffset": 1061372,
+   "preset": "auto",
+   "last": null
+  },
+  {
+   "e": 1788707379582,
+   "event": "publisher-close",
+   "relayLogOffset": 1061372,
+   "last": {
+    "transport": "webtransport",
+    "established": false,
+    "audioFrames": 2325,
+    "audioBytes": 214333,
+    "videoFrames": 0,
+    "keyframes": 0,
+    "audioCatalog": "{\"codec\":\"opus\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"container\":{\"kind\":\"legacy\"},\"jitter\":20,\"description\":\"4f707573486561640102380180bb0000000000\"}"
+   }
+  },
+  {
+   "e": 1788707379582,
+   "event": "done",
+   "relayLogOffset": 1061372
+  }
+ ]
+}

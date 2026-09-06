@@ -1,0 +1,16 @@
+Error: failed to bind UDP socket
+
+Caused by:
+    Address already in use (os error 48)
+
+Stack backtrace:
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1: std::backtrace_rs::backtrace::trace_unsynchronized::<<std::backtrace::Backtrace>::create::{closure#0}>
+             at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2: <std::backtrace::Backtrace>::create
+             at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/backtrace.rs:331:13
+   3: from<moq_tokio::error::Error>
+             at <cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.104/src/backtrace.rs:10:14
+   4: from_residual<moq_relay::relay::Relay, moq_tokio::error::Error, anyhow::Error>
+             at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/result.rs:2189:27

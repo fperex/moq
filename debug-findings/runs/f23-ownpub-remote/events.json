@@ -1,0 +1,441 @@
+{
+ "meta": {
+  "tag": "f23-ownpub-remote",
+  "relay": "https://cdn.moq.dev/anon",
+  "name": "rt/f23.hang",
+  "presets": [
+   "auto",
+   "500ms"
+  ],
+  "holdMs": 45000,
+  "publisher": "harness",
+  "worktree": "7dc07d46d72ec62c9a3ab3d173693d436478ba5e",
+  "branch": "debug/rt-audio",
+  "chrome": {
+   "Browser": "Chrome/152.0.7977.82",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+   "V8-Version": "15.2.124.21",
+   "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/58735338-38bd-49e0-81b7-f7b8a1d42124"
+  },
+  "startedAt": "2026-09-06T18:19:14.077Z"
+ },
+ "events": [
+  {
+   "e": 1788718754580,
+   "event": "start",
+   "relayLogOffset": -1,
+   "meta": {
+    "tag": "f23-ownpub-remote",
+    "relay": "https://cdn.moq.dev/anon",
+    "name": "rt/f23.hang",
+    "presets": [
+     "auto",
+     "500ms"
+    ],
+    "holdMs": 45000,
+    "publisher": "harness",
+    "worktree": "7dc07d46d72ec62c9a3ab3d173693d436478ba5e",
+    "branch": "debug/rt-audio",
+    "chrome": {
+     "Browser": "Chrome/152.0.7977.82",
+     "Protocol-Version": "1.3",
+     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+     "V8-Version": "15.2.124.21",
+     "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+     "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/58735338-38bd-49e0-81b7-f7b8a1d42124"
+    },
+    "startedAt": "2026-09-06T18:19:14.077Z"
+   }
+  },
+  {
+   "e": 1788718755881,
+   "event": "publisher-established",
+   "relayLogOffset": -1
+  },
+  {
+   "e": 1788718755881,
+   "event": "watch-open-auto",
+   "relayLogOffset": -1,
+   "preset": "auto"
+  },
+  {
+   "e": 1788718756957,
+   "event": "inject-auto",
+   "relayLogOffset": -1,
+   "result": "installed"
+  },
+  {
+   "e": 1788718756957,
+   "event": "watch-live-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 45,
+    "jitter": 56.25,
+    "delay": 79.25,
+    "maxAge": 79.25,
+    "ref": -1259.9690000071528,
+    "astalled": true,
+    "abufMs": 60,
+    "abytes": 138,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 6,
+    "catalogAudio": "{\"renditions\":{\"audio\":{\"codec\":\"opus\",\"container\":{\"kind\":\"legacy\"},\"description\":\"4f707573486561640102380180bb0000000000\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"jitter\":20}}}",
+    "catalogVideo": "{\"renditions\":{\"video\":{\"codec\":\"avc1.640028\",\"container\":{\"kind\":\"legacy\"},\"codedWidth\":1280,\"codedHeight\":720,\"framerate\":30.000030517578125,\"bitrate\":1935361,\"optimizeForLatency\":true,\"jitter\":34}},\"display\":{\"width\":1280,\"height\":720}}"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788718766960,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 44,
+    "jitter": 55,
+    "delay": 78,
+    "maxAge": 78,
+    "ref": -1262.9039999880788,
+    "astalled": false,
+    "abufMs": 88.01,
+    "abytes": 80893,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 305
+   },
+   "bb": "{\"seconds\":10,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":0,\"skipMsPerMin\":0,\"stalledPct\":1,\"silentPct\":8.5,\"delay\":78,\"jitter\":55,\"maxAge\":78,\"rtt\":44,\"isolated\":true,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788718776962,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 44,
+    "jitter": 55,
+    "delay": 78,
+    "maxAge": 78,
+    "ref": -1262.9039999880788,
+    "astalled": false,
+    "abufMs": 89.34,
+    "abytes": 159218,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 606
+   },
+   "bb": "{\"seconds\":20,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":0,\"skipMsPerMin\":0,\"stalledPct\":2,\"silentPct\":11.8,\"delay\":78,\"jitter\":55,\"maxAge\":78,\"rtt\":44,\"isolated\":true,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788718786963,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 44,
+    "jitter": 55,
+    "delay": 78,
+    "maxAge": 78,
+    "ref": -1263.2589999976153,
+    "astalled": false,
+    "abufMs": 90.67,
+    "abytes": 238149,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 906
+   },
+   "bb": "{\"seconds\":30,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":0,\"skipMsPerMin\":0,\"stalledPct\":2,\"silentPct\":13.2,\"delay\":78,\"jitter\":55,\"maxAge\":78,\"rtt\":44,\"isolated\":true,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788718796964,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 44,
+    "jitter": 55,
+    "delay": 78,
+    "maxAge": 78,
+    "ref": -1263.2589999976153,
+    "astalled": false,
+    "abufMs": 90.67,
+    "abytes": 318674,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1205
+   },
+   "bb": "{\"seconds\":40,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":0,\"skipMsPerMin\":0,\"stalledPct\":1.5,\"silentPct\":13.4,\"delay\":78,\"jitter\":55,\"maxAge\":78,\"rtt\":44,\"isolated\":true,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788718806965,
+   "event": "watch-hold-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 44,
+    "jitter": 55,
+    "delay": 78,
+    "maxAge": 78,
+    "ref": -1263.2589999976153,
+    "astalled": false,
+    "abufMs": 90.67,
+    "abytes": 391184,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1506
+   },
+   "bb": "{\"seconds\":50,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":0,\"skipMsPerMin\":0,\"stalledPct\":3.2,\"silentPct\":14.9,\"delay\":78,\"jitter\":55,\"maxAge\":78,\"rtt\":44,\"isolated\":true,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788718806965,
+   "event": "watch-close-auto",
+   "relayLogOffset": -1,
+   "preset": "auto",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 44,
+    "jitter": 55,
+    "delay": 78,
+    "maxAge": 78,
+    "ref": -1263.2589999976153,
+    "astalled": false,
+    "abufMs": 90.67,
+    "abytes": 391184,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1506
+   },
+   "bb": "{\"seconds\":50,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":0,\"skipMsPerMin\":0,\"stalledPct\":3.2,\"silentPct\":14.9,\"delay\":78,\"jitter\":55,\"maxAge\":78,\"rtt\":44,\"isolated\":true,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788718809967,
+   "event": "watch-open-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms"
+  },
+  {
+   "e": 1788718810791,
+   "event": "inject-500ms",
+   "relayLogOffset": -1,
+   "result": "installed"
+  },
+  {
+   "e": 1788718810791,
+   "event": "watch-live-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 39,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -54536.823999997614,
+    "astalled": true,
+    "abufMs": 120,
+    "abytes": 152,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 26,
+    "catalogAudio": "{\"renditions\":{\"audio\":{\"codec\":\"opus\",\"container\":{\"kind\":\"legacy\"},\"description\":\"4f707573486561640102380180bb0000000000\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"jitter\":20}}}",
+    "catalogVideo": "{\"renditions\":{\"video\":{\"codec\":\"avc1.640028\",\"container\":{\"kind\":\"legacy\"},\"codedWidth\":1280,\"codedHeight\":720,\"framerate\":30.000030517578125,\"bitrate\":1935361,\"optimizeForLatency\":true,\"jitter\":34}},\"display\":{\"width\":1280,\"height\":720}}"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788718820794,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 38,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -55346.84899999523,
+    "astalled": false,
+    "abufMs": 210.67,
+    "abytes": 78527,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 350
+   },
+   "bb": "{\"seconds\":10,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":6,\"skipMsPerMin\":304948,\"stalledPct\":3,\"silentPct\":4.5,\"delay\":523,\"jitter\":500,\"maxAge\":523,\"rtt\":38,\"isolated\":true,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788718830798,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 38,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -55346.84899999523,
+    "astalled": false,
+    "abufMs": 110.67,
+    "abytes": 157770,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 650
+   },
+   "bb": "{\"seconds\":20,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":3,\"skipMsPerMin\":152466,\"stalledPct\":1.5,\"silentPct\":2.3,\"delay\":523,\"jitter\":500,\"maxAge\":523,\"rtt\":38,\"isolated\":true,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788718840800,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 38,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -55346.96400000001,
+    "astalled": false,
+    "abufMs": 549.34,
+    "abytes": 227428,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 950
+   },
+   "bb": "{\"seconds\":30,\"plateausPerMin\":2,\"plateauMsPerMin\":99,\"skipsPerMin\":4,\"skipMsPerMin\":101709,\"stalledPct\":6.8,\"silentPct\":7.2,\"delay\":523,\"jitter\":500,\"maxAge\":523,\"rtt\":38,\"isolated\":true,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788718850802,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 38,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -55347.06399999405,
+    "astalled": false,
+    "abufMs": 552.34,
+    "abytes": 303985,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1250
+   },
+   "bb": "{\"seconds\":40,\"plateausPerMin\":1,\"plateauMsPerMin\":75,\"skipsPerMin\":21,\"skipMsPerMin\":76578,\"stalledPct\":6.5,\"silentPct\":6.8,\"delay\":523,\"jitter\":500,\"maxAge\":523,\"rtt\":38,\"isolated\":true,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788718860804,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 38,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -55347.06399999405,
+    "astalled": false,
+    "abufMs": 433.67,
+    "abytes": 377809,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1550
+   },
+   "bb": "{\"seconds\":50,\"plateausPerMin\":2,\"plateauMsPerMin\":120,\"skipsPerMin\":29,\"skipMsPerMin\":61470,\"stalledPct\":6.6,\"silentPct\":6.8,\"delay\":523,\"jitter\":500,\"maxAge\":523,\"rtt\":38,\"isolated\":true,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788718860805,
+   "event": "watch-close-500ms",
+   "relayLogOffset": -1,
+   "preset": "500ms",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 38,
+    "jitter": 500,
+    "delay": 523,
+    "maxAge": 523,
+    "ref": -55347.06399999405,
+    "astalled": false,
+    "abufMs": 433.67,
+    "abytes": 377809,
+    "actx": "running",
+    "arate": 48000,
+    "ajitter": 23,
+    "vstalled": false,
+    "vframes": 1550
+   },
+   "bb": "{\"seconds\":50,\"plateausPerMin\":2,\"plateauMsPerMin\":120,\"skipsPerMin\":29,\"skipMsPerMin\":61469,\"stalledPct\":6.6,\"silentPct\":6.8,\"delay\":523,\"jitter\":500,\"maxAge\":523,\"rtt\":38,\"isolated\":true,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788718863807,
+   "event": "publisher-close",
+   "relayLogOffset": -1,
+   "last": {
+    "transport": "webtransport",
+    "established": false,
+    "audioFrames": 5092,
+    "audioBytes": 818821,
+    "videoFrames": 3215,
+    "keyframes": 54,
+    "audioCatalog": "{\"codec\":\"opus\",\"sampleRate\":48000,\"numberOfChannels\":2,\"bitrate\":64000,\"container\":{\"kind\":\"legacy\"},\"jitter\":20,\"description\":\"4f707573486561640102380180bb0000000000\"}"
+   }
+  },
+  {
+   "e": 1788718863808,
+   "event": "done",
+   "relayLogOffset": -1
+  }
+ ]
+}

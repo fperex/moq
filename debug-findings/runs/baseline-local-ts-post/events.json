@@ -1,0 +1,470 @@
+{
+ "meta": {
+  "tag": "baseline-local-ts-post",
+  "relay": "http://localhost:4443",
+  "name": "bbb.hang",
+  "presets": [
+   "auto",
+   "500ms"
+  ],
+  "holdMs": 60000,
+  "publisher": "cmd",
+  "worktree": "7dc07d46d72ec62c9a3ab3d173693d436478ba5e",
+  "branch": "debug/rt-audio",
+  "chrome": {
+   "Browser": "Chrome/152.0.7977.82",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+   "V8-Version": "15.2.124.21",
+   "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/58735338-38bd-49e0-81b7-f7b8a1d42124"
+  },
+  "startedAt": "2026-09-06T17:19:33.128Z"
+ },
+ "events": [
+  {
+   "e": 1788715182138,
+   "event": "start",
+   "relayLogOffset": 1461,
+   "meta": {
+    "tag": "baseline-local-ts-post",
+    "relay": "http://localhost:4443",
+    "name": "bbb.hang",
+    "presets": [
+     "auto",
+     "500ms"
+    ],
+    "holdMs": 60000,
+    "publisher": "cmd",
+    "worktree": "7dc07d46d72ec62c9a3ab3d173693d436478ba5e",
+    "branch": "debug/rt-audio",
+    "chrome": {
+     "Browser": "Chrome/152.0.7977.82",
+     "Protocol-Version": "1.3",
+     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+     "V8-Version": "15.2.124.21",
+     "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+     "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/58735338-38bd-49e0-81b7-f7b8a1d42124"
+    },
+    "startedAt": "2026-09-06T17:19:33.128Z"
+   }
+  },
+  {
+   "e": 1788715182140,
+   "event": "watch-open-auto",
+   "relayLogOffset": 1461,
+   "preset": "auto"
+  },
+  {
+   "e": 1788715182716,
+   "event": "inject-auto",
+   "relayLogOffset": 9883,
+   "result": "installed"
+  },
+  {
+   "e": 1788715182716,
+   "event": "watch-live-auto",
+   "relayLogOffset": 10080,
+   "preset": "auto",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -8199.588,
+    "astalled": true,
+    "abufMs": 69.66,
+    "abytes": 2365,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 51,
+    "catalogAudio": "{\"renditions\":{\"0.aac\":{\"codec\":\"mp4a.40.2\",\"container\":{\"kind\":\"legacy\"},\"description\":\"1210\",\"sampleRate\":44100,\"numberOfChannels\":2,\"bitrate\":129906,\"jitter\":23}}}",
+    "catalogVideo": "{\"renditions\":{\"0.avc3\":{\"codec\":\"avc3.64001f\",\"container\":{\"kind\":\"legacy\"},\"codedWidth\":1280,\"codedHeight\":720,\"bitrate\":2654239,\"jitter\":42}}}"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788715192719,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 97362,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -8200.988,
+    "astalled": false,
+    "abufMs": 23.21,
+    "abytes": 41436,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 291
+   },
+   "bb": "{\"seconds\":10,\"plateausPerMin\":324,\"plateauMsPerMin\":31105,\"skipsPerMin\":6,\"skipMsPerMin\":70399,\"stalledPct\":9.5,\"silentPct\":59.3,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788715202721,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 183591,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -8201.421999999999,
+    "astalled": false,
+    "abufMs": 0.01,
+    "abytes": 82554,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 531
+   },
+   "bb": "{\"seconds\":20,\"plateausPerMin\":333,\"plateauMsPerMin\":30127,\"skipsPerMin\":6,\"skipMsPerMin\":110194,\"stalledPct\":6.5,\"silentPct\":60.5,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788715212722,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 267916,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -8201.421999999999,
+    "astalled": false,
+    "abufMs": 0.01,
+    "abytes": 124335,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 771
+   },
+   "bb": "{\"seconds\":30,\"plateausPerMin\":344,\"plateauMsPerMin\":29088,\"skipsPerMin\":4,\"skipMsPerMin\":73464,\"stalledPct\":4.3,\"silentPct\":58.2,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788715222724,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 351790,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -8201.421999999999,
+    "astalled": false,
+    "abufMs": 14.09,
+    "abytes": 166113,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 1011
+   },
+   "bb": "{\"seconds\":40,\"plateausPerMin\":348,\"plateauMsPerMin\":29111,\"skipsPerMin\":4,\"skipMsPerMin\":55141,\"stalledPct\":3.3,\"silentPct\":60.8,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788715232726,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 438235,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -8201.421999999999,
+    "astalled": false,
+    "abufMs": 0,
+    "abytes": 207770,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 1251
+   },
+   "bb": "{\"seconds\":50,\"plateausPerMin\":349,\"plateauMsPerMin\":28982,\"skipsPerMin\":5,\"skipMsPerMin\":109620,\"stalledPct\":3.5,\"silentPct\":63.5,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788715242728,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 522557,
+   "preset": "auto",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -8201.421999999999,
+    "astalled": false,
+    "abufMs": 0,
+    "abytes": 248550,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 1491
+   },
+   "bb": "{\"seconds\":60,\"plateausPerMin\":351,\"plateauMsPerMin\":28859,\"skipsPerMin\":4,\"skipMsPerMin\":91350,\"stalledPct\":2.9,\"silentPct\":62,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788715242731,
+   "event": "watch-close-auto",
+   "relayLogOffset": 522557,
+   "preset": "auto",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 20,
+    "delay": 46,
+    "maxAge": 46,
+    "ref": -8201.421999999999,
+    "astalled": false,
+    "abufMs": 0,
+    "abytes": 248550,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 1491
+   },
+   "bb": "{\"seconds\":60,\"plateausPerMin\":351,\"plateauMsPerMin\":28857,\"skipsPerMin\":4,\"skipMsPerMin\":91346,\"stalledPct\":2.9,\"silentPct\":62,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":\"auto\"}"
+  },
+  {
+   "e": 1788715245734,
+   "event": "watch-open-500ms",
+   "relayLogOffset": 524699,
+   "preset": "500ms"
+  },
+  {
+   "e": 1788715246314,
+   "event": "inject-500ms",
+   "relayLogOffset": 536047,
+   "result": "installed"
+  },
+  {
+   "e": 1788715246314,
+   "event": "watch-live-500ms",
+   "relayLogOffset": 536047,
+   "preset": "500ms",
+   "first": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 526,
+    "maxAge": 526,
+    "ref": -71756.23300000596,
+    "astalled": true,
+    "abufMs": 162.53,
+    "abytes": 424,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 45,
+    "catalogAudio": "{\"renditions\":{\"0.aac\":{\"codec\":\"mp4a.40.2\",\"container\":{\"kind\":\"legacy\"},\"description\":\"1210\",\"sampleRate\":44100,\"numberOfChannels\":2,\"bitrate\":139212,\"jitter\":23}}}",
+    "catalogVideo": "{\"renditions\":{\"0.avc3\":{\"codec\":\"avc3.64001f\",\"container\":{\"kind\":\"legacy\"},\"codedWidth\":1280,\"codedHeight\":720,\"bitrate\":3305324,\"jitter\":42}}}"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788715256318,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 732217,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 526,
+    "maxAge": 526,
+    "ref": -71792.98800000596,
+    "astalled": false,
+    "abufMs": 360.58,
+    "abytes": 161247,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 285
+   },
+   "bb": "{\"seconds\":10,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":6,\"skipMsPerMin\":640,\"stalledPct\":3.5,\"silentPct\":3.5,\"delay\":526,\"jitter\":500,\"maxAge\":526,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788715266320,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 930194,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 526,
+    "maxAge": 526,
+    "ref": -71796.78800001192,
+    "astalled": false,
+    "abufMs": 482.48,
+    "abytes": 324045,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 525
+   },
+   "bb": "{\"seconds\":20,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":3,\"skipMsPerMin\":320,\"stalledPct\":1.8,\"silentPct\":31.8,\"delay\":526,\"jitter\":500,\"maxAge\":526,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788715276322,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 1126367,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 526,
+    "maxAge": 526,
+    "ref": -71796.78800001192,
+    "astalled": false,
+    "abufMs": 491.19,
+    "abytes": 484477,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 765
+   },
+   "bb": "{\"seconds\":30,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":2,\"skipMsPerMin\":213,\"stalledPct\":1.2,\"silentPct\":36.3,\"delay\":526,\"jitter\":500,\"maxAge\":526,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788715286324,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 1320736,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 526,
+    "maxAge": 526,
+    "ref": -71796.78800001192,
+    "astalled": false,
+    "abufMs": 407.02,
+    "abytes": 644086,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 1005
+   },
+   "bb": "{\"seconds\":40,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":1,\"skipMsPerMin\":160,\"stalledPct\":0.9,\"silentPct\":29.6,\"delay\":526,\"jitter\":500,\"maxAge\":526,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788715296326,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 1516906,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 526,
+    "maxAge": 526,
+    "ref": -71796.78800001192,
+    "astalled": false,
+    "abufMs": 392.5,
+    "abytes": 804926,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 1245
+   },
+   "bb": "{\"seconds\":50,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":1,\"skipMsPerMin\":128,\"stalledPct\":0.7,\"silentPct\":23.7,\"delay\":526,\"jitter\":500,\"maxAge\":526,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788715306328,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 1712628,
+   "preset": "500ms",
+   "info": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 526,
+    "maxAge": 526,
+    "ref": -71796.78800001192,
+    "astalled": false,
+    "abufMs": 377.99,
+    "abytes": 965815,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 1485
+   },
+   "bb": "{\"seconds\":60,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":1,\"skipMsPerMin\":107,\"stalledPct\":0.6,\"silentPct\":23.8,\"delay\":526,\"jitter\":500,\"maxAge\":526,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788715306329,
+   "event": "watch-close-500ms",
+   "relayLogOffset": 1712628,
+   "preset": "500ms",
+   "last": {
+    "status": "live",
+    "transport": "webtransport",
+    "rtt": 1,
+    "jitter": 500,
+    "delay": 526,
+    "maxAge": 526,
+    "ref": -71796.78800001192,
+    "astalled": false,
+    "abufMs": 377.99,
+    "abytes": 965815,
+    "actx": "running",
+    "arate": 44100,
+    "ajitter": 26,
+    "vstalled": false,
+    "vframes": 1485
+   },
+   "bb": "{\"seconds\":60,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":1,\"skipMsPerMin\":107,\"stalledPct\":0.6,\"silentPct\":23.8,\"delay\":526,\"jitter\":500,\"maxAge\":526,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"500\",\"delayAttr\":\"500ms\"}"
+  },
+  {
+   "e": 1788715309331,
+   "event": "done",
+   "relayLogOffset": 1716541
+  }
+ ]
+}

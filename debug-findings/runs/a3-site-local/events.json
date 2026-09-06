@@ -1,0 +1,232 @@
+{
+ "meta": {
+  "tag": "a3-site-local",
+  "relay": "http://localhost:4443",
+  "name": "demo/bbb.hang",
+  "presets": [
+   "auto",
+   "500ms"
+  ],
+  "holdMs": 60000,
+  "publisher": "cmd",
+  "worktree": "7dc07d46d72ec62c9a3ab3d173693d436478ba5e",
+  "branch": "debug/rt-audio",
+  "chrome": {
+   "Browser": "Chrome/152.0.7977.82",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+   "V8-Version": "15.2.124.21",
+   "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/58735338-38bd-49e0-81b7-f7b8a1d42124"
+  },
+  "startedAt": "2026-09-06T17:06:50.276Z"
+ },
+ "events": [
+  {
+   "e": 1788714419296,
+   "event": "start",
+   "relayLogOffset": 1466,
+   "meta": {
+    "tag": "a3-site-local",
+    "relay": "http://localhost:4443",
+    "name": "demo/bbb.hang",
+    "presets": [
+     "auto",
+     "500ms"
+    ],
+    "holdMs": 60000,
+    "publisher": "cmd",
+    "worktree": "7dc07d46d72ec62c9a3ab3d173693d436478ba5e",
+    "branch": "debug/rt-audio",
+    "chrome": {
+     "Browser": "Chrome/152.0.7977.82",
+     "Protocol-Version": "1.3",
+     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+     "V8-Version": "15.2.124.21",
+     "WebKit-Version": "537.36 (@d04cdb24d67b081f6cf80200ffc5233f44b61109)",
+     "webSocketDebuggerUrl": "ws://127.0.0.1:9225/devtools/browser/58735338-38bd-49e0-81b7-f7b8a1d42124"
+    },
+    "startedAt": "2026-09-06T17:06:50.276Z"
+   }
+  },
+  {
+   "e": 1788714419299,
+   "event": "watch-open-auto",
+   "relayLogOffset": 1466,
+   "preset": "auto"
+  },
+  {
+   "e": 1788714419626,
+   "event": "set-latency-auto",
+   "relayLogOffset": 5655,
+   "value": "real-time",
+   "result": "real-time"
+  },
+  {
+   "e": 1788714419627,
+   "event": "inject-auto",
+   "relayLogOffset": 5655,
+   "result": "installed"
+  },
+  {
+   "e": 1788714419628,
+   "event": "watch-live-auto",
+   "relayLogOffset": 5655,
+   "preset": "auto",
+   "first": {
+    "status": "live",
+    "abytes": 30199,
+    "actx": "running"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788714429630,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 10105,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":10,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":6,\"skipMsPerMin\":42182,\"stalledPct\":1,\"silentPct\":1,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714439632,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 14123,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":20,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":6,\"skipMsPerMin\":21197,\"stalledPct\":0.5,\"silentPct\":5.3,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714449634,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 17699,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":30,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":6,\"skipMsPerMin\":14170,\"stalledPct\":0.3,\"silentPct\":3.5,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714459636,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 21275,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":40,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":6,\"skipMsPerMin\":10659,\"stalledPct\":0.3,\"silentPct\":6.6,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714469637,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 24851,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":50,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":7,\"skipMsPerMin\":8565,\"stalledPct\":0.2,\"silentPct\":13,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714479639,
+   "event": "watch-hold-auto",
+   "relayLogOffset": 29321,
+   "preset": "auto",
+   "info": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":9,\"skipMsPerMin\":7192,\"stalledPct\":0.2,\"silentPct\":10.8,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714479640,
+   "event": "watch-close-auto",
+   "relayLogOffset": 29321,
+   "preset": "auto",
+   "last": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":9,\"skipMsPerMin\":7192,\"stalledPct\":0.2,\"silentPct\":10.8,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"real-time\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714482643,
+   "event": "watch-open-500ms",
+   "relayLogOffset": 31489,
+   "preset": "500ms"
+  },
+  {
+   "e": 1788714482983,
+   "event": "set-latency-500ms",
+   "relayLogOffset": 35680,
+   "value": "500",
+   "result": "500"
+  },
+  {
+   "e": 1788714482984,
+   "event": "inject-500ms",
+   "relayLogOffset": 35680,
+   "result": "installed"
+  },
+  {
+   "e": 1788714482984,
+   "event": "watch-live-500ms",
+   "relayLogOffset": 35680,
+   "preset": "500ms",
+   "first": {
+    "status": "live",
+    "abytes": 22514,
+    "actx": "running"
+   },
+   "focus": "watch"
+  },
+  {
+   "e": 1788714492987,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 40150,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":10,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":12,\"skipMsPerMin\":423175,\"stalledPct\":2.5,\"silentPct\":2.5,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"20\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714502989,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 43726,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":20,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":9,\"skipMsPerMin\":211654,\"stalledPct\":1.3,\"silentPct\":30,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"20\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714512991,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 47302,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":30,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":10,\"skipMsPerMin\":141170,\"stalledPct\":0.8,\"silentPct\":36.7,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"20\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714522992,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 50878,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":40,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":7,\"skipMsPerMin\":105880,\"stalledPct\":0.6,\"silentPct\":30,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"20\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714532994,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 55348,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":50,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":8,\"skipMsPerMin\":84748,\"stalledPct\":0.5,\"silentPct\":24.1,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"20\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714542996,
+   "event": "watch-hold-500ms",
+   "relayLogOffset": 58924,
+   "preset": "500ms",
+   "info": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":10,\"skipMsPerMin\":70678,\"stalledPct\":0.4,\"silentPct\":24.2,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"20\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714542997,
+   "event": "watch-close-500ms",
+   "relayLogOffset": 58924,
+   "preset": "500ms",
+   "last": null,
+   "bb": "{\"seconds\":60,\"plateausPerMin\":0,\"plateauMsPerMin\":0,\"skipsPerMin\":10,\"skipMsPerMin\":70677,\"stalledPct\":0.4,\"silentPct\":24.2,\"delay\":46,\"jitter\":20,\"maxAge\":46,\"rtt\":1,\"isolated\":false,\"latencyAttr\":\"20\",\"delayAttr\":null}"
+  },
+  {
+   "e": 1788714546000,
+   "event": "done",
+   "relayLogOffset": 61092
+  }
+ ]
+}

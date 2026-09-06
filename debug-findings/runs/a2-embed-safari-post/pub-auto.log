@@ -1,0 +1,164 @@
+[2m2026-09-06T16:51:23.436458Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:23.436710Z[0m [33m WARN[0m [2mmoq_tokio::quinn[0m[2m:[0m performing insecure HTTP request for certificate [3murl[0m[2m=[0mhttp://localhost:4443/certificate.sha256
+[2m2026-09-06T16:51:23.436984Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection 'Some("localhost")'
+[2m2026-09-06T16:51:23.438072Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to [::1]:4443
+[2m2026-09-06T16:51:23.438263Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to [::1]:4443
+[2m2026-09-06T16:51:23.483861Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("http", localhost:4443)
+[2m2026-09-06T16:51:23.484214Z[0m [34mDEBUG[0m [2mmoq_tokio::quinn[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttps://localhost:4443
+[2m2026-09-06T16:51:23.485439Z[0m [34mDEBUG[0m [2mmoq_tokio::resolve[0m[2m:[0m resolved [3mlookup[0m[2m=[0mFull [3mcount[0m[2m=[0m2
+[2m2026-09-06T16:51:23.485477Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m dialing [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T16:51:23.511786Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m connected [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T16:51:23.511872Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m sending SETTINGS frame [3msettings[0m[2m=[0mSettings({ENABLE_CONNECT_PROTOCOL: 1, ENABLE_DATAGRAM: 1, ENABLE_DATAGRAM_DEPRECATED: 1, WEBTRANSPORT_ENABLE_DEPRECATED: 1, WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1, WEBTRANSPORT_MAX_SESSIONS: 1})
+[2m2026-09-06T16:51:23.512255Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m received SETTINGS frame [3msettings[0m[2m=[0mSettings({ENABLE_DATAGRAM: 1, ENABLE_CONNECT_PROTOCOL: 1, WEBTRANSPORT_ENABLE_DEPRECATED: 1, WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1, WEBTRANSPORT_MAX_SESSIONS: 1, ENABLE_DATAGRAM_DEPRECATED: 1})
+[2m2026-09-06T16:51:23.512279Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m sending CONNECT request [3mrequest[0m[2m=[0mConnectRequest { url: Url { scheme: "https", cannot_be_a_base: false, username: "", password: None, host: Some(Domain("localhost")), port: Some(4443), path: "/", query: None, fragment: None }, protocols: ["moq-lite-05", "moq-lite-04", "moq-lite-03", "moql", "moqt-19", "moqt-18", "moqt-17", "moqt-16", "moqt-15", "moq-00"], headers: {} }
+[2m2026-09-06T16:51:23.512763Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m received CONNECT response [3mresponse[0m[2m=[0mConnectResponse { status: 200, protocol: Some("moq-lite-05") }
+[2m2026-09-06T16:51:23.512922Z[0m [32m INFO[0m [2mmoq_tokio::client[0m[2m:[0m connected [3mversion[0m[2m=[0mmoq-lite-05
+[2m2026-09-06T16:51:23.512946Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connected [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:23.513876Z[0m [34mDEBUG[0m [2mmoq_net::lite::session[0m[2m:[0m failed to send setup [3merr[0m[2m=[0mtransport: invalid STOP_SENDING: 0
+[2m2026-09-06T16:51:23.514699Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m received goaway [3muri[0m[2m=[0m
+[2m2026-09-06T16:51:23.514976Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m upstream GOAWAY; migrating [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:23.515046Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m announce [3mbroadcast[0m[2m=[0mbbb.hang
+[2m2026-09-06T16:51:23.515131Z[0m [34mDEBUG[0m [2mmoq_net::lite::subscriber[0m[2m:[0m received peer setup [3msetup[0m[2m=[0mSetup { probe: Report, path: None, role: None, cost: None, origin: Some(Origin { id: 5371594803134317 }) }
+[2m2026-09-06T16:51:23.515155Z[0m [34mDEBUG[0m [2mmoq_net::lite::subscriber[0m[2m:[0m probe stream closed
+[2m2026-09-06T16:51:23.515006Z[0m [33m WARN[0m [2mmoq_tokio::connection[0m[2m:[0m peer redirected immediately; retrying after backoff [3mpeer[0m[2m=[0mhttp://localhost:4443 [3mwait[0m[2m=[0m889.982114ms
+[2m2026-09-06T16:51:24.406444Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:24.406670Z[0m [33m WARN[0m [2mmoq_tokio::quinn[0m[2m:[0m performing insecure HTTP request for certificate [3murl[0m[2m=[0mhttp://localhost:4443/certificate.sha256
+[2m2026-09-06T16:51:24.406886Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection 'Some("localhost")'
+[2m2026-09-06T16:51:24.407168Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to [::1]:4443
+[2m2026-09-06T16:51:24.407421Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to [::1]:4443
+[2m2026-09-06T16:51:24.407905Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("http", localhost:4443)
+[2m2026-09-06T16:51:24.408030Z[0m [34mDEBUG[0m [2mmoq_tokio::quinn[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttps://localhost:4443
+[2m2026-09-06T16:51:24.409334Z[0m [34mDEBUG[0m [2mmoq_tokio::resolve[0m[2m:[0m resolved [3mlookup[0m[2m=[0mFull [3mcount[0m[2m=[0m2
+[2m2026-09-06T16:51:24.409377Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m dialing [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T16:51:24.413576Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m connected [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T16:51:24.413828Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m sending SETTINGS frame [3msettings[0m[2m=[0mSettings({ENABLE_DATAGRAM: 1, WEBTRANSPORT_MAX_SESSIONS: 1, WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1, ENABLE_DATAGRAM_DEPRECATED: 1, WEBTRANSPORT_ENABLE_DEPRECATED: 1, ENABLE_CONNECT_PROTOCOL: 1})
+[2m2026-09-06T16:51:24.414873Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m received SETTINGS frame [3msettings[0m[2m=[0mSettings({ENABLE_CONNECT_PROTOCOL: 1, WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1, WEBTRANSPORT_MAX_SESSIONS: 1, ENABLE_DATAGRAM: 1, ENABLE_DATAGRAM_DEPRECATED: 1, WEBTRANSPORT_ENABLE_DEPRECATED: 1})
+[2m2026-09-06T16:51:24.414940Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m sending CONNECT request [3mrequest[0m[2m=[0mConnectRequest { url: Url { scheme: "https", cannot_be_a_base: false, username: "", password: None, host: Some(Domain("localhost")), port: Some(4443), path: "/", query: None, fragment: None }, protocols: ["moq-lite-05", "moq-lite-04", "moq-lite-03", "moql", "moqt-19", "moqt-18", "moqt-17", "moqt-16", "moqt-15", "moq-00"], headers: {} }
+[2m2026-09-06T16:51:24.416698Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m received CONNECT response [3mresponse[0m[2m=[0mConnectResponse { status: 200, protocol: Some("moq-lite-05") }
+[2m2026-09-06T16:51:24.417077Z[0m [32m INFO[0m [2mmoq_tokio::client[0m[2m:[0m connected [3mversion[0m[2m=[0mmoq-lite-05
+[2m2026-09-06T16:51:24.417123Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connected [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:24.417985Z[0m [34mDEBUG[0m [2mmoq_net::lite::session[0m[2m:[0m failed to send setup [3merr[0m[2m=[0mtransport: invalid STOP_SENDING: 0
+[2m2026-09-06T16:51:24.418756Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m received goaway [3muri[0m[2m=[0m
+[2m2026-09-06T16:51:24.418852Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m announce [3mbroadcast[0m[2m=[0mbbb.hang
+[2m2026-09-06T16:51:24.418861Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m upstream GOAWAY; migrating [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:24.418922Z[0m [33m WARN[0m [2mmoq_tokio::connection[0m[2m:[0m peer redirected immediately; retrying after backoff [3mpeer[0m[2m=[0mhttp://localhost:4443 [3mwait[0m[2m=[0m1.24389772s
+[2m2026-09-06T16:51:24.418956Z[0m [34mDEBUG[0m [2mmoq_net::lite::subscriber[0m[2m:[0m received peer setup [3msetup[0m[2m=[0mSetup { probe: Report, path: None, role: None, cost: None, origin: Some(Origin { id: 5371594803134317 }) }
+[2m2026-09-06T16:51:24.418985Z[0m [34mDEBUG[0m [2mmoq_net::lite::subscriber[0m[2m:[0m probe stream closed
+[2m2026-09-06T16:51:24.419370Z[0m [33m WARN[0m [2mweb_transport_quinn::session[0m[2m:[0m failed to read capsule [3me[0m[2m=[0mUnexpectedEnd
+[2m2026-09-06T16:51:24.419701Z[0m [33m WARN[0m [2mmoq_net::lite::publisher[0m[2m:[0m probe stream error [3merr[0m[2m=[0mtransport: session error: connection error: closed
+[2m2026-09-06T16:51:24.419732Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m announcing cancelled [3mprefix[0m[2m=[0m
+[2m2026-09-06T16:51:24.419772Z[0m [33m WARN[0m [2mmoq_net::lite::session[0m[2m:[0m session error [3merr[0m[2m=[0mgoaway timeout
+[2m2026-09-06T16:51:25.664308Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:25.664441Z[0m [33m WARN[0m [2mmoq_tokio::quinn[0m[2m:[0m performing insecure HTTP request for certificate [3murl[0m[2m=[0mhttp://localhost:4443/certificate.sha256
+[2m2026-09-06T16:51:25.664589Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection 'Some("localhost")'
+[2m2026-09-06T16:51:25.665100Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to [::1]:4443
+[2m2026-09-06T16:51:25.665297Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to [::1]:4443
+[2m2026-09-06T16:51:25.666317Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("http", localhost:4443)
+[2m2026-09-06T16:51:25.666508Z[0m [34mDEBUG[0m [2mmoq_tokio::quinn[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttps://localhost:4443
+[2m2026-09-06T16:51:25.666599Z[0m [34mDEBUG[0m [2mmoq_tokio::resolve[0m[2m:[0m resolved [3mlookup[0m[2m=[0mFull [3mcount[0m[2m=[0m2
+[2m2026-09-06T16:51:25.666647Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m dialing [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T16:51:25.669392Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m connected [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T16:51:25.669462Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m sending SETTINGS frame [3msettings[0m[2m=[0mSettings({WEBTRANSPORT_ENABLE_DEPRECATED: 1, ENABLE_DATAGRAM_DEPRECATED: 1, ENABLE_DATAGRAM: 1, ENABLE_CONNECT_PROTOCOL: 1, WEBTRANSPORT_MAX_SESSIONS: 1, WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1})
+[2m2026-09-06T16:51:25.669976Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m received SETTINGS frame [3msettings[0m[2m=[0mSettings({ENABLE_DATAGRAM: 1, WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1, ENABLE_DATAGRAM_DEPRECATED: 1, ENABLE_CONNECT_PROTOCOL: 1, WEBTRANSPORT_ENABLE_DEPRECATED: 1, WEBTRANSPORT_MAX_SESSIONS: 1})
+[2m2026-09-06T16:51:25.670016Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m sending CONNECT request [3mrequest[0m[2m=[0mConnectRequest { url: Url { scheme: "https", cannot_be_a_base: false, username: "", password: None, host: Some(Domain("localhost")), port: Some(4443), path: "/", query: None, fragment: None }, protocols: ["moq-lite-05", "moq-lite-04", "moq-lite-03", "moql", "moqt-19", "moqt-18", "moqt-17", "moqt-16", "moqt-15", "moq-00"], headers: {} }
+[2m2026-09-06T16:51:25.670653Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m received CONNECT response [3mresponse[0m[2m=[0mConnectResponse { status: 200, protocol: Some("moq-lite-05") }
+[2m2026-09-06T16:51:25.670764Z[0m [32m INFO[0m [2mmoq_tokio::client[0m[2m:[0m connected [3mversion[0m[2m=[0mmoq-lite-05
+[2m2026-09-06T16:51:25.670783Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connected [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:25.671911Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m received goaway [3muri[0m[2m=[0m
+[2m2026-09-06T16:51:25.671982Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m announce [3mbroadcast[0m[2m=[0mbbb.hang
+[2m2026-09-06T16:51:25.671987Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m upstream GOAWAY; migrating [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:25.672024Z[0m [33m WARN[0m [2mmoq_tokio::connection[0m[2m:[0m peer redirected immediately; retrying after backoff [3mpeer[0m[2m=[0mhttp://localhost:4443 [3mwait[0m[2m=[0m2.445677794s
+[2m2026-09-06T16:51:25.672114Z[0m [34mDEBUG[0m [2mmoq_net::lite::subscriber[0m[2m:[0m received peer setup [3msetup[0m[2m=[0mSetup { probe: Report, path: None, role: None, cost: None, origin: Some(Origin { id: 5371594803134317 }) }
+[2m2026-09-06T16:51:25.672135Z[0m [34mDEBUG[0m [2mmoq_net::lite::subscriber[0m[2m:[0m probe stream closed
+[2m2026-09-06T16:51:25.672304Z[0m [33m WARN[0m [2mweb_transport_quinn::session[0m[2m:[0m failed to read capsule [3me[0m[2m=[0mUnexpectedEnd
+[2m2026-09-06T16:51:25.672333Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m announcing cancelled [3mprefix[0m[2m=[0m
+[2m2026-09-06T16:51:25.672360Z[0m [33m WARN[0m [2mmoq_net::lite::publisher[0m[2m:[0m probe stream error [3merr[0m[2m=[0mtransport: session error: connection error: closed
+[2m2026-09-06T16:51:25.672377Z[0m [33m WARN[0m [2mmoq_net::lite::session[0m[2m:[0m session error [3merr[0m[2m=[0mgoaway timeout
+[2m2026-09-06T16:51:28.119694Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:28.119988Z[0m [33m WARN[0m [2mmoq_tokio::quinn[0m[2m:[0m performing insecure HTTP request for certificate [3murl[0m[2m=[0mhttp://localhost:4443/certificate.sha256
+[2m2026-09-06T16:51:28.120280Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection 'Some("localhost")'
+[2m2026-09-06T16:51:28.120661Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to [::1]:4443
+[2m2026-09-06T16:51:28.120999Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to [::1]:4443
+[2m2026-09-06T16:51:28.121696Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("http", localhost:4443)
+[2m2026-09-06T16:51:28.121822Z[0m [34mDEBUG[0m [2mmoq_tokio::quinn[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttps://localhost:4443
+[2m2026-09-06T16:51:28.123047Z[0m [34mDEBUG[0m [2mmoq_tokio::resolve[0m[2m:[0m resolved [3mlookup[0m[2m=[0mFull [3mcount[0m[2m=[0m2
+[2m2026-09-06T16:51:28.123087Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m dialing [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T16:51:28.126784Z[0m [34mDEBUG[0m [2mmoq_tokio::failover[0m[2m:[0m connected [3maddr[0m[2m=[0m[::1]:4443 [3mindex[0m[2m=[0m0
+[2m2026-09-06T16:51:28.126881Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m sending SETTINGS frame [3msettings[0m[2m=[0mSettings({WEBTRANSPORT_MAX_SESSIONS: 1, ENABLE_DATAGRAM: 1, ENABLE_DATAGRAM_DEPRECATED: 1, WEBTRANSPORT_ENABLE_DEPRECATED: 1, ENABLE_CONNECT_PROTOCOL: 1, WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1})
+[2m2026-09-06T16:51:28.127544Z[0m [34mDEBUG[0m [2mweb_transport_quinn::settings[0m[2m:[0m received SETTINGS frame [3msettings[0m[2m=[0mSettings({WEBTRANSPORT_MAX_SESSIONS_DEPRECATED: 1, WEBTRANSPORT_ENABLE_DEPRECATED: 1, ENABLE_CONNECT_PROTOCOL: 1, WEBTRANSPORT_MAX_SESSIONS: 1, ENABLE_DATAGRAM_DEPRECATED: 1, ENABLE_DATAGRAM: 1})
+[2m2026-09-06T16:51:28.127572Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m sending CONNECT request [3mrequest[0m[2m=[0mConnectRequest { url: Url { scheme: "https", cannot_be_a_base: false, username: "", password: None, host: Some(Domain("localhost")), port: Some(4443), path: "/", query: None, fragment: None }, protocols: ["moq-lite-05", "moq-lite-04", "moq-lite-03", "moql", "moqt-19", "moqt-18", "moqt-17", "moqt-16", "moqt-15", "moq-00"], headers: {} }
+[2m2026-09-06T16:51:28.128149Z[0m [34mDEBUG[0m [2mweb_transport_quinn::connect[0m[2m:[0m received CONNECT response [3mresponse[0m[2m=[0mConnectResponse { status: 200, protocol: Some("moq-lite-05") }
+[2m2026-09-06T16:51:28.128339Z[0m [32m INFO[0m [2mmoq_tokio::client[0m[2m:[0m connected [3mversion[0m[2m=[0mmoq-lite-05
+[2m2026-09-06T16:51:28.128372Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connected [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:28.129619Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m received goaway [3muri[0m[2m=[0m
+[2m2026-09-06T16:51:28.129770Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m upstream GOAWAY; migrating [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:28.129863Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m announce [3mbroadcast[0m[2m=[0mbbb.hang
+[2m2026-09-06T16:51:28.129886Z[0m [33m WARN[0m [2mmoq_tokio::connection[0m[2m:[0m peer redirected immediately; retrying after backoff [3mpeer[0m[2m=[0mhttp://localhost:4443 [3mwait[0m[2m=[0m4.966842725s
+[2m2026-09-06T16:51:28.130063Z[0m [34mDEBUG[0m [2mmoq_net::lite::subscriber[0m[2m:[0m received peer setup [3msetup[0m[2m=[0mSetup { probe: Report, path: None, role: None, cost: None, origin: Some(Origin { id: 5371594803134317 }) }
+[2m2026-09-06T16:51:28.130108Z[0m [34mDEBUG[0m [2mmoq_net::lite::subscriber[0m[2m:[0m probe stream closed
+[2m2026-09-06T16:51:28.130488Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m announcing cancelled [3mprefix[0m[2m=[0m
+[2m2026-09-06T16:51:28.130492Z[0m [33m WARN[0m [2mweb_transport_quinn::session[0m[2m:[0m failed to read capsule [3me[0m[2m=[0mUnexpectedEnd
+[2m2026-09-06T16:51:28.130533Z[0m [33m WARN[0m [2mmoq_net::lite::publisher[0m[2m:[0m probe stream error [3merr[0m[2m=[0mtransport: session error: connection error: closed
+[2m2026-09-06T16:51:28.130557Z[0m [33m WARN[0m [2mmoq_net::lite::session[0m[2m:[0m session error [3merr[0m[2m=[0mgoaway timeout
+[2m2026-09-06T16:51:30.223651Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info requested [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T16:51:30.224661Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info cancelled [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T16:51:30.226885Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m0 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T16:51:30.227082Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m0 [3mtrack[0m[2m=[0mcatalog.json [3msequence[0m[2m=[0m5
+[2m2026-09-06T16:51:30.227551Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m5
+[2m2026-09-06T16:51:30.237001Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info requested [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T16:51:30.240879Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m1 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T16:51:30.241033Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m2
+[2m2026-09-06T16:51:30.249196Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m track info requested [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T16:51:30.304600Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed started [3mid[0m[2m=[0m2 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T16:51:30.304748Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m2
+[2m2026-09-06T16:51:30.743453Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m1 [3mtrack[0m[2m=[0m0.m4s [3msequence[0m[2m=[0m3
+[2m2026-09-06T16:51:30.744076Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m3
+[2m2026-09-06T16:51:30.744467Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m2
+[2m2026-09-06T16:51:30.745855Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m finished group [3msequence[0m[2m=[0m2
+[2m2026-09-06T16:51:31.135002Z[0m [32m INFO[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed cancelled [3mid[0m[2m=[0m1 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T16:51:33.098224Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttp://localhost:4443
+[2m2026-09-06T16:51:33.098472Z[0m [33m WARN[0m [2mmoq_tokio::quinn[0m[2m:[0m performing insecure HTTP request for certificate [3murl[0m[2m=[0mhttp://localhost:4443/certificate.sha256
+[2m2026-09-06T16:51:33.098785Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection 'Some("localhost")'
+[2m2026-09-06T16:51:33.099230Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to [::1]:4443
+[2m2026-09-06T16:51:33.099723Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 127.0.0.1:4443
+[2m2026-09-06T16:51:33.100016Z[0m [33m WARN[0m [2mmoq_tokio::client[0m[2m:[0m QUIC connection failed [3merr[0m[2m=[0mfailed to fetch fingerprint
+[2m2026-09-06T16:51:33.255179Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m2 [3mtrack[0m[2m=[0m1.m4s [3msequence[0m[2m=[0m4
+[2m2026-09-06T16:51:33.300903Z[0m [34mDEBUG[0m [2mmoq_tokio::websocket[0m[2m:[0m QUIC not yet connected, attempting WebSocket fallback [3mpeer[0m[2m=[0mhttp://localhost:4443 [3mdelay_ms[0m[2m=[0m200
+[2m2026-09-06T16:51:33.300982Z[0m [34mDEBUG[0m [2mmoq_tokio::websocket[0m[2m:[0m connecting via WebSocket [3mpeer[0m[2m=[0mws://localhost:4443
+[2m2026-09-06T16:51:33.305637Z[0m [33m WARN[0m [2mmoq_tokio::websocket[0m[2m:[0m WebSocket connection failed [3merr[0m[2m=[0mfailed to connect WebSocket
+[2m2026-09-06T16:51:33.305664Z[0m [33m WARN[0m [2mmoq_tokio::client[0m[2m:[0m WebSocket connection failed [3merr[0m[2m=[0mfailed to connect WebSocket
+[2m2026-09-06T16:51:33.305690Z[0m [34mDEBUG[0m [2mmoq_tokio::connection[0m[2m:[0m address unreachable [3mpeer[0m[2m=[0mhttp://localhost:4443 [3merr[0m[2m=[0mfailed to connect to server: QUIC failed: failed to fetch fingerprint; WebSocket failed: failed to connect WebSocket
+[2m2026-09-06T16:51:33.305707Z[0m [33m WARN[0m [2mmoq_tokio::connection[0m[2m:[0m reconnecting after backoff [3mwait[0m[2m=[0m130.772792ms
+[2m2026-09-06T16:51:33.437503Z[0m [31mERROR[0m [2mmoq_tokio::connection[0m[2m:[0m connection loop exited [3merr[0m[2m=[0mreconnect timed out after 10s: failed to connect to server: QUIC failed: failed to fetch fingerprint; WebSocket failed: failed to connect WebSocket
+[2m2026-09-06T16:51:33.442755Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m serving group [3msubscribe[0m[2m=[0m0 [3mtrack[0m[2m=[0mcatalog.json [3msequence[0m[2m=[0m6
+[2m2026-09-06T16:51:33.443302Z[0m [33m WARN[0m [2mmoq_net::model::track[0m[2m:[0m track::Producer dropped without finish() or abort() [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-09-06T16:51:33.443378Z[0m [33m WARN[0m [2mmoq_net::model::track[0m[2m:[0m track::Producer dropped without finish() or abort() [3mtrack[0m[2m=[0mcatalog.json.z
+[2m2026-09-06T16:51:33.443431Z[0m [34mDEBUG[0m [2mmoq_net::model::origin_impl[0m[2m:[0m source refused track [3mname[0m[2m=[0mcatalog.json [3msource[0m[2m=[0m0 [3merr[0m[2m=[0mnot found
+[2m2026-09-06T16:51:33.443468Z[0m [33m WARN[0m [2mmoq_net::model::track[0m[2m:[0m track::Producer dropped without finish() or abort() [3mtrack[0m[2m=[0mcatalog
+[2m2026-09-06T16:51:33.443473Z[0m [34mDEBUG[0m [2mmoq_net::model::origin_impl[0m[2m:[0m every source refused track; aborting [3mname[0m[2m=[0mcatalog.json [3merr[0m[2m=[0mnot found
+[2m2026-09-06T16:51:33.443512Z[0m [33m WARN[0m [2mmoq_net::model::track[0m[2m:[0m track::Producer dropped without finish() or abort() [3mtrack[0m[2m=[0m1.m4s
+[2m2026-09-06T16:51:33.443539Z[0m [33m WARN[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed error [3mid[0m[2m=[0m0 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0mcatalog.json [3merr[0m[2m=[0mnot found
+[2m2026-09-06T16:51:33.443612Z[0m [33m WARN[0m [2mmoq_net::model::group[0m[2m:[0m group::Producer dropped without finish() or abort() [3msequence[0m[2m=[0m4
+[2m2026-09-06T16:51:33.443638Z[0m [34mDEBUG[0m [2mmoq_net::model::origin_impl[0m[2m:[0m source refused track [3mname[0m[2m=[0m1.m4s [3msource[0m[2m=[0m0 [3merr[0m[2m=[0mnot found
+[2m2026-09-06T16:51:33.443650Z[0m [33m WARN[0m [2mmoq_net::model::track[0m[2m:[0m track::Producer dropped without finish() or abort() [3mtrack[0m[2m=[0m0.m4s
+[2m2026-09-06T16:51:33.443664Z[0m [34mDEBUG[0m [2mmoq_net::model::origin_impl[0m[2m:[0m every source refused track; aborting [3mname[0m[2m=[0m1.m4s [3merr[0m[2m=[0mnot found
+[2m2026-09-06T16:51:33.443703Z[0m [33m WARN[0m [2mmoq_net::model::resume[0m[2m:[0m no route can serve the rest of this group [3mgroup[0m[2m=[0m4 [3mframe[0m[2m=[0m10 [3merr[0m[2m=[0mdropped
+[2m2026-09-06T16:51:33.443761Z[0m [33m WARN[0m [2mmoq_net::lite::publisher[0m[2m:[0m subscribed error [3mid[0m[2m=[0m2 [3mbroadcast[0m[2m=[0mbbb.hang [3mtrack[0m[2m=[0m1.m4s [3merr[0m[2m=[0mnot found
+[2m2026-09-06T16:51:33.443993Z[0m [33m WARN[0m [2mmoq_net::model::group[0m[2m:[0m group::Producer dropped without finish() or abort() [3msequence[0m[2m=[0m4
+[2m2026-09-06T16:51:33.444024Z[0m [33m WARN[0m [2mmoq_net::model::track[0m[2m:[0m track::Producer dropped without finish() or abort() [3mtrack[0m[2m=[0mtimeline.z
+[2m2026-09-06T16:51:33.444044Z[0m [33m WARN[0m [2mmoq_net::model::group[0m[2m:[0m group::Producer dropped without finish() or abort() [3msequence[0m[2m=[0m0
+[2m2026-09-06T16:51:33.444095Z[0m [33m WARN[0m [2mmoq_net::model::broadcast[0m[2m:[0m broadcast::Producer dropped without finish(). Keep the producer alive while publishing, then call finish().
+[2m2026-09-06T16:51:33.444215Z[0m [34mDEBUG[0m [2mmoq_net::lite::publisher[0m[2m:[0m unannounce [3mbroadcast[0m[2m=[0mbbb.hang
+Error: reconnect timed out after 10s: failed to connect to server: QUIC failed: failed to fetch fingerprint; WebSocket failed: failed to connect WebSocket
+
+Stack backtrace:
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1: std::backtrace_rs::backtrace::trace_unsynchronized::<<std::backtrace::Backtrace>::create::{closure#0}>
+             at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2: <std::backtrace::Backtrace>::create
+             at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/backtrace.rs:331:13
+   3: from<moq_tokio::error::Error>
+             at <cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.104/src/backtrace.rs:10:14
+   4: from_residual<(), moq_tokio::error::Error, anyhow::Error>
+             at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/result.rs:2189:27
