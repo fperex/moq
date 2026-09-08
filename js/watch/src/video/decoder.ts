@@ -71,6 +71,10 @@ type DecoderOutput = {
 
 	// Combined buffered ranges (network jitter + decode buffer)
 	buffered: Signal<Container.BufferedRanges>;
+
+	// How late video frames arrive relative to the earliest one, measured by the container
+	// consumer. Wired into Sync by the parent, which sizes the "auto" delay from it.
+	spread: Signal<Time.Milli | undefined>;
 };
 
 /** Downloads video from a track and decodes it into {@link VideoFrame}s with WebCodecs. */
@@ -87,6 +91,7 @@ export class Decoder {
 		stats: new Signal<Stats | undefined>(undefined),
 		jitter: new Signal<Time.Milli | undefined>(undefined),
 		buffered: new Signal<Container.BufferedRanges>([]),
+		spread: new Signal<Time.Milli | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -112,7 +117,7 @@ export class Decoder {
 
 		this.source = props.source;
 		this.sync = props.sync;
-		this.#signals.cleanup(this.sync.register(this.out.jitter));
+		this.#signals.cleanup(this.sync.register({ jitter: this.out.jitter, spread: this.out.spread }));
 		this.#identity = this.#signals.computed((effect) => {
 			const config = effect.get(this.source.out.config);
 			return config ? playbackIdentity(config) : undefined;
@@ -198,6 +203,7 @@ export class Decoder {
 		if (!active) {
 			// Clear stale data when disabled (e.g. paused or not visible).
 			this.#out.buffered.set([]);
+			this.#out.spread.set(undefined);
 			return;
 		}
 
@@ -214,6 +220,7 @@ export class Decoder {
 		});
 		effect.proxy(this.#out.timestamp, active.timestamp);
 		effect.proxy(this.#out.buffered, active.buffered);
+		effect.proxy(this.#out.spread, active.spread);
 	}
 
 	#runDisplay(effect: Effect): void {
@@ -284,6 +291,9 @@ class DecoderTrack {
 
 	// Network jitter + decode buffer.
 	buffered = new Signal<Container.BufferedRanges>([]);
+
+	// How late frames arrive relative to the earliest one, from the container consumer.
+	spread = new Signal<Time.Milli | undefined>(undefined);
 
 	// Decoded frames waiting to be rendered.
 	#buffered = new Signal<Container.BufferedRanges>([]);
@@ -400,6 +410,9 @@ class DecoderTrack {
 			this.buffered.update(() => Container.mergeBufferedRanges(network, decode));
 		});
 
+		// Publish the measured arrival spread for Sync.
+		effect.run((inner) => this.spread.set(inner.get(consumer.spread)));
+
 		decoder.configure({
 			codec: this.config.codec,
 			description: this.config.description ? Util.Hex.toBytes(this.config.description) : undefined,
@@ -475,6 +488,9 @@ class DecoderTrack {
 			const decode = inner.get(this.#buffered);
 			this.buffered.update(() => Container.mergeBufferedRanges(network, decode));
 		});
+
+		// Publish the measured arrival spread for Sync.
+		effect.run((inner) => this.spread.set(inner.get(consumer.spread)));
 
 		// Configure decoder with description from catalog
 		decoder.configure({

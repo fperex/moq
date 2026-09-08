@@ -14,7 +14,8 @@ import {
 /**
  * How far playback trails the live edge.
  *
- * `"auto"` (the default) sizes the jitter buffer from the connection RTT; a `Time.Milli` fixes it.
+ * `"auto"` (the default) sizes the jitter buffer from how late frames actually arrive; a
+ * `Time.Milli` fixes it.
  *
  * `"instant"` drops the buffer and the pacing together: nothing is held, and {@link Sync.wait}
  * returns without sleeping, so a frame presents as soon as it exists. It also overrides
@@ -23,9 +24,6 @@ import {
  * turn audio off.
  */
 export type Delay = "instant" | "auto" | Time.Milli;
-
-const MIN_JITTER = Time.Milli(20);
-const FALLBACK_JITTER = Time.Milli(100);
 
 export type SyncInput = {
 	/** How far playback trails the live edge. See {@link Delay}. */
@@ -42,10 +40,27 @@ export type SyncInput = {
 	buffer: Getter<Time.Milli>;
 
 	/**
-	 * The connection's PROBE estimates, whose RTT drives "auto" jitter. Usually wired
-	 * from a `Connection`'s `probe`.
+	 * The connection's PROBE estimates. Usually wired from a `Connection`'s `probe`.
+	 *
+	 * No longer read: "auto" sizes itself from measured arrivals, which the round trip does not
+	 * describe. Kept so the published type stays stable until the A/V clock quest reshapes it.
 	 */
 	probe: Getter<Moq.Connection.Probe | undefined>;
+};
+
+/** What one decoder contributes to the shared playback clock. */
+export type Media = {
+	/** The delay the selected rendition advertises. */
+	jitter: Getter<Time.Milli | undefined>;
+
+	/**
+	 * How late that rendition's frames arrive relative to the earliest one, from the container
+	 * consumer.
+	 *
+	 * This is what `"auto"` sizes the jitter buffer from: it measures what the publisher and the
+	 * network actually deliver, which the round trip does not describe.
+	 */
+	spread: Getter<Time.Milli | undefined>;
 };
 
 type SyncOutput = {
@@ -53,11 +68,11 @@ type SyncOutput = {
 	// This will keep being updated as we catch up to the live playhead then will be relatively static.
 	reference: Signal<Time.Milli | undefined>;
 
-	// The resolved delay from the live edge to the playhead: jitter + max(audio, video).
+	// The resolved delay from the live edge to the playhead. See `#runDelay` for how the terms combine.
 	delay: Signal<Time.Milli>;
 
 	// The jitter component of `delay` (always numeric).
-	// In "auto" mode this is updated automatically from RTT.
+	// In "auto" mode this follows the measured arrival spread, the largest across tracks.
 	// When the delay is a number, jitter equals that number.
 	jitter: Signal<Time.Milli>;
 
@@ -80,7 +95,7 @@ export class Sync {
 	readonly #out: SyncOutput = {
 		reference: new Signal<Time.Milli | undefined>(undefined),
 		delay: new Signal<Time.Milli>(Time.Milli.zero),
-		jitter: new Signal<Time.Milli>(FALLBACK_JITTER),
+		jitter: new Signal<Time.Milli>(Time.Milli.zero),
 		timestamp: new Signal<Time.Milli | undefined>(undefined),
 		buffered: new Signal<boolean>(false),
 		maxAge: new Signal<Time.Milli>(Time.Milli.zero),
@@ -94,10 +109,7 @@ export class Sync {
 	// Per-label late-frame tracking: accumulate count and max lateness, flush on recovery.
 	#late = new Map<string, { count: number; maxMs: number }>();
 
-	// Minimum RTT seen, used as the baseline for jitter calculation.
-	// Avoids inflating jitter due to bufferbloat.
-	#minRtt: number | undefined;
-	#media = new Signal<{ jitter: Getter<Time.Milli | undefined> }[]>([]);
+	#media = new Signal<Media[]>([]);
 
 	#signals = new Effect();
 
@@ -115,11 +127,19 @@ export class Sync {
 		this.#signals.run(this.#runMaxAge.bind(this));
 	}
 
-	/** Include a decoder's rendition delay in the shared playback clock until disposed. */
-	register(jitter: Getter<Time.Milli | undefined>): Dispose {
-		const registered = { jitter };
-		this.#media.update((media) => [...media, registered]);
-		return () => this.#media.update((media) => media.filter((candidate) => candidate !== registered));
+	/** Include a decoder's rendition delay and measured arrival spread in the shared playback clock until disposed. */
+	register(media: Media): Dispose {
+		this.#media.update((registered) => [...registered, media]);
+		return () => this.#media.update((registered) => registered.filter((candidate) => candidate !== media));
+	}
+
+	// The largest value any registered decoder reports for one of its terms.
+	#largest(effect: Effect, term: keyof Media): Time.Milli {
+		let largest = Time.Milli.zero;
+		for (const media of effect.get(this.#media)) {
+			largest = Time.Milli.max(largest, effect.get(media[term]) ?? Time.Milli.zero);
+		}
+		return largest;
 	}
 
 	// Derive `buffered` / `maxAge` from the resolved delay and the configured lookahead.
@@ -132,51 +152,41 @@ export class Sync {
 		this.#out.maxAge.set(Time.Milli.add(delay, buffer));
 	}
 
+	// "auto" sizes the buffer from what arrives, not from the round trip. A retransmit costs an RTT,
+	// but a publisher flushing a second of media at once costs a second, and a well-paced publisher
+	// across the world costs nothing above its frame duration: the arrival spread measures both, so
+	// it is the only term here.
 	#runJitter(effect: Effect): void {
 		const delay = effect.get(this.in.delay);
 
 		if (delay === "instant") {
 			// Holds nothing at all.
-			this.#minRtt = undefined;
 			this.#out.jitter.set(Time.Milli.zero);
 			return;
 		}
 
 		if (typeof delay === "number") {
 			// Fixed mode: the configured delay is the jitter.
-			this.#minRtt = undefined;
 			this.#out.jitter.set(delay);
 			return;
 		}
 
-		// "auto" mode: compute jitter from the connection's RTT estimate.
-		const rtt = effect.get(this.in.probe)?.rtt;
-		if (rtt !== undefined) {
-			// Track minimum RTT as baseline, ignoring bufferbloat.
-			this.#minRtt = this.#minRtt !== undefined ? Math.min(this.#minRtt, rtt) : rtt;
-
-			// Buffer enough for a retransmit (1 RTT for ACK + retransmit).
-			const jitter = Time.Milli(Math.max(MIN_JITTER, this.#minRtt * 1.25));
-			this.#out.jitter.set(jitter);
-			return;
-		}
-
-		// No RTT available: fall back to static default.
-		this.#minRtt = undefined;
-		this.#out.jitter.set(FALLBACK_JITTER);
+		this.#out.jitter.set(this.#largest(effect, "spread"));
 	}
 
+	// A fixed delay is what the viewer asked for, held on top of whatever the renditions advertise.
+	// "auto" takes the larger of the two terms rather than their sum: the advertised delay and the
+	// measured spread describe the same thing, a publisher that emits in bursts, so adding them
+	// would double the buffer for exactly the publishers that need it most. "instant" holds nothing.
 	#runDelay(effect: Effect): void {
+		const mode = effect.get(this.in.delay);
 		const jitter = effect.get(this.#out.jitter);
-		let media = Time.Milli.zero;
-		for (const registered of effect.get(this.#media)) {
-			media = Time.Milli.max(media, effect.get(registered.jitter) ?? Time.Milli.zero);
-		}
+		const advertised = this.#largest(effect, "jitter");
 
-		// A zero delay still holds the rendition's own delay, which is a frame interval at 60fps.
-		// "instant" holds nothing at all.
-		const instant = effect.get(this.in.delay) === "instant";
-		const delay = instant ? Time.Milli.zero : Time.Milli.add(media, jitter);
+		let delay: Time.Milli;
+		if (mode === "instant") delay = Time.Milli.zero;
+		else if (typeof mode === "number") delay = Time.Milli.add(advertised, jitter);
+		else delay = Time.Milli.max(advertised, jitter);
 		this.#out.delay.set(delay);
 
 		this.#update.resolve();

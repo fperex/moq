@@ -221,10 +221,11 @@ export default class MoqWatch extends HTMLElement {
 		});
 		this.signals.cleanup(() => this.text.close());
 
+		// The decoders register their rendition delay and measured arrival spread with Sync
+		// themselves, so it only needs the viewer's controls here.
 		this.sync = new Sync({
 			delay: this.controls.delay,
 			buffer: this.controls.buffer,
-			probe: this.connection.probe,
 		});
 		this.signals.cleanup(() => this.sync.close());
 

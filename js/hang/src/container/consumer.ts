@@ -3,6 +3,7 @@ import * as Moq from "@moq/net";
 import { Effect, type Getter, type GetterInit, getter, Once, Signal } from "@moq/signals";
 
 import type { Format } from "./format";
+import { Jitter } from "./jitter";
 import type { BufferedRanges, Frame } from "./types";
 
 /** Options for constructing a {@link Consumer}. */
@@ -100,6 +101,18 @@ export class Consumer {
 	/** The time ranges currently buffered and ready to play. */
 	readonly buffered: Getter<BufferedRanges> = this.#buffered;
 
+	// Measured at arrival, before any group is skipped: a target derived from what survives the
+	// age budget would only ever confirm the budget it was cut to.
+	#spread = new Jitter();
+
+	/**
+	 * How late frames arrive relative to the earliest one, measured as they land.
+	 *
+	 * Size the playback buffer with this rather than with the round trip, which says nothing about
+	 * how evenly a publisher emits frames.
+	 */
+	readonly spread: Getter<Time.Milli> = this.#spread.value;
+
 	#signals = new Effect();
 	#closed = new Once<Error | null>();
 
@@ -175,6 +188,11 @@ export class Consumer {
 
 				const decoded = this.#format.decode(next.payload);
 
+				// One arrival time per wire frame: every sample a container frame carries reached
+				// the receiver together, so sampling the clock per sample would spread one arrival
+				// across a few hundred microseconds of decode time.
+				const now = Moq.Time.Milli.now();
+
 				for (const sample of decoded) {
 					const marker = this.#format.end?.(sample) !== undefined;
 					const frame: Frame = {
@@ -214,6 +232,12 @@ export class Consumer {
 					this.#updateBuffered();
 
 					if (!marker && this.#abortIfRewound(group, frame.timestamp)) return;
+
+					// Measured once the timeline is settled and before the age budget can skip
+					// the group: a reneged straggler is already gone, a rewound group has already
+					// aborted the track above, and a target derived from what survives the budget
+					// would only ever confirm the budget it was cut to.
+					if (!marker) this.#spread.observe(frame.timestamp, now);
 
 					let skipped = false;
 					if (group.consumer.sequence !== this.#active) {
@@ -582,6 +606,7 @@ export class Consumer {
 		this.#discontinuity++;
 		this.#deliveredGroup = undefined;
 		this.#gap = true;
+		this.#spread.reanchor();
 	}
 
 	#updateBuffered(): void {

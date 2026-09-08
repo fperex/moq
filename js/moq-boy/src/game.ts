@@ -138,7 +138,6 @@ export class Game {
 
 		this.sync = new Watch.Sync({
 			delay: this.delay,
-			probe: connection.probe,
 		});
 		this.#signals.cleanup(() => this.sync.close());
 
