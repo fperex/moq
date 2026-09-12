@@ -9,7 +9,10 @@ set working-directory := '.'
 # Paths a JS check depends on: every bun workspace (they are not all under js/,
 # see the root package.json) plus the config shared by all of them. `check`,
 # `fix`, and `ci` all skip themselves when a diff misses this.
-scope := '^(js/|doc/|drafts/|demo/(boy|web)/|test/smoke/clients/js|test/wasm/|package\.json$|bun\.lock(b)?$|biome\.jsonc$)'
+#
+# The playout corpus lives in rs/moq-audio because that crate has to include_str! it, but it is
+# generated and freshness-checked from js/hang, so editing it has to run these suites too.
+scope := '^(js/|doc/|drafts/|demo/(boy|web)/|test/smoke/clients/js|test/wasm/|rs/moq-audio/tests/playout-01\.json$|package\.json$|bun\.lock(b)?$|biome\.jsonc$)'
 
 # Run all checks by default.
 default:

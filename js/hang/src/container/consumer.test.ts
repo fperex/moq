@@ -7,6 +7,7 @@ import { createAudioInitSegment, encodeDataSegment } from "./cmaf/encode.ts";
 import { Format as CmafFormat } from "./cmaf/format.ts";
 import { Consumer } from "./consumer.ts";
 import type { Format as ContainerFormat } from "./format.ts";
+import { Jitter } from "./jitter.ts";
 import { Format as LegacyFormat, Producer as LegacyProducer } from "./legacy.ts";
 import type { Frame } from "./types.ts";
 
@@ -530,6 +531,157 @@ test("Consumer measures how late frames arrive", async () => {
 	await drainFrames(consumer, 300);
 	expect(consumer.spread.peek()).toBeGreaterThanOrEqual(50 as Time.Milli);
 	consumer.close();
+});
+
+// The arrival observation point is load-bearing enough to guard directly: a spy on the estimator
+// says exactly which frames were measured, at which arrival time.
+function watchArrivals(): { calls: { timestamp: number; now: number }[]; restore: () => void } {
+	const calls: { timestamp: number; now: number }[] = [];
+	const spy = spyOn(Jitter.prototype, "observe").mockImplementation(function (
+		this: Jitter,
+		timestamp: Time.Micro,
+		now: Time.Milli,
+	) {
+		calls.push({ timestamp, now });
+	});
+	return { calls, restore: () => spy.mockRestore() };
+}
+
+test("Consumer observes a frame before the age budget can skip its group", async () => {
+	const { calls, restore } = watchArrivals();
+	try {
+		const track = new Track.Producer("test");
+		// A budget small enough that the second group is skipped on arrival rather than delivered.
+		const consumer = new Consumer(track.subscribe(), {
+			format: new LegacyFormat("audio"),
+			maxAge: 10 as Time.Milli,
+		});
+
+		writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro]);
+		await settle(60);
+		writeGroupWithLegacyFrames(track, 1, [20_000 as Time.Micro]);
+		track.close();
+
+		await drainFrames(consumer, 200);
+
+		// A target derived from what survives the budget would only ever confirm the budget, so the
+		// skipped group's frame still has to be measured.
+		expect(calls.map((c) => c.timestamp)).toEqual([0, 20_000]);
+		consumer.close();
+	} finally {
+		restore();
+	}
+});
+
+test("Consumer observes each frame of an active group exactly once", async () => {
+	const { calls, restore } = watchArrivals();
+	try {
+		const track = new Track.Producer("test");
+		const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 500 as Time.Milli });
+
+		writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro, 20_000 as Time.Micro, 40_000 as Time.Micro]);
+		track.close();
+
+		await drainFrames(consumer, 200);
+
+		// The active group and the non-active branch both observe, so a second call site would
+		// double-count every frame and halve the measured pacing.
+		expect(calls.map((c) => c.timestamp)).toEqual([0, 20_000, 40_000]);
+		consumer.close();
+	} finally {
+		restore();
+	}
+});
+
+test("Consumer never observes a marker frame", async () => {
+	const { calls, restore } = watchArrivals();
+	try {
+		const track = new Track.Producer("test");
+		const producer = new LocProducer(track);
+		producer.encode(new Uint8Array([0xde, 0xad]), 0 as Time.Micro, true);
+		// An empty LOC payload is a group-end marker: it carries no media, so it says nothing about
+		// how the path is behaving.
+		producer.encode(new Uint8Array(), 33_000 as Time.Micro, false);
+		producer.close();
+
+		const consumer = new Consumer(replay(track), { format: new LocFormat("audio"), maxAge: 500 as Time.Milli });
+		await drainFrames(consumer, 200);
+
+		expect(calls.map((c) => c.timestamp)).toEqual([0]);
+		consumer.close();
+	} finally {
+		restore();
+	}
+});
+
+test("Consumer gives every sample of one wire frame the same arrival time", async () => {
+	// One wire frame carrying three samples, the CMAF shape. They reached the receiver together, so
+	// sampling the clock per sample would spread one arrival across the decode loop instead of
+	// measuring the path.
+	let base = 0;
+	const multiFormat: ContainerFormat = {
+		decode(_frame: Uint8Array): Frame[] {
+			const at = base;
+			base += 60_000;
+			return [
+				{ payload: new Uint8Array([1]), timestamp: at as Time.Micro, keyframe: false },
+				{ payload: new Uint8Array([2]), timestamp: (at + 20_000) as Time.Micro, keyframe: false },
+				{ payload: new Uint8Array([3]), timestamp: (at + 40_000) as Time.Micro, keyframe: false },
+			];
+		},
+	};
+
+	const { calls, restore } = watchArrivals();
+	try {
+		const track = new Track.Producer("test");
+		const consumer = new Consumer(replay(track), { format: multiFormat, maxAge: 500 as Time.Milli });
+
+		const group = new Group.Producer(0);
+		group.writeFrame({ payload: new Uint8Array([0x01]), timestamp: Time.Timestamp.now() });
+		group.writeFrame({ payload: new Uint8Array([0x02]), timestamp: Time.Timestamp.now() });
+		group.close();
+		track.writeGroup(group);
+		track.close();
+
+		await drainFrames(consumer, 200);
+
+		expect(calls).toHaveLength(6);
+		// Two wire frames, so two arrival times, three samples sharing each.
+		expect(new Set(calls.map((c) => c.now)).size).toBeLessThanOrEqual(2);
+		expect(new Set(calls.slice(0, 3).map((c) => c.now)).size).toBe(1);
+		expect(new Set(calls.slice(3).map((c) => c.now)).size).toBe(1);
+		consumer.close();
+	} finally {
+		restore();
+	}
+});
+
+test("Consumer re-anchors the arrival reference on a playhead event", async () => {
+	const spy = spyOn(Jitter.prototype, "reanchor");
+	try {
+		const track = new Track.Producer("test");
+		const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 500 as Time.Milli });
+
+		writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro, 20_000 as Time.Micro]);
+		await settle();
+		await nextFrame(consumer);
+		await nextFrame(consumer);
+
+		const before = spy.mock.calls.length;
+
+		// The publisher restarts its source. A timeline only moves forward, so the restart is a
+		// marker and a jump ahead rather than a rewind, but the reference still holds pairs from
+		// before the jump and every arrival after it would read as 20s of delay.
+		writeMarkerGroup(track, 1, 20_000 as Time.Micro);
+		writeGroupWithLegacyFrames(track, 2, [20_000_000 as Time.Micro]);
+		track.close();
+		await drainFrames(consumer, 200);
+
+		expect(spy.mock.calls.length).toBeGreaterThan(before);
+		consumer.close();
+	} finally {
+		spy.mockRestore();
+	}
 });
 
 // --- Ordering ---
