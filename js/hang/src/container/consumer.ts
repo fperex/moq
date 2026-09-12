@@ -186,12 +186,12 @@ export class Consumer {
 				if (!next) break;
 				group.empty = false;
 
-				const decoded = this.#format.decode(next.payload);
-
-				// One arrival time per wire frame: every sample a container frame carries reached
-				// the receiver together, so sampling the clock per sample would spread one arrival
-				// across a few hundred microseconds of decode time.
+				// One arrival time per wire frame, read before the payload is parsed: every sample a
+				// container frame carries reached the receiver together, so sampling the clock per
+				// sample would fold this receiver's decode cost into a measurement of the path, and
+				// fold it in proportionally to the segment size.
 				const now = Moq.Time.Milli.now();
+				const decoded = this.#format.decode(next.payload);
 
 				for (const sample of decoded) {
 					const marker = this.#format.end?.(sample) !== undefined;

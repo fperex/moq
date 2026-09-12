@@ -11,6 +11,9 @@ import { Jitter } from "./jitter.ts";
 import { Format as LegacyFormat, Producer as LegacyProducer } from "./legacy.ts";
 import type { Frame } from "./types.ts";
 
+// What `Jitter` reads before any arrival has been folded in.
+const COLD_START = 80 as Time.Milli;
+
 const TIMESCALE = 90_000;
 const TEST_INIT: InitSegment = {
 	timescale: TIMESCALE,
@@ -526,10 +529,16 @@ test("Consumer measures how late frames arrive", async () => {
 	// The next group carries 20ms of media but shows up 150ms later, so a player needs the
 	// difference in its buffer to render it on time. Nothing about the round trip says that.
 	writeGroupWithLegacyFrames(track, 1, [20_000 as Time.Micro]);
+
+	// The estimator folds in one observation per 500ms interval, so the measurement only reaches
+	// the estimate once an interval closes. Without this third group the cold-start guess would
+	// still be standing and the assertion below would pass having measured nothing.
+	await settle(600);
+	writeGroupWithLegacyFrames(track, 2, [40_000 as Time.Micro]);
 	track.close();
 
 	await drainFrames(consumer, 300);
-	expect(consumer.spread.peek()).toBeGreaterThanOrEqual(50 as Time.Milli);
+	expect(consumer.spread.peek()).toBeGreaterThan(COLD_START);
 	consumer.close();
 });
 
