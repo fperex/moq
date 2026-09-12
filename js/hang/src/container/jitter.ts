@@ -1,164 +1,239 @@
 import { Time } from "@moq/net";
 import { type Getter, Signal } from "@moq/signals";
 
-/** Width of one histogram bucket, which is also the resolution of the estimate. */
-const BUCKET = 5;
-
-/** Number of buckets, so the estimate saturates at `BUCKET * BUCKETS`. */
-const BUCKETS = 200;
-
 /**
- * How much an arrival still counts once another arrives. 0.9993 halves a sample's weight after
- * ~1000 arrivals, roughly 20s of 50/s audio: long enough to hold a rare burst, short enough to
- * forget a network that has since settled.
+ * Width of one histogram bucket in milliseconds, and the resolution of the target.
+ *
+ * The target is always a whole number of buckets, so a consumer that wants to know whether the
+ * estimate really moved compares the change against this.
  */
-const FORGET = 0.9993;
+export const BUCKET = 20;
 
-/** The fraction of arrivals the estimate covers. */
-const PERCENTILE = 0.95;
+// Buckets in the histogram, so it covers 0 to BUCKETS * BUCKET ms of relative arrival delay.
+const BUCKETS = 100;
 
-/** How long the estimate holds its value before it may step down again. */
+// The fraction of arrivals the target covers.
+const QUANTILE = 0.95;
+
+// Steady-state forget factor, applied once per resampled observation rather than per arrival.
+// 500ms / (1 - 0.983) is about 29s of wall-clock memory.
+const FORGET = 0.983;
+
+// Cold-start ramp: the first observations replace the seeded prior instead of nudging it.
+const START_FORGET_WEIGHT = 2;
+
+// One observation per interval, the maximum delay seen in it.
+const RESAMPLE = 500;
+
+// How much media the arrival reference covers. Measured on the media axis, not the wall clock, so
+// a stalled sender cannot age out the only arrivals the reference has.
+const WINDOW = 2000;
+
+// The target before any observation lands.
+const START = 80;
+
+// How many empty intervals one arrival may decay. 60 intervals is 30s, past the histogram's own
+// memory, so a longer pause converges to the same near-reset for a bounded amount of work.
+const MAX_CATCHUP = 60;
+
+// How long the target holds before it may step down by another bucket.
 const LOWER_INTERVAL = 1000;
 
-/**
- * How long a minimum stays authoritative. The minimum is tracked over two windows and read as the
- * smaller of the two, so it survives at least this long and at most twice it. Without an expiry a
- * single early arrival would anchor the spread for the life of the stream, and a sender clock
- * drifting away from the receiver's would inflate it without bound.
- */
-const WINDOW = 30_000;
+// One admitted arrival, on both axes in milliseconds.
+type Arrival = { timestamp: number; arrival: number };
 
 /**
- * How much buffer late arrivals need, measured at arrival rather than derived from the round trip.
+ * How much buffer a receiver needs to play audio on time, measured from when frames arrive.
  *
- * Each arrival contributes `now - timestamp` relative to the running minimum of that difference,
- * which is the delay a player has to absorb to render the frame on time: zero for an evenly paced
- * sender, one flush span for a sender that emits a burst of frames at once. Samples land in a
- * histogram that forgets old arrivals, and the estimate is a high percentile of it plus one frame,
- * the shape WebRTC's NetEq uses. The extra frame is what keeps audio in the buffer at the bottom of
- * the swing the spread describes, rather than landing it on exactly zero.
+ * Each frame is measured against the fastest recent arrival rather than against the previous one,
+ * so a path that slowly gets worse reads as a delay climbing to its real size instead of as a
+ * string of tiny inter-arrival deltas. Those delays feed a histogram that is read at a high
+ * quantile, because network delay is one-sided and heavy-tailed and a mean plus deviations sizes
+ * that tail wrong.
  *
- * The estimate rises as soon as a late frame proves the buffer is too shallow, and lowers by at
- * most one frame per interval, so a refinement shrinks a viewer's buffer in steps it can absorb.
+ * The estimate rises the moment a late frame proves the buffer is too shallow and falls one bucket
+ * per second, so a refinement shrinks a viewer's buffer in steps it can absorb. It carries no floor
+ * of its own: the rendition's advertised jitter is a publisher-declared floor and belongs to
+ * whoever combines the two.
+ *
+ * The algorithm is written down in `doc/concept/playout.md` and held to it by the conformance
+ * corpus at `rs/moq-audio/tests/playout-01.json`. The design is WebRTC's NetEq
+ * (`modules/audio_coding/neteq/`: `underrun_optimizer.cc`, `packet_arrival_history.cc`,
+ * `histogram.cc`, `delay_manager.cc`), reimplemented in f64 rather than copied.
  */
 export class Jitter {
-	// Weighted count of arrivals per spread bucket, and their sum.
+	// Admitted arrivals within WINDOW of media, ascending by `arrival - timestamp`, so the front is
+	// the fastest recent arrival: the best-case path everything else is measured against.
+	#min: Arrival[] = [];
+
+	// The newest timestamp admitted so far. Anything not strictly newer is reordered.
+	#newest?: number;
+
+	// Weighted probability per delay bucket, summing to 1.
 	#buckets = new Float64Array(BUCKETS);
-	#total = 0;
 
-	// Smallest arrival delay in the current window and in the one before it. See WINDOW.
-	#current?: number;
-	#previous?: number;
-	#windowStart?: number;
+	// Observations folded in so far, and the factor the next one decays the histogram by.
+	#adds = 0;
+	#forget = 0;
 
-	// Largest spread ever measured. Buckets are read at their upper edge, which covers the whole
-	// spread the bucket might hold; this caps that at a spread actually seen, so an evenly paced
-	// sender reads as zero rather than as one bucket.
-	#max = 0;
+	// The resample interval currently open, and the largest delay seen inside it.
+	#intervalStart?: number;
+	#intervalMax = 0;
 
-	// Smallest positive gap between consecutive timestamps, i.e. the frame duration. It bounds how
-	// fast the estimate steps down.
-	#spacing?: number;
-	#latest?: Time.Micro;
+	// The quantile's upper edge, i.e. what the histogram currently asks for.
+	#optimal?: number;
 
-	// When the estimate last moved, so a step down waits out LOWER_INTERVAL.
+	// The published target, and when it last moved.
+	#target = START;
 	#lowered?: number;
 
-	#value = new Signal<Time.Milli>(Time.Milli.zero);
+	#value = new Signal<Time.Milli>(Time.Milli(START));
 
-	/** The current estimate: enough buffer to render `PERCENTILE` of arrivals on time. */
+	/** The current target: enough buffer to play `QUANTILE` of arrivals on time. */
 	readonly value: Getter<Time.Milli> = this.#value;
 
-	/** Fold one frame into the estimate, given its media timestamp and the wall time it arrived. */
-	observe(timestamp: Time.Micro, now: Time.Milli): void {
-		const delay = now - Time.Milli.fromMicro(timestamp);
-
-		// Roll the minimum window forward so a stale baseline expires. A gap longer than both
-		// windows expires both minima: promoting the one from before the gap would hold a path
-		// delay that no longer exists authoritative for another window, reading every punctual
-		// frame after the gap as late.
-		this.#windowStart ??= now;
-		const elapsed = now - this.#windowStart;
-		if (elapsed >= 2 * WINDOW) {
-			this.#previous = undefined;
-			this.#current = undefined;
-			this.#windowStart = now;
-		} else if (elapsed >= WINDOW) {
-			this.#previous = this.#current;
-			this.#current = undefined;
-			this.#windowStart = now;
-		}
-		this.#current = this.#current === undefined ? delay : Math.min(this.#current, delay);
-		const min = this.#previous === undefined ? this.#current : Math.min(this.#current, this.#previous);
-
-		// Learn the frame duration from the timeline itself; it is the step size for lowering.
-		if (this.#latest !== undefined && timestamp > this.#latest) {
-			const gap = Time.Milli.fromMicro((timestamp - this.#latest) as Time.Micro);
-			this.#spacing = this.#spacing === undefined ? gap : Math.min(this.#spacing, gap);
-		}
-		if (this.#latest === undefined || timestamp > this.#latest) this.#latest = timestamp;
-
-		const spread = Math.max(0, delay - min);
-		this.#max = Math.max(this.#max, spread);
-		const bucket = Math.min(BUCKETS - 1, Math.floor(spread / BUCKET));
-
-		// Decay everything, then count this arrival, so a sample's weight is relative to how many
-		// have arrived since rather than to how long ago it was.
-		for (let i = 0; i < BUCKETS; i++) this.#buckets[i] *= FORGET;
-		this.#total = this.#total * FORGET + 1;
-		this.#buckets[bucket] += 1;
-
-		this.#publish(now);
+	/** Seed the histogram with a decaying prior so a cold start has something to quantile. */
+	constructor() {
+		for (let i = 0; i < BUCKETS; i++) this.#buckets[i] = 0.5 ** (i + 1);
 	}
 
 	/**
-	 * Forget the arrival baseline, keeping the measured spread.
+	 * Fold one frame into the estimate, given its media timestamp and the wall time it arrived.
 	 *
-	 * A discontinuity moves the media timeline underneath the measurement, so `now - timestamp`
-	 * jumps by the size of the jump and the old minimum describes a timeline that no longer
-	 * exists. The histogram is in spread space, which the jump does not move, so it survives.
+	 * Pass `reordered` when the caller already knows the frame came out of order; a frame whose
+	 * timestamp is not strictly newer than the newest admitted one is treated the same way. Either
+	 * way it is excluded from both the reference and the histogram: its arrival is early relative to
+	 * its timestamp, so counting it would add the media-time distance between the two to a delay
+	 * measurement.
 	 */
-	reanchor(): void {
-		this.#current = undefined;
-		this.#previous = undefined;
-		this.#windowStart = undefined;
-		this.#latest = undefined;
+	observe(timestamp: Time.Micro, now: Time.Milli, reordered = false): void {
+		// Plain numbers from here down. The branded time types are structurally numbers, so mixing
+		// a media axis with a wall axis type-checks; keeping both in ms and unbranded makes the unit
+		// visible in the arithmetic instead.
+		const ts = timestamp / 1000;
+		const arrival = now as number;
+
+		if (reordered || (this.#newest !== undefined && ts <= this.#newest)) {
+			// Costing a reordered arrival as delay against loss is a separate step, not yet written.
+			this.#publish(arrival);
+			return;
+		}
+		this.#newest = ts;
+
+		// Drop arrivals the timeline has moved past. The window is media, so this prunes by how much
+		// content has been delivered rather than by how long the receiver has been running.
+		while (this.#min.length > 0 && this.#min[0].timestamp + WINDOW < ts) this.#min.shift();
+
+		// Maintain the monotone deque: anything at least as slow as this arrival can never be the
+		// minimum again.
+		while (this.#min.length > 0) {
+			const back = this.#min[this.#min.length - 1];
+			if (arrival - ts > back.arrival - back.timestamp) break;
+			this.#min.pop();
+		}
+		this.#min.push({ timestamp: ts, arrival });
+
+		const ref = this.#min[0];
+		const delay = Math.max(0, arrival - ref.arrival - (ts - ref.timestamp));
+
+		this.#resample(arrival, delay);
+		this.#publish(arrival);
 	}
 
-	#publish(now: Time.Milli): void {
-		// One frame on top of the percentile: the buffer swings by the spread the percentile
-		// measures, so without it the bottom of that swing lands on an empty ring.
-		const step = this.#spacing ?? BUCKET;
-		const measured = this.#percentile() + step;
-		const current = this.#value.peek();
+	/**
+	 * Forget the arrival reference, keeping the measured distribution.
+	 *
+	 * A discontinuity moves the media timeline underneath the measurement, so every arrival in the
+	 * reference describes a timeline that no longer exists and the open interval spans the jump.
+	 * The histogram holds delays, which the jump does not move, so it survives.
+	 */
+	reanchor(): void {
+		this.#min.length = 0;
+		this.#newest = undefined;
+		this.#intervalStart = undefined;
+		this.#intervalMax = 0;
+	}
 
-		if (measured >= current) {
+	// Take at most one observation per RESAMPLE, the largest delay in the interval. That
+	// decorrelates observations and turns the forget factor into a wall-clock time constant.
+	#resample(arrival: number, delay: number): void {
+		this.#intervalStart ??= arrival;
+
+		const elapsed = arrival - this.#intervalStart;
+		if (elapsed > RESAMPLE) {
+			this.#add(this.#intervalMax);
+
+			// Intervals that passed with no arrival still decay. A normalised histogram cannot
+			// forget without an observation, so a pause would otherwise preserve whatever the path
+			// looked like before it; a timer instead of this would be untestable and unportable.
+			const empty = Math.min(MAX_CATCHUP, Math.floor(elapsed / RESAMPLE) - 1);
+			for (let i = 0; i < empty; i++) this.#add(0);
+
+			this.#intervalStart = arrival;
+			this.#intervalMax = 0;
+		}
+
+		// The arrival that closed an interval belongs to the new one, not to the one it closed.
+		this.#intervalMax = Math.max(this.#intervalMax, delay);
+	}
+
+	// Fold one resampled observation into the histogram and read the quantile back out.
+	#add(ms: number): void {
+		const index = Math.floor(ms / BUCKET);
+
+		// Past the histogram's range the observation is dropped rather than clamped into the last
+		// bucket, so one absurd arrival cannot pin the target at the ceiling for a whole minute.
+		if (index < BUCKETS) {
+			const forget = this.#forget;
+			for (let i = 0; i < BUCKETS; i++) this.#buckets[i] *= forget;
+			this.#buckets[index] += 1 - forget;
+
+			this.#adds++;
+			this.#forget = Math.max(0, Math.min(FORGET, 1 - START_FORGET_WEIGHT / (this.#adds + 1)));
+		}
+
+		// The bucket's upper edge, because the delay it holds is somewhere inside it.
+		this.#optimal = (this.#quantile() + 1) * BUCKET;
+	}
+
+	// The lowest bucket whose tail mass has dropped to 1 - QUANTILE.
+	#quantile(): number {
+		let sum = 1 - this.#buckets[0];
+		let index = 0;
+		while (sum > 1 - QUANTILE && index < BUCKETS - 1) {
+			index++;
+			sum -= this.#buckets[index];
+		}
+		return index;
+	}
+
+	#publish(now: number): void {
+		const optimal = this.#optimal ?? START;
+		const current = this.#target;
+
+		if (optimal >= current) {
+			// Rise at once: a late frame has already proven the buffer is too shallow, and waiting
+			// costs an underrun the viewer hears. The histogram's range bounds how far one
+			// observation can take it.
 			this.#lowered = now;
-			if (measured > current) this.#value.set(Time.Milli(measured));
+			if (optimal > current) this.#set(optimal);
 			return;
 		}
 
-		// Lower gradually: the buffer shrinks by at most one frame per interval, so a refined
-		// estimate never drops the playhead onto an empty ring.
+		// Fall one bucket per second, in as many steps as the elapsed time allows so a 1 fps track
+		// and a 50 fps one shrink at the same wall-clock rate. Shrinking faster than this drops the
+		// playhead onto a ring the network has not refilled yet.
 		this.#lowered ??= now;
-		if (now - this.#lowered < LOWER_INTERVAL) return;
-		this.#lowered = now;
+		const steps = Math.floor((now - this.#lowered) / LOWER_INTERVAL);
+		if (steps <= 0) return;
 
-		this.#value.set(Time.Milli(Math.max(measured, current - step)));
+		this.#lowered += steps * LOWER_INTERVAL;
+		this.#set(Math.max(optimal, current - steps * BUCKET));
 	}
 
-	#percentile(): Time.Milli {
-		if (this.#total <= 0) return Time.Milli.zero;
-
-		const want = this.#total * PERCENTILE;
-		let sum = 0;
-		for (let i = 0; i < BUCKETS; i++) {
-			sum += this.#buckets[i];
-			// The upper edge of the bucket: the spread it holds is somewhere inside it, so covering
-			// the whole bucket is what actually covers the percentile.
-			if (sum >= want) return Time.Milli(Math.min((i + 1) * BUCKET, this.#max));
-		}
-
-		return Time.Milli(Math.min(BUCKETS * BUCKET, this.#max));
+	#set(target: number): void {
+		if (target === this.#target) return;
+		this.#target = target;
+		this.#value.set(Time.Milli(target));
 	}
 }
