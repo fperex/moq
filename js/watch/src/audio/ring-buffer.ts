@@ -1,4 +1,5 @@
 import { Time } from "@moq/net";
+import { WORKLET_QUANTUM } from "./config";
 
 export class AudioRingBuffer {
 	#buffer: Float32Array[];
@@ -53,6 +54,9 @@ export class AudioRingBuffer {
 		}
 	}
 
+	// Twice the target, so the ring can physically hold the skip band above it. `resize` keeps this
+	// true as the target moves, which is what stops a rising adaptive target from being silently
+	// capped by the `Math.min(..., capacity)` in `write`.
 	#capacityFor(latencySamples: number): number {
 		return latencySamples * 2;
 	}
@@ -143,14 +147,17 @@ export class AudioRingBuffer {
 		const end = start + samples;
 		this.#chunk = data[0].length;
 
-		// Bound the ring. While playing, drop the oldest once it holds a whole chunk more than the
-		// target and land back on the target: frames arrive one chunk at a time, so a ring sitting
-		// exactly on the target is a chunk above it the moment the next one lands, and dropping on
-		// that overshoot discards audio on every single write. While stalled the reader is not
-		// consuming, so only the hard capacity applies; the band would throw away the very audio the
-		// refill is accumulating. Buffered mode plays through everything, so it is capacity-bound too.
+		// Bound the ring. While playing, drop the oldest once it holds a whole chunk plus a render
+		// quantum more than the target and land back on the target: frames arrive one chunk at a
+		// time, so a ring sitting exactly on the target is a chunk above it the moment the next one
+		// lands, and dropping on that overshoot discards audio on every single write. The quantum on
+		// top is the reader's own granularity, which puts the ring a block above the target between
+		// reads for the same harmless reason. While stalled the reader is not consuming, so only the
+		// hard capacity applies; the band would throw away the very audio the refill is accumulating.
+		// Buffered mode plays through everything, so it is capacity-bound too.
 		const playing = !this.#stalled && !this.#buffered;
-		const limit = playing ? Math.min(this.#latencySamples + this.#chunk, this.capacity) : this.capacity;
+		const slack = this.#chunk + WORKLET_QUANTUM;
+		const limit = playing ? Math.min(this.#latencySamples + slack, this.capacity) : this.capacity;
 		if (end - this.#readIndex > limit) {
 			this.#readIndex = end - (playing ? Math.min(this.#latencySamples, this.capacity) : this.capacity);
 		}

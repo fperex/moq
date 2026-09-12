@@ -1,3 +1,4 @@
+import * as Container from "@moq/hang/container";
 import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
@@ -15,6 +16,9 @@ import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Si
  * turn audio off.
  */
 export type Delay = "instant" | "auto" | Time.Milli;
+
+// The widest measured jitter "auto" sizes a buffer from, which is the estimator's own ceiling.
+const JITTER_CEILING = Time.Milli(Container.Jitter.CEILING);
 
 export type SyncInput = {
 	/** How far playback trails the live edge. See {@link Delay}. */
@@ -153,13 +157,17 @@ export class Sync {
 
 		const audio = effect.get(this.in.audioSpread) ?? Time.Milli.zero;
 		const video = effect.get(this.in.videoSpread) ?? Time.Milli.zero;
-		this.#out.jitter.set(Time.Milli.max(audio, video));
+
+		// The estimator drops anything past its histogram's range rather than clamping it, so a
+		// reading above the range is not a reading. Bound the buffer by it either way.
+		this.#out.jitter.set(Time.Milli.min(JITTER_CEILING, Time.Milli.max(audio, video)));
 	}
 
-	// A fixed delay is what the viewer asked for, held on top of whatever the renditions advertise.
-	// "auto" takes the larger of the two terms rather than their sum: the advertised delay and the
-	// measured spread describe the same thing, a publisher that emits in bursts, so adding them
-	// would double the buffer for exactly the publishers that need it most. "instant" holds nothing.
+	// The advertised delay is a publisher-declared floor and the measured jitter is a measurement of
+	// the network, so "auto" is the larger of the two rather than their sum: the receiver measures
+	// the publisher's flush span itself, so adding them would double the buffer for exactly the
+	// publishers that need it most. A fixed delay is what the viewer asked for on top of the floor,
+	// so there the two do add. "instant" holds nothing.
 	#runDelay(effect: Effect): void {
 		const mode = effect.get(this.in.delay);
 		const jitter = effect.get(this.#out.jitter);

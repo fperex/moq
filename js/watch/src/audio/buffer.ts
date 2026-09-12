@@ -1,7 +1,20 @@
+import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
 import { Effect, type Getter, Signal } from "@moq/signals";
 import type { Data, InitPost, InitShared, Latency, Reset, Stall, State, Truncate } from "./render";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
+
+/**
+ * Samples the shared ring is sized for up front, so an "auto" target rising to the estimator's
+ * ceiling never reallocates.
+ *
+ * A resize hands the worklet a replacement ring by message and the reader keeps draining the old
+ * one until it lands, so it is the one operation worth paying memory to avoid: 2s at 48kHz stereo
+ * is under a megabyte after the power-of-two round.
+ */
+function ceilingSamples(rate: number): number {
+	return Math.ceil(rate * Time.Second.fromMilli(Time.Milli(Container.Jitter.CEILING)));
+}
 
 /**
  * Timestamp-based backpressure for buffered playback. The decoded PCM ring only holds the latency
@@ -173,7 +186,10 @@ class SharedAudioBuffer implements AudioBuffer {
 
 		// The ring holds the latency floor as decoded PCM (headroom above it for overflow). In
 		// buffered mode the lookahead above the floor stays encoded upstream, held back by `wait()`.
-		const capacity = Math.max(rate, latencySamples * 2);
+		// Sized for the estimator's ceiling from the start: an "auto" target climbing past the
+		// initial delay would otherwise hit the overflow path's `capacity` bound and be silently
+		// capped there, which is the one place a deeper target does not deepen the buffer.
+		const capacity = Math.max(rate, ceilingSamples(rate), latencySamples * 2);
 		this.#backpressure = new Backpressure(buffered, samplesToMicro(latencySamples, rate));
 
 		const init = allocSharedRingBuffer(channels, capacity, rate, buffered);
@@ -203,9 +219,11 @@ class SharedAudioBuffer implements AudioBuffer {
 	setLatency(samples: number): void {
 		this.#backpressure.setHeadroom(samplesToMicro(samples, this.rate));
 
-		// Grow the ring (preserving the unread window) if it's too small for the new latency.
+		// Grow the ring (preserving the unread window) if it's too small for the new latency. Only a
+		// fixed or buffered delay past the estimator's ceiling gets here; "auto" is sized for at
+		// construction.
 		if (this.#ring.capacity < samples * 1.5) {
-			const newCapacity = Math.max(this.rate, samples * 2);
+			const newCapacity = Math.max(this.rate, ceilingSamples(this.rate), samples * 2);
 			this.#ring = this.#ring.resize(newCapacity);
 			this.#ring.setLatency(samples);
 

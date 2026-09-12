@@ -85,12 +85,16 @@ function coerceLegacyDelay(value: unknown): Delay {
 
 // The released spellings of `delay`, in bare milliseconds. Kept unitless so pages still on them
 // behave exactly as they did; `delay` is the current surface and does require a unit.
-function parseLegacyDelay(value: string | null): Delay {
+function parseLegacyDelay(name: string, value: string | null): Delay {
 	const trimmed = value?.trim();
 	if (!trimmed || trimmed === "real-time") return "auto";
 	if (trimmed === "instant") return "instant";
 	const parsed = Number.parseFloat(trimmed);
-	return Moq.Time.Milli(Number.isFinite(parsed) ? parsed : 100);
+	if (Number.isFinite(parsed)) return Moq.Time.Milli(parsed);
+	// Falls back to the element's default, like every other attribute. It used to land on a silent
+	// 100ms, which is neither what the page asked for nor what the element does without it.
+	console.warn(`moq-watch: invalid ${name}="${value}", expected "auto", "instant", or milliseconds`);
+	return "auto";
 }
 
 /**
@@ -490,7 +494,7 @@ export default class MoqWatch extends HTMLElement {
 		} else if (name === "buffer") {
 			this.controls.buffer.set(parseBuffer(newValue));
 		} else if (name === "latency" || name === "latency-min" || name === "jitter") {
-			this.controls.delay.set(parseLegacyDelay(newValue));
+			this.controls.delay.set(parseLegacyDelay(name, newValue));
 		} else if (name === "catalog-format") {
 			this.#catalogFormat.set(parseCatalogFormat(newValue));
 		} else if (name === "captions") {

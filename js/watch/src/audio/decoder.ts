@@ -261,13 +261,19 @@ export class Decoder {
 	// (the "raise latency, only video re-buffers" desync). Stalling spends the deficit as silence,
 	// once, instead of leaving it to the underrun that the shallow buffer eventually causes anyway.
 	//
-	// The derived delay, not the user's setting, since the arrival estimator moves it too. Only a
-	// deepening worth more than a frame counts, so the estimator's small refinements ride through,
-	// and the debounce coalesces a slider drag or a converging estimate into a single stall.
-	// Decreases are left to natural catch-up.
+	// The derived delay, not the user's setting, since the arrival estimator moves it too. The
+	// threshold is the estimator's own resolution rather than the rendition's advertised jitter: the
+	// two are different quantities, and a codec with a long frame would otherwise let a real
+	// deepening through unparked while a short one parked on noise.
+	//
+	// Two buckets, not one. A stall is audible silence until the worklet can stretch instead, so it
+	// is worth paying only for a rise the estimator could not have produced by rounding, and a
+	// single-bucket rise is inside the buffer's own slack anyway.
+	// The debounce coalesces a slider drag or a converging estimate into a single stall. Decreases
+	// are left to natural catch-up.
 	#runLatencyReanchor(effect: Effect): void {
 		const target = effect.get(this.sync.out.delay);
-		const step = effect.get(this.source.out.jitter) ?? Time.Milli.zero;
+		const step = Time.Milli(2 * Container.Jitter.BUCKET);
 		if (this.#prevTarget === undefined) {
 			// Startup: the initial fill already builds the cushion; just record the baseline.
 			this.#prevTarget = target;

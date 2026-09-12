@@ -425,42 +425,56 @@ describe("overflow", () => {
 });
 
 describe("latency skip", () => {
-	it("should skip READ when buffered exceeds LATENCY plus a chunk", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 20 });
+	// 256 sample target, 128 sample chunks, 128 sample render quantum: the band is 512.
+	const BAND = { rate: 1000, channels: 1, capacity: 2048, latency: 256 };
 
-		// Fill 60 samples in 10-sample chunks — a whole chunk past the 20 sample LATENCY.
-		insertChunks(buffer, 0, 60, 10, { channels: 1, value: 1.0 });
+	it("should skip READ when buffered exceeds LATENCY plus a chunk and a quantum", () => {
+		const buffer = create(BAND);
+
+		// Fill 768 samples in 128-sample chunks, well past the 512 sample band.
+		insertChunks(buffer, 0, 768, 128, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read should skip ahead to maintain LATENCY distance from WRITE
-		const output = read(buffer, 128, 1);
+		const output = read(buffer, 1024, 1);
 
-		// Should only get LATENCY (20) samples, skipping the first 40
-		expect(output[0].length).toBe(20);
+		// Should only get LATENCY (256) samples, skipping the first 512
+		expect(output[0].length).toBe(256);
 	});
 
-	it("should tolerate one chunk above LATENCY", () => {
-		// A ring sitting on the target is a chunk above it the moment the next chunk lands, so
-		// skipping on that overshoot would discard audio on every single insert.
-		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 20 });
+	it("should tolerate one chunk and one render quantum above LATENCY", () => {
+		// A ring sitting on the target is a chunk above it the moment the next chunk lands, and a
+		// quantum above it between two reads. Skipping on either overshoot discards audio the
+		// reader was going to play anyway.
+		const buffer = create(BAND);
 
-		insertChunks(buffer, 0, 40, 20, { channels: 1, value: 1.0 });
+		insertChunks(buffer, 0, 512, 128, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
-		const output = read(buffer, 128, 1);
-		expect(output[0].length).toBe(40);
+		const output = read(buffer, 1024, 1);
+		expect(output[0].length).toBe(512);
+	});
+
+	it("should skip one chunk past the band", () => {
+		const buffer = create(BAND);
+
+		insertChunks(buffer, 0, 640, 128, { channels: 1, value: 1.0 });
+		expect(buffer.stalled).toBe(false);
+
+		const output = read(buffer, 1024, 1);
+		expect(output[0].length).toBe(256);
 	});
 
 	it("should not skip when buffered is within LATENCY", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 50 });
+		const buffer = create(BAND);
 
-		// Fill exactly 50 samples = LATENCY
-		insert(buffer, 0, 50, { channels: 1, value: 1.0 });
+		// Fill exactly 256 samples = LATENCY
+		insert(buffer, 0, 256, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
-		// Read should get all 50 — no skip needed
-		const output = read(buffer, 128, 1);
-		expect(output[0].length).toBe(50);
+		// Read should get all 256 — no skip needed
+		const output = read(buffer, 1024, 1);
+		expect(output[0].length).toBe(256);
 	});
 });
 
@@ -486,25 +500,46 @@ describe("timestamp getter", () => {
 
 describe("setLatency", () => {
 	it("should dynamically change latency affecting skip behavior", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 50 });
+		const buffer = create({ rate: 1000, channels: 1, capacity: 2048, latency: 256 });
 
-		// Fill 80 samples, in chunks so the skip band stays narrow.
-		insertChunks(buffer, 0, 80, 10, { channels: 1, value: 1.0 });
+		// Fill 768 samples, in chunks so the skip band stays narrow.
+		insertChunks(buffer, 0, 768, 128, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
-		// With LATENCY=50, reading should skip to 30 (80-50)
-		const output1 = read(buffer, 128, 1);
-		expect(output1[0].length).toBe(50);
+		// With LATENCY=256, reading should skip to 512 (768-256)
+		const output1 = read(buffer, 1024, 1);
+		expect(output1[0].length).toBe(256);
 
 		// Write more
-		insertChunks(buffer, 80, 80, 10, { channels: 1, value: 2.0 });
+		insertChunks(buffer, 768, 768, 128, { channels: 1, value: 2.0 });
 
-		// Change latency to 20
-		buffer.setLatency(20);
+		// Change latency to 128
+		buffer.setLatency(128);
 
 		// Now reading should skip more aggressively
-		const output2 = read(buffer, 128, 1);
-		expect(output2[0].length).toBe(20);
+		const output2 = read(buffer, 1024, 1);
+		expect(output2[0].length).toBe(128);
+	});
+});
+
+describe("capacity", () => {
+	it("refuses a target it could never hold rather than capping it", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 1024, latency: 256 });
+		expect(() => buffer.setLatency(4096)).toThrow(/exceeds/);
+	});
+
+	it("holds a deeper target once the owner has grown it", () => {
+		// `SharedAudioBuffer` sizes for the estimator's ceiling up front and resizes past it, so a
+		// target that climbs mid-stream keeps buffering instead of stalling on the old capacity.
+		const small = create({ rate: 1000, channels: 1, capacity: 1024, latency: 256 });
+		insertChunks(small, 0, 512, 128, { channels: 1, value: 1.0 });
+
+		const grown = small.resize(4096);
+		grown.setLatency(2048);
+		insertChunks(grown, 512, 2048, 128, { channels: 1, value: 1.0 });
+
+		expect(grown.length).toBeGreaterThanOrEqual(2048);
+		expect(grown.stalled).toBe(false);
 	});
 });
 
