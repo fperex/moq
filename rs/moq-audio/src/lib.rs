@@ -53,6 +53,11 @@ mod format;
 mod frame;
 mod opus;
 mod pcm;
+// The playout DSP: time stretch, concealment, and the background noise estimate they
+// share. Nothing outside its own tests drives it yet, so every item in here is dead
+// until the decision loop that calls it lands.
+#[allow(dead_code)]
+mod playout;
 mod resample;
 
 #[cfg(feature = "aec")]
