@@ -28,6 +28,7 @@ members = [
     "rs/moq-room",
     "rs/moq-rtc",
     "rs/moq-rtmp",
+    "rs/moq-shaper",
     "rs/moq-sock",
     "rs/moq-srt",
     "rs/moq-stats",
@@ -66,6 +67,7 @@ default-members = [
     "rs/moq-room",
     "rs/moq-rtc",
     "rs/moq-rtmp",
+    "rs/moq-shaper",
     "rs/moq-sock",
     "rs/moq-srt",
     "rs/moq-stats",
@@ -115,6 +117,7 @@ hex = "0.4"
 # HMAC-SHA256 for the mDNS membership proofs (moq-tokio's `mdns` feature).
 hmac = "0.13"
 humantime = "2.3"
+humantime-serde = "1.1"
 io-uring = "0.7.14"
 jsonwebtoken = "11"
 kio = { version = "0.5.9", path = "rs/kio" }
