@@ -1,0 +1,20 @@
+# A path that gets worse mid-run: 5ms for the first thirty seconds, then 60ms.
+#
+# An estimator that only ever converges downward passes every steady profile and
+# fails this one.
+name = "step"
+seed = 4
+
+[up]
+delay = "5ms"
+
+[up.step]
+at = "30s"
+delay = "60ms"
+
+[down]
+delay = "5ms"
+
+[down.step]
+at = "30s"
+delay = "60ms"

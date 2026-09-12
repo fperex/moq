@@ -1,0 +1,11 @@
+# A healthy wired LAN: a few milliseconds of delay with the same spread again.
+name = "mild"
+seed = 2
+
+[up]
+delay = "5ms"
+jitter = "5ms"
+
+[down]
+delay = "5ms"
+jitter = "5ms"
