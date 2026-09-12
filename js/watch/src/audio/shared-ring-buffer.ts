@@ -1,4 +1,5 @@
 import { Time } from "@moq/net";
+import { WORKLET_QUANTUM } from "./config";
 
 // Control array slot indices. The playhead is not here: see `state`.
 const WRITE = 0;
@@ -352,15 +353,16 @@ export class SharedRingBuffer {
 		const write = Atomics.load(this.#control, WRITE);
 		const latency = Atomics.load(this.#control, LATENCY);
 
-		// Latency skip: skip ahead only once the ring holds a whole chunk more than the target,
-		// landing back on the target. Frames arrive one chunk at a time, so a ring sitting exactly
-		// on the target is a chunk above it the moment the next one lands; skipping on that
-		// overshoot discards audio on every single insert. The chunk of slack is the difference
-		// between tolerating normal arrival and cutting it.
+		// Latency skip: skip ahead only once the ring holds a whole chunk plus a render quantum more
+		// than the target, landing back on the target. Frames arrive one chunk at a time, so a ring
+		// sitting exactly on the target is a chunk above it the moment the next one lands; skipping
+		// on that overshoot discards audio on every single insert. The quantum on top is this
+		// reader's own granularity: it drains in whole blocks, so the ring is routinely one block
+		// above the target between reads and that is not late audio either.
 		// CAS ensures we never step backward relative to a concurrent writer advance.
 		// Disabled in buffered mode, where we deliberately play through the whole buffer.
 		const buffered = (write - read) | 0;
-		const slack = Atomics.load(this.#control, CHUNK);
+		const slack = (Atomics.load(this.#control, CHUNK) + WORKLET_QUANTUM) | 0;
 		if (!this.buffered && latency > 0 && buffered > ((latency + slack) | 0)) {
 			const skipTo = (write - latency) | 0;
 			if (((skipTo - read) | 0) > 0) read = skipTo;
@@ -411,8 +413,18 @@ export class SharedRingBuffer {
 		return count;
 	}
 
-	/** Update the target latency in samples. */
+	/**
+	 * Update the target latency in samples.
+	 *
+	 * Refuses a target the ring cannot physically hold rather than capping it. The overflow path
+	 * advances READ before the buffer could ever reach such a target, so the ring would sit stalled
+	 * for good instead of playing deeper, and nothing upstream would say why. The owner sizes
+	 * capacity for the estimator's ceiling at construction, so reaching this is a bug.
+	 */
 	setLatency(samples: number): void {
+		if (samples > this.capacity) {
+			throw new Error(`audio ring: target of ${samples} samples exceeds its ${this.capacity} sample capacity`);
+		}
 		Atomics.store(this.#control, LATENCY, samples);
 	}
 

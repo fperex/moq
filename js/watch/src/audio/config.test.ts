@@ -61,20 +61,23 @@ test("routing and decoder inputs change the playback identity", () => {
 });
 
 test("an advertised jitter of zero falls back to the codec frame duration", () => {
-	// 48kHz stereo Opus: 20ms frames plus the 128 sample worklet quantum (3ms).
+	// 48kHz Opus reads as its 20ms frame, not 23ms: the worklet's render quantum is the ring's
+	// granularity, not the publisher's, so it is no longer folded in here.
 	const floor = playbackJitter(config());
-	expect(floor).toBe(Time.Milli(23));
+	expect(floor).toBe(Time.Milli(20));
 	expect(playbackJitter(config({ jitter: 0 }))).toBe(floor);
-	expect(playbackJitter(config({ jitter: 60 }))).toBe(Time.Milli(63));
+	expect(playbackJitter(config({ jitter: 60 }))).toBe(Time.Milli(60));
 });
 
 test("AAC and MP3 jitter follows their codec frame sizes", () => {
-	expect(playbackJitter(config({ codec: "mp4a.40.2", sampleRate: 48000 }))).toBe(Time.Milli(25));
-	expect(playbackJitter(config({ codec: "mp4a.40.2", sampleRate: 24000 }))).toBe(Time.Milli(49));
-	expect(playbackJitter(config({ codec: "mp3", sampleRate: 48000 }))).toBe(Time.Milli(27));
-	expect(playbackJitter(config({ codec: "mp3", sampleRate: 24000 }))).toBe(Time.Milli(30));
+	expect(playbackJitter(config({ codec: "mp4a.40.2", sampleRate: 48000 }))).toBe(Time.Milli(22));
+	expect(playbackJitter(config({ codec: "mp4a.40.2", sampleRate: 24000 }))).toBe(Time.Milli(43));
+	expect(playbackJitter(config({ codec: "mp3", sampleRate: 48000 }))).toBe(Time.Milli(24));
+	expect(playbackJitter(config({ codec: "mp3", sampleRate: 24000 }))).toBe(Time.Milli(24));
 });
 
-test("an unknown codec without advertised jitter only reserves the worklet quantum", () => {
-	expect(playbackJitter(config({ codec: "flac", jitter: 0 }))).toBe(Time.Milli(3));
+test("an unknown codec with no advertised jitter reserves nothing", () => {
+	// Nothing is known about its frame duration, so the estimator is the only term. The ring's own
+	// slack covers the render quantum either way.
+	expect(playbackJitter(config({ codec: "flac", jitter: 0 }))).toBe(Time.Milli(0));
 });

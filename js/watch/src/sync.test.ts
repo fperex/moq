@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import type * as Moq from "@moq/net";
 import type { Time } from "@moq/net";
 import { Signal } from "@moq/signals";
 import { Sync } from "./sync";
@@ -148,6 +149,51 @@ describe("auto delay", () => {
 		await flush();
 		expect(sync.out.jitter.peek()).toBe(500 as Time.Milli);
 		expect(sync.out.delay.peek()).toBe(520 as Time.Milli);
+		sync.close();
+	});
+
+	it("keeps the advertised delay as a floor", async () => {
+		// The advertised value is a publisher-declared flush span and the measurement is of the
+		// network. When the measurement is the smaller of the two the publisher still knows
+		// something the receiver has not seen yet, so it holds.
+		const audioSpread = new Signal<Time.Milli | undefined>(20 as Time.Milli);
+		const sync = new Sync({ audio: 250 as Time.Milli, audioSpread });
+		await flush();
+		expect(sync.out.jitter.peek()).toBe(20 as Time.Milli);
+		expect(sync.out.delay.peek()).toBe(250 as Time.Milli);
+		sync.close();
+	});
+
+	it("bounds the measured jitter at the estimator's ceiling", async () => {
+		// The estimator's histogram covers 2s and drops anything past it, so a reading above that is
+		// not a reading. Nothing should be able to size a buffer past it either way.
+		const audioSpread = new Signal<Time.Milli | undefined>(10_000 as Time.Milli);
+		const sync = new Sync({ audioSpread });
+		await flush();
+		expect(sync.out.jitter.peek()).toBe(2000 as Time.Milli);
+		expect(sync.out.delay.peek()).toBe(2000 as Time.Milli);
+		sync.close();
+	});
+
+	it("holds nothing when instant, whatever the spread says", async () => {
+		const sync = new Sync({ delay: "instant", audio: 250 as Time.Milli, audioSpread: 500 as Time.Milli });
+		await flush();
+		expect(sync.out.jitter.peek()).toBe(0 as Time.Milli);
+		expect(sync.out.delay.peek()).toBe(0 as Time.Milli);
+		sync.close();
+	});
+
+	it("no longer moves with the connection probe", async () => {
+		// The round trip does not describe a publisher that flushes a second of media at once, which
+		// is what a jitter buffer has to absorb. `probe` stays on the input for the published type.
+		const probe = new Signal<Moq.Connection.Probe | undefined>(undefined);
+		const sync = new Sync({ probe, audioSpread: 40 as Time.Milli });
+		await flush();
+		expect(sync.out.jitter.peek()).toBe(40 as Time.Milli);
+
+		probe.set({ rtt: 400 as Time.Milli } as Moq.Connection.Probe);
+		await flush();
+		expect(sync.out.jitter.peek()).toBe(40 as Time.Milli);
 		sync.close();
 	});
 });

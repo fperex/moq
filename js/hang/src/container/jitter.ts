@@ -9,8 +9,17 @@ import { type Getter, Signal } from "@moq/signals";
  */
 export const BUCKET = 20;
 
-// Buckets in the histogram, so it covers 0 to BUCKETS * BUCKET ms of relative arrival delay.
+// Buckets in the histogram.
 const BUCKETS = 100;
+
+/**
+ * The widest delay the histogram can hold, so the widest target it can produce.
+ *
+ * An observation above this is dropped rather than clamped, which makes this a real ceiling on the
+ * estimate rather than a saturation point. Whoever sizes a buffer from the estimate can allocate
+ * for it once instead of growing as the target climbs.
+ */
+export const CEILING = BUCKETS * BUCKET;
 
 // The fraction of arrivals the target covers.
 const QUANTILE = 0.95;

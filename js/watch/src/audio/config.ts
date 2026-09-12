@@ -1,8 +1,14 @@
 import type * as Catalog from "@moq/hang/catalog";
 import { Time } from "@moq/net";
 
-// AudioWorklet always renders in 128-sample quanta.
-const WORKLET_QUANTUM = 128;
+/**
+ * The AudioWorklet's render block, in samples. Fixed by the spec.
+ *
+ * It is the granularity of every read out of the audio ring, so it belongs to the ring's slack and
+ * not to the arrival estimate: native has no worklet, and a target series carrying the browser's
+ * render block could not be held to the same conformance corpus.
+ */
+export const WORKLET_QUANTUM = 128;
 const OPUS_FRAME_DURATION_MS = 20;
 const AAC_LC_FRAME_SAMPLES = 1024;
 const MP3_MPEG1_FRAME_SAMPLES = 1152;
@@ -40,15 +46,17 @@ export function playbackIdentity(config: Catalog.AudioConfig): PlaybackIdentity 
 	};
 }
 
-/** The jitter to add to the sync buffer for a rendition, in milliseconds. */
+/**
+ * The delay a rendition advertises, in milliseconds: the publisher's declared flush span.
+ *
+ * A floor, not a measurement. The render quantum used to be added here, which read 48kHz Opus as
+ * 23ms rather than 20ms; it is the ring's granularity rather than the publisher's, so it lives in
+ * the ring's slack now.
+ */
 export function playbackJitter(config: Catalog.AudioConfig): Time.Milli {
 	// A publisher advertising 0 is claiming frames are never delayed, which no encoder can do, so
 	// fall back to the codec's frame duration the same way an absent field does.
-	const codecJitter = (config.jitter || defaultJitter(config)) ?? 0;
-
-	// Add the worklet render quantum so the ring buffer has margin between frame arrivals.
-	const overhead = Math.ceil((WORKLET_QUANTUM / config.sampleRate) * 1000);
-	return Time.Milli(codecJitter + overhead);
+	return Time.Milli((config.jitter || defaultJitter(config)) ?? 0);
 }
 
 // Estimate the minimum jitter (frame duration) based on the audio codec.
