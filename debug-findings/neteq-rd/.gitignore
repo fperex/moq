@@ -1,0 +1,8 @@
+*.f32
+*.wav
+*.webm
+*.mp4
+/waveforms/
+/bbb-waveforms/
+/comparison.json
+/bbb-comparison.json

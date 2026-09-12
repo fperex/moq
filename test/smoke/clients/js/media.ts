@@ -17,7 +17,7 @@
  * @module
  */
 import { parseArgs } from "node:util";
-import type { Browser, Page } from "playwright";
+import type { Browser, BrowserContext, Page } from "playwright";
 import {
 	type BrowserErrors,
 	check,
@@ -54,6 +54,8 @@ const { values } = parseArgs({
 		cases: { type: "string" },
 		leak: { type: "boolean", default: false },
 		"expect-fail": { type: "string" },
+		"audio-decoder": { type: "string", default: "native" },
+		"late-audio-output": { type: "boolean", default: false },
 	},
 });
 
@@ -61,17 +63,28 @@ const url = values.url;
 const timeoutMs = Number.parseFloat(values.timeout ?? "30") * 1000;
 const fault = values.fault ?? "none";
 const expectFail = values["expect-fail"];
+const audioDecoder = values["audio-decoder"];
+const lateAudioOutput = values["late-audio-output"];
 const selected = new Set<string>(
 	values.cases === undefined ? CASES : values.cases === "none" ? [] : values.cases.split(","),
 );
 const unknown = [...selected].filter((name) => !CASES.some((c) => c === name));
-if (!url || !Number.isFinite(timeoutMs) || timeoutMs <= 0 || !FAULTS.some((f) => f === fault) || unknown.length > 0) {
+if (
+	!url ||
+	!Number.isFinite(timeoutMs) ||
+	timeoutMs <= 0 ||
+	!FAULTS.some((f) => f === fault) ||
+	unknown.length > 0 ||
+	!["native", "libav", "libav-mixed"].includes(audioDecoder)
+) {
 	console.error(
-		`usage: media.ts --url U [--timeout S>0] [--fault ${FAULTS.join("|")}] [--cases none|${CASES.join(",")}] [--leak] [--expect-fail TEXT]`,
+		`usage: media.ts --url U [--timeout S>0] [--fault ${FAULTS.join("|")}] [--cases none|${CASES.join(",")}] [--audio-decoder native|libav|libav-mixed] [--late-audio-output] [--leak] [--expect-fail TEXT]`,
 	);
 	process.exit(2);
 }
 const wants = (name: Case) => selected.has(name);
+if (lateAudioOutput && (audioDecoder !== "libav" || !wants("pause")))
+	throw new Error("--late-audio-output requires --audio-decoder libav and the pause case");
 
 // process.exit narrows `url` above, but not inside the function declarations below.
 const relay: string = url;
@@ -135,12 +148,7 @@ const HELD_MS = 1500;
  * The picture, not a status flag, is what a viewer sees stop, so this is what "playback stopped"
  * has to mean. A canvas that goes unreadable counts as stopped too.
  */
-async function waitFrozen(
-	page: Page,
-	errors: BrowserErrors,
-	assertion: string,
-	description: string,
-): Promise<number> {
+async function waitFrozen(page: Page, errors: BrowserErrors, assertion: string, description: string): Promise<number> {
 	const deadline = Date.now() + SETTLE_MS;
 	let frame: number | undefined;
 	let since = Date.now();
@@ -321,8 +329,82 @@ async function browserFor(): Promise<Browser> {
 
 /** Open a subscriber page and wait for the player to start sampling. Never reloads. */
 async function subscriber(broadcast: string, label: string): Promise<[Page, BrowserErrors]> {
+	const browser = await browserFor();
+	let owner: Browser | BrowserContext = browser;
+	if (audioDecoder !== "native") {
+		const context = await browser.newContext();
+		await context.addInitScript(
+			({ lateOutput, mixed }) => {
+				if (mixed)
+					Object.defineProperty(globalThis, "__moqSmokeNativeAudio", {
+						value: { encoder: AudioEncoder, data: AudioData, chunk: EncodedAudioChunk },
+					});
+				for (const name of mixed
+					? ["AudioDecoder"]
+					: ["AudioDecoder", "AudioEncoder", "AudioData", "EncodedAudioChunk"])
+					Reflect.deleteProperty(globalThis, name);
+				if (!lateOutput) return;
+				const stats = { delivered: 0, copied: 0, released: 0 };
+				const report = () => {
+					document.documentElement.dataset.lateAudioOutput = JSON.stringify(stats);
+				};
+				let installed: typeof AudioDecoder | undefined;
+				Object.defineProperty(globalThis, "AudioDecoder", {
+					configurable: true,
+					get: () => installed,
+					set: (Decoder: typeof AudioDecoder) => {
+						installed = class extends Decoder {
+							constructor(init: AudioDecoderInit) {
+								let held: AudioData | undefined;
+								let captured = false;
+								let closed = false;
+								super({
+									...init,
+									output: (data) => {
+										if (!captured) {
+											held = data.clone();
+											captured = true;
+										}
+										init.output(data);
+									},
+								});
+								const close = this.close.bind(this);
+								this.close = () => {
+									close();
+									if (closed) return;
+									closed = true;
+									const data = held;
+									held = undefined;
+									if (!data) return;
+									const copy = data.copyTo.bind(data);
+									const release = data.close.bind(data);
+									data.copyTo = (destination, options) => {
+										stats.copied++;
+										report();
+										copy(destination, options);
+									};
+									data.close = () => {
+										stats.released++;
+										report();
+										release();
+									};
+									queueMicrotask(() => {
+										stats.delivered++;
+										report();
+										init.output(data);
+									});
+								};
+							}
+						};
+					},
+				});
+			},
+			{ lateOutput: lateAudioOutput, mixed: audioDecoder === "libav-mixed" },
+		);
+		owner = context;
+	}
 	const [page, errors] = await open(
-		await browserFor(),
+		owner,
 		// visible="always" because the window is never frontmost in a headless run, and the default
 		// policy would stop downloading video and leave the canvas black.
 		pageUrl(server.origin, "subscribe", { url: relay, broadcast, visible: "always" }),
@@ -382,6 +464,28 @@ try {
 	console.error(`  presented frame ${first.frameId} before any gesture, audio ${first.audioContext ?? "absent"}`);
 
 	await gesture(player);
+	if (audioDecoder !== "native") {
+		check(
+			await player.evaluate(
+				() => typeof AudioDecoder === "function" && !String(AudioDecoder).includes("[native code]"),
+			),
+			"Libav decoder selected",
+			() => "subscriber did not replace the missing browser audio decoder",
+		);
+		if (audioDecoder === "libav-mixed")
+			check(
+				await player.evaluate(() => {
+					const before = Reflect.get(globalThis, "__moqSmokeNativeAudio");
+					return (
+						before.encoder === AudioEncoder &&
+						before.data === AudioData &&
+						before.chunk === EncodedAudioChunk
+					);
+				}),
+				"native audio constructors preserved",
+				() => "fallback decoder replaced a supported native audio API",
+			);
+	}
 	// Deliberately does not wait for a tone: whether audio actually carries the fixture is what
 	// assertMedia measures, so silence has to fail there rather than time out here.
 	await waitForState(player, playerErrors, {
@@ -416,6 +520,16 @@ try {
 		);
 
 		const held = await collect(player, playerErrors, HELD_MS);
+		if (lateAudioOutput) {
+			const stats = await player.evaluate(() =>
+				JSON.parse(document.documentElement.dataset.lateAudioOutput ?? "null"),
+			);
+			check(
+				stats?.delivered > 0 && stats.copied === 0 && stats.released === stats.delivered,
+				"late audio output discarded",
+				() => `injected post-close delivery: ${JSON.stringify(stats)}`,
+			);
+		}
 		const moved = held.filter((s) => s.frameId !== undefined && s.frameId !== paused);
 		check(
 			moved.length === 0,
@@ -548,6 +662,17 @@ try {
 		);
 		console.error(`  joined at frame ${joined.frameId}, live edge was ${live.frameId}`);
 		assertMedia(await collect(player, playerErrors, WINDOW_MS), "late join");
+	}
+	if (lateAudioOutput) {
+		const stats = await player.evaluate(() =>
+			JSON.parse(document.documentElement.dataset.lateAudioOutput ?? "null"),
+		);
+		check(
+			stats?.delivered > 0 && stats.copied === 0 && stats.released === stats.delivered,
+			"late audio output discarded",
+			() => `injected post-close delivery: ${JSON.stringify(stats)}`,
+		);
+		console.error(`  injected late audio output: ${stats.delivered} real decoded frames released without PCM copy`);
 	}
 } catch (err) {
 	failure = err instanceof Error ? err : new Error(String(err));

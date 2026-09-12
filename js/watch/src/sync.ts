@@ -1,6 +1,6 @@
 import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
-import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
+import { Derived, Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 
 /**
  * How far playback trails the live edge.
@@ -14,6 +14,16 @@ import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Si
  * turn audio off.
  */
 export type Delay = "instant" | "auto" | Time.Milli;
+
+/** A media position at a presentation time on the performance.now clock. */
+export interface Clock {
+	/** The media timestamp presented at reference. */
+	timestamp: Time.Milli;
+	/** The presentation time in performance.now milliseconds. */
+	reference: Time.Milli;
+	/** Media milliseconds per wall-clock millisecond, or zero while held. */
+	rate: number;
+}
 
 const MIN_JITTER = Time.Milli(20);
 const FALLBACK_JITTER = Time.Milli(100);
@@ -43,6 +53,12 @@ export type SyncInput = {
 
 	/** Any additional delay required for video (wired from the per-rendition source). */
 	video: Getter<Time.Milli | undefined>;
+
+	/** The audio presentation clock, absent when audio is inactive. */
+	clock: Getter<Clock | undefined>;
+
+	/** The total measured audio playout requirement, used only in auto mode. */
+	audioTarget: Getter<Time.Milli | undefined>;
 };
 
 type SyncOutput = {
@@ -94,6 +110,10 @@ export class Sync {
 	// Minimum RTT seen, used as the baseline for jitter calculation.
 	// Avoids inflating jitter due to bufferbloat.
 	#minRtt: number | undefined;
+	#clock: Clock | undefined;
+	#resetClock: Clock | undefined;
+	readonly #delay: Getter<Time.Milli>;
+	#closed = false;
 
 	#signals = new Effect();
 
@@ -104,13 +124,39 @@ export class Sync {
 			probe: getter(props?.probe),
 			audio: getter(props?.audio),
 			video: getter(props?.video),
+			clock: getter(props?.clock),
+			audioTarget: getter(props?.audioTarget),
 		};
+		this.#delay = new Derived(
+			[this.in.delay, this.#out.jitter, this.in.audio, this.in.video, this.in.audioTarget],
+			(mode, jitter, audio, video, measured) => {
+				if (mode === "instant") return Time.Milli.zero;
+				const media = Time.Milli.max(audio ?? Time.Milli.zero, video ?? Time.Milli.zero);
+				const floor = Time.Milli.add(media, typeof mode === "number" ? mode : jitter);
+				return mode === "auto" ? Time.Milli.max(floor, measured ?? Time.Milli.zero) : floor;
+			},
+		);
 
 		this.#update = Promise.withResolvers();
 
 		this.#signals.run(this.#runJitter.bind(this));
 		this.#signals.run(this.#runDelay.bind(this));
 		this.#signals.run(this.#runMaxAge.bind(this));
+		this.#signals.run(this.#runClock.bind(this));
+	}
+
+	#runClock(effect: Effect): void {
+		const snapshot = effect.get(this.in.clock);
+		const instant = effect.get(this.in.delay) === "instant";
+		const clock = instant || snapshot === this.#resetClock ? undefined : snapshot;
+		if (this.#clock && !clock && !instant) {
+			const now = Time.Milli.now();
+			const position = this.#clock.timestamp + (now - this.#clock.reference) * this.#clock.rate;
+			this.#out.reference.set(Time.Milli(now - position - this.#delay.peek()));
+		}
+		this.#clock = clock;
+		this.#update.resolve();
+		this.#update = Promise.withResolvers();
 	}
 
 	// Derive `buffered` / `maxAge` from the resolved delay and the configured lookahead.
@@ -158,15 +204,7 @@ export class Sync {
 	}
 
 	#runDelay(effect: Effect): void {
-		const jitter = effect.get(this.#out.jitter);
-		const video = effect.get(this.in.video) ?? Time.Milli.zero;
-		const audio = effect.get(this.in.audio) ?? Time.Milli.zero;
-
-		// A zero delay still holds the rendition's own delay, which is a frame interval at 60fps.
-		// "instant" holds nothing at all.
-		const instant = effect.get(this.in.delay) === "instant";
-		const delay = instant ? Time.Milli.zero : Time.Milli.add(Time.Milli.max(video, audio), jitter);
-		this.#out.delay.set(delay);
+		this.#out.delay.set(effect.get(this.#delay));
 
 		this.#update.resolve();
 		this.#update = Promise.withResolvers();
@@ -231,6 +269,8 @@ export class Sync {
 	// in buffered mode (typically alongside flushing the audio buffer) so the new content
 	// plays from its own first frame instead of inheriting the previous reference.
 	reset(): void {
+		this.#clock = undefined;
+		this.#resetClock = this.in.clock.peek();
 		this.#out.reference.set(undefined);
 		this.#late.clear();
 		this.#update.resolve();
@@ -240,44 +280,46 @@ export class Sync {
 	// The PTS that should be rendering right now, derived from the reference + buffer.
 	// Returns undefined if no frames have been received yet.
 	now(): Time.Milli | undefined {
+		if (this.in.delay.peek() !== "instant" && this.#clock) {
+			return Time.Milli(this.#clock.timestamp + (Time.Milli.now() - this.#clock.reference) * this.#clock.rate);
+		}
 		const reference = this.#out.reference.peek();
 		if (reference === undefined) return undefined;
-		return Time.Milli.sub(Time.Milli.sub(Time.Milli.now(), reference), this.#out.delay.peek());
+		return Time.Milli.sub(Time.Milli.sub(Time.Milli.now(), reference), this.#delay.peek());
 	}
 
 	// Sleep until it's time to render this frame.
 	async wait(timestamp: Time.Milli): Promise<void> {
 		// A zero delay still sleeps: the sleep comes from the reference, which holds an early frame
 		// until its timestamp comes up. "instant" is the only thing that skips the wait itself.
-		if (this.in.delay.peek() === "instant") return;
+		if (this.#closed || this.in.delay.peek() === "instant") return;
 
-		const reference = this.#out.reference.peek();
-		if (reference === undefined) {
+		if (!this.#clock && this.#out.reference.peek() === undefined) {
 			throw new Error("reference not set; call received() first");
 		}
 
 		for (;;) {
 			// Switching to "instant" resolves `#update`, so frames parked here wake and leave.
-			if (this.in.delay.peek() === "instant") return;
+			if (this.#closed || this.in.delay.peek() === "instant") return;
 
-			// Sleep until it's time to decode the next frame.
-			// NOTE: This function runs in parallel for each frame.
-			const now = Time.Milli.now();
-			const ref = Time.Milli.sub(now, timestamp);
-
-			const currentRef = this.#out.reference.peek();
-			if (currentRef === undefined) return;
-
-			const sleep = Time.Milli.add(Time.Milli.sub(currentRef, ref), this.#out.delay.peek());
-			if (sleep <= 0) return;
+			const current = this.now();
+			if (current === undefined || timestamp <= current) return;
+			const rate = this.#clock?.rate ?? 1;
+			const sleep = rate === 0 ? undefined : (timestamp - current) / rate;
 
 			// Skip setTimeout for small sleeps; the timer resolution (~4ms) would overshoot.
-			if (sleep < 5) return;
+			if (sleep !== undefined && sleep < 5) return;
 
-			const wait = new Promise((resolve) => setTimeout(resolve, sleep)).then(() => true);
-
-			const ok = await Promise.race([this.#update.promise, wait]);
-			if (ok) return;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const wait = new Promise<boolean>((resolve) => {
+				if (sleep !== undefined) timer = setTimeout(() => resolve(true), sleep);
+			});
+			try {
+				const done = await Promise.race([this.#update.promise.then(() => false), wait]);
+				if (done) return;
+			} finally {
+				if (timer !== undefined) clearTimeout(timer);
+			}
 		}
 	}
 
@@ -291,6 +333,8 @@ export class Sync {
 	}
 
 	close() {
+		this.#closed = true;
+		this.#update.resolve();
 		this.#signals.close();
 	}
 }

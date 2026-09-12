@@ -12,7 +12,7 @@ import { Effect, Signal } from "@moq/signals";
 import * as Audio from "./audio";
 import { Broadcast, type CatalogFormat, parseCatalogFormat } from "./broadcast";
 import { formatDuration, parseDuration } from "./duration";
-import { type Delay, Sync } from "./sync";
+import { type Clock, type Delay, Sync } from "./sync";
 import * as Text from "./text";
 import * as Video from "./video";
 
@@ -241,6 +241,8 @@ export default class MoqWatch extends HTMLElement {
 		// The video decoder owns rendition handoffs but also needs Sync. Bridge its output through a
 		// parent-owned signal so Sync can be constructed first without exposing mutable wiring.
 		const videoJitter = new Signal<Time.Milli | undefined>(undefined);
+		const audioClock = new Signal<Clock | undefined>(undefined);
+		const audioTarget = new Signal<Time.Milli | undefined>(undefined);
 
 		this.sync = new Sync({
 			delay: this.controls.delay,
@@ -248,12 +250,16 @@ export default class MoqWatch extends HTMLElement {
 			probe: this.connection.probe,
 			video: videoJitter,
 			audio: audioSource.out.jitter,
+			clock: audioClock,
+			audioTarget,
 		});
 		this.signals.cleanup(() => this.sync.close());
 
 		this.video = new Video.Decoder(videoSource, this.sync, { enabled: this.#videoEnabled });
 		this.signals.proxy(videoJitter, this.video.out.jitter);
 		this.audio = new Audio.Decoder(audioSource, this.sync, { enabled: this.#audioEnabled });
+		this.signals.proxy(audioClock, this.audio.out.clock);
+		this.signals.proxy(audioTarget, this.audio.out.target);
 		this.signals.cleanup(() => {
 			this.video.close();
 			this.audio.close();

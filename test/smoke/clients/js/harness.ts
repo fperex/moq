@@ -6,8 +6,8 @@
  *
  * @module
  */
-import { join } from "node:path";
-import { type Browser, chromium, type Page } from "playwright";
+import { basename, dirname, join } from "node:path";
+import { type Browser, type BrowserContext, chromium, type Page } from "playwright";
 import { CONTROL, type FixtureState, type Resources, type Sample, type SmokeControl } from "./src/contract";
 
 /**
@@ -64,6 +64,7 @@ export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve
 /** Serve the prebuilt page on localhost, a secure context so WebTransport and WebCodecs are enabled. */
 export function serve(): { origin: string; stop: () => void } {
 	const root = join(new URL(".", import.meta.url).pathname, "dist");
+	const libav = dirname(Bun.resolveSync("@libav.js/variant-opus-af", import.meta.dir));
 	const server = Bun.serve({
 		port: 0,
 		async fetch(req) {
@@ -71,6 +72,10 @@ export function serve(): { origin: string; stop: () => void } {
 			if (path === "/") path = "/index.html";
 			const file = Bun.file(join(root, path));
 			if (await file.exists()) return new Response(file);
+			if (path.startsWith("/assets/libav-")) {
+				const sidecar = Bun.file(join(libav, basename(path)));
+				if (await sidecar.exists()) return new Response(sidecar);
+			}
 			return new Response(Bun.file(join(root, "index.html"))); // SPA fallback
 		},
 	});
@@ -95,7 +100,11 @@ export function launch(args: string[] = []): Promise<Browser> {
 }
 
 /** Open a page and start collecting its errors, echoing everything it logs. */
-export async function open(browser: Browser, url: string, label = "page"): Promise<[Page, BrowserErrors]> {
+export async function open(
+	browser: Browser | BrowserContext,
+	url: string,
+	label = "page",
+): Promise<[Page, BrowserErrors]> {
 	const page = await browser.newPage();
 	const errors: BrowserErrors = { page: [], console: [] };
 	page.on("console", (message) => {

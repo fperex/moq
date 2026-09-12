@@ -233,6 +233,9 @@ prepare_js() {
         elif ! (cd "$CLIENTS/js" && bunx vite build) >"$HARNESS_RUN/js-vite.log" 2>&1; then
             mark_broken js "vite build failed"
             sed 's/^/        /' "$HARNESS_RUN/js-vite.log" >&2 || true
+        elif ! (cd "$CLIENTS/js" && bun pcm.ts) >"$HARNESS_RUN/js-pcm.log" 2>&1; then
+            mark_broken js "audio worklet PCM check failed"
+            sed 's/^/        /' "$HARNESS_RUN/js-pcm.log" >&2 || true
         fi
     fi
     if needs js-native-node && ! have node; then
@@ -632,6 +635,9 @@ if [[ "$MEDIA" -eq 1 ]]; then
     else
         echo "=== media output and lifecycle ==="
         run_media "media output + lifecycle"
+        run_media "Libav audio lifecycle" --audio-decoder libav --cases pause,rejoin,republish
+        run_media "Libav mixed audio lifecycle" --audio-decoder libav-mixed --cases pause,rejoin,republish
+        run_media "Libav delayed output lifecycle" --audio-decoder libav --late-audio-output --cases pause,rejoin,republish
         run_media "control: frozen video" --fault frozen-video --cases none --expect-fail "video progress"
         run_media "control: silent audio" --fault silent-audio --cases none --expect-fail "audio tone"
         run_media "control: offset audio" --fault audio-offset --cases none --expect-fail "audio/video sync"

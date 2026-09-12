@@ -17,6 +17,9 @@ import { hardwareReliable } from "../support/video";
 import type { Capture } from "./capture";
 import { normalizeSource, type Source } from "./types";
 
+// Limit work waiting for the codec without blocking codecs that retain frames for reordering.
+const MAX_ENCODE_QUEUE_SIZE = 8;
+
 /** Cumulative encoder output totals, measured from the chunks the encoder produces. */
 export interface Stats {
 	/** Total frames encoded while serving. Monotonic; diff over an interval for a frame rate. */
@@ -238,13 +241,19 @@ export class Encoder {
 		effect.cleanup(() => producer.close());
 
 		let lastKeyframe: Time.Micro | undefined;
-		let lastEncoded: Time.Micro | undefined;
+		let pacingRate: number | undefined;
+		let pacingDeadline: number | undefined;
+		let previousCapture: Time.Micro | undefined;
 
 		effect.spawn(async () => {
 			const encoder = new VideoEncoder({
 				output: (frame: EncodedVideoChunk) => {
 					const key = frame.type === "key";
-					if (key) {
+					if (
+						key &&
+						frame.timestamp <= (previousCapture ?? frame.timestamp) &&
+						(lastKeyframe === undefined || frame.timestamp > lastKeyframe)
+					) {
 						lastKeyframe = frame.timestamp as Time.Micro;
 					}
 
@@ -296,20 +305,32 @@ export class Encoder {
 							// This doesn't need to be reactive.
 							const config = this.config.peek();
 
-							// Pace to the target frame rate by dropping frames that arrive too soon.
-							// Allow half an interval of slack so jittery capture timestamps don't drop
-							// a frame we meant to keep.
-							const targetFrameRate = config?.frameRate;
-							if (targetFrameRate && lastEncoded !== undefined) {
-								const minGap = Time.Micro.fromSecond((1 / targetFrameRate) as Time.Second);
-								if (frame.timestamp - lastEncoded < minGap - minGap / 2) continue;
-							}
-							lastEncoded = frame.timestamp as Time.Micro;
 							const captured = frame.timestamp as Time.Micro;
+							const targetFrameRate = config?.frameRate;
+							if (targetFrameRate !== pacingRate) {
+								pacingRate = targetFrameRate;
+								pacingDeadline = undefined;
+							}
+							if (previousCapture !== undefined && captured < previousCapture) {
+								pacingDeadline = undefined;
+								lastKeyframe = undefined;
+							}
+							previousCapture = captured;
+
+							const frameInterval = targetFrameRate ? 1_000_000 / targetFrameRate : undefined;
+							if (
+								frameInterval !== undefined &&
+								pacingDeadline !== undefined &&
+								captured <= Math.round(pacingDeadline - frameInterval / 2)
+							) {
+								continue;
+							}
+
 							this.#firstCaptured ??= captured;
 							this.#lastCaptured = captured;
 							this.#lastCaptureWall = performance.now();
 							this.#observe({ demand: true, idle: false });
+							if (encoder.encodeQueueSize >= MAX_ENCODE_QUEUE_SIZE) continue;
 
 							const interval = config?.keyframeInterval ?? Time.Milli.fromSecond(2 as Time.Second);
 
@@ -321,6 +342,12 @@ export class Encoder {
 							}
 
 							encoder.encode(frame, { keyFrame });
+							if (frameInterval !== undefined) {
+								pacingDeadline =
+									pacingDeadline === undefined || captured - pacingDeadline > frameInterval
+										? captured + frameInterval
+										: pacingDeadline + frameInterval;
+							}
 						} finally {
 							frame.close();
 						}

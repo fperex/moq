@@ -1,72 +1,137 @@
-import type { Message, State } from "./render";
-import { AudioRingBuffer } from "./ring-buffer";
-import { SharedRingBuffer } from "./shared-ring-buffer";
+import { Time } from "@moq/net";
+import { type Command, Consumer } from "./ingress";
+import { Playout } from "./playout";
+import type { Message, Policy, State } from "./render";
 
 class Render extends AudioWorkletProcessor {
-	// Set after init, depending on which path the main thread chose.
-	#backend?: SharedRingBuffer | AudioRingBuffer;
-	#underflow = 0;
+	#playout?: Playout;
+	#shared?: Consumer;
+	#commands: Command[] = [];
 	#stateCounter = 0;
+	#epoch = 0;
+	#acceptedFrames = 0;
+	#lastTimestamp?: number;
+	#lastFrame = 0;
+	#nextFrame = 0;
 
 	constructor() {
 		super();
-
 		this.port.onmessage = (event: MessageEvent<Message>) => {
-			const msg = event.data;
-			if (msg.type === "init-shared") {
-				console.log("[audio-worklet] init-shared: using SharedArrayBuffer path");
-				const previous = this.#backend instanceof SharedRingBuffer ? this.#backend : undefined;
-				this.#backend = new SharedRingBuffer(msg, previous);
-				this.#underflow = 0;
-			} else if (msg.type === "init-post") {
-				console.log("[audio-worklet] init-post: using postMessage path");
-				this.#backend = new AudioRingBuffer(msg);
-				this.#underflow = 0;
-			} else if (msg.type === "data") {
-				// Only meaningful in post mode.
-				if (this.#backend instanceof AudioRingBuffer) this.#backend.write(msg.timestamp, msg.data);
-			} else if (msg.type === "latency") {
-				// Only meaningful in post mode.
-				if (this.#backend instanceof AudioRingBuffer) this.#backend.resize(msg.latency);
-			} else if (msg.type === "truncate") {
-				// Only meaningful in post mode; shared mode truncates via the control array.
-				if (this.#backend instanceof AudioRingBuffer) this.#backend.truncate(msg.timestamp);
-			} else if (msg.type === "reset") {
-				// Only meaningful in post mode; shared mode resets via the control array.
-				if (this.#backend instanceof AudioRingBuffer) this.#backend.reset();
+			try {
+				const message = event.data;
+				if (message.type === "init") {
+					this.#playout = new Playout({
+						rate: message.rate,
+						channels: message.channels,
+						...this.#policy(message.policy),
+					});
+					this.#shared = message.shared ? new Consumer(message.shared) : undefined;
+				} else {
+					this.#commands.push(message.command);
+				}
+			} catch (error) {
+				this.#failed(error);
 			}
 		};
 	}
 
-	process(_inputs: Float32Array[][], outputs: Float32Array[][], _parameters: Record<string, Float32Array>) {
-		const output = outputs[0];
-		const backend = this.#backend;
-		const samplesRead = backend?.read(output) ?? 0;
+	#policy(policy: Policy) {
+		return {
+			target:
+				policy.mode === "auto"
+					? {
+							kind: "auto" as const,
+							initialMilliseconds: policy.milliseconds,
+							minMilliseconds: policy.milliseconds,
+							maxMilliseconds: Math.max(1000, policy.milliseconds),
+						}
+					: { kind: "fixed" as const, milliseconds: policy.milliseconds },
+			buffered: policy.mode === "buffered",
+		};
+	}
 
-		if (samplesRead < output[0].length) {
-			this.#underflow += output[0].length - samplesRead;
-		} else if (this.#underflow > 0 && backend) {
-			console.debug(`audio underflow: ${Math.round((1000 * this.#underflow) / backend.rate)}ms`);
-			this.#underflow = 0;
-		}
-
-		// In post mode the main thread can't read worklet state directly, so we
-		// periodically ship it across via postMessage. In shared mode the main
-		// thread reads the shared control array directly.
-		if (backend instanceof AudioRingBuffer) {
-			this.#stateCounter++;
-			if (this.#stateCounter >= 5) {
-				this.#stateCounter = 0;
-				const state: State = {
-					type: "state",
-					timestamp: backend.timestamp,
-					stalled: backend.stalled,
-				};
-				this.port.postMessage(state);
+	#accept(command: Command): void {
+		const playout = this.#playout;
+		if (!playout) throw new Error("audio worklet is not initialized");
+		switch (command.kind) {
+			case "pcm":
+				playout.insert(command.timestamp, command.planes, command.arrival);
+				this.#acceptedFrames += command.planes[0].length;
+				break;
+			case "target":
+				playout.configure(this.#policy(command));
+				break;
+			case "truncate":
+				playout.truncate(command.timestamp, command.end);
+				break;
+			case "end":
+				playout.end(command.timestamp);
+				break;
+			case "reset":
+				playout.reset();
+				this.#epoch++;
+				this.#lastTimestamp = undefined;
+				break;
+			default: {
+				const exhaustive: never = command;
+				throw new Error(`unknown audio command: ${exhaustive}`);
 			}
 		}
+	}
 
-		return true;
+	#failed(error: unknown): never {
+		this.port.postMessage({ type: "error", message: error instanceof Error ? error.message : String(error) });
+		throw error;
+	}
+
+	process(_inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
+		try {
+			const output = outputs[0];
+			// Apply the published batch before rendering, including resets and overlapping replacements.
+			const commands = this.#shared ? this.#shared.length : this.#commands.length;
+			for (let i = 0; i < commands; i++) {
+				const command = this.#shared ? this.#shared.shift() : this.#commands.shift();
+				if (!command) break;
+				this.#accept(command);
+				if (!this.#shared)
+					this.port.postMessage({
+						type: "consumed",
+						frames: command.kind === "pcm" ? command.planes[0].length : 0,
+					});
+			}
+			const playout = this.#playout;
+			if (!playout) return true;
+			// Chromium can expose a stale currentFrame when its graph try-lock fails.
+			// Every process call still requests fresh audio, so count the samples pulled.
+			const start = Math.max(currentFrame, this.#nextFrame);
+			playout.render(output, start);
+			this.#nextFrame = start + output[0].length;
+			if (++this.#stateCounter >= 5) {
+				this.#stateCounter = 0;
+				const frame = this.#nextFrame;
+				const timestamp = playout.timestamp;
+				const slope =
+					timestamp === undefined || this.#lastTimestamp === undefined
+						? 1
+						: ((timestamp - this.#lastTimestamp) * sampleRate) / ((frame - this.#lastFrame) * 1e6);
+				const state: State = {
+					type: "state",
+					epoch: this.#epoch,
+					acceptedFrames: this.#acceptedFrames,
+					frame,
+					timestamp: timestamp === undefined ? undefined : Time.Micro(timestamp),
+					rate: playout.playing ? slope : 0,
+					stalled: !playout.playing,
+					stats: playout.stats,
+				};
+				this.port.postMessage(state);
+				this.#lastTimestamp = timestamp;
+				this.#lastFrame = frame;
+			}
+			return true;
+		} catch (error) {
+			return this.#failed(error);
+		}
 	}
 }
 

@@ -93,6 +93,89 @@ The matrix asks "did bytes arrive and did a pixel light up". That passes on a
 frozen picture, on silence, and on audio a second out of step, so
 `just test smoke-media` measures the media itself, browser to browser.
 
+### Buffered PCM worklet checks
+
+Every smoke run that builds the browser client also runs `clients/js/pcm.ts`.
+This driver needs no relay. It connects the actual audio buffer and render
+worklet to a second AudioWorklet that records their output. Both stereo
+channels must match the input samples exactly, and output after the declared
+endpoint must be zero.
+
+The matrix covers 44.1 kHz and 48 kHz on isolated pages using SharedArrayBuffer
+and non-isolated pages using transferred messages. It checks finite playback,
+reset, rendition truncation, and a queue of 400 PCM commands followed by
+truncation, replacement samples, and an endpoint. Two additional takeover cases
+deliver the successor endpoint before its first samples, with its start before
+or after the predecessor endpoint. The gapped case uses silence around the gap
+to test ordering and endpoint handling without requiring concealment to reproduce
+missing source audio.
+
+The native decoder check uses eight AAC-LC packets generated from a 997 Hz
+synthetic tone at 48 kHz stereo, encoded at 128 kbit/s with FFmpeg 9.0.1.
+The fixture contains no recording or external media. Regenerate it from the
+repository root with `bun test/smoke/clients/js/aac-fixture.ts`. The script
+extracts raw AAC packets from ADTS; encoder versions may produce different
+bytes, while the test checks decoded sample counts and source timestamps.
+
+Large-frame cases submit one three-second decoded PCM block without an intermediate
+wait. They verify complete playback and reset, truncation, and endpoint commands
+while part of that block still awaits admission. Only samples from the active
+timeline may reach the capture worklet. Both transports must respect the logical
+playout capacity even when a shared FIFO allocation is larger.
+
+The graph case renders two seconds of known stereo samples while repeatedly
+connecting and disconnecting silent gain nodes. It checks that every requested
+quantum contains the next samples, even if the browser exposes a stale clock.
+The result includes the capture processor's observed stale-frame count; a pass
+does not require that count to be nonzero. The worklet's count of samples pulled
+must remain usable when the observed context clock stalls; see the Chromium
+source links below.
+
+To run these checks independently from the repository root:
+
+```bash
+cd test/smoke/clients/js
+bunx vite build
+bun pcm.ts
+```
+
+To isolate a failure, pass `--case`, `--rate`, or `--transport`:
+
+```bash
+bun pcm.ts --case pressure --rate 48000 --transport post
+```
+
+The driver prints one JSON result per passing cell. A mismatch reports its
+channel, sample index, actual value, and expected value. Chromium and Playwright
+must already be installed, as described above. The checks measure PCM emitted
+by the browser graph. They do not measure physical speakers, codec quality,
+network jitter, or concealment quality.
+
+The standalone browser clock diagnostic needs no build or relay:
+
+```bash
+bun clock.ts --mode graph --seconds 10
+```
+
+It imports no MoQ code. It counts repeated `currentFrame` values and forward
+jumps in real `process()` callbacks, with a static graph, graph changes, or
+suspend/resume cycles (`--mode static|graph|suspend`; omit to run all three).
+This is a manual diagnostic, not a pass/fail gate requiring a browser defect.
+On Chromium 151.0.7922.34, a 10-second graph run recorded 342 repeated or stale
+frame values in 3,750 callbacks. A suspend/resume run recorded 34 in 1,876
+callbacks; the static run recorded none.
+
+Chromium advances its context frame after rendering, then
+[updates the worklet scope](https://github.com/chromium/chromium/blob/main/third_party/blink/renderer/modules/webaudio/realtime_audio_destination_handler.cc).
+That [scope update](https://github.com/chromium/chromium/blob/main/third_party/blink/renderer/modules/webaudio/base_audio_context.cc)
+uses a graph try-lock and skips the update when the lock is unavailable.
+Its [rendering guard](https://github.com/chromium/chromium/blob/main/third_party/blink/renderer/modules/webaudio/audio_handler.cc)
+uses the context clock separately. This source path is consistent with the
+observed stale worklet clock during graph changes; the probe does not instrument
+Chromium's internal lock state.
+
+### Stream output and lifecycle
+
 The publisher is a fixture, not a fake camera: a canvas painting a frame counter
 as black/white blocks, and a tone stepping through a fixed frequency table. Both
 are indexed off one `AudioContext` clock, so the subscriber can read the frame it
@@ -115,6 +198,27 @@ Each run covers, against a real local relay:
   it on the player's, so that assertion would measure the browser.
 - **pause and resume**, **unsubscribe and rejoin**, **detach and reattach**,
   **publisher stop and same-path republish**, and **late join**.
+
+Media CI also runs pause, rejoin, and republish with the real Libav Opus decoder.
+`--audio-decoder libav` removes the subscriber's four audio WebCodecs globals;
+`--audio-decoder libav-mixed` removes only `AudioDecoder` and verifies that the
+native encoder, audio data, and encoded chunk constructors remain unchanged.
+The publisher stays native. The harness serves the installed Libav worker and
+WASM sidecars beside the built browser assets, with no remote downloads.
+
+```bash
+bun media.ts --url http://localhost:4443 --audio-decoder libav --cases pause,rejoin,republish
+bun media.ts --url http://localhost:4443 --audio-decoder libav-mixed --cases pause,rejoin,republish
+bun media.ts --url http://localhost:4443 --audio-decoder libav --late-audio-output --cases pause,rejoin,republish
+```
+
+The last run injects callback scheduling: it retains a clone of one frame
+actually decoded by each Libav instance and delivers that frame through the
+original output callback after the decoder closes. It requires every stale
+frame to be released without copying PCM, then measures continuing audio and
+video through the usual lifecycle checks. This does not claim that the browser
+naturally delivered a late callback in that run.
+
 - **resources return to baseline** - the page wraps `WebTransport`, `WebSocket`,
   `AudioContext`, and `Worker` to count live instances, so a detach that leaks a
   session is visible rather than merely invisible.

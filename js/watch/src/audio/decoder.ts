@@ -16,11 +16,14 @@ import {
 import { base64ToBytes } from "../base64";
 import { nextMedia, subscribeMedia } from "../media";
 
-import type { Sync } from "../sync";
-import { type AudioBuffer, createAudioBuffer } from "./buffer";
+import type { Clock, Sync } from "../sync";
+import { AudioBuffer } from "./buffer";
 import { type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
+import { duration } from "./duration";
 import { Handover } from "./handover";
-import { reanchorFloor, ringSamples } from "./latency";
+import { reanchorFloor } from "./latency";
+import type { Stats as PlayoutStats } from "./playout";
+import type { Policy } from "./render";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -40,6 +43,9 @@ export type DecoderInput = {
 };
 
 type DecoderOutput = {
+	clock: Signal<Clock | undefined>;
+	target: Signal<Time.Milli | undefined>;
+	playout: Signal<PlayoutStats | undefined>;
 	context: Signal<AudioContext | undefined>;
 
 	// The root of the audio graph, which can be used for custom visualizations.
@@ -76,6 +82,9 @@ export class Decoder {
 	readonly sync: Sync;
 
 	readonly #out: DecoderOutput = {
+		clock: new Signal<Clock | undefined>(undefined),
+		target: new Signal<Time.Milli | undefined>(undefined),
+		playout: new Signal<PlayoutStats | undefined>(undefined),
 		context: new Signal<AudioContext | undefined>(undefined),
 		root: new Signal<AudioNode | undefined>(undefined),
 		sampleRate: new Signal<number | undefined>(undefined),
@@ -189,13 +198,13 @@ export class Decoder {
 			});
 			effect.cleanup(() => worklet.disconnect());
 
-			// Initial ring depth in samples.
-			const delay = this.sync.out.delay.peek();
-			const latencySamples = ringSamples(sampleRate, delay);
-			const buffered = this.sync.out.buffered.peek();
-
 			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
-			const ring = createAudioBuffer(worklet, channelCount, sampleRate, latencySamples, buffered);
+			const ring = new AudioBuffer({
+				worklet,
+				channels: channelCount,
+				rate: context.sampleRate,
+				policy: this.#policy(),
+			});
 			this.#ring = ring;
 			effect.cleanup(() => {
 				ring.close();
@@ -212,13 +221,27 @@ export class Decoder {
 				this.#out.stalled.set(inner.get(ring.stalled));
 			});
 
+			effect.run((inner) => {
+				const enabled = inner.get(this.in.enabled);
+				this.#out.clock.set(enabled ? inner.get(ring.clock) : undefined);
+				this.#out.target.set(enabled ? inner.get(ring.target) : undefined);
+				this.#out.playout.set(inner.get(ring.stats));
+			});
+			effect.cleanup(() => {
+				this.#out.clock.set(undefined);
+				this.#out.target.set(undefined);
+				this.#out.playout.set(undefined);
+			});
 			effect.set(this.#out.root, worklet);
 		});
 	}
 
 	#runEnabled(effect: Effect): void {
 		const enabled = effect.get(this.in.enabled);
-		if (!enabled) return;
+		if (!enabled) {
+			this.#ring?.reset();
+			return;
+		}
 
 		const context = effect.get(this.#out.context);
 		if (!context) return;
@@ -238,8 +261,30 @@ export class Decoder {
 		const ring = this.#ring;
 		if (!ring) return;
 
-		const delay = effect.get(this.sync.out.delay);
-		ring.setLatency(ringSamples(ring.rate, delay));
+		effect.get(this.sync.out.delay);
+		effect.get(this.sync.out.jitter);
+		effect.get(this.sync.out.buffered);
+		effect.get(this.sync.in.delay);
+		effect.get(this.sync.in.audio);
+		effect.get(this.sync.in.video);
+		ring.configure(this.#policy());
+	}
+
+	#policy(): Policy {
+		const delay = this.sync.in.delay.peek();
+		const mode =
+			delay === "instant"
+				? "instant"
+				: this.sync.out.buffered.peek()
+					? "buffered"
+					: delay === "auto"
+						? "auto"
+						: "fixed";
+		const target =
+			mode === "auto"
+				? this.sync.out.jitter.peek() + Math.max(this.sync.in.audio.peek() ?? 0, this.sync.in.video.peek() ?? 0)
+				: this.sync.out.delay.peek();
+		return { kind: "target", mode, milliseconds: Math.max((128 / (this.#ring?.rate ?? 48000)) * 1000, target) };
 	}
 
 	// Re-anchor when the delay floor *increases*. A larger floor needs a deeper cushion: video
@@ -339,18 +384,29 @@ export class Decoder {
 
 			const warmup = new Warmup(LEGACY_WARMUP_CALLBACKS);
 
-			const decoder = new AudioDecoder({
-				output: (data) => {
-					const decoded = this.#terminal.span(data);
-					if (warmup.drop()) {
-						// Drop initial callbacks to prime the decoder.
-						data.close();
-						return;
-					}
-					this.#emit(data, decoded);
-				},
-				error: (error) => console.error("audio decoder error", error),
-			});
+			let decoder: AudioDecoder;
+			const createDecoder = () => {
+				const current = new AudioDecoder({
+					output: (data) => {
+						// Libav can deliver queued output after close; it belongs to the old timeline.
+						if (effect.abort.aborted || decoder !== current) {
+							data.close();
+							return;
+						}
+						try {
+							const decoded = this.#terminal.spans(data);
+							if (!warmup.drop()) this.#emit(data, decoded);
+						} finally {
+							data.close();
+						}
+					},
+					error: (error) => {
+						if (!effect.abort.aborted && decoder === current) console.error("audio decoder error", error);
+					},
+				});
+				return current;
+			};
+			decoder = createDecoder();
 			effect.cleanup(() => {
 				if (decoder.state !== "closed") decoder.close();
 			});
@@ -374,7 +430,8 @@ export class Decoder {
 				const next = await nextMedia(consumer);
 				if (!next) break;
 				if (this.#onNext(next)) {
-					decoder.reset();
+					decoder.close();
+					decoder = createDecoder();
 					decoder.configure(decoderConfig);
 				}
 				if (next.end !== undefined) {
@@ -394,9 +451,12 @@ export class Decoder {
 
 				// Backpressure: in buffered mode this holds the encoded frame until the playhead nears
 				// it, keeping the lookahead above the floor as Opus instead of decoded PCM. No-op live.
-				await this.#ring?.wait(frame.timestamp as Time.Micro);
+				if (!(await this.#ready(effect, decoder, frame.timestamp as Time.Micro))) break;
 
+				const packetDuration = duration(config, frame);
+				this.#terminal.push({ timestamp: frame.timestamp, duration: packetDuration });
 				const chunk = new EncodedAudioChunk({
+					duration: packetDuration === undefined ? undefined : Math.round(packetDuration),
 					type: frame.keyframe ? "key" : "delta",
 					data: frame.payload,
 					timestamp: frame.timestamp,
@@ -444,10 +504,27 @@ export class Decoder {
 			const loaded = await Util.Libav.polyfill();
 			if (!loaded) return; // cancelled
 
-			const decoder = new AudioDecoder({
-				output: (data) => this.#emit(data),
-				error: (error) => console.error("audio decoder error", error),
-			});
+			let decoder: AudioDecoder;
+			const createDecoder = () => {
+				const current = new AudioDecoder({
+					output: (data) => {
+						if (effect.abort.aborted || decoder !== current) {
+							data.close();
+							return;
+						}
+						try {
+							this.#emit(data, this.#terminal.spans(data));
+						} finally {
+							data.close();
+						}
+					},
+					error: (error) => {
+						if (!effect.abort.aborted && decoder === current) console.error("audio decoder error", error);
+					},
+				});
+				return current;
+			};
+			decoder = createDecoder();
 			effect.cleanup(() => {
 				if (decoder.state !== "closed") decoder.close();
 			});
@@ -467,7 +544,8 @@ export class Decoder {
 
 				// Reset and re-anchor before decoding the first frame of a new codec epoch.
 				if (this.#onNext(next)) {
-					decoder.reset();
+					decoder.close();
+					decoder = createDecoder();
 					decoder.configure(decoderConfig);
 				}
 
@@ -483,11 +561,14 @@ export class Decoder {
 
 				// Backpressure: in buffered mode this holds the encoded frame until the playhead nears
 				// it, keeping the lookahead above the floor as Opus instead of decoded PCM. No-op live.
-				await this.#ring?.wait(frame.timestamp);
+				if (!(await this.#ready(effect, decoder, frame.timestamp))) break;
 
 				if (decoder.state === "closed") break;
+				const packetDuration = duration(config, frame);
+				this.#terminal.push({ timestamp: frame.timestamp, duration: packetDuration });
 				decoder.decode(
 					new EncodedAudioChunk({
+						duration: packetDuration === undefined ? undefined : Math.round(packetDuration),
 						type: frame.keyframe ? "key" : "delta",
 						data: frame.payload,
 						timestamp: frame.timestamp,
@@ -497,61 +578,84 @@ export class Decoder {
 		});
 	}
 
-	#emit(sample: AudioData, decoded: DecodedSpan = this.#terminal.span(sample)) {
-		const { timestamp, frameOffset, frames } = decoded;
-		const timestampMilli = Time.Milli.fromMicro(timestamp);
-		if (frames === 0) {
-			sample.close();
-			return;
+	async #ready(effect: Effect, decoder: AudioDecoder, timestamp: Time.Micro): Promise<boolean> {
+		await this.#ring?.wait(timestamp, effect.abort);
+		while (!effect.abort.aborted && decoder.state === "configured" && decoder.decodeQueueSize >= 2) {
+			const changed = Promise.withResolvers<void>();
+			const dequeue = () => changed.resolve();
+			decoder.addEventListener("dequeue", dequeue, { once: true });
+			try {
+				await Promise.race([changed.promise, effect.cancel]);
+			} finally {
+				decoder.removeEventListener("dequeue", dequeue);
+			}
 		}
+		return !effect.abort.aborted && decoder.state === "configured";
+	}
 
-		const ring = this.#ring;
-		if (!ring) {
-			// We're probably in the process of closing.
-			sample.close();
-			return;
+	#emit(sample: AudioData, decoded: DecodedSpan[]) {
+		for (const span of decoded) {
+			const { timestamp, frameOffset, frames } = span;
+			const timestampMilli = Time.Milli.fromMicro(timestamp);
+			if (frames === 0) {
+				continue;
+			}
+
+			const ring = this.#ring;
+			if (!ring) {
+				return;
+			}
+
+			// sample.sampleRate is the source of truth, and it can differ from the rate we pre-built the
+			// graph against (Opus decodes to 48kHz on Chrome/Firefox but to the configured rate on Safari).
+			// If they disagree, rebuild the graph at the real rate and drop this frame; the ring being torn
+			// down can't accept it, and the next frame lands in the correctly-rated ring.
+			if (sample.sampleRate !== ring.rate) {
+				this.#decodedSampleRate.set(sample.sampleRate);
+				return;
+			}
+
+			const durationMicro = ((frames / sample.sampleRate) * 1_000_000) as Time.Micro;
+			const durationMilli = Time.Milli.fromMicro(durationMicro);
+			const end = Time.Milli.add(timestampMilli, durationMilli);
+
+			// A new subscription has taken over the timeline: drop the previous one's write-ahead tail
+			// rather than letting it play out after this frame. See #runDecoder.
+			if (this.#handover.takeover()) {
+				ring.truncate(timestamp, this.#terminal.end);
+				this.#truncateDecodeBuffered(timestampMilli);
+			}
+
+			this.#addDecodeBuffered(timestampMilli, end);
+
+			// Firefox's Opus decoder sometimes outputs more channels than requested
+			// (e.g. 6 for stereo). Clamp to the ring's channel count.
+			const channels = Math.min(sample.numberOfChannels, ring.channels);
+			const channelData = Array.from({ length: channels }, () => new Float32Array(frames));
+			// Omit a full remainder count because Libav rejects that optional bound.
+			const frameCount = frames < sample.numberOfFrames - frameOffset ? frames : undefined;
+			if (sample.format?.endsWith("-planar")) {
+				for (let channel = 0; channel < channels; channel++) {
+					sample.copyTo(channelData[channel], {
+						format: "f32-planar",
+						planeIndex: channel,
+						frameOffset,
+						frameCount,
+					});
+				}
+			} else {
+				// Copy packed output as packed PCM; Libav's packed-to-planar conversion misindexes stereo.
+				const packed = new Float32Array(frames * sample.numberOfChannels);
+				sample.copyTo(packed, { format: "f32", planeIndex: 0, frameOffset, frameCount });
+				for (let channel = 0; channel < channels; channel++) {
+					for (let frame = 0; frame < frames; frame++) {
+						channelData[channel][frame] = packed[frame * sample.numberOfChannels + channel];
+					}
+				}
+			}
+
+			ring.insert(timestamp, channelData);
 		}
-
-		// sample.sampleRate is the source of truth, and it can differ from the rate we pre-built the
-		// graph against (Opus decodes to 48kHz on Chrome/Firefox but to the configured rate on Safari).
-		// If they disagree, rebuild the graph at the real rate and drop this frame; the ring being torn
-		// down can't accept it, and the next frame lands in the correctly-rated ring.
-		if (sample.sampleRate !== ring.rate) {
-			this.#decodedSampleRate.set(sample.sampleRate);
-			sample.close();
-			return;
-		}
-
-		// Calculate end time from sample duration
-		const durationMicro = ((frames / sample.sampleRate) * 1_000_000) as Time.Micro;
-		const durationMilli = Time.Milli.fromMicro(durationMicro);
-		const end = Time.Milli.add(timestampMilli, durationMilli);
-
-		// A new subscription has taken over the timeline: drop the previous one's write-ahead tail
-		// rather than letting it play out after this frame. See #runDecoder.
-		if (this.#handover.takeover()) {
-			ring.truncate(timestamp);
-			this.#truncateDecodeBuffered(timestampMilli);
-		}
-
-		// Add to decode buffer
-		this.#addDecodeBuffered(timestampMilli, end);
-
-		// Firefox's Opus decoder sometimes outputs more channels than requested
-		// (e.g. 6 for stereo). Clamp to the ring's channel count.
-		const channels = Math.min(sample.numberOfChannels, ring.channels);
-		const channelData: Float32Array[] = [];
-		for (let channel = 0; channel < channels; channel++) {
-			const data = new Float32Array(frames);
-			sample.copyTo(data, { format: "f32-planar", planeIndex: channel, frameOffset, frameCount: frames });
-			channelData.push(data);
-		}
-
-		// Hand off to the ring. Shared transport writes directly; post transport
-		// transfers the ArrayBuffers.
-		ring.insert(timestamp, channelData);
-
-		sample.close();
 	}
 
 	#addDecodeBuffered(start: Time.Milli, end: Time.Milli): void {
@@ -602,9 +706,14 @@ export class Decoder {
 	// Apply ordered container metadata before handling the result. An endpoint that also
 	// starts a new epoch must survive the reset so its following drain is trimmed.
 	#onNext(next: { discontinuity: number; end?: Time.Micro; frame?: { timestamp: Time.Micro } }): boolean {
-		if (!this.#terminal.update(next)) return false;
+		const changed = this.#terminal.update(next);
+		if (!changed) {
+			if (next.end !== undefined) this.#ring?.end(next.end);
+			return false;
+		}
 		this.#ring?.reset();
 		this.sync.reset();
+		if (next.end !== undefined) this.#ring?.end(next.end);
 		return true;
 	}
 
@@ -649,6 +758,7 @@ async function supported(config: Catalog.AudioConfig): Promise<boolean> {
 			}
 		}
 	}
+	await Util.Libav.polyfill();
 	const res = await AudioDecoder.isConfigSupported({
 		...config,
 		description,

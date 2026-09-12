@@ -1,7 +1,17 @@
 {
 	"extends": "../../../../js/tsconfig.json",
 	"compilerOptions": {
-		"types": ["bun", "vite/client"]
+		"types": ["bun", "vite/client", "audioworklet"]
 	},
-	"include": ["driver.ts", "harness.ts", "media.ts", "src", "vite.config.ts", "../../../../js/common/worklet.d.ts"]
+	"include": [
+		"aac-fixture.ts",
+		"clock.ts",
+		"driver.ts",
+		"harness.ts",
+		"media.ts",
+		"pcm.ts",
+		"src",
+		"vite.config.ts",
+		"../../../../js/common/worklet.d.ts"
+	]
 }

@@ -6,6 +6,11 @@
 # Ignore local Claude Code config
 *.local.json
 
+# Local audio research, browser captures, and reference checkouts.
+/.audit/
+/debug-findings/*
+!/debug-findings/neteq-rd/
+
 # Claude Code scratch space. These are untracked working directories, and
 # `just _changed` counts untracked files, so leaving them visible pushes the
 # changed-file list past its cap and silently turns every scoped `just check`

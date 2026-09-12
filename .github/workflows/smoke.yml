@@ -94,6 +94,22 @@ jobs:
         run: nix develop --command just test smoke-media
         shell: bash -leo pipefail {0}
 
+      - name: File audio presentation regression and native codec observations
+        run: nix develop --command bun debug-findings/neteq-rd/publisher-verify.ts
+        shell: bash -leo pipefail {0}
+
+      - name: Verify decoded HE-AAC file formats
+        run: nix develop --command bun debug-findings/neteq-rd/file-format-verify.ts
+        shell: bash -leo pipefail {0}
+
+      - name: Verify authored source overlap classification
+        run: nix develop --command bun debug-findings/neteq-rd/source-timeline-verify.ts
+        shell: bash -leo pipefail {0}
+
+      - name: Audio worklet burst benchmark
+        run: nix develop --command bun debug-findings/neteq-rd/performance.ts
+        shell: bash -leo pipefail {0}
+
       # Round-trips a PCR-paced TS through a relay and checks the subscriber's
       # `export ts` output with TSDuck (tsp/tsanalyze from the nix devShell).
       - name: TS compliance
