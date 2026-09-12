@@ -1,9 +1,10 @@
 import { type Dispose, type Getter, Signal } from "@moq/signals";
 import type * as broadcast from "../broadcast.ts";
-import { error, reason } from "../error.ts";
+import { error, reason, StreamCode, StreamError } from "../error.ts";
 import type * as group from "../group.ts";
+import { type Route, routesEqual } from "../hop.ts";
 import { hooks } from "../internal.ts";
-import type { Consumer as OriginConsumer } from "../origin.ts";
+import type { Advertised, Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
 import { type Stream, Writer } from "../stream.ts";
 import type { Timescale } from "../time.ts";
@@ -12,6 +13,7 @@ import { withTimeout } from "../util/timeout.ts";
 import * as Varint from "../varint.ts";
 import type { Session } from "./adapter.ts";
 import * as Cluster from "./cluster.ts";
+import { requestReason, toRequestCode } from "./error.ts";
 import { FetchHeader } from "./fetch.ts";
 import * as Filter from "./filter.ts";
 import { FetchFrame, Frame, Group as GroupMessage } from "./object.ts";
@@ -35,6 +37,19 @@ const RETRY_BASE = 100;
 
 /** Ceiling on that wait. The loop retries for the life of the session, so it must not spin. */
 const RETRY_MAX = 5000;
+
+/** Cluster parameters for one snapshot: the advertised hops, then our own id last. */
+function clusterFor(base: Cluster.Advert | undefined, route: Route): Cluster.Advert | undefined {
+	if (!base) return undefined;
+	const self = base.hops.at(-1);
+	if (self === undefined) return undefined;
+	const hops = route.hops.at(-1) === self ? [...route.hops] : [...route.hops, self];
+	return { hops, cost: route.cost.warm };
+}
+
+function sameAdvert(a: Advertised | undefined, b: Advertised | undefined): boolean {
+	return a !== undefined && b !== undefined && a.identity === b.identity && routesEqual(a.route, b.route);
+}
 
 /** PUBLISH_DONE statuses this implementation emits. Stable across drafts 14 through 19. */
 const PUBLISH_DONE_STATUS = {
@@ -144,6 +159,8 @@ export class Publisher {
 	// advertised with an unsolicited PUBLISH_NAMESPACE (see {@link runPublishNamespaces}), or on
 	// request if the peer asked for that (see {@link runSubscribeNamespace}).
 	#broadcasts: Getter<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>;
+	#advertised: Getter<ReadonlyMap<Path.Valid, Advertised> | undefined>;
+	#publish?: OriginConsumer;
 
 	// What every advertisement carries on a session that negotiated the MoQ Cluster
 	// extension: a hop path holding our own id, so the peer can tell that what it hears
@@ -176,6 +193,8 @@ export class Publisher {
 		this.#quic = quic;
 		this.#session = session;
 		this.#broadcasts = publish?.broadcasts ?? new Signal(new Map());
+		this.#advertised = publish?.advertised ?? new Signal(new Map());
+		this.#publish = publish;
 		this.#requiresSolicitation = requiresSolicitation;
 		this.#advert = Cluster.advertise(cluster);
 	}
@@ -189,30 +208,45 @@ export class Publisher {
 	async runSubscribe(msg: Subscribe, stream: Stream) {
 		const version = this.#session.version;
 		const name = msg.trackNamespace;
-		const broadcast = this.#broadcasts.peek()?.get(name);
+		let broadcast: broadcast.Consumer | undefined;
+		let refusal: { errorCode: number; reasonPhrase: string } | undefined;
+		try {
+			broadcast = this.#broadcasts.peek()?.get(name) ?? (await this.#publish?.demand(name));
+			if (!broadcast) {
+				refusal = {
+					errorCode: toRequestCode("does_not_exist", "subscribe", version),
+					reasonPhrase: "broadcast not found",
+				};
+			}
+		} catch (err: unknown) {
+			const e = error(err);
+			const condition =
+				e instanceof StreamError && e.code === StreamCode.NotFound ? "does_not_exist" : "internal";
+			refusal = { errorCode: toRequestCode(condition, "subscribe", version), reasonPhrase: reason(e) };
+		}
 
-		if (!broadcast) {
-			// Write error response
+		if (refusal) {
 			if (version === Version.DRAFT_14) {
 				await stream.writer.u53(SubscribeError.id);
 				const err = new SubscribeError({
 					requestId: msg.requestId,
-					errorCode: 404,
-					reasonPhrase: "Broadcast not found",
+					errorCode: refusal.errorCode,
+					reasonPhrase: refusal.reasonPhrase,
 				});
 				await err.encode(stream.writer, version);
 			} else {
 				await stream.writer.u53(RequestError.id);
 				const err = new RequestError({
 					requestId: version === Version.DRAFT_15 || version === Version.DRAFT_16 ? msg.requestId : undefined,
-					errorCode: 404,
-					reasonPhrase: "Broadcast not found",
+					errorCode: refusal.errorCode,
+					reasonPhrase: refusal.reasonPhrase,
 				});
 				await err.encode(stream.writer, version);
 			}
 			stream.close();
 			return;
 		}
+		if (!broadcast) return;
 
 		const priority = fromWire(msg.subscriberPriority);
 		const track = broadcast.subscribe(msg.trackName, {
@@ -274,8 +308,16 @@ export class Publisher {
 						: undefined,
 				trackAlias: msg.requestId,
 				// Required once the track has content; a fill-requesting subscriber sizes its
-				// backfill against this.
-				largest: edge.largest && { groupId: edge.largest.group, objectId: edge.largest.object },
+				// backfill against this. Below draft-20 round it down to the start of its
+				// group, matching what the subscription serves there: a draft-20 subscriber
+				// recovers a group's head with a FILL, which we serve, while older drafts
+				// recover it with a joining FETCH, which we do not, so naming a mid-group
+				// start would strand them.
+				largest:
+					edge.largest &&
+					(Filter.isDraft20(version)
+						? { groupId: edge.largest.group, objectId: edge.largest.object }
+						: { groupId: edge.largest.group, objectId: 0n }),
 				properties: msg.propertiesWanted
 					? // Declaring the timescale is what opts the track into timestamps; every
 						// object Timestamp below is in these units. We serve the newest group
@@ -448,10 +490,8 @@ export class Publisher {
 					// outside the requested range, so stop without waiting for the group's end.
 					if (slice.until !== undefined && next >= slice.until) break;
 
-					// Reading from the filter's start drops the objects below it, including any the
-					// group's cache evicted: they are outside the requested range, so losing them is
-					// not the gap that would otherwise reset this stream and forfeit the rest of the
-					// group. An eviction at or above the start is a real gap and still throws.
+					// Reading from the filter's start drops the objects below it: they are outside
+					// the requested range, so skipping them is not a gap.
 					const read = await Promise.race([hooks.readGroupFrame(group, slice.skip), stream.closed]);
 					if (!read) break;
 					next = read.sequence + 1;
@@ -564,8 +604,7 @@ export class Publisher {
 			// subscription, so stop without waiting for the group's end.
 			if (fill.until !== undefined && next >= fill.until) break;
 
-			// Reading from the fill's start drops everything below it, evicted objects included;
-			// see the same read in #runGroup.
+			// Reading from the fill's start drops everything below it; see the same read in #runGroup.
 			const frame = await Promise.race([
 				group.readFrameSequence({ from: Number(fill.skip) }),
 				stream.closed,
@@ -629,13 +668,14 @@ export class Publisher {
 
 			// Reports whether the peer now holds the namespace: an inline entry always
 			// lands, but a PUBLISH_NAMESPACE request can be declined.
-			const advertise = async (suffix: Path.Valid): Promise<boolean> => {
+			const advertise = async (suffix: Path.Valid, snap: Advertised): Promise<boolean> => {
+				const cluster = clusterFor(this.#advert, snap.route);
 				if (legacy) {
-					return await this.#advertise(Path.join(prefix, suffix), requests, refused);
+					return await this.#advertise(Path.join(prefix, suffix), requests, refused, cluster);
 				}
 
 				await stream.writer.u53(SubscribeNamespaceEntry.id);
-				await new SubscribeNamespaceEntry({ suffix, cluster: this.#advert }).encode(stream.writer, version);
+				await new SubscribeNamespaceEntry({ suffix, cluster }).encode(stream.writer, version);
 				return true;
 			};
 			const withdraw = async (suffix: Path.Valid) => {
@@ -649,12 +689,12 @@ export class Publisher {
 
 			// What the peer holds: keyed by suffix, valued by the routing front, so a republish
 			// diffs as withdraw-then-advertise rather than nothing.
-			let active = new Map<Path.Valid, broadcast.Consumer>();
+			let active = new Map<Path.Valid, Advertised>();
 			let retry = 0;
 			// What the peer refused, and whether coming back is worth anything.
 			const refused = new Map<Path.Valid, Refused>();
-			// The front each refusal was about, so a republish at the same path clears it.
-			const offered = new Map<Path.Valid, broadcast.Consumer>();
+			// The identity each refusal was about, so a republish at the same path clears it.
+			const offered = new Map<Path.Valid, object>();
 
 			for (;;) {
 				// Subscribe BEFORE reconciling, for the same reason as
@@ -662,21 +702,21 @@ export class Publisher {
 				// waits for its reply only notifies listeners already registered.
 				// TODO Make a better helper within Signals.
 				let dispose!: Dispose;
-				const changed = new Promise<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>((resolve) => {
-					dispose = this.#broadcasts.changed(resolve);
+				const changed = new Promise<ReadonlyMap<Path.Valid, Advertised> | undefined>((resolve) => {
+					dispose = this.#advertised.changed(resolve);
 				});
 
-				const broadcasts = this.#broadcasts.peek();
-				if (!broadcasts) {
+				const advertised = this.#advertised.peek();
+				if (!advertised) {
 					dispose();
 					break;
 				}
 
-				const updated = new Map<Path.Valid, broadcast.Consumer>();
-				for (const [name, front] of broadcasts) {
+				const updated = new Map<Path.Valid, Advertised>();
+				for (const [name, snap] of advertised) {
 					const suffix = Path.stripPrefix(prefix, name);
 					if (suffix === null) continue;
-					updated.set(suffix, front);
+					updated.set(suffix, snap);
 				}
 
 				// A namespace that is gone, or that a republish replaced, takes its refusal with
@@ -685,8 +725,8 @@ export class Publisher {
 				// so the path never leaves `updated` and only the front says they differ.
 				for (const path of [...refused.keys()]) {
 					const suffix = Path.stripPrefix(prefix, path);
-					const front = suffix === null ? undefined : updated.get(suffix);
-					if (front === undefined || offered.get(path) !== front) {
+					const snap = suffix === null ? undefined : updated.get(suffix);
+					if (snap === undefined || offered.get(path) !== snap.identity) {
 						refused.delete(path);
 						offered.delete(path);
 					}
@@ -695,18 +735,20 @@ export class Publisher {
 				// Track what the peer holds rather than what we attempted: a declined
 				// advertisement stays out of `held`, so the next turn retries it instead of
 				// believing the namespace is already up.
-				const held = new Map<Path.Valid, broadcast.Consumer>(active);
-				// Withdraw first so a republish reads as withdraw-then-advertise (a restart).
-				for (const [removed, front] of active) {
-					if (updated.get(removed) === front) continue;
+				const held = new Map<Path.Valid, Advertised>(active);
+				// Withdraw first so a republish or re-price reads as withdraw-then-advertise
+				// (a restart). Identity change is a new broadcast; a route change is the
+				// same one at a new cost or hop chain.
+				for (const [removed, snap] of active) {
+					if (sameAdvert(updated.get(removed), snap)) continue;
 					await withdraw(removed);
 					held.delete(removed);
 				}
-				for (const [added, front] of updated) {
-					if (held.get(added) === front) continue;
+				for (const [added, snap] of updated) {
+					if (sameAdvert(held.get(added), snap)) continue;
 					if (!this.#offerable(Path.join(prefix, added), refused)) continue;
-					offered.set(Path.join(prefix, added), front);
-					if (await advertise(added)) held.set(added, front);
+					offered.set(Path.join(prefix, added), snap.identity);
+					if (await advertise(added, snap)) held.set(added, snap);
 				}
 
 				active = held;
@@ -715,14 +757,14 @@ export class Publisher {
 				// does: only a legacy request can be declined, and nothing about the peer
 				// starting to answer raises a signal this loop is watching.
 				const outstanding = [...updated].some(
-					([suffix, front]) =>
-						active.get(suffix) !== front && this.#pending(Path.join(prefix, suffix), refused),
+					([suffix, snap]) =>
+						!sameAdvert(active.get(suffix), snap) && this.#pending(Path.join(prefix, suffix), refused),
 				);
 				retry = outstanding ? Math.min(retry ? retry * 2 : RETRY_BASE, RETRY_MAX) : 0;
 
 				// Wait for the next change, or for the peer to unsubscribe.
 				const next = await (retry
-					? Promise.race([changed, stream.reader.closed, retryAfter(retry).then(() => broadcasts)])
+					? Promise.race([changed, stream.reader.closed, retryAfter(retry).then(() => advertised)])
 					: Promise.race([changed, stream.reader.closed]));
 				dispose();
 				if (!next) break;
@@ -772,15 +814,16 @@ export class Publisher {
 			() => undefined,
 		);
 
+		let dispose: Dispose | undefined;
 		try {
-			// What the peer holds: keyed by path, valued by the routing front, so a republish
-			// diffs as withdraw-then-advertise rather than nothing.
-			let active = new Map<Path.Valid, broadcast.Consumer>();
+			// What the peer holds: keyed by path, valued by identity plus route, so a
+			// republish diffs as withdraw-then-advertise rather than nothing.
+			let active = new Map<Path.Valid, Advertised>();
 			let retry = 0;
 			// What the peer refused, and whether coming back is worth anything.
 			const refused = new Map<Path.Valid, Refused>();
-			// The front each refusal was about, so a republish at the same path clears it.
-			const offered = new Map<Path.Valid, broadcast.Consumer>();
+			// The identity each refusal was about, so a republish at the same path clears it.
+			const offered = new Map<Path.Valid, object>();
 
 			for (;;) {
 				// Subscribe BEFORE reconciling. Each advertisement below waits a round trip
@@ -789,50 +832,48 @@ export class Publisher {
 				// through it and leave the namespace unadvertised until something unrelated
 				// changed.
 				// TODO Make a better helper within Signals.
-				let dispose!: Dispose;
-				const changed = new Promise<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>((resolve) => {
-					dispose = this.#broadcasts.changed(resolve);
+				const changed = new Promise<ReadonlyMap<Path.Valid, Advertised> | undefined>((resolve) => {
+					dispose = this.#advertised.changed(resolve);
 				});
 
-				const broadcasts = this.#broadcasts.peek();
-				if (!broadcasts) {
-					dispose();
+				const advertised = this.#advertised.peek();
+				if (!advertised) {
+					dispose?.();
 					break;
 				}
 
-				const updated = new Map<Path.Valid, broadcast.Consumer>(broadcasts);
+				const updated = new Map<Path.Valid, Advertised>(advertised);
 
 				// A namespace that is gone, or that a republish replaced, takes its refusal with
 				// it: the peer refused a broadcast, not a path forever, so a different one at
 				// the same path is offered again. Rust gets this by rebuilding the watched entry.
 				for (const path of [...refused.keys()]) {
-					const front = updated.get(path);
-					if (front === undefined || offered.get(path) !== front) {
+					const snap = updated.get(path);
+					if (snap === undefined || offered.get(path) !== snap.identity) {
 						refused.delete(path);
 						offered.delete(path);
 					}
 				}
 
-				// Withdraw first so a republish reads as withdraw-then-advertise (a restart)
-				// rather than nothing: the front changed, so the peer is holding a broadcast
-				// that no longer exists.
-				for (const [removed, front] of active) {
-					if (updated.get(removed) === front) continue;
+				// Withdraw first so a republish or re-price reads as withdraw-then-advertise
+				// (a restart) rather than nothing.
+				for (const [removed, snap] of active) {
+					if (sameAdvert(updated.get(removed), snap)) continue;
 					await this.#withdraw(removed, requests);
 				}
-				for (const [added, front] of updated) {
-					if (active.get(added) === front) continue;
+				for (const [added, snap] of updated) {
+					if (sameAdvert(active.get(added), snap)) continue;
 					if (!this.#offerable(added, refused)) continue;
-					offered.set(added, front);
-					await this.#advertise(added, requests, refused);
+					offered.set(added, snap.identity);
+					await this.#advertise(added, requests, refused, clusterFor(this.#advert, snap.route));
 				}
 
 				// What the peer holds, not what we attempted: a declined PUBLISH_NAMESPACE
 				// leaves no request behind, so it stays outstanding below.
-				active = new Map<Path.Valid, broadcast.Consumer>(
+				active = new Map<Path.Valid, Advertised>(
 					[...requests.keys()].flatMap((path) => {
-						const front = updated.get(path);
-						return front ? [[path, front] as const] : [];
+						const snap = updated.get(path);
+						return snap ? [[path, snap] as const] : [];
 					}),
 				);
 
@@ -840,15 +881,15 @@ export class Publisher {
 				// transient failure clearing, or the peer starting to answer raises no
 				// signal of its own, so the only way back is to ask again on a timer.
 				const outstanding = [...updated].some(
-					([path, front]) => active.get(path) !== front && this.#pending(path, refused),
+					([path, snap]) => !sameAdvert(active.get(path), snap) && this.#pending(path, refused),
 				);
 				retry = outstanding ? Math.min(retry ? retry * 2 : RETRY_BASE, RETRY_MAX) : 0;
 
 				// Wait for the next change, which has already fired if one landed above.
 				const next = await (retry
-					? Promise.race([changed, closed, retryAfter(retry).then(() => broadcasts)])
+					? Promise.race([changed, closed, retryAfter(retry).then(() => advertised)])
 					: Promise.race([changed, closed]));
-				dispose();
+				dispose?.();
 				if (!next) break;
 			}
 		} catch (err: unknown) {
@@ -856,6 +897,7 @@ export class Publisher {
 			// discovery. Not a debug-level event.
 			console.warn(`publish_namespace loop failed: ${reason(error(err))}`);
 		} finally {
+			dispose?.();
 			// Close out every open PUBLISH_NAMESPACE request.
 			for (const path of [...requests.keys()]) {
 				await this.#withdraw(path, requests);
@@ -899,6 +941,7 @@ export class Publisher {
 		path: Path.Valid,
 		requests: Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>,
 		refused: Map<Path.Valid, Refused>,
+		cluster: Cluster.Advert | undefined = this.#advert,
 	): Promise<boolean> {
 		const requestId = await this.#session.nextRequestId();
 		if (requestId === undefined) return false;
@@ -919,7 +962,7 @@ export class Publisher {
 			await withTimeout(
 				(async () => {
 					await stream.writer.u53(PublishNamespace.id);
-					const msg = new PublishNamespace({ requestId, trackNamespace: path, cluster: this.#advert });
+					const msg = new PublishNamespace({ requestId, trackNamespace: path, cluster });
 					await msg.encode(stream.writer, this.#session.version);
 
 					// Read response (RequestOk and PublishNamespaceOk share 0x07)
@@ -937,7 +980,14 @@ export class Publisher {
 								err.retryInterval === 0n ? "never" : Date.now() + Number(err.retryInterval),
 							);
 						}
-						throw new Error(`PublishNamespace rejected: ${err.errorCode} ${err.reasonPhrase}`);
+						throw new Error(
+							`PublishNamespace rejected: ${requestReason(
+								err.errorCode,
+								err.reasonPhrase,
+								"publish_namespace",
+								this.#session.version,
+							)}`,
+						);
 					}
 					if (respTypeId !== RequestOk.id) {
 						throw new Error(`PublishNamespace rejected: typeId=0x${respTypeId.toString(16)}`);
@@ -987,8 +1037,14 @@ export class Publisher {
 			} catch {
 				// Stream might already be closed
 			}
+			request.stream.close();
+			return;
 		}
 		request.stream.close();
+		// Wait for transport acknowledgment before opening a replacement request.
+		// This assumes the peer processes the withdrawal by then; FIN acknowledgment
+		// does not itself acknowledge application processing across streams.
+		await request.stream.writer.closed;
 	}
 
 	/**

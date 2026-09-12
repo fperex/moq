@@ -5,7 +5,7 @@ authors = ["Luke Curley <kixelated@gmail.com>", "Brian Medley <bpm@bmedley.org>"
 repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.5.13"
+version = "0.5.14"
 edition = "2024"
 rust-version.workspace = true
 
@@ -20,6 +20,7 @@ crate-type = ["staticlib"]
 anyhow = { workspace = true, features = ["backtrace"] }
 bytes = { workspace = true }
 hang = { workspace = true }
+kio = { workspace = true }
 # Codecs only: OBS and the other C consumers do their own device I/O.
 moq-audio = { workspace = true, features = ["aac"] }
 moq-json = { workspace = true }

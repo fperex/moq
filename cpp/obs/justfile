@@ -15,10 +15,6 @@
 
 set quiet
 
-# Plain `cargo` unless set. See rs/justfile for the local wrapper option.
-_rust_cargo := env_var_or_default("RUST_CARGO", "cargo")
-cargo_compile := if _rust_cargo == "" { "cargo" } else { _rust_cargo }
-
 # List all of the available commands.
 default:
     just --list
@@ -202,14 +198,14 @@ _includes:
         exit 1
     fi
 
-    (cd ../.. && {{ cargo_compile }} check --locked --quiet -p libmoq)
+    (cd ../.. && cargo check --locked --quiet -p libmoq)
 
     # Ask cargo where its build script ran rather than reconstructing the path.
     # CARGO_TARGET_DIR, a `--target` triple and a custom profile each move the
     # generated header, and guessing wrong doesn't fail: it type-checks against
     # whatever stale copy the default directory still holds. Replays the check
     # above from cache, so it costs a process rather than a compile.
-    out_dir=$(cd ../.. && {{ cargo_compile }} check --locked -p libmoq --message-format=json |
+    out_dir=$(cd ../.. && cargo check --locked -p libmoq --message-format=json |
         jq -r 'select(.reason == "build-script-executed") | select(.package_id | tostring | test("libmoq")) | .out_dir' |
         tail -1)
     if [ -z "$out_dir" ]; then
@@ -303,13 +299,19 @@ _unit mode="plain":
     trap 'rm -rf "$out"' EXIT
 
     # One binary per source under test: each test file defines its own libobs and
-    # libmoq stubs, so two of them can't share a link.
+    # libmoq stubs, so two of them can't share a link. Header-only helpers
+    # (quality defaults) build as a third binary with no plugin source.
     for name in moq-output moq-source; do
         # shellcheck disable=SC2086
         # $ffmpeg stays unquoted on purpose: pkg-config hands back one
         # space-separated string, and splitting it is the intended reading.
         "$cxx" "${flags[@]}" "${includes[@]}" $ffmpeg \
             -o "$out/$name-test" "test/$name-test.cpp" "src/$name.cpp"
+        TSAN_OPTIONS="halt_on_error=1" "$out/$name-test"
+    done
+    for name in moq-quality-defaults moq-dock-stop moq-error moq-encoder-latency moq-dial moq-spark; do
+        "$cxx" "${flags[@]}" "${includes[@]}" \
+            -o "$out/$name-test" "test/$name-test.cpp"
         TSAN_OPTIONS="halt_on_error=1" "$out/$name-test"
     done
 

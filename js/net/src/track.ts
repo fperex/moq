@@ -5,7 +5,13 @@
  */
 import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
 import type { Datagram } from "./datagram.ts";
-import { type Frame, type Consumer as GroupConsumer, Producer as GroupProducer, Lagged } from "./group.ts";
+import {
+	type Frame,
+	type Consumer as GroupConsumer,
+	Producer as GroupProducer,
+	GroupTooLarge,
+	Lagged,
+} from "./group.ts";
 import { hooks, type Recv, type TrackRequestOptions, type TrackSequence, type TrackSequences } from "./internal.ts";
 import { Timescale, type Timestamp } from "./time.ts";
 
@@ -63,17 +69,32 @@ export interface Info {
 	 * Publisher Max Age: the maximum age (milliseconds) of a non-latest group before
 	 * the publisher evicts it. Reported in TRACK_INFO (Lite05+) so relays re-serve with the
 	 * same bound. The publisher-side half of the budget a subscriber sets for itself.
+	 * Rounded up to a whole millisecond by {@link infoDefaults}, which refuses a negative
+	 * or non-finite value.
 	 */
 	maxAge: number;
 	/** Tie-break priority between subscriptions of equal subscriber priority. */
 	priority: number;
 }
 
+// Normalize a latency budget for the wire, which carries it as an unsigned varint.
+//
+// Callers derive it from measurements (a jitter estimate scaled off RTT), so a fractional
+// millisecond is expected; ceil rather than round, because a budget shortened by rounding
+// skips a group the subscriber still wants. Anything that is not a duration is refused
+// here, where the field is named, rather than deep in the encoder.
+function maxAgeMillis(value: number): number {
+	if (!Number.isFinite(value) || value < 0) {
+		throw new RangeError(`maxAge must be a non-negative number of milliseconds: ${value}`);
+	}
+	return Math.ceil(value);
+}
+
 /** Fill in any unset {@link Info} fields with their defaults. */
 export function infoDefaults(info: Partial<Info> = {}): Info {
 	return {
 		timescale: info.timescale ?? Timescale.MILLI,
-		maxAge: info.maxAge ?? DEFAULT_MAX_AGE_MS,
+		maxAge: maxAgeMillis(info.maxAge ?? DEFAULT_MAX_AGE_MS),
 		priority: info.priority ?? 0,
 	};
 }
@@ -85,7 +106,11 @@ export function infoDefaults(info: Partial<Info> = {}): Info {
 export interface Subscription {
 	/** Delivery priority relative to this session's other subscriptions. Defaults to `0`. */
 	priority?: number;
-	/** Maximum age (milliseconds) of a non-latest group before it is skipped. Defaults to `0`. */
+	/**
+	 * Maximum age (milliseconds) of a non-latest group before it is skipped. Defaults to `0`.
+	 * Rounded up to a whole millisecond, so a value derived from a measurement is never
+	 * shortened. A negative or non-finite value is refused.
+	 */
 	maxAge?: number;
 	/**
 	 * The lowest group the publisher may deliver (a floor), or omit for none.
@@ -105,7 +130,7 @@ export interface Subscription {
 function subscriptionDefaults(subscription: Subscription = {}): Subscription {
 	return {
 		priority: subscription.priority ?? 0,
-		maxAge: subscription.maxAge ?? 0,
+		maxAge: maxAgeMillis(subscription.maxAge ?? 0),
 		startGroup: subscription.startGroup,
 		endGroup: subscription.endGroup,
 	};
@@ -402,6 +427,16 @@ export class Producer {
 	 */
 	info(): Promise<Info> {
 		return resolveInfo(this.#state);
+	}
+
+	/**
+	 * Publisher priority from the committed {@link Info}, or 0 before {@link accept}.
+	 *
+	 * Higher is served first. Hang publishers set this from `Catalog.PRIORITY` so
+	 * audio outranks video on the wire and in the bandwidth allocator.
+	 */
+	get priority(): number {
+		return this.#state.info.peek()?.priority ?? 0;
 	}
 
 	/**
@@ -1229,8 +1264,8 @@ export class Subscriber {
 	 * Groups are acquired through the same sequence cursor as {@link Ordered.nextGroup},
 	 * so frames never run backwards: a late lower-sequence group is skipped, and so is
 	 * one every frame of which `maxAge` proves is too old. A group the budget abandons
-	 * mid-stall ends cleanly and the cursor resyncs from the next group; an eviction gap
-	 * inside a group still surfaces as {@link Lagged}.
+	 * mid-stall ends cleanly and the cursor resyncs from the next group; a gap inside a
+	 * group still surfaces as {@link Lagged} or {@link GroupTooLarge}.
 	 */
 	async #readFrameSequence(): Promise<({ group: number; frame: number } & Frame) | undefined> {
 		for (;;) {
@@ -1248,7 +1283,7 @@ export class Subscriber {
 				// only what the caller can act on (a gap, or the track's own abort).
 				this.#frameGroup = undefined;
 				group.close();
-				if (err instanceof Lagged) throw err;
+				if (err instanceof Lagged || err instanceof GroupTooLarge) throw err;
 				const closed = this.#state.closed.peek();
 				if (closed instanceof Error) throw closed;
 				continue;

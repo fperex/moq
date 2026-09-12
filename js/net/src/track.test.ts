@@ -26,6 +26,13 @@ function mockMonotonicTime(initial: number) {
 	};
 }
 
+test("priority reads the committed info and is 0 before accept", () => {
+	const producer = new TrackProducer("video");
+	expect(producer.priority).toBe(0);
+	producer.accept({ priority: 60 });
+	expect(producer.priority).toBe(60);
+});
+
 test("used reflects subscriber demand and unused resolves when the last one leaves", async () => {
 	const producer = new TrackProducer("test");
 
@@ -161,6 +168,36 @@ test("subscriber options and updates are forwarded to the producer's aggregate",
 	const next = producer.subscription.changed();
 	track.update({ priority: 7, maxAge: 250, startGroup: 2, endGroup: 9 });
 	expect(await next).toEqual({ priority: 7, maxAge: 250, startGroup: 2, endGroup: 9 });
+});
+
+test("a fractional maxAge is rounded up before the wire sees it", async () => {
+	const producer = new TrackProducer("test");
+
+	// Subscribers derive this from measurements (a jitter estimate scaled off RTT), so a
+	// fractional millisecond is expected. The wire encodes it as a varint, which throws on a
+	// non-integer, and rounding down would shorten a budget the subscriber asked for.
+	const track = producer.subscribe({ maxAge: 38.75 });
+	expect(producer.subscription.peek()?.maxAge).toBe(39);
+
+	const next = producer.subscription.changed();
+	track.update({ maxAge: 500.25 });
+	expect((await next)?.maxAge).toBe(501);
+
+	// The publisher half of the budget lands on the wire through TRACK_INFO, with the same hazard.
+	producer.accept({ maxAge: 1000.5 });
+	expect((await producer.info()).maxAge).toBe(1001);
+});
+
+test("a maxAge that is not a duration is refused, not rounded into one", () => {
+	const producer = new TrackProducer("test");
+
+	// The wire carries an unsigned varint, so rounding these would encode a budget the
+	// caller never asked for: -0.5 would ceil to zero and silently take the live edge.
+	expect(() => producer.subscribe({ maxAge: -0.5 })).toThrow(RangeError);
+	expect(() => producer.subscribe({ maxAge: -100 })).toThrow(RangeError);
+	expect(() => producer.subscribe({ maxAge: Number.NaN })).toThrow(RangeError);
+	expect(() => producer.subscribe({ maxAge: Number.POSITIVE_INFINITY })).toThrow(RangeError);
+	expect(() => producer.accept({ maxAge: -0.5 })).toThrow(RangeError);
 });
 
 test("multiple subscriber options aggregate like Rust", async () => {
@@ -1356,24 +1393,20 @@ test("largest names the newest frame written", async () => {
 	producer.close();
 });
 
-// A subscriber that arrives after the frames were written reads mirrors, and a mirror only
-// replays what is still buffered. Once a group has evicted from its front, a replay-local
-// count would put the edge below the frames actually written.
-test("largest survives a mirror replay of an evicted group", async () => {
+// A subscriber that arrives after the frames were written reads mirrors. largest is the
+// last frame successfully written, even after an overflow aborts the group.
+test("largest survives a mirror replay of an aborted group", async () => {
 	const producer = new TrackProducer("test").accept();
 
-	// Overflow the group's frame cap so the front is evicted, which is the only case where
-	// the replayed frames and the frames ever written disagree.
-	const written = MAX_GROUP_FRAMES + 5;
 	const group = producer.appendGroup();
-	for (let i = 0; i < written; i++) {
+	for (let i = 0; i < MAX_GROUP_FRAMES; i++) {
 		group.writeFrame({ payload: enc.encode(`${i}`), timestamp: Timestamp.now() });
 	}
-	group.close();
+	expect(() => group.writeFrame({ payload: enc.encode("overflow"), timestamp: Timestamp.now() })).toThrow();
 
-	// Subscribing now replays the retained window into a fresh sink.
+	// Subscribing now replays into a fresh sink; the last legal frame is still the edge.
 	const late = producer.subscribe();
-	expect(late.largest()).toEqual({ group: 0, frame: written - 1 });
+	expect(late.largest()).toEqual({ group: 0, frame: MAX_GROUP_FRAMES - 1 });
 
 	producer.close();
 });

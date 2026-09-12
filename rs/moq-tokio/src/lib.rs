@@ -28,6 +28,7 @@
 ))]
 compile_error!("a rustls QUIC backend requires a crypto provider: enable either the `aws-lc-rs` or `ring` feature");
 
+mod abort;
 pub mod accept;
 pub use moq_sock::bind;
 pub mod cli;
@@ -38,7 +39,13 @@ mod crypto;
 mod deprecated;
 mod duration;
 mod error;
-#[cfg(any(feature = "quinn", feature = "noq", feature = "quiche", feature = "tcp"))]
+#[cfg(any(
+	feature = "quinn",
+	feature = "noq",
+	feature = "quiche",
+	feature = "tcp",
+	feature = "websocket"
+))]
 pub mod failover;
 #[cfg(feature = "jemalloc")]
 pub mod jemalloc;
@@ -50,18 +57,19 @@ pub mod origin;
 pub mod quic;
 #[cfg(feature = "quinn")]
 pub mod quinn;
-#[cfg(any(feature = "quinn", feature = "noq", feature = "quiche", feature = "tcp"))]
+#[cfg(any(
+	feature = "quinn",
+	feature = "noq",
+	feature = "quiche",
+	feature = "tcp",
+	feature = "websocket"
+))]
 mod resolve;
 pub mod runtime;
-#[cfg(any(
-	feature = "noq",
-	feature = "quinn",
-	feature = "quiche",
-	feature = "iroh",
-	feature = "websocket",
-	feature = "tcp"
-))]
+#[cfg(feature = "_transport")]
 pub mod server;
+#[doc(hidden)]
+pub mod settings;
 #[cfg(feature = "tcp")]
 pub mod tcp;
 pub mod tls;
@@ -82,19 +90,12 @@ pub mod websocket;
 // new `pub` item in these modules doesn't silently join it.
 pub use client::Client;
 pub use connect::{Addrs, ConnectError};
-pub use connection::{Backoff, Connection, ConnectionStatsReader, GoawayConfig, Redirect, Status};
+pub use connection::{Backoff, Connection, ConnectionSnapshot, ConnectionStatsReader, GoawayConfig, Redirect, Status};
 pub use deprecated::Deprecated;
 pub use duration::Duration;
 pub use error::{Error, Result};
 pub use log::{Log, RedactedUrl};
-#[cfg(any(
-	feature = "noq",
-	feature = "quinn",
-	feature = "quiche",
-	feature = "iroh",
-	feature = "websocket",
-	feature = "tcp"
-))]
+#[cfg(feature = "_transport")]
 pub use server::{Listener, Request, Server, Transport};
 
 // Re-export these crates.

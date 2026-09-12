@@ -50,7 +50,7 @@ impl<E: CatalogExt> Import<E> {
 		let rendition = reserved.video(track.name())?;
 		// The hint names the container; the writer is built from that same value so the wire
 		// cannot disagree with what the rendition advertises.
-		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
+		let wire = crate::catalog::hang::Container::try_from(&hint)?;
 		let catalog = crate::codec::video::Catalog::new(hint);
 		let mut import = Self {
 			avc1: false,
@@ -60,7 +60,7 @@ impl<E: CatalogExt> Import<E> {
 			last_sps: None,
 		};
 		if let Some(config) = import.catalog.initial_config() {
-			import.apply_config(config);
+			import.apply_config(config)?;
 		}
 		Ok(import)
 	}
@@ -89,7 +89,7 @@ impl<E: CatalogExt> Import<E> {
 		// importer in avc3 mode where inline-SPS keyframes still self-initialize.
 		let config = config_from_avcc(avcc_bytes)?;
 		self.avc1 = true;
-		self.apply_config(config);
+		self.apply_config(config)?;
 		Ok(())
 	}
 
@@ -124,7 +124,7 @@ impl<E: CatalogExt> Import<E> {
 	/// Finish the track, flushing any buffered data.
 	pub fn finish(&mut self) -> Result<()> {
 		self.track.finish()?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
@@ -136,14 +136,14 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
 	/// the fields its config didn't supply.
-	fn estimate(&mut self) {
-		self.rendition.estimate(self.track.estimate());
+	fn estimate(&mut self) -> crate::Result<()> {
+		self.rendition.estimate(self.track.estimate())
 	}
 
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<()> {
 		self.track.cut(end)?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
@@ -152,23 +152,24 @@ impl<E: CatalogExt> Import<E> {
 	/// [`Producer::discontinuity`](crate::container::Producer::discontinuity).
 	pub fn discontinuity(&mut self) -> Result<()> {
 		self.track.discontinuity()?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		self.track.seek(sequence)?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
 	/// Record a frame's reorder delay (`PTS - DTS`) so the catalog `jitter` reflects the
 	/// B-frame reorder depth (the decode buffer a transmuxer/player must hold). The
 	/// container supplies this since the elementary stream alone carries no decode time.
-	pub fn observe_reorder(&mut self, reorder: moq_net::Timestamp) {
+	pub fn observe_reorder(&mut self, reorder: moq_net::Timestamp) -> crate::Result<()> {
 		self.track.reorder(reorder);
-		self.estimate();
+		self.estimate()?;
+		Ok(())
 	}
 
 	/// Resolve the avc3 config from an inline SPS, updating it in place.
@@ -181,7 +182,7 @@ impl<E: CatalogExt> Import<E> {
 		}
 		let config = config_from_sps(sps_nal)?;
 		self.last_sps = Some(sps_nal.clone());
-		self.apply_config(config);
+		self.apply_config(config)?;
 		Ok(())
 	}
 
@@ -189,8 +190,8 @@ impl<E: CatalogExt> Import<E> {
 	///
 	/// A changed config (new avcC, or a new inline SPS) just re-mirrors the
 	/// rendition; there are no fixed tracks to reject a reconfiguration.
-	fn apply_config(&mut self, config: hang::catalog::VideoConfig) {
-		self.catalog.publish(&mut self.rendition, config);
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> crate::Result<()> {
+		self.catalog.publish(&mut self.rendition, config)
 	}
 
 	/// Write split frames to the track, resolving the avc3 config from the first
@@ -217,9 +218,11 @@ impl<E: CatalogExt> Import<E> {
 			}
 
 			self.track.write(frame)?;
+			self.catalog
+				.on_frame(&mut self.rendition, self.track.track().is_used())?;
 		}
 
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
@@ -227,6 +230,22 @@ impl<E: CatalogExt> Import<E> {
 	/// inline SPS and refining the catalog jitter as it goes.
 	pub fn decode(&mut self, frames: impl IntoIterator<Item = Frame>) -> Result<()> {
 		self.write_frames(frames)
+	}
+
+	/// Re-evaluate stall from source silence.
+	pub fn tick(&mut self) -> crate::Result<()> {
+		self.catalog.tick(&mut self.rendition, self.track.track().is_used())
+	}
+
+	/// The source is gone; this rendition is never stalled while idle.
+	pub fn idle(&mut self) -> crate::Result<()> {
+		self.catalog.idle(&mut self.rendition)
+	}
+
+	/// Record the encode duration before publishing its frames so the catalog can report a stall.
+	pub fn observe_lag(&mut self, lag: std::time::Duration) -> crate::Result<()> {
+		self.catalog
+			.observe_lag(&mut self.rendition, self.track.track().is_used(), lag)
 	}
 }
 
@@ -465,6 +484,50 @@ mod tests {
 		assert!(
 			catalog.snapshot().video.renditions.is_empty(),
 			"no config yet, so no catalog"
+		);
+	}
+
+	/// Encode lag past a few frame intervals marks the rendition stalled, and
+	/// releasing the source clears it. Demand is required; an idle import is not stalled.
+	#[tokio::test(start_paused = true)]
+	async fn encode_lag_marks_the_rendition_stalled() {
+		let sps: &[u8] = &[
+			0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
+			0x01, 0xd4, 0xc0, 0x80,
+		];
+		let pps: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+		let mut annexb = BytesMut::new();
+		for nal in [sps, pps, idr] {
+			annexb.extend_from_slice(&[0, 0, 0, 1]);
+			annexb.extend_from_slice(nal);
+		}
+
+		let mut split = Split::new();
+		let (track, catalog) = setup("video");
+		let _demand = track.subscribe(None);
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let mut frames = split.decode(&annexb, pts).expect("split keyframe");
+		frames.extend(split.flush(pts).expect("flush keyframe"));
+		import.decode(frames).expect("decode keyframe");
+		assert_eq!(
+			catalog.snapshot().video.renditions.get("video").and_then(|c| c.stalled),
+			None
+		);
+
+		import
+			.observe_lag(std::time::Duration::from_millis(200))
+			.expect("observe lag");
+		assert_eq!(
+			catalog.snapshot().video.renditions.get("video").and_then(|c| c.stalled),
+			Some(true)
+		);
+
+		import.idle().expect("idle");
+		assert_eq!(
+			catalog.snapshot().video.renditions.get("video").and_then(|c| c.stalled),
+			None
 		);
 	}
 }

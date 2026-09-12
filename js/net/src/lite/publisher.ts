@@ -2,9 +2,9 @@ import { type Dispose, type Getter, Signal } from "@moq/signals";
 import type * as broadcast from "../broadcast.ts";
 import { error, NotFound, reason, StreamCode, StreamError } from "../error.ts";
 import type * as group from "../group.ts";
-import type { Hop } from "../hop.ts";
+import { type Hop, type Route, routesEqual } from "../hop.ts";
 import { hooks } from "../internal.ts";
-import type { Consumer as OriginConsumer } from "../origin.ts";
+import type { Advertised, Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
 import { type Reader, type Stream, Writer } from "../stream.ts";
 import { Timescale } from "../time.ts";
@@ -321,9 +321,15 @@ export class Publisher {
 	#datagramWriter?: WritableStreamDefaultWriter<Uint8Array>;
 
 	// The published broadcasts, borrowed from the origin this session serves. The origin
-	// outlives the session, so this is read-only here: announce streams watch it for
-	// changes, and closing the session leaves the broadcasts alone.
+	// outlives the session, so this is read-only here: subscribe/fetch look it up, and
+	// closing the session leaves the broadcasts alone.
 	#broadcasts: Getter<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>;
+
+	// Originated advertisements this session forwards. Unadvertised local broadcasts
+	// stay reachable by exact path without appearing here.
+	#advertised: Getter<ReadonlyMap<Path.Valid, Advertised> | undefined>;
+
+	#publish?: OriginConsumer;
 
 	// TRACK_INFO is immutable per track, so resolve it from the application once
 	// (via a throwaway subscribe whose info() resolves when the app calls accept)
@@ -347,6 +353,8 @@ export class Publisher {
 		this.version = version;
 		this.hop = hop;
 		this.#broadcasts = publish?.broadcasts ?? new Signal(new Map());
+		this.#advertised = publish?.advertised ?? new Signal(new Map());
+		this.#publish = publish;
 
 		// Grab the datagram writer up front when the transport carries datagrams (no group
 		// fallback, so it stays undefined otherwise). One writer for all subscriptions.
@@ -365,112 +373,148 @@ export class Publisher {
 	async runAnnounce(msg: AnnounceRequest, stream: Stream) {
 		console.debug(`announce: prefix=${msg.prefix}`);
 
-		// Send initial announcements. Keyed by suffix, valued by the routing front, so a
-		// republish (a new broadcast taking the path) diffs as ended-then-active rather
-		// than nothing; the subscriber treats that as a restart and re-consumes.
-		let active = new Map<Path.Valid, broadcast.Consumer>();
-
-		const broadcasts = this.#broadcasts.peek();
-		if (!broadcasts) return; // closed
-
-		for (const [name, front] of broadcasts) {
-			const suffix = Path.stripPrefix(msg.prefix, name);
-			if (suffix === null) continue;
-			console.debug(`announce: broadcast=${name} active=true`);
-			active.set(suffix, front);
-		}
+		// Keyed by suffix, valued by identity plus route, so a republish diffs as
+		// ended-then-active and a re-price as a restart.
+		let active = new Map<Path.Valid, Advertised>();
 
 		// Lite06+: announce ids. Every active we send implicitly assigns the next
-		// per-stream ordinal; ended references the id instead of repeating the path.
+		// per-stream ordinal; ended/restart reference the id instead of repeating the path.
 		let nextAnnounceId = 0n;
 		const announceIds = new Map<Path.Valid, bigint>();
 
-		switch (this.version) {
-			case Version.DRAFT_01:
-			case Version.DRAFT_02: {
-				const init = new AnnounceInit([...active.keys()]);
-				await init.encode(stream.writer, this.version);
-				break;
+		const wireHops = (route: Route): Hop[] => {
+			if (hasAnnounceOk(this.version)) return route.hops;
+			return [...route.hops, this.hop];
+		};
+
+		const announce = async (suffix: Path.Valid, route: Route) => {
+			console.debug(`announce: broadcast=${suffix} active=true`);
+			if (hasAnnounceId(this.version)) announceIds.set(suffix, nextAnnounceId++);
+			await encodeAnnounceBroadcast(
+				stream.writer,
+				{ status: "active", suffix, hops: wireHops(route), cost: route.cost },
+				this.version,
+			);
+		};
+
+		const restart = async (suffix: Path.Valid, route: Route) => {
+			if (!hasAnnounceId(this.version)) {
+				await retract(suffix);
+				await announce(suffix, route);
+				return;
 			}
-			default: {
-				if (!hasAnnounceOk(this.version)) {
-					// Draft03/04: send individual Announce messages, stamping our origin as a hop.
+			const id = announceIds.get(suffix);
+			if (id === undefined) {
+				await announce(suffix, route);
+				return;
+			}
+			console.debug(`announce: broadcast=${suffix} restart=true`);
+			await encodeAnnounceBroadcast(
+				stream.writer,
+				{ status: "restart", id, hops: wireHops(route), cost: route.cost },
+				this.version,
+			);
+		};
+
+		// Lite06+ retracts by announce id; older versions repeat the path (ended announces
+		// don't need hops).
+		const retract = async (suffix: Path.Valid) => {
+			console.debug(`announce: broadcast=${suffix} active=false`);
+			if (!hasAnnounceId(this.version)) {
+				await encodeAnnounceBroadcast(stream.writer, { status: "ended", suffix }, this.version);
+				return;
+			}
+
+			const id = announceIds.get(suffix);
+			announceIds.delete(suffix);
+			if (id === undefined) return; // never announced
+			await encodeAnnounceBroadcast(stream.writer, { status: "endedId", id }, this.version);
+		};
+
+		// Subscribe BEFORE writing anything: every encode below awaits the wire, and a publish
+		// landing in that window only notifies the listeners already registered. One created
+		// afterwards would sleep through it, leaving the change unannounced until something
+		// unrelated moved.
+		// TODO Make a better helper within Signals.
+		let dispose!: Dispose;
+		let changed = new Promise<ReadonlyMap<Path.Valid, Advertised> | undefined>((resolve) => {
+			dispose = this.#advertised.changed(resolve);
+		});
+
+		try {
+			const initial = this.#advertised.peek();
+			if (!initial) return; // closed
+
+			for (const [name, snap] of initial) {
+				const suffix = Path.stripPrefix(msg.prefix, name);
+				if (suffix === null) continue;
+				active.set(suffix, snap);
+			}
+
+			switch (this.version) {
+				case Version.DRAFT_01:
+				case Version.DRAFT_02: {
 					for (const suffix of active.keys()) {
-						await encodeAnnounceBroadcast(
-							stream.writer,
-							{ status: "active", suffix, hops: [this.hop] },
-							this.version,
-						);
+						console.debug(`announce: broadcast=${suffix} active=true`);
+					}
+					const init = new AnnounceInit([...active.keys()]);
+					await init.encode(stream.writer, this.version);
+					break;
+				}
+				default: {
+					if (!hasAnnounceOk(this.version)) {
+						for (const [suffix, snap] of active) {
+							await announce(suffix, snap.route);
+						}
+						break;
+					}
+
+					const ok = new AnnounceOk(this.hop, active.size);
+					await ok.encode(stream.writer, this.version);
+					for (const [suffix, snap] of active) {
+						await announce(suffix, snap.route);
 					}
 					break;
 				}
+			}
 
-				// Report our Hop ID once via AnnounceOk and the count of initial announces
-				// that follow; the subscriber stamps our origin onto each hop chain, so we omit it.
-				const ok = new AnnounceOk(this.hop, active.size);
-				await ok.encode(stream.writer, this.version);
-				for (const suffix of active.keys()) {
-					if (hasAnnounceId(this.version)) {
-						announceIds.set(suffix, nextAnnounceId++);
+			for (;;) {
+				const advertised = await Promise.race([changed, stream.reader.closed]);
+				dispose();
+				if (!advertised) break;
+
+				// Re-arm before reading, so an advertise that lands while we write is not lost.
+				changed = new Promise<ReadonlyMap<Path.Valid, Advertised> | undefined>((resolve) => {
+					dispose = this.#advertised.changed(resolve);
+				});
+
+				const latest = this.#advertised.peek();
+				if (!latest) break;
+
+				const updated = new Map<Path.Valid, Advertised>();
+				for (const [name, snap] of latest) {
+					const suffix = Path.stripPrefix(msg.prefix, name);
+					if (suffix === null) continue;
+					updated.set(suffix, snap);
+				}
+
+				for (const [suffix, snap] of active) {
+					const cur = updated.get(suffix);
+					if (!cur || cur.identity !== snap.identity) await retract(suffix);
+				}
+				for (const [suffix, snap] of updated) {
+					const prev = active.get(suffix);
+					if (!prev || prev.identity !== snap.identity) {
+						await announce(suffix, snap.route);
+					} else if (!routesEqual(prev.route, snap.route)) {
+						await restart(suffix, snap.route);
 					}
-					await encodeAnnounceBroadcast(stream.writer, { status: "active", suffix, hops: [] }, this.version);
 				}
-				break;
+
+				active = updated;
 			}
-		}
-
-		// Wait for updates to the broadcasts.
-		for (;;) {
-			// TODO Make a better helper within Signals.
-			let dispose!: Dispose;
-			const changed = new Promise<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>((resolve) => {
-				dispose = this.#broadcasts.changed(resolve);
-			});
-
-			// Wait until the map of broadcasts changes.
-			const broadcasts = await Promise.race([changed, stream.reader.closed]);
+		} finally {
 			dispose();
-			if (!broadcasts) break;
-
-			// Create a new map of active broadcasts.
-			// This is SLOW, but it's not worth optimizing because we often have just 1 broadcast anyway.
-			const newActive = new Map<Path.Valid, broadcast.Consumer>();
-			for (const [name, front] of broadcasts) {
-				const suffix = Path.stripPrefix(msg.prefix, name);
-				if (suffix === null) continue; // Not our prefix.
-				newActive.set(suffix, front);
-			}
-
-			// Retract removed and superseded broadcasts first, so a republish reads as
-			// ended-then-active (a restart) on the wire. Lite06+ retracts by announce id;
-			// older versions repeat the path (ended announces don't need hops).
-			for (const [removed, front] of active) {
-				if (newActive.get(removed) === front) continue;
-				console.debug(`announce: broadcast=${removed} active=false`);
-				if (hasAnnounceId(this.version)) {
-					const id = announceIds.get(removed);
-					announceIds.delete(removed);
-					if (id === undefined) continue; // never announced
-					await encodeAnnounceBroadcast(stream.writer, { status: "endedId", id }, this.version);
-				} else {
-					await encodeAnnounceBroadcast(stream.writer, { status: "ended", suffix: removed }, this.version);
-				}
-			}
-
-			// Announce new and superseding broadcasts. Lite05+ reports our origin once via
-			// AnnounceOk, so the subscriber stamps it onto each hop chain; older versions
-			// stamp it here.
-			for (const [added, front] of newActive) {
-				if (active.get(added) === front) continue;
-				console.debug(`announce: broadcast=${added} active=true`);
-				const hops = hasAnnounceOk(this.version) ? [] : [this.hop];
-				if (hasAnnounceId(this.version)) {
-					announceIds.set(added, nextAnnounceId++);
-				}
-				await encodeAnnounceBroadcast(stream.writer, { status: "active", suffix: added, hops }, this.version);
-			}
-
-			active = newActive;
 		}
 	}
 
@@ -482,7 +526,13 @@ export class Publisher {
 	 * @internal
 	 */
 	async runSubscribe(msg: Subscribe, stream: Stream) {
-		const front = this.#broadcasts.peek()?.get(msg.broadcast);
+		let front: broadcast.Consumer | undefined;
+		try {
+			front = this.#broadcasts.peek()?.get(msg.broadcast) ?? (await this.#publish?.demand(msg.broadcast));
+		} catch (err: unknown) {
+			stream.writer.reset(error(err));
+			return;
+		}
 		if (!front) {
 			console.debug(`publish unknown: broadcast=${msg.broadcast}`);
 			stream.writer.reset(new NotFound(`broadcast ${msg.broadcast}`));
@@ -588,7 +638,13 @@ export class Publisher {
 			return;
 		}
 
-		const front = this.#broadcasts.peek()?.get(msg.broadcast);
+		let front: broadcast.Consumer | undefined;
+		try {
+			front = this.#broadcasts.peek()?.get(msg.broadcast) ?? (await this.#publish?.demand(msg.broadcast));
+		} catch (err: unknown) {
+			stream.writer.reset(error(err));
+			return;
+		}
 		if (!front) {
 			console.debug(`fetch unknown: broadcast=${msg.broadcast}`);
 			stream.writer.reset(new NotFound(`broadcast ${msg.broadcast}`));
@@ -777,7 +833,7 @@ export class Publisher {
 	 */
 	async runTrackInfo(msg: TrackMessage, stream: Stream) {
 		try {
-			const front = this.#broadcasts.peek()?.get(msg.broadcast);
+			const front = this.#broadcasts.peek()?.get(msg.broadcast) ?? (await this.#publish?.demand(msg.broadcast));
 			if (!front) throw new NotFound(`broadcast ${msg.broadcast}`);
 
 			const info = await this.#resolveTrackInfo(front, msg.track);

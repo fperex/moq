@@ -443,7 +443,7 @@ async fn import_populates_the_broadcast_timeline() {
 	let audio_name = snapshot.audio.renditions.keys().next().unwrap().clone();
 
 	// The one timeline is advertised at the catalog root, named by convention.
-	let section = snapshot.timeline.clone().expect("the import advertises a timeline");
+	let section = snapshot.archive.clone().expect("the import advertises a timeline");
 	assert_eq!(section.track, hang::timeline::DEFAULT_NAME);
 
 	// Subscribe while the producer is alive, then finish so the timeline group closes and the
@@ -480,6 +480,7 @@ fn info(track_id: u32, timescale: moq_net::Timescale, sequence_number: u32) -> s
 		track_id,
 		timescale,
 		sequence_number,
+		kind: super::Kind::Video,
 	}
 }
 
@@ -498,7 +499,7 @@ fn sample(timestamp_us: u64, keyframe: bool, duration_us: Option<u64>) -> crate:
 fn decode_rejects_durationless_multisample() {
 	let frames = vec![sample(0, true, None), sample(33_000, false, None)];
 	let frag = super::encode_fragment(info(1, scale(), 0), &frames).unwrap();
-	let err = super::decode(frag, scale()).unwrap_err();
+	let err = super::decode(frag, scale(), crate::container::fmp4::Kind::Video).unwrap_err();
 	assert!(matches!(err, super::Error::MissingSampleDuration), "got {err:?}");
 }
 
@@ -506,7 +507,7 @@ fn decode_rejects_durationless_multisample() {
 #[test]
 fn decode_single_sample_no_duration_ok() {
 	let frag = super::encode_fragment(info(1, scale(), 0), &[sample(0, true, None)]).unwrap();
-	let out = super::decode(frag, scale()).unwrap();
+	let out = super::decode(frag, scale(), crate::container::fmp4::Kind::Video).unwrap();
 	assert_eq!(out.len(), 1);
 	assert_eq!(out[0].timestamp.as_micros(), 0);
 }
@@ -517,7 +518,7 @@ fn decode_single_sample_no_duration_ok() {
 fn decode_multisample_with_durations_roundtrips() {
 	let frames = vec![sample(0, true, Some(33_000)), sample(33_000, false, Some(33_000))];
 	let frag = super::encode_fragment(info(1, scale(), 0), &frames).unwrap();
-	let out = super::decode(frag, scale()).unwrap();
+	let out = super::decode(frag, scale(), crate::container::fmp4::Kind::Video).unwrap();
 	assert_eq!(out.len(), 2);
 	assert_eq!(out[0].timestamp.as_micros(), 0);
 	assert_eq!(out[1].timestamp.as_micros(), 33_000);
@@ -721,7 +722,7 @@ async fn segmented_source_indexes_one_group_range_per_track() {
 	let snapshot = catalog.snapshot();
 	let video_name = snapshot.video.renditions.keys().next().unwrap().clone();
 	let audio_name = snapshot.audio.renditions.keys().next().unwrap().clone();
-	let section = snapshot.timeline.clone().expect("the import advertises a timeline");
+	let section = snapshot.archive.clone().expect("the import advertises a timeline");
 
 	// Subscribe while the producer is alive so the reader terminates on finish rather than blocking.
 	let mut timeline = crate::timeline::Consumer::<()>::subscribe(&consumer, &section)
@@ -803,7 +804,7 @@ async fn segment_ranges_with_skew(
 	let snapshot = catalog.snapshot();
 	let video_name = snapshot.video.renditions.keys().next().unwrap().clone();
 	let audio_name = snapshot.audio.renditions.keys().next().unwrap().clone();
-	let section = snapshot.timeline.clone().unwrap();
+	let section = snapshot.archive.clone().unwrap();
 	let mut timeline = crate::timeline::Consumer::<()>::subscribe(&consumer, &section)
 		.await
 		.unwrap();
@@ -942,4 +943,252 @@ async fn a_single_leading_styp_still_segments_on_keyframes() {
 		vec![1, 1, 1, 1],
 		"audio follows the same boundaries rather than trailing a segment behind"
 	);
+}
+
+/// One audio fragment for bbb's track 2, carrying a single sample at the track's 44100 timescale.
+///
+/// `trun.data_offset` is left unset so the samples start at the front of the mdat, which is all
+/// the importer needs to slice them back out.
+fn audio_fragment(base_media_decode_time: u64, duration: u32, size: u32) -> Vec<u8> {
+	let moof = mp4_atom::Moof {
+		mfhd: mp4_atom::Mfhd { sequence_number: 0 },
+		traf: vec![mp4_atom::Traf {
+			tfhd: mp4_atom::Tfhd {
+				track_id: 2,
+				default_sample_duration: Some(duration),
+				default_sample_size: Some(size),
+				..Default::default()
+			},
+			tfdt: Some(mp4_atom::Tfdt { base_media_decode_time }),
+			trun: vec![mp4_atom::Trun {
+				data_offset: None,
+				entries: vec![mp4_atom::TrunEntry::default()],
+			}],
+			..Default::default()
+		}],
+	};
+
+	let mut buf = Vec::new();
+	moof.encode(&mut buf).unwrap();
+	mp4_atom::Mdat {
+		data: vec![0xAA; size as usize],
+	}
+	.encode(&mut buf)
+	.unwrap();
+	buf
+}
+
+/// Every fragment restates its decode time, so a stale one puts two different samples on the same
+/// timestamp, which a decoder reads as an undeclared hole and resets on. ffmpeg writes exactly that
+/// when `frag_every_frame` interleaves audio and video, so refuse the fragment rather than publish
+/// the collision.
+#[test]
+fn non_advancing_fragment_decode_time_is_rejected() {
+	let data = include_bytes!("test_data/bbb.mp4");
+	let (ftyp, moov) = decode_init(data);
+	let mut init = Vec::new();
+	ftyp.encode(&mut init).unwrap();
+	moov.encode(&mut init).unwrap();
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
+	fmp4.decode(&init).unwrap();
+
+	// An advancing pair imports, one AAC frame apart.
+	fmp4.decode(&audio_fragment(3072, 1024, 327)).unwrap();
+	fmp4.decode(&audio_fragment(4096, 1024, 361)).unwrap();
+
+	// A third fragment repeating the previous decode time is a different sample landing on the
+	// same timestamp.
+	let err = fmp4.decode(&audio_fragment(4096, 1024, 339)).unwrap_err();
+	assert!(
+		matches!(
+			err,
+			crate::Error::Cmaf(crate::container::fmp4::Error::NonMonotonicDecodeTime {
+				track: 2,
+				decode_time,
+				previous,
+			}) if decode_time == moq_net::Timestamp::from_scale(4096, 44100).unwrap()
+				&& previous == decode_time
+		),
+		"expected a non-monotonic decode time, got {err:?}"
+	);
+}
+
+#[test]
+fn seek_resets_fragment_decode_time() {
+	let (ftyp, moov) = decode_init(include_bytes!("test_data/bbb.mp4"));
+	let mut init = Vec::new();
+	ftyp.encode(&mut init).unwrap();
+	moov.encode(&mut init).unwrap();
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
+	fmp4.decode(&init).unwrap();
+	fmp4.decode(&audio_fragment(4096, 1024, 327)).unwrap();
+	fmp4.seek(1).unwrap();
+	fmp4.decode(&audio_fragment(0, 1024, 327)).unwrap();
+	fmp4.decode(&audio_fragment(1024, 1024, 327)).unwrap();
+}
+
+#[test]
+fn rejected_fragment_preserves_decode_time() {
+	let (ftyp, moov) = decode_init(include_bytes!("test_data/bbb.mp4"));
+	let mut init = Vec::new();
+	ftyp.encode(&mut init).unwrap();
+	moov.encode(&mut init).unwrap();
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
+	fmp4.decode(&init).unwrap();
+	fmp4.decode(&audio_fragment(4096, 1024, 327)).unwrap();
+	assert!(fmp4.decode(&audio_fragment(3000, 1024, 327)).is_err());
+	assert!(matches!(
+		fmp4.decode(&audio_fragment(3500, 1024, 327)),
+		Err(crate::Error::Cmaf(
+			crate::container::fmp4::Error::NonMonotonicDecodeTime { decode_time, previous, .. }
+		)) if previous == moq_net::Timestamp::from_scale(4096, 44100).unwrap()
+			&& decode_time == moq_net::Timestamp::from_scale(3500, 44100).unwrap()
+	));
+}
+
+/// Like [`audio_fragment`] but carrying `samples` samples, the shape a real segmenter emits.
+fn audio_fragment_samples(base_media_decode_time: u64, duration: u32, size: u32, samples: usize) -> Vec<u8> {
+	let moof = mp4_atom::Moof {
+		mfhd: mp4_atom::Mfhd { sequence_number: 0 },
+		traf: vec![mp4_atom::Traf {
+			tfhd: mp4_atom::Tfhd {
+				track_id: 2,
+				default_sample_duration: Some(duration),
+				default_sample_size: Some(size),
+				..Default::default()
+			},
+			tfdt: Some(mp4_atom::Tfdt { base_media_decode_time }),
+			trun: vec![mp4_atom::Trun {
+				data_offset: None,
+				entries: vec![mp4_atom::TrunEntry::default(); samples],
+			}],
+			..Default::default()
+		}],
+	};
+
+	let mut buf = Vec::new();
+	moof.encode(&mut buf).unwrap();
+	mp4_atom::Mdat {
+		data: vec![0xAA; size as usize * samples],
+	}
+	.encode(&mut buf)
+	.unwrap();
+	buf
+}
+
+/// Each fragment advertises its media span immediately. A source whose
+/// fragments shrink (or whose last fragment holds a single sample) must not walk the advertised
+/// value back down: the publisher can emit a long fragment again at any point.
+#[test]
+fn fragment_jitter_never_shrinks() {
+	let (ftyp, moov) = decode_init(include_bytes!("test_data/bbb.mp4"));
+	let mut init = Vec::new();
+	ftyp.encode(&mut init).unwrap();
+	moov.encode(&mut init).unwrap();
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
+	fmp4.decode(&init).unwrap();
+
+	let audio_jitter = |catalog: &crate::catalog::Producer| {
+		catalog
+			.snapshot()
+			.audio
+			.renditions
+			.values()
+			.next()
+			.expect("an audio rendition")
+			.jitter
+	};
+
+	// bbb's AAC track runs at 44100; eight 1024-sample frames span 8192 ticks (~186 ms).
+	fmp4.decode(&audio_fragment_samples(0, 1024, 327, 8)).unwrap();
+	assert!(
+		audio_jitter(&catalog).is_some(),
+		"the first fragment must publish its own span"
+	);
+	fmp4.decode(&audio_fragment_samples(8192, 1024, 327, 8)).unwrap();
+	let cadence = audio_jitter(&catalog).expect("the fragment cadence is published");
+	assert!(
+		cadence >= std::time::Duration::from_millis(180) && cadence <= std::time::Duration::from_millis(190),
+		"two fragments establish the cadence: {cadence:?}"
+	);
+
+	// Single-sample fragments 23 ms apart. Publishing that spacing would tell a consumer to size
+	// its buffer for one frame when the next fragment is 186 ms again.
+	fmp4.decode(&audio_fragment_samples(16384, 1024, 327, 1)).unwrap();
+	fmp4.decode(&audio_fragment_samples(17408, 1024, 327, 1)).unwrap();
+	assert_eq!(
+		audio_jitter(&catalog),
+		Some(cadence),
+		"a tighter fragment pair lowered the jitter"
+	);
+
+	fmp4.finish().unwrap();
+	assert_eq!(audio_jitter(&catalog), Some(cadence));
+}
+
+#[test]
+fn fragment_jitter_uses_sample_endpoints() {
+	for (samples, expected) in [
+		(vec![(Some(882), 0), (Some(4410), 0)], 120),
+		(vec![(Some(441), 0), (Some(4410), -441)], 100),
+		(vec![(Some(882), 0), (None, 0)], 40),
+	] {
+		let (ftyp, mut moov) = decode_init(include_bytes!("test_data/bbb.mp4"));
+		for trex in &mut moov.mvex.as_mut().unwrap().trex {
+			trex.default_sample_duration = 0;
+		}
+		let mut init = Vec::new();
+		ftyp.encode(&mut init).unwrap();
+		moov.encode(&mut init).unwrap();
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut import = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
+		import.decode(&init).unwrap();
+		let moof = mp4_atom::Moof {
+			mfhd: mp4_atom::Mfhd { sequence_number: 0 },
+			traf: vec![mp4_atom::Traf {
+				tfhd: mp4_atom::Tfhd {
+					track_id: 2,
+					default_sample_size: Some(8),
+					..Default::default()
+				},
+				tfdt: Some(mp4_atom::Tfdt {
+					base_media_decode_time: 0,
+				}),
+				trun: vec![mp4_atom::Trun {
+					data_offset: None,
+					entries: samples
+						.iter()
+						.map(|(duration, cts)| mp4_atom::TrunEntry {
+							duration: *duration,
+							cts: Some(*cts),
+							..Default::default()
+						})
+						.collect(),
+				}],
+				..Default::default()
+			}],
+		};
+		let mut fragment = Vec::new();
+		moof.encode(&mut fragment).unwrap();
+		mp4_atom::Mdat {
+			data: vec![0xAA; samples.len() * 8],
+		}
+		.encode(&mut fragment)
+		.unwrap();
+		import.decode(&fragment).unwrap();
+		let snapshot = catalog.snapshot();
+		let jitter = snapshot.audio.renditions.values().next().unwrap().jitter.unwrap();
+		assert_eq!(jitter.as_nanos().div_ceil(1_000_000), expected);
+	}
 }

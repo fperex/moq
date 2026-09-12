@@ -153,6 +153,9 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// [`Reserved`](super::Reserved) mints tracks under one policy. See
 	/// [`Config::with_max_age`].
 	max_age: Option<std::time::Duration>,
+	/// Connection allocator passthrough tracks claim their peak-hold bitrate on.
+	/// See [`Config::with_bandwidth`].
+	bandwidth: moq_net::bandwidth::Allocator,
 }
 
 // Manual Clone so a producer is cheaply clonable regardless of whether `E` is.
@@ -164,6 +167,7 @@ impl<E: CatalogExt> Clone for Producer<E> {
 			clock: self.clock,
 			timeline: self.timeline.clone(),
 			max_age: self.max_age,
+			bandwidth: self.bandwidth.clone(),
 		}
 	}
 }
@@ -179,6 +183,7 @@ impl<E: CatalogExt> Clone for Producer<E> {
 pub struct Config<E: CatalogExt = ()> {
 	catalog: Catalog<E>,
 	max_age: Option<std::time::Duration>,
+	bandwidth: moq_net::bandwidth::Allocator,
 }
 
 impl Default for Config<()> {
@@ -186,6 +191,7 @@ impl Default for Config<()> {
 		Self {
 			catalog: Catalog::default(),
 			max_age: None,
+			bandwidth: moq_net::bandwidth::Allocator::unlimited(),
 		}
 	}
 }
@@ -198,6 +204,7 @@ impl<E: CatalogExt> Config<E> {
 		Config {
 			catalog,
 			max_age: self.max_age,
+			bandwidth: self.bandwidth,
 		}
 	}
 
@@ -214,6 +221,18 @@ impl<E: CatalogExt> Config<E> {
 	/// moq-net's default: both are read at the live edge, which is retained unconditionally.
 	pub fn with_max_age(mut self, max_age: impl Into<Option<std::time::Duration>>) -> Self {
 		self.max_age = max_age.into();
+		self
+	}
+
+	/// Claim each media track's peak-hold catalog bitrate on `bandwidth`.
+	///
+	/// A passthrough import has no configured ceiling, so it reserves the
+	/// measured maximum instead: taken on the first 1 s window, raised when a
+	/// later window exceeds it, never walked back. A co-resident encoder then
+	/// targets what is left of the uplink. `unlimited` (the default) claims
+	/// nothing a sender can follow.
+	pub fn with_bandwidth(mut self, bandwidth: moq_net::bandwidth::Allocator) -> Self {
+		self.bandwidth = bandwidth;
 		self
 	}
 }
@@ -288,6 +307,7 @@ impl<E: CatalogExt> Producer<E> {
 			clock: crate::Clock::new(),
 			timeline,
 			max_age: config.max_age,
+			bandwidth: config.bandwidth,
 		})
 	}
 
@@ -435,14 +455,22 @@ impl<E: CatalogExt> Producer<E> {
 	/// segments.
 	///
 	/// The broadcast's one timeline track is created (and advertised in the catalog's root
-	/// `timeline` section) on first use; see [`timeline`](crate::timeline) for the whole model.
+	/// `archive` entry) on first use; see [`timeline`](crate::timeline) for the whole model.
 	pub fn media_producer<C: crate::container::Container>(
 		&mut self,
 		track: moq_net::track::Producer,
 		container: C,
 	) -> crate::Result<crate::container::Producer<C>> {
 		let recorder = self.enroll(track.name())?;
-		Ok(crate::container::Producer::new(track, container).with_recorder(recorder))
+		Ok(crate::container::Producer::new(track, container)
+			.with_recorder(recorder)
+			.with_bandwidth(self.bandwidth.clone()))
+	}
+
+	/// The allocator passthrough tracks claim on. fMP4 writes groups by hand
+	/// (no [`media_producer`](Self::media_producer)), so it reads this itself.
+	pub(crate) fn bandwidth(&self) -> moq_net::bandwidth::Allocator {
+		self.bandwidth.clone()
 	}
 
 	/// Enroll `track` in the broadcast's timeline, advertising the timeline in the catalog's
@@ -456,8 +484,8 @@ impl<E: CatalogExt> Producer<E> {
 
 		let section = self.timeline.section();
 		let mut catalog = self.lock();
-		if catalog.timeline.is_none() {
-			catalog.timeline = Some(section);
+		if catalog.archive.is_none() {
+			catalog.archive = Some(section);
 		}
 
 		Ok(recorder)
@@ -465,8 +493,8 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// The broadcast's [`timeline::Producer`](crate::timeline::Producer): its segment index.
 	///
-	/// The MoQ track behind it is created (and advertised in the catalog's root `timeline`
-	/// section) when the first media track enrolls, so reading this costs nothing on a
+	/// The MoQ track behind it is created (and advertised in the catalog's root `archive`
+	/// entry) when the first media track enrolls, so reading this costs nothing on a
 	/// broadcast that never segments. Use it to declare boundaries
 	/// ([`cut`](crate::timeline::Producer::cut)) or to hold publishing back while tracks
 	/// enroll ([`reserve`](crate::timeline::Producer::reserve), the timeline's counterpart to
@@ -491,7 +519,7 @@ impl<E: CatalogExt> Producer<E> {
 		config: crate::json::Config,
 	) -> crate::Result<crate::json::Snapshot<T, E>> {
 		let rendition = self.data_entry(track.name())?;
-		Ok(crate::json::Snapshot::new(track, rendition, &config))
+		crate::json::Snapshot::new(track, rendition, &config)
 	}
 
 	/// Publish `track` as an append-log JSON track, advertising it in the catalog.
@@ -504,7 +532,7 @@ impl<E: CatalogExt> Producer<E> {
 		config: crate::json::Config,
 	) -> crate::Result<crate::json::Stream<T, E>> {
 		let rendition = self.data_entry(track.name())?;
-		Ok(crate::json::Stream::new(track, rendition, &config))
+		crate::json::Stream::new(track, rendition, &config)
 	}
 
 	/// Publish `track` as a latest-value binary track, advertising it in the catalog.
@@ -517,7 +545,7 @@ impl<E: CatalogExt> Producer<E> {
 		config: crate::binary::Config,
 	) -> crate::Result<crate::binary::Snapshot<E>> {
 		let rendition = self.data_entry(track.name())?;
-		Ok(crate::binary::Snapshot::new(track, rendition, &config))
+		crate::binary::Snapshot::new(track, rendition, &config)
 	}
 
 	/// Publish `track` as an append-log binary track, advertising it in the catalog.
@@ -530,7 +558,7 @@ impl<E: CatalogExt> Producer<E> {
 		config: crate::binary::Config,
 	) -> crate::Result<crate::binary::Stream<E>> {
 		let rendition = self.data_entry(track.name())?;
-		Ok(crate::binary::Stream::new(track, rendition, &config))
+		crate::binary::Stream::new(track, rendition, &config)
 	}
 
 	/// Reserve the catalog entry a data producer owns, keyed by its track name.
@@ -931,14 +959,14 @@ mod test {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut catalog = Producer::new(&mut broadcast).unwrap();
 
-		// A broadcast that never segments never advertises a timeline.
-		assert_eq!(catalog.snapshot().timeline, None);
+		// A broadcast that never segments never advertises an archive.
+		assert_eq!(catalog.snapshot().archive, None);
 
 		let _recorder = catalog.enroll("video0").unwrap();
 		assert_eq!(
-			catalog.snapshot().timeline,
+			catalog.snapshot().archive,
 			Some(catalog.timeline().section()),
-			"the root section should advertise the timeline track"
+			"the root archive should advertise the timeline track"
 		);
 	}
 
@@ -969,14 +997,14 @@ mod test {
 		drop(reserved); // done reserving; both renditions still outstanding
 
 		// Audio resolves first: withheld, because video is still outstanding.
-		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2));
+		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2)).unwrap();
 		assert!(
 			matches!(consumer.poll_next(&waiter), Poll::Pending),
 			"an audio-only catalog must not publish while video is unresolved"
 		);
 
 		// Video resolves: the complete catalog publishes now, in one snapshot.
-		video.set(h264_config());
+		video.set(h264_config()).unwrap();
 		let snapshot = match consumer.poll_next(&waiter) {
 			Poll::Ready(Ok(Some(c))) => c,
 			other => panic!("expected the complete catalog, got {other:?}"),
@@ -1002,7 +1030,7 @@ mod test {
 			"the unresolved live rendition owns its name"
 		);
 		let mut audio = catalog.rendition::<AudioConfig>("audio0").unwrap();
-		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2));
+		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2)).unwrap();
 
 		let snapshot = match consumer.poll_next(&waiter) {
 			Poll::Ready(Ok(Some(c))) => c,
@@ -1026,7 +1054,7 @@ mod test {
 		let video = reserved.video("video0").unwrap();
 		drop(reserved);
 
-		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2));
+		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2)).unwrap();
 		assert!(matches!(consumer.poll_next(&waiter), Poll::Pending));
 
 		// The video stream never resolves and is cancelled; the audio-only catalog publishes.
@@ -1056,7 +1084,7 @@ mod test {
 		// rendition alive (dropping it would retire the track), so bind it.
 		let early = catalog.reserve();
 		let mut a0 = early.audio("audio0").unwrap();
-		a0.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2));
+		a0.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2)).unwrap();
 		drop(early);
 		assert!(
 			matches!(consumer.poll_next(&waiter), Poll::Pending),
@@ -1067,7 +1095,7 @@ mod test {
 		let mut late = deferred.audio("audio1").unwrap();
 		drop(deferred); // the importer releases its own hold; only the rendition's remains
 		assert!(matches!(consumer.poll_next(&waiter), Poll::Pending));
-		late.set(AudioConfig::new(AudioCodec::Opus, 48_000, 1));
+		late.set(AudioConfig::new(AudioCodec::Opus, 48_000, 1)).unwrap();
 
 		let snapshot = match consumer.poll_next(&waiter) {
 			Poll::Ready(Ok(Some(c))) => c,

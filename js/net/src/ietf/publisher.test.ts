@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, mock, spyOn, test } from "bun:test";
+import { Signal } from "@moq/signals";
 import type { Producer as BroadcastProducer } from "../broadcast.ts";
 import { error } from "../error.ts";
 import { Producer as GroupProducer, MAX_GROUP_FRAMES } from "../group.ts";
@@ -19,7 +20,13 @@ import { Publisher } from "./publisher.ts";
 import { RequestError, RequestOk } from "./request.ts";
 import { Subscribe, SubscribeOk } from "./subscribe.ts";
 import { SubscribeNamespace } from "./subscribe_namespace.ts";
-import { ALPN, Version } from "./version.ts";
+import { ALPN, type IetfVersion, Version } from "./version.ts";
+
+function publish(origin: OriginProducer, path: Path.Valid) {
+	const broadcast = origin.createBroadcast(path);
+	broadcast.announce();
+	return broadcast;
+}
 
 const VERSION = Version.DRAFT_19;
 
@@ -84,7 +91,8 @@ async function declinePublishNamespace(stream: Stream, retryInterval = 1n): Prom
 		await stream.writer.u53(RequestError.id);
 		await new RequestError({
 			requestId: undefined,
-			errorCode: 403,
+			// UNINTERESTED, draft-19 section 15.11.2.
+			errorCode: 0x20,
 			reasonPhrase: "no",
 			retryInterval,
 		}).encode(stream.writer, VERSION);
@@ -155,7 +163,7 @@ test("a blocked group header is reset when the group expires", async () => {
 	pair.server.createUnidirectionalStream = async () => writable;
 
 	const { pub, origin } = publisher(pair.server);
-	const broadcast = origin.publish(Path.from("test"));
+	const broadcast = publish(origin, Path.from("test"));
 	const track = broadcast.createTrack("video");
 	const client = await Stream.open(pair.client, { version: VERSION });
 	const server = await Stream.accept(pair.server, VERSION);
@@ -204,6 +212,89 @@ test("a blocked group header is reset when the group expires", async () => {
 	}
 });
 
+test.each(["acknowledged", "rejected"] as const)(
+	"a replacement waits until its predecessor's FIN is %s",
+	async (result) => {
+		const pair = createMockTransportPair(ALPN.DRAFT_19);
+		const open = pair.server.createBidirectionalStream.bind(pair.server);
+		const closing = Promise.withResolvers<void>();
+		const acknowledged = Promise.withResolvers<void>();
+		let opened = 0;
+		pair.server.createBidirectionalStream = async (options) => {
+			const stream = await open(options);
+			if (++opened !== 1) return stream;
+			const writer = stream.writable.getWriter();
+			return {
+				readable: stream.readable,
+				writable: new WritableStream<Uint8Array>({
+					write: (chunk) => writer.write(chunk),
+					async close() {
+						await writer.close();
+						closing.resolve();
+						await acknowledged.promise;
+					},
+					abort: (reason) => writer.abort(reason),
+				}),
+			} as WebTransportBidirectionalStream;
+		};
+		const { pub, origin } = publisher(pair.server);
+		let first: BroadcastProducer | undefined;
+		let second: BroadcastProducer | undefined;
+		const changed = Signal.prototype.changed;
+		const disposed = mock(() => {});
+		let registration: ReturnType<typeof spyOn<typeof Signal.prototype, "changed">> | undefined;
+		const loop = pub.runPublishNamespaces();
+		try {
+			first = publish(origin, Path.from("replacement"));
+			const old = await nextStream(pair.client);
+			if (!old) throw new Error("missing initial advertisement");
+			expect(await readPublishNamespace(old)).toBe(Path.from("replacement"));
+			await acceptPublishNamespace(old);
+			registration = spyOn(Signal.prototype, "changed").mockImplementation(function (
+				this: Signal<unknown>,
+				fn?: (value: unknown) => void,
+			) {
+				const original = changed.bind(this);
+				if (!fn) return original();
+				const dispose = original(fn);
+				return () => {
+					dispose();
+					disposed();
+				};
+			} as typeof changed);
+			first.close();
+			second = publish(origin, Path.from("replacement"));
+			await closing.promise;
+			const early = await nextStream(pair.client);
+			early?.abort(new Error("replacement arrived before acknowledgment"));
+			expect(early).toBeUndefined();
+			expect(opened).toBe(1);
+			if (result === "rejected") {
+				expect(disposed).not.toHaveBeenCalled();
+				acknowledged.reject(new Error("FIN acknowledgment failed"));
+				await loop;
+				expect(opened).toBe(1);
+				expect(disposed).toHaveBeenCalled();
+				return;
+			}
+			acknowledged.resolve();
+			const replacement = await nextStream(pair.client);
+			if (!replacement) throw new Error("missing replacement after acknowledgment");
+			expect(await readPublishNamespace(replacement)).toBe(Path.from("replacement"));
+			await acceptPublishNamespace(replacement);
+		} finally {
+			registration?.mockRestore();
+			acknowledged.resolve();
+			first?.close();
+			second?.close();
+			origin.close();
+			await loop;
+			pair.client.close();
+			pair.server.close();
+		}
+	},
+);
+
 /**
  * Every advertisement waits a round trip for the peer's reply. A broadcast published in
  * that window has to survive it: the loop is not watching the signal while it waits, so
@@ -214,7 +305,7 @@ test("a broadcast published mid-advertisement is still announced", async () => {
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 	const { pub, origin } = publisher(pair.server);
 
-	origin.publish(Path.from("first"));
+	publish(origin, Path.from("first"));
 
 	void pub.runPublishNamespaces();
 
@@ -224,7 +315,7 @@ test("a broadcast published mid-advertisement is still announced", async () => {
 	expect(await readPublishNamespace(one)).toBe(Path.from("first"));
 
 	// Publish while the loop is parked on that reply.
-	origin.publish(Path.from("second"));
+	publish(origin, Path.from("second"));
 	await new Promise((resolve) => setTimeout(resolve, SETTLE));
 
 	await acceptPublishNamespace(one);
@@ -246,7 +337,7 @@ test("a declined advertisement is retried on the next change", async () => {
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 	const { pub, origin } = publisher(pair.server);
 
-	origin.publish(Path.from("first"));
+	publish(origin, Path.from("first"));
 
 	void pub.runPublishNamespaces();
 
@@ -257,7 +348,7 @@ test("a declined advertisement is retried on the next change", async () => {
 
 	// Any later change re-runs the diff, which is where the refused namespace has to
 	// reappear rather than being remembered as up.
-	origin.publish(Path.from("second"));
+	publish(origin, Path.from("second"));
 
 	const seen = new Set<Path.Valid>();
 	for (let i = 0; i < 2; i++) {
@@ -295,14 +386,14 @@ test("a failed stream open does not kill the announce loop", async () => {
 	};
 
 	const { pub, origin } = publisher(pair.server, { session });
-	origin.publish(Path.from("first"));
+	publish(origin, Path.from("first"));
 
 	void pub.runPublishNamespaces();
 	await new Promise((resolve) => setTimeout(resolve, SETTLE));
 
 	// The refused open cost "first" its turn; the next change has to bring it back along
 	// with the newcomer.
-	origin.publish(Path.from("second"));
+	publish(origin, Path.from("second"));
 
 	const seen = new Set<Path.Valid>();
 	for (let i = 0; i < 2; i++) {
@@ -340,7 +431,7 @@ test("a namespace refused once is retried without anything else changing", async
 	};
 
 	const { pub, origin } = publisher(pair.server, { session });
-	origin.publish(Path.from("lonely"));
+	publish(origin, Path.from("lonely"));
 
 	void pub.runPublishNamespaces();
 
@@ -378,7 +469,7 @@ test("a solicited legacy advertisement refused once is retried", async () => {
 	// The peer declared that advertisements to it must be solicited, so this is the loop
 	// that answers its SUBSCRIBE_NAMESPACE.
 	const { pub, origin } = publisher(pair.server, { requiresSolicitation: true, session });
-	origin.publish(Path.from("lonely"));
+	publish(origin, Path.from("lonely"));
 
 	const subscription = await Stream.open(pair.client, { version: Version.DRAFT_15 });
 	const accepted = await Stream.accept(pair.server, Version.DRAFT_15);
@@ -403,7 +494,7 @@ test("a solicited legacy advertisement refused once is retried", async () => {
 test("a refusal that forbids retrying is not retried", async () => {
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 	const { pub, origin } = publisher(pair.server);
-	origin.publish(Path.from("lonely"));
+	publish(origin, Path.from("lonely"));
 
 	void pub.runPublishNamespaces();
 
@@ -428,7 +519,7 @@ test("republishing a path clears a refusal without unannouncing first", async ()
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 	const { pub, origin } = publisher(pair.server);
 
-	origin.publish(Path.from("recycled"));
+	publish(origin, Path.from("recycled"));
 
 	void pub.runPublishNamespaces();
 
@@ -439,7 +530,7 @@ test("republishing a path clears a refusal without unannouncing first", async ()
 	await new Promise((resolve) => setTimeout(resolve, SETTLE));
 
 	// A new broadcast takes the path over outright: no close, no gap.
-	origin.publish(Path.from("recycled"));
+	publish(origin, Path.from("recycled"));
 
 	const retried = await nextStream(pair.client);
 	if (!retried) throw new Error("the replacement broadcast was never offered");
@@ -459,7 +550,7 @@ test("re-announcing a path clears a refusal that forbade retrying", async () => 
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 	const { pub, origin } = publisher(pair.server);
 
-	const first = origin.publish(Path.from("recycled"));
+	const first = publish(origin, Path.from("recycled"));
 
 	void pub.runPublishNamespaces();
 
@@ -471,7 +562,7 @@ test("re-announcing a path clears a refusal that forbade retrying", async () => 
 	// The broadcast goes away, taking the refusal with it, and a new one takes its place.
 	first.close();
 	await new Promise((resolve) => setTimeout(resolve, SETTLE));
-	origin.publish(Path.from("recycled"));
+	publish(origin, Path.from("recycled"));
 
 	const retried = await nextStream(pair.client);
 	if (!retried) throw new Error("a re-announced path was never offered again");
@@ -490,7 +581,7 @@ test("closing the session ends the unsolicited announce loop", async () => {
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 	const { pub, origin } = publisher(pair.server);
 
-	origin.publish(Path.from("first"));
+	publish(origin, Path.from("first"));
 
 	const loop = pub.runPublishNamespaces();
 
@@ -510,7 +601,7 @@ test("closing the session ends the unsolicited announce loop", async () => {
 	]);
 
 	// The origin really did survive the session, so publishing into it is still valid.
-	origin.publish(Path.from("second"));
+	publish(origin, Path.from("second"));
 	origin.close();
 });
 
@@ -525,7 +616,7 @@ test("an advertisement carries our hop id once the peer declared one", async () 
 	for (const peer of [HopSchema.parse(9n), undefined]) {
 		const pair = createMockTransportPair(ALPN.DRAFT_19);
 		const { pub, origin } = publisher(pair.server, { cluster: { self, peer } });
-		origin.publish(Path.from("mine"));
+		publish(origin, Path.from("mine"));
 		void pub.runPublishNamespaces();
 
 		const stream = await nextStream(pair.client);
@@ -549,6 +640,36 @@ test("an advertisement carries our hop id once the peer declared one", async () 
 	}
 });
 
+test("an advertisement carries the announced route and re-prices in place", async () => {
+	const self: Hop = HopSchema.parse(7n);
+	const peer: Hop = HopSchema.parse(9n);
+	const via: Hop = HopSchema.parse(3n);
+	const pair = createMockTransportPair(ALPN.DRAFT_19);
+	const { pub, origin } = publisher(pair.server, { cluster: { self, peer } });
+	const broadcast = origin.createBroadcast(Path.from("mine"));
+	broadcast.announce({ hops: [via], cost: 4n });
+	void pub.runPublishNamespaces();
+
+	const stream = await nextStream(pair.client);
+	if (!stream) throw new Error("no PUBLISH_NAMESPACE for the broadcast");
+	expect(await stream.reader.u53()).toBe(PublishNamespace.id);
+	const msg = await PublishNamespace.decode(stream.reader, VERSION, true);
+	expect(msg.trackNamespace).toBe(Path.from("mine"));
+	expect(msg.cluster).toEqual({ hops: [via, self], cost: 4n });
+	await acceptPublishNamespace(stream);
+
+	broadcast.announce({ hops: [via], cost: 8n });
+	const next = await nextStream(pair.client);
+	if (!next) throw new Error("no PUBLISH_NAMESPACE for the re-price");
+	expect(await next.reader.u53()).toBe(PublishNamespace.id);
+	const updated = await PublishNamespace.decode(next.reader, VERSION, true);
+	expect(updated.trackNamespace).toBe(Path.from("mine"));
+	expect(updated.cluster).toEqual({ hops: [via, self], cost: 8n });
+	await acceptPublishNamespace(next);
+
+	origin.close();
+});
+
 test("subscription completion sends PUBLISH_DONE on every supported draft", async () => {
 	const versions = [
 		Version.DRAFT_14,
@@ -565,7 +686,7 @@ test("subscription completion sends PUBLISH_DONE on every supported draft", asyn
 			const session = new NativeSession(pair.server, version, true);
 			const path = Path.from("test");
 			const { pub, origin } = publisher(pair.server, { session });
-			const broadcast = origin.publish(path);
+			const broadcast = publish(origin, path);
 			const track = broadcast.createTrack("video");
 
 			const client = await Stream.open(pair.client, { version });
@@ -627,23 +748,37 @@ interface ServedFill {
 	reset?: Error;
 }
 
+/** The subprotocol each draft negotiates, so the mock pair names the version under test. */
+const ALPNS: Record<IetfVersion, string> = {
+	[Version.DRAFT_14]: ALPN.DRAFT_14,
+	[Version.DRAFT_15]: ALPN.DRAFT_15,
+	[Version.DRAFT_16]: ALPN.DRAFT_16,
+	[Version.DRAFT_17]: ALPN.DRAFT_17,
+	[Version.DRAFT_18]: ALPN.DRAFT_18,
+	[Version.DRAFT_19]: ALPN.DRAFT_19,
+	[Version.DRAFT_20]: ALPN.DRAFT_20,
+	[Version.DRAFT_21]: ALPN.DRAFT_21,
+};
+
 /**
- * A publisher serving one broadcast over draft-20, with the subscribe stream already open.
+ * A publisher serving one broadcast over `version` (draft-20 unless a test says otherwise),
+ * with the subscribe stream already open.
  *
  * The uni reader is taken up front: a group stream opened before the test asks for one still
  * queues, but taking the reader late races the publisher rather than the test.
  */
-function fixture(): {
+function fixture(version: IetfVersion = V20): {
 	pair: ReturnType<typeof createMockTransportPair>;
 	pub: Publisher;
 	broadcast: BroadcastProducer;
 	uni: ReadableStreamDefaultReader<ReadableStream<Uint8Array>>;
+	version: IetfVersion;
 	close: () => void;
 } {
-	const pair = createMockTransportPair(ALPN.DRAFT_20);
-	const session = new NativeSession(pair.server, V20, true);
+	const pair = createMockTransportPair(ALPNS[version]);
+	const session = new NativeSession(pair.server, version, true);
 	const { pub, origin } = publisher(pair.server, { session });
-	const broadcast = origin.publish(Path.from("test"));
+	const broadcast = publish(origin, Path.from("test"));
 	const uni = pair.client.incomingUnidirectionalStreams.getReader() as ReadableStreamDefaultReader<
 		ReadableStream<Uint8Array>
 	>;
@@ -653,6 +788,7 @@ function fixture(): {
 		pub,
 		broadcast,
 		uni,
+		version,
 		close: () => {
 			uni.releaseLock();
 			origin.close();
@@ -674,14 +810,14 @@ async function runSubscribe(
 	fx: ReturnType<typeof fixture>,
 	msg: Subscribe,
 ): Promise<{ client: Stream; ok: SubscribeOk }> {
-	const client = await Stream.open(fx.pair.client, { version: V20 });
-	const server = await Stream.accept(fx.pair.server, V20);
+	const client = await Stream.open(fx.pair.client, { version: fx.version });
+	const server = await Stream.accept(fx.pair.server, fx.version);
 	if (!server) throw new Error("publisher never accepted the subscribe stream");
 
 	void fx.pub.runSubscribe(msg, server);
 
 	expect(await client.reader.u53()).toBe(SubscribeOk.id);
-	return { client, ok: await SubscribeOk.decode(client.reader, V20) };
+	return { client, ok: await SubscribeOk.decode(client.reader, fx.version) };
 }
 
 /** Take the next uni stream the publisher opened, or undefined if it opened none. */
@@ -879,20 +1015,20 @@ test("draft-20: a fill serves the current group's head on a fetch stream", async
 });
 
 /**
- * A group that outgrows its cache evicts its own front. A Next Object subscriber joins above
- * that evicted prefix, so it lost nothing it asked for: evicting objects the filter already
- * excludes must not forfeit the live tail it did request.
+ * A group that outgrows its cache is aborted. A Next Object subscriber joining that group
+ * sees the abort rather than a live tail served off a trimmed head.
  */
-test("draft-20: an open group that outgrew its cache still serves the live tail", async () => {
+test("draft-20: an open group that outgrew its cache aborts instead of serving a tail", async () => {
 	const fx = fixture();
 	const track = fx.broadcast.createTrack("video");
 
-	// Past the frame cap, so the oldest objects are gone before anyone subscribes.
 	const group = track.appendGroup();
-	const published = MAX_GROUP_FRAMES + 10;
-	for (let i = 0; i < published; i++) {
+	for (let i = 0; i < MAX_GROUP_FRAMES; i++) {
 		group.writeFrame({ payload: new TextEncoder().encode(`0.${i}`), timestamp: Timestamp.now() });
 	}
+	expect(() =>
+		group.writeFrame({ payload: new TextEncoder().encode("overflow"), timestamp: Timestamp.now() }),
+	).toThrow();
 
 	const { client, ok } = await runSubscribe(
 		fx,
@@ -906,19 +1042,11 @@ test("draft-20: an open group that outgrew its cache still serves the live tail"
 	);
 
 	try {
-		expect(ok.largest).toEqual({ groupId: 0n, objectId: BigInt(published - 1) });
-
-		group.writeFrame({ payload: new TextEncoder().encode(`0.${published}`), timestamp: Timestamp.now() });
-		group.close();
+		expect(ok.largest).toEqual({ groupId: 0n, objectId: BigInt(MAX_GROUP_FRAMES - 1) });
 
 		const live = await nextUni(fx.uni);
-		if (!live) throw new Error("the subscription never served the live tail");
-		expect(await readGroup(live)).toEqual({
-			sequence: 0,
-			// The join is mid-group, so the stream does not start at the group's first object.
-			firstObject: false,
-			objects: [{ id: published, payload: `0.${published}` }],
-		});
+		if (!live) throw new Error("the subscription never opened a stream for the aborted group");
+		await expect(readGroup(live)).rejects.toBeDefined();
 	} finally {
 		fx.close();
 		client.close();
@@ -1020,6 +1148,62 @@ test("draft-20: an empty track opens no fill stream", async () => {
 		fx.close();
 		client.close();
 	}
+});
+
+/**
+ * Subscribe over `version` to a track whose live edge is object 3 of group 5, and report the
+ * Largest Location the SUBSCRIBE_OK advertised.
+ */
+async function subscribeOkLargest(version: IetfVersion): Promise<SubscribeOk["largest"]> {
+	const fx = fixture(version);
+	const track = fx.broadcast.createTrack("video");
+
+	const group = new GroupProducer(5);
+	track.writeGroup(group);
+	for (let i = 0; i < 4; i++) {
+		group.writeFrame({ payload: new TextEncoder().encode(`5.${i}`), timestamp: Timestamp.now() });
+	}
+	group.close();
+
+	const { client, ok } = await runSubscribe(
+		fx,
+		new Subscribe({
+			requestId: 7n,
+			trackNamespace: Path.from("test"),
+			trackName: "video",
+			subscriberPriority: 0,
+			filter: { kind: "unfiltered" },
+		}),
+	);
+
+	try {
+		return ok.largest;
+	} finally {
+		fx.close();
+		client.close();
+	}
+}
+
+/**
+ * What LARGEST_OBJECT names has to match where the subscription actually starts. Below
+ * draft-20 the filter is ignored and the whole group is served, and the only way to ask for a
+ * head we skipped is a joining FETCH, which we answer with an empty stream. Advertising the
+ * mid-group edge there promises a backfill nothing can deliver, so the Location drops to the
+ * start of the group.
+ */
+test.each([
+	["draft-15", Version.DRAFT_15],
+	["draft-16", Version.DRAFT_16],
+	["draft-17", Version.DRAFT_17],
+	["draft-18", Version.DRAFT_18],
+	["draft-19", Version.DRAFT_19],
+] as const)("%s: LARGEST_OBJECT is the start of the group it serves", async (_draft, version) => {
+	expect(await subscribeOkLargest(version)).toEqual({ groupId: 5n, objectId: 0n });
+});
+
+/** Draft-20 serves a skipped head with a FILL, so it advertises the true live edge. */
+test("draft-20: LARGEST_OBJECT is the live edge", async () => {
+	expect(await subscribeOkLargest(Version.DRAFT_20)).toEqual({ groupId: 5n, objectId: 3n });
 });
 
 /**

@@ -15,13 +15,6 @@ use web_transport_proto::{ConnectRequest, ConnectResponse};
 pub use iroh::Endpoint;
 pub use web_transport_iroh;
 
-/// The congestion control family to install, defaulting to loss-based.
-///
-/// iroh uses loss-based congestion control unless delay-based is requested.
-fn congestion_control(quic: &crate::quic::Resolved) -> CongestionControl {
-	quic.congestion_control.unwrap_or(CongestionControl::Loss)
-}
-
 /// The iroh controller factory for a congestion control family.
 ///
 /// iroh is built on noq, so its BBR is v3. It re-exports the `ControllerFactory`
@@ -144,6 +137,7 @@ pub struct EndpointConfig {
 		name = "iroh-enabled",
 		long = "iroh-enabled",
 		env = "MOQ_IROH_ENABLED",
+		setting = "iroh.enabled",
 		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
@@ -152,17 +146,32 @@ pub struct EndpointConfig {
 
 	/// Secret key for the iroh endpoint, either a hex-encoded string or a path to a file.
 	/// If the file does not exist, a random key will be generated and written to the path.
-	#[usage(name = "iroh-secret", long = "iroh-secret", env = "MOQ_IROH_SECRET")]
+	#[usage(
+		name = "iroh-secret",
+		long = "iroh-secret",
+		env = "MOQ_IROH_SECRET",
+		setting = "iroh.secret"
+	)]
 	pub secret: Option<String>,
 
 	/// Listen for UDP packets on the given address.
 	/// Defaults to `0.0.0.0:0` if not provided.
-	#[usage(name = "iroh-bind-v4", long = "iroh-bind-v4", env = "MOQ_IROH_BIND_V4")]
+	#[usage(
+		name = "iroh-bind-v4",
+		long = "iroh-bind-v4",
+		env = "MOQ_IROH_BIND_V4",
+		setting = "iroh.bind_v4"
+	)]
 	pub bind_v4: Option<net::SocketAddrV4>,
 
 	/// Listen for UDP packets on the given address.
 	/// Defaults to `[::]:0` if not provided.
-	#[usage(name = "iroh-bind-v6", long = "iroh-bind-v6", env = "MOQ_IROH_BIND_V6")]
+	#[usage(
+		name = "iroh-bind-v6",
+		long = "iroh-bind-v6",
+		env = "MOQ_IROH_BIND_V6",
+		setting = "iroh.bind_v6"
+	)]
 	pub bind_v6: Option<net::SocketAddrV6>,
 
 	/// Disable the iroh relay, using only direct P2P connections.
@@ -170,6 +179,7 @@ pub struct EndpointConfig {
 		name = "iroh-disable-relay",
 		long = "iroh-disable-relay",
 		env = "MOQ_IROH_DISABLE_RELAY",
+		setting = "iroh.disable_relay",
 		default_missing = "true",
 		num_args = 0..=1,
 		require_equals = true,
@@ -251,7 +261,7 @@ impl EndpointConfig {
 		if let Some(window) = quic.send_window {
 			transport = transport.send_window(window);
 		}
-		transport = transport.congestion_controller_factory(congestion_factory(congestion_control(&quic)));
+		transport = transport.congestion_controller_factory(congestion_factory(quic.congestion()));
 
 		let mut builder = if self.disable_relay.unwrap_or(false) {
 			Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -414,6 +424,7 @@ mod tests {
 	async fn bind_refuses_a_released_quic_spelling() {
 		#[derive(usage::Cli)]
 		#[usage(unknown_flags = "error", args_override_self = false)]
+		#[usage(settings)]
 		struct Cli {
 			#[usage(flatten)]
 			quic: crate::quic::Config,
@@ -480,16 +491,5 @@ mod tests {
 
 		let delay = congestion_factory(CongestionControl::Delay).build(now, mtu);
 		assert!(delay.into_any().downcast::<noq_proto::congestion::Bbr3>().is_ok());
-	}
-
-	/// An unset knob lands on CUBIC, while an explicit delay request gets BBRv3.
-	#[test]
-	fn congestion_control_defaults_to_loss() {
-		let mut quic = crate::quic::Config::default();
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Loss);
-
-		// An explicit request still gets through.
-		quic.congestion_control = Some(CongestionControl::Delay);
-		assert_eq!(congestion_control(&quic.resolve()), CongestionControl::Delay);
 	}
 }

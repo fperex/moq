@@ -230,10 +230,7 @@ fn apply_settings(settings: &mut web_transport_quiche::Settings, quic: &Resolved
 		settings.max_stream_window = window;
 	}
 
-	// Live media wants a steady send rate an encoder can track, not CUBIC's sawtooth,
-	// so default to BBR rather than quiche's own CUBIC.
-	let family = quic.congestion_control.unwrap_or(CongestionControl::Delay);
-	settings.cc_algorithm = cc_algorithm(family).to_owned();
+	settings.cc_algorithm = cc_algorithm(quic.congestion()).to_owned();
 
 	// quiche writes one file per connection itself, named after the connection ID.
 	if let Some(dir) = quic.qlog_dir() {
@@ -329,9 +326,14 @@ impl QuicheClient {
 		})
 	}
 
-	pub async fn connect(&self, url: Url, versions: &moq_net::Versions) -> Result<web_transport_quiche::Connection> {
+	pub async fn connect(
+		&self,
+		addr: crate::connect::Addr,
+		versions: &moq_net::Versions,
+	) -> Result<web_transport_quiche::Connection> {
 		use crate::tls::Verification;
 
+		let url = addr.url().clone();
 		let host = url.host().ok_or(Error::InvalidDnsName)?.to_string();
 		let port = url.port().unwrap_or(443);
 
@@ -399,8 +401,11 @@ impl QuicheClient {
 		// the answers Happy Eyeballs style as they land, so neither a broken family
 		// nor a lookup still waiting on its AAAA record can stall the connect.
 		let target = url.host().ok_or(Error::InvalidDnsName)?;
-		let mut candidates =
-			crate::resolve::Candidates::resolve(target, port, self.resolution_delay).with_local(local, dual_stack);
+		let mut candidates = match addr.addresses() {
+			Some(addrs) => crate::resolve::Candidates::fixed(addrs.iter().copied()),
+			None => crate::resolve::Candidates::resolve(target, port, self.resolution_delay),
+		}
+		.with_local(local, dual_stack);
 
 		// Each attempt binds its own socket, and a pinned non-zero source port only
 		// fits one socket at a time: an overlapping attempt would fail its bind with

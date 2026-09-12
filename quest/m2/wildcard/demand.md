@@ -9,17 +9,18 @@ player never demands what it hides.
 
 ## Plan
 
-The gate is JS-only, and it is already half fixed.
-[moq#3225](https://github.com/moq-dev/moq/pull/3225) made `#isPathAnnounced` in
-`js/watch/src/broadcast.ts` prefix-aware: it holds the set of announced
-prefixes and accepts any that covers the path, so a route at `room/` already
-makes `room/alice/cam.hang` selectable without naming it. What it cannot do is
-match a pattern, since it tests with `Path.hasPrefix`.
+The gate is JS-only, and it is already prefix-aware.
+[moq#3225](https://github.com/moq-dev/moq/pull/3225) made `#isPathAnnounced`
+(`js/watch/src/broadcast.ts:216`) hold the set of announced prefixes and accept
+any that covers the path, so a route at `room/` already makes
+`room/alice/cam.hang` selectable without naming it. What it cannot do is match
+a pattern, since it tests with `Path.hasPrefix` (`:223`).
 
 So the remaining work is narrow: teach the JS client the wildcard
-advertisement (`js/net`'s announce handling, mirroring what
-[advertise](/quest/m2/wildcard/advertise.md) does in moq-net) and make the
-covering test use the shared pattern matching rather than prefix containment.
+advertisement (`js/net/src/announced.ts` and `js/net/src/lite/announce.ts`,
+mirroring what [advertise](/quest/m1/wildcard-advertise.md) does in moq-net)
+and make the covering test use `Path.Pattern` (`js/net/src/path.ts:526`)
+rather than prefix containment.
 Withdrawal of the last covering wildcard hides the rendition again, the same
 reactive shape announcements have today.
 

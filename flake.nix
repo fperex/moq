@@ -198,6 +198,7 @@
         # `just rs package` works from `nix develop` on both Linux and macOS.
         packagingDeps = with pkgs; [
           nfpm
+          rpm
           dpkg
           gettext
 
@@ -216,7 +217,6 @@
           lib.optionals (!stdenv.hostPlatform.isDarwin) [
             apt
             createrepo_c
-            rpm
             rclone
             gnupg
             gzip
@@ -318,6 +318,8 @@
           # The upstream repository ignores Cargo.lock so cargo installs test
           # the unlocked resolver. Nix still consumes committed lock data.
           cargoLock.lockFile = ./nix/uniffi-dart-Cargo.lock;
+          # Enum fields must use the record's converter name without renaming it.
+          patches = [ ./nix/uniffi-dart-record-error.patch ];
           postPatch = ''
             cp ${./nix/uniffi-dart-Cargo.lock} Cargo.lock
           '';
@@ -478,15 +480,14 @@
           # host had, which shadows the Cargo shim `mbx setup` installs. Put it
           # back in front, so a bare `cargo` in this shell reaches the same
           # wrapper it reaches outside. `setup --status` is what knows where
-          # that shim lives; it exits non-zero when the host has none, which is
+          # that shim lives; it exits non-zero when there is none, which is
           # every machine that made a different caching choice.
           #
-          # Never in CI, where check.yml enters this shell and the `target/`
-          # the workflow restored is the one the job has to build in. A shim
-          # would silently move it into a machine-wide managed target instead,
-          # on whichever runner happens to have been set up that way.
+          # CI included: `.github/actions/rust-cache` runs `mbx setup` so this
+          # finds a shim there too. That is the only way mbx reaches a build
+          # that spawns Cargo itself, which release-plz does.
           shellHook = ''
-            if [ -z "''${CI:-}" ] && status=$(mbx setup --status 2>/dev/null); then
+            if status=$(mbx setup --status 2>/dev/null); then
               shim=$(printf '%s\n' "$status" | sed -n '1s/.*: //p')
               if [ -x "$shim" ]; then
                 export PATH="$(dirname "$shim"):$PATH"
@@ -513,9 +514,8 @@
         formatter = pkgs.nixfmt-tree;
 
         # Heavy Rust CI (clippy / doc / test) runs via `just check` and `just
-        # test` (see rs/justfile). CI and local commands default to plain Cargo;
-        # local development can select a compatible wrapper with RUST_CARGO.
-        # Neither path goes through crane.
+        # test` (see rs/justfile), reaching mbx through the Cargo shim the dev
+        # shell puts on PATH. Neither path goes through crane.
         # `nix flake check` is kept -- it still validates flake eval + builds the
         # dev shell -- but no longer compiles the workspace, so it's cheap
         # enough that `just check` runs it on any Nix/Rust input change. Release

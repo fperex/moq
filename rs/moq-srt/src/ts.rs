@@ -36,14 +36,13 @@ impl Publisher {
 	/// Create the broadcast on `origin` at `path` and wire up the TS importer +
 	/// catalog.
 	///
-	/// `max_age` is the retention declared on the media tracks the importer mints: how
-	/// long relays keep a non-latest group fetchable, or `None` for hang's own default.
-	pub fn new(origin: &origin::Producer, path: &str, max_age: Option<Duration>) -> Result<Self> {
+	/// `config` is the catalog the importer publishes into: retention
+	/// (`with_max_age`) and the connection allocator passthrough tracks claim on
+	/// (`with_bandwidth`).
+	pub fn new(origin: &origin::Producer, path: &str, config: moq_mux::catalog::Config) -> Result<Self> {
 		let mut broadcast = origin.create_broadcast(path)?;
 		broadcast.announce(moq_net::origin::Route::default())?;
-		let config = moq_mux::catalog::Config::default()
-			.with_catalog(moq_mux::catalog::hang::Catalog::<ts::Ext>::default())
-			.with_max_age(max_age);
+		let config = config.with_catalog(moq_mux::catalog::hang::Catalog::<ts::Ext>::default());
 		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
 		let handle = broadcast.clone();
 		let importer = ts::Import::new(broadcast, catalog.reserve());
@@ -124,6 +123,17 @@ impl Subscriber {
 	pub async fn next(&mut self) -> Result<Option<Frame>> {
 		Ok(self.export.next().await?)
 	}
+
+	/// The muxer's generation counter for the frame [`next`](Self::next) just
+	/// returned, which increments each time the publisher rewinds its timeline.
+	///
+	/// The muxer restarts its program clock across that boundary, so a caller
+	/// pacing on the media timestamps has to drop its own anchor with it: sample
+	/// this after every frame and re-anchor when it changes, or the rewound span
+	/// maps into the past and the whole new generation collapses onto one instant.
+	pub fn discontinuity(&self) -> u64 {
+		self.export.discontinuity()
+	}
 }
 
 #[cfg(test)]
@@ -201,7 +211,12 @@ mod tests {
 	#[tokio::test]
 	async fn publisher_declares_the_configured_retention() {
 		let origin = produce_origin();
-		let mut publisher = Publisher::new(&origin, "live/cam0", Some(Duration::from_secs(3))).unwrap();
+		let mut publisher = Publisher::new(
+			&origin,
+			"live/cam0",
+			moq_mux::catalog::Config::default().with_max_age(Duration::from_secs(3)),
+		)
+		.unwrap();
 
 		let mut ts = psi_packet(0x0000, &pat(0x0100));
 		ts.extend_from_slice(&psi_packet(0x0100, &pmt(0x0101)));
@@ -218,7 +233,7 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn publisher_preserves_scte35_cues() {
 		let origin = produce_origin();
-		let mut publisher = Publisher::new(&origin, "ingest", None).unwrap();
+		let mut publisher = Publisher::new(&origin, "ingest", Default::default()).unwrap();
 
 		let consumer = origin.consume();
 		timeout(Duration::from_secs(5), consumer.routed("ingest"))
@@ -255,7 +270,7 @@ mod tests {
 		};
 
 		let track = broadcast.track(name.as_str()).unwrap().subscribe(None).await.unwrap();
-		let mut reader = moq_mux::container::Consumer::new(track, Container::Legacy);
+		let mut reader = moq_mux::container::Consumer::new(track, Container::Legacy(moq_mux::container::Kind::Data));
 		let cue = timeout(Duration::from_secs(5), reader.read())
 			.await
 			.expect("cue read timed out")
@@ -303,7 +318,7 @@ mod tests {
 			})
 			.expect("SRT egress preserves the SCTE-35 track");
 		let track = roundtrip_consumer.track(name).unwrap().subscribe(None).await.unwrap();
-		let mut reader = moq_mux::container::Consumer::new(track, Container::Legacy);
+		let mut reader = moq_mux::container::Consumer::new(track, Container::Legacy(moq_mux::container::Kind::Data));
 		let cue = timeout(Duration::from_secs(5), reader.read())
 			.await
 			.expect("round-trip cue read timed out")

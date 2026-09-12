@@ -13,7 +13,7 @@ use crate::{
 	util::{MaybeBoxedExt, MaybeSendBox, TaskSet, Tasks},
 };
 
-use super::{Message, Version, cluster, peer};
+use super::{Message, Version, cluster, error::request, peer};
 
 use web_async::Lock;
 use web_transport_trait::{MaybeSend, MaybeSync};
@@ -146,6 +146,20 @@ struct State {
 
 	// Each broadcast created by a PUBLISH_NAMESPACE message.
 	broadcasts: HashMap<PathOwned, BroadcastState>,
+}
+
+impl Drop for State {
+	fn drop(&mut self) {
+		// The session dispatcher owns this state and can be dropped at any await.
+		// Active receive tasks abort their own groups. Cancel any head waiting for
+		// its tail here, along with the track. Ordinary unsubscribe removes its entry.
+		for (_, track) in self.subscribes.drain() {
+			if let Fill::Ready { producer, .. } = &*track.fill.read() {
+				let _ = producer.clone().abort(Error::Cancel);
+			}
+			let _ = track.producer.abort(Error::Cancel);
+		}
+	}
 }
 
 /// The head of a joined group, delivered on the subscription's fill fetch stream.
@@ -640,13 +654,15 @@ where
 			}
 			ietf::SubscribeNamespaceError::ID if self.version == Version::Draft14 => {
 				let msg = ietf::SubscribeNamespaceError::decode_msg(&mut data, self.version)?;
-				tracing::warn!(error_code = %msg.error_code, reason = %msg.reason_phrase, "subscribe_namespace error");
-				return Err(Error::Cancel);
+				let err = request::from_code(msg.error_code, request::Kind::SubscribeNamespace, self.version);
+				tracing::warn!(%err, reason = %msg.reason_phrase, "subscribe_namespace error");
+				return Err(err);
 			}
 			ietf::RequestError::ID => {
 				let msg = ietf::RequestError::decode_msg(&mut data, self.version)?;
-				tracing::warn!(error_code = %msg.error_code, reason = %msg.reason_phrase, "subscribe_namespace error");
-				return Err(Error::Cancel);
+				let err = request::from_code(msg.error_code, request::Kind::SubscribeNamespace, self.version);
+				tracing::warn!(%err, reason = %msg.reason_phrase, "subscribe_namespace error");
+				return Err(err);
 			}
 			_ => return Err(Error::UnexpectedMessage),
 		}
@@ -856,8 +872,13 @@ where
 		// than attaching a source we would then have to route around.
 		let Some(advert) = self.route(msg.cluster.as_ref(), &peer) else {
 			tracing::debug!(%path, "dropping reflected publish_namespace");
-			self.write_error(&mut stream, request_id, 400, "route loops through this relay")
-				.await?;
+			self.write_error(
+				&mut stream,
+				request_id,
+				&Error::Unroutable,
+				"route loops through this relay",
+			)
+			.await?;
 			let _ = stream.writer.close().await;
 			return Ok(());
 		};
@@ -871,7 +892,8 @@ where
 				}
 			}
 			Err(err) => {
-				self.write_error(&mut stream, request_id, 400, &err.to_string()).await?;
+				self.write_error(&mut stream, request_id, &err, &err.to_string())
+					.await?;
 				let _ = stream.writer.close().await;
 				return Ok(());
 			}
@@ -1010,17 +1032,20 @@ where
 	) -> Result<(), Error> {
 		tracing::debug!(broadcast = %msg.track_namespace, track = %msg.track_name, "rejecting publish");
 
-		// NOT_SUPPORTED, from the PUBLISH error codes in draft-19 section 10.10. We decline
-		// the method itself rather than this particular track, which is UNINTERESTED (0x4).
+		// We decline the method itself rather than this particular track, which would be
+		// UNINTERESTED.
 		//
 		// The alias the message carries is deliberately not recorded. Nothing will ever bind
 		// it, and a rejected request has no lifetime of ours to hang the cleanup on, so the
 		// entry would have to be swept asynchronously. Any data streams the publisher opened
 		// before reading this are dropped by the unknown-alias path instead.
-		const NOT_SUPPORTED: u64 = 0x3;
-
-		self.write_publish_error(&mut stream, msg.request_id, NOT_SUPPORTED, "PUBLISH is not supported")
-			.await?;
+		self.write_publish_error(
+			&mut stream,
+			msg.request_id,
+			&Error::Unsupported,
+			"PUBLISH is not supported",
+		)
+		.await?;
 		// The rejection is the whole exchange, but it still has to arrive: a finish alone
 		// leaves the drop-time reset free to discard it before the peer acknowledges it.
 		let _ = stream.writer.close().await;
@@ -1052,14 +1077,16 @@ where
 		Ok(())
 	}
 
-	/// Send error on the bidi stream.
+	/// Refuse a PUBLISH_NAMESPACE on the bidi stream that carries it.
 	async fn write_error(
 		&self,
 		stream: &mut Stream<S, Version>,
 		request_id: RequestId,
-		error_code: u64,
+		err: &Error,
 		reason: &str,
 	) -> Result<(), Error> {
+		let error_code = request::to_code(err, request::Kind::PublishNamespace, self.version);
+
 		match self.version {
 			Version::Draft14 => {
 				stream.writer.encode(&ietf::PublishNamespaceError::ID).await?;
@@ -1100,13 +1127,16 @@ where
 		Ok(())
 	}
 
+	/// Refuse a PUBLISH on the bidi stream that carries it.
 	async fn write_publish_error(
 		&self,
 		stream: &mut Stream<S, Version>,
 		request_id: RequestId,
-		error_code: u64,
+		err: &Error,
 		reason: &str,
 	) -> Result<(), Error> {
+		let error_code = request::to_code(err, request::Kind::Publish, self.version);
+
 		match self.version {
 			Version::Draft14 => {
 				stream.writer.encode(&ietf::PublishError::ID).await?;
@@ -1201,7 +1231,8 @@ where
 			}
 			Entry::Vacant(entry) => {
 				// Propagates Error::Unauthorized if the namespace is out of scope.
-				let dynamic = self.origin.dynamic(&path, route.clone())?;
+				let pattern = crate::Pattern::subtree(path.as_str()).map_err(|_| Error::Unsupported)?;
+				let dynamic = self.origin.dynamic(pattern, route.clone())?;
 
 				entry.insert(BroadcastState {
 					route,
@@ -1727,15 +1758,25 @@ where
 					largest: msg.largest,
 				}))
 			}
+			// The rejection reaches the track as the reason the publisher gave, so a
+			// subscriber can tell a broadcast that is not there from one it may not have.
 			ietf::SubscribeError::ID if self.version == Version::Draft14 => {
 				let msg = ietf::SubscribeError::decode_msg(&mut data, self.version)?;
 				tracing::warn!(message = ?msg, "subscribe error");
-				Err(Error::Cancel)
+				Err(request::from_code(
+					msg.error_code,
+					request::Kind::Subscribe,
+					self.version,
+				))
 			}
 			ietf::RequestError::ID => {
 				let msg = ietf::RequestError::decode_msg(&mut data, self.version)?;
 				tracing::warn!(message = ?msg, "request error");
-				Err(Error::Cancel)
+				Err(request::from_code(
+					msg.error_code,
+					request::Kind::Subscribe,
+					self.version,
+				))
 			}
 			_ => Err(Error::UnexpectedMessage),
 		}
@@ -1802,7 +1843,7 @@ where
 		// The peek inside blocks until the publisher produces the group's first object, so
 		// race it against the subscription going away the same way the group read below is.
 		// Otherwise dropping the local subscriber cannot end this handler.
-		let (mut producer, start) = {
+		let (producer, start) = {
 			let mut opening = track.clone();
 			let mut open = std::pin::pin!(self.open_group(stream, &mut opening, &fill, group.group_id));
 			kio::wait(|waiter| {
@@ -1813,6 +1854,10 @@ where
 			})
 			.await?
 		};
+
+		// Guarded: this handler can be dropped at any await below, and a group producer
+		// that dies without a terminal leaves its consumer waiting on nothing.
+		let producer = crate::recv::Group::new(producer);
 
 		let res = {
 			let mut ingest = GroupIngest::new(&group, timescale, self.version, start);
@@ -1830,8 +1875,8 @@ where
 		};
 
 		match res {
-			Err(Error::Cancel) => {
-				let _ = producer.abort(Error::Cancel);
+			Err(err @ (Error::Cancel | Error::Stream(crate::StreamError::Cancel))) => {
+				let _ = producer.abort(err);
 			}
 			Err(err) => {
 				tracing::debug!(%err, group = %producer.sequence, "group error");
@@ -2103,14 +2148,14 @@ where
 		track: &mut track::Producer,
 		timescale: Option<Timescale>,
 	) -> Result<Fill, Error> {
-		let mut head: Option<(u64, u64, group::Producer)> = None;
+		let mut head: Option<(u64, u64, crate::recv::Group)> = None;
 
 		match self.run_fill_objects(stream, track, timescale, &mut head).await {
 			Ok(()) => Ok(match head {
 				Some((sequence, next, producer)) => Fill::Ready {
 					sequence,
 					next,
-					producer,
+					producer: producer.into_inner(),
 				},
 				None => Fill::Done,
 			}),
@@ -2134,7 +2179,7 @@ where
 		stream: &mut Reader<S::RecvStream, Version>,
 		track: &mut track::Producer,
 		timescale: Option<Timescale>,
-		head: &mut Option<(u64, u64, group::Producer)>,
+		head: &mut Option<(u64, u64, crate::recv::Group)>,
 	) -> Result<(), Error> {
 		while let Some(object) = stream.decode_maybe::<ietf::FetchObject>().await? {
 			let ietf::FetchObject::Object {
@@ -2171,7 +2216,7 @@ where
 					};
 
 					let producer = track.create_group(group::Info { sequence })?;
-					*head = Some((sequence, 0, producer));
+					*head = Some((sequence, 0, crate::recv::Group::new(producer)));
 				}
 				// A Group ID on a later object names a different group. We ask for the
 				// current group only, and a publisher refuses a wider fill rather than
@@ -2788,7 +2833,8 @@ mod tests {
 			writer
 				.encode(&ietf::RequestError {
 					request_id: Some(RequestId(1)),
-					error_code: 404,
+					// DOES_NOT_EXIST, draft-16 section 13.4.2.
+					error_code: 0x10,
 					reason_phrase: "not found".into(),
 					retry_interval: 0,
 				})
@@ -4181,78 +4227,98 @@ mod tests {
 	/// PUBLISH offers one track, but a source attaches per namespace and serves every
 	/// track under it. Rather than invent a namespace-level source from a track-level
 	/// offer, decline the request and leave the session running.
+	///
+	/// Draft-14 answers with PUBLISH_ERROR and its own registry; draft-15 folded the message
+	/// into REQUEST_ERROR, so both shapes have to carry NOT_SUPPORTED.
 	#[tokio::test]
 	async fn publish_is_rejected_without_announcing() {
-		// An open gate, so the rejection actually reaches the wire.
-		let gate = kio::Producer::new(true);
-		let session = crate::lite::test_transport::SinkSession::gated_bi(gate.consume());
-		let origin = crate::origin::Info::new(crate::Hop::new(1).unwrap()).produce();
-		let consumer = origin.consume();
-		let (tasks, task_set) = crate::util::TaskSet::new();
-		std::mem::forget(task_set);
+		for version in [Version::Draft14, Version::Draft19] {
+			// An open gate, so the rejection actually reaches the wire.
+			let gate = kio::Producer::new(true);
+			let session = crate::lite::test_transport::SinkSession::gated_bi(gate.consume());
+			let origin = crate::origin::Info::new(crate::Hop::new(1).unwrap()).produce();
+			let consumer = origin.consume();
+			let (tasks, task_set) = crate::util::TaskSet::new();
+			std::mem::forget(task_set);
 
-		let mut subscriber = Subscriber::new(
-			TestRuntime::new(),
-			session.clone(),
-			origin,
-			Control::new(None, false),
-			None,
-			peer::PeerSetup::default(),
-			crate::Hop::new(1).unwrap(),
-			None,
-			Version::Draft19,
-			tasks,
-			Default::default(),
-		);
-
-		let stream = Stream::open(&mut session.clone(), Version::Draft19).await.unwrap();
-		let msg = ietf::Publish {
-			request_id: RequestId(1),
-			track_namespace: crate::Path::new("room/host"),
-			track_name: "video".into(),
-			track_alias: 7,
-			largest_location: None,
-			forward: true,
-			properties: ietf::Properties::default(),
-		};
-
-		// Errors are surfaced to the peer on the stream, not raised as a session error.
-		subscriber.run_publish_stream(stream, msg).await.unwrap();
-		tokio::time::sleep(Duration::from_millis(1)).await;
-
-		assert!(
-			routed_now(&consumer, "room/host").is_none(),
-			"a rejected PUBLISH must not announce a broadcast"
-		);
-		// Encode the reply we expect rather than matching the reason alone, so the error code
-		// regressing to something outside draft-19 section 10.10's table cannot slip through.
-		let expected = {
-			const NOT_SUPPORTED: u64 = 0x3;
-
-			let log = crate::lite::test_transport::Log::default();
-			let mut writer = crate::coding::Writer::new(
-				crate::lite::test_transport::SinkSend::new(log.clone()),
-				Version::Draft19,
+			let mut subscriber = Subscriber::new(
+				TestRuntime::new(),
+				session.clone(),
+				origin,
+				Control::new(None, false),
+				None,
+				peer::PeerSetup::default(),
+				crate::Hop::new(1).unwrap(),
+				None,
+				version,
+				tasks,
+				Default::default(),
 			);
-			writer.encode(&ietf::RequestError::ID).await.unwrap();
-			writer
-				.encode(&ietf::RequestError {
-					request_id: None,
-					error_code: NOT_SUPPORTED,
-					reason_phrase: "PUBLISH is not supported".into(),
-					retry_interval: 0,
-				})
-				.await
-				.unwrap();
 
-			log.writes.lock().unwrap().clone()
-		};
+			let stream = Stream::open(&mut session.clone(), version).await.unwrap();
+			let msg = ietf::Publish {
+				request_id: RequestId(1),
+				track_namespace: crate::Path::new("room/host"),
+				track_name: "video".into(),
+				track_alias: 7,
+				largest_location: None,
+				forward: true,
+				properties: ietf::Properties::default(),
+			};
 
-		assert_eq!(
-			occurrences(&session.log, &expected),
-			1,
-			"the decline reaches the peer as NOT_SUPPORTED"
-		);
+			// Errors are surfaced to the peer on the stream, not raised as a session error.
+			subscriber.run_publish_stream(stream, msg).await.unwrap();
+			tokio::time::sleep(Duration::from_millis(1)).await;
+
+			assert!(
+				routed_now(&consumer, "room/host").is_none(),
+				"a rejected PUBLISH must not announce a broadcast"
+			);
+			// Encode the reply we expect rather than matching the reason alone, so an error
+			// code regressing to something outside the draft's table cannot slip through.
+			// NOT_SUPPORTED is 0x3 in every registry, which is what makes it comparable here.
+			let expected = {
+				const NOT_SUPPORTED: u64 = 0x3;
+
+				let log = crate::lite::test_transport::Log::default();
+				let mut writer =
+					crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+
+				match version {
+					Version::Draft14 => {
+						writer.encode(&ietf::PublishError::ID).await.unwrap();
+						writer
+							.encode(&ietf::PublishError {
+								request_id: RequestId(1),
+								error_code: NOT_SUPPORTED,
+								reason_phrase: "PUBLISH is not supported".into(),
+							})
+							.await
+							.unwrap();
+					}
+					_ => {
+						writer.encode(&ietf::RequestError::ID).await.unwrap();
+						writer
+							.encode(&ietf::RequestError {
+								request_id: None,
+								error_code: NOT_SUPPORTED,
+								reason_phrase: "PUBLISH is not supported".into(),
+								retry_interval: 0,
+							})
+							.await
+							.unwrap();
+					}
+				}
+
+				log.writes.lock().unwrap().clone()
+			};
+
+			assert_eq!(
+				occurrences(&session.log, &expected),
+				1,
+				"{version} must decline the PUBLISH as NOT_SUPPORTED"
+			);
+		}
 	}
 }
 
@@ -4274,14 +4340,15 @@ struct Join {
 /// Object subscription plus a `StartGroup=1` fill, which is the only form a publisher has
 /// to honor. It splits the group across two streams, the fill carrying the head and the
 /// subscription the tail, which `claim_fill` stitches back into one group producer.
-/// Earlier drafts cannot name a fill at all, so they keep asking for the next Object and
-/// joining mid-group, exactly as they always did.
+/// Earlier drafts have no fill parameter. Request unfiltered delivery so our publisher
+/// supplies the current group from its start without a separate joining FETCH.
+///
 /// A start group we already know is absolute and needs no fill: the subscription's own
 /// range covers it, which is what our publisher serves from its cache.
 fn subscribe_join(start: Option<track::Position>, end: Option<track::Position>, version: Version) -> Join {
 	if !Filter::is_draft20(version) {
 		return Join {
-			filter: Filter::NextObject,
+			filter: Filter::Unfiltered,
 			fill: None,
 		};
 	}
@@ -4458,10 +4525,9 @@ mod filter_tests {
 		);
 	}
 
-	/// Earlier drafts have no fill and no way to name a group relative to a live edge they
-	/// have not learned, so they keep asking for exactly what they always did.
+	/// Without joining FETCH support, older-draft clients must not exclude the cached prefix.
 	#[test]
-	fn older_drafts_ask_for_the_next_object() {
+	fn older_drafts_ask_for_unfiltered_delivery() {
 		for version in [Version::Draft14, Version::Draft16, Version::Draft19] {
 			assert_eq!(
 				subscribe_join(
@@ -4470,7 +4536,7 @@ mod filter_tests {
 					version
 				),
 				Join {
-					filter: Filter::NextObject,
+					filter: Filter::Unfiltered,
 					fill: None,
 				},
 				"{version}"
@@ -4777,6 +4843,35 @@ mod stitch_tests {
 		let (sequence, frames) = read_group(&mut consumer).await;
 		assert_eq!(sequence, SEQUENCE);
 		assert_eq!(frames.len(), 2, "the head is published once, not twice");
+	}
+
+	/// A fill head parked waiting for its tail is still a live group producer. Dropping the
+	/// session has to end it, or the consumer waits on a group nobody will ever write again.
+	/// The guard is `State`'s own `Drop`, so it runs however the driver was torn down.
+	#[tokio::test]
+	async fn a_cancelled_session_aborts_a_waiting_fill_head() {
+		let h = Harness::new(
+			Fill::Serving(Some(Timescale::MICRO)),
+			vec![fill_stream(SEQUENCE, &[b"head-0"])],
+		);
+		let mut consumer = h.track.subscribe(None);
+
+		let mut fill = h.stream().await;
+		h.subscriber.clone().recv_fill(&mut fill).await.expect("fill");
+
+		// The head exists and is waiting for the tail that never comes.
+		let mut group = consumer
+			.recv_group()
+			.await
+			.expect("track aborted")
+			.expect("track finished");
+
+		drop(h);
+
+		assert!(
+			matches!(group.read_frame().await, Err(Error::Cancel)),
+			"a waiting fill head must be cancelled, not left parked"
+		);
 	}
 
 	/// The same contradiction as above, with the streams the other way round: the whole

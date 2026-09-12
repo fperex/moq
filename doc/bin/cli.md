@@ -41,38 +41,60 @@ instead host sessions with `--listen`, or both at once. `moq import --help` list
 
 ```bash
 # Publish a file (remux to MPEG-TS without re-encoding)
-ffmpeg -re -i video.mp4 -c copy -f mpegts - | \
+ffmpeg -re -i video.mp4 -c copy -f mpegts -pes_payload_size 0 - | \
     moq --connect https://relay.example.com/anon --broadcast my-stream.hang import ts
 
 # Pull it back out
-moq --connect https://relay.example.com/anon --broadcast my-stream.hang export fmp4 | ffplay -
+moq --connect https://relay.example.com/anon --broadcast my-stream.hang export ts | ffplay -
 
 # With a token
 moq --connect "https://relay.example.com/rooms/1?jwt=$TOKEN" --broadcast alice.hang import ts
 ```
 
 MPEG-TS import carries H.264/H.265 and AAC/MP2/AC-3/E-AC-3, passes SCTE-35 and
-subtitle PIDs through as tracks, and round-trips the service tables. FLV
-covers H.264 + AAC.
+subtitle PIDs through as tracks, and round-trips the service tables. A
+`discontinuity_indicator` on the program's PCR PID is a system time-base reset,
+so it breaks every track's timeline and the exported clock declares the break in
+turn. The same flag on an elementary PID other than the program PCR PID, a
+continuity-counter gap, and the 33-bit timestamp rollover move no clock and
+declare nothing. FLV covers H.264 + AAC.
 
 MPEG-TS export restarts its clock and table cadence after a publisher rewind,
 discarding the old mux buffer. The first new clock packet signals the break and
 stdout pacing re-anchors. Other renditions resume at their own discontinuity
 boundary, so old-timeline frames cannot advance the new clock.
 
+fMP4 export writes one fragment per publisher group on each track. Audio follows
+the publisher's cuts; video normally follows GOPs. Closing a group flushes it
+even when the live publisher pauses. `--fragment-duration 2s` caps
+the fragment span as frames arrive, including audio whose publisher never cuts.
+MKV uses the same flag to cap clusters, which otherwise follow video GOPs.
+
 ## Play
 
 ```bash
 moq --connect https://relay.example.com/anon --broadcast my-stream.hang play
+moq ... play --delay 500ms          # trade latency for a jittery link
 ```
 
 Decodes H.264, H.265, and AV1 video and Opus, PCM, and AAC-LC audio using
 the platform hardware decoder where available. `--video-name` and
-`--audio-name` pick a rendition; `--max-age` (default 500 ms) bounds how
-far a stalled group may lag before it is skipped. Each role follows the catalog
-for as long as it lasts, so a publisher that retires the rendition being played
-ends that track and the role picks a replacement. Playback is behind the
-`play` feature, since it pulls in windowing and audio-device dependencies:
+`--audio-name` pick a rendition.
+
+Playback runs on a clock it owns. `--delay` (default 100 ms) is how far it
+trails the live edge, which is both the jitter a late frame may absorb and the
+point past which a stalled group is skipped. The speaker holds the delay, with a
+50 ms floor under it, and the picture is scheduled against where the speaker
+actually is. While video owns the clock, a frame arriving earlier than predicted
+pulls playback forward, so a late start catches up to live instead of staying
+behind it. Once the speaker owns the clock, video follows the speaker instead.
+
+Each role follows the catalog for as long as it lasts. Each decoder starts at
+the newest cached group, including when a rendition is reopened, so playback
+does not replay the retained backlog. A publisher that retires the rendition
+being played ends that track and the role picks a replacement. Playback is
+behind the `play` feature, since it pulls in windowing and audio-device
+dependencies:
 
 ```bash
 cargo install moq-cli --no-default-features --features "iroh,quinn,websocket,play"
@@ -140,6 +162,26 @@ interchangeable sources: relays hold both routes and fail over at a group
 boundary. They must produce identical tracks with aligned groups. Everywhere
 else leave `--hop` unset: a fresh id per run is what makes a restarted
 encoder take over cleanly instead of splicing mid-stream.
+
+## LAN mesh
+
+`--cluster-lan` advertises this process on the LAN over mDNS and meshes with
+every other participating MoQ process, no relay required. It reuses `--listen`,
+filling in an ephemeral port and a generated certificate when those are unset.
+
+```bash
+moq --cluster-lan import capture
+moq --cluster-lan --cluster-lan-secret /etc/moq/cluster.key import capture
+```
+
+`--cluster-lan-secret` restricts the mesh to peers holding the same key.
+Without it, anyone who can reach the listener joins, so leave it unset only
+on networks you trust.
+
+`--cluster-lan-app` names the DNS-SD application this process advertises
+under. Peers using a different name never discover this one. It defaults to
+`default`, which moq-relay shares, so the two find each other with no
+configuration. An application built on the library picks its own name.
 
 ## Tokens
 

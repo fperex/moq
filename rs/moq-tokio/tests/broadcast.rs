@@ -1186,6 +1186,12 @@ async fn broadcast_moq_transport_20() {
 	broadcast_test("moqt", Some("moq-transport-20"), Some("moq-transport-20")).await;
 }
 
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_moq_transport_21() {
+	broadcast_test("moqt", Some("moq-transport-21"), Some("moq-transport-21")).await;
+}
+
 // ── Raw QUIC – server supports all versions, client pins one ─────────
 
 #[tracing_test::traced_test]
@@ -1480,6 +1486,12 @@ async fn broadcast_webtransport_moq_transport_19() {
 #[tokio::test]
 async fn broadcast_webtransport_moq_transport_20() {
 	broadcast_test("https", Some("moq-transport-20"), Some("moq-transport-20")).await;
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_webtransport_moq_transport_21() {
+	broadcast_test("https", Some("moq-transport-21"), Some("moq-transport-21")).await;
 }
 
 // ── WebTransport – server supports all, client pins one ─────────────
@@ -3214,7 +3226,10 @@ async fn abort_carries_its_code_to_the_peer() {
 		.await
 		.expect("the peer never saw the close")
 		.expect("server task gone");
-	assert!(matches!(reason, moq_net::Error::App(42)), "unexpected close: {reason}");
+	assert!(
+		matches!(reason, moq_net::Error::Session(moq_net::SessionError::App(42))),
+		"unexpected close: {reason}"
+	);
 
 	server_handle.abort();
 }

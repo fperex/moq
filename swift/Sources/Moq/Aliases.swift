@@ -9,7 +9,7 @@ import MoqFFI
 /// A payload plus the presentation timestamp it should play at. The unit of
 /// every raw write and raw read.
 public typealias Frame = MoqFFI.MoqFrame
-/// A frame plus the codec metadata a media track carries.
+/// A media frame whose keyframe flag marks a group start or video keyframe; audio flags only group starts.
 public typealias MediaFrame = MoqFFI.MoqMediaFrame
 /// The JSON manifest describing a broadcast's tracks: video and audio
 /// renditions, display geometry, and untyped application sections.
@@ -96,3 +96,12 @@ public typealias ConnectionStatus = MoqFFI.MoqConnectionStatus
 /// The error thrown by every throwing call in this package. Already conforms to
 /// `Swift.Error` and `LocalizedError`; see `Errors.swift` for conveniences.
 public typealias MoqError = MoqFFI.MoqError
+
+/// Whether a protocol code is from the session or stream registry.
+public typealias ErrorScope = MoqFFI.MoqErrorScope
+
+/// A recognized protocol kind, or `app` / `unknown` when the code is not named.
+public typealias ProtocolKind = MoqFFI.MoqProtocolKind
+
+/// A protocol failure: scope, verbatim wire code, kind, and a diagnostic message.
+public typealias ProtocolError = MoqFFI.MoqProtocolError

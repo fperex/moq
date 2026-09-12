@@ -9,6 +9,7 @@ use moq_net::kio;
 use rand::RngExt;
 use url::Url;
 
+use crate::abort::AbortOnDrop;
 use crate::connect::Endpoint;
 use crate::{Addrs, Client, Error};
 
@@ -88,15 +89,33 @@ pub struct Backoff {
 	/// Doubles as the bar a session must stay up to count as healthy, so it is
 	/// floored at 50ms: at zero every session would look healthy and the retry
 	/// pacing would collapse.
-	#[usage(name = "backoff-initial", long, env = "MOQ_BACKOFF_INITIAL", default = "1s")]
+	#[usage(
+		name = "backoff-initial",
+		long,
+		env = "MOQ_BACKOFF_INITIAL",
+		default = "1s",
+		setting = "connect.backoff.initial"
+	)]
 	pub initial: CliDuration,
 
 	/// Multiplier applied to delay after each failure. Defaults to 2.
-	#[usage(name = "backoff-multiplier", long, env = "MOQ_BACKOFF_MULTIPLIER", default = "2")]
+	#[usage(
+		name = "backoff-multiplier",
+		long,
+		env = "MOQ_BACKOFF_MULTIPLIER",
+		default = "2",
+		setting = "connect.backoff.multiplier"
+	)]
 	pub multiplier: u32,
 
 	/// Maximum delay between reconnect attempts. Defaults to 5s.
-	#[usage(name = "backoff-max", long, env = "MOQ_BACKOFF_MAX", default = "5s")]
+	#[usage(
+		name = "backoff-max",
+		long,
+		env = "MOQ_BACKOFF_MAX",
+		default = "5s",
+		setting = "connect.backoff.max"
+	)]
 	pub max: CliDuration,
 
 	/// Maximum time to spend retrying before giving up. Defaults to 10s.
@@ -104,7 +123,13 @@ pub struct Backoff {
 	/// Resets after a stable connection (one that outlives the initial backoff), so a flapping
 	/// session that reconnects then immediately drops still counts toward the timeout. Set to 0 for
 	/// unlimited retries.
-	#[usage(name = "backoff-timeout", long, env = "MOQ_BACKOFF_TIMEOUT", default = "10s")]
+	#[usage(
+		name = "backoff-timeout",
+		long,
+		env = "MOQ_BACKOFF_TIMEOUT",
+		default = "10s",
+		setting = "connect.backoff.timeout"
+	)]
 	pub timeout: CliDuration,
 }
 
@@ -307,7 +332,8 @@ pub struct GoawayConfig {
 		long,
 		env = "MOQ_GOAWAY_REDIRECT",
 		value_enum,
-		default = "same-host"
+		default = "same-host",
+		setting = "connect.goaway.redirect"
 	)]
 	pub redirect: Redirect,
 
@@ -315,7 +341,13 @@ pub struct GoawayConfig {
 	/// "10s" or "500ms". This is a cap: a GOAWAY naming a shorter deadline wins,
 	/// since the peer force-closes at its own deadline regardless, but a longer one
 	/// does not extend it. Defaults to 10 seconds.
-	#[usage(name = "goaway-handover", long, env = "MOQ_GOAWAY_HANDOVER", default = "10s")]
+	#[usage(
+		name = "goaway-handover",
+		long,
+		env = "MOQ_GOAWAY_HANDOVER",
+		default = "10s",
+		setting = "connect.goaway.handover"
+	)]
 	pub handover: CliDuration,
 }
 
@@ -403,6 +435,10 @@ impl GoawayConfig {
 struct State {
 	/// Current connection status, or `None` before the first connect.
 	status: Option<Status>,
+	/// How many sessions have been live on this handle, counting the current one.
+	/// Advanced by `Shared::connected` with the same write that publishes `status`,
+	/// so a reader can't see `Connected` without its epoch.
+	epoch: u64,
 	/// The negotiated MoQ version of the live session, or `None` when disconnected.
 	version: Option<Version>,
 	/// Set when the reconnect loop permanently gives up (reconnect timeout exceeded).
@@ -438,6 +474,7 @@ impl Shared {
 		}
 		if let Ok(mut state) = self.state.write() {
 			state.status = Some(Status::Connected);
+			state.epoch += 1;
 			state.version = Some(session.version());
 			state.session = Some(session.clone());
 		}
@@ -497,6 +534,25 @@ impl ConnectionStatsReader {
 	pub fn stats(&self) -> Option<moq_net::ConnectionStats> {
 		self.state.read().session.as_ref().map(moq_net::Session::stats)
 	}
+
+	/// Snapshot statistics and protocol together, or `None` while disconnected.
+	pub fn snapshot(&self) -> Option<ConnectionSnapshot> {
+		let state = self.state.read();
+		let session = state.session.as_ref()?;
+		Some(ConnectionSnapshot {
+			stats: session.stats(),
+			version: session.version(),
+		})
+	}
+}
+
+/// Statistics and protocol sampled from the same live connection.
+#[non_exhaustive]
+pub struct ConnectionSnapshot {
+	/// Transport statistics at the time of the snapshot.
+	pub stats: moq_net::ConnectionStats,
+	/// Protocol negotiated by the connection that supplied these statistics.
+	pub version: Version,
 }
 
 /// Handle to a connection maintained by a background task.
@@ -509,13 +565,13 @@ impl ConnectionStatsReader {
 /// and [`recv_bandwidth`](Self::recv_bandwidth) track the live session and reset while disconnected.
 /// The extra toggle a plain session doesn't have is the connection lifecycle: [`established`](Self::established)
 /// waits for the first session, [`connected`](Self::connected) reads the current state synchronously,
-/// and [`status`](Self::status) waits for the next change. [`closed`](Self::closed)
-/// waits for the loop to stop. Clones share the loop; it stops when the last
-/// clone drops (or on an explicit [`close`](Self::close)).
+/// [`epoch`](Self::epoch) counts the sessions so far, and [`status`](Self::status) waits for the
+/// next change. [`closed`](Self::closed) waits for the loop to stop. Clones share the loop; it
+/// stops when the last clone drops (or on an explicit [`close`](Self::close)).
 #[derive(Clone)]
 #[must_use = "dropping the Connection stops the dial; hold it for as long as you want the session"]
 pub struct Connection {
-	task: std::sync::Arc<AbortOnDrop>,
+	task: std::sync::Arc<Task>,
 	state: kio::Consumer<State>,
 	/// Persistent send-bitrate estimate, fed by the loop from each live session.
 	send_bandwidth: BandwidthConsumer,
@@ -526,16 +582,11 @@ pub struct Connection {
 	last_reported: Option<Status>,
 }
 
-/// Aborts the connection loop when the last [`Connection`] clone drops.
-struct AbortOnDrop {
-	handle: tokio::task::AbortHandle,
+/// The connection loop, shared by every [`Connection`] clone and aborted when the
+/// last one drops.
+struct Task {
+	handle: AbortOnDrop,
 	closed: CloseGuard,
-}
-
-impl Drop for AbortOnDrop {
-	fn drop(&mut self) {
-		self.handle.abort();
-	}
 }
 
 /// Serializes [`Connection::abort`] against the loop publishing a fresh session.
@@ -583,8 +634,8 @@ impl Connection {
 			// Dropping the producers here closes the channels, signaling consumers.
 		});
 		Self {
-			task: std::sync::Arc::new(AbortOnDrop {
-				handle: task.abort_handle(),
+			task: std::sync::Arc::new(Task {
+				handle: AbortOnDrop::new(task),
 				closed,
 			}),
 			state,
@@ -651,7 +702,8 @@ impl Connection {
 			let budget = retry_budget(client.reconnect, retry_start, timeout);
 
 			match Self::dial_any(shared, &client, &addrs, &mut draining, budget).await {
-				Ok((url, session)) => {
+				Ok((addr, session)) => {
+					let url = addr.url().clone();
 					tracing::info!(peer = %Endpoint(&url), "connected");
 					shared.connected(&session);
 
@@ -664,6 +716,14 @@ impl Connection {
 					// A session that stayed up past the initial backoff is healthy; one that
 					// ended sooner counts as a failed attempt however it ended.
 					let healthy = connected.elapsed() >= initial;
+
+					// The connected target owns the policy, including in one-shot mode.
+					if let Ended::Goaway(msg) = &ended
+						&& addr.addresses().is_some()
+						&& goaway.redirect().target(&msg.uri, &url).is_some()
+					{
+						return Err(Error::PinnedRedirect);
+					}
 
 					// One-shot mode leaves rather than migrating: there is no replacement to
 					// dial, and a GOAWAY naming no deadline never force-closes, so the peer
@@ -828,11 +888,12 @@ impl Connection {
 		addrs: &Addrs,
 		draining: &mut Option<Draining>,
 		budget: Option<tokio::time::Instant>,
-	) -> crate::Result<(Url, moq_net::Session)> {
+	) -> crate::Result<(crate::connect::Addr, moq_net::Session)> {
 		let candidates = addrs.as_slice();
 		let mut last = None;
 
-		for (index, url) in candidates.iter().enumerate() {
+		for (index, addr) in candidates.iter().enumerate() {
+			let url = addr.url();
 			// The retry window can run out mid-walk. Stop rather than starting an
 			// attempt with no time to finish; the caller reports the budget error.
 			if budget.is_some_and(|budget| tokio::time::Instant::now() >= budget) {
@@ -841,7 +902,7 @@ impl Connection {
 
 			tracing::info!(peer = %Endpoint(url), "connecting");
 
-			let mut dial = std::pin::pin!(client.dial(url.clone()));
+			let mut dial = std::pin::pin!(client.dial(addr.clone()));
 			let dialed = kio::wait(|waiter| {
 				if poll_draining(draining, waiter) {
 					shared.disconnected();
@@ -859,7 +920,7 @@ impl Connection {
 			};
 
 			match dialed {
-				Ok(session) => return Ok((url.clone(), session)),
+				Ok(session) => return Ok((addr.clone(), session)),
 				// A status the peer actually sent is its answer, not this address's, so
 				// unless it invites another attempt it settles the whole walk. Carrying
 				// on would offer the same rejected credentials at the peer's other
@@ -950,6 +1011,16 @@ impl Connection {
 	/// state rather than the next change.
 	pub fn connected(&self) -> bool {
 		self.state.read().status == Some(Status::Connected)
+	}
+
+	/// How many sessions have been live on this handle: 1 after the first connect,
+	/// one more per reconnect (and per GOAWAY migration, which is a new session too).
+	///
+	/// Advanced in the same write that publishes [`Status::Connected`], so reading
+	/// after a `Connected` status never returns a stale count. Zero only if no
+	/// session has connected yet, which [`established`](Self::established) rules out.
+	pub fn epoch(&self) -> u64 {
+		self.state.read().epoch
 	}
 
 	/// The negotiated MoQ version of the live session, or `None` while disconnected.
@@ -1216,6 +1287,7 @@ mod tests {
 	fn cli_does_not_clobber_toml_backoff() {
 		#[derive(usage::Cli)]
 		#[usage(unknown_flags = "error", args_override_self = false)]
+		#[usage(settings)]
 		struct Wrapper {
 			#[usage(flatten)]
 			backoff: Backoff,
@@ -1253,6 +1325,7 @@ mod tests {
 	fn cli_does_not_clobber_toml_goaway() {
 		#[derive(usage::Cli)]
 		#[usage(unknown_flags = "error", args_override_self = false)]
+		#[usage(settings)]
 		struct Wrapper {
 			#[usage(flatten)]
 			goaway: GoawayConfig,
@@ -1675,7 +1748,7 @@ mod tests {
 		.await
 		.expect("the walk must not hang")
 		.expect("the live address must connect");
-		assert_eq!(connected, live, "the walk must land on the one that answers");
+		assert_eq!(connected.url(), &live, "the walk must land on the one that answers");
 	}
 
 	/// With nothing reachable the walk reports a failure rather than hanging.

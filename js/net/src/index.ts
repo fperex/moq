@@ -9,10 +9,12 @@
 export * as Signals from "@moq/signals";
 /** Broadcast announcement streams. */
 export * as Announce from "./announced.ts";
+/** Send-side bandwidth estimates split among the tracks sharing a connection. */
+export * as Bandwidth from "./bandwidth.ts";
 /** Broadcast role handles. */
 export * as Broadcast from "./broadcast.ts";
-/** Connection helpers: connect to or accept a MoQ session and reconnect on failure. */
-export * as Connection from "./connection/index.ts";
+/** A reconnecting, shareable handle on a MoQ session. */
+export { Connection } from "./connection/index.ts";
 /** Session and stream errors, each carrying a code from its own registry. */
 export {
 	NotFound,

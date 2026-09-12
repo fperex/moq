@@ -9,10 +9,7 @@ use crate::media::*;
 use crate::producer::MoqTrackInfo;
 
 fn timestamp_us(timestamp: moq_net::Timestamp) -> Result<u64, MoqError> {
-	timestamp
-		.as_micros()
-		.try_into()
-		.map_err(|_| MoqError::TimeOverflow(moq_net::TimeOverflow))
+	timestamp.as_micros().try_into().map_err(|_| MoqError::TimeOverflow)
 }
 
 fn raw_frame(frame: moq_net::frame::Frame) -> Result<MoqFrame, MoqError> {
@@ -36,8 +33,8 @@ fn media_frame(mut frame: moq_mux::container::Frame) -> Result<MoqMediaFrame, Mo
 
 fn media_container(container: MoqContainer) -> Result<moq_mux::catalog::hang::Container, MoqError> {
 	let container: hang::catalog::Container = container.into();
-	(&container)
-		.try_into()
+	// This byte-oriented API has no media-kind configuration.
+	moq_mux::catalog::hang::Container::new(&container, moq_mux::container::Kind::Data)
 		.map_err(|e| MoqError::Codec(format!("invalid container: {e}")))
 }
 

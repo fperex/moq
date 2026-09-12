@@ -8,14 +8,15 @@ matching wildcard.
 ## Plan
 
 [moq#3225](https://github.com/moq-dev/moq/pull/3225) built the table this quest
-was going to need. `Consumer::request_broadcast` resolves a local broadcast
-first, then `best_server`, which filters routes to those covering the path,
-drops any whose hop chain contains the requester's excluded hop, keeps the
-longest covering prefix, and orders the survivors by `route_order`. The winning
-session serves the request on demand, and `ServeState.served` caches the result
-per path so repeat requests share one upstream subscription. The old
-`origin::Dynamic` objection (one shared FIFO, no requester identity, no route
-chain to check) no longer applies, because that is not the path a route takes.
+needs. `Consumer::request_broadcast` resolves a local broadcast first, then
+`best_server`, which filters routes to those covering the path, drops any whose
+hop chain contains the requester's excluded hop, keeps the longest covering
+prefix, and orders the survivors by `route_order`
+(`rs/moq-net/src/model/origin.rs:633`). The winning session serves the request
+on demand, and `ServeState.served` (`:764`) caches the result per path so
+repeat requests share one upstream subscription. A route never passes through
+`origin::Dynamic`'s shared FIFO, so requester identity and the hop chain are
+both available to selection.
 
 So this quest extends a working table rather than standing one up: teach the
 route entries to hold a pattern instead of only a literal prefix, and teach
@@ -96,4 +97,4 @@ Tests, at the process level with real sessions rather than an in-process stand-i
 
 ## Required
 
-- [Advertise](/quest/m2/wildcard/advertise.md)
+- [Advertise](/quest/m1/wildcard-advertise.md)

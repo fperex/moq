@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 keywords = ["moq", "gameboy", "streaming", "emulator", "live"]
 categories = ["multimedia::video", "emulators", "network-programming"]
 
-version = "0.4.13"
+version = "0.4.14"
 edition = "2024"
 rust-version.workspace = true
 
@@ -33,4 +33,4 @@ moq-video = { workspace = true, features = ["nvidia", "vaapi"] }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
-usage = { workspace = true, features = ["completions"] }
+usage = { workspace = true, features = ["completions", "config"] }

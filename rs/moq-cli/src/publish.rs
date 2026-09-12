@@ -257,14 +257,12 @@ impl Publish {
 	pub fn new(
 		mut broadcast: moq_net::broadcast::Producer,
 		format: &PublishFormat,
-		max_age: Option<std::time::Duration>,
+		config: moq_mux::catalog::Config,
 	) -> anyhow::Result<Self> {
 		// TS carries undecoded elementary streams (SCTE-35, teletext, DVB AC-3, ...)
 		// verbatim, so it uses the `mpegts` catalog extension rather than the media-only
 		// `()`. The catalog producer owns the broadcast's catalog tracks, so each broadcast
 		// gets exactly one; TS builds its `Ext` catalog here instead of the shared `()` below.
-		let config = moq_mux::catalog::Config::default().with_max_age(max_age);
-
 		if let PublishFormat::Ts = format {
 			let config = config.with_catalog(moq_mux::catalog::hang::Catalog::<ts::Ext>::default());
 			let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
@@ -578,7 +576,7 @@ mod tests {
 			.mpegts
 			.tracks
 			.insert(section.name().to_string(), section_track);
-		let mut section_producer = Producer::new(section, Container::Legacy);
+		let mut section_producer = Producer::new(section, Container::Legacy(moq_mux::container::Kind::Data));
 		// bbb's first video keyframe is at 1.4 s; stamp the ancillary streams just after
 		// it so they clear the export's keyframe alignment (anything before the first
 		// keyframe is dropped on tune-in).
@@ -603,7 +601,7 @@ mod tests {
 		let mut pes_track = tscat::Track::new(VERBATIM_PES_PID);
 		pes_track.verbatim = Some(verbatim);
 		catalog.lock().mpegts.tracks.insert(pes.name().to_string(), pes_track);
-		let mut pes_producer = Producer::new(pes, Container::Legacy);
+		let mut pes_producer = Producer::new(pes, Container::Legacy(moq_mux::container::Kind::Data));
 		pes_producer
 			.write(Frame {
 				timestamp: Timestamp::from_millis(1410).unwrap(),
@@ -654,7 +652,7 @@ mod tests {
 		let origin = moq_tokio::origin::spawn(moq_net::Hop::random());
 		let broadcast = origin.create_broadcast("cli").unwrap();
 		settle().await;
-		let mut publish = Publish::new(broadcast, &PublishFormat::Ts, None).unwrap();
+		let mut publish = Publish::new(broadcast, &PublishFormat::Ts, Default::default()).unwrap();
 		#[allow(irrefutable_let_patterns)]
 		let Source::Stream(decoder) = &mut publish.source else {
 			panic!("expected a stream source");
@@ -727,7 +725,7 @@ mod tests {
 	/// Read the first frame of a verbatim track back as raw bytes.
 	async fn read_frame(consumer: &moq_net::broadcast::Consumer, name: &str) -> Vec<u8> {
 		let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
-		let mut reader = Consumer::new(track, Container::Legacy);
+		let mut reader = Consumer::new(track, Container::Legacy(moq_mux::container::Kind::Data));
 		let frame = tokio::time::timeout(Duration::from_secs(1), reader.read())
 			.await
 			.expect("verbatim read timed out")

@@ -34,7 +34,7 @@ impl<E: CatalogExt> Import<E> {
 		let rendition = reserved.video(track.name())?;
 		// The hint names the container; the writer is built from that same value so the wire
 		// cannot disagree with what the rendition advertises.
-		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
+		let wire = crate::catalog::hang::Container::try_from(&hint)?;
 		let catalog = crate::codec::video::Catalog::new(hint);
 		let mut import = Self {
 			track: reserved.producer().media_producer(track, wire)?,
@@ -42,7 +42,7 @@ impl<E: CatalogExt> Import<E> {
 			catalog,
 		};
 		if let Some(config) = import.catalog.initial_config() {
-			import.apply_config(config);
+			import.apply_config(config)?;
 		}
 		Ok(import)
 	}
@@ -65,7 +65,7 @@ impl<E: CatalogExt> Import<E> {
 		config.coded_width = Some(width as u32);
 		config.coded_height = Some(height as u32);
 
-		self.apply_config(config);
+		self.apply_config(config)?;
 		Ok(())
 	}
 
@@ -73,8 +73,8 @@ impl<E: CatalogExt> Import<E> {
 	///
 	/// A changed config just re-mirrors the rendition; there are no fixed tracks to reject a
 	/// reconfiguration.
-	fn apply_config(&mut self, config: hang::catalog::VideoConfig) {
-		self.catalog.publish(&mut self.rendition, config);
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> crate::Result<()> {
+		self.catalog.publish(&mut self.rendition, config)
 	}
 
 	/// Decode a single VP8 frame.
@@ -95,9 +95,27 @@ impl<E: CatalogExt> Import<E> {
 			keyframe: header.keyframe,
 			duration: None,
 		})?;
-		self.estimate();
+		self.catalog
+			.on_frame(&mut self.rendition, self.track.track().is_used())?;
+		self.estimate()?;
 
 		Ok(())
+	}
+
+	/// Re-evaluate stall from source silence.
+	pub fn tick(&mut self) -> crate::Result<()> {
+		self.catalog.tick(&mut self.rendition, self.track.track().is_used())
+	}
+
+	/// The source is gone; this rendition is never stalled while idle.
+	pub fn idle(&mut self) -> crate::Result<()> {
+		self.catalog.idle(&mut self.rendition)
+	}
+
+	/// Record the encode duration before publishing its frames so the catalog can report a stall.
+	pub fn observe_lag(&mut self, lag: std::time::Duration) -> crate::Result<()> {
+		self.catalog
+			.observe_lag(&mut self.rendition, self.track.track().is_used(), lag)
 	}
 
 	/// A watch-only handle to this track's subscriber demand.
@@ -108,7 +126,7 @@ impl<E: CatalogExt> Import<E> {
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
 		self.track.finish()?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
@@ -120,21 +138,21 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
 	/// the fields its config didn't supply.
-	fn estimate(&mut self) {
-		self.rendition.estimate(self.track.estimate());
+	fn estimate(&mut self) -> crate::Result<()> {
+		self.rendition.estimate(self.track.estimate())
 	}
 
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		self.track.cut(end)?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
 		self.track.seek(sequence)?;
-		self.estimate();
+		self.estimate()?;
 		Ok(())
 	}
 }
@@ -207,7 +225,10 @@ mod tests {
 			.decode(&keyframe, Some(Timestamp::from_micros(0).unwrap()))
 			.unwrap();
 
-		let mut media = crate::container::Consumer::new(subscriber, crate::catalog::hang::Container::Loc);
+		let mut media = crate::container::Consumer::new(
+			subscriber,
+			crate::catalog::hang::Container::Loc(crate::container::Kind::Data),
+		);
 		let frame = tokio::time::timeout(std::time::Duration::from_secs(1), media.read())
 			.await
 			.unwrap()

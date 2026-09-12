@@ -14,7 +14,7 @@ import {
 	Signal,
 } from "@moq/signals";
 import { base64ToBytes } from "../base64";
-import { subscribeMedia } from "../media";
+import { nextMedia, subscribeMedia } from "../media";
 
 import type { Sync } from "../sync";
 import {
@@ -303,6 +303,7 @@ class DecoderTrack {
 			priority: Catalog.PRIORITY.video,
 			maxAge: this.sync.out.maxAge,
 		});
+		if (!sub) return;
 
 		const decoder = new VideoDecoder({
 			output: async (frame: VideoFrame) => {
@@ -355,7 +356,7 @@ class DecoderTrack {
 			},
 			// TODO bubble up error
 			error: (error) => {
-				console.error(error);
+				console.error("video decoder error", error);
 				effect.close();
 			},
 		});
@@ -373,7 +374,9 @@ class DecoderTrack {
 
 	#runLegacy(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
 		const format =
-			this.config.container.kind === "loc" ? new Container.Loc.Format() : new Container.Legacy.Format();
+			this.config.container.kind === "loc"
+				? new Container.Loc.Format("video")
+				: new Container.Legacy.Format(this.config);
 		// Create consumer that reorders groups/frames up to the provided latency.
 		const consumer = new Container.Consumer(sub, {
 			format,
@@ -402,7 +405,7 @@ class DecoderTrack {
 
 		effect.spawn(async () => {
 			for (;;) {
-				const next = await consumer.next();
+				const next = await nextMedia(consumer);
 				if (!next) break;
 
 				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
@@ -479,7 +482,7 @@ class DecoderTrack {
 
 		effect.spawn(async () => {
 			for (;;) {
-				const next = await consumer.next();
+				const next = await nextMedia(consumer);
 				if (!next) break;
 
 				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.

@@ -1,28 +1,55 @@
-# [L] Merge dev into main
+# [XL] Merge dev into main
 
 ## Goal
 
 `main` carries everything on `dev`: the thread-per-core runtime, the net model
-and allocator work, the announce handle and its bindings, the archive line, and
-every fix that only dev has. The merge PR closes each issue dev fixed with a
-closing keyword, and the release that follows is the one moq.pro adopts.
+and allocator work, the announce handle and its bindings, the archive catalog
+and store, and every fix that only dev has. The merge PR closes each issue dev
+fixed with a closing keyword, and the release that follows is the one moq.pro
+adopts.
 
 ## Plan
 
-As of 2026-09-05 dev is 243 commits ahead of main and main 16 ahead of dev.
-Merge main into dev first and resolve there, then open the merge PR from dev
-with the list below as closing keywords. Run `just check-all`, `just test all`,
-`just test smoke-full`, and `just bench origin/main` on the merged tree. The
-breaking-change targeting rules in CONTRIBUTING.md govern the release that
-follows, and [Dart announce](/quest/m1/dart-announce.md) unblocks when this
-lands.
+main is merged into dev as of 2026-09-12, so the merge PR opens from dev with
+the list below as closing keywords once the gates clear. Run `just check-all`,
+`just test all`, `just test smoke-full`, and `just bench origin/main` on the
+merged tree, and record the revision the proof ran on.
+
+Resolve by behavior, never by side. The traps the last main-into-dev merge
+hit, so the merge PR re-checks each on the combined tree:
+
+- main's joining FETCH keeps its saved object prefix (#3562) and answers with
+  FETCH_OK; dev's registry maps its two refusal codes to DOES_NOT_EXIST until
+  [IETF leftovers](/quest/m2/ietf-leftovers.md) adds them.
+- main's refusal of an incompatible copy during failover (#3521) lives on
+  dev's source table (`FrontState::track_info`, `accept_track_info`) and is
+  checked on `Step::Splice`; a successor with a different timescale never
+  rescales samples a subscriber already holds.
+- dev's structural flush-span jitter (#3513), registered request codes
+  (#3531), bounded `moq_json::window` timeline (#3240), and duration marker
+  (#3575) keep their regressions; main's draft-21 (#3574) is in every
+  per-version list, including the stream and request registries.
+- The hop-0 ban is abandoned (#3623); anonymous routes rank last instead
+  ([Anonymous rank](/quest/m1/anonymous-route-rank.md)).
+- Auto-merged files hide breakage: `just check` and `just test` run before
+  the merge commit, not after.
+
+Also soak HLS on the merged tree: a fresh viewer joining a `moq import ts`
+broadcast that has been up for days must get a playlist promptly. The bounded
+`moq_json::window` timeline (#3240) is what makes that hold, and only a long
+run proves it.
+
+The breaking-change targeting rules in CONTRIBUTING.md govern the release
+that follows. Dart already has that surface, so nothing waits on this
+merge for it. The rest of the archive line, wildcard resolution, and every
+additive quest that builds on dev-only code start on main afterwards from
+[m2](/quest/m2/README.md).
 
 ## Required
 
-- [Archive](/quest/m1/archive/README.md) - moq.pro needs archive-backed recording on the release dev produces
-- [#3190](/quest/m1/3190-align-origin-broadcast-creation-naming-across-language.md) - every native binding on that surface
-- [JS announce](/quest/m1/js-announce.md) - js/net on that surface
-- [Gap discontinuity](/quest/m1/gap-discontinuity.md) - so the lost-reset regression does not ship
+- [m0](/quest/m0/README.md) - every release blocker lands or is punted before the merge
+- [Monotonic timeline](/quest/m1/monotonic-timeline.md) - so a shed marker still jumps the playhead on a timestamp hole (#3291)
+- [Advertise](/quest/m1/wildcard-advertise.md) - so `dynamic(pattern, route)` can advertise non-prefix patterns before the announce API is published
 
 ## Closes
 
@@ -51,7 +78,11 @@ lands.
 - [#2217](https://github.com/moq-dev/moq/issues/2217) - moq-ffi: the announce handle carries the lifecycle (announce-handle, #3190)
 - [#980](https://github.com/moq-dev/moq/issues/980) - dual-stack binding on main; happy eyeballs in `moq-tokio::resolve` (#2749)
 - [#2153](https://github.com/moq-dev/moq/issues/2153) - go: the wrapper caught up on main; hops landed on dev (#2168)
+- [#679](https://github.com/moq-dev/moq/issues/679) - QUIC receive is spread across thread-per-core workers, each on its own socket (#2921)
+- [#1073](https://github.com/moq-dev/moq/issues/1073) - the origin lifecycle is caller-driven: `origin::Driver` plus `moq_tokio::origin::spawn` (#2897, #2901)
+- [#2155](https://github.com/moq-dev/moq/issues/2155) - js/net: subscriptions take a `Subscription` options object with `startGroup`, `endGroup`, and `update()` (#2716); ordering became a handle (#3099)
 
 ## Related
 
-- [Dart announce](/quest/m1/dart-announce.md) - waits on this merge, so it cannot be required here
+- [Archive](/quest/m2/archive/README.md) - the writer, reader, HLS, DVR, browser, and proof follow the release
+- [Wildcard](/quest/m2/wildcard/README.md) - Resolve and Demand are additive and follow the release
