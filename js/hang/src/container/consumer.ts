@@ -113,6 +113,11 @@ export class Consumer {
 	 */
 	readonly spread: Getter<Time.Milli> = this.#spread.value;
 
+	#skipped = new Signal(0);
+
+	/** Groups that lost content because the local age budget skipped them or the transport gave up. */
+	readonly skipped: Getter<number> = this.#skipped;
+
 	#signals = new Effect();
 	#closed = new Once<Error | null>();
 
@@ -274,6 +279,13 @@ export class Consumer {
 			// The tail is gone though, so the next group does not continue this one.
 			group.truncated = true;
 			if (!(err instanceof Moq.Error.Stream)) throw err;
+
+			// A stream verdict is a delivery outcome, not a task failure: the subscription's
+			// max age gave up on the group (Expired), the cache dropped it (TooFarBehind), the
+			// publisher reset it. Counting it here rather than rethrowing is what keeps a
+			// routine skip out of the effect's `spawn error` log, and what lets a viewer see
+			// that content was censored above the decoder.
+			this.#skipped.set(this.#skipped.peek() + 1);
 		} finally {
 			group.done = true;
 
@@ -370,6 +382,10 @@ export class Consumer {
 			first.frames.length = 0;
 			skipped = true;
 			this.#gap = true;
+			// The local half of the same verdict the wire budget reaches, so it lands in the
+			// same counter. #tryDurationSkip does not: it only drops a group the next one
+			// already covers, so nothing is lost there.
+			this.#skipped.set(this.#skipped.peek() + 1);
 		}
 
 		if (hole) this.#markPlayhead();

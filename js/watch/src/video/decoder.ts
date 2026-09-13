@@ -14,7 +14,7 @@ import {
 	Signal,
 } from "@moq/signals";
 import { base64ToBytes } from "../base64";
-import { nextMedia, subscribeMedia } from "../media";
+import { accumulate, nextMedia, subscribeMedia } from "../media";
 
 import type { Sync } from "../sync";
 import {
@@ -75,6 +75,10 @@ type DecoderOutput = {
 	// How late video frames arrive relative to the earliest one, measured by the container
 	// consumer. Wired into Sync by the parent, which sizes the "auto" delay from it.
 	spread: Signal<Time.Milli | undefined>;
+
+	// Groups that lost content above the decoder: the age budget skipped them, or the transport
+	// gave up on delivering them in time.
+	skipped: Signal<number>;
 };
 
 /** Downloads video from a track and decodes it into {@link VideoFrame}s with WebCodecs. */
@@ -92,6 +96,7 @@ export class Decoder {
 		jitter: new Signal<Time.Milli | undefined>(undefined),
 		buffered: new Signal<Container.BufferedRanges>([]),
 		spread: new Signal<Time.Milli | undefined>(undefined),
+		skipped: new Signal<number>(0),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -221,6 +226,7 @@ export class Decoder {
 		effect.proxy(this.#out.timestamp, active.timestamp);
 		effect.proxy(this.#out.buffered, active.buffered);
 		effect.proxy(this.#out.spread, active.spread);
+		accumulate(effect, this.#out.skipped, active.skipped);
 	}
 
 	#runDisplay(effect: Effect): void {
@@ -294,6 +300,9 @@ class DecoderTrack {
 
 	// How late frames arrive relative to the earliest one, from the container consumer.
 	spread = new Signal<Time.Milli | undefined>(undefined);
+
+	// Groups this track lost to the age budget or a transport that gave up.
+	skipped = new Signal<number>(0);
 
 	// Decoded frames waiting to be rendered.
 	#buffered = new Signal<Container.BufferedRanges>([]);
@@ -413,6 +422,8 @@ class DecoderTrack {
 		// Publish the measured arrival spread for Sync.
 		effect.run((inner) => this.spread.set(inner.get(consumer.spread)));
 
+		accumulate(effect, this.skipped, consumer.skipped);
+
 		decoder.configure({
 			codec: this.config.codec,
 			description: this.config.description ? Util.Hex.toBytes(this.config.description) : undefined,
@@ -491,6 +502,8 @@ class DecoderTrack {
 
 		// Publish the measured arrival spread for Sync.
 		effect.run((inner) => this.spread.set(inner.get(consumer.spread)));
+
+		accumulate(effect, this.skipped, consumer.skipped);
 
 		// Configure decoder with description from catalog
 		decoder.configure({

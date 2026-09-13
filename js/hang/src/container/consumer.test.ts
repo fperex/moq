@@ -518,6 +518,59 @@ test("Consumer skips groups via PTS-span when over the max age", async () => {
 	consumer.close();
 });
 
+// The subscription's age budget and the cache both end a group by resetting its stream, and the
+// consumer's group reader used to rethrow anything that was not a StreamError. A bare Error made
+// every abandoned group a red `spawn error` in the console with no counter and no record that
+// content had gone missing above the decoder.
+test("Consumer counts a group the budget abandoned instead of failing its task", async () => {
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	try {
+		const track = new Track.Producer("test");
+		const consumer = new Consumer(replay(track), {
+			format: new LegacyFormat("data"),
+			maxAge: 30_000 as Time.Milli,
+		});
+
+		const abandoned = new Group.Producer(0);
+		abandoned.writeFrame({ payload: encodeLegacy(0 as Time.Micro), timestamp: Time.Timestamp.now() });
+		abandoned.writeFrame({ payload: encodeLegacy(20_000 as Time.Micro), timestamp: Time.Timestamp.now() });
+		track.writeGroup(abandoned);
+		await settle();
+
+		// The verdict a subscription that gave up on this group reaches, and the same one a peer's
+		// DELIVERY_TIMEOUT reset decodes back into.
+		abandoned.close(new Group.Expired());
+
+		writeGroupWithLegacyFrames(track, 1, [40_000 as Time.Micro]);
+		track.close();
+
+		const frames = await drainFrames(consumer, 200);
+
+		// Everything that did arrive before the truncation still plays.
+		expect(frames.map((f) => f.timestamp as number)).toEqual([0, 20_000, 40_000]);
+		expect(consumer.skipped.peek()).toBe(1);
+		expect(errors.mock.calls.flat().join(" ")).not.toContain("spawn error");
+		consumer.close();
+	} finally {
+		errors.mockRestore();
+	}
+});
+
+test("Consumer counts every group the max age skips", async () => {
+	const track = new Track.Producer("test");
+	// Zero max age: any span at all convicts the oldest group, so groups 0 and 1 are both shifted.
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("data"), maxAge: 0 as Time.Milli });
+
+	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro]);
+	writeGroupWithLegacyFrames(track, 1, [100_000 as Time.Micro]);
+	writeGroupWithLegacyFrames(track, 2, [200_000 as Time.Micro]);
+	track.close();
+
+	await drainFrames(consumer, 300);
+	expect(consumer.skipped.peek()).toBe(2);
+	consumer.close();
+});
+
 test("Consumer measures how late frames arrive", async () => {
 	const track = new Track.Producer("test");
 	const consumer = new Consumer(track.subscribe(), { format: new LegacyFormat("audio"), maxAge: 500 as Time.Milli });
