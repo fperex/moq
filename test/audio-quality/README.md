@@ -338,6 +338,6 @@ from a shell script driving the OS, and now comes from `moq-shaper` with a seed 
 
 ## Not covered here
 
-The nightly job. iOS: no device, and desktop Safari is the closest proxy this lane has. Video: the stage breakdown is defined generically so video can adopt
+iOS: no device, and desktop Safari is the closest proxy this lane has. Video: the stage breakdown is defined generically so video can adopt
 it, but nothing here asserts on it. No perceptual scoring: the grade is glitches and latency, not an
 opinion about how it sounds.
