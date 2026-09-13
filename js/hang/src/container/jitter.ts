@@ -28,8 +28,14 @@ const START = 80;
 // memory, so a longer pause converges to the same near-reset for a bounded amount of work.
 const MAX_CATCHUP = 60;
 
-// How long the target holds before it may step down by another bucket.
+// How long the target holds before it may step down again.
 const LOWER_INTERVAL = 1000;
+
+// The share of the distance to the quantile the target may close per LOWER_INTERVAL, when that is
+// more than one bucket: one part in this many. Enough to close the histogram's whole range inside
+// the histogram's own memory, so the limiter can never outlast the observation that raised the
+// target. A divisor rather than a fraction so the arithmetic is exact in every language.
+const LOWER_DIVISOR = 6;
 
 // One admitted arrival, on both axes in milliseconds.
 type Arrival = { timestamp: number; arrival: number };
@@ -43,10 +49,14 @@ type Arrival = { timestamp: number; arrival: number };
  * quantile, because network delay is one-sided and heavy-tailed and a mean plus deviations sizes
  * that tail wrong.
  *
- * The estimate rises the moment a late frame proves the buffer is too shallow and falls one bucket
- * per second, so a refinement shrinks a viewer's buffer in steps it can absorb. It carries no floor
- * of its own: the rendition's advertised jitter is a publisher-declared floor and belongs to
- * whoever combines the two.
+ * The estimate rises the moment a late frame proves the buffer is too shallow and falls once a
+ * second by a share of the distance left, so a refinement shrinks a viewer's buffer in steps it can
+ * absorb without taking longer to undo than the histogram remembers. It carries no floor of its
+ * own: the rendition's advertised jitter is a publisher-declared floor and belongs to whoever
+ * combines the two.
+ *
+ * Time the receiver spends not reading is not the path's fault, so a gap in the receiver's own
+ * reading drops the arrival reference rather than reading as a delay the size of the gap.
  *
  * The algorithm is written down in `doc/concept/playout.md` and held to it by the conformance
  * corpus at `rs/moq-audio/tests/playout-01.json`. The design is WebRTC's NetEq
@@ -77,6 +87,9 @@ export class Jitter {
 
 	// The newest timestamp admitted so far. Anything not strictly newer is reordered.
 	#newest?: number;
+
+	// The previous admitted arrival, on both axes, so a gap in the receiver's own reading is visible.
+	#previous?: Arrival;
 
 	// Weighted probability per delay bucket, summing to 1.
 	#buckets = new Float64Array(BUCKETS);
@@ -129,6 +142,23 @@ export class Jitter {
 		}
 		this.#newest = ts;
 
+		// The arrival clock is sampled by the receiver's own read loop. When that loop does not run
+		// for a whole resample interval, the time it spent not running lands in the next arrival it
+		// stamps, and in every frame it then pulls out of the backlog, because all of them are
+		// measured against a reference taken before the gap. Drop the reference so they are measured
+		// against each other instead.
+		//
+		// The media term is what tells the receiver apart from the publisher. A track that genuinely
+		// sends one frame a second is idle for longer than the interval too, but its timeline
+		// advances by as much as the wall clock does; a receiver that was not reading comes back to
+		// a backlog, so its idle time exceeds the media it covered.
+		const previous = this.#previous;
+		this.#previous = { timestamp: ts, arrival };
+		if (previous !== undefined) {
+			const idle = arrival - previous.arrival;
+			if (idle > RESAMPLE && idle - (ts - previous.timestamp) > RESAMPLE) this.#min.length = 0;
+		}
+
 		// Drop arrivals the timeline has moved past. The window is media, so this prunes by how much
 		// content has been delivered rather than by how long the receiver has been running.
 		while (this.#min.length > 0 && this.#min[0].timestamp + WINDOW < ts) this.#min.shift();
@@ -159,6 +189,7 @@ export class Jitter {
 	reanchor(): void {
 		this.#min.length = 0;
 		this.#newest = undefined;
+		this.#previous = undefined;
 		this.#intervalStart = undefined;
 		this.#intervalMax = 0;
 	}
@@ -229,15 +260,24 @@ export class Jitter {
 			return;
 		}
 
-		// Fall one bucket per second, in as many steps as the elapsed time allows so a 1 fps track
-		// and a 50 fps one shrink at the same wall-clock rate. Shrinking faster than this drops the
-		// playhead onto a ring the network has not refilled yet.
+		// Fall once a second, in as many steps as the elapsed time allows so a 1 fps track and a 50
+		// fps one shrink at the same wall-clock rate. Shrinking faster than this drops the playhead
+		// onto a ring the network has not refilled yet.
 		this.#lowered ??= now;
 		const steps = Math.floor((now - this.#lowered) / LOWER_INTERVAL);
 		if (steps <= 0) return;
-
 		this.#lowered += steps * LOWER_INTERVAL;
-		this.#set(Math.max(optimal, current - steps * Jitter.BUCKET));
+
+		// Each step closes a share of the distance left, with one bucket as the floor. What a ring
+		// can refill scales with the buffer being shrunk, so a fixed step brakes hardest exactly
+		// when the target is furthest from what the histogram asks for: walking 1600ms back a bucket
+		// at a time takes longer than the histogram remembers why it went up.
+		let target = current;
+		for (let i = 0; i < steps && target > optimal; i++) {
+			const share = Math.floor((target - optimal) / LOWER_DIVISOR / Jitter.BUCKET) * Jitter.BUCKET;
+			target = Math.max(optimal, target - Math.max(Jitter.BUCKET, share));
+		}
+		this.#set(target);
 	}
 
 	#set(target: number): void {
