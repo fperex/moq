@@ -6,7 +6,7 @@ to be merged as a unit. It exists so the work is readable and measurable, and so
 slices you want.
 
 Branch: [`fperex/moq` `debug-findings-solution`](https://github.com/fperex/moq/tree/debug-findings-solution),
-based on `upstream/dev` at `246a4733f`, tip `<final-hash>`. 37 commits.
+based on `upstream/dev` at `246a4733f`, tip `<final-hash>`. 49 commits.
 Full write-up:
 [`debug-findings/REPORT.md`](https://github.com/fperex/moq/blob/debug-findings-solution/debug-findings/REPORT.md).
 
@@ -43,11 +43,13 @@ intact; everything in them except the estimator is kept.
 | tune-in defect, found by the harness | `dbb8228e3` (browser), `7ad6b1a5c` (native) |
 | [`audio-jitter-target/native.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/native.md) | `9cadfc19c`, `e9d451cdf`, `1e5ce49b6`, `9deb1db75` |
 | [`watch-audio-time-stretch.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/watch-audio-time-stretch.md) | `6ce7d2bcf`, `ed095f21c`, `c0a3deddf` |
-| concealment (my call, see below) | `dfd568613` |
+| concealment (my call, see below) | `dfd568613`, `a472947be` (the element attribute) |
 | [`transport-impairment-profile.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/transport-impairment-profile.md) | `863d39c32` (`rs/moq-shaper`) |
-| [`audio-quality-harness/browser.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-quality-harness/browser.md) | `e103f0d80`, `aa0069373`, `ae2fe4256`, `527d3a0d2`, `41b86931e`, `5425bf3c1`, `38c452730`, `69c233696` |
+| [`audio-quality-harness/browser.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-quality-harness/browser.md) | `e103f0d80`, `aa0069373`, `ae2fe4256`, `527d3a0d2`, `41b86931e`, `5425bf3c1`, `38c452730`, `69c233696`, `673da3fef` (replay lane), `20b2fcbb9` (nightly), `38d4123e1`, `b939f2d10`, `00596e813`, `b31eb9552` |
 | [`qa-failure-artifacts.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/qa-failure-artifacts.md) | `f4c9da0b2` |
 | re-landed narrow fixes, each with a failing-then-passing test | `42fefae05`, `6bc60d12e`, `ddda15ab2`, `23d310dcd`, `0f775995d` |
+| the shaper defect found while re-measuring | `492781763` |
+| review, flake and delivery | `2ecf1c1a1`, `dececbf81`, `393ff294d`, `<final-hash>` |
 
 If you only read seven: `bdf4f64e0`, `c97496853`, `4a6680c7d`, `4383a2e09`, `6f3bd3e3c`,
 `c0a3deddf`, `dfd568613`. The native half is the same algorithm again. The harness stands alone and
@@ -55,7 +57,7 @@ can be adopted without touching the player.
 
 The estimator is the NetEq delay manager, written down once in `doc/concept/playout.md` and held by
 a checked-in corpus at `rs/moq-audio/tests/playout-01.json` that both languages replay exactly, 14 of
-14. No frame term: the quantile already reports the bucket's upper edge, and the consumer's own
+14\. No frame term: the quantile already reports the bucket's upper edge, and the consumer's own
 granularity belongs to the ring. That is what removes the timestamp arithmetic that gave #3517 its
 14.56 s target.
 
@@ -68,7 +70,7 @@ postMessage path, 120 s, unmuted:
 200 ms delay throughout.**
 
 Local relay with the bursty TS publisher: 6 underruns at a 700 ms held delay, then 0 at 372 ms, then
-0. Concealment on versus off, back to back on the public relay: 3 underruns and 70 short quanta
+0\. Concealment on versus off, back to back on the public relay: 3 underruns and 70 short quanta
 against 5 and 151.
 
 The budget finding has its own control. Replaying the recorded `relay-bbb-7frame` trace through a
@@ -76,9 +78,88 @@ real subscription and a real `Container.Consumer`: 0 of 443 groups convicted in 
 measured target, 0 with the headroom, and **91 at the 46 ms round-trip budget the estimator
 replaced**. That 91 is the censoring mechanism, measured.
 
-<!-- FINAL: enforced budget table -->
+### The harness, and what it will and will not enforce
 
-<!-- FINAL: before/after table and gate results -->
+`test/audio-quality` re-recorded its budgets from two 60 second runs of the whole matrix. A row
+whose two runs agreed within 1.5x on every graded metric is enforced; the rest keep a `recorded`
+marker that prints a breach without failing the run. Ten of twenty-four are enforced today. A
+metric one run measured as zero and the other did not counts as a disagreement, because the ratio
+is unbounded, so an enforced row is one that played the same way twice.
+
+| Row | Enforced | underrun ep/min | skipped ms/min | silence | target p95 | converge s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| opus, near-zero, isolated | | 1.7 | 944.4 | 0.191 | 180 | 34.5 |
+| opus, near-zero, plain | yes | 0 | 0 | 0.38 | 120 | 0 |
+| opus, mild, isolated | | 0 | 67.1 | 0.573 | 630 | 60 |
+| opus, mild, plain | | 0 | 65.7 | 0.15 | 330 | 60 |
+| opus, bursty, isolated | | 4.9 | 1082.1 | 0.15 | 840 | 60 |
+| opus, bursty, plain | | 1.7 | 6834.3 | 0.573 | 3000 | 60 |
+| opus, step, isolated | | 1.7 | 0 | 0.096 | 450 | 60 |
+| opus, step, plain | yes | 0 | 2221.6 | 0.387 | 2250 | 60 |
+| opus, high-rtt, isolated | | 0 | 69 | 0 | 420 | 60 |
+| opus, high-rtt, plain | | 1.7 | 66.4 | 0.109 | 270 | 23.7 |
+| opus, fixed-250, isolated | yes | 0 | 0 | 0.393 | 441 | 0 |
+| opus, fixed-250, plain | yes | 0 | 0 | 0.436 | 441 | 0 |
+| aac, near-zero, isolated | yes | 0 | 0 | 0.252 | 558 | 0 |
+| aac, near-zero, plain | yes | 0 | 0 | 0.075 | 558 | 0 |
+| aac, mild, isolated | yes | 0 | 0 | 0.361 | 558 | 0 |
+| aac, mild, plain | yes | 0 | 0 | 0.471 | 558 | 0 |
+| aac, bursty, isolated | | 0 | 6185.2 | 0.464 | 1500 | 60 |
+| aac, bursty, plain | | 0 | 2446.4 | 1 | 2760 | 60 |
+| aac, step, isolated | | 0 | 0 | 0.048 | 570 | 0 |
+| aac, step, plain | | 1.7 | 0 | 0.191 | 600 | 22.5 |
+| aac, high-rtt, isolated | yes | 0 | 0 | 0.401 | 558 | 0 |
+| aac, high-rtt, plain | | 0 | 0 | 0.532 | 690 | 30.5 |
+| aac, fixed-250, isolated | yes | 0 | 0 | 0.177 | 933 | 0 |
+| aac, fixed-250, plain | | 0 | 0 | 0.211 | 933 | 0 |
+
+A third run under `--enforce` passed all 120 enforced checks with no void row and breached only on
+rows that had kept the marker. The replay lane is enforced in full, 74 checks across six rows,
+because it is deterministic.
+
+Twelve rows still carry a non-zero ceiling on a counter the engine is meant to keep at zero. Eight
+of those sixteen entries are one event in a minute, measured once and not the other time. Three are
+the real remainder: the two `bursty` skip-ahead ceilings and `opus-step-plain`'s 32.7. A 160 ms
+flush arriving as one burst still outruns what 15 ms of stretch per 100 ms of output can absorb, so
+the band still fires. That is the next piece of work, not something I am claiming is done.
+
+### Before and after, across the matrix
+
+`dev` at `246a4733f` against this branch, same desktop. **Not the same row length**: the baseline
+was recorded at 40 s a row and this branch's rows are 60 s, so the per-minute counters compare and
+`target p95` and `silence` do not strictly.
+
+| Row | underrun ep/min | skipped ms/min | silence | target p95 |
+| --- | ---: | ---: | ---: | ---: |
+| opus, mild, plain | 8.6 -> 0 | 4911.5 -> 0 | 0.471 -> 0.1 | 63 -> 160 |
+| opus, step, isolated | 3.4 -> 0 | 5503.6 -> 0 | 0.107 -> 0.05 | 67 -> 300 |
+| opus, high-rtt, plain | 0 -> 1.1 | 11491.3 -> 44.3 | 0.307 -> 0.059 | 155.8 -> 180 |
+| opus, high-rtt, isolated | 0 -> 0 | 2013.8 -> 46 | 0.443 -> 0 | 142 -> 280 |
+| opus, bursty, isolated | 8.6 -> 2.2 | 6158.2 -> 486.4 | 0.293 -> 0.1 | 67 -> 340 |
+| opus, bursty, plain | 3.4 -> 1.1 | 6921.2 -> 1612.1 | 0.436 -> 0.382 | 185.8 -> 1720 |
+| aac, mild, isolated | 0 -> 0 | 253 -> 0 | 0.489 -> 0.241 | 395 -> 372 |
+| aac, mild, plain | 0 -> 0 | 715.9 -> 0 | 0.657 -> 0.314 | 395 -> 372 |
+| aac, bursty, plain | 0 -> 0 | 5827.9 -> 518.8 | 0.329 -> 0.005 | 395 -> 640 |
+| aac, high-rtt, isolated | 0 -> 0 | 0 -> 0 | 0.716 -> 0.267 | 507.5 -> 372 |
+| aac, bursty, isolated | 0 -> 0 | 74.7 -> 3530.7 | 0.271 -> 0.309 | 395 -> 1000 |
+| opus, step, plain | 0 -> 0 | 1111.7 -> 1481.1 | 0.286 -> 0.258 | 67 -> 1500 |
+
+The full 24 rows are in `REPORT.md`. Where the baseline discarded audio to hold a round-trip-sized
+buffer, this holds a measured one and discards nothing; the targets rise to pay for it, which is the
+trade. The last two rows go the other way and I am not explaining them away: `aac-bursty-isolated`
+and `opus-step-plain` are both `recorded` rows and both are in the residual list.
+
+### Gates
+
+| Gate | Exit | What it covered |
+| --- | ---: | --- |
+| `just fix` | 0 | No tracked change left over |
+| `just check upstream/dev` | 0 | Every package the branch touches, scoped as CI scopes it |
+| `just test default upstream/dev` | 0 | 4545 Rust tests (7 skipped), 1587 Bun tests, 58 Python |
+| `cargo nextest run -p moq-shaper -p moq-audio` | 0 | 191 tests |
+| `just test audio-quality --enforce` | 0 | 24 Chromium rows at 60 s, 120 enforced checks, no void |
+| `just test audio-quality --runtime replay --enforce` | 0 | 6 rows, 74 enforced checks |
+| `just drafts check` | 0 | No draft changed on this branch |
 
 ### Where I departed from the quests
 
@@ -118,6 +199,21 @@ replaced**. That 91 is the censoring mechanism, measured.
   is not in `moq-relay`'s default set, and it still says `use moq_native::...` where `moq-native` is
   now a tombstone crate that refuses to build as a dependency. I have the shaper's impaired second
   lane written as a patch and did not land it on a file that does not compile.
+- **My own shaper was reordering datagrams, and that is worth reading even if you never run it.**
+  Every datagram drew `now + delay + jitter * gaussian` independently, so any profile with jitter
+  released datagrams out of order; QUIC read that as loss and backed off. Fixed in `492781763`.
+  What it exposed is about the player, not the shaper: the reordering hurt the *video* stream, not
+  audio, and the measured audio spread stayed at 100 to 180 ms while the video spread ran at 1.6 to
+  2.0 s. `Sync` in auto takes the larger spread across tracks, so the audio buffer was dragged to 1.5
+  to 3 s by a number that never came from audio arrivals. Target p95 on the opus plain rows went from
+  1960 ms to 420 ms on `mild` and 1760 ms to 360 ms on `high-rtt` once the path stopped lying.
+  Whether one track's spread should size another track's buffer is a genuine question; I kept the
+  `max()` #3517 had rather than answer it here.
+- **`localhost` is not `127.0.0.1` for this.** Chromium resolves `localhost` to `::1` first and the
+  shaper binds IPv4, so a page pointed at `localhost` either falls back to the WebSocket and grades
+  an unimpaired TCP session, or, with the fallback removed, never connects at all. Neither failure
+  announces itself. Another argument for a `Connection` option: the race turns a name-resolution
+  mismatch into a working session over the wrong transport.
 
 ### Public API and wire impact
 
@@ -144,9 +240,9 @@ replaced**. That 91 is the censoring mechanism, measured.
 Stating this plainly, because some of it matters for how much weight the numbers carry.
 
 - **No iOS device.** Desktop Safari through safaridriver is the closest proxy. iOS is not measured.
-- **The nightly CI job is not wired.** The harness has its recipe and its README and runs, but
-  nothing under `.github/` runs it, and budgets are recorded rather than enforced until it lands.
-- **The replay lane is not in the harness**, only as unit tests in `js/watch/src/audio/replay.test.ts`.
+- **The nightly job has never run on your runner.** `20b2fcbb9` adds it and it passes `--enforce`,
+  but every ceiling in `budgets.json` was measured on one desktop. The rows still marked `recorded`
+  are the ones I would not ask a different machine to clear yet.
 - **Local measurements were taken on a loaded machine** (load average 13 to 23 at times). One control
   re-run of the same bytes on the same build gave 1360 ms where an earlier pass gave 372 ms. Treat
   every local number as an upper bound. The public-relay rows are remote and held steady across every

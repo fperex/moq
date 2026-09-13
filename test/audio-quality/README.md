@@ -93,6 +93,11 @@ The certificate is pinned by hash rather than by hostname, so pointing the page 
 instead of the relay's needs nothing else: no second certificate, no name resolution, no TLS
 exception. That is the whole reason a userspace shaper is enough here.
 
+Every URL handed to the page is literal `127.0.0.1`, never `localhost`. Chromium resolves `localhost`
+to `::1` first and the shaper binds IPv4, so a page pointed at the name either wins the WebSocket
+race and grades an unimpaired TCP session, or, with the fallback denied as it is below, never
+connects at all. Neither failure announces itself.
+
 The publisher stays on the clean path deliberately. Impairing the ingest too would grade the
 receiver on a stream that was already damaged before it was published, and the publisher's own flush
 span is a separate stage of the ledger.
