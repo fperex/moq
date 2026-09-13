@@ -89,11 +89,6 @@ impl Decision {
 		self.target = frames(self.rate, target);
 	}
 
-	/// The target, in frames.
-	pub(crate) fn level_target(&self) -> usize {
-		self.target
-	}
-
 	/// Note how much audio arrived in one go, which is how far above target a
 	/// well-behaved publisher can put the buffer.
 	pub(crate) fn arrived(&mut self, count: usize) {
@@ -191,11 +186,6 @@ impl Decision {
 		self.since = usize::MAX / 2;
 		self.concealing = false;
 		self.stalled = buffered < frames(self.rate, BLOCK);
-	}
-
-	/// The smoothed buffer level, in frames.
-	pub(crate) fn level(&self) -> usize {
-		self.level.filtered()
 	}
 }
 

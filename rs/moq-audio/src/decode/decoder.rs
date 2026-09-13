@@ -56,7 +56,7 @@ pub enum Start {
 ///
 /// `#[non_exhaustive]`: build via [`Config::new`] (or `default()`) and set the
 /// optional fields, so future knobs don't break callers.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Config {
 	/// How to pack samples in each emitted frame.
@@ -75,14 +75,70 @@ pub struct Config {
 	/// Set [`max_age`](Self::max_age) to the playout buffer you can
 	/// tolerate (typically tens to a few hundred ms) for the best
 	/// congestion-vs-quality trade-off.
+	///
+	/// With [`delay`](Self::delay) set this is a ceiling rather than the budget
+	/// itself: playout claims three quarters of it, and the budget on the wire then
+	/// follows the measured target so the arrivals it was sized to cover are not
+	/// skipped before the estimator can see them.
 	pub max_age: std::time::Duration,
 	/// Where to start on a track that already holds groups.
 	pub start: Start,
+	/// How much audio to hold before playing it, so a late arrival still makes its
+	/// slot: `Some` turns the jitter buffer on and [`Consumer`](super::Consumer)
+	/// hands back playout blocks instead of decoded packets.
+	///
+	/// A floor, not a target. The buffer is sized from what actually arrives
+	/// (`doc/concept/playout.md`), and this is the least it may size itself to, for
+	/// a caller who knows something the arrivals do not say. The estimator raises it
+	/// whenever the path asks for more.
+	///
+	/// It has to fit under [`max_age`](Self::max_age), which is the ceiling on how
+	/// deep the buffer may grow rather than the budget in force: playout claims three
+	/// quarters of it, always leaves it the headroom it has to keep above the target
+	/// (a bucket, a block, and a time stretch, 105 ms), and never takes more than
+	/// [`DELAY_MAX`](Self::DELAY_MAX) whatever the budget says. A floor that does not
+	/// fit is refused rather than clamped, since clamping would leave playback
+	/// holding less than the caller asked for and say nothing. Leave room above the
+	/// floor, or the estimator has nowhere to raise the target to.
+	///
+	/// `None`, the default, decodes without buffering: each packet comes back as it
+	/// is decoded, which is what a recorder or an export wants.
+	pub delay: Option<std::time::Duration>,
+	/// Whether a gap in the media is concealed with synthesized audio, or played as
+	/// a ramp into silence (default: `true`).
+	///
+	/// Only read when [`delay`](Self::delay) turns playout on. Concealment repeats
+	/// the pitch period of what was playing and fades toward the room tone, which is
+	/// what a listener hears as continuous speech over a lost packet rather than a
+	/// click.
+	pub conceal: bool,
+}
+
+impl Default for Config {
+	fn default() -> Self {
+		Self {
+			format: Format::default(),
+			sample_rate: None,
+			channels: None,
+			max_age: std::time::Duration::ZERO,
+			start: Start::default(),
+			delay: None,
+			conceal: true,
+		}
+	}
 }
 
 impl Config {
+	/// The deepest buffer [`delay`](Self::delay) may ask for.
+	///
+	/// The estimator describes delay with a hundred twenty millisecond buckets
+	/// (`doc/concept/playout.md`), so two seconds is the widest target it can
+	/// produce and the widest floor it can be held to. The effective bound is often
+	/// lower, since [`max_age`](Self::max_age) caps it too.
+	pub const DELAY_MAX: std::time::Duration = crate::playout::delay::CEILING;
+
 	/// A default config: the codec's native rate and channel count, interleaved
-	/// `f32`, and real-time latency.
+	/// `f32`, real-time latency, and no jitter buffer.
 	pub fn new() -> Self {
 		Self::default()
 	}

@@ -103,11 +103,6 @@ impl Expand {
 		frames(self.rate, HISTORY)
 	}
 
-	/// Frames per channel each [`Self::process`] call produces.
-	pub(crate) fn block(&self) -> usize {
-		self.block
-	}
-
 	/// How many blocks have been concealed since the last real audio.
 	pub(crate) fn consecutive(&self) -> u32 {
 		self.consecutive

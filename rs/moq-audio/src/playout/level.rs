@@ -61,11 +61,6 @@ impl Level {
 	pub(crate) fn filtered(&self) -> usize {
 		self.filtered.round() as usize
 	}
-
-	/// Back to empty, keeping the current target's smoothing.
-	pub(crate) fn reset(&mut self) {
-		self.filtered = 0.0;
-	}
 }
 
 impl Default for Level {

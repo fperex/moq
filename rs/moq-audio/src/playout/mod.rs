@@ -34,7 +34,10 @@
 //! | [`buffer`] frame buffer and flushing | `packet_buffer.cc` | here |
 //! | [`decision`] per-block decision loop | `decision_logic.cc` | here |
 //! | [`engine`] the loop that runs them all | `neteq_impl.cc` | here |
-//! | wiring into `decode` / `playback` | `neteq_impl.cc` | next |
+//!
+//! [`decode::Consumer`](crate::decode::Consumer) is what drives it: it measures
+//! arrivals off the container, feeds the engine decoded PCM, and hands its caller one
+//! block per [`read`](crate::decode::Consumer::read).
 
 use std::time::Duration;
 
@@ -53,6 +56,8 @@ pub(crate) mod sync;
 mod corpus;
 #[cfg(test)]
 mod fixture;
+#[cfg(test)]
+mod replay;
 
 /// One block of playout: what the sink pulls, and what concealment produces per call.
 pub(crate) const BLOCK: Duration = Duration::from_millis(10);
@@ -94,6 +99,18 @@ pub(crate) const STRETCH_BOUND: Duration = Duration::from_millis(75);
 /// Concealment blocks produced back to back before the output is comfort noise and
 /// nothing else, so a dead stream does not repeat a pitch period forever.
 pub(crate) const MAX_CONSECUTIVE_EXPANDS: u32 = 200;
+
+/// How much further than the target audio may arrive and still be played.
+///
+/// Three terms, each one something playout absorbs without dropping a sample: the
+/// estimator reports a bucket's upper edge, so the real delay sits up to a bucket
+/// below it; the output leaves a block at a time; and a time stretch moves the
+/// playhead by up to its own bound.
+///
+/// It is both the gap an age budget has to keep above the target, and therefore the
+/// amount a budget has to be deeper than the target it will allow.
+pub(crate) const HEADROOM: Duration =
+	Duration::from_millis(delay::BUCKET as u64 + BLOCK.as_millis() as u64 + STRETCH_BOUND.as_millis() as u64);
 
 /// Frames in `duration` at `rate`.
 pub(crate) fn frames(rate: u32, duration: Duration) -> usize {
