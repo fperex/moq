@@ -311,8 +311,10 @@ describe("decision", () => {
 	const RATE = 48000;
 	const TARGET = frames(RATE, 100);
 	const CHUNK = frames(RATE, 20);
-	// low = target, high = target + chunk + 20ms.
-	const HIGH = TARGET + CHUNK + frames(RATE, 20);
+	// The level the ring holds, because the target counts the chunk being played.
+	const LOW = TARGET + CHUNK;
+	// low = target + chunk, high = that plus 20ms.
+	const HIGH = LOW + frames(RATE, 20);
 
 	/** What the ring looks like at `buffered`, with media to play and concealment available. */
 	function demand(buffered: number, outputFrame = 0): Demand {
@@ -340,7 +342,7 @@ describe("decision", () => {
 	}
 
 	it("plays normally inside the band", () => {
-		expect(decide(seeded(TARGET), TARGET)).toBe("normal");
+		expect(decide(seeded(LOW), LOW)).toBe("normal");
 		expect(decide(seeded(HIGH - 1), HIGH - 1)).toBe("normal");
 	});
 
@@ -350,11 +352,11 @@ describe("decision", () => {
 		expect(decide(seeded(4 * HIGH), 4 * HIGH)).toBe("fast-accelerate");
 	});
 
-	it("expands below the target but not below half of it", () => {
-		expect(decide(seeded(TARGET - 1), TARGET - 1)).toBe("expand");
-		expect(decide(seeded(TARGET / 2), TARGET / 2)).toBe("expand");
-		// Below half the target the ring is refilling, and holding audio back would fight the refill.
-		expect(decide(seeded(TARGET / 2 - 1), TARGET / 2 - 1)).toBe("normal");
+	it("expands below the hold level but not below half of it", () => {
+		expect(decide(seeded(LOW - 1), LOW - 1)).toBe("expand");
+		expect(decide(seeded(LOW / 2), LOW / 2)).toBe("expand");
+		// Below half of it the ring is refilling, and holding audio back would fight the refill.
+		expect(decide(seeded(LOW / 2 - 1), LOW / 2 - 1)).toBe("normal");
 	});
 
 	it("holds a cooldown of a hundred milliseconds of output", () => {
@@ -394,7 +396,7 @@ describe("decision", () => {
 		decision.discontinuity();
 		// The filter would take a second to walk down from four times the limit; a flush means the
 		// level never drifted there, so the next observation replaces it.
-		expect(decide(decision, TARGET)).toBe("normal");
+		expect(decide(decision, LOW)).toBe("normal");
 	});
 });
 

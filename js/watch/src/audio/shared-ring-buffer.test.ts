@@ -50,6 +50,22 @@ function insertChunks(
 	}
 }
 
+/**
+ * Fill the ring with `samples` as two halves, which is what un-stalls a ring targeting half of them.
+ *
+ * The ring holds the target with one chunk on top, because the target counts the frame in play. A
+ * fill that lands as a single insert can therefore never un-stall a ring targeting the whole of it:
+ * one chunk is exactly what it is short of. Two halves at a half-sized target reach the same depth.
+ */
+function fill(
+	buffer: SharedRingBuffer,
+	timestampMs: number,
+	samples: number,
+	opts?: { channels?: number; value?: number },
+): void {
+	insertChunks(buffer, timestampMs, samples, Math.ceil(samples / 2), opts);
+}
+
 function read(buffer: SharedRingBuffer, samples: number, channelCount?: number): Float32Array[] {
 	const ch = channelCount ?? buffer.channels;
 	const output: Float32Array[] = [];
@@ -103,7 +119,7 @@ describe("initialization", () => {
 
 describe("insert", () => {
 	it("should write continuous data", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 
 		insert(buffer, 0, 10, { value: 1.0 });
 		expect(buffer.length).toBe(10);
@@ -113,7 +129,7 @@ describe("insert", () => {
 	});
 
 	it("should handle gaps by filling with zeros", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 
 		insert(buffer, 0, 10, { value: 1.0 });
 
@@ -123,7 +139,7 @@ describe("insert", () => {
 		expect(buffer.length).toBe(30); // 10 + 10 (gap) + 10
 
 		// Fill to exit stalled mode
-		insert(buffer, 30, 70, { value: 0.0 });
+		fill(buffer, 30, 70, { value: 0.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read and verify the gap was filled with zeros
@@ -145,10 +161,10 @@ describe("insert", () => {
 	});
 
 	it("should handle out-of-order writes", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 50 });
 
 		// Fill buffer to exit stalled mode
-		insert(buffer, 0, 100, { channels: 1, value: 0.0 });
+		fill(buffer, 0, 100, { channels: 1, value: 0.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read 50 samples to advance read pointer to 50
@@ -178,10 +194,10 @@ describe("insert", () => {
 	});
 
 	it("should discard samples that are too old", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 
 		// Fill and exit stalled mode
-		insert(buffer, 0, 100, { value: 0.0 });
+		fill(buffer, 0, 100, { value: 0.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read 60 samples, readIndex now at 60
@@ -210,10 +226,10 @@ describe("insert", () => {
 
 describe("reading", () => {
 	it("should read available data", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 
 		// Fill to exit stalled mode
-		insert(buffer, 0, 100, { value: 0.0 });
+		fill(buffer, 0, 100, { value: 0.0 });
 		expect(buffer.stalled).toBe(false);
 
 		read(buffer, 80);
@@ -238,10 +254,10 @@ describe("reading", () => {
 	});
 
 	it("should handle partial reads", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 
 		// Fill and exit stalled
-		insert(buffer, 0, 100, { value: 0.0 });
+		fill(buffer, 0, 100, { value: 0.0 });
 		read(buffer, 80);
 
 		insert(buffer, 100, 20, { value: 1.0 });
@@ -260,10 +276,10 @@ describe("reading", () => {
 	});
 
 	it("should return 0 when empty", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 
 		// Fill and drain to exit stalled
-		insert(buffer, 0, 100, { value: 0.0 });
+		fill(buffer, 0, 100, { value: 0.0 });
 		read(buffer, 100);
 		expect(buffer.length).toBe(0);
 
@@ -275,7 +291,7 @@ describe("reading", () => {
 
 describe("stall behavior", () => {
 	it("should start stalled and not output data", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 		expect(buffer.stalled).toBe(true);
 
 		insert(buffer, 0, 50, { value: 1.0 });
@@ -283,23 +299,24 @@ describe("stall behavior", () => {
 		expect(output[0].length).toBe(0);
 	});
 
-	it("should un-stall when buffer reaches LATENCY", () => {
+	it("should un-stall when buffer reaches LATENCY plus a chunk", () => {
 		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 
-		// Write 49 samples — not enough
-		insert(buffer, 0, 49, { value: 1.0 });
+		// 50 samples in 10 sample chunks: on the target, and still one chunk short of the level the
+		// ring holds, because the target counts the chunk being played.
+		insertChunks(buffer, 0, 50, 10, { value: 1.0 });
 		expect(buffer.stalled).toBe(true);
 
-		// Write 1 more to reach 50 = LATENCY
-		insert(buffer, 49, 1, { value: 1.0 });
+		// The chunk on top, which is the audio that is actually waiting to be played.
+		insert(buffer, 50, 10, { value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 	});
 
 	it("should un-stall on overflow (buffer reaches capacity)", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 
 		// Fill buffer completely
-		insert(buffer, 0, 100, { value: 1.0 });
+		fill(buffer, 0, 100, { value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Overflow — should still not be stalled
@@ -310,10 +327,10 @@ describe("stall behavior", () => {
 
 describe("ring wrapping", () => {
 	it("should wrap around when buffer is full", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 128, latency: 128 });
+		const buffer = create({ rate: 1000, channels: 1, capacity: 128, latency: 64 });
 
 		// Fill buffer
-		insert(buffer, 0, 128, { channels: 1, value: 1.0 });
+		fill(buffer, 0, 128, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read 64 to make room
@@ -341,10 +358,10 @@ describe("ring wrapping", () => {
 
 describe("multi-channel", () => {
 	it("should handle stereo data correctly", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 100, latency: 50 });
 
 		// Fill and exit stalled
-		insert(buffer, 0, 100, { value: 0.5 });
+		fill(buffer, 0, 100, { value: 0.5 });
 		expect(buffer.stalled).toBe(false);
 
 		read(buffer, 80);
@@ -381,10 +398,10 @@ describe("edge cases", () => {
 	});
 
 	it("should handle fractional timestamps", () => {
-		const buffer = create({ rate: 1000, channels: 2, capacity: 200, latency: 200 });
+		const buffer = create({ rate: 1000, channels: 2, capacity: 200, latency: 100 });
 
 		// Fill buffer to exit stalled
-		insert(buffer, 0, 200, { value: 0.0 });
+		fill(buffer, 0, 200, { value: 0.0 });
 		read(buffer, 200);
 
 		// Fractional timestamp that rounds
@@ -400,8 +417,8 @@ describe("overflow", () => {
 	it("should advance READ when exceeding capacity", () => {
 		const buffer = create({ rate: 1000, channels: 1, capacity: 128, latency: 64 });
 
-		// Fill buffer to 64 (LATENCY) to un-stall
-		insert(buffer, 0, 64, { channels: 1, value: 1.0 });
+		// Fill buffer to 64 (LATENCY) plus the chunk on top of it, to un-stall
+		insertChunks(buffer, 0, 96, 32, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Write way past capacity — should advance READ
@@ -425,29 +442,32 @@ describe("overflow", () => {
 });
 
 describe("latency skip", () => {
-	// 325 sample target, 100 sample chunks, and the 75 sample stretch band at this rate: 500 in all.
+	// 325 sample target, 100 sample chunks, and the 75 sample stretch band at this rate: the ring
+	// holds 425 and skips past 500.
 	const BAND = { rate: 1000, channels: 1, capacity: 2048, latency: 325 };
 	const TARGET = 325;
 	const CHUNK = 100;
+	// What the ring holds: the target counts the chunk being played, so the audio still waiting to be
+	// played is the target plus one more chunk. Every skip lands back here.
+	const HOLD = TARGET + CHUNK;
 
-	it("should skip READ when buffered exceeds LATENCY plus a chunk and the stretch band", () => {
+	it("should skip READ when buffered exceeds the hold level and the stretch band", () => {
 		const buffer = create(BAND);
 
 		// Fill 700 samples in 100-sample chunks, well past the 500 sample band.
 		insertChunks(buffer, 0, 700, CHUNK, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
-		// Read should skip ahead to maintain LATENCY distance from WRITE
+		// Read should skip ahead to leave the hold level between READ and WRITE
 		const output = read(buffer, 1024, 1);
 
-		// Should only get LATENCY samples, skipping the rest
-		expect(output[0].length).toBe(TARGET);
+		expect(output[0].length).toBe(HOLD);
 	});
 
-	it("should tolerate one chunk and the stretch band above LATENCY", () => {
-		// A ring sitting on the target is a chunk above it the moment the next chunk lands, and the
-		// band above that is what the reader's time stretch closes on its own. Skipping on either
-		// overshoot discards audio the reader was going to play anyway.
+	it("should tolerate the stretch band above the hold level", () => {
+		// A ring sitting on what it holds is inside the band the moment the next chunk lands, and the
+		// band is what the reader's time stretch closes on its own. Skipping on that overshoot
+		// discards audio the reader was going to play anyway.
 		const buffer = create(BAND);
 
 		insertChunks(buffer, 0, 500, CHUNK, { channels: 1, value: 1.0 });
@@ -464,28 +484,28 @@ describe("latency skip", () => {
 		expect(buffer.stalled).toBe(false);
 
 		const output = read(buffer, 1024, 1);
-		expect(output[0].length).toBe(TARGET);
+		expect(output[0].length).toBe(HOLD);
 	});
 
-	it("should not skip when buffered is within LATENCY", () => {
+	it("should not skip when buffered is on the hold level", () => {
 		const buffer = create(BAND);
 
-		// Fill exactly LATENCY samples
-		insert(buffer, 0, TARGET, { channels: 1, value: 1.0 });
+		// Fill exactly what the ring holds
+		insertChunks(buffer, 0, HOLD, CHUNK, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read should get all of them: no skip needed
 		const output = read(buffer, 1024, 1);
-		expect(output[0].length).toBe(TARGET);
+		expect(output[0].length).toBe(HOLD);
 	});
 });
 
 describe("timestamp getter", () => {
 	it("should track READ position as timestamp", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 50 });
 
 		// Fill and un-stall
-		insert(buffer, 0, 100, { channels: 1, value: 0.0 });
+		fill(buffer, 0, 100, { channels: 1, value: 0.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Initially at 0
@@ -508,9 +528,9 @@ describe("setLatency", () => {
 		insertChunks(buffer, 0, 768, 128, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
-		// With LATENCY=256, reading should skip to 512 (768-256)
+		// With LATENCY=256 and 128 sample chunks the ring holds 384, so the skip lands there.
 		const output1 = read(buffer, 1024, 1);
-		expect(output1[0].length).toBe(256);
+		expect(output1[0].length).toBe(384);
 
 		// Write more
 		insertChunks(buffer, 768, 768, 128, { channels: 1, value: 2.0 });
@@ -520,7 +540,7 @@ describe("setLatency", () => {
 
 		// Now reading should skip more aggressively
 		const output2 = read(buffer, 1024, 1);
-		expect(output2[0].length).toBe(128);
+		expect(output2[0].length).toBe(256);
 	});
 });
 
@@ -545,15 +565,60 @@ describe("capacity", () => {
 	});
 });
 
+describe("the chunk above the target", () => {
+	// The real shape a conference call has: 48kHz Opus in 20ms frames, and the lowest target the
+	// estimator can report. The target counts the frame being played, the way NetEq's does, so the
+	// ring holds 40ms and one arrival a few milliseconds late no longer finds it empty.
+	const RATE = 48000;
+	const CHUNK = 960;
+	const TARGET = 960;
+
+	function opus() {
+		const buffer = create({ rate: RATE, channels: 1, capacity: RATE, latency: TARGET });
+		return buffer;
+	}
+
+	it("un-stalls at the target plus a chunk, not at the target", () => {
+		const buffer = opus();
+
+		insert(buffer, 0, CHUNK, { channels: 1, value: 1.0 });
+		expect(buffer.length).toBe(TARGET);
+		expect(buffer.stalled).toBe(true);
+
+		insert(buffer, 20, CHUNK, { channels: 1, value: 1.0 });
+		expect(buffer.stalled).toBe(false);
+	});
+
+	it("plays a full quantum through a chunk that arrives ten milliseconds late", () => {
+		const buffer = opus();
+		// Feed it a chunk at a time and start playing the moment it says it is ready, which is what
+		// the refill after a stall does. What it stops at is the whole question.
+		for (let at = 0; buffer.stalled; at += 20) {
+			insert(buffer, at, CHUNK, { channels: 1, value: 1.0 });
+		}
+
+		// Thirty milliseconds of render quanta with nothing arriving: the chunk due at 40ms is ten
+		// late. A ring holding only the target would be empty ten milliseconds before it landed.
+		const quanta = Math.floor((RATE * 30) / 1000 / 128);
+		for (let i = 0; i < quanta; i++) {
+			expect(read(buffer, 128, 1)[0].length).toBe(128);
+		}
+		expect(buffer.underruns).toBe(0);
+		expect(buffer.stalled).toBe(false);
+	});
+});
+
 describe("re-buffer", () => {
-	it("re-stalls and refills to the target after running dry", () => {
+	it("re-stalls and refills to the hold level after running dry", () => {
+		// A 40 sample target with 20 sample chunks: the ring holds 60, the target plus the chunk
+		// being played.
 		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
 
-		insertChunks(buffer, 0, 40, 20, { channels: 1, value: 1.0 });
+		insertChunks(buffer, 0, 60, 20, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Drain it.
-		expect(read(buffer, 40, 1)[0].length).toBe(40);
+		expect(read(buffer, 60, 1)[0].length).toBe(60);
 		expect(buffer.length).toBe(0);
 
 		// The next read finds nothing and parks playback rather than handing the worklet a quantum
@@ -562,32 +627,32 @@ describe("re-buffer", () => {
 		expect(buffer.stalled).toBe(true);
 		expect(buffer.underruns).toBe(1);
 
-		// A single chunk is not the target, so playback stays parked.
-		insert(buffer, 40, 20, { channels: 1, value: 2.0 });
+		// Two chunks are still short of the level, so playback stays parked.
+		insertChunks(buffer, 60, 40, 20, { channels: 1, value: 2.0 });
 		expect(buffer.stalled).toBe(true);
 		expect(read(buffer, 20, 1)[0].length).toBe(0);
 
-		// Reaching the target resumes it, and nothing buffered in the meantime was lost.
-		insert(buffer, 60, 20, { channels: 1, value: 2.0 });
+		// Reaching it resumes playback, and nothing buffered in the meantime was lost.
+		insert(buffer, 100, 20, { channels: 1, value: 2.0 });
 		expect(buffer.stalled).toBe(false);
-		expect(read(buffer, 40, 1)[0].length).toBe(40);
+		expect(read(buffer, 60, 1)[0].length).toBe(60);
 	});
 
 	it("counts a quantum it could only partly fill as an underrun", () => {
 		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
 
-		insertChunks(buffer, 0, 40, 20, { channels: 1, value: 1.0 });
-		expect(read(buffer, 30, 1)[0].length).toBe(30);
+		insertChunks(buffer, 0, 60, 20, { channels: 1, value: 1.0 });
+		expect(read(buffer, 50, 1)[0].length).toBe(50);
 
 		// Ten samples remain against a quantum of twenty: the rest of the quantum is silence, which
 		// is an underrun whether or not a chunk lands before the next read. It is not a stall: a
-		// refill would cost the whole target to cover a gap shorter than one quantum.
+		// refill would cost the whole level to cover a gap shorter than one quantum.
 		expect(read(buffer, 20, 1)[0].length).toBe(10);
 		expect(buffer.stalled).toBe(false);
 		expect(buffer.underruns).toBe(1);
 
 		// A chunk landing before the next read keeps playback going.
-		insert(buffer, 40, 20, { channels: 1, value: 2.0 });
+		insert(buffer, 60, 20, { channels: 1, value: 2.0 });
 		expect(read(buffer, 20, 1)[0].length).toBe(20);
 		expect(buffer.underruns).toBe(1);
 	});
@@ -595,7 +660,7 @@ describe("re-buffer", () => {
 	it("stall() parks playback without discarding what is buffered", () => {
 		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
 
-		insertChunks(buffer, 0, 40, 20, { channels: 1, value: 1.0 });
+		insertChunks(buffer, 0, 60, 20, { channels: 1, value: 1.0 });
 		expect(read(buffer, 20, 1)[0].length).toBe(20);
 
 		// The target deepens, so playback parks until the ring holds the new depth.
@@ -603,12 +668,12 @@ describe("re-buffer", () => {
 		buffer.stall();
 		expect(buffer.stalled).toBe(true);
 		expect(read(buffer, 20, 1)[0].length).toBe(0);
-		expect(buffer.length).toBe(20); // nothing was thrown away, unlike reset()
-
-		insert(buffer, 40, 20, { channels: 1, value: 2.0 });
-		expect(buffer.stalled).toBe(true); // 40 buffered, target is 60
+		expect(buffer.length).toBe(40); // nothing was thrown away, unlike reset()
 
 		insert(buffer, 60, 20, { channels: 1, value: 2.0 });
+		expect(buffer.stalled).toBe(true); // 60 buffered, the ring holds 80
+
+		insert(buffer, 80, 20, { channels: 1, value: 2.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Playback resumes on the same timeline: the samples buffered before the stall play first.
@@ -631,14 +696,14 @@ describe("stalled getter", () => {
 		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 50 });
 		expect(buffer.stalled).toBe(true);
 
-		insert(buffer, 0, 50, { channels: 1, value: 1.0 });
+		fill(buffer, 0, 100, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 	});
 });
 
 describe("length getter", () => {
 	it("should report buffered samples", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 50 });
 
 		expect(buffer.length).toBe(0);
 
@@ -646,7 +711,7 @@ describe("length getter", () => {
 		expect(buffer.length).toBe(30);
 
 		// Fill to un-stall and read
-		insert(buffer, 30, 70, { channels: 1, value: 0.0 });
+		fill(buffer, 30, 70, { channels: 1, value: 0.0 });
 		read(buffer, 50, 1);
 		expect(buffer.length).toBe(50);
 	});
@@ -700,8 +765,8 @@ describe("i32 wrap epoch", () => {
 		const buffer = new SharedRingBuffer(init);
 		buffer.setLatency(16);
 
-		insert(buffer, 0, 16, { channels: 1, value: 0.25 });
-		read(buffer, 16, 1);
+		insertChunks(buffer, 0, 32, 16, { channels: 1, value: 0.25 });
+		read(buffer, 32, 1);
 
 		// Park both cursors 8 samples below the boundary so the next frame straddles it.
 		const edge = 0x7fffffff - 8;
@@ -721,11 +786,11 @@ describe("i32 wrap epoch", () => {
 
 describe("i32 wrapping", () => {
 	it("should handle modular arithmetic with large sample indices", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 100 });
+		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 50 });
 
 		// At rate 1000: sample = round(seconds * 1000)
 		// Use 2_000_000 ms = 2000 seconds → sample index 2_000_000
-		insert(buffer, 2_000_000, 100, { channels: 1, value: 42.0 });
+		fill(buffer, 2_000_000, 100, { channels: 1, value: 42.0 });
 		expect(buffer.stalled).toBe(false);
 
 		const output = read(buffer, 100, 1);
@@ -747,6 +812,7 @@ describe("i32 wrapping", () => {
 
 		insert(buffer, startMs, 4410, { channels: 1, value: 0.5 });
 		insert(buffer, startMs + 100, 4410, { channels: 1, value: 0.5 });
+		insert(buffer, startMs + 200, 4410, { channels: 1, value: 0.5 });
 
 		expect(buffer.stalled).toBe(false);
 		// The anchor is preserved, so media time survives the wrap rather than reading negative.
@@ -758,9 +824,9 @@ describe("i32 wrapping", () => {
 
 	it("should handle slot indexing past capacity boundary", () => {
 		// capacity=10, start at sample 97 → wraps across boundary
-		const buffer = create({ rate: 1000, channels: 1, capacity: 10, latency: 10 });
+		const buffer = create({ rate: 1000, channels: 1, capacity: 10, latency: 5 });
 
-		insert(buffer, 97, 10, { channels: 1, value: 7.0 });
+		fill(buffer, 97, 10, { channels: 1, value: 7.0 });
 		expect(buffer.stalled).toBe(false);
 
 		const output = read(buffer, 10, 1);
@@ -773,8 +839,8 @@ describe("i32 wrapping", () => {
 
 describe("SharedRingBuffer.resize", () => {
 	it("preserves the unread window when growing capacity", () => {
-		const src = create({ rate: 1000, channels: 2, capacity: 64, latency: 30 });
-		insert(src, 0, 30, { value: 3.5 });
+		const src = create({ rate: 1000, channels: 2, capacity: 64, latency: 15 });
+		fill(src, 0, 30, { value: 3.5 });
 		expect(src.stalled).toBe(false);
 
 		const dst = src.resize(256);
@@ -822,9 +888,9 @@ describe("buffered mode", () => {
 	it("anchors to the first frame instead of index 0", () => {
 		const buffer = createBuffered(50);
 		// First frame at a future timestamp; READ should snap to it, not gap-fill from 0.
-		insert(buffer, 2000, 100, { channels: 1, value: 0.1 });
+		fill(buffer, 2000, 100, { channels: 1, value: 0.1 });
 		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(2000 as Time.Milli);
-		expect(buffer.stalled).toBe(false); // 100 buffered >= 50 latency
+		expect(buffer.stalled).toBe(false); // 100 buffered >= the 50 target plus a 50 sample chunk
 	});
 
 	it("plays through the whole buffer without skipping ahead", () => {
@@ -846,14 +912,14 @@ describe("buffered mode", () => {
 
 	it("reset re-stalls and re-anchors to the next utterance", () => {
 		const buffer = createBuffered(50);
-		insert(buffer, 2000, 100, { channels: 1, value: 0.1 });
+		fill(buffer, 2000, 100, { channels: 1, value: 0.1 });
 		read(buffer, 50, 1);
 
 		buffer.reset();
 		expect(buffer.stalled).toBe(true);
 
 		// A new utterance with its own timestamps anchors fresh.
-		insert(buffer, 500, 100, { channels: 1, value: 0.9 });
+		fill(buffer, 500, 100, { channels: 1, value: 0.9 });
 		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(500 as Time.Milli);
 		const out = read(buffer, 100, 1);
 		expect(out[0][0]).toBeCloseTo(0.9, 5);
@@ -1041,7 +1107,10 @@ describe("packed state", () => {
 						dst.truncate(Time.Micro.fromMilli(48 as Time.Milli));
 					} else {
 						dst.reset();
-						insert(dst, 1000, 64, { channels: 1, value: 2 });
+						// In 32 sample chunks, so 64 samples is the 32 sample target with a chunk on
+						// top and the re-anchored ring plays rather than staying parked.
+						dst.setLatency(32);
+						insertChunks(dst, 1000, 64, 32, { channels: 1, value: 2 });
 					}
 				};
 				const realLoad = Atomics.load;
@@ -1087,9 +1156,9 @@ describe("packed state", () => {
 		read(worklet, 64, 1);
 
 		const dst = src.resize(256);
-		dst.setLatency(64);
+		dst.setLatency(32);
 		dst.reset();
-		insert(dst, 30_000, 64, { channels: 1, value: 2 });
+		insertChunks(dst, 30_000, 64, 32, { channels: 1, value: 2 });
 
 		const replacement = new SharedRingBuffer(dst.init, worklet);
 		expect(replacement.length).toBe(64);

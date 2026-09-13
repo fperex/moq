@@ -220,9 +220,10 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 	});
 
 	it("tracks a sender running slow instead of running dry", () => {
-		// Two percent slow drains a 100ms ring in five seconds. An expansion consumes less media
-		// than it emits, so the ring holds its depth instead.
-		const report = run(build, { target: 100, prefill: 100, seconds: 10, pace: 0.98 });
+		// Two percent slow drains the ring in five seconds. An expansion consumes less media than it
+		// emits, so the ring holds its depth instead. The prefill is what the ring holds: the 100ms
+		// target with the 20ms chunk being played on top of it.
+		const report = run(build, { target: 100, prefill: 120, seconds: 10, pace: 0.98 });
 
 		console.log(
 			`${name}: slow sender left ${(report.buffered / RATE) * 1000}ms buffered after ${report.expands} expands and ${report.underruns} underruns`,
