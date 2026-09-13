@@ -61,6 +61,18 @@ const stop = sink
 	? beacon({ url: sink, tag, drain: collector.drain, environment: collector.environment, notes: collector.notes })
 	: undefined;
 
+// The same batches the beacon posts, for a driver that pulls instead of being pushed to.
+//
+// The Safari lane has no sink: `safaridriver` is the only channel back, so its driver drains this
+// through `execute/sync` on the same 250ms grid and writes the ndjson itself. One shape, one
+// analyzer, whichever way the samples travelled.
+(globalThis as unknown as { moqAudioQuality?: unknown }).moqAudioQuality = {
+	tag,
+	drain: () => collector.drain(),
+	environment: () => collector.environment(),
+	notes: () => collector.notes(),
+};
+
 // The driver reads the run off the DOM rather than out of the sink, so a row can be graded even if
 // the sink never came up, and so a wait has something to poll.
 const status = document.createElement("pre");
@@ -101,9 +113,15 @@ setInterval(() => {
 // Chromium runs with --autoplay-policy=no-user-gesture-required, but Safari and a human opening this
 // by hand both need a real gesture before an AudioContext will start. The button is that gesture;
 // `unlockOnGesture` inside the element is already listening for the pointerdown.
+//
+// Pinned to the corner above everything, because a WebDriver Element Click refuses an element the
+// page has scrolled away or covered, and the player grows to fill the viewport the moment it has a
+// frame to render. In flow it is clickable before the catalog arrives and "not interactable" after,
+// which is the one moment the click has to work.
 const start = document.createElement("button");
 start.id = "start";
 start.textContent = "start audio";
+start.style.cssText = "position:fixed;top:0;left:0;z-index:2147483647";
 start.addEventListener("click", () => {
 	watch.muted = false;
 	watch.paused = false;

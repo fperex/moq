@@ -11,6 +11,7 @@ just test audio-quality --duration 30 --profiles bursty   # one profile, faster
 just test audio-quality --codecs opus --rings plain        # the production path only
 just test audio-quality --out ~/runs/after                 # keep the run directory
 just test audio-quality --enforce                          # fail on the budgets
+just test audio-quality --runtime safari                   # real Safari, local only
 ```
 
 The matrix is codec x jitter profile x ring path: 24 rows, about 30 minutes at the default 60
@@ -19,8 +20,15 @@ a given impairment; `--duration` shortens a row.
 
 **Budgets are recorded, not enforced.** `budgets.json` holds what this machine measured, not what the
 player is required to achieve, and `grade.ts` prints the table and exits zero unless `--enforce` is
-passed. Enforcement, the Safari lane, the replay lane, and the nightly job are the second half of
-this quest.
+passed.
+
+`--runtime` picks which of three lanes runs, and each measures a different thing:
+
+| Runtime | What it is | Shaper | Where |
+| --- | --- | --- | --- |
+| `chromium` | Headless Chromium over WebTransport, the matrix above | yes | nightly and locally |
+| `safari` | Real Safari over a WebSocket, the two control profiles | no | locally, on macOS |
+| `replay` | The recorded traces through the same player, on a simulated clock | no | anywhere, in a second |
 
 ## How the browser reaches the relay
 
@@ -59,6 +67,44 @@ loads. Both names, because qmux prefers `WebSocketStream` where the browser has 
 not the other looks like it works and changes nothing. With the fallback gone the same `bursty` row
 runs on WebTransport, the shaper reports 990 datagrams up and 6267 down, and the resolved target
 rises from 100 ms to 440 ms, which is the impairment the row exists to measure.
+
+## The Safari lane
+
+Real Safari, driven through `safaridriver` over plain W3C WebDriver ([`clients/js/webdriver.ts`](clients/js/webdriver.ts),
+about 150 lines with no dependencies). Not Playwright's WebKit: that is a build of WebKit with its
+own network stack, its own media pipeline and its own AudioWorklet scheduling, so grading it would
+say something about WebKit and nothing about what a viewer on macOS hears.
+
+Three things follow from the engine, and each one changes what the lane may claim.
+
+**The session is a WebSocket.** `@moq/net` refuses WebTransport on every WebKit engine, because
+WebKit's flow-control window never refills ([webkit-webtransport-gate](../../quest/m0/webkit-webtransport-gate.md)).
+So the page keeps its WebSocket for this lane (`?fallback=1`, the one thing the Chromium lane denies
+outright) and the row records `transport: websocket`. A row that somehow negotiates anything else is
+void, because these budgets were measured on the reliable transport.
+
+**The shaper is therefore not in the path.** A WebSocket is TCP, and the shaper passes TCP through
+untouched by design. There is no impairment to apply and none to claim, so the lane runs against the
+relay directly and its rows record `shaper: none`. It offers only `near-zero` and `fixed-250`, the
+two profiles whose path treatment is already nothing; asking for `bursty` here is refused rather than
+answered with an unimpaired run under an impaired name.
+
+**Safari has to be frontmost.** With the window unfocused, `document.hasFocus()` is false and both an
+Element Click and a WebDriver Actions sequence answer `{"value":null}` while delivering no
+`pointerdown` at all. The page's own click counter stays at zero, the AudioContext sits in WebKit's
+`interrupted` state, and the row would otherwise record a full minute of plausible counters over
+total silence. The driver runs `open -a Safari` (which needs no Automation permission, so nothing
+prompts) and clicks until the context reports `running`; if it never does, the row is void on
+`activation` or `focus` rather than graded. That is also why the lane is serial, local, and not in
+CI: it moves the frontmost application on the desktop, and anything else taking focus mid-run voids
+every row after it.
+
+There is no sink either. `safaridriver` is the only channel back to the page, so the driver drains
+the probe over `execute/sync` on the same 250 ms grid and writes the same ndjson the beacon would
+have posted. `analyze.ts` cannot tell which lane produced a file, which is the point.
+
+`render_load` is null here: `AudioContext.renderCapacity` is Chromium's. `worklet_cadence` stands in
+for it, below.
 
 ## The metric schema
 
@@ -131,6 +177,14 @@ definition is a judgement call are:
   a stale group and the transport giving up on a slow one land in the same counter, which is why
   `budget_aborts` stays null rather than being read off this.
 
+- **`worklet_cadence`** is what a hundred render quanta actually cost in wall time, against the
+  128/rate they are worth. It exists because `renderCapacity` is Chromium's alone, so a Safari row
+  has no `render_load`: `AudioContext.currentTime` advances exactly one quantum per render callback,
+  so the quanta between two samples are the context's own advance and the wall time they took is
+  the page's. A render thread that kept up spends the nominal; one that hitched spends more. It
+  needs the device's rate rather than the stream's, which is why `contextRate` is in the
+  environment, and it reports null without one rather than being computed against a guess.
+
 - **`wall_clock_share`** is the share of the graded window in which no track's playhead was driving
   playback, from `sync.out.clock`. A sample from a build without that signal is left out of the
   denominator rather than counted as a zero, so an older build reports `null`.
@@ -169,6 +223,8 @@ passed would be worse than failing it, so under `--enforce` a void row fails the
 | `clock` | `AudioContext.currentTime` drifted more than 1% from wall time over the first ten seconds, or was never readable. |
 | `window` | No samples survived the warmup. |
 | `driver` | The driver threw. A Playwright trace is saved into the run directory. |
+| `focus` | Safari lane only: the window was not frontmost, so no click reached the page. |
+| `activation` | Safari lane only: the AudioContext never reached `running`, so nothing was rendered. |
 
 ## Profiles
 
@@ -203,6 +259,8 @@ clients/js/
   src/beacon.ts             batches to the sink, sendBeacon on pagehide
   src/schema.ts             the metric contract
   driver.ts                 one row in headless Chromium, and the void checks
+  safari.ts                 one row in real Safari, and the void checks it needs instead
+  webdriver.ts              a dependency-free W3C WebDriver client over safaridriver
   sink.ts                   one ndjson file per row
   analyze.ts                ndjson to summary.json and summary.md
   grade.ts                  summaries against budgets.json
@@ -236,6 +294,7 @@ from a shell script driving the OS, and now comes from `moq-shaper` with a seed 
 
 ## Not covered here
 
-Safari, the replay lane over the recorded traces, enforced budgets, and the nightly job. Video: the
-stage breakdown is defined generically so video can adopt it, but nothing here asserts on it. No
-perceptual scoring: the grade is glitches and latency, not an opinion about how it sounds.
+The replay lane over the recorded traces, and the nightly job. iOS: no device, and desktop Safari is
+the closest proxy this lane has. Video: the stage breakdown is defined generically so video can adopt
+it, but nothing here asserts on it. No perceptual scoring: the grade is glitches and latency, not an
+opinion about how it sounds.
