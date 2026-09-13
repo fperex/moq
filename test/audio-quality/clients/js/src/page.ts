@@ -69,13 +69,14 @@ document.body.appendChild(status);
 // Every read here goes through `peek`, which throws when an older build does not publish the signal
 // at all. This status is what the driver waits on, so one missing counter must not be the reason a
 // row never starts: the probe's own samples take the same care.
-const peek = <T>(read: () => T): T | undefined => {
+// A declaration rather than a generic arrow, whose `<T>` a JSX-aware parser reads as an element.
+function peek<T>(read: () => T): T | undefined {
 	try {
 		return read();
 	} catch {
 		return undefined;
 	}
-};
+}
 
 setInterval(() => {
 	const environment = collector.environment();
