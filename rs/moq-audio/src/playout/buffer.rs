@@ -194,8 +194,12 @@ impl Buffer {
 	/// is the delay the target exists to bound. NetEq flushes partially for the same
 	/// reason: a full flush would take the audio that is about to play with it.
 	///
-	/// [`OVERFULL`] times the target is the loosest threshold worth using, and the
-	/// one NetEq applies; a caller that can absorb less says so.
+	/// The threshold applied is the looser of `threshold` and [`OVERFULL`] times the
+	/// target, which is NetEq's. A flush that convicted audio the decision loop was
+	/// about to stretch away would take back the very cushion the loop needs, so a
+	/// caller asking for less than the multiple is not given it; what a caller can do
+	/// is hold more, which is what the decision loop's own skip ceiling does once the
+	/// target is small enough that four times it is inside that ceiling.
 	pub(crate) fn flush(&mut self, target: Duration, threshold: Duration) -> usize {
 		let target = target.max(self.duration(1));
 		match self.buffered() > threshold.max(target * OVERFULL) {
@@ -353,6 +357,21 @@ mod tests {
 		assert_eq!(buffer.flush(ms(100), ms(400)), frames(RATE, ms(900)));
 		assert_eq!(buffer.buffered(), ms(100));
 		assert_eq!(buffer.front(), Some(ms(900)), "the newest audio is what was kept");
+	}
+
+	#[test]
+	fn a_threshold_under_the_multiple_does_not_tighten_the_flush() {
+		let mut buffer = Buffer::new(RATE, 1);
+		for i in 0..30 {
+			buffer.insert(ms(i * 10), &block(1.0));
+		}
+		assert_eq!(buffer.buffered(), ms(300));
+
+		// 200ms is over what the caller asked to hold and inside four times the target. The looser
+		// of the two wins, because the decision loop would have stretched this audio away rather
+		// than lost it: pinned here, since tightening it costs `Engine` a skip on every small target.
+		assert_eq!(buffer.flush(ms(100), ms(200)), 0);
+		assert_eq!(buffer.buffered(), ms(300));
 	}
 
 	#[test]

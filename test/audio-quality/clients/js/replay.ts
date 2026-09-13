@@ -128,13 +128,19 @@ for (const { recording, row } of matrix) {
 
 	const arrivals = recorded(recording.fixture);
 	// The catalog floor `Sync` holds the target above is the codec's frame duration, which is
-	// the trace's own nominal spacing.
-	const spacings = arrivals
-		.map((a) => a.media)
-		.sort((a, b) => a - b)
-		.map((m, i, all) => (i === 0 ? 0 : m - all[i - 1]))
-		.filter((gap) => gap > 0);
-	const floorMs = Math.ceil(Math.min(...spacings));
+	// the trace's own nominal spacing. Reduced rather than spread, because a recording is tens of
+	// thousands of frames and `Math.min(...)` of that many arguments blows the stack.
+	const media = arrivals.map((a) => a.media).sort((a, b) => a - b);
+	let smallest = Number.POSITIVE_INFINITY;
+	for (let i = 1; i < media.length; i++) {
+		const gap = media[i] - media[i - 1];
+		if (gap > 0 && gap < smallest) smallest = gap;
+	}
+	if (!Number.isFinite(smallest)) {
+		console.error(`error: ${tag} has no two distinct media timestamps, so it has no frame duration`);
+		process.exit(2);
+	}
+	const floorMs = Math.ceil(smallest);
 
 	const build = row.ring === "isolated" ? shared(recording.rate) : post(recording.rate);
 	const result = replay(build, arrivals, {
