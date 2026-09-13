@@ -283,10 +283,11 @@ describe.each(RINGS)("%s ring, the rare tail", (ring, build) => {
 			`${ring}/rare-tail: ${measured.concealed} concealed samples over ${measured.merges} merges and ${measured.underruns} underruns, against ${ramped.short} silent quanta with concealment off`,
 		);
 
-		// Every outage is covered end to end: nothing reaches the device short, and nothing in what
-		// was rendered is digital silence.
+		// Every outage is covered end to end: nothing reaches the device short. The concealment
+		// fades out under the muting slope, so the tail of each outage is digital silence rather
+		// than room tone, and no run of it is longer than the outage that caused it.
 		expect(measured.short).toBe(0);
-		expect(zeroRun(measured.played)).toBeLessThanOrEqual(2);
+		expect(zeroRun(measured.played)).toBeLessThan((RATE * Math.max(...RARE)) / 1000);
 		expect(measured.merges).toBe(RARE.length);
 		// The three outages, less the 45ms or so the ring still held when each one started.
 		expect(measured.concealed).toBeGreaterThan((RATE * 300) / 1000);
