@@ -159,7 +159,7 @@ Two derivations have to survive that, and both were wrong before they were measu
 ### Void rules
 
 A row that cannot be trusted is void, and a void row is reported rather than graded. Marking it
-passed would be worse than failing it.
+passed would be worse than failing it, so under `--enforce` a void row fails the run.
 
 | Void | Why |
 | --- | --- |

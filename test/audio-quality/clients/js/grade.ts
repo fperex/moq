@@ -2,7 +2,8 @@
  * Grades a run's summaries against `budgets.json` and prints the table.
  *
  * Every budget value is a ceiling, and a row with no budget is a failure rather than a pass: a
- * matrix that grows a cell nobody wrote a budget for would otherwise quietly grade nothing.
+ * matrix that grows a cell nobody wrote a budget for would otherwise quietly grade nothing. A void
+ * row fails the same way, for the same reason: its numbers are the ones that cannot be trusted.
  *
  * In this stage the budgets are **recorded, not enforced**. The table prints, the results are
  * written, and the exit status is zero unless `--enforce` is passed. The numbers in `budgets.json`
@@ -127,6 +128,11 @@ if (!values.enforce) {
 	process.exit(0);
 }
 
-const failed = over.length > 0 || unbudgeted.length > 0;
-if (failed) console.error(`FAIL: ${over.length} over budget, ${unbudgeted.length} unbudgeted`);
+// A void row fails too. It is a row whose numbers cannot be trusted, and letting the run pass on it
+// is the one outcome worse than failing: the matrix would report green for a cell that measured the
+// WebSocket fallback, the other ring, or a throttled clock.
+const failed = over.length > 0 || unbudgeted.length > 0 || voided.length > 0;
+if (failed) {
+	console.error(`FAIL: ${over.length} over budget, ${unbudgeted.length} unbudgeted, ${voided.length} void`);
+}
 process.exit(failed ? 1 : 0);

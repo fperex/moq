@@ -135,9 +135,12 @@ for c in "${CODECS[@]}"; do valid "$c" codec "${ALL_CODECS[@]}"; done
 # a steady profile under the step's name and passes on numbers that mean something else. Refuse it
 # rather than record it. The step time comes from the profile itself, so shortening it there is
 # enough; there is no second copy here to forget.
-STEP_AT=$(sed -n 's/^at = "\([0-9]*\)s"/\1/p' "$WORKSPACE/rs/moq-shaper/profiles/step.toml" | head -1)
 for p in "${PROFILES[@]}"; do
     [[ "$p" == step ]] || continue
+    # Read inside the branch, and tolerate the read failing, so an unreadable profile file stops the
+    # one run that depends on it with the message below rather than killing every other run under
+    # `set -e` before that message can be printed.
+    STEP_AT=$(sed -n 's/^at = "\([0-9]*\)s"/\1/p' "$WORKSPACE/rs/moq-shaper/profiles/step.toml" 2>/dev/null | head -1 || true)
     if [[ -z "$STEP_AT" ]]; then
         echo "error: could not read the step time from rs/moq-shaper/profiles/step.toml" >&2
         exit 2

@@ -202,7 +202,7 @@ export function probe(watch: MoqWatch): Probe {
 			return samples.splice(0, samples.length);
 		},
 		environment() {
-			const catalog = watch.broadcast.out.catalog.peek();
+			const catalog = maybe(() => watch.broadcast.out.catalog.peek());
 			// The catalog is what says the session got far enough to be measuring anything.
 			if (!catalog) return null;
 			const renditions = catalog.audio?.renditions ?? {};
@@ -234,6 +234,6 @@ export function probe(watch: MoqWatch): Probe {
 
 /** The connection's reported round-trip time, which is an object rather than a number. */
 function rttOf(watch: MoqWatch): number | undefined {
-	const rtt = watch.connection.probe.peek()?.rtt;
+	const rtt = maybe(() => watch.connection.probe.peek()?.rtt);
 	return typeof rtt === "number" && Number.isFinite(rtt) ? rtt : undefined;
 }
