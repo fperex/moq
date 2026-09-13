@@ -2595,13 +2595,25 @@ fn advance_pts(pts: Option<Timestamp>, samples: u64, sample_rate: u32) -> anyhow
 	let Some(pts) = pts else {
 		return Ok(None);
 	};
-	// `pts` is a 90 kHz PES PTS; rescale the sample-rate advance to match before adding
-	// (the scale-aware Timestamp rejects mixed scales).
 	let advance = Timestamp::from_scale(samples, sample_rate as u64)?;
-	Ok(Some(pts.checked_add(advance.convert(pts.scale())?)?))
+	// Add in a timescale that holds both clocks exactly, so the fractional part of a frame
+	// carries into the next one. Rounding each frame down to a 90 kHz tick loses ~8.8 us per
+	// 44.1 kHz AAC frame, which accumulates until the next PES anchor jumps backwards.
+	let mut gcd = pts.scale().as_u64();
+	let mut divisor = advance.scale().as_u64();
+	while divisor != 0 {
+		(gcd, divisor) = (divisor, gcd % divisor);
+	}
+	let scale = pts
+		.scale()
+		.as_u64()
+		.checked_mul(advance.scale().as_u64() / gcd)
+		.context("audio timestamp timescale overflow")?;
+	let scale = moq_net::Timescale::new(scale)?;
+	Ok(Some(pts.convert(scale)?.checked_add(advance.convert(scale)?)?))
 }
 
-/// Convert a raw 90 kHz PTS to a microsecond [`Timestamp`], unwrapping the
+/// Convert a raw 90 kHz PTS to a 90 kHz [`Timestamp`], unwrapping the
 /// 33-bit field. Returns `None` when the PES carried no PTS.
 fn unwrap_pts(unwrap: &mut PtsUnwrap, pts: Option<u64>) -> anyhow::Result<Option<Timestamp>> {
 	let Some(raw) = pts else {
@@ -2611,7 +2623,7 @@ fn unwrap_pts(unwrap: &mut PtsUnwrap, pts: Option<u64>) -> anyhow::Result<Option
 	Ok(Some(Timestamp::from_scale(extended, 90_000)?))
 }
 
-/// The reorder delay `PTS - DTS` for one PES, as a microsecond [`Timestamp`]. `None` unless
+/// The reorder delay `PTS - DTS` for one PES, as a 90 kHz [`Timestamp`]. `None` unless
 /// both stamps are present and the gap is a plausible reorder (a few seconds); a larger or
 /// negative gap is a discontinuity or bad DTS, ignored so it can't inflate the jitter. Both
 /// are raw 90 kHz, so the subtraction is done modulo the 33-bit field to stay correct across
@@ -3686,6 +3698,94 @@ mod test {
 		let mut f = super::adts::write_header(2, 48_000, 2, raw_len).unwrap().to_vec();
 		f.resize(raw_len + 7, fill);
 		f
+	}
+
+	// A 44.1 kHz AAC frame lasts 1024/44100 s, which is 2089.79... ticks of the 90 kHz PES
+	// clock. Rounding each frame down loses ~8.8 us per frame, so the clock drifts away
+	// from the anchors the stream actually carries.
+	#[tokio::test(start_paused = true)]
+	async fn aac_sample_clock_keeps_fractional_ticks_and_pes_anchors() {
+		const AAC_PID: u16 = 0x0060;
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut import = super::Import::new(broadcast, catalog.reserve());
+		import
+			.decode(&bytes::BytesMut::from(
+				&synth_pmt(&[(StreamType::AdtsAac, AAC_PID)], false)[..],
+			))
+			.unwrap();
+
+		let mut frame = super::adts::write_header(2, 44_100, 2, 10).unwrap().to_vec();
+		frame.resize(17, 0xAA);
+		let mut first = frame.repeat(7);
+		first.extend_from_slice(&frame[..8]);
+		import
+			.decode(audio_pes_packet(AAC_PID, 0, 90_001, &first).as_slice())
+			.unwrap();
+		let mut second = frame[8..].to_vec();
+		second.extend_from_slice(&frame.repeat(2));
+		import
+			.decode(audio_pes_packet(AAC_PID, 1, 106_719, &second).as_slice())
+			.unwrap();
+		import
+			.decode(audio_pes_packet(AAC_PID, 2, 270_007, &frame.repeat(2)).as_slice())
+			.unwrap();
+		import.finish().unwrap();
+
+		let frames = read_audio_frames(&consumer, &catalog).await;
+		assert_eq!(
+			frames
+				.iter()
+				.map(|frame| frame.timestamp.as_micros())
+				.collect::<Vec<_>>(),
+			[
+				1_000_011, 1_023_231, 1_046_451, 1_069_670, 1_092_890, 1_116_110, 1_139_330, 1_162_550, 1_185_766,
+				1_208_986, 3_000_077, 3_023_297,
+			]
+		);
+		assert!(frames.iter().all(|published| published.payload.as_ref() == &frame[7..]));
+	}
+
+	// E-AC-3 frames carry a variable number of 256-sample blocks, so the accumulated
+	// remainder has to survive across frames of different durations.
+	#[tokio::test(start_paused = true)]
+	async fn eac3_sample_clock_accumulates_variable_frame_durations() {
+		const EAC3_PID: u16 = 0x0060;
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut import = super::Import::new(broadcast, catalog.reserve());
+		let pmt = synth_pmt(
+			&[(StreamType::DolbyDigitalPlusUpTo16ChannelAudioForAtsc, EAC3_PID)],
+			false,
+		);
+		import.decode(&bytes::BytesMut::from(&pmt[..])).unwrap();
+		let mut payload = Vec::new();
+		// 44.1 kHz stereo frames with 1, 2, 3, 6, then 1 block of 256 samples.
+		for blocks in [0, 1, 2, 3, 0] {
+			payload.extend_from_slice(&[0x0B, 0x77, 0x00, 0x03, 0x44 | (blocks << 4), 0x80, 0xAA, 0xAA]);
+		}
+		import
+			.decode(audio_pes_packet(EAC3_PID, 0, 90_001, &payload).as_slice())
+			.unwrap();
+		import.finish().unwrap();
+
+		let frames = read_audio_frames(&consumer, &catalog).await;
+		assert_eq!(
+			frames
+				.iter()
+				.map(|frame| frame.timestamp.as_micros())
+				.collect::<Vec<_>>(),
+			[1_000_011, 1_005_816, 1_017_426, 1_034_841, 1_069_670]
+		);
+		assert_eq!(
+			frames
+				.iter()
+				.flat_map(|frame| frame.payload.iter().copied())
+				.collect::<Vec<_>>(),
+			payload
+		);
 	}
 
 	// The AAC mirror of `legacy_drops_a_pes_completed_across_a_continuity_break`.
