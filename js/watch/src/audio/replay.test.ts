@@ -84,7 +84,7 @@ function recorded(fixture: Fixture): Arrival[] {
  * moves it moves what these rings are sized to.
  */
 function target(t: Arrival[]): number {
-	const jitter = new Container.Jitter.Jitter();
+	const jitter = new Container.Jitter();
 	for (const { media, arrival } of t) {
 		jitter.observe(Time.Micro.fromMilli(media as Time.Milli), arrival as Time.Milli);
 	}
@@ -170,7 +170,7 @@ function replay(build: (latencyMs: number) => Ring, t: Arrival[], warmupMs: numb
 	// let `Sync` and `Decoder.#runLatency` push the new target into the ring. A settled number
 	// measured up front would hide the thing the design turns on, which is that the target rises the
 	// moment an arrival proves the buffer too shallow.
-	const jitter = new Container.Jitter.Jitter();
+	const jitter = new Container.Jitter();
 	const latency = () => fixed ?? Math.max(FLOOR, jitter.value.peek());
 
 	const ring = build(latency());
