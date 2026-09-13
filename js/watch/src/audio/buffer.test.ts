@@ -97,4 +97,20 @@ describe("ClockSource", () => {
 		clock.advance(10);
 		expect(source.sample(playhead(510, 0))?.rate).toBe(0);
 	});
+
+	it("gives up the clock at once on a declared endpoint", () => {
+		// A publisher that says it has paused is not refilling, so there is nothing to wait out:
+		// holding video against the playhead would freeze the picture for a second first.
+		clock = fakeClock();
+		const source = new ClockSource();
+		source.sample(playhead(500, 1));
+
+		source.ended();
+		expect(source.sample(playhead(500, 0))).toBeUndefined();
+
+		// Media returning takes it back.
+		clock.advance(10);
+		source.filling();
+		expect(source.sample(playhead(500, 0))?.rate).toBe(0);
+	});
 });

@@ -4,7 +4,7 @@ import { Effect, type Getter, Signal } from "@moq/signals";
 import type { Clock } from "../sync";
 import type { Playhead } from "./playhead";
 import type { Snapshot } from "./playout";
-import type { Data, InitPost, InitShared, Latency, Reset, Stall, State, Truncate } from "./render";
+import type { Data, End, InitPost, InitShared, Latency, Reset, Stall, State, Truncate } from "./render";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 
 /**
@@ -29,10 +29,19 @@ export class ClockSource {
 	// When the playhead stopped, with nothing written since. Undefined while it is moving or being
 	// fed, which is the whole of normal playback.
 	#parked: Time.Milli | undefined;
+	// Whether the publisher declared the timeline finished, so the park is not a refill and waiting
+	// out PARK_LIMIT would only freeze the picture for a second first.
+	#ended = false;
 
 	/** Note that media reached the ring, so a park is a refill rather than an abandoned playhead. */
 	filling(): void {
 		this.#parked = undefined;
+		this.#ended = false;
+	}
+
+	/** Note that the publisher declared the timeline finished, so nothing is coming to fill it. */
+	ended(): void {
+		this.#ended = true;
 	}
 
 	/** Stamp `playhead`, or return undefined when it should not be driving playback. */
@@ -47,6 +56,7 @@ export class ClockSource {
 		if (playhead.rate !== 0) {
 			this.#parked = undefined;
 		} else {
+			if (this.#ended) return undefined;
 			this.#parked ??= now;
 			if (Time.Milli.sub(now, this.#parked) > PARK_LIMIT) return undefined;
 		}
@@ -148,6 +158,16 @@ export interface AudioBuffer {
 	 * clear, so a ring already playing keeps draining at its old depth.
 	 */
 	stall(): void;
+
+	/**
+	 * The publisher declared the timeline finished: play out what is buffered, then silence.
+	 *
+	 * A publisher that stops sending leaves a gap the reader conceals, because nothing on the wire
+	 * says whether the audio is late or over. An endpoint does say so, and this is how it reaches
+	 * the reader: no concealment, no underrun, and the clock hands over to wall time rather than
+	 * holding video against a playhead that will not move. The next `insert` takes it back.
+	 */
+	end(): void;
 
 	/**
 	 * Drop buffered samples at or after `timestamp`, keeping what is already due.
@@ -342,6 +362,12 @@ class SharedAudioBuffer implements AudioBuffer {
 		this.#backpressure.flush(); // let the decode loop fill the deeper target
 	}
 
+	end(): void {
+		this.#ring.end();
+		this.#clockSource.ended();
+		this.#backpressure.flush(); // nothing is coming, so nothing should be waiting on the playhead
+	}
+
 	wait(timestamp: Time.Micro): Promise<void> {
 		// Stalled = still filling the floor (bootstrap, an underrun the reader re-stalled on, or an
 		// explicit reset): let frames through so the ring refills to the floor. This is the single
@@ -462,6 +488,16 @@ class PostAudioBuffer implements AudioBuffer {
 		// releases the decode loop now.
 		this.#stalled.set(true);
 		this.#backpressure.flush(); // let the decode loop fill the deeper target
+	}
+
+	end(): void {
+		const msg: End = { type: "end" };
+		this.#worklet.port.postMessage(msg);
+		this.#clockSource.ended();
+		// Hand the clock over now rather than at the worklet's next state message: `Sync` should
+		// not hold video against a playhead the publisher has already said will not move.
+		this.#clock.set(undefined);
+		this.#backpressure.flush(); // nothing is coming, so nothing should be waiting on the playhead
 	}
 
 	wait(timestamp: Time.Micro): Promise<void> {

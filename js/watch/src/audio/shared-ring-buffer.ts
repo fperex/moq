@@ -55,7 +55,15 @@ const DISCARDED = 15;
 const CONCEALED = 16;
 // Times media returning after a concealment was spliced back on. Reader only.
 const MERGES = 17;
-const CONTROL_SLOTS = 18;
+/**
+ * Whether the publisher declared the timeline finished, so nothing more is coming. Writer only.
+ *
+ * Set by `end` when an endpoint lands on the wire, cleared by the next insert. A stall says the
+ * ring is refilling and an empty ring says media is late; this says neither is true, so the reader
+ * renders silence rather than concealing a gap nobody left.
+ */
+const ENDED = 18;
+const CONTROL_SLOTS = 19;
 
 /**
  * The playhead and its mutation epoch, packed into one 64-bit word: epoch in the high
@@ -298,6 +306,14 @@ export class SharedRingBuffer implements RingReader {
 	insert(timestamp: Time.Micro, data: Float32Array[]): void {
 		if (data.length !== this.channels) throw new Error("wrong number of channels");
 
+		// Media is back, so the declared pause is over. If the reader played the pause out, refill to
+		// the target before resuming, exactly as after an underrun: starting on the first chunk to
+		// arrive would run dry on the next quantum, and this time the gap really would be concealed.
+		if (Atomics.exchange(this.#control, ENDED, 0) === 1) {
+			const read = readOf(Atomics.load(this.#state, 0));
+			if (((Atomics.load(this.#control, WRITE) - read) | 0) <= 0) Atomics.store(this.#control, STALLED, 1);
+		}
+
 		let start = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
 		const originalLength = data[0].length;
 		let offset = 0;
@@ -345,15 +361,11 @@ export class SharedRingBuffer implements RingReader {
 
 		const samples = originalLength - offset;
 
-		// Overflow: if the write would exceed capacity from current READ, advance READ.
-		// Use CAS so a concurrent reader advance isn't clobbered backward.
-		if (((end - read) | 0) > this.capacity) {
-			const to = (end - this.capacity) | 0;
-			Atomics.add(this.#control, DISCARDED, (to - read) | 0);
-			this.#advance(to);
-		}
-
-		// Gap fill: zero-fill from current WRITE to start if there's a discontinuity
+		// Gap fill: zero-fill from current WRITE to start if there's a discontinuity.
+		//
+		// Before the overflow bound below, because a hole holds no samples: bounding first charges
+		// the part of a hole past capacity to DISCARDED, and the step-over then counts the whole
+		// hole again as skipped.
 		const write = Atomics.load(this.#control, WRITE);
 		const gap = (start - write) | 0;
 		if (gap > 0) {
@@ -362,7 +374,8 @@ export class SharedRingBuffer implements RingReader {
 				// already covering for it: queueing it as silence would make a listener wait for the
 				// same missing audio a second time. Step the playhead over it instead. Buffered
 				// playback keeps the silence, because a producer writing ahead of the playhead means
-				// the pause it wrote.
+				// the pause it wrote. A declared pause resumes the same way: the jump is what
+				// re-anchors the reader, and the engine re-seeds its level filter on it.
 				Atomics.add(this.#control, SKIPS, 1);
 				Atomics.add(this.#control, SKIPPED, gap);
 				// The playhead moves first. The other order leaves a window where WRITE describes
@@ -380,6 +393,15 @@ export class SharedRingBuffer implements RingReader {
 					}
 				}
 			}
+		}
+
+		// Overflow: if the write would exceed capacity from current READ, advance READ.
+		// Use CAS so a concurrent reader advance isn't clobbered backward.
+		const bounded = readOf(Atomics.load(this.#state, 0));
+		if (((end - bounded) | 0) > this.capacity) {
+			const to = (end - this.capacity) | 0;
+			Atomics.add(this.#control, DISCARDED, (to - bounded) | 0);
+			this.#advance(to);
 		}
 
 		// Write sample data
@@ -464,12 +486,17 @@ export class SharedRingBuffer implements RingReader {
 
 		this.#cursor = read;
 
+		// A declared endpoint only reaches the output once everything published before it has
+		// played; until then there is real audio to hand over.
+		const ended = Atomics.load(this.#control, ENDED) === 1 && ((write - read) | 0) <= 0;
+
 		return {
 			buffered: stalled || unstable ? 0 : (write - read) | 0,
 			target,
 			chunk,
 			skip,
 			stalled,
+			ended,
 			unstable,
 			converge: !this.buffered,
 			skipped: jumped + this.#pending,
@@ -555,7 +582,7 @@ export class SharedRingBuffer implements RingReader {
 	 */
 	read(output: Float32Array[]): number {
 		const view = this.view();
-		if (view.stalled || view.unstable) return 0;
+		if (view.stalled || view.unstable || view.ended) return 0;
 
 		const count = Math.min(view.buffered, output[0].length);
 		if (view.buffered <= 0) this.starve();
@@ -649,8 +676,25 @@ export class SharedRingBuffer implements RingReader {
 	 * Flush buffered samples and re-stall, ready to anchor the next utterance (buffered mode).
 	 * Main thread only. The worklet reader sees STALLED and stops until the next insert.
 	 */
+	/**
+	 * The publisher declared the timeline finished here: play out what is buffered, then silence.
+	 * Main thread only.
+	 *
+	 * The next insert takes it back, so a publisher that pauses and resumes needs no second call.
+	 */
+	end(): void {
+		Atomics.store(this.#control, ENDED, 1);
+
+		// A stall waits for a refill, and there is no refill coming: releasing it is what lets the
+		// tail play out instead of being held against a target nothing will ever reach. Safe against
+		// the reader's own raise, which only happens on an empty ring, where there is no tail.
+		const read = readOf(Atomics.load(this.#state, 0));
+		if (((Atomics.load(this.#control, WRITE) - read) | 0) > 0) Atomics.store(this.#control, STALLED, 0);
+	}
+
 	reset(): void {
 		this.#anchored = false;
+		Atomics.store(this.#control, ENDED, 0);
 		Atomics.store(this.#control, STALLED, 1);
 		const write = Atomics.load(this.#control, WRITE);
 		const state = Atomics.load(this.#state, 0);
@@ -714,6 +758,7 @@ export class SharedRingBuffer implements RingReader {
 			SKIPS,
 			SKIPPED,
 			DISCARDED,
+			ENDED,
 		]) {
 			Atomics.store(dst.#control, control, Atomics.load(this.#control, control));
 		}

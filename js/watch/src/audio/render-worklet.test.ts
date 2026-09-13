@@ -32,6 +32,7 @@ interface Harness {
 	readonly reader: RingReader;
 	insert(start: number, count: number): void;
 	setLatency(samples: number): void;
+	end(): void;
 	debug(): Snapshot;
 }
 
@@ -42,6 +43,7 @@ function shared(targetMs: number, buffered = false): Harness {
 		reader: ring,
 		insert: (start, count) => ring.insert(micro(start), [media(start, count)]),
 		setLatency: (samples) => ring.setLatency(samples),
+		end: () => ring.end(),
 		debug: () => ring.debug(),
 	};
 }
@@ -52,6 +54,7 @@ function post(targetMs: number, buffered = false): Harness {
 		reader: ring,
 		insert: (start, count) => ring.write(micro(start), [media(start, count)]),
 		setLatency: (samples) => ring.resize(((samples / RATE) * 1000) as Time.Milli),
+		end: () => ring.end(),
 		debug: () => ring.debug(),
 	};
 }
@@ -84,8 +87,13 @@ interface Script {
 	target: number;
 	/** Whether a gap is concealed rather than rendered as a ramp into silence. Defaults to on. */
 	conceal?: boolean;
-	/** A hole in the media, as a fraction of the run and a length in milliseconds. */
-	hole?: { at: number; ms: number };
+	/**
+	 * A hole in the media, as a fraction of the run and a length in milliseconds.
+	 *
+	 * `declared` makes it a pause the publisher announced (a mute) rather than media that went
+	 * missing: the writer calls `end` as the hole opens, which is the endpoint marker arriving.
+	 */
+	hole?: { at: number; ms: number; declared?: boolean };
 	/** Media inserted before the first quantum is pulled, in milliseconds. */
 	prefill: number;
 	/** How long to run, in seconds of output. */
@@ -102,6 +110,8 @@ interface Script {
 interface Report extends Snapshot {
 	/** Everything the engine emitted, so a splice can be checked for continuity. */
 	played: Float32Array;
+	/** Every quantum as the device receives it, so what a short one leaves behind is visible too. */
+	rendered: Float32Array;
 	/** Quanta that came back short of a full block. */
 	shortQuanta: number;
 	/** Whether `READ == output - concealed + stretched + queued + skipped` held on every quantum. */
@@ -117,6 +127,7 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 
 	const quanta = Math.floor((RATE * script.seconds) / QUANTUM);
 	const played = new Float32Array(quanta * QUANTUM);
+	const rendered = new Float32Array(quanta * QUANTUM);
 	const pace = script.pace ?? 1;
 	const stallAt = script.stallAt === undefined ? undefined : Math.floor(quanta * script.stallAt);
 
@@ -136,6 +147,7 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 		frames: ms(script.hole.ms),
 	};
 
+	let declared = false;
 	let outputFrame = 0;
 	let nextArrival = CHUNK / pace;
 	let shortQuanta = 0;
@@ -149,7 +161,13 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 			// A hole is media that never arrives: the timeline keeps its place, so what lands after
 			// it is the audio that follows the hole rather than the audio inside it.
 			const missing = hole && written >= hole.from && written < hole.from + hole.frames;
-			if (!missing) {
+			if (missing) {
+				// A declared pause says so once, as the publisher's encoder stops.
+				if (script.hole?.declared && !declared) {
+					harness.end();
+					declared = true;
+				}
+			} else {
 				harness.insert(written, CHUNK);
 				inserted = written + CHUNK;
 			}
@@ -161,6 +179,7 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 		out[0].fill(0);
 		const got = engine.render(harness.reader, out, outputFrame);
 		played.set(out[0].subarray(0, got), length);
+		rendered.set(out[0], q * QUANTUM);
 		length += got;
 		if (got < QUANTUM) shortQuanta++;
 
@@ -183,6 +202,7 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 	return {
 		...harness.debug(),
 		played: played.subarray(0, length),
+		rendered,
 		shortQuanta,
 		balanced,
 		monotone,
@@ -307,6 +327,78 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 		// The gap is the thing being measured: quanta that came back short, and the silence after.
 		expect(report.shortQuanta).toBeGreaterThan(0);
 	});
+
+	it("renders a declared endpoint as silence rather than concealing it", () => {
+		// The same 300ms of absent media, except the publisher said it was pausing. Nothing is
+		// missing, so there is nothing to conceal and nothing to count against the reader.
+		const script: Script = {
+			target: 100,
+			prefill: 100 + CHUNK_MS,
+			seconds: 6,
+			hole: { at: 0.4, ms: 300, declared: true },
+		};
+		const report = run(build, script);
+
+		expect(report.balanced).toBe(true);
+		expect(report.monotone).toBe(true);
+		expect(report.concealed).toBe(0);
+		expect(report.merges).toBe(0);
+		expect(report.underruns).toBe(0);
+
+		// The pause really is silent, for most of what the publisher declared: the ring plays out
+		// what it still held first.
+		expect(zeroRun(report.rendered)).toBeGreaterThan(ms(150));
+		// And neither edge is a click, including the resume, which re-anchors rather than merging.
+		expect(maxStep(report.rendered)).toBeLessThan(1.5 * SLOPE);
+
+		// The same hole without the declaration is the concealed one, which is the control.
+		const undeclared = run(build, { ...script, hole: { at: 0.4, ms: 300 } });
+		expect(undeclared.concealed).toBeGreaterThan(0);
+		expect(undeclared.merges).toBeGreaterThan(0);
+	});
+
+	it("plays out the tail of a ring that was still refilling when the endpoint landed", () => {
+		// The target is never reached, because nothing more is coming. A stall waiting for that
+		// refill would hold the last audio the publisher did send, for good.
+		const harness = build(100);
+		const engine = new Stretcher(RATE, 1);
+		const out = [new Float32Array(QUANTUM)];
+
+		harness.insert(0, CHUNK);
+		harness.end();
+
+		let played = 0;
+		for (let q = 0; q < 100; q++) {
+			played += engine.render(harness.reader, out, q * QUANTUM);
+		}
+
+		expect(played).toBeGreaterThanOrEqual(CHUNK);
+		expect(harness.debug().concealed).toBe(0);
+		expect(harness.debug().underruns).toBe(0);
+	});
+
+	it("plays on through a declared endpoint the ring has not reached yet", () => {
+		// The endpoint lands while the ring still holds a cushion. Everything published before it is
+		// real audio and has to play, so the silence starts a target's worth later, not now.
+		const harness = build(100);
+		const engine = new Stretcher(RATE, 1);
+		const out = [new Float32Array(QUANTUM)];
+
+		for (let at = 0; at < ms(100); at += CHUNK) harness.insert(at, CHUNK);
+		harness.end();
+
+		let played = 0;
+		for (let q = 0; q < 200; q++) {
+			played += engine.render(harness.reader, out, q * QUANTUM);
+		}
+
+		// Everything buffered reached the device, and nothing beyond it was invented: the only
+		// audio past the target is what a preemptive expansion stretched out of the media itself.
+		expect(played).toBeGreaterThanOrEqual(ms(100));
+		expect(played).toBeLessThan(ms(130));
+		expect(harness.debug().concealed).toBe(0);
+		expect(harness.debug().underruns).toBe(0);
+	});
 });
 
 describe("both rings", () => {
@@ -341,6 +433,7 @@ describe("a ring that moves under the reader", () => {
 				chunk: CHUNK,
 				skip: ms(STRETCH_BOUND),
 				stalled: false,
+				ended: false,
 				unstable: false,
 				converge: true,
 				skipped: 0,

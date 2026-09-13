@@ -507,6 +507,7 @@ export class Decoder {
 					decoder.configure(decoderConfig);
 				}
 				if (next.end !== undefined) {
+					await this.#declareEnd(decoder);
 					continue;
 				}
 
@@ -610,6 +611,11 @@ export class Decoder {
 				if (this.#onNext(next)) {
 					decoder.reset();
 					decoder.configure(decoderConfig);
+				}
+
+				if (next.end !== undefined) {
+					await this.#declareEnd(decoder);
+					continue;
 				}
 
 				const { frame } = next;
@@ -766,6 +772,26 @@ export class Decoder {
 	// Use in buffered mode at an utterance boundary (see Sync.reset).
 	reset(): void {
 		this.#ring?.reset();
+	}
+
+	/**
+	 * Tell the ring the publisher declared the timeline finished here.
+	 *
+	 * Everything before the endpoint has been handed to the decoder, but its PCM may still be in
+	 * flight, and the ring may only render silence once it holds all of it. Each hang audio frame is
+	 * independently decodable, so flushing costs nothing but the wait.
+	 */
+	async #declareEnd(decoder: AudioDecoder): Promise<void> {
+		if (decoder.state === "configured") {
+			// A flush rejects only when the decoder is torn down under it, in which case the ring is
+			// going away too and there is no endpoint left to declare.
+			const flushed = await decoder.flush().then(
+				() => true,
+				() => false,
+			);
+			if (!flushed) return;
+		}
+		this.#ring?.end();
 	}
 
 	// Apply ordered container metadata before handling the result. An endpoint that also
