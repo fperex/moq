@@ -1,0 +1,198 @@
+{
+	"version": 1,
+	"note": "Recorded, not required. Every value is a ceiling measured on one machine before the playout work landed: the worst observed value times 1.5 for a timing metric, and a 0 only where the measured value was 0. They exist so a regression is visible, not because the player is meant to stop here. Stage 8b replaces them with what the fix has to achieve and turns on enforcement.",
+	"rows": [
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "near-zero",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "near-zero",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "mild",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "mild",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "bursty",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "bursty",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "step",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "step",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "high-rtt",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "high-rtt",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "fixed-250",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "fixed-250",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "near-zero",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "near-zero",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "mild",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "mild",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "bursty",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "bursty",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "step",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "step",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "high-rtt",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "high-rtt",
+			"ring": "plain",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "fixed-250",
+			"ring": "isolated",
+			"recorded": true
+		},
+		{
+			"runtime": "chromium",
+			"codec": "aac",
+			"rate": 44100,
+			"profile": "fixed-250",
+			"ring": "plain",
+			"recorded": true
+		}
+	]
+}
