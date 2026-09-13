@@ -1,17 +1,16 @@
 //! What the stream sounds like when nobody is talking.
 //!
-//! Mirrors `background_noise.cc`. Two consumers: the time stretch asks for
-//! [`Noise::energy`] to decide whether a block is speech or room tone, and
-//! concealment asks for [`Noise::generate`] so a long outage fades into the room
-//! rather than into silence.
+//! Mirrors the estimator half of `background_noise.cc`. One consumer: the time
+//! stretch asks for [`Noise::energy`] to decide whether a block is speech or room
+//! tone. The synthesis half is not here, because nothing plays comfort noise: an
+//! outage fades to silence. If hang ever carries a DTX/CNG signal, a generator
+//! driven by this estimate belongs with it.
 //!
 //! The estimate only moves on a window that is quieter than everything accepted so
 //! far and whose spectrum is flat enough to be noise, which is what keeps a held
 //! vowel or a sustained tone out of it. The acceptance threshold then climbs slowly
 //! on every loud window, so a room that gets noisier is tracked within seconds
 //! instead of being locked out forever.
-
-use super::Rng;
 
 /// Frames each update looks at. NetEq fixes this at 256 samples whatever the rate,
 /// which is 5.3 ms at 48 kHz, and so do we.
@@ -55,20 +54,14 @@ const FLATNESS: f32 = 16.0 / (5.0 * RESIDUAL as f32);
 pub(crate) struct Noise {
 	channels: Vec<Channel>,
 	initialised: bool,
-	/// Carries the same excitation to every channel, as `expand.cc` does, so noise
-	/// added to a correlated stereo image does not decorrelate it.
-	shared: Vec<f32>,
 }
 
-/// One channel's estimate: a level, a one pole spectrum, and the search state that
-/// decides when to replace them.
+/// One channel's estimate: a level, and the search state that decides when to
+/// replace it.
 struct Channel {
 	energy: f32,
 	max_energy: f32,
 	threshold: f32,
-	reflection: f32,
-	gain: f32,
-	state: f32,
 }
 
 impl Noise {
@@ -77,7 +70,6 @@ impl Noise {
 		Self {
 			channels: (0..channels.max(1)).map(|_| Channel::new()).collect(),
 			initialised: false,
-			shared: Vec::new(),
 		}
 	}
 
@@ -118,28 +110,6 @@ impl Noise {
 		}
 	}
 
-	/// Write `out.len()` interleaved samples of background noise, scaled by `gain`.
-	///
-	/// Silence until the estimate initialises, matching NetEq: inventing a room tone
-	/// we have never heard would be worse than the gap.
-	pub(crate) fn generate(&mut self, out: &mut [f32], gain: f32, rng: &mut Rng) {
-		let channels = self.channels.len();
-		if !self.initialised {
-			out.fill(0.0);
-			return;
-		}
-
-		self.shared.clear();
-		self.shared.extend((0..out.len() / channels).map(|_| rng.sample()));
-
-		for (index, channel) in self.channels.iter_mut().enumerate() {
-			for (frame, excitation) in self.shared.iter().enumerate() {
-				channel.state = (channel.gain * excitation + channel.reflection * channel.state).clamp(-1.0, 1.0);
-				out[frame * channels + index] = channel.state * gain;
-			}
-		}
-	}
-
 	/// Forget everything, for a stream that restarted somewhere else.
 	pub(crate) fn reset(&mut self) {
 		self.initialised = false;
@@ -155,9 +125,6 @@ impl Channel {
 			energy: 2500.0 / (32768.0 * 32768.0),
 			max_energy: 0.0,
 			threshold: THRESHOLD,
-			reflection: 0.0,
-			gain: 0.0,
-			state: 0.0,
 		}
 	}
 
@@ -202,8 +169,6 @@ impl Channel {
 		}
 
 		self.energy = energy.max(MIN_ENERGY);
-		self.reflection = reflection;
-		self.gain = residual.sqrt();
 		true
 	}
 }
@@ -261,31 +226,16 @@ mod tests {
 	}
 
 	#[test]
-	fn generates_nothing_until_it_is_initialised() {
-		let mut estimate = Noise::new(2);
-		let mut out = vec![1.0; 960];
-		estimate.generate(&mut out, 1.0, &mut Rng::new());
-		assert!(out.iter().all(|s| *s == 0.0));
-	}
-
-	#[test]
-	fn generates_noise_at_the_estimated_level() {
+	fn tracks_the_level_of_the_room() {
 		let mut estimate = Noise::new(1);
-		let level = 0.02;
+		let level: f32 = 0.02;
 		for chunk in noise(48_000, 1.0, level, 1).chunks(WINDOW) {
 			estimate.update(chunk);
 		}
 		assert!(estimate.initialised());
 
-		let mut out = vec![0.0; 4800];
-		estimate.generate(&mut out, 1.0, &mut Rng::new());
-
-		let energy = out.iter().map(|x| x * x).sum::<f32>() / out.len() as f32;
-		let ratio = energy / estimate.energy(0);
-		assert!(
-			ratio > 0.25 && ratio < 4.0,
-			"generated {energy} vs {}",
-			estimate.energy(0)
-		);
+		// The fixture's noise is uniform on -level..level, so its mean energy is level^2 / 3.
+		let ratio = estimate.energy(0) / (level * level / 3.0);
+		assert!(ratio > 0.25 && ratio < 4.0, "estimated {}", estimate.energy(0));
 	}
 }

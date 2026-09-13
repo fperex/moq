@@ -27,7 +27,7 @@
 //! | [`stretch`] accelerate / preemptive expand | `accelerate.cc`, `preemptive_expand.cc`, `time_stretch.cc` | here |
 //! | [`expand`] concealment | `expand.cc` | here |
 //! | [`merge`] splice back to real audio | `merge.cc` | here |
-//! | [`noise`] background estimate and comfort noise | `background_noise.cc` | here |
+//! | [`noise`] background estimate | `background_noise.cc` | here, estimator only |
 //! | [`level`] smoothed buffer level | `buffer_level_filter.cc` | here |
 //! | [`sync`] committed-but-unplayed PCM | `sync_buffer.cc` | here |
 //! | [`delay`] target estimator and constraints | `delay_manager.cc`, `underrun_optimizer.cc`, `delay_constraints.cc` | here, to `doc/concept/playout.md` |
@@ -96,8 +96,8 @@ pub(crate) const PASSIVE_GATE: f32 = 8.0;
 /// interval, over the estimator's own resample interval.
 pub(crate) const STRETCH_BOUND: Duration = Duration::from_millis(75);
 
-/// Concealment blocks produced back to back before the output is comfort noise and
-/// nothing else, so a dead stream does not repeat a pitch period forever.
+/// Concealment blocks produced back to back before the output is silence and nothing
+/// else, so a dead stream does not repeat a pitch period forever.
 pub(crate) const MAX_CONSECUTIVE_EXPANDS: u32 = 200;
 
 /// How much further than the target audio may arrive and still be played.
@@ -117,7 +117,7 @@ pub(crate) fn frames(rate: u32, duration: Duration) -> usize {
 	(f64::from(rate) * duration.as_secs_f64()).round() as usize
 }
 
-/// The deterministic noise source behind the unvoiced and comfort-noise parts.
+/// The deterministic noise source behind concealment's unvoiced part.
 ///
 /// NetEq draws from a fixed table plus an LCG so its output is reproducible across
 /// builds (`random_vector.cc`). A xorshift gives us the same property without a

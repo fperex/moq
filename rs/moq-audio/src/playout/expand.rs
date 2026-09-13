@@ -6,23 +6,24 @@
 //! for the unvoiced part, and a mix between them set by how periodic the signal
 //! actually was. A held vowel is nearly all period; a fricative is nearly all noise.
 //!
-//! Every block after the first is quieter than the last, so a stream that never
-//! comes back fades into the room instead of buzzing forever, and after
-//! [`MAX_CONSECUTIVE_EXPANDS`] blocks there is nothing left but comfort noise.
+//! Every block after the first is quieter than the last, and once the muting slope
+//! has taken the gain to zero the output is digital silence, so an outage that never
+//! ends is not a sound. That is what the pinned Chromium tree does: `Expand::Process`
+//! scales each block by `mute_factor`, drops the factor by the muting slope every
+//! block, and pins it to zero outright past the third consecutive expansion once the
+//! slope would no longer lower it; `BackgroundNoise::GenerateBackgroundNoise` ignores
+//! both the slope and `TooManyExpands()` it is handed and never raises its own mute
+//! factor, which `ChannelParameters::Reset` leaves at 0, so the noise term contributes
+//! nothing at any point. Comfort noise belongs to a codec that says it is sending
+//! comfort noise; if hang ever carries a DTX/CNG signal, that is where it goes, not
+//! here.
 //!
-//! Two simplifications against the original, both audible only on a long outage,
-//! which the muting slope covers anyway:
-//!
-//! - NetEq keeps three candidate lags and alternates between them so a long
-//!   concealment does not sound metronomic. We keep one.
-//! - The pinned tree leaves its background noise muted for the whole expand period,
-//!   which makes the tail fade to digital silence. We fade the noise in as the voiced
-//!   part fades out, which is what the muting slope was for and what the older
-//!   `GenerateBackgroundNoise` unmuting did.
+//! One simplification against the original, audible only on a long outage, which the
+//! muting slope covers anyway: NetEq keeps three candidate lags and alternates between
+//! them so a long concealment does not sound metronomic. We keep one.
 
 use std::time::Duration;
 
-use super::noise::Noise;
 use super::stretch::peak;
 use super::{BLOCK, MAX_CONSECUTIVE_EXPANDS, MAX_LAG, OVERLAP, Rng, channel, fade, frames};
 
@@ -63,11 +64,10 @@ pub(crate) struct Expand {
 	ready: bool,
 	rng: Rng,
 	excitation: Vec<f32>,
-	background: Vec<f32>,
 }
 
 /// One channel's concealment: a period to repeat, a filter to drive, and the two
-/// gains that fade one into the other and then both into the background.
+/// gains that fade one into the other and then the whole thing out.
 struct Channel {
 	period: Vec<f32>,
 	filter: [f32; ORDER],
@@ -94,7 +94,6 @@ impl Expand {
 			ready: false,
 			rng: Rng::new(),
 			excitation: Vec::new(),
-			background: Vec::new(),
 		}
 	}
 
@@ -108,7 +107,7 @@ impl Expand {
 		self.consecutive
 	}
 
-	/// Whether the ceiling is reached and the output is comfort noise from here.
+	/// Whether the ceiling is reached and the output is silence from here.
 	pub(crate) fn exhausted(&self) -> bool {
 		self.consecutive >= MAX_CONSECUTIVE_EXPANDS
 	}
@@ -142,18 +141,15 @@ impl Expand {
 	}
 
 	/// Append one block of concealment to `out`.
-	pub(crate) fn process(&mut self, noise: &mut Noise, out: &mut Vec<f32>) {
+	pub(crate) fn process(&mut self, out: &mut Vec<f32>) {
 		let count = self.channels.len();
 		let start = out.len();
 		out.resize(start + self.block * count, 0.0);
 
-		self.background.resize(self.block * count, 0.0);
-		self.background.fill(0.0);
-
 		if !self.ready || self.exhausted() {
-			// Nothing to repeat, or nothing left worth repeating: room tone only.
-			noise.generate(&mut self.background, 1.0, &mut self.rng);
-			out[start..].copy_from_slice(&self.background);
+			// Nothing to repeat, or nothing left worth repeating. Silence, not room tone: an
+			// outage this long is not a quiet room, and a listener who can hear the noise cannot
+			// tell whether the talker went quiet or the stream died.
 			self.consecutive = (self.consecutive + 1).min(MAX_CONSECUTIVE_EXPANDS);
 			return;
 		}
@@ -161,7 +157,6 @@ impl Expand {
 		// One excitation for every channel, so a correlated image stays correlated.
 		self.excitation.clear();
 		self.excitation.extend((0..self.block).map(|_| self.rng.sample()));
-		noise.generate(&mut self.background, 1.0, &mut self.rng);
 
 		for (index, state) in self.channels.iter_mut().enumerate() {
 			state.escalate(self.consecutive, self.rate);
@@ -172,8 +167,10 @@ impl Expand {
 				let unvoiced = state.unvoiced(self.excitation[frame]);
 				let mixed = voiced * state.current_mix + unvoiced * (1.0 - state.current_mix);
 
+				// The muting slope is the whole ramp: it reaches zero within ~100 ms of the
+				// escalations, and there is nothing underneath it to fade into.
 				let at = start + frame * count + index;
-				out[at] = mixed * state.mute + self.background[frame * count + index] * (1.0 - state.mute);
+				out[at] = mixed * state.mute;
 
 				position = (position + 1) % state.period.len();
 				state.advance();
@@ -376,22 +373,18 @@ mod tests {
 	use super::super::{channel as split, merge::Merge};
 	use super::*;
 
-	/// A noise estimate trained on a second of quiet room tone.
-	fn trained(rate: u32, channels: usize, level: f32) -> Noise {
-		let mut estimate = Noise::new(channels);
-		for chunk in white(rate, 1.0, level, channels).chunks(256 * channels) {
-			estimate.update(chunk);
+	/// `count` blocks of concealment, concatenated.
+	fn conceal(expand: &mut Expand, count: u32) -> Vec<f32> {
+		let mut out = Vec::new();
+		for _ in 0..count {
+			expand.process(&mut out);
 		}
-		assert!(estimate.initialised());
-		estimate
+		out
 	}
 
 	#[test]
-	fn conceals_a_tone_and_decays_toward_the_background() {
+	fn conceals_a_tone_and_fades_it_out() {
 		let rate = 48_000;
-		let mut estimate = trained(rate, 1, 0.002);
-		let floor = estimate.energy(0);
-
 		let history = tone(rate, 0.05, 997.0, 0.5, 1);
 		let mut expand = Expand::new(rate, 1);
 		expand.analyse(&history[history.len() - expand.history()..]);
@@ -399,25 +392,22 @@ mod tests {
 		let mut blocks = Vec::new();
 		for _ in 0..20 {
 			let mut out = Vec::new();
-			expand.process(&mut estimate, &mut out);
+			expand.process(&mut out);
 			blocks.push(out);
 		}
 
+		let first = energy(&blocks[0]);
 		let mut previous = f32::MAX;
 		for (index, block) in blocks.iter().enumerate() {
 			let level = energy(block);
 
-			// Once the concealment has faded into the room, what is left is noise and
-			// noise wanders. Until then every block is quieter than the last.
-			if level > 2.0 * floor {
-				assert!(level <= previous * 1.05, "block {index} grew: {level} after {previous}");
-				previous = level;
-			}
+			// Every block is quieter than the last, all the way down.
+			assert!(level <= previous * 1.05, "block {index} grew: {level} after {previous}");
+			previous = level;
 
-			// And while it is still well clear of the room it is still the tone.
-			// Closer than 20 dB the background dominates the off pitch bin, which is
-			// the whole point of fading into it.
-			if level > 100.0 * floor {
+			// And while it is still loud it is still the tone. Further down the unvoiced
+			// part has taken over, which is what a fade is supposed to sound like.
+			if level > first / 100.0 {
 				let signal = goertzel(block, rate, 997.0);
 				let off = goertzel(block, rate, 1600.0);
 				assert!(signal > 8.0 * off, "block {index} lost its pitch: {signal} vs {off}");
@@ -428,51 +418,63 @@ mod tests {
 		let found = dominant(&all, rate, 900.0, 1100.0);
 		assert!((found - 997.0).abs() < 9.97, "dominant {found} Hz");
 
+		// The muting slope reaches zero well inside the ceiling, so the tail is digital silence.
 		let last = energy(blocks.last().unwrap());
-		assert!(last < energy(&blocks[0]) / 1000.0, "no decay at all: {last}");
-		assert!(last < 4.0 * floor, "twenty blocks did not reach the background: {last}");
+		assert_eq!(last, 0.0, "twenty blocks did not reach silence: {last}");
 	}
 
 	#[test]
-	fn stops_at_the_ceiling_and_plays_the_background() {
+	fn plays_silence_from_the_ceiling_on() {
 		let rate = 48_000;
-		let mut estimate = trained(rate, 1, 0.002);
-		let floor = estimate.energy(0);
+		// Room tone under the signal, which is what the estimator used to hand back here: with
+		// comfort noise this block came back at the room's own level and never stopped.
+		let mut history = tone(rate, 0.05, 997.0, 0.5, 1);
+		let room = white(rate, 0.05, 0.002, 1);
+		for (sample, noise) in history.iter_mut().zip(&room) {
+			*sample += noise;
+		}
 
+		let mut expand = Expand::new(rate, 1);
+		expand.analyse(&history[history.len() - expand.history()..]);
+
+		conceal(&mut expand, MAX_CONSECUTIVE_EXPANDS);
+		assert!(expand.exhausted());
+		assert_eq!(expand.consecutive(), MAX_CONSECUTIVE_EXPANDS);
+
+		let after = conceal(&mut expand, 50);
+		assert!(
+			after.iter().all(|sample| *sample == 0.0),
+			"the ceiling still made a sound"
+		);
+	}
+
+	#[test]
+	fn fades_a_long_outage_to_silence() {
+		let rate = 48_000;
 		let history = tone(rate, 0.05, 997.0, 0.5, 1);
 		let mut expand = Expand::new(rate, 1);
 		expand.analyse(&history[history.len() - expand.history()..]);
 
-		for _ in 0..MAX_CONSECUTIVE_EXPANDS {
-			let mut out = Vec::new();
-			expand.process(&mut estimate, &mut out);
-		}
-		assert!(expand.exhausted());
-		assert_eq!(expand.consecutive(), MAX_CONSECUTIVE_EXPANDS);
+		let produced = conceal(&mut expand, MAX_CONSECUTIVE_EXPANDS);
+		let tail = &produced[produced.len() - frames(rate, Duration::from_millis(1000))..];
+		assert_eq!(energy(tail), 0.0);
 
-		let mut out = Vec::new();
-		expand.process(&mut estimate, &mut out);
-		let level = energy(&out);
-		assert!(
-			level > floor / 4.0 && level < floor * 4.0,
-			"comfort noise at {level}, background {floor}"
-		);
+		// And it got there smoothly: the last audible sample is small enough that stopping is
+		// not a click.
+		let last = produced.iter().rposition(|sample| *sample != 0.0).unwrap();
+		assert!(produced[last].abs() < 0.01, "stopped at {}", produced[last]);
 	}
 
 	#[test]
 	fn merges_back_into_real_audio_without_a_click() {
 		let rate = 48_000;
-		let mut estimate = trained(rate, 1, 0.002);
 
 		let source = tone(rate, 0.5, 997.0, 0.5, 1);
 		let history = &source[..frames(rate, HISTORY)];
 		let mut expand = Expand::new(rate, 1);
 		expand.analyse(history);
 
-		let mut concealed = Vec::new();
-		for _ in 0..3 {
-			expand.process(&mut estimate, &mut concealed);
-		}
+		let concealed = conceal(&mut expand, 3);
 
 		// The stream comes back where it would have been had nothing been lost.
 		let resumed = &source[history.len() + concealed.len()..history.len() + concealed.len() + frames(rate, BLOCK)];
@@ -488,16 +490,12 @@ mod tests {
 	#[test]
 	fn stereo_concealment_stays_antiphase() {
 		let rate = 48_000;
-		let mut estimate = Noise::new(2);
 		let history = antiphase(rate, 0.05, 997.0, 0.5);
 
 		let mut expand = Expand::new(rate, 2);
 		expand.analyse(&history[history.len() - expand.history() * 2..]);
 
-		let mut out = Vec::new();
-		for _ in 0..5 {
-			expand.process(&mut estimate, &mut out);
-		}
+		let out = conceal(&mut expand, 5);
 
 		let left = split(&out, 2, 0);
 		let right = split(&out, 2, 1);
