@@ -86,14 +86,14 @@ for (const summary of summaries) {
 
 const lines: string[] = [];
 lines.push(
-	"| row | underrun ep/min | underrun ms/min | skips/min | skipped ms/min | silence | stalled | target p95 | converge s | void |",
+	"| row | underrun ep/min | underrun ms/min | skips/min | skipped ms/min | groups/min | silence | stalled | target p95 | converge s | void |",
 );
-lines.push("|---|---|---|---|---|---|---|---|---|---|");
+lines.push("|---|---|---|---|---|---|---|---|---|---|---|");
 const cell = (x: number | null | undefined) => (x === null || x === undefined ? "n/a" : String(x));
 for (const summary of summaries) {
 	const m = summary.metrics;
 	lines.push(
-		`| ${rowKey(summary.row)} | ${cell(m.underrun_episodes_per_min)} | ${cell(m.underrun_samples_per_min)} | ${cell(m.skip_aheads_per_min)} | ${cell(m.skipped_samples_per_min)} | ${cell(m.silence_share_share)} | ${cell(m.stalled_quanta_share)} | ${cell(m.target_ms_p95)} | ${cell(m.converge_s_seconds)} | ${summary.voids.map((v) => v.assertion).join(",") || "-"} |`,
+		`| ${rowKey(summary.row)} | ${cell(m.underrun_episodes_per_min)} | ${cell(m.underrun_samples_per_min)} | ${cell(m.skip_aheads_per_min)} | ${cell(m.skipped_samples_per_min)} | ${cell(m.skipped_groups_per_min)} | ${cell(m.silence_share_share)} | ${cell(m.stalled_quanta_share)} | ${cell(m.target_ms_p95)} | ${cell(m.converge_s_seconds)} | ${summary.voids.map((v) => v.assertion).join(",") || "-"} |`,
 	);
 }
 

@@ -149,15 +149,16 @@ export const METRICS: Record<string, MetricSpec> = {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Groups the container consumer abandoned, for any reason it could name.",
-		pending: "needs Container.Consumer.skipped, stage 3",
+		description:
+			"Groups the container consumer abandoned with content still unread. A group the next one already covers is not one of these: nothing was lost there.",
 	},
 	budget_aborts: {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Groups abandoned specifically because they exceeded the subscription's age budget.",
-		pending: "needs the typed Expired verdict, stage 3",
+		pending:
+			"skipped_groups counts the age budget and a transport give-up as one; separating them needs a typed verdict",
 	},
 	target_ms: {
 		unit: "ms",
@@ -178,6 +179,13 @@ export const METRICS: Record<string, MetricSpec> = {
 		aggregations: ["share"],
 		description:
 			"Share of sampled windows whose RMS at the audio graph's output was below the silence floor. The only metric read from the audio itself rather than from a counter.",
+	},
+	wall_clock_share: {
+		unit: "share",
+		clock: "viewer",
+		aggregations: ["share"],
+		description:
+			"Share of the graded window in which no track's playhead drove playback, so the reference followed the wall clock and the ring was chasing it rather than setting the pace.",
 	},
 	render_load: {
 		unit: "share",
@@ -315,6 +323,14 @@ export type Sample = {
 	reference?: number;
 	/** `sync.out.timestamp`: the media time `sync` believes should be playing now. */
 	syncTimestamp?: Ms;
+	/**
+	 * `sync.out.clock`: whose playhead playback is paced against.
+	 *
+	 * `"none"` is the wall clock, which is a different answer from the field being absent: absent
+	 * means the build predates the signal, and grading those two the same would read a player that
+	 * never handed the clock to audio as one that could not be asked.
+	 */
+	clock?: "audio" | "video" | "none";
 
 	/** RMS at the audio graph output over this window, from an AnalyserNode. */
 	rms?: number;
