@@ -420,7 +420,7 @@ impl Engine {
 		match self.conceal {
 			true => {
 				self.analyse();
-				self.expand.process(&mut self.noise, &mut produced);
+				self.expand.process(&mut produced);
 			}
 			false => {
 				self.gap(&mut produced);
@@ -459,7 +459,7 @@ impl Engine {
 			self.analyse();
 			self.concealed.clear();
 			let mut concealed = std::mem::take(&mut self.concealed);
-			self.expand.process(&mut self.noise, &mut concealed);
+			self.expand.process(&mut concealed);
 			let kept = self.merge.merge(&concealed, &input, &mut produced);
 			self.concealed = concealed;
 
