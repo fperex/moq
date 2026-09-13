@@ -599,6 +599,21 @@ test("Consumer measures how late frames arrive", async () => {
 	consumer.close();
 });
 
+test("Consumer starts its measurement at what the rendition advertises", async () => {
+	const track = new Track.Producer("test");
+	// The publisher's declared flush span is the only thing a receiver knows about the path before
+	// the first frame lands, so it is where the estimate starts rather than a floor under it.
+	const consumer = new Consumer(track.subscribe(), {
+		format: new LegacyFormat("audio"),
+		maxAge: 500 as Time.Milli,
+		jitter: 302 as Time.Milli,
+	});
+
+	expect(consumer.spread.peek()).toBe(320 as Time.Milli);
+	track.close();
+	consumer.close();
+});
+
 // The arrival observation point is load-bearing enough to guard directly: a spy on the estimator
 // says exactly which frames were measured, at which arrival time.
 function watchArrivals(): { calls: { timestamp: number; now: number }[]; restore: () => void } {

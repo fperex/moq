@@ -19,6 +19,15 @@ export interface ConsumerProps {
 	 */
 	// Read-only: a Getter (e.g. another component's output) is accepted directly.
 	maxAge?: GetterInit<Time.Milli>;
+
+	/**
+	 * What the rendition advertises it flushes, from its catalog `jitter` (default: none).
+	 *
+	 * Seeds {@link Consumer.spread} so a cold start reads the publisher's own declaration rather
+	 * than a constant. A plain value, not a getter: a rendition that changes it is a different
+	 * rendition and gets a new consumer.
+	 */
+	jitter?: Time.Milli;
 }
 
 interface Group {
@@ -103,15 +112,16 @@ export class Consumer {
 
 	// Measured at arrival, before any group is skipped: a target derived from what survives the
 	// age budget would only ever confirm the budget it was cut to.
-	#spread = new Jitter();
+	#spread: Jitter;
 
 	/**
 	 * How late frames arrive relative to the earliest one, measured as they land.
 	 *
 	 * Size the playback buffer with this rather than with the round trip, which says nothing about
-	 * how evenly a publisher emits frames.
+	 * how evenly a publisher emits frames. Starts at {@link ConsumerProps.jitter}, the publisher's
+	 * own declaration, until the first arrivals replace it.
 	 */
-	readonly spread: Getter<Time.Milli> = this.#spread.value;
+	readonly spread: Getter<Time.Milli>;
 
 	#skipped = new Signal(0);
 
@@ -126,6 +136,8 @@ export class Consumer {
 		this.#track = track;
 		this.#format = props.format;
 		this.#maxAge = getter(props.maxAge ?? Moq.Time.Milli.zero);
+		this.#spread = new Jitter({ start: props.jitter });
+		this.spread = this.#spread.value;
 
 		this.#signals.spawn(this.#run.bind(this));
 		this.#signals.cleanup(() => {

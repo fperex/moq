@@ -21,7 +21,7 @@ const RESAMPLE = 500;
 // a stalled sender cannot age out the only arrivals the reference has.
 const WINDOW = 2000;
 
-// The target before any observation lands.
+// The target before any observation lands, when the publisher declares nothing.
 const START = 80;
 
 // How many empty intervals one arrival may decay. 60 intervals is 30s, past the histogram's own
@@ -40,6 +40,18 @@ const LOWER_DIVISOR = 6;
 // One admitted arrival, on both axes in milliseconds.
 type Arrival = { timestamp: number; arrival: number };
 
+/** How to start a {@link Jitter} that has not measured anything yet. */
+export type JitterProps = {
+	/**
+	 * What the publisher declares it flushes, from the rendition's catalog `jitter`.
+	 *
+	 * The cold-start target, not a floor: it is the only thing a receiver knows about the path
+	 * before the first frame lands, and it is a better guess than a constant. The measurement takes
+	 * over from the first resampled observation and may take the target below it.
+	 */
+	start?: Time.Milli;
+};
+
 /**
  * How much buffer a receiver needs to play audio on time, measured from when frames arrive.
  *
@@ -51,9 +63,9 @@ type Arrival = { timestamp: number; arrival: number };
  *
  * The estimate rises the moment a late frame proves the buffer is too shallow and falls once a
  * second by a share of the distance left, so a refinement shrinks a viewer's buffer in steps it can
- * absorb without taking longer to undo than the histogram remembers. It carries no floor of its
- * own: the rendition's advertised jitter is a publisher-declared floor and belongs to whoever
- * combines the two.
+ * absorb without taking longer to undo than the histogram remembers. It carries no floor: the
+ * rendition's advertised jitter is where it starts ({@link JitterProps.start}), and the measurement
+ * owns the target from the first observation onwards.
  *
  * Time the receiver spends not reading is not the path's fault, so a gap in the receiver's own
  * reading drops the arrival reference rather than reading as a delay the size of the gap.
@@ -105,18 +117,26 @@ export class Jitter {
 	// The quantile's upper edge, i.e. what the histogram currently asks for.
 	#optimal?: number;
 
+	// What the target reads until the first observation lands.
+	readonly #start: number;
+
 	// The published target, and when it last moved.
-	#target = START;
+	#target: number;
 	#lowered?: number;
 
-	#value = new Signal<Time.Milli>(Time.Milli(START));
+	#value: Signal<Time.Milli>;
 
 	/** The current target: enough buffer to play `QUANTILE` of arrivals on time. */
-	readonly value: Getter<Time.Milli> = this.#value;
+	readonly value: Getter<Time.Milli>;
 
 	/** Seed the histogram with a decaying prior so a cold start has something to quantile. */
-	constructor() {
+	constructor(props?: JitterProps) {
 		for (let i = 0; i < BUCKETS; i++) this.#buckets[i] = 0.5 ** (i + 1);
+
+		this.#start = startTarget(props?.start);
+		this.#target = this.#start;
+		this.#value = new Signal<Time.Milli>(Time.Milli(this.#start));
+		this.value = this.#value;
 	}
 
 	/**
@@ -248,7 +268,7 @@ export class Jitter {
 	}
 
 	#publish(now: number): void {
-		const optimal = this.#optimal ?? START;
+		const optimal = this.#optimal ?? this.#start;
 		const current = this.#target;
 
 		if (optimal >= current) {
@@ -285,4 +305,16 @@ export class Jitter {
 		this.#target = target;
 		this.#value.set(Time.Milli(target));
 	}
+}
+
+// Where the target sits before anything has been measured.
+//
+// A publisher's declared flush span is the best prior a receiver has: it is exactly the quantity
+// the estimator goes on to measure, published by the only party that already knows it. NetEq has to
+// guess 80ms because RTP carries nothing like it. Never below that guess, because a publisher can
+// declare a flush span the network then adds to, and rounded up to a whole bucket so a cold start
+// reads on the same grid every later target does.
+function startTarget(advertised: Time.Milli | undefined): number {
+	const ms = Math.max(START, advertised ?? 0);
+	return Math.min(Jitter.CEILING, Math.ceil(ms / Jitter.BUCKET) * Jitter.BUCKET);
 }

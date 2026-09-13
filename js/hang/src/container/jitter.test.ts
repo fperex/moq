@@ -60,6 +60,44 @@ describe("tune-in", () => {
 	it("starts at the cold-start guess", () => {
 		expect(new Jitter().value.peek()).toBe(START as Time.Milli);
 	});
+
+	it("starts at what the publisher declares it flushes", () => {
+		// The TS importer advertises 302ms on the bbb sources. A declaration is a measurement of the
+		// same quantity by the party that already knows it, so it is where the estimate starts.
+		expect(new Jitter({ start: 302 as Time.Milli }).value.peek()).toBe(320 as Time.Milli);
+	});
+
+	it("never starts below the cold-start guess", () => {
+		// A browser publisher declares its 20ms frame duration. The network still adds to that, and
+		// nothing has been measured yet, so the guess stands.
+		expect(new Jitter({ start: 20 as Time.Milli }).value.peek()).toBe(START as Time.Milli);
+		expect(new Jitter({ start: Time.Milli.zero }).value.peek()).toBe(START as Time.Milli);
+	});
+
+	it("never starts above the histogram's range", () => {
+		// A publisher declaring more than the estimator can ever measure would otherwise name a
+		// target no observation could bring down.
+		expect(new Jitter({ start: 9000 as Time.Milli }).value.peek()).toBe(Jitter.CEILING as Time.Milli);
+	});
+
+	it("falls from a declared start to what it measures", () => {
+		// The declaration is a prior, not a floor: a path that turns out to be clean walks the
+		// target down to the same bucket the unseeded estimator settles on, at the ordinary bound.
+		const jitter = new Jitter({ start: 302 as Time.Milli });
+		expect(jitter.value.peek()).toBe(320 as Time.Milli);
+
+		// 20s of evenly paced frames, which is more than the fall bound needs from 320ms.
+		flush(jitter, { frames: 1000 });
+		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
+	});
+
+	it("holds a declared start for as long as the fall bound says", () => {
+		// One second of clean arrivals cannot undo a 320ms start: the bound is a sixth of the
+		// distance per second, so a viewer never has the buffer pulled out from under them.
+		const jitter = new Jitter({ start: 302 as Time.Milli });
+		flush(jitter, { frames: 50 });
+		expect(jitter.value.peek()).toBeGreaterThanOrEqual(280 as Time.Milli);
+	});
 });
 
 describe("steady state", () => {
@@ -374,7 +412,7 @@ describe("conformance", () => {
 
 	for (const entry of corpus.cases) {
 		it(`${entry.name}: ${entry.description}`, () => {
-			expect(replay(entry.arrivals)).toEqual(entry.target_ms);
+			expect(replay(entry.arrivals, entry.start_ms)).toEqual(entry.target_ms);
 		});
 	}
 });
