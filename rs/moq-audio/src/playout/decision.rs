@@ -15,11 +15,10 @@ use std::time::Duration;
 use super::level::Level;
 use super::{BLOCK, MAX_LAG, frames};
 
-/// How far above the target the buffer may sit before playout speeds up.
+/// How far above the level playout holds the buffer may sit before it speeds up.
 ///
-/// One arrival chunk covers a publisher that flushes several frames at once; the
-/// bucket on top is the estimator's own resolution, so an estimate that rounded up
-/// does not read as a buffer that needs draining.
+/// The estimator's own resolution: an estimate that rounded up does not read as a
+/// buffer that needs draining. NetEq's `kDelayAdjustmentGranularityMs`.
 const SLACK: Duration = Duration::from_millis(20);
 
 /// Output between two operations, NetEq's `kMinTimescaleInterval` in wall time.
@@ -55,8 +54,8 @@ pub(crate) struct Decision {
 	level: Level,
 	/// The playout target, in frames.
 	target: usize,
-	/// The largest arrival seen, in frames: a publisher flushing several frames at
-	/// once lands that much above target through no fault of the path.
+	/// The most recent arrival, in frames, and the term on top of the target that
+	/// makes the level playout holds. See [`Self::hold`].
 	chunk: usize,
 	/// Output since the last operation, in frames.
 	since: usize,
@@ -89,15 +88,33 @@ impl Decision {
 		self.target = frames(self.rate, target);
 	}
 
-	/// Note how much audio arrived in one go, which is how far above target a
-	/// well-behaved publisher can put the buffer.
+	/// Note how much audio arrived in one go, which is the chunk playout holds on top
+	/// of the target.
+	///
+	/// The most recent arrival, not a running maximum: one oversized decode would
+	/// otherwise deepen playout for the life of the stream, and a publisher that
+	/// changes its frame duration is described within one arrival. Never below one
+	/// output block, since that is the least playout can take at a time.
 	pub(crate) fn arrived(&mut self, count: usize) {
-		self.chunk = self.chunk.max(count).min(frames(self.rate, super::delay::CEILING));
+		let block = frames(self.rate, BLOCK);
+		self.chunk = count.clamp(block, frames(self.rate, super::delay::CEILING));
+	}
+
+	/// The audio playout holds ahead of the playhead, in frames.
+	///
+	/// The target counts the frame being played, the way NetEq's does (its buffer
+	/// level is the `packet_buffer` span plus what the sync buffer still holds), so
+	/// what is still waiting to be played is the target plus one chunk. Playout
+	/// refills to this after a stall and a flush drops back to it; holding the target
+	/// alone leaves nothing unplayed, and the first arrival a millisecond late runs
+	/// the buffer dry again.
+	pub(crate) fn hold(&self) -> usize {
+		self.target + self.chunk
 	}
 
 	/// The level at which playout starts speeding up, in frames.
 	pub(crate) fn high(&self) -> usize {
-		self.target + self.chunk + frames(self.rate, SLACK)
+		self.hold() + frames(self.rate, SLACK)
 	}
 
 	/// How much audio may sit ahead of the playhead before it is dropped rather than
@@ -124,12 +141,12 @@ impl Decision {
 			return Action::Conceal;
 		}
 
-		// A buffer that ran dry refills to the target before playing again.
-		// Resuming on whatever arrived first plays on an empty cushion, so the next
-		// late arrival is another stall, which is what a viewer hears as a stutter
-		// that never settles.
+		// A buffer that ran dry refills to the level playout holds before playing
+		// again. Resuming on whatever arrived first plays on an empty cushion, so the
+		// next late arrival is another stall, which is what a viewer hears as a
+		// stutter that never settles.
 		if self.stalled {
-			if ready < self.target {
+			if ready < self.hold() {
 				return Action::Conceal;
 			}
 			self.stalled = false;
@@ -153,10 +170,11 @@ impl Decision {
 			return Action::Accelerate { fast: false };
 		}
 
-		// Below half the target the buffer is not being refilled by a slow path, it
-		// is empty, and stretching it thinner only delays the concealment that is
-		// coming. NetEq holds decoding back at the same threshold.
-		if level < self.target && level >= self.target / 2 && ready >= self.stretch_input() {
+		// Below half the level it holds the buffer is not being refilled by a slow
+		// path, it is empty, and stretching it thinner only delays the concealment
+		// that is coming. NetEq holds decoding back at the same threshold.
+		let hold = self.hold();
+		if level < hold && level >= hold / 2 && ready >= self.stretch_input() {
 			return Action::Expand;
 		}
 
@@ -209,14 +227,17 @@ mod tests {
 		}
 	}
 
+	/// The level playout holds for a target, with the default 10ms chunk on top.
+	fn hold(target: Duration) -> usize {
+		frames(RATE, target + BLOCK)
+	}
+
 	#[test]
-	fn a_buffer_on_target_plays_normally() {
+	fn a_buffer_on_the_level_it_holds_plays_normally() {
 		let mut decision = decision(Duration::from_millis(100));
-		settle(&mut decision, frames(RATE, Duration::from_millis(100)));
-		assert_eq!(
-			decision.decide(frames(RATE, Duration::from_millis(100)), 0, true),
-			Action::Normal
-		);
+		let ready = hold(Duration::from_millis(100));
+		settle(&mut decision, ready);
+		assert_eq!(decision.decide(ready, 0, true), Action::Normal);
 	}
 
 	#[test]
@@ -267,6 +288,7 @@ mod tests {
 		let mut decision = decision(target);
 		let ready = frames(RATE, Duration::from_millis(150));
 		settle(&mut decision, ready);
+		assert!(ready < hold(target));
 		assert_eq!(decision.decide(ready, 0, true), Action::Expand);
 	}
 
@@ -287,21 +309,21 @@ mod tests {
 	fn an_empty_buffer_conceals_and_the_return_merges() {
 		let target = Duration::from_millis(100);
 		let mut decision = decision(target);
-		decision.reset(frames(RATE, target));
+		decision.reset(hold(target));
 
 		assert_eq!(decision.decide(0, 0, true), Action::Conceal);
 		decision.produced(BLOCK_FRAMES, 0, true);
 
-		assert_eq!(decision.decide(frames(RATE, target), 0, true), Action::Merge);
+		assert_eq!(decision.decide(hold(target), 0, true), Action::Merge);
 	}
 
 	/// Resuming on whatever arrived first plays on an empty cushion, so the next
 	/// late arrival is another stall: the stutter a viewer hears never settles.
 	#[test]
-	fn a_dry_buffer_refills_to_the_target_before_it_plays() {
+	fn a_dry_buffer_refills_to_the_level_it_holds_before_it_plays() {
 		let target = Duration::from_millis(100);
 		let mut decision = decision(target);
-		decision.reset(frames(RATE, target));
+		decision.reset(hold(target));
 
 		assert_eq!(decision.decide(0, 0, true), Action::Conceal);
 		decision.produced(BLOCK_FRAMES, 0, true);
@@ -314,7 +336,16 @@ mod tests {
 		);
 		decision.produced(BLOCK_FRAMES, 0, true);
 
-		assert_eq!(decision.decide(frames(RATE, target), 0, true), Action::Merge);
+		// The target alone is still a chunk short of what playout holds, because the
+		// target counts the chunk being played.
+		assert_eq!(
+			decision.decide(frames(RATE, target), 0, true),
+			Action::Conceal,
+			"played on the target alone"
+		);
+		decision.produced(BLOCK_FRAMES, 0, true);
+
+		assert_eq!(decision.decide(hold(target), 0, true), Action::Merge);
 	}
 
 	#[test]
@@ -333,13 +364,26 @@ mod tests {
 
 		decision.arrived(frames(RATE, Duration::from_millis(160)));
 		assert!(decision.high() > tight);
+		assert_eq!(decision.hold(), frames(RATE, Duration::from_millis(260)));
 
-		let ready = frames(RATE, Duration::from_millis(200));
+		let ready = frames(RATE, Duration::from_millis(280));
 		settle(&mut decision, ready);
 		assert_eq!(
 			decision.decide(ready, 0, true),
 			Action::Normal,
 			"a 7 frame flush is not a path that needs draining"
+		);
+	}
+
+	#[test]
+	fn one_arrival_describes_the_chunk_rather_than_every_arrival_before_it() {
+		let mut decision = decision(Duration::from_millis(100));
+		decision.arrived(frames(RATE, Duration::from_millis(160)));
+		decision.arrived(frames(RATE, Duration::from_millis(20)));
+		assert_eq!(
+			decision.hold(),
+			frames(RATE, Duration::from_millis(120)),
+			"one oversized decode deepened playout for the life of the stream"
 		);
 	}
 }

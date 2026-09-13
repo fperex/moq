@@ -213,7 +213,7 @@ impl Buffer {
 	///
 	/// What the caller is choosing between is dropping this audio and playing it
 	/// late, so the audio dropped is the oldest: it is the part that would be late.
-	pub(crate) fn drop_to(&mut self, target: Duration) -> usize {
+	fn drop_to(&mut self, target: Duration) -> usize {
 		let buffered = self.buffered();
 		if buffered <= target {
 			return 0;

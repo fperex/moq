@@ -200,11 +200,8 @@ impl Engine {
 			.get_or_insert_with(|| self.buffer.front().unwrap_or(timestamp));
 
 		// A burst far past anything playout will reach is dropped here rather than
-		// played late, which is the delay the target exists to bound. The threshold
-		// is the same one the decision loop skips at, so a target that has fallen
-		// does not suddenly convict audio the loop was about to stretch away.
-		let ceiling = self.buffer.duration(self.decision.ceiling());
-		let dropped = self.buffer.flush(self.target, ceiling);
+		// played late, which is the delay the target exists to bound.
+		let dropped = self.flush();
 		self.record_skip(dropped);
 	}
 
@@ -282,6 +279,24 @@ impl Engine {
 		self.target
 	}
 
+	/// The audio playout holds ahead of the playhead: the target plus the chunk being
+	/// played, which is what a listener actually waits. See [`Decision::hold`].
+	fn hold(&self) -> Duration {
+		self.buffer.duration(self.decision.hold().max(self.block))
+	}
+
+	// Drop audio sitting so far ahead of the playhead that playing it would be late,
+	// back to the level playout holds, and report the frames thrown away.
+	//
+	// One rule for both ends. The decision loop's own skip ceiling is the threshold, so
+	// a target that has fallen does not suddenly convict audio the loop was about to
+	// stretch away, and the buffer's flush keeps NetEq's multiple of the level underneath
+	// that, so a ceiling that just narrowed does not either.
+	fn flush(&mut self) -> usize {
+		let ceiling = self.buffer.duration(self.decision.ceiling());
+		self.buffer.flush(self.hold(), ceiling)
+	}
+
 	// Follow the estimator, which moves on every arrival.
 	fn retarget(&mut self) {
 		self.target = self.constraints.apply(self.jitter.target());
@@ -290,7 +305,6 @@ impl Engine {
 
 	// One turn of the decision loop, committing at least one block to the output.
 	fn produce(&mut self) {
-		let ready = self.buffer.ready();
 		let front = self.buffer.front();
 		let contiguous = match (self.played, front) {
 			(Some(played), Some(front)) => front <= played + self.buffer.duration(1),
@@ -298,11 +312,12 @@ impl Engine {
 			_ => false,
 		};
 
-		// Audio that has run too far ahead of the playhead is dropped back to the
-		// target: it is going to be late either way, and playing it is the delay the
-		// target exists to bound.
-		if ready > self.decision.ceiling() {
-			let dropped = self.buffer.drop_to(self.target.max(self.buffer.duration(self.block)));
+		// Audio that has run too far ahead of the playhead is dropped back to the level
+		// playout holds: it is going to be late either way, and playing it is the delay
+		// the target exists to bound. The same rule as on the way in, so a target that
+		// has just fallen does not convict from here what it tolerates there.
+		let dropped = self.flush();
+		if dropped > 0 {
 			self.record_skip(dropped);
 			self.decision.reset(self.buffer.ready());
 		}
@@ -711,8 +726,11 @@ mod tests {
 		);
 		assert_eq!(stats.skips, 0, "{stats:?}");
 
-		// The warmup stall is the only concealment a clean path needs.
-		let warmup = frames(RATE, target + PACKET) / frames(RATE, BLOCK) + 4;
+		// The warmup stall is the only concealment a clean path needs. It is measured from
+		// the 80ms default target the estimator starts at rather than from where it
+		// settles, plus the packet playout holds on top of it: the silence a listener
+		// hears at the start is the refill to that level, not to the final one.
+		let warmup = frames(RATE, Duration::from_millis(80) + PACKET + PACKET) / frames(RATE, BLOCK);
 		let played = player.played(warmup);
 		// A sine crosses zero exactly, so what a silent block looks like is a run,
 		// not a sample.
