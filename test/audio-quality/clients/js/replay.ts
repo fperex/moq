@@ -173,6 +173,9 @@ for (const { recording, row } of matrix) {
 	const discarded = rise((s) => s.debug.discarded);
 	const accelerates = rise((s) => s.debug.accelerates);
 	const expands = rise((s) => s.debug.expands);
+	// The ring publishes the signed net (what an accelerate removed less what an expansion
+	// inserted), so a row where both ran reports the net rather than the sum: a lower bound on how
+	// much media had its duration altered, not the total.
 	const stretched = Math.abs(rise((s) => s.debug.stretched));
 	const short = rise((s) => s.debug.short);
 

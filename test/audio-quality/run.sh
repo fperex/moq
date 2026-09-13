@@ -13,7 +13,13 @@
 #   - The ring that ran is the one the row asked for, which is decided by whether the document is
 #     cross-origin isolated, not by anything the page can assert about itself.
 #
-# Budgets are recorded here, not enforced: see README.md and grade.ts. Pass --enforce to fail on them.
+# `--runtime` picks which of three lanes runs. `chromium` is the matrix above. `safari` is real
+# Safari through safaridriver, whose session is a WebSocket and therefore never traverses the UDP
+# shaper, so it offers only the profiles whose path treatment is already nothing. `replay` drives the
+# recorded traces through the same player on a simulated clock, with no relay, shaper, or browser at
+# all. See README.md; the void rules above are the browser lanes'.
+#
+# Budgets are graded by grade.ts and only fail the run under --enforce, which the nightly job passes.
 set -euo pipefail
 
 AQ_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -226,8 +232,8 @@ shaper_of() {
     esac
 }
 
-# Grade what the run produced and, if asked, keep the directory it produced it in. Both lanes end
-# here, so the two cannot disagree about what a run leaves behind.
+# Grade what the run produced and, if asked, keep the directory it produced it in. Every lane ends
+# here, so no two of them can disagree about what a run leaves behind.
 finish() {
     local status="$1"
     echo ""

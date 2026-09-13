@@ -117,14 +117,22 @@ type Status = {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const voids: Void[] = [];
-/** The environment last written to the ndjson, as JSON, so only a change is written again. */
-let sentEnvironment: string | undefined;
+/** Whether the environment has been written to the ndjson yet; it goes in once. */
+let sentEnvironment = false;
 const note = (assertion: string, detail: string) => {
 	console.error(`void: ${assertion}: ${detail}`);
 	voids.push({ assertion, detail });
 };
 
-const driver = await WebDriver.start(values.binary, driverPort, join(out, `${values.tag}.safaridriver.log`));
+// Outside the try below only so the helpers can name it; a driver that never starts is a row that
+// never ran, and it is reported as a void rather than as an unhandled rejection with a live server
+// still bound behind it.
+const driver = await WebDriver.start(values.binary, driverPort, join(out, `${values.tag}.safaridriver.log`)).catch(
+	(err: unknown) => {
+		server.stop();
+		throw err;
+	},
+);
 
 let status = 0;
 try {
@@ -169,10 +177,11 @@ try {
 		note("activation", `the AudioContext is ${state ?? "absent"} after 30s of clicking the start button`);
 	}
 
-	// WebKit has no WebTransport this lane can use, so a row that somehow negotiated one did not
-	// measure what these budgets were recorded on. Named for what it is rather than passed quietly.
+	// WebKit has no WebTransport this lane can use, so a row that somehow negotiated one measured a
+	// different path from the one this lane describes. Named for what it is rather than passed
+	// quietly: nothing else here would notice.
 	if (ready.transport !== "websocket") {
-		note("transport", `negotiated ${ready.transport}, and this lane's budgets were measured on websocket`);
+		note("transport", `negotiated ${ready.transport}, and this lane is the WebSocket one`);
 	}
 	if (ready.crossOriginIsolated !== (ring === "isolated")) {
 		note("ring", `asked for ${ring}, page reports crossOriginIsolated=${ready.crossOriginIsolated}`);
@@ -183,8 +192,8 @@ try {
 	// as a several-percent drift on a healthy run. See `driver.ts`.
 	const playingBy = Date.now() + 30_000;
 	while (Date.now() < playingBy) {
-		const state = await readStatus();
-		if (state && state.stalled === false && typeof state.timestamp === "number") break;
+		const playing = await readStatus();
+		if (playing && playing.stalled === false && typeof playing.timestamp === "number") break;
 		await collect();
 		await sleep(200);
 	}
@@ -320,12 +329,10 @@ async function collect(final = false): Promise<void> {
 
 	const drained = JSON.parse(text) as { samples?: Sample[]; environment?: Environment; notes?: string[] };
 
-	// Only when it changes, the way the beacon does it, so the file is samples rather than a copy of
-	// the environment every quarter second. It does change once: the catalog is readable before the
-	// AudioContext exists, so the first report cannot carry the device's rate.
-	const encoded = drained.environment === undefined ? undefined : JSON.stringify(drained.environment);
-	const environment = encoded !== undefined && encoded !== sentEnvironment ? drained.environment : undefined;
-	if (environment) sentEnvironment = encoded;
+	// Once, the way the beacon sends it, so the file is samples rather than a copy of the
+	// environment every quarter second.
+	const environment = sentEnvironment ? undefined : drained.environment;
+	if (environment) sentEnvironment = true;
 
 	const batch: Beacon = {
 		tag: values.tag as string,
