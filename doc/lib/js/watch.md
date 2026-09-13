@@ -147,6 +147,31 @@ const broadcast = new Watch.Broadcast({ origin: connection.origin, name: Moq.Pat
 is a signal from [`@moq/signals`](/lib/js/signals). Load from a CDN
 (`https://esm.sh/@moq/watch/element`) for a no-build embed.
 
+## Keeping tracks together
+
+`Watch.Sync` is the clock the tracks render against. It takes the playback
+settings, `delay` and `buffer`, and nothing else; each track is wired through a
+handle of its own:
+
+```ts
+const sync = new Watch.Sync({ delay: "auto" });
+
+const audio = sync.track("audio");
+audio.advertised; // what the selected rendition says it flushes at once
+audio.spread;     // how late its frames actually arrived
+```
+
+`"auto"` sizes the delay from the larger of the two, across every track;
+`sync.track("text")` joins on the same footing.
+
+While audio plays, its ring publishes where it is (`audio.clock`) and
+everything else is paced against that: `sync.wait()` for video frames,
+`sync.now()` for captions. A ring that re-buffers parks its playhead, and
+video parks with it instead of running away from the audio you can hear. Mute
+the player or end the track and the clock is handed back to the wall clock
+where the playhead left it, so nothing jumps. `sync.out.clock` names whichever
+track is driving, or is empty while playback runs on wall time.
+
 ## Buffered playback
 
 By default the player minimizes latency: it skips ahead whenever media piles

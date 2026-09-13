@@ -1,4 +1,5 @@
 import type { Time } from "@moq/net";
+import type { Playhead } from "./playhead";
 import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
 /** Everything the main thread sends the render worklet over its port. */
@@ -59,7 +60,9 @@ export interface Latency {
 /** State update from the worklet back to main thread (fallback path only). */
 export interface State {
 	type: "state";
-	timestamp: Time.Micro;
+	// Where the reader is and how fast it is moving, or undefined until the first write anchors the
+	// ring. The main thread stamps it with its arrival and extrapolates until the next one.
+	playhead: Playhead | undefined;
 	stalled: boolean;
 	// How many times the ring has run dry mid-playback, cumulative.
 	underruns: number;

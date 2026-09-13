@@ -1,8 +1,58 @@
 import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
 import { Effect, type Getter, Signal } from "@moq/signals";
+import type { Clock } from "../sync";
+import type { Playhead } from "./playhead";
 import type { Data, InitPost, InitShared, Latency, Reset, Stall, State, Truncate } from "./render";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
+
+/**
+ * How long a parked playhead may go without media arriving and still be the clock.
+ *
+ * A park is a refill, and a refill has frames landing in it: playback pauses with it so video does
+ * not run away from the audio a listener can hear, however deep the target is. A playhead that has
+ * neither moved nor been written to for this long is not refilling (a muted track that drained, a
+ * download that stopped, a track that ended with its ring still alive), and holding video against
+ * it would freeze the picture, so the ring gives up the clock and `Sync` carries on at wall speed
+ * from where the playhead stopped.
+ */
+const PARK_LIMIT = Time.Milli(1000);
+
+/**
+ * Turns ring playhead samples into the clock `Sync` follows.
+ *
+ * Stamps each sample with the time it was taken, which is what `Sync` extrapolates from, and gives
+ * up the clock once a park stops looking like a refill. See {@link PARK_LIMIT}.
+ */
+export class ClockSource {
+	// When the playhead stopped, with nothing written since. Undefined while it is moving or being
+	// fed, which is the whole of normal playback.
+	#parked: Time.Milli | undefined;
+
+	/** Note that media reached the ring, so a park is a refill rather than an abandoned playhead. */
+	filling(): void {
+		this.#parked = undefined;
+	}
+
+	/** Stamp `playhead`, or return undefined when it should not be driving playback. */
+	sample(playhead: Playhead | undefined): Clock | undefined {
+		const now = Time.Milli.now();
+
+		if (!playhead) {
+			this.#parked = undefined;
+			return undefined;
+		}
+
+		if (playhead.rate !== 0) {
+			this.#parked = undefined;
+		} else {
+			this.#parked ??= now;
+			if (Time.Milli.sub(now, this.#parked) > PARK_LIMIT) return undefined;
+		}
+
+		return { timestamp: playhead.timestamp, reference: now, rate: playhead.rate };
+	}
+}
 
 /**
  * Samples the shared ring is sized for up front, so an "auto" target rising to the estimator's
@@ -118,6 +168,14 @@ export interface AudioBuffer {
 	/** Current playback timestamp (derived from reader position). */
 	readonly timestamp: Getter<Time.Micro>;
 
+	/**
+	 * The playhead as a clock for `Sync`, or undefined while it is not one.
+	 *
+	 * Republished as the reader moves, so `Sync` re-anchors rather than drifting; it extrapolates
+	 * between samples, so video paces against main-thread memory instead of the ring itself.
+	 */
+	readonly clock: Getter<Clock | undefined>;
+
 	/** Whether the buffer is stalled (waiting to fill). */
 	readonly stalled: Getter<boolean>;
 
@@ -175,6 +233,10 @@ class SharedAudioBuffer implements AudioBuffer {
 	readonly #underruns = new Signal<number>(0);
 	readonly underruns: Getter<number> = this.#underruns;
 
+	readonly #clock = new Signal<Clock | undefined>(undefined);
+	readonly clock: Getter<Clock | undefined> = this.#clock;
+	readonly #clockSource = new ClockSource();
+
 	#backpressure: Backpressure;
 
 	#signals = new Effect();
@@ -199,12 +261,15 @@ class SharedAudioBuffer implements AudioBuffer {
 		const msg: InitShared = { type: "init-shared", ...init };
 		worklet.port.postMessage(msg);
 
-		// Poll the shared control array and reflect it into signals.
+		// Poll the shared control array and reflect it into signals. Also the clock's cadence: video
+		// re-anchors to the audio playhead once per poll and extrapolates in between, so a per-frame
+		// wait costs no shared-memory read at all.
 		this.#signals.interval(() => {
 			const stalled = this.#ring.stalled;
 			this.#timestamp.set(this.#ring.timestamp);
 			this.#stalled.set(stalled);
 			this.#underruns.set(this.#ring.underruns);
+			this.#clock.set(this.#clockSource.sample(this.#ring.playhead));
 			// While stalled the playhead is parked, so release the decode loop to refill the floor;
 			// once playing, hold it to ~the floor ahead.
 			if (stalled) this.#backpressure.flush();
@@ -213,6 +278,7 @@ class SharedAudioBuffer implements AudioBuffer {
 	}
 
 	insert(timestamp: Time.Micro, data: Float32Array[]): void {
+		this.#clockSource.filling();
 		this.#ring.insert(timestamp, data);
 	}
 
@@ -259,6 +325,7 @@ class SharedAudioBuffer implements AudioBuffer {
 
 	close(): void {
 		this.#backpressure.flush(); // never leave a decode loop awaiting a closed buffer
+		this.#clock.set(undefined); // a closed buffer is not a clock
 		this.#signals.close();
 	}
 }
@@ -277,6 +344,10 @@ class PostAudioBuffer implements AudioBuffer {
 
 	readonly #underruns = new Signal<number>(0);
 	readonly underruns: Getter<number> = this.#underruns;
+
+	readonly #clock = new Signal<Clock | undefined>(undefined);
+	readonly clock: Getter<Clock | undefined> = this.#clock;
+	readonly #clockSource = new ClockSource();
 
 	// Backpressure runs off the playhead the worklet reports in its state messages.
 	#backpressure: Backpressure;
@@ -298,13 +369,17 @@ class PostAudioBuffer implements AudioBuffer {
 		this.#signals.event(worklet.port, "message", (ev: Event) => {
 			const data = (ev as MessageEvent<State>).data;
 			if (data?.type === "state") {
-				this.#timestamp.set(data.timestamp);
+				const timestamp = data.playhead?.timestamp ?? Time.Micro.zero;
+				this.#timestamp.set(timestamp);
 				this.#stalled.set(data.stalled);
 				this.#underruns.set(data.underruns);
+				// Stamped on arrival rather than at the send, so the clock carries the transport's
+				// own lag; the main thread extrapolates from here until the next message.
+				this.#clock.set(this.#clockSource.sample(data.playhead));
 				// While stalled the playhead is parked, so release the decode loop to refill the floor;
 				// once playing, hold it to ~the floor ahead.
 				if (data.stalled) this.#backpressure.flush();
-				else this.#backpressure.advance(data.timestamp);
+				else this.#backpressure.advance(timestamp);
 			}
 		});
 		// addEventListener on a MessagePort requires start() to begin delivery.
@@ -312,6 +387,7 @@ class PostAudioBuffer implements AudioBuffer {
 	}
 
 	insert(timestamp: Time.Micro, data: Float32Array[]): void {
+		this.#clockSource.filling();
 		const msg: Data = { type: "data", data, timestamp };
 		// Transfer the ArrayBuffers to avoid a copy. This is why samples can be dropped
 		// under load: the main thread loses access until the worklet drains the message queue.
@@ -360,6 +436,7 @@ class PostAudioBuffer implements AudioBuffer {
 
 	close(): void {
 		this.#backpressure.flush(); // never leave a decode loop awaiting a closed buffer
+		this.#clock.set(undefined); // a closed buffer is not a clock
 		this.#signals.close();
 	}
 }

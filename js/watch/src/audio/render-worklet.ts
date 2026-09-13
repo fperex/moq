@@ -89,7 +89,7 @@ class Render extends AudioWorkletProcessor {
 				this.#stateCounter = 0;
 				const state: State = {
 					type: "state",
-					timestamp: backend.timestamp,
+					playhead: backend.playhead,
 					stalled: backend.stalled,
 					underruns: backend.underruns,
 				};

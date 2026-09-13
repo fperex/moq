@@ -18,6 +18,11 @@ export function bufferingIndicator(parent: Effect, watch: MoqWatch): HTMLElement
 		const offline = effect.get(watch.broadcast.out.status) === "offline";
 		const unsupported = effect.get(watch.video.source.out.error) === "unsupported";
 		container.style.display = buffering && !offline && !unsupported ? "" : "none";
+
+		// Which playhead everything is paced against, since a stall means something different for
+		// each: the audio ring refilling parks playback, where the wall clock runs through it.
+		const clock = effect.get(watch.sync.out.clock);
+		container.title = clock ? `Buffering (${clock} clock)` : "Buffering";
 	});
 
 	return container;
