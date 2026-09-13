@@ -42,6 +42,13 @@ export interface RingView {
 	skip: number;
 	/** Whether playback is parked while the ring refills. */
 	stalled: boolean;
+	/**
+	 * Whether the publisher declared the timeline finished and everything it published has played.
+	 *
+	 * A stall is a refill and an empty ring is a gap, so both are covered with concealment. This is
+	 * neither: the pause is on the wire, so there is nothing to conceal and nothing to wait for.
+	 */
+	ended: boolean;
 	/** Whether the writer is mid-rebase, so nothing buffered can be trusted this quantum. */
 	unstable: boolean;
 	/**
@@ -184,6 +191,9 @@ export class Stretcher {
 
 	#generation: number | undefined;
 	#stalled = true;
+	// Whether the last block the engine tried to produce was refused because the publisher had
+	// declared the timeline finished, so the quantum that came up short is a declared pause.
+	#ended = false;
 
 	/**
 	 * An engine for planar `channels` channel PCM at `rate`.
@@ -283,8 +293,9 @@ export class Stretcher {
 		}
 
 		// The ring ran dry or is parked with concealment turned off, so the caller ramps what it got
-		// down to the silence that follows.
-		if (offset < quantum) this.#short++;
+		// down to the silence that follows. A declared endpoint is not that: the silence is the
+		// audio, so it is not counted against the reader.
+		if (offset < quantum && !this.#ended) this.#short++;
 
 		ring.report(this.counters());
 		return offset;
@@ -315,6 +326,21 @@ export class Stretcher {
 			// to a timeline that is gone.
 			if (this.#generation !== undefined) this.discontinuity();
 			this.#generation = view.generation;
+		}
+
+		this.#ended = view.ended;
+		if (view.ended) {
+			// The publisher declared the timeline finished and the ring has played everything it
+			// published. There is no gap to cover, so concealment would be inventing audio nobody
+			// sent: park and render silence until frames return.
+			this.#park();
+			// And drop the played history with it. What the ring resumes with belongs to the far
+			// side of a declared pause, so splicing it onto the last thing heard before the pause,
+			// or concealing with it while the ring refills, would be inventing a join that is not
+			// there.
+			this.#sync.flush();
+			this.#expand.reset();
+			return false;
 		}
 
 		if (view.stalled || view.unstable) {
@@ -430,7 +456,7 @@ export class Stretcher {
 
 	/** Nothing to play: make one block up. */
 	#hide(): boolean {
-		this.#expand.process(this.#noise, this.#result, 0);
+		this.#expand.process(this.#result, 0);
 		this.#queue(this.#result, this.#expand.block, this.#expand.block);
 		return true;
 	}
@@ -443,7 +469,7 @@ export class Stretcher {
 
 		// One more block of concealment for the returning media to be aligned and crossfaded
 		// against, which is what makes the splice inaudible.
-		this.#expand.process(this.#noise, this.#concealment, 0);
+		this.#expand.process(this.#concealment, 0);
 		const kept = this.#merge.merge(this.#concealment, this.#expand.block, this.#input, want, this.#result);
 
 		// The kept concealment lengthens the block without consuming media, exactly as a preemptive

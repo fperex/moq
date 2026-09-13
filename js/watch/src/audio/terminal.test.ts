@@ -90,6 +90,19 @@ test("Terminal re-anchors on the frame after the hole rather than one later", ()
 	expect(terminal.continues(6_000_000 as Time.Micro)).toBe(false);
 });
 
+test("a declared break reopens a timeline that ended", () => {
+	// A muted publisher declares where its timeline stops, and declares a break when it resumes:
+	// an endpoint trims everything past it, so without the break the watcher would never hear the
+	// talker again.
+	const terminal = new Terminal();
+	terminal.update({ discontinuity: 0, frame: { timestamp: 0 as Time.Micro }, end: 20_000 as Time.Micro });
+	expect(terminal.end).toBe(20_000 as Time.Micro);
+
+	expect(terminal.update({ discontinuity: 1, frame: { timestamp: 10_020_000 as Time.Micro } })).toBe(true);
+	expect(terminal.end).toBeUndefined();
+	expect(terminal.span({ timestamp: 10_020_000, sampleRate: 48_000, numberOfFrames: 960 }).frames).toBe(960);
+});
+
 test("a discontinuity reapplies Opus pre-skip in the resumed epoch", () => {
 	const terminal = new Terminal();
 	terminal.clear(312);

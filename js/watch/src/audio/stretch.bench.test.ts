@@ -54,6 +54,7 @@ class Fixed implements RingReader {
 			chunk: CHUNK,
 			skip: frames(RATE, STRETCH_BOUND),
 			stalled: false,
+			ended: false,
 			unstable: false,
 			converge: true,
 			skipped: 0,

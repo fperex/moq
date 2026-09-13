@@ -4,7 +4,7 @@ import type { Snapshot } from "./playout";
 import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
 /** Everything the main thread sends the render worklet over its port. */
-export type Message = InitShared | InitPost | Data | Latency | Reset | Stall | Truncate;
+export type Message = InitShared | InitPost | Data | End | Latency | Reset | Stall | Truncate;
 export type ToMain = State;
 
 /** Init message when SharedArrayBuffer is available. */
@@ -39,6 +39,14 @@ export interface Reset {
  */
 export interface Stall {
 	type: "stall";
+}
+
+/**
+ * The publisher declared the timeline finished: play out what is buffered, then silence rather than
+ * concealment (fallback path only; the shared path ends via Atomics).
+ */
+export interface End {
+	type: "end";
 }
 
 /**

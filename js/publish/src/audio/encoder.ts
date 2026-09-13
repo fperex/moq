@@ -159,6 +159,10 @@ export class Encoder {
 	// reconfiguring it would be a retry, so the rendition stays down for the life of this encoder.
 	#fatal = new Signal<Error | undefined>(undefined);
 
+	// Whether the last run declared where its timeline stopped, so the next frame has to declare
+	// the break that reopens it. See the endpoint written when encoding stops.
+	#paused = false;
+
 	#signals = new Effect();
 
 	constructor(name: string, props?: EncoderProps) {
@@ -369,6 +373,14 @@ export class Encoder {
 
 				const framer = createFramer(resolved, config.sampleRate);
 
+				// Where the audio written so far stops, so muting can say so on the wire. WebCodecs
+				// stamps a duration on the chunk it hands back; the configured frame is the
+				// fallback, which for a fixed-frame codec is its sample count.
+				const frameDuration =
+					resolved.frameDuration ??
+					Time.Micro.fromSecond((AAC_FRAME_SAMPLES / config.sampleRate) as Time.Second);
+				let end: Time.Micro | undefined;
+
 				const encoder = new AudioEncoder({
 					output: (frame, metadata) => {
 						if (frame.type !== "key") {
@@ -382,12 +394,25 @@ export class Encoder {
 							bytes: stats.bytes + frame.byteLength,
 						}));
 
+						const producer = track.peek();
+						if (!producer) return;
+
+						if (this.#paused) {
+							// The last run declared where the timeline stopped, which trims
+							// everything past it. Declare the break so a subscriber that heard the
+							// endpoint flushes what it holds and re-anchors on this frame.
+							producer.appendGroup().close();
+							this.#paused = false;
+						}
+
 						// Each audio frame is its own group so the relay can forward it without
 						// waiting for a group boundary. Loss is handled by the codec's PLC.
-						track.peek()?.writeFrame({
+						producer.writeFrame({
 							payload: Container.Legacy.encodeFrame(frame, frame.timestamp as Time.Micro),
 							timestamp: Time.Timestamp.fromMicros(frame.timestamp as Time.Micro),
 						});
+
+						end = (frame.timestamp + (frame.duration ?? frameDuration)) as Time.Micro;
 					},
 					error: (err) => {
 						console.error("encoder error", err);
@@ -399,6 +424,24 @@ export class Encoder {
 				// A fatal error already closed the codec, and closing it twice throws.
 				effect.cleanup(() => {
 					if (encoder.state !== "closed") encoder.close();
+
+					// Muting stops the encoder without closing the track, and a subscriber has no
+					// way to tell audio that stopped from audio that is late: it conceals the gap,
+					// and keeps concealing. Say where the timeline stops instead, with the empty
+					// frame hang already defines as an endpoint. Closing discards whatever the
+					// codec still held, so the last chunk that reached the output callback is
+					// where it really stops. A reconfigure keeps encoding, so it declares nothing.
+					if (end === undefined || this.in.enabled.peek()) return;
+					const producer = track.peek();
+					if (!producer) return;
+
+					producer.writeFrame({
+						payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
+						timestamp: Time.Timestamp.fromMicros(end),
+					});
+					// An endpoint trims everything past it, so the run that resumes has to declare
+					// a break before its first frame.
+					this.#paused = true;
 				});
 
 				console.debug("encoding audio", encoderConfig);
