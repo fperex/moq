@@ -19,9 +19,16 @@ The matrix is codec x jitter profile x ring path: 24 rows, about 30 minutes at t
 seconds a row. `--profiles`, `--rings`, and `--codecs` take comma-separated lists; `--seed` replays
 a given impairment; `--duration` shortens a row.
 
-**Budgets are recorded, not enforced.** `budgets.json` holds what this machine measured, not what the
-player is required to achieve, and `grade.ts` prints the table and exits zero unless `--enforce` is
-passed.
+`grade.ts` prints the table and exits zero unless `--enforce` is passed, which the nightly job does.
+Every row still marked `recorded` in `budgets.json` is what a machine measured rather than what the
+player is required to achieve, so a ceiling comes down as the work lands and never goes up without a
+reason in review. A row with no budget at all fails under `--enforce` rather than passing quietly.
+
+The nightly `audio-quality` job runs the Chromium lane and keeps the run directory of a failure for a
+week: each process's log, the shaper's counters, the raw ndjson, the per-row summaries, and a
+Playwright trace of the page that failed. It is nightly rather than a merge gate because it is half
+an hour of real-time playback and every number in it is a timing one, which moves with whatever else
+the runner is doing.
 
 `--runtime` picks which of three lanes runs, and each measures a different thing:
 
