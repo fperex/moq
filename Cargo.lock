@@ -4313,6 +4313,7 @@ dependencies = [
  "rand 0.10.2",
  "ringbuf",
  "rubato",
+ "serde_json",
  "sonora",
  "symphonia-codec-aac",
  "symphonia-core",
