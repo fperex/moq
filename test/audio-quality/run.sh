@@ -131,6 +131,24 @@ for p in "${PROFILES[@]}"; do valid "$p" profile "${ALL_PROFILES[@]}"; done
 for r in "${RINGS[@]}"; do valid "$r" ring "${ALL_RINGS[@]}"; done
 for c in "${CODECS[@]}"; do valid "$c" codec "${ALL_CODECS[@]}"; done
 
+# `step` exists to move the path part-way through a run, so a run that ends before the step measures
+# a steady profile under the step's name and passes on numbers that mean something else. Refuse it
+# rather than record it. The step time comes from the profile itself, so shortening it there is
+# enough; there is no second copy here to forget.
+STEP_AT=$(sed -n 's/^at = "\([0-9]*\)s"/\1/p' "$WORKSPACE/rs/moq-shaper/profiles/step.toml" | head -1)
+for p in "${PROFILES[@]}"; do
+    [[ "$p" == step ]] || continue
+    if [[ -z "$STEP_AT" ]]; then
+        echo "error: could not read the step time from rs/moq-shaper/profiles/step.toml" >&2
+        exit 2
+    fi
+    if (($(printf '%.0f' "$DURATION") <= STEP_AT)); then
+        echo "error: --duration $DURATION never reaches the step profile's change at ${STEP_AT}s;" >&2
+        echo "       run it longer, or drop 'step' from --profiles" >&2
+        exit 2
+    fi
+done
+
 # The codec's sample rate is part of the row key, because it moves the expected floor as much as the
 # profile does: a 44.1kHz stream's frames do not land on the 48kHz render quantum.
 rate_of() {

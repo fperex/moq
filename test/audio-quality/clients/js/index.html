@@ -3,6 +3,26 @@
   <head>
     <meta charset="utf-8" />
     <title>moq audio quality</title>
+    <script>
+      // Deny the WebSocket fallback, so the session has nowhere to go but QUIC.
+      //
+      // `@moq/net` gives WebTransport a 500ms head start and then races a WebSocket against it. Here
+      // only the UDP path is impaired and the TCP passthrough is clean by design, so on any profile
+      // that slows the QUIC handshake past that head start the WebSocket wins: measured on `bursty`,
+      // every row fell back. That is the race working as written, and it is also the one outcome this
+      // page must never measure, since a TCP session never touches the shaper at all.
+      //
+      // Removing the constructors makes the fallback reject immediately and leaves WebTransport to
+      // finish in its own time, however long the profile makes that take. It runs here, in a classic
+      // script before the module, because by the time the module's imports have been evaluated the
+      // element has already started connecting. The driver's transport check stays as the backstop:
+      // if a row still reports websocket after this, it is wrong rather than merely slow.
+      //
+      // Both names, because qmux prefers `WebSocketStream` where the browser has it and only falls
+      // back to `WebSocket`. Removing one and not the other looks like it works and changes nothing.
+      delete window.WebSocketStream;
+      delete window.WebSocket;
+    </script>
   </head>
   <body>
     <script type="module" src="/src/page.ts"></script>

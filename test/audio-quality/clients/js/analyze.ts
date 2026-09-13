@@ -240,14 +240,19 @@ for (let i = SKIP_WINDOW; i < lags.length - SKIP_WINDOW; i++) {
 
 // The ring's own underrun counter is cumulative, and it is the authoritative count: it sees every
 // partly-filled quantum, including the ones that begin and end between two 250 ms samples.
+//
+// A build that does not publish it at all reports null, not zero. The difference matters most in
+// exactly the comparison this harness exists for: a baseline without the counter would otherwise
+// show a perfect zero next to the branch's real number and read as a regression.
 const underrunCounts = window.map((s) => s.underruns);
-let underruns = 0;
-for (let i = 1; i < underrunCounts.length; i++) {
+const hasCounter = underrunCounts.some((c) => typeof c === "number");
+let underruns: number | null = hasCounter ? 0 : null;
+for (let i = 1; hasCounter && i < underrunCounts.length; i++) {
 	const prev = underrunCounts[i - 1];
 	const cur = underrunCounts[i];
 	if (typeof prev !== "number" || typeof cur !== "number") continue;
 	// Sum positive deltas only: a rebuilt ring restarts the counter.
-	underruns += Math.max(0, cur - prev);
+	underruns = (underruns ?? 0) + Math.max(0, cur - prev);
 }
 
 // An episode is a maximal run of consecutive samples in which that counter was still rising: one
@@ -259,7 +264,7 @@ for (let i = 1; i < underrunCounts.length; i++) {
 // counter; the fallback is what lets an older one still produce a number rather than a zero.
 const episodes: number[] = [];
 let openEpisode: { at: number } | undefined;
-const hasCounter = underrunCounts.some((c) => typeof c === "number");
+if (!hasCounter) notes.push("underruns: this build publishes no counter; episodes are the coarser playhead plateaus");
 for (let i = 1; i < window.length; i++) {
 	const prev = window[i - 1];
 	const cur = window[i];
@@ -421,7 +426,7 @@ const rate = environment?.catalogRate ?? row.rate;
 /** Every key a budget may name. A metric this lane cannot measure is null, never zero. */
 const metrics: Record<string, number | null> = {
 	underruns_total: underruns,
-	underruns_per_min: round1(underruns / minutes),
+	underruns_per_min: underruns === null ? null : round1(underruns / minutes),
 	underrun_episodes_total: episodes.length,
 	underrun_episodes_per_min: round1(episodes.length / minutes),
 	underrun_episodes_p50: round1(episodeStats.p50),
