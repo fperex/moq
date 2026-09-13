@@ -6,7 +6,8 @@ to be merged as a unit. It exists so the work is readable and measurable, and so
 slices you want.
 
 Branch: [`fperex/moq` `debug-findings-solution`](https://github.com/fperex/moq/tree/debug-findings-solution),
-based on `upstream/dev` at `246a4733f`, tip `<final-hash>`. 49 commits.
+based on `upstream/dev` at `246a4733f`, read at the branch tip (the docs commits sit on top of the
+last code commit, `b31eb9552`). 49 commits.
 Full write-up:
 [`debug-findings/REPORT.md`](https://github.com/fperex/moq/blob/debug-findings-solution/debug-findings/REPORT.md).
 
@@ -49,7 +50,7 @@ intact; everything in them except the estimator is kept.
 | [`qa-failure-artifacts.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/qa-failure-artifacts.md) | `f4c9da0b2` |
 | re-landed narrow fixes, each with a failing-then-passing test | `42fefae05`, `6bc60d12e`, `ddda15ab2`, `23d310dcd`, `0f775995d` |
 | the shaper defect found while re-measuring | `492781763` |
-| review, flake and delivery | `2ecf1c1a1`, `dececbf81`, `393ff294d`, `<final-hash>` |
+| review, flake and delivery | `2ecf1c1a1`, `dececbf81`, `393ff294d`, `067fa459c`, plus this one |
 
 If you only read seven: `bdf4f64e0`, `c97496853`, `4a6680c7d`, `4383a2e09`, `6f3bd3e3c`,
 `c0a3deddf`, `dfd568613`. The native half is the same algorithm again. The harness stands alone and
@@ -260,6 +261,5 @@ run rather than a pitch period and its expand emits quiet noise rather than conc
 the port it looks like. The harness upstreams my own earlier `debug/rt-audio` work and the
 `rt-audio-traces-2026-09-06` traces, with attribution in `test/audio-quality/README.md`.
 
-Happy to split any of this into real PRs in whatever order and shape you want, or to drop the parts
-you disagree with. The estimator plus the ring work is the smallest thing that makes the public
-player play clean, and the harness is the part that keeps it that way.
+No pull request is coming from this side. Cherry-pick any slice in any order, and if a slice should
+be reshaped first, say which.
