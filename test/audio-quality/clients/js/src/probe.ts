@@ -147,7 +147,10 @@ export function probe(watch: MoqWatch): Probe {
 
 		// `buffered` is a list of ranges, not a depth. What the grader wants is how much audio is
 		// ready to play, so the ranges are summed; a gap in the middle is not playable time.
-		const ranges = maybe(() => audio.buffered.peek()) ?? [];
+		// A build whose `buffered` is not a range list reads as nothing buffered rather than throwing
+		// out of the sample: this probe is pointed at whatever build the page happens to be running.
+		const peeked = maybe(() => audio.buffered.peek());
+		const ranges = Array.isArray(peeked) ? peeked : [];
 		const buffered = ranges.reduce((total, range) => total + (Number(range.end) - Number(range.start)), 0);
 
 		return {

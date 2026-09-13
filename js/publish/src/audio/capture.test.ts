@@ -94,24 +94,27 @@ test("does not construct an AudioWorkletNode when torn down mid worklet load", a
 	using webaudio = installFakeWebAudio();
 	const error = spyOn(console, "error").mockImplementation(() => {});
 
-	const capture = new Capture({
-		enabled: true,
-		source: new Signal(fakeSource()) as never,
-	});
+	try {
+		const capture = new Capture({
+			enabled: true,
+			source: new Signal(fakeSource()) as never,
+		});
 
-	// Let the capture spawn its task and park it on the pending addModule race.
-	await settle();
+		// Let the capture spawn its task and park it on the pending addModule race.
+		await settle();
 
-	// Tear the run down before the module finishes loading. cleanup() calls context.close(), which on
-	// Firefox/Safari leaves .state === "suspended", then effect.cancel wins the race.
-	capture.close();
-	await settle();
+		// Tear the run down before the module finishes loading. cleanup() calls context.close(), which on
+		// Firefox/Safari leaves .state === "suspended", then effect.cancel wins the race.
+		capture.close();
+		await settle();
 
-	expect(webaudio.audioWorkletNodes).toBe(0);
-	expect(error).not.toHaveBeenCalled();
-	// Left installed, this spy outlives the file: `spyOn` returns it to every later suite that
-	// spies on console.error, call log and all.
-	error.mockRestore();
+		expect(webaudio.audioWorkletNodes).toBe(0);
+		expect(error).not.toHaveBeenCalled();
+	} finally {
+		// Left installed, this spy outlives the file: `spyOn` returns it to every later suite that
+		// spies on console.error, call log and all.
+		error.mockRestore();
+	}
 });
 
 // Regression: a Bluetooth mic on macOS reports 44100 after an A2DP flip. Capturing at that rate means

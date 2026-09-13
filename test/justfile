@@ -135,10 +135,12 @@ ts-eit *args:
 # where the playout delay settled. The matrix is codec x jitter profile x ring
 # path, and a budget is keyed by the whole row. A row whose shaper treated
 # nothing, whose transport fell back to WebSocket, or whose document was not
-# isolated the way the row asked for is void rather than passed. Flags:
-# `--profiles --rings --codecs --duration --seed --out --list --enforce`. Budgets
-# print either way and only fail the run under `--enforce`. See
-# audio-quality/README.md.
+# isolated the way the row asked for is void rather than passed. `--runtime`
+# picks the lane: `chromium` (the matrix above), `safari` (real Safari through
+# safaridriver, local only), or `replay` (the recorded traces on a simulated
+# clock, in a second). Flags: `--runtime --profiles --rings --codecs --duration
+# --seed --out --list --enforce`. Budgets print either way and only fail the run
+# under `--enforce`. See audio-quality/README.md.
 
 # Browser audio playout quality over an impaired path.
 audio-quality *args:

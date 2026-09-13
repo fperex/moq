@@ -252,6 +252,14 @@ finish() {
     exit "$status"
 }
 
+# Refused up front rather than half an hour later: the run directory is copied over `--out` file by
+# file, so a directory holding an earlier run would come out a mixture of the two, with every row
+# this invocation did not cover still reading as a result.
+if [[ $LIST -eq 0 && -n "$OUT" && -d "$OUT" ]] && [[ -n "$(ls -A "$OUT" 2>/dev/null)" ]]; then
+    echo "error: --out $OUT is not empty; remove it or name a new directory" >&2
+    exit 2
+fi
+
 # ── replay ──────────────────────────────────────────────────────────────────
 # No relay, no shaper, no browser, no clock: the recordings go straight through the real estimator,
 # the real rings, and the real playout engine on a simulated clock. `replay.ts` owns the row keys,
