@@ -46,6 +46,20 @@ The publisher stays on the clean path deliberately. Impairing the ingest too wou
 receiver on a stream that was already damaged before it was published, and the publisher's own flush
 span is a separate stage of the ledger.
 
+### Why the page denies the WebSocket fallback
+
+`@moq/net` gives WebTransport a 500 ms head start and then races a WebSocket against it. Here only
+the UDP path is impaired and the TCP passthrough is clean by design, so on any profile that slows
+the QUIC handshake past that head start the WebSocket wins: measured on `bursty`, every row fell
+back, and the shaper saw seven datagrams for the whole run. That is the race working exactly as
+written, and it is also the one outcome this harness must never measure.
+
+So `index.html` removes `WebSocketStream` and `WebSocket` in a classic script before the module
+loads. Both names, because qmux prefers `WebSocketStream` where the browser has it: removing one and
+not the other looks like it works and changes nothing. With the fallback gone the same `bursty` row
+runs on WebTransport, the shaper reports 990 datagrams up and 6267 down, and the resolved target
+rises from 100 ms to 440 ms, which is the impairment the row exists to measure.
+
 ## The metric schema
 
 [`clients/js/src/schema.ts`](clients/js/src/schema.ts) is the contract, not a description of one.
@@ -134,7 +148,7 @@ passed would be worse than failing it.
 | Void | Why |
 | --- | --- |
 | `shaper` | An active profile's `delayed` counter is zero, so the impairment never applied and an impaired run became an unimpaired pass. `near-zero` and `fixed-250` are exempt: zero is the right answer for the control. |
-| `transport` | The session negotiated something other than WebTransport. A WebSocket fallback is TCP and never touches the UDP shaper. |
+| `transport` | The session negotiated something other than WebTransport. A WebSocket fallback is TCP and never touches the UDP shaper. The page denies the fallback outright (below), so this is a backstop rather than the usual outcome. |
 | `ring` | The document's `crossOriginIsolated` does not match the ring the row asked for, so the other ring ran. |
 | `clock` | `AudioContext.currentTime` drifted more than 1% from wall time over the first ten seconds, or was never readable. |
 | `window` | No samples survived the warmup. |

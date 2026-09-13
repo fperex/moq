@@ -73,6 +73,7 @@ setInterval(() => {
 		{
 			tag,
 			delay,
+			webSocket: typeof (globalThis as unknown as { WebSocket?: unknown }).WebSocket,
 			crossOriginIsolated: globalThis.crossOriginIsolated === true,
 			transport: environment?.transport,
 			timestamp: watch.audio.out.timestamp.peek(),
