@@ -7,7 +7,7 @@ slices you want.
 
 Branch: [`fperex/moq` `debug-findings-solution`](https://github.com/fperex/moq/tree/debug-findings-solution),
 based on `upstream/dev` at `246a4733f`, read at the branch tip (the docs commits sit on top of the
-last code commit, `b31eb9552`). 49 commits.
+last code commit, `5dacdd1b3`). 53 commits.
 Full write-up:
 [`debug-findings/REPORT.md`](https://github.com/fperex/moq/blob/debug-findings-solution/debug-findings/REPORT.md).
 
@@ -232,6 +232,23 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
   What the A/V clock quest changed is that video now follows the playhead, so the collapse shows up
   as a stalled picture rather than only late audio. Worst painted-video-minus-audio skew over the
   reported sequence went from 3418 ms to 50 ms, and the run's underruns from 6 to 0.
+- **Publisher mute played as concealment, then room noise, for as long as the mute lasted.** Found by
+  a listener on `publish.html` with a real microphone: mute it and the watcher keeps making sound.
+  Two halves. On the wire a mute is invisible: the encoder stops and nothing says whether the next
+  frame is late or never coming, so a capture across a 10 s mute shows group 590 at 14.81 s and then
+  group 591 at 24.86 s, sequence contiguous, ten seconds of presentation simply absent. The only
+  thing that eventually stops playback is the rendition leaving the catalog, which is a different
+  track on its own schedule. And in the reader, my concealment had no end: I deviated from the pinned
+  Chromium tree on purpose and faded into the estimated background rather than to zero. That was
+  wrong. Current WebRTC does end in digital silence: `Expand::Process` pins `mute_factor` to zero
+  past the third consecutive expansion, and `GenerateBackgroundNoise` ignores the slope and the
+  `TooManyExpands()` it is handed and never unmutes its own factor, which `Reset` leaves at 0. On a
+  file the estimated background is the digital floor and the difference is inaudible; on a microphone
+  it is the room. Both halves fixed: concealment fades to silence in both engines, and a muted
+  publisher writes hang's empty-frame audio endpoint and a break before the frame that resumes, which
+  the watcher renders as silence with no concealment and no underrun. Over a 12 s pause on a real
+  mic, RMS p50 went from 2.2e-4 to 0, reaching digital silence 0.2 s in and staying there, largest
+  sample step 9.2e-5, audio back in the first 100 ms bucket after the resume.
 - **`demo/web` pinned `delay="100ms"` on every tile.** That is the "100 ms chip on a fresh session"
   from `watch.md`. No stored preference, nothing restoring anything. Fixed in `0d06ca4e8`.
 - **`ui/components/buffer-control.ts` sets a numeric delay on mousedown**, so a single click on the
@@ -263,7 +280,10 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
 
 ### Public API and wire impact
 
-**No wire change.** All of the below is `dev` material.
+**No wire format change.** One semantics addition: an audio endpoint bounds the source, not the
+track, so a publisher that pauses declares one and declares a discontinuity before the frame that
+resumes. The draft and `doc/concept/hang.md` say so; the bytes are the empty frame and the empty
+group both already define. All of the below is `dev` material.
 
 - `@moq/net`: new `Expired extends StreamError` on `DELIVERY_TIMEOUT`, re-exported beside `Lagged`.
 - `@moq/hang`: `Container.Jitter` is a class now (with `BUCKET` and `CEILING` as statics), plus
@@ -271,7 +291,8 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
 - `@moq/watch`: `SyncInput` reduced to `{delay, buffer}`; new `Sync.track()`, `Sync.out.clock`, and
   the `Clock` / `SyncTrack` / `SyncClockTrack` exports; `Audio.Decoder.out` gains `spread`,
   `underruns`, `skipped`, `debug`; `Video.Decoder.out` gains `skipped`; new `DecoderInput.conceal`
-  and the `<moq-watch conceal>` attribute.
+  and the `<moq-watch conceal>` attribute. Internal to the ring, not exported: `AudioBuffer.end()`,
+  `RingView.ended`, and an `ENDED` control slot that takes the shared ring from 18 to 19.
 - `rs/moq-audio`: `decode::Config::{delay, conceal, DELAY_MAX}` on a `#[non_exhaustive]` struct, and
   `Consumer::{delay, playhead}`.
 - `moq play --delay` becomes a floor capped at 2 s rather than the delay capped at 10 s. That is the

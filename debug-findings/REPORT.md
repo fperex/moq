@@ -2,7 +2,7 @@
 
 Branch: `fperex/moq` `debug-findings-solution`, based on `upstream/dev` (`246a4733f`).
 This report sits at the branch tip (the docs commits sit on top of the last code commit,
-`b31eb9552`). 49 commits, 144 files, +29760/-682.
+`5dacdd1b3`). 53 commits, 146 files.
 
 ## Summary
 
@@ -16,6 +16,10 @@ This report sits at the branch tip (the docs commits sit on top of the last code
 8. `rs/moq-audio` gets the same engine, so `moq play` has a jitter buffer for the first time.
 9. `test/audio-quality` measures all of it over a seeded impaired path, in Chromium, in real Safari, and against the recorded traces on a simulated clock, and grades it nightly.
 10. On the public relay at auto, over 120 s: 36 underruns before the engine, 1 after.
+11. A user then muted a real microphone and kept hearing the room. Concealment had no end: it faded
+    into the measured background level and stayed there. It now ends in silence, as current WebRTC
+    does, and a muted publisher says on the wire that its timeline paused instead of leaving the
+    watcher to guess. See finding 10.
 
 No PR is intended. This is a proof of concept the maintainer can adopt one commit at a time.
 
@@ -75,9 +79,17 @@ with their author intact.
 | 46 | `393ff294d` | delivery | This report and the issue comment |
 | 47 | `492781763` | shaper defect | Jitter varies the delay without reordering datagrams |
 | 48 | `b31eb9552` | harness | The budgets re-recorded and enforced on the fixed shaper |
-| 49 | `067fa459c` | delivery | This report, filled in with the enforced budgets |
+| 49 | `067fa459c`, `6a9ea6ac0` | delivery | This report, filled in with the enforced budgets |
 | 50 | `8ea218165` | `m1/plan-av-clock.md`, user report | A hole in the source reaches the decoder, and a ring nothing is draining is flushed |
-| 51 | this one | delivery | This report and the issue comment, with the A/V desync fix |
+| 51 | `f8ce3e6b1` | delivery | This report and the issue comment, with the A/V desync fix |
+| 52 | `a5280e11c` | mic hold (user report) | Both rings hold one chunk above the playout target |
+| 53 | `f9b50db59` | mic hold (user report) | The same one-frame hold in the native engine |
+| 54 | `ac9f13cbb` | harness | The real-microphone traces replayed and graded |
+| 55 | `2c50b3abd` | delivery | This report and the issue comment, with the one-frame hold finding |
+| 56 | `b3f0c219d` | mute (user report) | A long outage ends in silence, not comfort noise |
+| 57 | `ed9318afa` | mute (user report) | A muted audio track declares its endpoint, both ends |
+| 58 | `5dacdd1b3` | mute (user report) | The same silence in the native engine |
+| 59 | this one | delivery | This report and the issue comment, with the mute finding |
 
 Suggested reading order for review: 3, 4, 9 to 11, 21, 22, 31. Those seven are the fix. The native
 half (7, 16 to 20) is the same algorithm again and can be read second or skipped entirely. The
@@ -348,9 +360,11 @@ measured one rather than an output frame count a stretch has moved.
 
 When the ring runs dry mid-playback the reader carries the audio on instead of ramping to silence:
 the pitch period of the last real audio, repeated with a voiced and unvoiced mix set by how periodic
-the signal was, fading toward a noise floor measured from the stream itself, giving up after two
-seconds. When the media comes back it is aligned against the concealment and crossfaded in. That is
-NetEq's expand and merge. A hole that reaches the playhead with nothing behind it is no longer queued
+the signal was, muted block by block under NetEq's muting slope until it is digital silence, and
+giving up entirely after two seconds. When the media comes back it is aligned against the
+concealment and crossfaded in. That is NetEq's expand and merge. (An earlier commit on this branch
+faded the tail into the measured room tone instead of to silence; finding 10 is why it no longer
+does.) A hole that reaches the playhead with nothing behind it is no longer queued
 as silence by the ring either: playing it would make a listener wait for the same missing audio
 twice, once while the reader covers for it and again when the zeros arrive.
 
@@ -802,16 +816,20 @@ Things found while working that are separate from the fix.
 1. **`demo/web` pinned `delay="100ms"` on every tile.** That is the "100 ms chip on a fresh session"
    from `watch.md`. Nothing was restoring anything, and no storage was involved. Fixed in
    `0d06ca4e8`.
+
 2. **`ui/components/buffer-control.ts` sets a numeric delay on mousedown.** A single click on the bar
    therefore leaves auto without the user asking for a value. Not changed here; it is a UI decision.
+
 3. **The released `latency` attribute falls back to a silent 100 ms** for an unparseable value, where
    its `delay` sibling warns and falls back to the element default. Made consistent in `c97496853`.
+
 4. **`js/net` races a WebSocket against WebTransport after a 500 ms head start.** Any path that slows
    the QUIC handshake past that head start silently falls back to TCP. On the harness's `bursty`
    profile the shaper saw seven datagrams for a whole run, and the row measured a TCP session that
    never touched it. The harness works around it by deleting both `WebSocket` and `WebSocketStream`
    on the page before the module loads, which is a test hack. The real fix is an option on
    `Connection`, and it is not in this branch.
+
 5. **`rs/moq-relay/tests/drills.rs` compiles zero tests today.** It is gated
    `#![cfg(all(feature = "quinn", feature = "websocket"))]`, and `quinn` is not in `moq-relay`'s
    default feature set, so `just test drill` runs nothing. It also still says `use moq_native::...`,
@@ -819,11 +837,14 @@ Things found while working that are separate from the fix.
    not compile even with the feature on (34 API-rot errors when measured in session). A patch adding
    the shaper's impaired second lane, which `transport-impairment-profile.md` asks for, is written
    and was deliberately not landed on top of a test file that does not build.
+
 6. **Safari takes the WebSocket path**, so the shaper does not apply to it and the Safari lane grades
    an unimpaired path. The lane records `shaper: none` rather than labelling an unimpaired run
    `bursty`.
+
 7. **`conceal` needed an element attribute** to be settable from a page before connect, so
    `<moq-watch conceal>` exists (`a472947be`). It is the only new attribute.
+
 8. **The shaper's own jitter was reordering datagrams, and it was grading the wrong thing.** Each
    datagram drew its release time as `now + delay + jitter * gaussian`, independently of every other
    one, so on any profile with non-zero jitter a later datagram was routinely released before an
@@ -845,6 +866,7 @@ Things found while working that are separate from the fix.
    stopped reordering. Whether one track's spread should be allowed to size another track's buffer is
    a real question for the maintainer, separately from the shaper defect; this branch keeps the
    `max()` across tracks that #3517 had.
+
 9. **The harness has to address the shaper by `127.0.0.1`, not by `localhost`.** Chromium resolves
    `localhost` to `::1` first, and `moq-shaper` binds IPv4. With the WebSocket fallback still in the
    page that produces a silent fallback to TCP straight past the shaper, which the production page
@@ -854,9 +876,70 @@ Things found while working that are separate from the fix.
    WebSocket against WebTransport turns a name-resolution mismatch into a working but unimpaired
    session, and there is no option on `Connection` to refuse that.
 
+10. **Publisher mute played as concealment, then room noise, for as long as the mute lasted.** A user
+    published from a real microphone, muted it, and the watcher carried on making sound. Two
+    mechanisms, one on each side.
+
+    On the wire, a mute is invisible. The publish element's `muted` turns the audio encoder off, the
+    frames stop, and nothing says whether the next one is late or never coming. A capture of the
+    audio track across a 10 s mute, taken from the watcher's own connection, carried no marker of
+    any kind: group 590 at 14.81 s, then group 591 at 24.86 s, contiguous sequence, ten seconds of
+    presentation missing. The only thing that eventually stopped playback was the rendition leaving
+    the catalog, which is a different track, arrives on its own schedule, and on a loaded or remote
+    relay can lag the audio it describes by a lot.
+
+    In the reader, concealment had no end. Commit 31 deviated from the pinned Chromium tree on
+    purpose and faded the concealment into the background level rather than to zero, on the reading
+    that ending an outage in digital silence was a regression. It is not: current WebRTC does end
+    there. `Expand::Process` scales each block by `mute_factor`, lowers it by the muting slope, and
+    pins it to zero outright past the third consecutive expansion, and
+    `BackgroundNoise::GenerateBackgroundNoise` ignores both the slope and the `TooManyExpands()` it
+    is handed and never raises its own mute factor, which `ChannelParameters::Reset` leaves at 0. On
+    a file or a tone the difference is inaudible, because the estimated background is the digital
+    floor. On a microphone it is the room, and the listener hears it forever.
+
+    Both are fixed. Concealment now fades to silence and the ceiling is silence, in both engines.
+    The publisher writes the empty frame hang already defines as an audio endpoint when muting stops
+    the encoder, and declares a break before the first frame when it resumes; the watcher carries
+    the endpoint to the ring, which renders silence with no concealment, no underrun, and hands the
+    clock to wall time at once.
+
+    Measured on this worktree's `demo/web`, headed Chromium, the real microphone, the local relay,
+    the shared-memory ring, 12 s of speech then 12 s paused then 12 s of speech. The pause is the
+    capture graph suspended rather than the element muted, so the subscription outlives it and the
+    engine's own behaviour is what is being measured:
+
+    | Ring | | RMS p50 over the pause | peak | first silent 100 ms bucket | silent from then on |
+    | --- | --- | ---: | ---: | ---: | ---: |
+    | shared | before | 2.2e-4 | 1.6e-3 | never, over 12 s | no |
+    | shared | after | 0 | 4.3e-4 | 0.2 s | yes |
+    | postMessage | before | 3.1e-5 | 1.2e-4 | never, over 12 s | no |
+    | postMessage | after | 0 | 6.1e-5 | 0.2 s | yes |
+
+    The postMessage pair ran in a quieter room, and it shows the mechanism plainly: over that pause
+    the before run's RMS *rose*, from 1.9e-5 while real audio was playing to 3.1e-5 once concealment
+    took over, because the comfort noise it settled on was louder than the room the microphone was
+    actually sending.
+
+    The largest sample-to-sample step anywhere in the pause is 9.2e-5, so it fades rather than cuts,
+    and audio is back in the first 100 ms bucket after the resume. The engine still conceals the
+    outage (`concealed` grows by 11.4 s of samples in both runs, since nothing declared it): what
+    changed is where the concealment ends up. Both rings were measured, because the shared one is
+    what a cross-origin isolated page gets and the postMessage one is what production serves.
+
+    With the element's own mute, and so the endpoint, the local relay delivers the catalog update
+    within ~100 ms and `<moq-watch>` tears the whole audio graph down when the rendition leaves the
+    catalog, which is faster than the probe's resolution. What the run does show is the counter:
+    `audio.out.debug.concealed` over the same sequence went from 46,244 samples before to 0 after.
+    The endpoint's own path is covered by unit tests on both rings instead.
+
 ## Public API and wire impact
 
-No wire change anywhere. All of the below is `dev` material.
+No wire format change anywhere. One wire *semantics* addition: an audio endpoint bounds the source
+media rather than the track, so a publisher that pauses declares one and declares a discontinuity
+before the frame that resumes. `drafts/draft-lcurley-moq-hang.md` and `doc/concept/hang.md` say so;
+the bytes are the empty frame and the empty group that both already define. All of the below is
+`dev` material.
 
 **`@moq/net`**
 
@@ -880,6 +963,13 @@ No wire change anywhere. All of the below is `dev` material.
 - `Video.Decoder.out` gains `skipped`.
 - `DecoderInput.conceal` is new, with the element attribute `<moq-watch conceal>`.
 - `audioMaxAge` and `maxAgeHeadroom` are new in the audio config module.
+- Internal to the audio ring, not exported: `AudioBuffer.end()` on both transports, `RingView.ended`
+  on the reader surface, and an `ENDED` control slot, which takes the shared ring from 18 to 19.
+
+**`@moq/publish`**
+
+- No API change. `Audio.Encoder` writes an endpoint when it stops encoding and a break when it
+  resumes, which is behaviour rather than surface.
 
 **`rs/moq-audio`**
 
