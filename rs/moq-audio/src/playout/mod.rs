@@ -31,13 +31,17 @@
 //! | [`level`] smoothed buffer level | `buffer_level_filter.cc` | here |
 //! | [`sync`] committed-but-unplayed PCM | `sync_buffer.cc` | here |
 //! | [`delay`] target estimator and constraints | `delay_manager.cc`, `underrun_optimizer.cc`, `delay_constraints.cc` | here, to `doc/concept/playout.md` |
-//! | frame buffer and flushing | `packet_buffer.cc` | next |
-//! | per-block decision loop | `decision_logic.cc` | next |
-//! | engine and its wiring into `decode` / `playback` | `neteq_impl.cc` | next |
+//! | [`buffer`] frame buffer and flushing | `packet_buffer.cc` | here |
+//! | [`decision`] per-block decision loop | `decision_logic.cc` | here |
+//! | [`engine`] the loop that runs them all | `neteq_impl.cc` | here |
+//! | wiring into `decode` / `playback` | `neteq_impl.cc` | next |
 
 use std::time::Duration;
 
+pub(crate) mod buffer;
+pub(crate) mod decision;
 pub(crate) mod delay;
+pub(crate) mod engine;
 pub(crate) mod expand;
 pub(crate) mod level;
 pub(crate) mod merge;
@@ -81,6 +85,11 @@ pub(crate) const CORRELATION_FAST: f32 = 0.5;
 /// How far above the background a block must sit to count as speech. Below it the
 /// correlation is meaningless and a splice is inaudible, so it is always allowed.
 pub(crate) const PASSIVE_GATE: f32 = 8.0;
+
+/// The most one run of time stretches can move the playhead, and so the headroom
+/// every buffer above the engine needs: the deepest single splice, once per cooldown
+/// interval, over the estimator's own resample interval.
+pub(crate) const STRETCH_BOUND: Duration = Duration::from_millis(75);
 
 /// Concealment blocks produced back to back before the output is comfort noise and
 /// nothing else, so a dead stream does not repeat a pitch period forever.
