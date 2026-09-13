@@ -119,9 +119,10 @@ function createTile(name: string): WatchTile {
 	const watch = document.createElement("moq-watch") as MoqWatch;
 	watch.name = name;
 	watch.muted = true; // unmuted only while active (see below)
-	// Default to a fixed 100ms jitter buffer (instead of adaptive "auto") so
-	// the delay visualization has something to show. Drag it in the panel.
-	watch.setAttribute("delay", "100ms");
+	// Adaptive, which is what a viewer gets by default. It used to be pinned at a fixed 100ms so
+	// the delay visualization had a value to draw; the measured target is a real value now, so the
+	// visualization shows what the estimator actually settles on. Drag it in the panel to override.
+	watch.setAttribute("delay", "auto");
 	const canvas = document.createElement("canvas");
 	canvas.style.cssText = "width: 100%; height: auto;";
 	watch.appendChild(canvas);
