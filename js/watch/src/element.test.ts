@@ -76,3 +76,26 @@ test("an unparseable legacy latency attribute falls back to the element's defaul
 	el.attributeChangedCallback("latency", "nonsense", "250");
 	expect(el.controls.delay.peek()).toBe(250);
 });
+
+test("the conceal attribute reaches the audio decoder, defaulting to on", () => {
+	const MoqWatch = require("./element").default as new () => {
+		attributeChangedCallback(name: string, old: string | null, value: string | null): void;
+		audio: { in: { conceal: { peek(): boolean } } };
+		conceal: boolean;
+	};
+	const el = new MoqWatch();
+
+	// Concealment is the player's default, so a page that never mentions it gets it.
+	expect(el.audio.in.conceal.peek()).toBe(true);
+
+	// Presence alone cannot say "off", which is why the boolean attributes take the explicit form.
+	el.attributeChangedCallback("conceal", null, "false");
+	expect(el.conceal).toBe(false);
+	expect(el.audio.in.conceal.peek()).toBe(false);
+
+	el.attributeChangedCallback("conceal", "false", "");
+	expect(el.audio.in.conceal.peek()).toBe(true);
+
+	el.conceal = false;
+	expect(el.audio.in.conceal.peek()).toBe(false);
+});
