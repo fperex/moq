@@ -230,8 +230,8 @@ const RINGS: Array<[string, (latencyMs: number) => Ring]> = [
 ];
 
 describe.each(RINGS)("%s ring replay", (_name, build) => {
-	// The target starts at the cold-start guess and falls one bucket per second, and a fall costs
-	// the ring the bucket it lands on. Counting starts once it has settled; the traces are 12s long.
+	// The target starts at the cold-start guess and falls once a second, and a fall costs the ring
+	// the bucket it lands on. Counting starts once it has settled; the traces are 12s long.
 	const WARMUP = 6000;
 
 	it("plays an evenly paced sender without underruns or skips", () => {

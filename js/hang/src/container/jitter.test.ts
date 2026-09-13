@@ -136,6 +136,64 @@ describe("reordering", () => {
 	});
 });
 
+describe("the receiver's own reading gap", () => {
+	it("does not read a blocked read loop as path delay", () => {
+		// A tune-in blocks the main thread on a decoder polyfill, a worklet start and the first
+		// keyframe. Nothing about the path changes: the frames land on time and queue, and the read
+		// loop stamps every one of them when it runs again. Measured against a reference from before
+		// the block the first one out of the queue reads as the whole block.
+		const jitter = new Jitter();
+		flush(jitter, { frames: 200, burst: 7 });
+
+		const settled = jitter.value.peek();
+		expect(settled).toBe(140 as Time.Milli);
+
+		const BLOCK = 1500;
+		const DRAIN = 3;
+		const blocked = 200 * FRAME;
+
+		let cursor = blocked + BLOCK;
+		let max = settled;
+		let recovered: number | undefined;
+
+		for (let i = 200; i < 1200; i++) {
+			const media = i * FRAME;
+
+			// Read at the later of when the frame landed and when the loop got to it.
+			const read = Math.max(media + 50, cursor);
+			cursor = read + DRAIN;
+			observe(jitter, media, read);
+
+			const value = jitter.value.peek();
+			max = Time.Milli.max(max, value);
+			if (recovered === undefined && value <= settled) recovered = read;
+		}
+
+		expect(max).toBeLessThanOrEqual((settled + 2 * Jitter.BUCKET) as Time.Milli);
+		expect(recovered).toBeLessThanOrEqual(blocked + BLOCK + 5000);
+	});
+
+	it("still measures a publisher slower than the resample interval", () => {
+		// One frame a second is idle for longer than the resample interval on every single arrival,
+		// so a rule that only looked at how long the loop was idle would throw the whole track away.
+		// What says the receiver was reading is that the timeline advanced as far as the wall clock
+		// did, which is true here and false for a backlog.
+		const jitter = new Jitter();
+
+		for (let i = 0; i < 10; i++) observe(jitter, i * 1000, i * 1000 + 50);
+		expect(jitter.value.peek()).toBeLessThanOrEqual(Jitter.BUCKET as Time.Milli);
+
+		// From here every other frame is 400ms late. The receiver was reading throughout: each
+		// arrival covers as much media as the wall clock moved, give or take the path's own jitter,
+		// which is the 400ms the buffer has to hold.
+		for (let i = 10; i < 60; i++) {
+			observe(jitter, i * 1000, i * 1000 + 50 + (i % 2 === 1 ? 400 : 0));
+		}
+
+		expect(jitter.value.peek()).toBeGreaterThanOrEqual(400 as Time.Milli);
+	});
+});
+
 describe("the histogram", () => {
 	it("drops an observation past its range instead of clamping it", () => {
 		const jitter = new Jitter();
@@ -228,7 +286,7 @@ describe("rise and fall", () => {
 		expect(jitter.value.peek()).toBe(140 as Time.Milli);
 	});
 
-	it("falls no faster than one bucket per second", () => {
+	it("falls no faster than one bucket per second while it is close", () => {
 		const jitter = new Jitter();
 		flush(jitter, { frames: 100, burst: 7 });
 
@@ -250,6 +308,39 @@ describe("rise and fall", () => {
 		}
 
 		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
+	});
+
+	it("closes a large overshoot without taking a second per bucket", () => {
+		// The path degrades 30ms a frame for a second, which the estimator reads as the delay it is,
+		// and then flushes what it queued. The quantile comes down in whole handfuls of buckets as
+		// the histogram forgets, and a fixed step cannot follow it: 1480ms at a bucket a second is
+		// 74 seconds, well past the 29 seconds the histogram remembers why it went up.
+		const jitter = new Jitter();
+		flush(jitter, { frames: 500 });
+
+		const degraded = 500 * FRAME;
+		for (let i = 0; i < 50; i++) {
+			const media = degraded + i * FRAME;
+			observe(jitter, media, media + 50 + i * 30);
+		}
+		expect(jitter.value.peek()).toBeGreaterThan(1000 as Time.Milli);
+
+		// The queue drains at 3ms a frame and the path is clean again from there.
+		const recovering = degraded + 50 * FRAME;
+		let cursor = recovering + 50 + 49 * 30;
+		let settled: number | undefined;
+
+		for (let i = 0; i < 4000; i++) {
+			const media = recovering + i * FRAME;
+			const read = Math.max(media + 50, cursor);
+			cursor = read + 3;
+			observe(jitter, media, read);
+
+			if (settled === undefined && jitter.value.peek() === Jitter.BUCKET) settled = read;
+		}
+
+		expect(settled).toBeDefined();
+		expect((settled as number) - recovering).toBeLessThan(45_000);
 	});
 });
 

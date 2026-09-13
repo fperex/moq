@@ -59,6 +59,7 @@ export type Corpus = {
 		start_ms: number;
 		max_catchup: number;
 		lower_interval_ms: number;
+		lower_divisor: number;
 	};
 	cases: Case[];
 };
@@ -74,6 +75,7 @@ const CONSTANTS: Corpus["constants"] = {
 	start_ms: 80,
 	max_catchup: 60,
 	lower_interval_ms: 1000,
+	lower_divisor: 6,
 };
 
 /** Replay one trace through the estimator and collect the target after each arrival. */
@@ -153,6 +155,21 @@ function shift(arrivals: Arrival[], ms: number): Arrival[] {
 	return arrivals.map((a) => ({ ...a, arrival_ms: grid(a.arrival_ms + ms) }));
 }
 
+// A receiver whose read loop stops for `stall` ms at `at`. The path is untouched: frames keep
+// landing on time, they just queue until the loop runs again and then come back out of it one every
+// `drain` ms, which is far faster than the media they carry.
+function stalled(arrivals: Arrival[], options: { at: number; stall: number; drain: number }): Arrival[] {
+	const { at, stall, drain } = options;
+	let cursor = at + stall;
+
+	return arrivals.map((a) => {
+		if (a.arrival_ms < at) return a;
+		const read = Math.max(a.arrival_ms, cursor);
+		cursor = read + drain;
+		return { ...a, arrival_ms: grid(read) };
+	});
+}
+
 function cases(): { name: string; description: string; arrivals: Arrival[] }[] {
 	return [
 		{
@@ -230,6 +247,16 @@ function cases(): { name: string; description: string; arrivals: Arrival[] }[] {
 				for (const a of paced({ frames: 500, base: 5, spread: 1, seed: 41, start: 14_580 })) arrivals.push(a);
 				return arrivals;
 			})(),
+		},
+		{
+			name: "tune-in-stall",
+			description:
+				"The receiver's own read loop blocks for 1500ms four seconds in, the way a tune-in blocks it on a decoder polyfill, a worklet start and the first keyframe. The path never changes: frames keep landing on time, queue, and come back out at 3.25ms each once the loop runs again. Against a reference from before the block the first of them reads as 1500ms of delay that belongs to the receiver, so the target has to stay where the path put it.",
+			arrivals: stalled(paced({ frames: 700, burst: 7, base: 50, spread: 1, seed: 73 }), {
+				at: 4000,
+				stall: 1500,
+				drain: 3.25,
+			}),
 		},
 		{
 			name: "pause-10s",

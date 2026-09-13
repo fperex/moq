@@ -108,6 +108,56 @@ Costing reordering explicitly as delay against loss, the way WebRTC's
 `ReorderOptimizer` does, is a later step. The target is the underrun estimate
 alone until then.
 
+## The receiver's own reading gap
+
+The arrival clock is sampled by the consumer's read loop. When that loop does
+not run, the time it spent not running lands in the next arrival it stamps, and
+the estimator has no way to tell that from the path being slow.
+
+So, for two consecutive admitted arrivals:
+
+```
+idle     = arrival(p) - arrival(prev)
+progress = timestamp(p) - timestamp(prev)
+if (idle > 500 && idle - progress > 500) {
+    // the receiver was not reading; drop the arrival reference
+    min.clear()
+}
+```
+
+The reference goes, the histogram and the newest timestamp stay. The first
+frame after the gap becomes the new reference, so the backlog behind it is
+measured against the path as the receiver can now see it rather than against a
+reference taken before the gap.
+
+Dropping the reference, rather than dropping the one arrival, is the point. A
+receiver that stops reading for 1500 ms comes back to a backlog, and it reads
+that backlog in a couple of hundred milliseconds. Every frame in it is that
+same 1500 ms late against a reference from before the gap, so skipping only the
+first would leave the second to set the same interval maximum.
+
+**The media term is what tells the receiver apart from the publisher.** A track
+that genuinely sends one frame a second is idle for longer than the resample
+interval on every single arrival. Its timeline advances as far as the wall clock
+does, so `idle - progress` stays at whatever the path's jitter is. A receiver
+that was not reading comes back to media it has to catch up on, so its idle time
+exceeds the media it covered by the length of the block. Without the media term
+a 1 fps track drops its reference on every arrival and reads every delay it ever
+measures as zero; the `sparse` corpus case is the one that catches that.
+
+**The threshold is the resample interval** because that is the unit the
+histogram is fed in. A gap shorter than one cannot be the whole of an
+observation, and what it can inject into the one it lands in is bounded by its
+own length.
+
+**A path that stalls and then bursts is indistinguishable from this** and is
+therefore also discounted. That is a deliberate false negative. The receiver
+cannot tell "nobody handed me anything" from "I was not asking", and the
+measurement it would keep is one it took while blind. A path that is genuinely
+getting worse shows up as a delay climbing across arrivals the receiver did
+read, which this rule does not touch, and the `slow-buildup` case holds that
+line.
+
 ## Max-over-interval resampling
 
 The histogram takes at most one observation per 500 ms: the largest delay seen
@@ -233,21 +283,47 @@ There is no rise limiter because there does not need to be one: the histogram's
 range caps the target at 2000 ms, and a single observation can only move the
 quantile by the mass one add carries.
 
-**Fall is one bucket per second**, and multi-step:
+**Fall is once a second**, by a sixth of the distance left or one bucket,
+whichever is more, and multi-step:
 
 ```
 steps = floor((now - lowered) / 1000)
 if (steps > 0) {
     lowered += steps * 1000
-    target = max(optimal, target - steps * 20)
+    repeat steps times, while target > optimal:
+        share = floor((target - optimal) / 6 / 20) * 20
+        target = max(optimal, target - max(20, share))
 }
 ```
 
-Falling is the opposite case. Nothing is proven by a quiet second, the cost of
-being wrong is another underrun, and the viewer notices a buffer that shrinks
-faster than this. The multi-step form is what makes a 1 fps track and a 50 fps
-track shrink at the same wall-clock rate; stepping once per arrival would tie
-the fall to the frame rate.
+Falling is the opposite case to rising. Nothing is proven by a quiet second and
+the cost of being wrong is another underrun, so the target comes down at a
+bounded rate instead of following the quantile straight down. The multi-step
+form is what makes a 1 fps track and a
+50 fps track shrink at the same wall-clock rate; stepping once per arrival would
+tie the fall to the frame rate.
+
+**Why a share and not a fixed step.** What the limiter protects is the ring: it
+must not hand the playhead a target the network has not refilled up to yet, and
+what a ring can refill in a second scales with the buffer it is holding. Twenty
+milliseconds out of an 80 ms buffer is a quarter of it; twenty milliseconds out
+of a 1600 ms buffer is nothing at all. A fixed step therefore brakes hardest
+exactly where the target is furthest from what the histogram asks for, and the
+time it takes to undo an overshoot grows with the overshoot: 1600 ms at a bucket
+a second is eighty seconds.
+
+**Why a sixth.** The limiter must never outlast the observation that raised the
+target. The histogram forgets in about 29 seconds, and the widest gap it can
+open is its own range, 2000 ms down to one bucket, a factor of 100. Closing a
+factor of 100 inside 29 seconds needs `1 - 100^(-1/29)`, about 0.147 per second;
+a sixth is the next simple fraction above it. It is written as a division by 6,
+not a multiplication by an `f64` sixth, so the floor below it lands on the same
+bucket in every language. The bucket stays as the floor because it is the
+estimator's own resolution, and below it the target cannot move at all.
+
+The quantile is a bucket index, so it comes down in handfuls of buckets at a
+time as mass leaves the tail, not smoothly. That is the case the fixed step
+could not follow.
 
 **No floor.** The estimator never applies one. The rendition's advertised
 `jitter` is the publisher's declared flush span, a property of the encoder, and
@@ -259,8 +335,8 @@ delay is `max(advertised, target)` and a fixed delay is `advertised + target`.
 ## Re-anchoring
 
 A timeline discontinuity moves the media axis underneath the measurement.
-`reanchor()` clears the reference deque, the newest timestamp, and the open
-interval. It keeps the histogram.
+`reanchor()` clears the reference deque, the newest timestamp, the previous
+arrival and the open interval. It keeps the histogram.
 
 The reasoning is that the histogram holds delays, and a jump in the timeline
 does not move a delay. The reference deque holds absolute pairs from a timeline
@@ -308,6 +384,13 @@ The same list, from the Rust side. Each of these reads correct and is not.
 - The quantile subtracts bucket 0 before the loop, not inside it.
 - Empty-interval decay runs after the closed interval's maximum, capped at 60.
 - The target starts at 80 ms, not at 0 and not at the first quantile.
+- The reading-gap test needs both terms. Idle time alone throws away every
+  observation a track slower than two frames a second makes.
+- The reading gap is measured against the previous **admitted** arrival, so a
+  reordered frame does not reset it, and `reanchor()` clears it.
+- The fall's share is `floor(distance / 6.0 / 20.0) * 20.0`: a division, floored
+  to a whole bucket before the maximum with one bucket. Multiplying by an `f64`
+  sixth instead can land the floor a bucket lower.
 
 ## The corpus
 
@@ -359,6 +442,7 @@ The cases, and what each one holds:
 | `step-change` | A one-off jump in path delay does not become permanent. |
 | `reordered` | Out-of-order arrivals move nothing. |
 | `tune-in-stale` | A stale frame then the live edge never inflates the target. |
+| `tune-in-stall` | A receiver whose read loop blocks for 1500 ms does not read its own block as path delay. |
 | `pause-10s` | A gap decays the histogram toward a reset. |
 | `pause-10min` | The 60-interval catch-up cap. |
 | `discontinuity` | `reanchor()` keeps the distribution and drops the reference. |
