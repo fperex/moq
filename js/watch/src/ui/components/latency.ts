@@ -42,7 +42,7 @@ export function latencyTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	// The draggable buffered-range timeline.
 	const timeline = bufferControl(parent, watch);
 
-	// Numeric readout: resolved jitter + total end-to-end buffer.
+	// Numeric readout: the target the estimator resolved, and what a listener actually waits.
 	const readout = DOM.create("div", { className: "latency-readout" });
 	const jitterStat = DOM.create("div", { className: "latency-stat" });
 	const jitterVal = DOM.create("span", { className: "latency-stat-value" }, "—");
@@ -55,9 +55,16 @@ export function latencyTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	parent.run((effect) => {
 		const mode = effect.get(watch.controls.delay);
 		const jitter = effect.get(watch.sync.out.jitter);
-		const total = effect.get(watch.sync.out.delay);
+		const delay = effect.get(watch.sync.out.delay);
+		// The target counts the frame being played, so the ring holds a chunk on top of it and that
+		// chunk is time the listener waits too. Reporting the target alone reads as 20ms on a call
+		// where 40ms of audio is queued ahead of the speaker.
+		const playout = effect.get(watch.audio.out.debug);
+		const rate = effect.get(watch.audio.out.sampleRate);
+		const chunk = playout && rate ? Moq.Time.Milli((playout.chunk / rate) * 1000) : Moq.Time.Milli.zero;
+
 		jitterVal.textContent = `${formatMillis(jitter)}${mode === "auto" ? " (auto)" : ""}`;
-		bufferVal.textContent = formatMillis(total);
+		bufferVal.textContent = formatMillis(Moq.Time.Milli.add(delay, chunk));
 	});
 
 	const hint = DOM.create(

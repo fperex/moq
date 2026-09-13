@@ -12,10 +12,11 @@ export class AudioRingBuffer implements RingReader {
 	#stalled = true;
 	#underruns = 0;
 
-	// Samples in the most recent write, i.e. one decoded chunk. The overflow band tolerates this
-	// much above the target before dropping, so a ring sitting exactly on the target doesn't drop
-	// audio the moment the next chunk lands. The most recent write rather than a running maximum:
-	// one oversized decode would otherwise widen the band for the life of the ring.
+	// Samples in the most recent write, i.e. one decoded chunk. The term on top of the target that
+	// makes the level this ring holds: the target counts the frame in play, so the audio still
+	// waiting to be played is the target plus one chunk. The most recent write rather than a running
+	// maximum: one oversized decode would otherwise deepen the ring for the life of the stream, and a
+	// publisher that changes its frame duration is described within one write.
 	#chunk = 0;
 
 	// Buffered mode: play through everything buffered without skipping ahead.
@@ -29,9 +30,9 @@ export class AudioRingBuffer implements RingReader {
 	// one knows to drop it. The shared transport reads its mutation epoch for the same purpose.
 	#generation = 0;
 
-	// How far above `latency + chunk` the ring may sit before the reader skips ahead. A property of
-	// the reader's time stretch rather than of this stream: everything inside the band is something
-	// the stretch closes without dropping a sample.
+	// How far above the hold level the ring may sit before the reader skips ahead. A property of the
+	// reader's time stretch rather than of this stream: everything inside the band is something the
+	// stretch closes without dropping a sample.
 	readonly #skip: number;
 
 	// What the playout engine is holding, plus what the writer threw away. The shared transport
@@ -53,6 +54,13 @@ export class AudioRingBuffer implements RingReader {
 	// Samples the writer dropped out from under the reader since its last view, which the playout
 	// engine has to treat as a step rather than as the buffer draining.
 	#jumped = 0;
+
+	// The widest chunk written so far, which capacity has to hold on top of the target. A high-water
+	// mark rather than the current chunk, because growing the array replaces the timeline and the
+	// reader drops the block it was holding: a publisher alternating two frame durations would
+	// otherwise pay that on every other write. It only costs memory, since the band is measured
+	// against the current chunk either way.
+	#largest = 0;
 
 	// The depth the ring keeps between flushes, which is the one that says a surplus is real.
 	#floor = new Floor();
@@ -79,8 +87,8 @@ export class AudioRingBuffer implements RingReader {
 		this.#skip = frames(props.rate, STRETCH_BOUND);
 
 		// The ring holds the latency floor as PCM, with headroom above it. Sizing capacity to the
-		// floor exactly makes the ring physically incapable of holding the slack the overflow band
-		// wants, so every chunk that arrives while the ring is on target drops the oldest samples.
+		// floor exactly makes the ring physically incapable of holding the chunk on top of it or the
+		// slack the overflow band wants, so every chunk arriving on target drops the oldest samples.
 		// In buffered mode the headroom is also what keeps the backpressure-paced decode loop (on
 		// the main thread) from overflow-dropping; the rest of the lookahead stays encoded upstream.
 		const capacity = this.#capacityFor(this.#latencySamples);
@@ -91,12 +99,15 @@ export class AudioRingBuffer implements RingReader {
 		}
 	}
 
-	// Twice the target, plus the stretch band the reader converges across so the ring can physically
-	// hold it however shallow the target is. `resize` keeps this true as the target moves, which is
-	// what stops a rising adaptive target from being silently capped by the `Math.min(..., capacity)`
-	// in `write`. Buffered mode never skips ahead, so it has no band to hold.
+	// The level the ring holds, plus the stretch band the reader converges across, so the ring can
+	// physically hold both however shallow the target is. `resize` keeps this true as the target
+	// moves and {@link write} keeps it true as the chunk does, which is what stops a rising adaptive
+	// target or a publisher with frames longer than its own advertised jitter from being silently
+	// capped by the `Math.min(..., capacity)` in `write`. Buffered mode never skips ahead, so it has
+	// no band to hold.
 	#capacityFor(latencySamples: number): number {
-		return latencySamples * 2 + (this.#buffered ? 0 : this.#skip);
+		if (this.#buffered) return latencySamples * 2;
+		return latencySamples + Math.max(latencySamples, this.#largest) + this.#skip;
 	}
 
 	get stalled(): boolean {
@@ -175,6 +186,12 @@ export class AudioRingBuffer implements RingReader {
 
 		if (this.#latencySamples === 0) throw new Error("empty buffer");
 
+		this.#reallocate();
+	}
+
+	// Move the ring into an array sized for what it now has to hold, keeping the newest samples that
+	// fit. A no-op when the size did not change, which is every write of a well behaved stream.
+	#reallocate(): void {
 		const newCapacity = this.#capacityFor(this.#latencySamples);
 		if (newCapacity === this.capacity) return;
 
@@ -209,6 +226,15 @@ export class AudioRingBuffer implements RingReader {
 	write(timestamp: Time.Micro, data: Float32Array[]): void {
 		if (data.length !== this.channels) throw new Error("wrong number of channels");
 
+		// A chunk wider than the target needs a wider ring, or the level this one holds plus the
+		// stretch band would not fit in it and the hard capacity would start dropping audio the band
+		// was meant to keep. Nothing to do for the streams whose frames are no longer than the delay
+		// their catalog advertises, which is every one the catalog describes correctly.
+		if (data[0].length > this.#largest) {
+			this.#largest = data[0].length;
+			this.#reallocate();
+		}
+
 		let start = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
 		let samples = data[0].length;
 
@@ -240,26 +266,22 @@ export class AudioRingBuffer implements RingReader {
 		const end = start + samples;
 		this.#chunk = data[0].length;
 
-		// Bound the ring. While playing, drop the oldest once it holds a whole chunk plus the stretch
-		// band more than the target and land back on the target: frames arrive one chunk at a time,
-		// so a ring sitting exactly on the target is a chunk above it the moment the next one lands,
-		// and dropping on that overshoot discards audio on every single write. The band on top is
-		// what the reader's time stretch closes on its own, so everything inside it plays rather
-		// than being thrown away. While stalled the reader is not consuming, so only the hard
-		// capacity applies; the band would throw away the very audio the refill is accumulating.
-		// Buffered mode plays through everything, so it is capacity-bound too.
+		// Bound the ring. While playing, drop the oldest once it holds the stretch band more than the
+		// hold level and land back on the hold level. The band is exactly what the reader's time
+		// stretch closes on its own, so everything inside it plays rather than being thrown away.
+		// While stalled the reader is not consuming, so only the hard capacity applies; the band would
+		// throw away the very audio the refill is accumulating. Buffered mode plays through
+		// everything, so it is capacity-bound too.
 		const playing = !this.#stalled && !this.#buffered;
-		const slack = this.#chunk + this.#skip;
-		const band = playing ? Math.min(this.#latencySamples + slack, this.capacity) : this.capacity;
+		const hold = this.#latencySamples + this.#chunk;
+		const band = playing ? Math.min(hold + this.#skip, this.capacity) : this.capacity;
 		const depth = end - this.#readIndex;
 		// A flush lands several frames at once, so the depth peaks by a whole flush and drains back
 		// before the next one: the trough between two flushes is the part that is actually surplus.
 		const sustained = playing ? this.#floor.observe(depth, this.#readIndex, this.#latencySamples) : depth;
-		// While stalled or buffered the reader is not consuming, so only the hard capacity applies;
-		// the band would throw away the very audio the refill is accumulating.
 		const surplus = playing && sustained > band;
 		if (surplus || depth > this.capacity) {
-			const to = end - (surplus ? Math.min(this.#latencySamples, this.capacity) : this.capacity);
+			const to = end - (surplus ? Math.min(hold, this.capacity) : this.capacity);
 			const dropped = Math.max(0, to - this.#readIndex);
 			this.#discarded += dropped;
 			this.#jumped += dropped;
@@ -315,10 +337,13 @@ export class AudioRingBuffer implements RingReader {
 			this.#writeIndex = end;
 		}
 
-		// Start playback once we've buffered the latency target. This is the only way out of a
-		// stall, so an underrun mid-playback refills to the target before resuming rather than
-		// playing the next chunk on an empty cushion.
-		if (this.length >= this.#latencySamples) {
+		// Start playback once the ring holds the target and the chunk being played on top of it. The
+		// target counts the frame in play, the way NetEq's does (the `packet_buffer` span plus the
+		// sync buffer), so a ring holding the target alone holds nothing unplayed and runs dry on the
+		// first arrival that is a millisecond late. This is the only way out of a stall, so an
+		// underrun mid-playback refills to the same level before resuming. Bounded by what the ring
+		// physically holds, or a chunk wider than the ring would name a level no refill could reach.
+		if (this.length >= Math.min(hold, this.capacity)) {
 			this.#stalled = false;
 		}
 	}
@@ -338,7 +363,7 @@ export class AudioRingBuffer implements RingReader {
 	}
 
 	/**
-	 * Hold playback until the ring holds the target again, keeping everything buffered.
+	 * Hold playback until the ring holds its level again, keeping everything buffered.
 	 *
 	 * Used when the target deepens: `resize` alone only raises the bar a future refill has to clear,
 	 * so a ring already playing keeps draining at its old depth and audio runs that much ahead of
@@ -405,7 +430,7 @@ export class AudioRingBuffer implements RingReader {
 	}
 
 	/**
-	 * The reader ran dry mid-playback: count the underrun and park until the ring holds the target.
+	 * The reader ran dry mid-playback: count the underrun and park until the ring holds its level.
 	 * Only once the caller has seen an empty {@link view}.
 	 */
 	starve(): void {
@@ -432,7 +457,7 @@ export class AudioRingBuffer implements RingReader {
 
 		const samples = Math.min(view.buffered, output[0].length);
 		if (samples <= 0) {
-			// Ran dry mid-playback: re-stall so write() refills to the target before resuming.
+			// Ran dry mid-playback: re-stall so write() refills to the hold level before resuming.
 			this.starve();
 			return 0;
 		}

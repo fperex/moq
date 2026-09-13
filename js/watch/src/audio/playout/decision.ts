@@ -14,8 +14,8 @@ import { frames } from "./stretch";
 export const BLOCK = 20;
 
 /**
- * How far the ring may sit above its target before the reader skips ahead instead of stretching,
- * in milliseconds.
+ * How far the ring may sit above the level it holds before the reader skips ahead instead of
+ * stretching, in milliseconds.
  *
  * One operation moves at most one 15ms pitch period, and the cooldown lets one run every 100ms of
  * output, so five blocks is what the stretch can close in half a second. Past that a listener would
@@ -35,10 +35,10 @@ export const STRETCH_BOUND = 75;
 const COOLDOWN = 100;
 
 /**
- * The slack above the target that is not a reason to accelerate, in milliseconds.
+ * The slack above the hold level that is not a reason to accelerate, in milliseconds.
  *
- * NetEq's `kDelayAdjustmentGranularityMs`, added to the target and the widest arrival delay to form
- * the upper limit.
+ * NetEq's `kDelayAdjustmentGranularityMs`, added to the level the ring holds to form the upper
+ * limit.
  */
 const GRANULARITY = 20;
 
@@ -49,15 +49,15 @@ const GRANULARITY = 20;
 const FAST = 4;
 
 /**
- * Share of the target below which the engine stops holding audio back and lets the ring refill.
+ * Share of the hold level below which the engine stops holding audio back and lets the ring refill.
  *
  * NetEq's `kPostponeDecodingLevel`, which postpones *decoding* at half the target so playback does
  * not restart onto an empty buffer. We have no decode to postpone (the ring is fed from the main
- * thread), so the same hysteresis gates expansion instead: below half the target the ring is
+ * thread), so the same hysteresis gates expansion instead: below half the level the ring is
  * refilling and stretching would only fight the refill.
  *
  * The other half of that rule, not resuming from a concealment until the ring holds a cushion again,
- * is the ring's: it parks on an underrun and only un-parks once it holds the whole target, which is
+ * is the ring's: it parks on an underrun and only un-parks once it holds that level again, which is
  * stricter than NetEq's half and is one mechanism rather than two.
  */
 const POSTPONE = 0.5;
@@ -152,8 +152,12 @@ export class Decision {
 		if (!demand.converge) return "normal";
 
 		const level = this.#level.filtered;
-		const low = demand.target;
-		const high = low + demand.chunk + this.#granularity;
+		// The level the ring holds: the target counts the frame in play, the way NetEq's does (the
+		// `packet_buffer` span plus the sync buffer), so what is still waiting to be played is the
+		// target plus one chunk. The ring un-stalls and refills to the same level, so a filter aimed at
+		// the target alone would ask for an expansion on every block of a perfectly healthy stream.
+		const low = demand.target + demand.chunk;
+		const high = low + this.#granularity;
 
 		// Far enough above that one period at a time will never close it, and a listener is already
 		// hearing every word late. No cooldown: this is the case the cooldown would prolong.
@@ -161,7 +165,7 @@ export class Decision {
 
 		if (demand.outputFrame < this.#ready) return "normal";
 		if (level >= high) return "accelerate";
-		// Below half the target the ring is refilling and holding audio back would fight it.
+		// Below half the hold level the ring is refilling and holding audio back would fight it.
 		if (level < low && level >= low * POSTPONE) return "expand";
 
 		return "normal";

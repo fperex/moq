@@ -82,9 +82,10 @@ export function audioMaxAge(maxAge: Time.Milli, config: Catalog.AudioConfig | un
  * The age budget and the estimator measure the same path but round it differently, so a budget set
  * to the target alone convicts the arrivals the target was sized to cover. Three terms separate
  * them, and each is something the ring absorbs without dropping a sample: the estimator reports a
- * bucket's upper edge, so the real delay sits up to one bucket below it; a frame arrives whole, so
- * the last one to land carries its own duration; and the reader's time stretch plays the ring back
- * onto its target across the stretch band rather than dropping what sits inside it.
+ * bucket's upper edge, so the real delay sits up to one bucket below it; the ring holds one chunk on
+ * top of the target, because the target counts the frame being played; and the reader's time stretch
+ * plays the ring back onto that level across the stretch band rather than dropping what sits inside
+ * it.
  */
 export function maxAgeHeadroom(config: Catalog.AudioConfig): Time.Milli {
 	// The codec's own frame duration, not the advertised flush span: a publisher batching ten

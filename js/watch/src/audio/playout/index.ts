@@ -31,7 +31,12 @@ export interface RingView {
 	buffered: number;
 	/** The playout target, in samples. */
 	target: number;
-	/** The most recent insert, in samples: one decoded chunk. */
+	/**
+	 * The most recent insert, in samples: one decoded chunk.
+	 *
+	 * The target counts the frame in play, so the level the ring holds is `target + chunk` and the
+	 * skip band sits on top of that.
+	 */
 	chunk: number;
 	/** How far above `target + chunk` the ring may sit before the reader skips ahead, in samples. */
 	skip: number;
@@ -112,7 +117,7 @@ export interface Snapshot extends Counters {
 	target: number;
 	/** The most recent insert, in samples. */
 	chunk: number;
-	/** The skip-ahead band above `target + chunk`, in samples. */
+	/** The skip-ahead band above the level the ring holds, in samples. */
 	skip: number;
 	/** Whether playback is parked while the ring refills. */
 	stalled: boolean;

@@ -8,22 +8,29 @@ const LATENCY = 1;
 /**
  * Whether playback is held while the ring refills. The one slot both threads write.
  *
- * The writer clears it once the ring holds the target, the reader raises it when the ring runs
- * dry. Neither needs a compare-exchange. The reader only raises it having observed an empty ring,
- * which means it already drained everything the writer published, and the writer only clears it
- * having published enough to cover the target. A raise landing after a clear costs one quantum of
+ * The writer clears it once the ring holds the target and a chunk on top, the reader raises it when
+ * the ring runs dry. Neither needs a compare-exchange. The reader only raises it having observed an
+ * empty ring, which means it already drained everything the writer published, and the writer only
+ * clears it having published enough to cover both. A raise landing after a clear costs one quantum of
  * silence and the next insert undoes it, since every insert re-checks. A clear landing after a
  * raise is correct on its face: the samples are there.
  */
 const STALLED = 2;
 // Timeline identity changes only on re-anchor, independently of the packed mutation epoch.
 const TIMELINE = 3;
-// The size of the most recent insert, i.e. one decoded chunk. See `read`.
+/**
+ * The size of the most recent insert, i.e. one decoded chunk.
+ *
+ * The term on top of LATENCY that makes the level the ring holds: the target counts the frame in
+ * play, so the audio still waiting to be played is the target plus one chunk. The most recent
+ * insert, not a running maximum: one oversized decode would otherwise deepen the ring for the life
+ * of the stream, and a publisher that changes its frame duration is described within one insert.
+ */
 const CHUNK = 4;
 // How many times the reader ran dry mid-playback. Diagnostics only.
 const UNDERRUN = 5;
 /**
- * How far above `LATENCY + CHUNK` the ring may sit before the reader skips ahead, in samples.
+ * How far above the hold level the ring may sit before the reader skips ahead, in samples.
  *
  * Written once by the writer, because it is a property of the reader's time stretch rather than of
  * this stream: everything inside the band is something the stretch closes without dropping a sample.
@@ -384,23 +391,29 @@ export class SharedRingBuffer implements RingReader {
 			}
 		}
 
-		// Publish the chunk size for the reader's skip band before the samples it describes become
-		// visible. The two stores are not one transaction, so the reader can land between them:
-		// this way it sees the wider band with the old cursor, which only makes it skip less, where
-		// the other order would have it measure a longer span against a narrower band and cut audio
-		// that is not actually late. The most recent insert, not a running maximum: one oversized
-		// decode would otherwise widen the band for the life of the ring, and a publisher that
-		// changes its frame duration is described within one insert.
+		// Publish the chunk size before the samples it describes become visible. The two stores are not
+		// one transaction, so the reader can land between them: this way it sees the wider band with
+		// the old cursor, which only makes it skip less, where the other order would have it measure a
+		// longer span against a narrower band and cut audio that is not actually late.
 		Atomics.store(this.#control, CHUNK, originalLength);
 
 		// Advance WRITE (only forward)
 		Atomics.store(this.#control, WRITE, i32Max(Atomics.load(this.#control, WRITE), end));
 
-		// Un-stall: if buffered data >= LATENCY
+		// Un-stall once the ring holds the target and the chunk being played on top of it. The target
+		// counts the frame in play, the way NetEq's does (the `packet_buffer` span plus the sync
+		// buffer), so a ring holding the target alone holds nothing unplayed and runs dry on the first
+		// arrival that is a millisecond late. See CHUNK.
 		const currentRead = readOf(Atomics.load(this.#state, 0));
 		const currentWrite = Atomics.load(this.#control, WRITE);
 		const latency = Atomics.load(this.#control, LATENCY);
-		if (((currentWrite - currentRead) | 0) >= latency && latency > 0) {
+		const chunk = Atomics.load(this.#control, CHUNK);
+		// Bounded by what the ring physically holds: the overflow path keeps the span at or under
+		// capacity, so a chunk wider than the ring would leave a level no refill could ever reach and
+		// the stream would stay parked for good. `setLatency` refuses a target past capacity outright;
+		// the chunk is the stream's to choose, so it is the term that gives way.
+		const hold = Math.min((latency + chunk) | 0, this.capacity);
+		if (((currentWrite - currentRead) | 0) >= hold && latency > 0) {
 			Atomics.store(this.#control, STALLED, 0);
 		}
 	}
@@ -431,19 +444,17 @@ export class SharedRingBuffer implements RingReader {
 		const chunk = Atomics.load(this.#control, CHUNK);
 		const skip = Atomics.load(this.#control, SKIP);
 
-		// Latency skip: skip ahead only once the ring holds a whole chunk plus the stretch band more
-		// than the target, landing back on the target. Frames arrive one chunk at a time, so a ring
-		// sitting exactly on the target is a chunk above it the moment the next one lands; skipping
-		// on that overshoot discards audio on every single insert. The band on top is what the
-		// reader's time stretch closes on its own, so everything inside it plays rather than being
-		// thrown away.
+		// Latency skip: skip ahead only once the ring holds the stretch band more than the hold level,
+		// landing back on the hold level. The band is exactly what the reader's time stretch closes on
+		// its own, so everything inside it plays rather than being thrown away.
 		// The advance is published by `commit`, so a concurrent writer advance is never stepped back.
 		// Disabled in buffered mode, where we deliberately play through the whole buffer.
 		this.#pending = 0;
 		if (!stalled && !unstable && !this.buffered && target > 0) {
+			const hold = (target + chunk) | 0;
 			const sustained = this.#floor.observe((write - read) | 0, read, target);
-			if (sustained > ((target + chunk + skip) | 0)) {
-				const skipTo = (write - target) | 0;
+			if (sustained > ((hold + skip) | 0)) {
+				const skipTo = (write - hold) | 0;
 				if (((skipTo - read) | 0) > 0) {
 					this.#pending = (skipTo - read) | 0;
 					read = skipTo;
@@ -523,10 +534,10 @@ export class SharedRingBuffer implements RingReader {
 	}
 
 	/**
-	 * The reader ran dry mid-playback: count the underrun and park until the ring holds the target.
+	 * The reader ran dry mid-playback: count the underrun and park until the ring holds the level.
 	 * AudioWorklet only, and only once the caller has seen an empty {@link view}.
 	 *
-	 * A park is how `insert` gets to refill to the target before playback resumes: the alternative
+	 * A park is how `insert` gets to refill to the hold level before playback resumes: the alternative
 	 * is playing the next chunk on an empty cushion, which underruns again on the very next
 	 * quantum. See STALLED for the write discipline.
 	 */
@@ -622,7 +633,7 @@ export class SharedRingBuffer implements RingReader {
 	}
 
 	/**
-	 * Hold playback until the ring holds the target again, keeping everything buffered.
+	 * Hold playback until the ring holds its level again, keeping everything buffered.
 	 * Main thread only.
 	 *
 	 * Used when the target deepens: `setLatency` alone only raises the bar a future refill has to
