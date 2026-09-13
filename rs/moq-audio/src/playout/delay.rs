@@ -50,8 +50,16 @@ const START: f64 = 80.0;
 /// bounded amount of work.
 const MAX_CATCHUP: usize = 60;
 
-/// How long the target holds before it may step down by another bucket.
+/// How long the target holds before it may step down again.
 const LOWER_INTERVAL: f64 = 1000.0;
+
+/// The share of the remaining distance one fall step closes.
+///
+/// Written as a divisor rather than an `f64` sixth so the floor below it lands on the
+/// same bucket in every language. A sixth a second closes the histogram's whole range
+/// inside the 29s the histogram remembers, so the limiter can never outlast the
+/// observation that raised the target.
+const LOWER_DIVISOR: f64 = 6.0;
 
 /// Width of one histogram bucket in milliseconds, and the resolution of the target.
 ///
@@ -81,6 +89,10 @@ pub(crate) struct Jitter {
 	/// The newest timestamp admitted so far. Anything not strictly newer is
 	/// reordered.
 	newest: Option<f64>,
+
+	/// The last arrival admitted, on both axes, so the next one can tell a gap in
+	/// this receiver's own reading from a gap on the path.
+	previous: Option<Arrival>,
 
 	/// Weighted probability per delay bucket, summing to 1.
 	buckets: [f64; BUCKETS],
@@ -113,6 +125,7 @@ impl Jitter {
 		Self {
 			min: VecDeque::new(),
 			newest: None,
+			previous: None,
 			buckets,
 			adds: 0,
 			forget: 0.0,
@@ -145,6 +158,29 @@ impl Jitter {
 			return;
 		}
 		self.newest = Some(ts);
+
+		// The arrival clock is sampled by whoever calls this, so time that caller
+		// spent not reading lands in the next arrival it stamps and looks exactly
+		// like a slow path. An arrival that follows a gap in the reading longer than
+		// one interval, and that covers less media than the gap was long, drops the
+		// reference: the backlog behind it is then measured against the path as the
+		// receiver can now see it. The media term is what separates the two, since a
+		// 1 fps track is idle for longer than an interval on every arrival while its
+		// timeline advances just as far. Dropping the reference and not the one
+		// arrival is the point: every frame in a backlog is equally late against a
+		// reference taken before the gap, so skipping the first would leave the
+		// second to set the same interval maximum.
+		if let Some(previous) = self.previous {
+			let idle = now - previous.arrival;
+			let progress = ts - previous.timestamp;
+			if idle > RESAMPLE && idle - progress > RESAMPLE {
+				self.min.clear();
+			}
+		}
+		self.previous = Some(Arrival {
+			timestamp: ts,
+			arrival: now,
+		});
 
 		// Drop arrivals the timeline has moved past. The window is media, so this
 		// prunes by how much content has been delivered rather than by how long the
@@ -182,6 +218,7 @@ impl Jitter {
 	pub(crate) fn reanchor(&mut self) {
 		self.min.clear();
 		self.newest = None;
+		self.previous = None;
 		self.interval_start = None;
 		self.interval_max = 0.0;
 	}
@@ -272,10 +309,16 @@ impl Jitter {
 			return;
 		}
 
-		// Fall one bucket per second, in as many steps as the elapsed time allows so
-		// a 1 fps track and a 50 fps one shrink at the same wall-clock rate.
-		// Shrinking faster than this drops the playhead onto a buffer the network
-		// has not refilled yet.
+		// Fall once a second, in as many steps as the elapsed time allows so a 1 fps
+		// track and a 50 fps one shrink at the same wall-clock rate. Shrinking faster
+		// drops the playhead onto a buffer the network has not refilled yet.
+		//
+		// Each step closes a share of the distance left rather than a fixed bucket,
+		// because what a buffer can refill in a second scales with what it is
+		// holding: a bucket out of 80ms is a quarter of it and a bucket out of 1600ms
+		// is nothing, so a fixed step brakes hardest exactly where the target is
+		// furthest from what the histogram asks for. The bucket stays as the floor,
+		// since below its own resolution the target cannot move at all.
 		let lowered = *self.lowered.get_or_insert(now);
 		let steps = ((now - lowered) / LOWER_INTERVAL).floor();
 		if steps <= 0.0 {
@@ -283,7 +326,15 @@ impl Jitter {
 		}
 
 		self.lowered = Some(lowered + steps * LOWER_INTERVAL);
-		self.target = optimal.max(current - steps * BUCKET);
+		let mut target = current;
+		for _ in 0..steps as u64 {
+			if target <= optimal {
+				break;
+			}
+			let share = ((target - optimal) / LOWER_DIVISOR / BUCKET).floor() * BUCKET;
+			target = optimal.max(target - share.max(BUCKET));
+		}
+		self.target = target;
 	}
 }
 
@@ -339,11 +390,6 @@ impl Constraints {
 	/// The deepest target these constraints allow.
 	fn ceiling(&self) -> Duration {
 		self.max.min(self.capacity * Self::SHARE / 4).min(CEILING)
-	}
-
-	/// The caller's floor.
-	pub(crate) fn min(&self) -> Duration {
-		self.min
 	}
 
 	/// `target` held between the floor and the ceiling.
@@ -428,8 +474,65 @@ mod tests {
 		assert_eq!(jitter.target(), settled);
 	}
 
+	/// A receiver that stops reading for a second and a half comes back to a backlog
+	/// every frame of which is that late against a reference taken before the block.
+	/// None of it came from the path, so none of it belongs in the target.
 	#[test]
-	fn the_target_falls_one_bucket_per_second() {
+	fn a_gap_in_the_receivers_own_reading_is_not_the_paths_delay() {
+		let mut jitter = Jitter::new();
+		let mut now = steady(&mut jitter, 100, 20.0, 5.0, 0.0);
+		let settled = jitter.target();
+
+		// The reading loop blocks for 1500ms. The media kept coming, so it drains in
+		// a few milliseconds a frame once the loop runs again.
+		let mut ts = 2000.0;
+		now += 1500.0;
+		let mut peak = settled;
+		for _ in 0..75 {
+			jitter.observe(Duration::from_secs_f64(ts / 1000.0), now, false);
+			peak = peak.max(jitter.target());
+			ts += 20.0;
+			now += 3.25;
+		}
+
+		// Then paced again, on a path that never changed.
+		for _ in 0..200 {
+			jitter.observe(Duration::from_secs_f64(ts / 1000.0), now + 5.0, false);
+			peak = peak.max(jitter.target());
+			ts += 20.0;
+			now += 20.0;
+		}
+
+		// Nothing the block did reached the target, which without the rule would be
+		// asking for the whole block and then walking it back down for a minute.
+		assert_eq!(peak, settled, "the block raised the target");
+		assert!(jitter.target() <= settled, "{:?}", jitter.target());
+	}
+
+	/// The media term is what tells the two apart: a track that genuinely sends one
+	/// frame a second is idle for longer than an interval on every arrival, and its
+	/// timeline advances just as far, so nothing is discounted.
+	#[test]
+	fn a_sparse_track_still_measures_its_path() {
+		let mut jitter = Jitter::new();
+
+		// One frame a second, arriving 150ms late every time.
+		for i in 0..60u64 {
+			let ts = (i * 1000) as f64;
+			jitter.observe(Duration::from_secs(i), ts + 150.0, false);
+		}
+
+		// The path's own delay is steady, so the reference holds and the spread it
+		// measures is the 150ms it really is rather than nothing at all.
+		assert!(jitter.target() <= Duration::from_millis(40), "{:?}", jitter.target());
+	}
+
+	/// A sixth of the distance left, floored to a bucket, with a bucket as the floor.
+	/// The bound exists so the playhead is never handed a target the network has not
+	/// refilled up to, and what a buffer refills in a second scales with what it
+	/// holds, so the step does too.
+	#[test]
+	fn the_target_falls_by_a_share_of_the_distance_left() {
 		let mut jitter = Jitter::new();
 
 		// A publisher flushing 15 frames at a time, so the oldest frame of each
@@ -441,7 +544,7 @@ mod tests {
 		let raised = jitter.target();
 		assert!(raised >= Duration::from_millis(280), "{raised:?}");
 
-		// Then it stops flushing and the target walks back down, a bucket a second.
+		// Then it stops flushing and the target walks back down.
 		let mut now = 3000.0;
 		let mut fell = vec![raised];
 		for i in 0..2000u64 {
@@ -456,11 +559,22 @@ mod tests {
 		assert!(fell.last().unwrap() < &raised, "{fell:?}");
 		for pair in fell.windows(2) {
 			let step = pair[0].saturating_sub(pair[1]);
-			assert!(
-				step <= Duration::from_millis(20),
-				"fell {step:?} in one second: {fell:?}"
-			);
+			let allowed = Duration::from_millis(
+				((pair[0].as_millis() as f64 - 20.0) / LOWER_DIVISOR / BUCKET).floor() as u64 * BUCKET as u64,
+			)
+			.max(Duration::from_millis(BUCKET as u64));
+			assert!(step <= allowed, "fell {step:?} in one second: {fell:?}");
 		}
+
+		// And while it is far from the quantile it comes down in more than a bucket a
+		// second, which is the whole point: a fixed step takes eighty seconds to undo
+		// a 1600ms overshoot, long after the histogram has forgotten what raised it.
+		assert!(
+			fell.windows(2)
+				.any(|pair| pair[0].saturating_sub(pair[1]) > Duration::from_millis(BUCKET as u64)),
+			"{fell:?}"
+		);
+		assert_eq!(fell.last(), Some(&Duration::from_millis(20)), "{fell:?}");
 	}
 
 	#[test]
