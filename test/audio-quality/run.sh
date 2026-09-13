@@ -277,8 +277,11 @@ if [[ "$RUNTIME" == replay ]]; then
     fi
 
     harness_begin audio-quality "$RERUN"
-    bun "$CLIENT/replay.ts" --out "$HARNESS_RUN" "${replay_args[@]}"
-    finish 0
+    # Graded even when it fails part-way, the way a failing browser row is: the rows that did
+    # produce a summary are still worth a table, and the status carries the failure out.
+    replay_status=0
+    bun "$CLIENT/replay.ts" --out "$HARNESS_RUN" "${replay_args[@]}" || replay_status=$?
+    finish "$replay_status"
 fi
 
 # One entry per row: the tag, then the fields the row needs, tab separated. The tag encodes the same

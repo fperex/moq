@@ -503,6 +503,10 @@ export type Point = {
 /**
  * Maximal runs of consecutive rising samples, as durations in ms: one audible gap each.
  *
+ * A point's `rising` describes the interval that ended at it, so an episode runs from the sample
+ * before the first rising one to the last rising one. The sample that closes it is the first that
+ * did not rise, and the interval before it carried no underrun, so it is not part of the gap.
+ *
  * A run open at the last sample is closed at `endAt`. An excluded sample closes any run it lands in
  * rather than extending it, because a stall is silence the player chose and is graded on its own.
  *
@@ -519,7 +523,7 @@ export function episodes(points: Point[], endAt: Ms): Ms[] {
 		if (cur.rising && !cur.excluded && !prev.excluded) {
 			open ??= prev.at;
 		} else if (open !== undefined) {
-			out.push(cur.at - open);
+			out.push(prev.at - open);
 			open = undefined;
 		}
 	}
