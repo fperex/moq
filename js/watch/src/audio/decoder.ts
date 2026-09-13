@@ -22,6 +22,7 @@ import { type AudioBuffer, createAudioBuffer } from "./buffer";
 import { audioMaxAge, type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
 import { Handover } from "./handover";
 import { ringSamples } from "./latency";
+import type * as Playout from "./playout";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -69,6 +70,14 @@ type DecoderOutput = {
 	// How late audio frames arrive relative to the earliest one, measured by the container
 	// consumer. Wired into Sync by the parent, which sizes the "auto" delay from it.
 	spread: Signal<Time.Milli | undefined>;
+
+	/**
+	 * Every audio ring counter at once: what it holds, what the playout engine did with it, and what
+	 * either end threw away. Undefined until the graph is built and the first sample lands.
+	 *
+	 * @internal
+	 */
+	debug: Signal<Playout.Snapshot | undefined>;
 };
 
 /** Cumulative audio statistics since the decoder started. */
@@ -98,6 +107,7 @@ export class Decoder {
 		skipped: new Signal<number>(0),
 		buffered: new Signal<Container.BufferedRanges>([]),
 		spread: new Signal<Time.Milli | undefined>(undefined),
+		debug: new Signal<Playout.Snapshot | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -253,6 +263,9 @@ export class Decoder {
 			});
 			effect.run((inner) => {
 				this.#out.underruns.set(inner.get(ring.underruns));
+			});
+			effect.run((inner) => {
+				this.#out.debug.set(inner.get(ring.debug));
 			});
 
 			effect.set(this.#out.root, worklet);

@@ -85,12 +85,12 @@ test("an unknown codec with no advertised jitter reserves nothing", () => {
 // The age budget and the playout target measure the same arrivals, so a budget equal to the target
 // convicts exactly the frames the target was sized to cover. The headroom is the rounding between
 // them, and every term is something the ring absorbs without dropping a sample.
-test("the age budget headroom is a bucket, a frame, and a render quantum", () => {
-	// 20ms bucket + 20ms Opus frame + 128 samples at 48kHz (2.67ms).
-	expect(maxAgeHeadroom(config())).toBe(Time.Milli(43));
+test("the age budget headroom is a bucket, a frame, and the stretch band", () => {
+	// 20ms bucket + 20ms Opus frame + the 75ms the reader's time stretch closes on its own.
+	expect(maxAgeHeadroom(config())).toBe(Time.Milli(115));
 
-	// 20ms bucket + 24ms AAC-LC frame (1024 samples) + 128 samples at 44.1kHz (2.9ms).
-	expect(maxAgeHeadroom(config({ codec: "mp4a.40.2", sampleRate: 44100 }))).toBe(Time.Milli(47));
+	// 20ms bucket + 24ms AAC-LC frame (1024 samples at 44.1kHz) + the same 75ms band.
+	expect(maxAgeHeadroom(config({ codec: "mp4a.40.2", sampleRate: 44100 }))).toBe(Time.Milli(119));
 });
 
 test("a publisher's flush span does not inflate the headroom", () => {
@@ -99,14 +99,14 @@ test("a publisher's flush span does not inflate the headroom", () => {
 	expect(maxAgeHeadroom(config({ jitter: 200 }))).toBe(maxAgeHeadroom(config()));
 
 	// With no codec frame duration to read, the advertised span is the only thing left.
-	expect(maxAgeHeadroom(config({ codec: "flac", jitter: 30 }))).toBe(Time.Milli(53));
+	expect(maxAgeHeadroom(config({ codec: "flac", jitter: 30 }))).toBe(Time.Milli(125));
 });
 
 test("the audio age budget carries the headroom, except in instant mode", () => {
 	const shared = Time.Milli(240);
 
 	// Auto and fixed both hold a buffer, so the ring can absorb the rounding above the target.
-	expect(audioMaxAge(shared, config(), false)).toBe(Time.Milli(283));
+	expect(audioMaxAge(shared, config(), false)).toBe(Time.Milli(355));
 
 	// Instant holds nothing, so there is nothing to absorb it with.
 	expect(audioMaxAge(shared, config(), true)).toBe(shared);

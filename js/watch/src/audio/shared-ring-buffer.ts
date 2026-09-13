@@ -1,7 +1,6 @@
 import { Time } from "@moq/net";
-import { WORKLET_QUANTUM } from "./config";
 import type { Playhead } from "./playhead";
-import type { RingView } from "./playout";
+import { type Counters, Floor, frames, type RingReader, type RingView, type Snapshot, STRETCH_BOUND } from "./playout";
 
 // Control array slot indices. The playhead is not here: see `state`.
 const WRITE = 0;
@@ -23,7 +22,29 @@ const TIMELINE = 3;
 const CHUNK = 4;
 // How many times the reader ran dry mid-playback. Diagnostics only.
 const UNDERRUN = 5;
-const CONTROL_SLOTS = 6;
+/**
+ * How far above `LATENCY + CHUNK` the ring may sit before the reader skips ahead, in samples.
+ *
+ * Written once by the writer, because it is a property of the reader's time stretch rather than of
+ * this stream: everything inside the band is something the stretch closes without dropping a sample.
+ */
+const SKIP = 6;
+// Media samples the reader has committed to its output block but not emitted yet. Reader only.
+const QUEUED = 7;
+// Samples an accelerate removed less the samples an expansion inserted, cumulative. Reader only.
+const STRETCHED = 8;
+// Frames the reader has emitted to the device, cumulative. Reader only.
+const OUTPUT = 9;
+// Blocks an accelerate shortened, blocks an expansion lengthened, quanta that ended short.
+const ACCELERATES = 10;
+const EXPANDS = 11;
+const SHORT = 12;
+// Skip-aheads, and the samples they threw away. Reader only.
+const SKIPS = 13;
+const SKIPPED = 14;
+// Samples the writer dropped: too old for the playhead, or past the ring's capacity. Writer only.
+const DISCARDED = 15;
+const CONTROL_SLOTS = 16;
 
 /**
  * The playhead and its mutation epoch, packed into one 64-bit word: epoch in the high
@@ -106,6 +127,9 @@ export function allocSharedRingBuffer(
 	// Initialize STALLED to 1
 	const ctrl = new Int32Array(control);
 	Atomics.store(ctrl, STALLED, 1);
+	// The reader's time stretch closes this much without dropping a sample, so nothing inside it is
+	// late audio. See STRETCH_BOUND.
+	Atomics.store(ctrl, SKIP, frames(rate, STRETCH_BOUND));
 
 	return { channels, capacity, rate, samples, control, state, buffered };
 }
@@ -126,7 +150,7 @@ function slot(idx: number, capacity: number): number {
 	return idx & (capacity - 1);
 }
 
-export class SharedRingBuffer {
+export class SharedRingBuffer implements RingReader {
 	readonly channels: number;
 	readonly capacity: number;
 	readonly rate: number;
@@ -144,6 +168,15 @@ export class SharedRingBuffer {
 	// skip-ahead left it on. Reader thread only, since only the worklet reads.
 	#snapshot = 0n;
 	#cursor = 0;
+	// Samples the skip-ahead in `view` passed over, counted once `commit` publishes it.
+	#pending = 0;
+	// The depth the ring keeps between flushes, which is the one that says a surplus is real.
+	#floor = new Floor();
+
+	// Where the last `commit` left the cursor, or undefined before the first one. Anything past it
+	// is the writer having dropped the oldest samples out from under the reader, which the playout
+	// engine has to treat as a step rather than as the buffer draining.
+	#expected: number | undefined;
 
 	// Absolute sample index of that first sample. READ/WRITE are stored relative to it, so
 	// `timestamp` adds it back to recover media time. Main-thread only: the worklet reads by
@@ -158,6 +191,12 @@ export class SharedRingBuffer {
 	// 2^31 samples, which the 50ms poll in `buffer.ts` satisfies by six orders of magnitude.
 	#position = 0;
 	#lastRead = 0;
+
+	// The media playhead last reported, and the counters the rate was last measured against. Main
+	// thread only, and stateful for the same reason `#position` is.
+	#lastMedia = Number.NEGATIVE_INFINITY;
+	#lastOutput = 0;
+	#lastStretched = 0;
 
 	/**
 	 * Wrap the shared memory described by `init`.
@@ -265,6 +304,8 @@ export class SharedRingBuffer {
 			this.#anchored = true;
 			this.#position = 0;
 			this.#lastRead = 0;
+			this.#lastMedia = Number.NEGATIVE_INFINITY;
+			Atomics.store(this.#control, QUEUED, 0);
 		}
 
 		// Positions are relative to the anchor. READ/WRITE are Int32, so an absolute sample index
@@ -281,6 +322,7 @@ export class SharedRingBuffer {
 		const read = readOf(Atomics.load(this.#state, 0));
 		const behind = (read - start) | 0;
 		if (behind > 0) {
+			Atomics.add(this.#control, DISCARDED, Math.min(behind, originalLength) | 0);
 			if (behind >= originalLength) {
 				// All samples are too old
 				return;
@@ -294,7 +336,9 @@ export class SharedRingBuffer {
 		// Overflow: if the write would exceed capacity from current READ, advance READ.
 		// Use CAS so a concurrent reader advance isn't clobbered backward.
 		if (((end - read) | 0) > this.capacity) {
-			this.#advance((end - this.capacity) | 0);
+			const to = (end - this.capacity) | 0;
+			Atomics.add(this.#control, DISCARDED, (to - read) | 0);
+			this.#advance(to);
 		}
 
 		// Gap fill: zero-fill from current WRITE to start if there's a discontinuity
@@ -360,24 +404,29 @@ export class SharedRingBuffer {
 		const unstable = retreating(state);
 
 		let read = readOf(state);
+		const jumped = this.#expected === undefined ? 0 : Math.max(0, (read - this.#expected) | 0);
 		const write = Atomics.load(this.#control, WRITE);
 		const target = Atomics.load(this.#control, LATENCY);
 		const chunk = Atomics.load(this.#control, CHUNK);
-		const skip = WORKLET_QUANTUM;
+		const skip = Atomics.load(this.#control, SKIP);
 
-		// Latency skip: skip ahead only once the ring holds a whole chunk plus a render quantum more
+		// Latency skip: skip ahead only once the ring holds a whole chunk plus the stretch band more
 		// than the target, landing back on the target. Frames arrive one chunk at a time, so a ring
 		// sitting exactly on the target is a chunk above it the moment the next one lands; skipping
-		// on that overshoot discards audio on every single insert. The quantum on top is this
-		// reader's own granularity: it drains in whole blocks, so the ring is routinely one block
-		// above the target between reads and that is not late audio either.
+		// on that overshoot discards audio on every single insert. The band on top is what the
+		// reader's time stretch closes on its own, so everything inside it plays rather than being
+		// thrown away.
 		// The advance is published by `commit`, so a concurrent writer advance is never stepped back.
 		// Disabled in buffered mode, where we deliberately play through the whole buffer.
+		this.#pending = 0;
 		if (!stalled && !unstable && !this.buffered && target > 0) {
-			const buffered = (write - read) | 0;
-			if (buffered > ((target + chunk + skip) | 0)) {
+			const sustained = this.#floor.observe((write - read) | 0, read, target);
+			if (sustained > ((target + chunk + skip) | 0)) {
 				const skipTo = (write - target) | 0;
-				if (((skipTo - read) | 0) > 0) read = skipTo;
+				if (((skipTo - read) | 0) > 0) {
+					this.#pending = (skipTo - read) | 0;
+					read = skipTo;
+				}
 			}
 		}
 
@@ -390,6 +439,8 @@ export class SharedRingBuffer {
 			skip,
 			stalled,
 			unstable,
+			converge: !this.buffered,
+			skipped: jumped + this.#pending,
 			generation: epochOf(state),
 		};
 	}
@@ -420,8 +471,32 @@ export class SharedRingBuffer {
 	commit(count: number): boolean {
 		const state = this.#snapshot;
 		const next = (this.#cursor + count) | 0;
-		if (((next - readOf(state)) | 0) === 0) return true;
-		return Atomics.compareExchange(this.#state, 0, state, pack(epochOf(state), next)) === state;
+		if (((next - readOf(state)) | 0) !== 0) {
+			if (Atomics.compareExchange(this.#state, 0, state, pack(epochOf(state), next)) !== state) return false;
+		}
+		if (this.#pending > 0) {
+			Atomics.add(this.#control, SKIPS, 1);
+			Atomics.add(this.#control, SKIPPED, this.#pending);
+			this.#pending = 0;
+		}
+		this.#expected = next;
+		return true;
+	}
+
+	/**
+	 * Publish what the reader's playout engine is holding.
+	 * AudioWorklet only, once per render quantum.
+	 *
+	 * Diagnostics, except for QUEUED: the media playhead the main thread reports is READ less that,
+	 * so a stale value would put video ahead of the audio a listener can hear.
+	 */
+	report(counters: Counters): void {
+		Atomics.store(this.#control, QUEUED, counters.queued | 0);
+		Atomics.store(this.#control, STRETCHED, counters.stretched | 0);
+		Atomics.store(this.#control, OUTPUT, counters.output | 0);
+		Atomics.store(this.#control, ACCELERATES, counters.accelerates | 0);
+		Atomics.store(this.#control, EXPANDS, counters.expands | 0);
+		Atomics.store(this.#control, SHORT, counters.short | 0);
 	}
 
 	/**
@@ -465,10 +540,17 @@ export class SharedRingBuffer {
 			return 0;
 		}
 
+		// This reader holds nothing back and stretches nothing, so every sample it takes is a frame
+		// it emits. Published so the playhead reads the same whichever reader drives the ring.
+		Atomics.add(this.#control, OUTPUT, count);
+
 		// A short quantum ends in silence, so it counts as an underrun even if a chunk lands before
 		// the next read. It does not park playback: the shortfall is under one quantum, and a
 		// refill would spend the whole target as silence to cover it.
-		if (count < output[0].length) Atomics.add(this.#control, UNDERRUN, 1);
+		if (count < output[0].length) {
+			Atomics.add(this.#control, UNDERRUN, 1);
+			Atomics.add(this.#control, SHORT, 1);
+		}
 
 		return count;
 	}
@@ -583,14 +665,31 @@ export class SharedRingBuffer {
 		Atomics.store(dst.#control, WRITE, write);
 		Atomics.store(dst.#control, LATENCY, latency);
 		Atomics.store(dst.#control, STALLED, stalled);
-		Atomics.store(dst.#control, CHUNK, Atomics.load(this.#control, CHUNK));
-		Atomics.store(dst.#control, UNDERRUN, Atomics.load(this.#control, UNDERRUN));
+		for (const control of [
+			CHUNK,
+			UNDERRUN,
+			SKIP,
+			QUEUED,
+			STRETCHED,
+			OUTPUT,
+			ACCELERATES,
+			EXPANDS,
+			SHORT,
+			SKIPS,
+			SKIPPED,
+			DISCARDED,
+		]) {
+			Atomics.store(dst.#control, control, Atomics.load(this.#control, control));
+		}
 
 		// Carry the unwrapped playhead over, rebased onto dst's READ. Fold the same `read`
 		// snapshot the copy used so both sides agree on one observation; `copyStart` is at or
 		// ahead of it whenever the copy dropped the oldest samples.
 		dst.#position = this.#foldRead(read) + ((copyStart - read) | 0);
 		dst.#lastRead = copyStart;
+		dst.#lastMedia = this.#lastMedia;
+		dst.#lastOutput = this.#lastOutput;
+		dst.#lastStretched = this.#lastStretched;
 
 		return dst;
 	}
@@ -611,28 +710,83 @@ export class SharedRingBuffer {
 	}
 
 	/**
-	 * Current playback timestamp derived from READ position.
+	 * The media position the reader has played up to, in anchor-relative samples.
+	 *
+	 * READ less what the reader is still holding: a time stretch makes those two diverge, and it is
+	 * the media position, not the output frame count, that video has to be paced against.
+	 *
+	 * READ and QUEUED live in separate words, so a poll can land between the reader's two stores and
+	 * pair a fresh cursor with a stale queue. The error is bounded by one output block and only
+	 * happens at a commit, but a playhead that stepped backwards would make video wait for audio
+	 * that has already been heard, so this never reports less than it did last time.
+	 */
+	#media(): number {
+		const queued = Atomics.load(this.#control, QUEUED);
+		this.#lastMedia = Math.max(this.#lastMedia, this.#unwrapRead() - queued);
+		return this.#lastMedia;
+	}
+
+	/**
+	 * Current playback timestamp derived from the media playhead.
 	 *
 	 * Main thread only, and stateful: it advances the unwrapped read position, so it has to be
 	 * polled rather than sampled once. See `#position`.
 	 */
 	get timestamp(): Time.Micro {
-		return Time.Micro.fromSecond(((this.#anchor + this.#unwrapRead()) / this.rate) as Time.Second);
+		return Time.Micro.fromSecond(((this.#anchor + this.#media()) / this.rate) as Time.Second);
 	}
 
 	/**
 	 * Where the reader is on the media timeline and how fast it is moving, or undefined until the
 	 * first insert anchors the ring.
 	 *
-	 * Main thread only, and stateful for the same reason {@link timestamp} is.
+	 * Main thread only, and stateful for the same reason {@link timestamp} is: the rate is measured
+	 * between polls.
 	 *
-	 * The rate is the reader's own: it drains a quantum per quantum while playing and nothing at all
-	 * while stalled, so a stall reports zero and whoever follows this playhead parks with it rather
-	 * than running away from the audio it can hear.
+	 * The rate is the reader's own, `1 + dSTRETCHED/dOUTPUT`: it consumes a sample of media per
+	 * output frame while playing normally, a few percent more or less while a time stretch converges
+	 * on the target, and nothing at all while parked, so a stall reports zero and whoever follows
+	 * this playhead parks with it rather than running away from the audio it can hear.
 	 */
 	get playhead(): Playhead | undefined {
 		if (!this.#anchored) return undefined;
-		return { timestamp: this.timestamp, rate: this.stalled ? 0 : 1 };
+
+		const timestamp = this.timestamp;
+		const output = Atomics.load(this.#control, OUTPUT);
+		const stretched = Atomics.load(this.#control, STRETCHED);
+		const elapsed = (output - this.#lastOutput) | 0;
+		const moved = (stretched - this.#lastStretched) | 0;
+		this.#lastOutput = output;
+		this.#lastStretched = stretched;
+
+		return { timestamp, rate: elapsed > 0 ? 1 + moved / elapsed : 0 };
+	}
+
+	/**
+	 * Every control slot at once, for the quality harness and the stats panel.
+	 * Main thread only.
+	 *
+	 * @internal
+	 */
+	debug(): Snapshot {
+		const load = (index: number) => Atomics.load(this.#control, index);
+		return {
+			buffered: this.length,
+			target: load(LATENCY),
+			chunk: load(CHUNK),
+			skip: load(SKIP),
+			stalled: this.stalled,
+			underruns: load(UNDERRUN),
+			queued: load(QUEUED),
+			stretched: load(STRETCHED),
+			output: load(OUTPUT),
+			accelerates: load(ACCELERATES),
+			expands: load(EXPANDS),
+			short: load(SHORT),
+			skips: load(SKIPS),
+			skipped: load(SKIPPED),
+			discarded: load(DISCARDED),
+		};
 	}
 
 	/** Whether the buffer is stalled (waiting to fill). */

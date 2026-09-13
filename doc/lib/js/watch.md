@@ -172,6 +172,23 @@ the player or end the track and the clock is handed back to the wall clock
 where the playhead left it, so nothing jumps. `sync.out.clock` names whichever
 track is driving, or is empty while playback runs on wall time.
 
+## Converging on the delay
+
+The audio ring is almost never exactly on its target: a publisher that flushes
+several frames at once fills it in steps, the network moves the arrivals around,
+and the target itself follows what arrives. Rather than jump, the ring plays the
+media very slightly faster or slower until it is back where it belongs, the way
+WebRTC's NetEq does. Each correction drops or repeats one pitch period, at most
+15ms per 100ms of audio and only where the waveform repeats, so convergence is
+inaudible.
+
+Skipping ahead is left for what the stretch cannot close in half a second, and an
+underrun still renders a ramped gap. `audio.out.underruns` counts the times the
+ring ran dry, and the stats panel shows the corrections beside it: `Stretch`
+counts the blocks played fast and then the blocks played slow, and `Skipped` what
+was thrown away. A healthy stream shows corrections and no skips; skips mean the
+delay is moving faster than the stretch can follow.
+
 ## Buffered playback
 
 By default the player minimizes latency: it skips ahead whenever media piles
