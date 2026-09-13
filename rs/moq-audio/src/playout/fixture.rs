@@ -41,8 +41,11 @@ pub(crate) fn noise(rate: u32, seconds: f32, amplitude: f32, channels: usize) ->
 /// A signal with a short period plus enough noise to spoil its correlation.
 pub(crate) fn buzz(rate: u32, seconds: f32, period: std::time::Duration, amplitude: f32, jitter: f32) -> Vec<f32> {
 	let total = (rate as f32 * seconds) as usize;
-	let len = super::frames(rate, period);
 	let shape = noise(rate, period.as_secs_f32(), amplitude, 1);
+	// The shape's own length, not the rounded frame count: `frames` rounds to nearest and
+	// `noise` truncates, so a period landing on a half frame (5 ms at 44.1 kHz) would index
+	// one sample past the end.
+	let len = shape.len();
 	let dither = noise(rate, seconds, jitter, 1);
 	(0..total).map(|i| shape[i % len] + dither[i]).collect()
 }
