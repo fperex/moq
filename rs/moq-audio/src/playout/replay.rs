@@ -53,3 +53,19 @@ fn a_lan_path_settles_where_the_browser_settles() {
 fn a_seven_frame_flush_settles_where_the_browser_settles() {
 	assert_eq!(replay("relay-bbb-7frame"), Duration::from_millis(240));
 }
+
+/// A browser publisher's microphone over a local relay: 20ms Opus, one frame per
+/// group. The spread is so narrow that the estimator sits on its lowest value, which
+/// is the case the ring's own level has to carry.
+#[test]
+fn a_local_microphone_settles_where_the_browser_settles() {
+	assert_eq!(replay("mic-local"), Duration::from_millis(20));
+}
+
+/// The same publisher through the public relay, 45ms round trip. A wide-area path
+/// adds delay, not spread, so the target is the same 20ms and the listener's wait is
+/// the level playout holds on top of it.
+#[test]
+fn a_remote_microphone_settles_where_the_browser_settles() {
+	assert_eq!(replay("mic-remote"), Duration::from_millis(20));
+}
