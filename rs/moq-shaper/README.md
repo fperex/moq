@@ -67,6 +67,18 @@ Delivery runs through one queue ordered by release time, with arrival order brea
 ties, drained by a single timer. Reorder is therefore always a deliberate act, an extra
 `reorder_delay` on a datagram the generator picked, never a scheduler artifact.
 
+## Jitter does not reorder
+
+Jitter is queueing delay on a FIFO path, so each direction is a queue: a datagram leaves
+no earlier than the one in front of it. The draw stretches and compresses the spacing
+between arrivals, which is what a jittery path does, and never moves one past another.
+Only `reorder` does that, and it counts itself.
+
+This is not a detail. A shaper whose jitter overtakes hands QUIC a gap it can only read
+as loss, so the connection retransmits and backs off, and the run measures congestion
+response rather than the profile. On `mild` (5ms delay, 5ms sigma) that alone dragged a
+receiver's audio buffer from 120ms to nearly two seconds.
+
 ## Why TCP is not impaired
 
 A relay serves `/certificate.sha256` over HTTP on the same port number it serves QUIC on,
@@ -87,9 +99,9 @@ seed = 7
 
 [up]
 delay = "5ms"            # added to every datagram
-jitter = "5ms"           # sigma of a gaussian on top; the total is never negative
+jitter = "5ms"           # sigma of a gaussian on top; never negative, never reorders
 loss = 0.02              # fraction discarded
-reorder = 0.01           # fraction pushed back by reorder_delay
+reorder = 0.01           # fraction pushed back by reorder_delay, the only thing that reorders
 reorder_delay = "20ms"
 
 [up.burst]               # hold up to `count`, or until `window`, then release together

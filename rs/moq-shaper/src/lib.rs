@@ -6,6 +6,12 @@
 //! jitter, loss, reorder, bunching, and a rate limit, with no capabilities and nothing
 //! touching the host's network.
 //!
+//! Jitter is queueing delay on a FIFO path: it stretches and compresses the spacing
+//! between datagrams, and never lets a later one overtake an earlier one. Only the
+//! `reorder` draw does that, which is what keeps a reorder a deliberate act rather than a
+//! side effect of the noise. A shaper that let jitter reorder would be read by QUIC as
+//! loss, and the run would measure congestion response instead of the profile.
+//!
 //! One generator per direction, seeded from the profile, makes the decisions reproducible.
 //! It does not make the kernel's delivery clock reproducible: a replayed run drops and
 //! reorders the same datagrams, but the wall time each one lands is still the host's.
@@ -425,12 +431,7 @@ impl State {
 			return;
 		}
 
-		let mut wait = shape.delay.as_secs_f64() + shape.jitter.as_secs_f64() * spread;
-		if reorder < shape.reorder {
-			wait += shape.reorder_delay.as_secs_f64();
-			lane.counters.reordered += 1;
-		}
-
+		let wait = shape.delay.as_secs_f64() + shape.jitter.as_secs_f64() * spread;
 		let mut release = now + Duration::from_secs_f64(wait.max(0.0));
 
 		if let Some(rate) = shape.rate {
@@ -445,6 +446,18 @@ impl State {
 				release = release.max(now + Duration::from_secs_f64(owed));
 				lane.counters.rate_limited += 1;
 			}
+		}
+
+		// The lane is a queue, so a datagram leaves no earlier than the one in front of it:
+		// jitter varies the spacing, never the order. The front advances by this datagram's
+		// own release, before any reorder delay, so the datagram it is meant to fall behind
+		// is not dragged along with it.
+		release = release.max(lane.last_release);
+		lane.last_release = release;
+
+		if reorder < shape.reorder {
+			release += shape.reorder_delay;
+			lane.counters.reordered += 1;
 		}
 
 		self.seq += 1;
@@ -519,6 +532,9 @@ struct Lane {
 	tokens: f64,
 	refilled: Instant,
 
+	/// When the datagram in front of the queue leaves, which is the floor for the next one.
+	last_release: Instant,
+
 	/// The batch a burst profile is filling, and when it gives up waiting.
 	held: Vec<Entry>,
 	deadline: Option<Instant>,
@@ -537,6 +553,7 @@ impl Lane {
 			shape,
 			rng: SmallRng::seed_from_u64(seed),
 			refilled: start,
+			last_release: start,
 			held: Vec::new(),
 			deadline: None,
 			queued: 0,
@@ -634,6 +651,26 @@ mod tests {
 		}
 	}
 
+	/// Feed `count` numbered datagrams `spacing` apart, the way a live stream arrives.
+	fn stream(state: &mut State, socket: &Arc<UdpSocket>, now: Instant, count: u32, spacing: Duration) {
+		for id in 0..count {
+			let at = now + spacing * id;
+			state.accept(Dir::Up, id.to_be_bytes().to_vec(), socket.clone(), None, at);
+		}
+	}
+
+	/// What the delivery loop would send by `until`, in the order it would send it.
+	fn delivered(state: &mut State, until: Instant) -> Vec<(u32, Instant)> {
+		state
+			.due(until)
+			.into_iter()
+			.map(|entry| {
+				let id = u32::from_be_bytes(entry.payload[..4].try_into().unwrap());
+				(id, entry.at)
+			})
+			.collect()
+	}
+
 	#[tokio::test]
 	async fn an_untreated_datagram_is_due_immediately() {
 		let socket = socket().await;
@@ -681,6 +718,88 @@ mod tests {
 		for entry in state.queue.iter() {
 			assert!(entry.at >= entry.arrived);
 		}
+	}
+
+	#[tokio::test]
+	async fn jitter_alone_never_changes_the_order() {
+		let socket = socket().await;
+		let now = Instant::now();
+		let shape = Direction {
+			delay: Duration::from_millis(5),
+			jitter: Duration::from_millis(50),
+			..Default::default()
+		};
+		let mut state = State::new(&profile(shape), now);
+
+		// Ten times the sigma of arrivals, so an independent draw per datagram would shuffle
+		// nearly all of them. QUIC reads that as loss, retransmits, and the profile stops
+		// measuring what it claims to.
+		stream(&mut state, &socket, now, 2000, Duration::from_millis(5));
+
+		let ids: Vec<u32> = delivered(&mut state, now + Duration::from_secs(60))
+			.into_iter()
+			.map(|(id, _)| id)
+			.collect();
+
+		assert_eq!(ids.len(), 2000);
+		assert!(ids.is_sorted(), "jitter delivered datagrams out of order");
+		assert_eq!(state.lanes[0].counters.reordered, 0, "nothing asked for a reorder");
+	}
+
+	#[tokio::test]
+	async fn the_reorder_draw_is_the_only_thing_that_overtakes() {
+		let socket = socket().await;
+		let now = Instant::now();
+		let shape = Direction {
+			delay: Duration::from_millis(5),
+			jitter: Duration::from_millis(50),
+			reorder: 0.05,
+			reorder_delay: Duration::from_millis(40),
+			..Default::default()
+		};
+		let mut state = State::new(&profile(shape), now);
+
+		stream(&mut state, &socket, now, 2000, Duration::from_millis(5));
+
+		let ids: Vec<u32> = delivered(&mut state, now + Duration::from_secs(60))
+			.into_iter()
+			.map(|(id, _)| id)
+			.collect();
+
+		let overtaken = ids.windows(2).filter(|pair| pair[0] > pair[1]).count();
+		assert!(overtaken > 0, "the reorder draw delivered everything in order anyway");
+		assert!(state.lanes[0].counters.reordered > 0, "the reorder draw never fired");
+	}
+
+	#[tokio::test]
+	async fn fifo_jitter_still_varies_the_spacing() {
+		let socket = socket().await;
+		let now = Instant::now();
+		let spacing = Duration::from_millis(20);
+		let shape = Direction {
+			delay: Duration::from_millis(5),
+			jitter: Duration::from_millis(5),
+			..Default::default()
+		};
+		let mut state = State::new(&profile(shape), now);
+
+		stream(&mut state, &socket, now, 2000, spacing);
+
+		let gaps: Vec<f64> = delivered(&mut state, now + Duration::from_secs(60))
+			.windows(2)
+			.map(|pair| pair[1].1.duration_since(pair[0].1).as_secs_f64())
+			.collect();
+
+		// Keeping the order is not the same as pacing the lane: a datagram that drew a
+		// larger delay than the one in front still falls further behind it, and one that
+		// drew a smaller delay closes up against it.
+		let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
+		let stddev = (gaps.iter().map(|gap| (gap - mean).powi(2)).sum::<f64>() / gaps.len() as f64).sqrt();
+		assert!(stddev > 0.0, "every datagram arrived exactly {mean}s after the last");
+
+		let spacing = spacing.as_secs_f64();
+		assert!(gaps.iter().any(|&gap| gap < spacing), "nothing closed up");
+		assert!(gaps.iter().any(|&gap| gap > spacing), "nothing fell behind");
 	}
 
 	#[tokio::test]

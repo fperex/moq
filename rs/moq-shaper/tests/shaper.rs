@@ -212,6 +212,30 @@ async fn the_control_profile_delivers_everything_in_order() {
 }
 
 #[tokio::test]
+async fn a_jittery_path_delivers_everything_in_order() {
+	// Jitter is queueing delay on a FIFO path: it moves when a datagram leaves, never
+	// which one leaves first. A shaper whose jitter overtook would hand QUIC a gap it can
+	// only read as loss, and every row run over it would measure the congestion response.
+	let upstream = Upstream::start().await;
+	let shape = Direction {
+		delay: Duration::from_millis(5),
+		jitter: Duration::from_millis(50),
+		..Default::default()
+	};
+	let shaper = start(upward("jittery", 23, shape), upstream.addr, false).await;
+
+	blast(shaper.local_addr(), 300, Duration::ZERO).await;
+	let arrived = settle(&shaper, &upstream, 300).await;
+
+	let ids: Vec<u32> = arrived.into_iter().map(|(id, _)| id).collect();
+	assert_eq!(ids, (0..300).collect::<Vec<_>>(), "a jittery path reordered");
+
+	let counters = shaper.report().up;
+	assert_eq!(counters.reordered, 0, "nothing asked for a reorder");
+	assert!(counters.delayed > 0, "nothing was held back");
+}
+
+#[tokio::test]
 async fn an_untreated_profile_reports_nothing_delayed() {
 	// This is the rule a harness leans on: a row whose active profile delayed nothing
 	// never applied its impairment, so the control has to be the only profile that
