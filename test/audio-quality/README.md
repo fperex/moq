@@ -114,6 +114,12 @@ have posted. `analyze.ts` cannot tell which lane produced a file, which is the p
 `render_load` is null here: `AudioContext.renderCapacity` is Chromium's. `worklet_cadence` stands in
 for it, below.
 
+There is no `runtime: "safari"` row in `budgets.json` yet, so `--enforce` reports these rows as
+unbudgeted rather than grading them. That is deliberate: a budget wants several runs of each cell,
+and this lane's numbers move with whatever else is happening on the desktop it is running on, so one
+machine's afternoon is not a bar the lane has to clear. Read the printed table, or `--out` two runs
+and `compare.ts` them.
+
 ## The replay lane
 
 `--runtime replay` grades the recorded arrival traces in

@@ -179,6 +179,7 @@ export function probe(watch: MoqWatch): Probe {
 			outputLatency: context ? context.outputLatency * 1000 : undefined,
 			baseLatency: context ? context.baseLatency * 1000 : undefined,
 			contextTime: context ? context.currentTime * 1000 : undefined,
+			contextRate: context?.sampleRate,
 		};
 	};
 
@@ -218,7 +219,6 @@ export function probe(watch: MoqWatch): Probe {
 				catalogCodec: config?.codec,
 				catalogRate: config?.sampleRate,
 				catalogJitter: config?.jitter,
-				contextRate: maybe(() => watch.audio.out.context.peek()?.sampleRate),
 				timeOrigin: performance.timeOrigin,
 			};
 		},

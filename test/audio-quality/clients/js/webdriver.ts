@@ -168,11 +168,16 @@ async function request(origin: string, method: string, path: string, body?: unkn
 		throw new Error(`${method} ${path}: ${response.status} with an unreadable body: ${text.slice(0, 200)}`);
 	}
 
-	const value = payload.value;
-	if (value && typeof value === "object" && "error" in value) {
-		const error = value as { error: string; message?: string };
-		throw new WebDriverError(error.error, error.message ?? "");
+	// The status decides, not the shape. A command that succeeds and returns an object with an
+	// `error` key of its own is a perfectly good result, and reading the envelope first would turn
+	// it into a thrown WebDriverError.
+	if (!response.ok) {
+		const value = payload.value;
+		if (value && typeof value === "object" && "error" in value) {
+			const error = value as { error: string; message?: string };
+			throw new WebDriverError(error.error, error.message ?? "");
+		}
+		throw new Error(`${method} ${path}: ${response.status} ${text.slice(0, 200)}`);
 	}
-	if (!response.ok) throw new Error(`${method} ${path}: ${response.status} ${text.slice(0, 200)}`);
-	return value;
+	return payload.value;
 }

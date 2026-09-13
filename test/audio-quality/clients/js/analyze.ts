@@ -333,7 +333,7 @@ const loads = window.map((s) => s.renderLoad).filter((x): x is number => typeof 
 // It needs the device's rate, not the stream's: a 44.1 kHz stream still renders at whatever the
 // output device runs at. Without it there is no quantum to count, so the metric is null rather than
 // computed against a guess.
-const contextRate = environment?.contextRate;
+const contextRate = window.find((s) => typeof s.contextRate === "number")?.contextRate;
 const cadences: number[] = [];
 if (typeof contextRate === "number" && contextRate > 0) {
 	const nominal = (CADENCE_QUANTA * RENDER_QUANTUM * 1000) / contextRate;

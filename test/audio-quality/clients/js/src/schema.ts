@@ -355,6 +355,15 @@ export type Sample = {
 	baseLatency?: Ms;
 	/** `AudioContext.currentTime`, in ms: the device clock, which must track wall time. */
 	contextTime?: Ms;
+	/**
+	 * `AudioContext.sampleRate`, in Hz: the device's rate, not the stream's.
+	 *
+	 * It is what a render quantum is worth in wall time, so `worklet_cadence` is unreadable without
+	 * it, and it is routinely not the catalog's: a 44.1 kHz stream still renders at whatever the
+	 * output device runs at. Sampled rather than reported once in the {@link Environment}, because
+	 * the context does not exist yet when the catalog first makes the rest of that readable.
+	 */
+	contextRate?: number;
 };
 
 /** What the page reports once, at the start, rather than every sample. */
@@ -371,14 +380,6 @@ export type Environment = {
 	catalogRate?: number;
 	/** The publisher's declared flush span, in ms: the `publish_flush` stage, declared not measured. */
 	catalogJitter?: Ms;
-	/**
-	 * `AudioContext.sampleRate`, in Hz: the device's rate, not the stream's.
-	 *
-	 * It is what a render quantum is worth in wall time, so `worklet_cadence` is unreadable without
-	 * it, and it is routinely not the catalog's rate: a 44.1 kHz stream still renders at whatever
-	 * the output device runs at.
-	 */
-	contextRate?: number;
 	/** `performance.timeOrigin`, so the viewer clock can be put on the host epoch. */
 	timeOrigin: number;
 };

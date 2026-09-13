@@ -24,7 +24,13 @@ export type BeaconProps = {
 	tag: string;
 	/** Take everything sampled since the last call. */
 	drain: () => Sample[];
-	/** What the page is, once it knows. Repeated on the batch where it first becomes available. */
+	/**
+	 * What the page is, once it knows. Null until the session is up.
+	 *
+	 * Sent on the first batch that can report it, and not again: it carries the connection's
+	 * round-trip time, which moves constantly, so re-sending it on a change would be re-sending it
+	 * every batch. Anything not settled by the time the catalog arrives is a {@link Sample} field.
+	 */
 	environment: () => Environment | null;
 	/** Console warnings and errors so far. */
 	notes: () => string[];
@@ -32,18 +38,12 @@ export type BeaconProps = {
 
 /** Start shipping. The returned function flushes once more and stops. */
 export function beacon(props: BeaconProps): () => void {
-	// The last environment shipped, as JSON, so a change is detectable without a deep compare. It
-	// does change: the catalog is readable before the AudioContext exists, so the first batch that
-	// can report anything cannot yet report the device's rate, and a run whose page never re-sent it
-	// would have no rate to convert a render quantum with.
-	let sent: string | undefined;
+	let sentEnvironment = false;
 
 	const batch = (final: boolean): Beacon | undefined => {
 		const samples = props.drain();
-		const current = props.environment();
-		const encoded = current === null ? undefined : JSON.stringify(current);
-		const environment = encoded !== undefined && encoded !== sent ? (current ?? undefined) : undefined;
-		if (environment) sent = encoded;
+		const environment = sentEnvironment ? undefined : (props.environment() ?? undefined);
+		if (environment) sentEnvironment = true;
 		// A batch with nothing new in it is not worth a request, but the last one always goes: it is
 		// what tells the sink the row ended rather than the page having died mid-run.
 		if (!final && samples.length === 0 && !environment) return undefined;
