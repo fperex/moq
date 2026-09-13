@@ -87,6 +87,7 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	const aChannels = line(audioCard.grid, "Channels");
 	const aBitrate = line(audioCard.grid, "Bitrate");
 	const aUnderruns = line(audioCard.grid, "Underruns");
+	const aStretch = line(audioCard.grid, "Stretch");
 	const aSkipped = line(audioCard.grid, "Skipped");
 	const aClock = line(audioCard.grid, "Clock");
 	track(parent, audioCard, {
@@ -144,9 +145,16 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 		const aUnder = watch.audio.out.underruns.peek();
 		aUnderruns.textContent = watch.audio.out.stalled.peek() ? `${aUnder} (buffering)` : `${aUnder}`;
 
+		// How often the ring played the media slightly fast or slow to converge on the delay. A
+		// stream that shows these and no skips is converging the way it should.
+		const playout = watch.audio.out.debug.peek();
+		aStretch.textContent = playout ? `${playout.accelerates} / ${playout.expands}` : "—";
+
 		// Content lost above the decoder, which an underrun count alone cannot show: the ring
-		// never ran dry, the frames simply never got there.
-		aSkipped.textContent = `${watch.audio.out.skipped.peek()}`;
+		// never ran dry, the frames simply never got there. The ring's own jumps join it, since a
+		// listener cannot tell the two apart.
+		const jumped = playout ? playout.skips : 0;
+		aSkipped.textContent = `${watch.audio.out.skipped.peek() + jumped}`;
 
 		// Which playhead paces everything else. "wall" means nothing is rendering on a clock of its
 		// own (video only, muted, or audio that stopped), so playback runs on wall time instead.

@@ -1,13 +1,15 @@
 import type * as Catalog from "@moq/hang/catalog";
 import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
+import { STRETCH_BOUND } from "./playout";
 
 /**
  * The AudioWorklet's render block, in samples. Fixed by the spec.
  *
- * It is the granularity of every read out of the audio ring, so it belongs to the ring's slack and
- * not to the arrival estimate: native has no worklet, and a target series carrying the browser's
- * render block could not be held to the same conformance corpus.
+ * The floor under any ring depth, since a ring shallower than one block can never be read from. It
+ * is this reader's own granularity rather than anything about the stream, so it stays out of the
+ * arrival estimate: native has no worklet, and a target series carrying the browser's render block
+ * could not be held to the same conformance corpus.
  */
 export const WORKLET_QUANTUM = 128;
 const OPUS_FRAME_DURATION_MS = 20;
@@ -81,17 +83,14 @@ export function audioMaxAge(maxAge: Time.Milli, config: Catalog.AudioConfig | un
  * to the target alone convicts the arrivals the target was sized to cover. Three terms separate
  * them, and each is something the ring absorbs without dropping a sample: the estimator reports a
  * bucket's upper edge, so the real delay sits up to one bucket below it; a frame arrives whole, so
- * the last one to land carries its own duration; and the ring is read a render quantum at a time.
- *
- * Stage 5 replaces the quantum with the time-stretch bound, which is the larger thing the ring will
- * absorb once it can stretch.
+ * the last one to land carries its own duration; and the reader's time stretch plays the ring back
+ * onto its target across the stretch band rather than dropping what sits inside it.
  */
 export function maxAgeHeadroom(config: Catalog.AudioConfig): Time.Milli {
 	// The codec's own frame duration, not the advertised flush span: a publisher batching ten
 	// frames per flush still delivers them one frame at a time to the ring.
 	const frame = defaultJitter(config) ?? config.jitter ?? 0;
-	const quantum = (WORKLET_QUANTUM / config.sampleRate) * 1000;
-	return Time.Milli(Math.ceil(Container.Jitter.BUCKET + frame + quantum));
+	return Time.Milli(Math.ceil(Container.Jitter.BUCKET + frame + STRETCH_BOUND));
 }
 
 // Estimate the minimum jitter (frame duration) based on the audio codec.

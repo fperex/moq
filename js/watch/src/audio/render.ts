@@ -1,5 +1,6 @@
 import type { Time } from "@moq/net";
 import type { Playhead } from "./playhead";
+import type { Snapshot } from "./playout";
 import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
 /** Everything the main thread sends the render worklet over its port. */
@@ -63,7 +64,7 @@ export interface State {
 	// Where the reader is and how fast it is moving, or undefined until the first write anchors the
 	// ring. The main thread stamps it with its arrival and extrapolates until the next one.
 	playhead: Playhead | undefined;
-	stalled: boolean;
-	// How many times the ring has run dry mid-playback, cumulative.
-	underruns: number;
+	// Every counter the shared transport keeps in its control array, since the main thread cannot
+	// read this ring's memory directly.
+	debug: Snapshot;
 }

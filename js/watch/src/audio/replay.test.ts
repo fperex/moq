@@ -8,6 +8,7 @@ import { maxAgeHeadroom } from "./config";
 import fourKWebm from "./fixtures/4k-webm.json" with { type: "json" };
 import lanBbb from "./fixtures/lan-bbb.json" with { type: "json" };
 import relayBbb7Frame from "./fixtures/relay-bbb-7frame.json" with { type: "json" };
+import { type RingReader, type Snapshot, Stretcher } from "./playout";
 import { AudioRingBuffer } from "./ring-buffer";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -102,9 +103,10 @@ function target(t: Arrival[]): number {
 
 /** The two rings behind one interface, since the harness drives them identically. */
 interface Ring {
+	readonly reader: RingReader;
 	insert(timestamp: Time.Micro, data: Float32Array[]): void;
-	read(output: Float32Array[]): number;
 	setLatency(ms: number): void;
+	debug(): Snapshot;
 	readonly length: number;
 }
 
@@ -115,9 +117,10 @@ function shared(latencyMs: number): Ring {
 	const ring = new SharedRingBuffer(allocSharedRingBuffer(1, ceiling, RATE));
 	ring.setLatency(Math.ceil((RATE * latencyMs) / 1000));
 	return {
+		reader: ring,
 		insert: (timestamp, data) => ring.insert(timestamp, data),
-		read: (output) => ring.read(output),
 		setLatency: (ms) => ring.setLatency(Math.ceil((RATE * ms) / 1000)),
+		debug: () => ring.debug(),
 		get length() {
 			return ring.length;
 		},
@@ -127,9 +130,10 @@ function shared(latencyMs: number): Ring {
 function post(latencyMs: number): Ring {
 	const ring = new AudioRingBuffer({ rate: RATE, channels: 1, latency: latencyMs as Time.Milli });
 	return {
+		reader: ring,
 		insert: (timestamp, data) => ring.write(timestamp, data),
-		read: (output) => ring.read(output),
 		setLatency: (ms) => ring.resize(ms as Time.Milli),
+		debug: () => ring.debug(),
 		get length() {
 			return ring.length;
 		},
@@ -137,12 +141,17 @@ function post(latencyMs: number): Ring {
 }
 
 interface Result {
-	/** Quanta rendered short of a full block after the warmup, i.e. audible underruns. */
+	/** Times the reader ran dry mid-playback after the warmup. */
 	underruns: number;
-	/** Samples inserted after the warmup that were never played: skipped or overflow-dropped. */
+	/** Samples thrown away after the warmup: the reader skipped them or the writer dropped them. */
 	skipped: number;
 	/** Quanta rendered after the warmup, so `underruns` can be read as a rate. */
 	quanta: number;
+	/** Quanta that came back short of a full block after the warmup. */
+	short: number;
+	/** Blocks the time stretch shortened and lengthened after the warmup. */
+	accelerates: number;
+	expands: number;
 }
 
 /**
@@ -167,7 +176,8 @@ function frameSamples(t: Arrival[]): number[] {
 
 /**
  * Play `t` through `ring` in real time: insert every frame the moment it arrives, and pull one
- * render quantum every quantum's worth of wall time, which is what the AudioWorklet does.
+ * render quantum every quantum's worth of wall time through the real playout engine, which is what
+ * the AudioWorklet does.
  */
 function replay(build: (latencyMs: number) => Ring, t: Arrival[], warmupMs: number, fixed?: number): Result {
 	const step = (QUANTUM / RATE) * 1000;
@@ -183,43 +193,59 @@ function replay(build: (latencyMs: number) => Ring, t: Arrival[], warmupMs: numb
 	const latency = () => fixed ?? Math.max(FLOOR, jitter.value.peek());
 
 	const ring = build(latency());
+	const engine = new Stretcher(RATE, 1);
 
 	let next = 0;
-	let played = 0;
-	let inserted = 0;
-	let short = 0;
+	let outputFrame = 0;
 	let started = false;
 	let quanta = 0;
-	let mark: { played: number; inserted: number; buffered: number; short: number; quanta: number } | undefined;
+	let short = 0;
+	let mark: { quanta: number; short: number; debug: Snapshot } | undefined;
 
 	for (let now = 0; now < end; now += step) {
 		while (next < t.length && t[next].arrival <= now) {
 			const count = samples[next];
 			jitter.observe(Time.Micro.fromMilli(t[next].media as Time.Milli), now as Time.Milli);
 			ring.setLatency(latency());
-			ring.insert(Time.Micro.fromMilli(t[next].media as Time.Milli), [new Float32Array(count).fill(0.5)]);
-			inserted += count;
+			// A 200Hz tone rather than a constant: a splice on a constant is seamless whatever the
+			// correlation search decides, which would hide a kernel that picked the wrong lag.
+			ring.insert(Time.Micro.fromMilli(t[next].media as Time.Milli), [voice(count)]);
 			next++;
 		}
 
-		const count = ring.read(output);
-		played += count;
+		const count = engine.render(ring.reader, output, outputFrame);
+		outputFrame += QUANTUM;
 		quanta++;
 		if (started && count < QUANTUM) short++;
 		if (count > 0) started = true;
 
-		if (now >= warmupMs && !mark) mark = { played, inserted, buffered: ring.length, short, quanta };
+		if (now >= warmupMs && !mark) mark = { quanta, short, debug: ring.debug() };
 	}
 
-	const from = mark ?? { played, inserted, buffered: ring.length, short, quanta };
+	const debug = ring.debug();
+	const from = mark ?? { quanta, short, debug };
 	return {
-		underruns: short - from.short,
-		skipped: inserted - from.inserted - (played - from.played) - (ring.length - from.buffered),
+		underruns: debug.underruns - from.debug.underruns,
+		skipped: debug.skipped - from.debug.skipped + (debug.discarded - from.debug.discarded),
 		quanta: quanta - from.quanta,
+		short: short - from.short,
+		accelerates: debug.accelerates - from.debug.accelerates,
+		expands: debug.expands - from.debug.expands,
 	};
 }
 
-/** Drop the quantum count, so a clean run compares as a whole object. */
+/** A 200Hz tone the correlation search can find a period in. */
+const TONE = new Float32Array(RATE);
+for (let i = 0; i < TONE.length; i++) TONE[i] = 0.5 * Math.sin((2 * Math.PI * 200 * i) / RATE);
+
+let voiceAt = 0;
+function voice(count: number): Float32Array {
+	const start = voiceAt % (TONE.length - count);
+	voiceAt += count;
+	return TONE.slice(start, start + count);
+}
+
+/** Drop everything but what a listener would notice, so a clean run compares as a whole object. */
 function clean({ underruns, skipped }: Result): { underruns: number; skipped: number } {
 	return { underruns, skipped };
 }
@@ -254,38 +280,56 @@ describe.each(RINGS)("%s ring replay", (_name, build) => {
 		expect(clean(replay(build, t, WARMUP))).toEqual({ underruns: 0, skipped: 0 });
 	});
 
-	it("underruns constantly when the target ignores the arrival spread", () => {
+	it("runs dry when the target ignores the arrival spread", () => {
 		// 46ms is what the round-trip formula produced on the connection this was measured on: it
 		// describes the network and says nothing about a sender that flushes five frames at once.
+		// The time stretch bends a few percent; it cannot invent the fifty milliseconds the target
+		// is short by, so the ring still runs dry between flushes.
 		const t = trace(600, 5, 5);
 		const result = replay(build, t, WARMUP, 46);
-		expect(result.underruns).toBeGreaterThan(100);
-		expect(result.skipped).toBeGreaterThan(10 * CHUNK);
+		expect(result.underruns).toBeGreaterThan(20);
+		// Nothing is thrown away even here: a flush only inflates the ring until it drains again,
+		// which the reader no longer mistakes for a surplus. A target this shallow costs silence,
+		// not audio.
+		expect(result.skipped).toBe(0);
 	});
 });
 
 /**
- * Each recording, and what it is here to hold.
+ * Each recording, and what it is here to hold once the target has settled.
  *
- * `improvement` is how much better than the 46ms round-trip target the measured one has to be. The
- * LAN trace has almost no spread, so the round trip is already about the right size there and the
- * claim worth making is only that measuring does not make it worse in kind.
+ * Two of the three are zero on both counts: a target sized from the arrivals and a reader that
+ * bends the media to reach it neither runs dry nor throws anything away.
  *
- * `shortRate` is the share of quanta allowed to end short, and it is not zero. The target is a 95th
- * percentile, so the tail above it lands by construction, and the two remote recordings also carry
- * real holes in their media: they were captured through a client whose age budget was skipping
- * groups, which is the finding the next quest is about. Absorbing the rest without a deeper buffer
- * is what the time-stretch quest is for. These are ceilings, not goals.
+ * The 4k recording is not, and its budget names why rather than rounding it off. It carries real
+ * holes in its media, because it was captured through a client whose age budget was skipping
+ * groups: no reader can play audio that never arrived, so the ring runs dry where the hole is and
+ * the frame that lands after it is entirely older than the playhead. Concealment is the next quest;
+ * until then those quanta are silence.
+ *
+ * `measured` is above the round trip, which is the claim about the estimator: the LAN trace has
+ * almost no spread, so the round trip is already about the right size there and the only claim
+ * worth making is that measuring does not make it worse in kind.
  */
-const FIXTURES: Array<[string, Fixture, { improvement: number; shortRate: number }]> = [
-	["lan-bbb", lanBbb as Fixture, { improvement: 0, shortRate: 0.02 }],
-	["relay-bbb-7frame", relayBbb7Frame as Fixture, { improvement: 4, shortRate: 0.05 }],
-	["4k-webm", fourKWebm as Fixture, { improvement: 4, shortRate: 0.05 }],
+interface Budget {
+	/** Times the ring may run dry after the warmup. */
+	underruns: number;
+	/** Samples that may be thrown away after the warmup. */
+	skipped: number;
+	/** Whether the measured target should come out above the 46ms round trip. */
+	deeper: boolean;
+}
+
+const FIXTURES: Array<[string, Fixture, Budget]> = [
+	["lan-bbb", lanBbb as Fixture, { underruns: 0, skipped: 0, deeper: false }],
+	["relay-bbb-7frame", relayBbb7Frame as Fixture, { underruns: 0, skipped: 0, deeper: true }],
+	// One hole in the recording: one dry ring, and one frame that arrived entirely too late.
+	["4k-webm", fourKWebm as Fixture, { underruns: 2, skipped: CHUNK, deeper: true }],
 ];
 
 describe.each(RINGS)("%s ring, recorded traces", (ring, build) => {
 	for (const [name, fixture, budget] of FIXTURES) {
-		it(`sizes ${name} from what arrived rather than from the round trip`, () => {
+		it(`plays ${name} without running dry or throwing audio away`, () => {
 			const t = recorded(fixture);
 			const settled = target(t);
 			const measured = replay(build, t, 4000);
@@ -294,16 +338,20 @@ describe.each(RINGS)("%s ring, recorded traces", (ring, build) => {
 			// Printed, because a regression in the estimator shows up as a different target long
 			// before it shows up as an underrun.
 			console.log(
-				`${ring}/${name}: target ${settled}ms, ${measured.underruns}/${measured.quanta} short quanta and ${measured.skipped} skipped samples, against ${rtt.underruns} and ${rtt.skipped} at the 46ms round-trip target`,
+				`${ring}/${name}: target ${settled}ms, ${measured.underruns} underruns and ${measured.skipped} skipped samples over ${measured.quanta} quanta, with ${measured.accelerates} accelerates and ${measured.expands} expands, against ${rtt.underruns} and ${rtt.skipped} at the 46ms round-trip target`,
 			);
 
 			expect(settled % Container.Jitter.BUCKET).toBe(0);
-			expect(measured.underruns / measured.quanta).toBeLessThan(budget.shortRate);
+			expect(measured.underruns).toBeLessThanOrEqual(budget.underruns);
+			expect(measured.skipped).toBeLessThanOrEqual(budget.skipped);
 
-			if (budget.improvement > 0) {
+			if (budget.deeper) {
 				expect(settled).toBeGreaterThan(46);
-				expect(measured.underruns * budget.improvement).toBeLessThan(rtt.underruns);
-				expect(measured.skipped * budget.improvement).toBeLessThan(rtt.skipped);
+				// The control: the round trip describes the network and says nothing about a
+				// publisher that flushes several frames at once, and no reader can bend media it
+				// was never given time to hold.
+				expect(measured.underruns).toBeLessThan(rtt.underruns);
+				expect(measured.skipped).toBeLessThan(rtt.skipped);
 			}
 		});
 	}

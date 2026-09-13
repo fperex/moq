@@ -70,7 +70,7 @@ describe("initialization", () => {
 		expect(init.capacity).toBe(128);
 		expect(init.rate).toBe(1000);
 		expect(init.samples.byteLength).toBe(2 * 128 * 4); // 2 channels * 128 samples * Float32
-		expect(init.control.byteLength).toBe(6 * 4); // 6 control slots * Int32
+		expect(init.control.byteLength).toBe(16 * 4); // 16 control slots * Int32
 		expect(init.state.byteLength).toBe(8); // packed epoch + read cursor
 	});
 
@@ -425,56 +425,58 @@ describe("overflow", () => {
 });
 
 describe("latency skip", () => {
-	// 256 sample target, 128 sample chunks, 128 sample render quantum: the band is 512.
-	const BAND = { rate: 1000, channels: 1, capacity: 2048, latency: 256 };
+	// 325 sample target, 100 sample chunks, and the 75 sample stretch band at this rate: 500 in all.
+	const BAND = { rate: 1000, channels: 1, capacity: 2048, latency: 325 };
+	const TARGET = 325;
+	const CHUNK = 100;
 
-	it("should skip READ when buffered exceeds LATENCY plus a chunk and a quantum", () => {
+	it("should skip READ when buffered exceeds LATENCY plus a chunk and the stretch band", () => {
 		const buffer = create(BAND);
 
-		// Fill 768 samples in 128-sample chunks, well past the 512 sample band.
-		insertChunks(buffer, 0, 768, 128, { channels: 1, value: 1.0 });
+		// Fill 700 samples in 100-sample chunks, well past the 500 sample band.
+		insertChunks(buffer, 0, 700, CHUNK, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read should skip ahead to maintain LATENCY distance from WRITE
 		const output = read(buffer, 1024, 1);
 
-		// Should only get LATENCY (256) samples, skipping the first 512
-		expect(output[0].length).toBe(256);
+		// Should only get LATENCY samples, skipping the rest
+		expect(output[0].length).toBe(TARGET);
 	});
 
-	it("should tolerate one chunk and one render quantum above LATENCY", () => {
-		// A ring sitting on the target is a chunk above it the moment the next chunk lands, and a
-		// quantum above it between two reads. Skipping on either overshoot discards audio the
-		// reader was going to play anyway.
+	it("should tolerate one chunk and the stretch band above LATENCY", () => {
+		// A ring sitting on the target is a chunk above it the moment the next chunk lands, and the
+		// band above that is what the reader's time stretch closes on its own. Skipping on either
+		// overshoot discards audio the reader was going to play anyway.
 		const buffer = create(BAND);
 
-		insertChunks(buffer, 0, 512, 128, { channels: 1, value: 1.0 });
+		insertChunks(buffer, 0, 500, CHUNK, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		const output = read(buffer, 1024, 1);
-		expect(output[0].length).toBe(512);
+		expect(output[0].length).toBe(500);
 	});
 
 	it("should skip one chunk past the band", () => {
 		const buffer = create(BAND);
 
-		insertChunks(buffer, 0, 640, 128, { channels: 1, value: 1.0 });
+		insertChunks(buffer, 0, 600, CHUNK, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		const output = read(buffer, 1024, 1);
-		expect(output[0].length).toBe(256);
+		expect(output[0].length).toBe(TARGET);
 	});
 
 	it("should not skip when buffered is within LATENCY", () => {
 		const buffer = create(BAND);
 
-		// Fill exactly 256 samples = LATENCY
-		insert(buffer, 0, 256, { channels: 1, value: 1.0 });
+		// Fill exactly LATENCY samples
+		insert(buffer, 0, TARGET, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
-		// Read should get all 256 — no skip needed
+		// Read should get all of them: no skip needed
 		const output = read(buffer, 1024, 1);
-		expect(output[0].length).toBe(256);
+		expect(output[0].length).toBe(TARGET);
 	});
 });
 

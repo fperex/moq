@@ -3,6 +3,7 @@ import { Time } from "@moq/net";
 import { Effect, type Getter, Signal } from "@moq/signals";
 import type { Clock } from "../sync";
 import type { Playhead } from "./playhead";
+import type { Snapshot } from "./playout";
 import type { Data, InitPost, InitShared, Latency, Reset, Stall, State, Truncate } from "./render";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -182,6 +183,14 @@ export interface AudioBuffer {
 	/** How many times the ring has run dry mid-playback, cumulative. */
 	readonly underruns: Getter<number>;
 
+	/**
+	 * Every control slot at once: what the ring holds, what the playout engine did with it, and what
+	 * either end threw away. Undefined until the first sample lands.
+	 *
+	 * @internal
+	 */
+	readonly debug: Getter<Snapshot | undefined>;
+
 	/** Release any resources (event listeners, intervals, etc.). */
 	close(): void;
 }
@@ -233,6 +242,9 @@ class SharedAudioBuffer implements AudioBuffer {
 	readonly #underruns = new Signal<number>(0);
 	readonly underruns: Getter<number> = this.#underruns;
 
+	readonly #debug = new Signal<Snapshot | undefined>(undefined);
+	readonly debug: Getter<Snapshot | undefined> = this.#debug;
+
 	readonly #clock = new Signal<Clock | undefined>(undefined);
 	readonly clock: Getter<Clock | undefined> = this.#clock;
 	readonly #clockSource = new ClockSource();
@@ -269,6 +281,7 @@ class SharedAudioBuffer implements AudioBuffer {
 			this.#timestamp.set(this.#ring.timestamp);
 			this.#stalled.set(stalled);
 			this.#underruns.set(this.#ring.underruns);
+			this.#debug.set(this.#ring.debug());
 			this.#clock.set(this.#clockSource.sample(this.#ring.playhead));
 			// While stalled the playhead is parked, so release the decode loop to refill the floor;
 			// once playing, hold it to ~the floor ahead.
@@ -345,6 +358,9 @@ class PostAudioBuffer implements AudioBuffer {
 	readonly #underruns = new Signal<number>(0);
 	readonly underruns: Getter<number> = this.#underruns;
 
+	readonly #debug = new Signal<Snapshot | undefined>(undefined);
+	readonly debug: Getter<Snapshot | undefined> = this.#debug;
+
 	readonly #clock = new Signal<Clock | undefined>(undefined);
 	readonly clock: Getter<Clock | undefined> = this.#clock;
 	readonly #clockSource = new ClockSource();
@@ -371,14 +387,15 @@ class PostAudioBuffer implements AudioBuffer {
 			if (data?.type === "state") {
 				const timestamp = data.playhead?.timestamp ?? Time.Micro.zero;
 				this.#timestamp.set(timestamp);
-				this.#stalled.set(data.stalled);
-				this.#underruns.set(data.underruns);
+				this.#stalled.set(data.debug.stalled);
+				this.#underruns.set(data.debug.underruns);
+				this.#debug.set(data.debug);
 				// Stamped on arrival rather than at the send, so the clock carries the transport's
 				// own lag; the main thread extrapolates from here until the next message.
 				this.#clock.set(this.#clockSource.sample(data.playhead));
 				// While stalled the playhead is parked, so release the decode loop to refill the floor;
 				// once playing, hold it to ~the floor ahead.
-				if (data.stalled) this.#backpressure.flush();
+				if (data.debug.stalled) this.#backpressure.flush();
 				else this.#backpressure.advance(timestamp);
 			}
 		});

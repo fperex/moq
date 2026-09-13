@@ -1,9 +1,8 @@
 import { Time } from "@moq/net";
-import { WORKLET_QUANTUM } from "./config";
 import type { Playhead } from "./playhead";
-import type { RingView } from "./playout";
+import { type Counters, Floor, frames, type RingReader, type RingView, type Snapshot, STRETCH_BOUND } from "./playout";
 
-export class AudioRingBuffer {
+export class AudioRingBuffer implements RingReader {
 	#buffer: Float32Array[];
 	#writeIndex = 0;
 	#readIndex = 0;
@@ -30,6 +29,27 @@ export class AudioRingBuffer {
 	// one knows to drop it. The shared transport reads its mutation epoch for the same purpose.
 	#generation = 0;
 
+	// How far above `latency + chunk` the ring may sit before the reader skips ahead. A property of
+	// the reader's time stretch rather than of this stream: everything inside the band is something
+	// the stretch closes without dropping a sample.
+	readonly #skip: number;
+
+	// What the playout engine is holding, plus what the writer threw away. The shared transport
+	// keeps the same numbers in its control array; here the worklet owns both ends, so they are
+	// plain fields shipped to the main thread in the state message.
+	#counters: Counters = { queued: 0, stretched: 0, output: 0, accelerates: 0, expands: 0, short: 0 };
+	#skips = 0;
+	#skipped = 0;
+	#discarded = 0;
+	// Samples the writer dropped out from under the reader since its last view, which the playout
+	// engine has to treat as a step rather than as the buffer draining.
+	#jumped = 0;
+
+	// The depth the ring keeps between flushes, which is the one that says a surplus is real.
+	#floor = new Floor();
+	#lastOutput = 0;
+	#lastStretched = 0;
+
 	constructor(props: {
 		rate: number;
 		channels: number;
@@ -46,6 +66,7 @@ export class AudioRingBuffer {
 		this.rate = props.rate;
 		this.channels = props.channels;
 		this.#buffered = props.buffered ?? false;
+		this.#skip = frames(props.rate, STRETCH_BOUND);
 
 		// The ring holds the latency floor as PCM, with headroom above it. Sizing capacity to the
 		// floor exactly makes the ring physically incapable of holding the slack the overflow band
@@ -60,11 +81,12 @@ export class AudioRingBuffer {
 		}
 	}
 
-	// Twice the target, so the ring can physically hold the skip band above it. `resize` keeps this
-	// true as the target moves, which is what stops a rising adaptive target from being silently
-	// capped by the `Math.min(..., capacity)` in `write`.
+	// Twice the target, plus the stretch band the reader converges across so the ring can physically
+	// hold it however shallow the target is. `resize` keeps this true as the target moves, which is
+	// what stops a rising adaptive target from being silently capped by the `Math.min(..., capacity)`
+	// in `write`. Buffered mode never skips ahead, so it has no band to hold.
 	#capacityFor(latencySamples: number): number {
-		return latencySamples * 2;
+		return latencySamples * 2 + (this.#buffered ? 0 : this.#skip);
 	}
 
 	get stalled(): boolean {
@@ -76,22 +98,57 @@ export class AudioRingBuffer {
 		return this.#underruns;
 	}
 
+	/**
+	 * Current playback timestamp: READ less what the reader is still holding.
+	 *
+	 * A time stretch makes those two diverge, and it is the media position, not the output frame
+	 * count, that video has to be paced against.
+	 */
 	get timestamp(): Time.Micro {
-		return Time.Micro.fromSecond((this.#readIndex / this.rate) as Time.Second);
+		return Time.Micro.fromSecond(((this.#readIndex - this.#counters.queued) / this.rate) as Time.Second);
 	}
 
 	/**
 	 * Where the reader is on the media timeline and how fast it is moving, or undefined until the
 	 * first write anchors the ring.
 	 *
-	 * Read in the worklet and posted to the main thread, which extrapolates between messages. The
-	 * rate is the reader's own: it drains a quantum per quantum while playing and nothing at all
-	 * while stalled, so a stall reports zero and whoever follows this playhead parks with it rather
-	 * than running away from the audio it can hear.
+	 * Read in the worklet and posted to the main thread, which extrapolates between messages, so it
+	 * is stateful: the rate is measured between reads of this getter.
+	 *
+	 * The rate is the reader's own, `1 + dSTRETCHED/dOUTPUT`: it consumes a sample of media per
+	 * output frame while playing normally, a few percent more or less while a time stretch converges
+	 * on the target, and nothing at all while parked, so a stall reports zero and whoever follows
+	 * this playhead parks with it rather than running away from the audio it can hear.
 	 */
 	get playhead(): Playhead | undefined {
 		if (!this.#anchored) return undefined;
-		return { timestamp: this.timestamp, rate: this.#stalled ? 0 : 1 };
+
+		const elapsed = this.#counters.output - this.#lastOutput;
+		const moved = this.#counters.stretched - this.#lastStretched;
+		this.#lastOutput = this.#counters.output;
+		this.#lastStretched = this.#counters.stretched;
+
+		return { timestamp: this.timestamp, rate: elapsed > 0 ? 1 + moved / elapsed : 0 };
+	}
+
+	/**
+	 * Every counter at once, for the quality harness and the stats panel.
+	 *
+	 * @internal
+	 */
+	debug(): Snapshot {
+		return {
+			...this.#counters,
+			buffered: this.length,
+			target: this.#latencySamples,
+			chunk: this.#chunk,
+			skip: this.#skip,
+			stalled: this.#stalled,
+			underruns: this.#underruns,
+			skips: this.#skips,
+			skipped: this.#skipped,
+			discarded: this.#discarded,
+		};
 	}
 
 	get length(): number {
@@ -105,9 +162,10 @@ export class AudioRingBuffer {
 	resize(latency: Time.Milli): void {
 		this.#latencySamples = Math.ceil(this.rate * Time.Second.fromMilli(latency));
 
+		if (this.#latencySamples === 0) throw new Error("empty buffer");
+
 		const newCapacity = this.#capacityFor(this.#latencySamples);
 		if (newCapacity === this.capacity) return;
-		if (newCapacity === 0) throw new Error("empty buffer");
 
 		const newBuffer: Float32Array[] = [];
 		for (let i = 0; i < this.channels; i++) {
@@ -157,9 +215,11 @@ export class AudioRingBuffer {
 		let offset = this.#readIndex - start;
 		if (offset > samples) {
 			// All samples are too old, ignore them
+			this.#discarded += samples;
 			return;
 		} else if (offset > 0) {
 			// Some samples are too old, skip them
+			this.#discarded += offset;
 			samples -= offset;
 			start += offset;
 		} else {
@@ -169,19 +229,30 @@ export class AudioRingBuffer {
 		const end = start + samples;
 		this.#chunk = data[0].length;
 
-		// Bound the ring. While playing, drop the oldest once it holds a whole chunk plus a render
-		// quantum more than the target and land back on the target: frames arrive one chunk at a
-		// time, so a ring sitting exactly on the target is a chunk above it the moment the next one
-		// lands, and dropping on that overshoot discards audio on every single write. The quantum on
-		// top is the reader's own granularity, which puts the ring a block above the target between
-		// reads for the same harmless reason. While stalled the reader is not consuming, so only the
-		// hard capacity applies; the band would throw away the very audio the refill is accumulating.
+		// Bound the ring. While playing, drop the oldest once it holds a whole chunk plus the stretch
+		// band more than the target and land back on the target: frames arrive one chunk at a time,
+		// so a ring sitting exactly on the target is a chunk above it the moment the next one lands,
+		// and dropping on that overshoot discards audio on every single write. The band on top is
+		// what the reader's time stretch closes on its own, so everything inside it plays rather
+		// than being thrown away. While stalled the reader is not consuming, so only the hard
+		// capacity applies; the band would throw away the very audio the refill is accumulating.
 		// Buffered mode plays through everything, so it is capacity-bound too.
 		const playing = !this.#stalled && !this.#buffered;
-		const slack = this.#chunk + WORKLET_QUANTUM;
-		const limit = playing ? Math.min(this.#latencySamples + slack, this.capacity) : this.capacity;
-		if (end - this.#readIndex > limit) {
-			this.#readIndex = end - (playing ? Math.min(this.#latencySamples, this.capacity) : this.capacity);
+		const slack = this.#chunk + this.#skip;
+		const band = playing ? Math.min(this.#latencySamples + slack, this.capacity) : this.capacity;
+		const depth = end - this.#readIndex;
+		// A flush lands several frames at once, so the depth peaks by a whole flush and drains back
+		// before the next one: the trough between two flushes is the part that is actually surplus.
+		const sustained = playing ? this.#floor.observe(depth, this.#readIndex, this.#latencySamples) : depth;
+		// While stalled or buffered the reader is not consuming, so only the hard capacity applies;
+		// the band would throw away the very audio the refill is accumulating.
+		const surplus = playing && sustained > band;
+		if (surplus || depth > this.capacity) {
+			const to = end - (surplus ? Math.min(this.#latencySamples, this.capacity) : this.capacity);
+			const dropped = Math.max(0, to - this.#readIndex);
+			this.#discarded += dropped;
+			this.#jumped += dropped;
+			this.#readIndex = to;
 		}
 
 		// Fill gaps with zeros if there's a discontinuity
@@ -275,9 +346,12 @@ export class AudioRingBuffer {
 			buffered: this.#stalled ? 0 : buffered,
 			target: this.#latencySamples,
 			chunk: this.#chunk,
-			skip: WORKLET_QUANTUM,
+			skip: this.#skip,
 			stalled: this.#stalled,
 			unstable: false,
+			converge: !this.#buffered,
+			// The writer bounds this ring on the way in, so the jump is on its side rather than here.
+			skipped: this.#jumped,
 			generation: this.#generation,
 		};
 	}
@@ -301,6 +375,7 @@ export class AudioRingBuffer {
 	 */
 	commit(count: number): boolean {
 		this.#readIndex += count;
+		this.#jumped = 0;
 		return true;
 	}
 
@@ -311,6 +386,11 @@ export class AudioRingBuffer {
 	starve(): void {
 		this.#stalled = true;
 		this.#underruns++;
+	}
+
+	/** Record what the reader's playout engine is holding, so the state message can carry it. */
+	report(counters: Counters): void {
+		this.#counters = counters;
 	}
 
 	/**
@@ -335,10 +415,17 @@ export class AudioRingBuffer {
 		this.peek(output, samples);
 		this.commit(samples);
 
+		// This reader holds nothing back and stretches nothing, so every sample it takes is a frame
+		// it emits. Recorded so the playhead reads the same whichever reader drives the ring.
+		this.#counters.output += samples;
+
 		// A short quantum ends in silence, so it counts as an underrun even if a chunk lands before
 		// the next read. It does not park playback: the shortfall is under one quantum, and a
 		// refill would spend the whole target as silence to cover it.
-		if (samples < output[0].length) this.#underruns++;
+		if (samples < output[0].length) {
+			this.#underruns++;
+			this.#counters.short++;
+		}
 
 		return samples;
 	}
