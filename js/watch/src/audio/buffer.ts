@@ -331,6 +331,9 @@ class SharedAudioBuffer implements AudioBuffer {
 
 	reset(): void {
 		this.#ring.reset();
+		// A flushed ring has no playhead until the next insert anchors it. Publishing the one it had
+		// would leave `Sync` extrapolating from a position the reader is never going to resume from.
+		this.#clock.set(undefined);
 		this.#backpressure.flush(); // the old timeline is gone; let the decode loop re-anchor
 	}
 
@@ -398,7 +401,9 @@ class PostAudioBuffer implements AudioBuffer {
 		this.#signals.event(worklet.port, "message", (ev: Event) => {
 			const data = (ev as MessageEvent<State>).data;
 			if (data?.type === "state") {
-				const timestamp = data.playhead?.timestamp ?? Time.Micro.zero;
+				// A flushed ring has no playhead until the next insert anchors it: report where it
+				// stopped rather than the start of the timeline, which is not a position it was at.
+				const timestamp = data.playhead?.timestamp ?? this.#timestamp.peek();
 				this.#timestamp.set(timestamp);
 				this.#stalled.set(data.debug.stalled);
 				this.#underruns.set(data.debug.underruns);
@@ -443,6 +448,10 @@ class PostAudioBuffer implements AudioBuffer {
 	reset(): void {
 		const msg: Reset = { type: "reset" };
 		this.#worklet.port.postMessage(msg);
+		// A flushed ring has no playhead until the next insert anchors it. Mirror it locally rather
+		// than waiting for the worklet's next state message, which still describes the old one.
+		this.#stalled.set(true);
+		this.#clock.set(undefined);
 		this.#backpressure.flush(); // the old timeline is gone; let the decode loop re-anchor
 	}
 

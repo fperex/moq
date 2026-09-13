@@ -30,6 +30,12 @@ export class Terminal {
 	#preSkip = 0;
 	#preSkipRemaining?: number;
 
+	// The source timestamp of the last frame handed to the decoder, and the media duration of one
+	// decoded frame, learned from the decoder's own output. Together they say whether the next frame
+	// continues the run the decoder is anchored on. See `continues`.
+	#fed?: Time.Micro;
+	#frame?: Time.Micro;
+
 	/** The exclusive source endpoint most recently received. */
 	get end(): Time.Micro | undefined {
 		return this.#end;
@@ -40,7 +46,9 @@ export class Terminal {
 		this.#discontinuity = 0;
 		this.#end = undefined;
 		this.#preSkip = preSkip;
-		this.#resetEpoch();
+		this.#frame = undefined;
+		this.#fed = undefined;
+		this.reanchor();
 	}
 
 	/** Apply one ordered consumer result and report whether its codec epoch changed. */
@@ -49,17 +57,58 @@ export class Terminal {
 		if (reset) {
 			this.#discontinuity = next.discontinuity;
 			this.#end = undefined;
-			this.#resetEpoch();
+			// The caller re-anchors the decoder on an epoch change, so the frame that opens the new
+			// epoch starts the run rather than being measured against the one before the break.
+			this.#fed = undefined;
+			this.reanchor();
 		}
 		if (next.frame && this.#epoch === undefined) this.#epoch = next.frame.timestamp;
 		if (next.end !== undefined) this.#end = next.end;
 		return reset;
 	}
 
+	/**
+	 * Note a frame on its way to the decoder, and report whether it continues the run the decoder is
+	 * anchored on.
+	 *
+	 * A decoder timestamps its output by accumulating decoded frame durations from the chunk that
+	 * opened the run rather than by copying each chunk's own timestamp, so a hole it is not told
+	 * about is swallowed: a subscription that restarts at the live edge after a mute, or a group the
+	 * age budget skipped, and every sample after it lands on the media timeline that far in the
+	 * past. A `false` means the caller has to drain the decoder and re-anchor it (`reanchor`), which
+	 * puts this frame's own timestamp back on the output.
+	 */
+	continues(timestamp: Time.Micro): boolean {
+		const previous = this.#fed;
+		this.#fed = timestamp;
+
+		// Nothing to measure a hole against until a run is under way and one frame has decoded.
+		if (previous === undefined || this.#frame === undefined) return true;
+
+		// Consecutive frames sit exactly one frame duration apart, so anything past the midpoint of
+		// the next slot is a hole rather than the container's timestamp rounding. Forward only: a
+		// repeated frame costs the decoder nothing, and a real rewind arrives as a discontinuity.
+		return timestamp - previous < this.#frame * 1.5;
+	}
+
+	/**
+	 * Forget the run the decoder was anchored on, so the next decoded sample opens a new one.
+	 *
+	 * Called after draining a decoder that is about to be reset: a restarted decoder emits the
+	 * codec's pre-skip again, and its output timeline starts over at the next chunk's timestamp.
+	 */
+	reanchor(): void {
+		this.#epoch = undefined;
+		this.#preSkipRemaining = undefined;
+	}
+
 	/** Remove codec pre-skip and terminal padding from one decoded sample. */
 	span(sample: SampleSpan): DecodedSpan {
 		const epoch = this.#epoch ?? (sample.timestamp as Time.Micro);
 		this.#epoch = epoch;
+
+		// The decoder's own frame duration, which is what a hole in the source is measured against.
+		this.#frame = ((sample.numberOfFrames * 1_000_000) / sample.sampleRate) as Time.Micro;
 
 		const delayFrames = Math.floor((this.#preSkip * sample.sampleRate) / 48_000);
 		const remaining = this.#preSkipRemaining ?? delayFrames;
@@ -80,10 +129,5 @@ export class Terminal {
 		}
 
 		return { timestamp, frameOffset, frames };
-	}
-
-	#resetEpoch(): void {
-		this.#epoch = undefined;
-		this.#preSkipRemaining = undefined;
 	}
 }

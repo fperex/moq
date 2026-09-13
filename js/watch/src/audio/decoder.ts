@@ -198,6 +198,7 @@ export class Decoder {
 
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
+		this.#signals.run(this.#runFlush.bind(this));
 		this.#signals.run(this.#runClock.bind(this));
 		this.#signals.run(this.#runLatency.bind(this));
 		this.#signals.run(this.#runLatencyReanchor.bind(this));
@@ -304,6 +305,19 @@ export class Decoder {
 		unlockOnGesture(effect, context);
 
 		// NOTE: You should disconnect/reconnect the worklet to save power when disabled.
+	}
+
+	/**
+	 * Flush the ring when the download stops.
+	 *
+	 * Nothing drains it while audio is off, since the emitter disconnects the graph, so what it holds
+	 * is media that will be stale by the time the download comes back. Playing it out would step the
+	 * playhead back to where the audio stopped and take every track paced against it along, so drop
+	 * it and let the restarted subscription's first frame anchor the ring where playback actually is.
+	 */
+	#runFlush(effect: Effect): void {
+		if (!effect.get(this.in.enabled)) return;
+		effect.cleanup(() => this.#ring?.reset());
 	}
 
 	/**
@@ -503,6 +517,11 @@ export class Decoder {
 				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
 				this.sync.received(timestamp, "audio");
 
+				// A hole in the source has to reach the decoder as one. See #reanchor.
+				if (!this.#terminal.continues(frame.timestamp as Time.Micro)) {
+					await this.#reanchor(decoder, decoderConfig);
+				}
+
 				this.#out.stats.update((stats) => ({
 					bytesReceived: (stats?.bytesReceived ?? 0) + frame.payload.byteLength,
 				}));
@@ -599,6 +618,11 @@ export class Decoder {
 				const timestamp = Time.Milli.fromMicro(frame.timestamp);
 				this.sync.received(timestamp, "audio");
 
+				// A hole in the source has to reach the decoder as one. See #reanchor.
+				if (!this.#terminal.continues(frame.timestamp)) {
+					await this.#reanchor(decoder, decoderConfig);
+				}
+
 				this.#out.stats.update((stats) => ({
 					bytesReceived: (stats?.bytesReceived ?? 0) + frame.payload.byteLength,
 				}));
@@ -617,6 +641,29 @@ export class Decoder {
 				);
 			}
 		});
+	}
+
+	/**
+	 * Put the decoder back on the source timeline after a hole in it.
+	 *
+	 * A decoder timestamps its output by accumulating decoded frame durations from the chunk that
+	 * opened its run, not by copying each chunk's own timestamp, so a hole it is not told about is
+	 * swallowed: the subscription that restarts at the live edge after a mute, or a group the age
+	 * budget skipped, and every sample after it lands in the ring that far in the past. The ring then
+	 * plays a contiguous stream whose playhead sits behind the live edge for good, and since the
+	 * playhead is the clock, every other track is paced behind it too. Restarting the decoder is what
+	 * re-anchors it: the next chunk's own timestamp opens the new run.
+	 *
+	 * Draining first keeps the frames still in flight, which belong to the run that is ending.
+	 */
+	async #reanchor(decoder: AudioDecoder, config: AudioDecoderConfig): Promise<void> {
+		// Teardown rejects a flush in progress; the decode loop checks `state` before its next decode.
+		await decoder.flush().catch(() => {});
+		if (decoder.state !== "configured") return;
+
+		this.#terminal.reanchor();
+		decoder.reset();
+		decoder.configure(config);
 	}
 
 	#emit(sample: AudioData, decoded: DecodedSpan = this.#terminal.span(sample)) {

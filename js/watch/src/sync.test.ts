@@ -343,6 +343,82 @@ describe("clock", () => {
 		sync.close();
 	});
 
+	it("re-derives the reference when the clock comes back at a different playhead", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: 100 as Time.Milli });
+		await flush();
+
+		sync.track("audio").clock.set(sample(5000, clock.at));
+		await flush();
+
+		// Muted: the download stops and the flushed ring stops being a clock. Playback carries on at
+		// wall speed from where the playhead was.
+		sync.track("audio").clock.set(undefined);
+		await flush();
+		clock.advance(3000);
+		expect(sync.now()).toBe(8000 as Time.Milli);
+
+		// Unmuted: the subscription restarts at the live edge, so the ring anchors three seconds on
+		// from where it stopped. The reference follows the playhead in one step rather than
+		// extrapolating across the hole, so the position is the new playhead exactly.
+		sync.track("audio").clock.set(sample(8300, clock.at));
+		await flush();
+		expect(sync.out.clock.peek()).toBe("audio");
+		expect(sync.now()).toBe(8300 as Time.Milli);
+		// The delay is still the distance from the reference to the playhead, which is what an
+		// arrival is measured against.
+		expect(sync.out.reference.peek()).toBe(Time.Milli.sub(clock.at, 8400 as Time.Milli));
+
+		sync.close();
+	});
+
+	it("keeps playing through a clock that comes back where it left off", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: 100 as Time.Milli });
+		await flush();
+
+		sync.track("audio").clock.set(sample(5000, clock.at));
+		await flush();
+
+		sync.track("audio").clock.set(undefined);
+		await flush();
+		clock.advance(3000);
+
+		// A flushed ring that refills from the same point on the timeline as the wall clock reached
+		// costs no step at all: `now()` is continuous across the hand-back.
+		const before = sync.now();
+		sync.track("audio").clock.set(sample(8000, clock.at));
+		await flush();
+		expect(sync.now()).toBe(before as Time.Milli);
+
+		sync.close();
+	});
+
+	it("presents the frames a re-nominated playhead is already past", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: 100 as Time.Milli });
+		await flush();
+
+		sync.track("audio").clock.set(sample(5000, clock.at));
+		await flush();
+
+		// Video held these while audio was off: the picture is paced against a playhead that stopped.
+		let rendered = 0;
+		const held = [5100, 5200, 7000].map((ts) => sync.wait(ts as Time.Milli).then(() => rendered++));
+		sync.track("audio").clock.set(undefined);
+		await flush();
+		expect(rendered).toBe(0);
+
+		// The ring re-anchored past all of them, so they are due now rather than after the wall
+		// clock walks up to each one.
+		clock.advance(3000);
+		sync.track("audio").clock.set(sample(8300, clock.at));
+		await Promise.all(held);
+		expect(rendered).toBe(3);
+
+		sync.close();
+	});
+
 	it("paces a frame against the playhead rather than the wall clock", async () => {
 		clock = fakeClock();
 		const sync = new Sync({ delay: 100 as Time.Milli });
