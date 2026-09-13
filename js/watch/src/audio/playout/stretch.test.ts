@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Decision } from "./decision";
+import { Decision, type Demand } from "./decision";
 import { antiphase, buzz, dominant, energy, maxStep, noise, tone, zeroRun } from "./fixture";
 import {
 	CORRELATION,
@@ -314,15 +314,29 @@ describe("decision", () => {
 	// low = target, high = target + chunk + 20ms.
 	const HIGH = TARGET + CHUNK + frames(RATE, 20);
 
+	/** What the ring looks like at `buffered`, with media to play and concealment available. */
+	function demand(buffered: number, outputFrame = 0): Demand {
+		return {
+			buffered,
+			queued: 0,
+			target: TARGET,
+			chunk: CHUNK,
+			outputFrame,
+			starved: false,
+			conceal: true,
+			converge: true,
+		};
+	}
+
 	/** A decision that has adopted `buffered` as its level, so the next call rules on that alone. */
 	function seeded(buffered: number): Decision {
 		const decision = new Decision(RATE);
-		decision.decide({ buffered, queued: 0, target: TARGET, chunk: CHUNK, outputFrame: 0 });
+		decision.decide(demand(buffered));
 		return decision;
 	}
 
 	function decide(decision: Decision, buffered: number, outputFrame = 0) {
-		return decision.decide({ buffered, queued: 0, target: TARGET, chunk: CHUNK, outputFrame });
+		return decision.decide(demand(buffered, outputFrame));
 	}
 
 	it("plays normally inside the band", () => {

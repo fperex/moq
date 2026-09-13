@@ -45,6 +45,34 @@ export function noise(rate: number, seconds: number, amplitude: number, channels
 	return Array.from({ length: channels }, () => mono.slice());
 }
 
+/**
+ * A tone that pauses, over a noise floor: the shape a background estimate can learn from.
+ *
+ * A pure sine never trains {@link Noise}, because no window of it is ever quiet, so concealment
+ * built on one fades into digital silence rather than into the room. Real speech pauses, and the
+ * pauses are where the room is measured, so anything testing concealment over more than a few
+ * blocks wants this rather than {@link tone}.
+ */
+export function speech(
+	rate: number,
+	seconds: number,
+	frequency: number,
+	amplitude: number,
+	floor: number,
+	channels = 1,
+): Float32Array[] {
+	const [voiced] = tone(rate, seconds, frequency, amplitude, 1);
+	const [room] = noise(rate, seconds, floor, 1);
+	const cycle = Math.round(rate * 1.0);
+	const pause = Math.round(rate * 0.2);
+
+	const mono = new Float32Array(voiced.length);
+	for (let i = 0; i < mono.length; i++) {
+		mono[i] = room[i] + (i % cycle < cycle - pause ? voiced[i] : 0);
+	}
+	return Array.from({ length: channels }, () => mono.slice());
+}
+
 /** A signal with a short period plus enough noise to spoil its correlation. */
 export function buzz(
 	rate: number,

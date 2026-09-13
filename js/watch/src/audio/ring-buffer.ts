@@ -37,7 +37,16 @@ export class AudioRingBuffer implements RingReader {
 	// What the playout engine is holding, plus what the writer threw away. The shared transport
 	// keeps the same numbers in its control array; here the worklet owns both ends, so they are
 	// plain fields shipped to the main thread in the state message.
-	#counters: Counters = { queued: 0, stretched: 0, output: 0, accelerates: 0, expands: 0, short: 0 };
+	#counters: Counters = {
+		queued: 0,
+		stretched: 0,
+		output: 0,
+		concealed: 0,
+		accelerates: 0,
+		expands: 0,
+		merges: 0,
+		short: 0,
+	};
 	#skips = 0;
 	#skipped = 0;
 	#discarded = 0;
@@ -49,6 +58,7 @@ export class AudioRingBuffer implements RingReader {
 	#floor = new Floor();
 	#lastOutput = 0;
 	#lastStretched = 0;
+	#lastConcealed = 0;
 
 	constructor(props: {
 		rate: number;
@@ -115,18 +125,19 @@ export class AudioRingBuffer implements RingReader {
 	 * Read in the worklet and posted to the main thread, which extrapolates between messages, so it
 	 * is stateful: the rate is measured between reads of this getter.
 	 *
-	 * The rate is the reader's own, `1 + dSTRETCHED/dOUTPUT`: it consumes a sample of media per
-	 * output frame while playing normally, a few percent more or less while a time stretch converges
-	 * on the target, and nothing at all while parked, so a stall reports zero and whoever follows
-	 * this playhead parks with it rather than running away from the audio it can hear.
+	 * The rate is the reader's own, `1 + (dSTRETCHED - dCONCEALED)/dOUTPUT`: it consumes a sample of
+	 * media per output frame while playing normally, a few percent more or less while a time stretch
+	 * converges on the target, and none at all while concealment covers a gap or while parked, so
+	 * whoever follows this playhead waits with the audio rather than running away from it.
 	 */
 	get playhead(): Playhead | undefined {
 		if (!this.#anchored) return undefined;
 
 		const elapsed = this.#counters.output - this.#lastOutput;
-		const moved = this.#counters.stretched - this.#lastStretched;
+		const moved = this.#counters.stretched - this.#lastStretched - (this.#counters.concealed - this.#lastConcealed);
 		this.#lastOutput = this.#counters.output;
 		this.#lastStretched = this.#counters.stretched;
+		this.#lastConcealed = this.#counters.concealed;
 
 		return { timestamp: this.timestamp, rate: elapsed > 0 ? 1 + moved / elapsed : 0 };
 	}
@@ -255,18 +266,32 @@ export class AudioRingBuffer implements RingReader {
 			this.#readIndex = to;
 		}
 
-		// Fill gaps with zeros if there's a discontinuity
 		if (start > this.#writeIndex) {
-			const gapSize = Math.min(start - this.#writeIndex, this.#buffer[0].length);
-			if (gapSize === 1) {
-				console.warn("floating point inaccuracy detected");
-			}
+			if (!this.#buffered && this.#readIndex >= this.#writeIndex) {
+				// Nothing left to play, so the hole is media that was never sent and the reader is
+				// already covering for it: queueing it as silence would make a listener wait for the
+				// same missing audio a second time. Step the playhead over it instead. Buffered
+				// playback keeps the silence, because a producer writing ahead of the playhead means
+				// the pause it wrote.
+				const hole = start - this.#writeIndex;
+				this.#skips++;
+				this.#skipped += hole;
+				this.#jumped += hole;
+				this.#readIndex = start;
+				this.#writeIndex = start;
+			} else {
+				// Fill the gap with zeros: there is audio behind it that still has to play in place.
+				const gapSize = Math.min(start - this.#writeIndex, this.#buffer[0].length);
+				if (gapSize === 1) {
+					console.warn("floating point inaccuracy detected");
+				}
 
-			for (let channel = 0; channel < this.channels; channel++) {
-				const dst = this.#buffer[channel];
-				for (let i = 0; i < gapSize; i++) {
-					const writePos = (this.#writeIndex + i) % dst.length;
-					dst[writePos] = 0;
+				for (let channel = 0; channel < this.channels; channel++) {
+					const dst = this.#buffer[channel];
+					for (let i = 0; i < gapSize; i++) {
+						const writePos = (this.#writeIndex + i) % dst.length;
+						dst[writePos] = 0;
+					}
 				}
 			}
 		}

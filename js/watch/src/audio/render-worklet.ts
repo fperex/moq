@@ -27,11 +27,11 @@ class Render extends AudioWorkletProcessor {
 				console.log("[audio-worklet] init-shared: using SharedArrayBuffer path");
 				const previous = this.#backend instanceof SharedRingBuffer ? this.#backend : undefined;
 				this.#backend = new SharedRingBuffer(msg, previous);
-				this.#reset(msg.rate, msg.channels);
+				this.#reset(msg.rate, msg.channels, msg.conceal);
 			} else if (msg.type === "init-post") {
 				console.log("[audio-worklet] init-post: using postMessage path");
 				this.#backend = new AudioRingBuffer(msg);
-				this.#reset(msg.rate, msg.channels);
+				this.#reset(msg.rate, msg.channels, msg.conceal);
 			} else if (msg.type === "data") {
 				// Only meaningful in post mode.
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.write(msg.timestamp, msg.data);
@@ -55,12 +55,12 @@ class Render extends AudioWorkletProcessor {
 	 * Point the engine at a replacement ring.
 	 *
 	 * A resize hands over a ring on the same timeline, so the engine keeps its counters and only
-	 * drops the block it was holding; a different rate or channel count is a different stream and
-	 * needs a different engine.
+	 * drops the block it was holding; a different rate, channel count, or concealment setting is a
+	 * different reader and needs a different engine.
 	 */
-	#reset(rate: number, channels: number): void {
-		if (this.#engine?.rate !== rate || this.#engine.channels !== channels) {
-			this.#engine = new Stretcher(rate, channels);
+	#reset(rate: number, channels: number, conceal: boolean): void {
+		if (this.#engine?.rate !== rate || this.#engine.channels !== channels || this.#engine.conceal !== conceal) {
+			this.#engine = new Stretcher(rate, channels, conceal);
 		} else {
 			this.#engine.discontinuity();
 		}

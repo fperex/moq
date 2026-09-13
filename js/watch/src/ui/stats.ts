@@ -88,6 +88,7 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	const aBitrate = line(audioCard.grid, "Bitrate");
 	const aUnderruns = line(audioCard.grid, "Underruns");
 	const aStretch = line(audioCard.grid, "Stretch");
+	const aConcealed = line(audioCard.grid, "Concealed");
 	const aSkipped = line(audioCard.grid, "Skipped");
 	const aClock = line(audioCard.grid, "Clock");
 	track(parent, audioCard, {
@@ -153,6 +154,13 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 		// Content lost above the decoder, which an underrun count alone cannot show: the ring
 		// never ran dry, the frames simply never got there. The ring's own jumps join it, since a
 		// listener cannot tell the two apart.
+		// Audio the reader made up because the ring had none, which is what an underrun sounds like
+		// now: the pitch of what was playing rather than a hole. The count of splices beside it says
+		// how many separate outages that covered.
+		const concealed = playout ? playout.concealed / (watch.audio.out.sampleRate.peek() ?? 48000) : undefined;
+		aConcealed.textContent =
+			concealed !== undefined ? `${(1000 * concealed).toFixed(0)}ms / ${playout?.merges}` : "—";
+
 		const jumped = playout ? playout.skips : 0;
 		aSkipped.textContent = `${watch.audio.out.skipped.peek() + jumped}`;
 

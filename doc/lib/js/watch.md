@@ -182,12 +182,34 @@ WebRTC's NetEq does. Each correction drops or repeats one pitch period, at most
 15ms per 100ms of audio and only where the waveform repeats, so convergence is
 inaudible.
 
-Skipping ahead is left for what the stretch cannot close in half a second, and an
-underrun still renders a ramped gap. `audio.out.underruns` counts the times the
-ring ran dry, and the stats panel shows the corrections beside it: `Stretch`
-counts the blocks played fast and then the blocks played slow, and `Skipped` what
-was thrown away. A healthy stream shows corrections and no skips; skips mean the
-delay is moving faster than the stretch can follow.
+Skipping ahead is left for what the stretch cannot close in half a second.
+`audio.out.underruns` counts the times the ring ran dry, and the stats panel
+shows the corrections beside it: `Stretch` counts the blocks played fast and then
+the blocks played slow, and `Skipped` what was thrown away. A healthy stream
+shows corrections and no skips; skips mean the delay is moving faster than the
+stretch can follow.
+
+## Covering what never arrived
+
+A stretch bends a few percent, so it cannot cover a packet that is a whole
+hundred milliseconds late or a group the network gave up on. Rather than play the
+hole as silence, the player carries the audio on: it takes the pitch period of
+the last real audio, repeats it under a noise floor measured from the stream
+itself, and fades toward that floor if the outage runs on, the way WebRTC's NetEq
+conceals one. When the media comes back it is lined up against the concealment
+and crossfaded in, so neither end of the outage is a click. Two seconds of
+concealment is the limit; past that what is left is the room tone alone.
+
+The stats panel's `Concealed` row is how much audio was invented and how many
+separate outages that covered. Turn it off with `conceal` on the audio decoder
+and a gap is a gap again, audibly:
+
+```ts
+new Watch.Audio.Decoder(source, sync, { conceal: false });
+```
+
+It is read when the audio graph is built, since it belongs to the reader inside
+the worklet.
 
 ## Buffered playback
 

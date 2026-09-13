@@ -9,6 +9,7 @@ import fourKWebm from "./fixtures/4k-webm.json" with { type: "json" };
 import lanBbb from "./fixtures/lan-bbb.json" with { type: "json" };
 import relayBbb7Frame from "./fixtures/relay-bbb-7frame.json" with { type: "json" };
 import { type RingReader, type Snapshot, Stretcher } from "./playout";
+import { speech, zeroRun } from "./playout/fixture";
 import { AudioRingBuffer } from "./ring-buffer";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -152,6 +153,11 @@ interface Result {
 	/** Blocks the time stretch shortened and lengthened after the warmup. */
 	accelerates: number;
 	expands: number;
+	/** Samples synthesized to cover a gap after the warmup, and the splices that ended them. */
+	concealed: number;
+	merges: number;
+	/** Everything the engine emitted after the warmup, so silence can be looked for in it. */
+	played: Float32Array;
 }
 
 /**
@@ -179,7 +185,13 @@ function frameSamples(t: Arrival[]): number[] {
  * render quantum every quantum's worth of wall time through the real playout engine, which is what
  * the AudioWorklet does.
  */
-function replay(build: (latencyMs: number) => Ring, t: Arrival[], warmupMs: number, fixed?: number): Result {
+function replay(
+	build: (latencyMs: number) => Ring,
+	t: Arrival[],
+	warmupMs: number,
+	fixed?: number,
+	conceal = true,
+): Result {
 	const step = (QUANTUM / RATE) * 1000;
 	const output = [new Float32Array(QUANTUM)];
 	const end = t[t.length - 1].arrival;
@@ -193,7 +205,7 @@ function replay(build: (latencyMs: number) => Ring, t: Arrival[], warmupMs: numb
 	const latency = () => fixed ?? Math.max(FLOOR, jitter.value.peek());
 
 	const ring = build(latency());
-	const engine = new Stretcher(RATE, 1);
+	const engine = new Stretcher(RATE, 1, conceal);
 
 	let next = 0;
 	let outputFrame = 0;
@@ -201,6 +213,11 @@ function replay(build: (latencyMs: number) => Ring, t: Arrival[], warmupMs: numb
 	let quanta = 0;
 	let short = 0;
 	let mark: { quanta: number; short: number; debug: Snapshot } | undefined;
+
+	// Everything rendered after the warmup, so a gap can be looked for as silence rather than only
+	// counted as a short quantum.
+	const played = new Float32Array(Math.ceil(((end + step) * RATE) / 1000));
+	let length = 0;
 
 	for (let now = 0; now < end; now += step) {
 		while (next < t.length && t[next].arrival <= now) {
@@ -218,6 +235,10 @@ function replay(build: (latencyMs: number) => Ring, t: Arrival[], warmupMs: numb
 		quanta++;
 		if (started && count < QUANTUM) short++;
 		if (count > 0) started = true;
+		if (mark && length + count <= played.length) {
+			played.set(output[0].subarray(0, count), length);
+			length += count;
+		}
 
 		if (now >= warmupMs && !mark) mark = { quanta, short, debug: ring.debug() };
 	}
@@ -231,12 +252,18 @@ function replay(build: (latencyMs: number) => Ring, t: Arrival[], warmupMs: numb
 		short: short - from.short,
 		accelerates: debug.accelerates - from.debug.accelerates,
 		expands: debug.expands - from.debug.expands,
+		concealed: debug.concealed - from.debug.concealed,
+		merges: debug.merges - from.debug.merges,
+		played: played.subarray(0, length),
 	};
 }
 
-/** A 200Hz tone the correlation search can find a period in. */
-const TONE = new Float32Array(RATE);
-for (let i = 0; i < TONE.length; i++) TONE[i] = 0.5 * Math.sin((2 * Math.PI * 200 * i) / RATE);
+/**
+ * A 200Hz tone the correlation search can find a period in, pausing over a quiet room so the
+ * background estimate has something to learn from. A pure sine trains nothing, and concealment
+ * built on one fades into digital silence rather than into the room.
+ */
+const TONE = speech(RATE, 2, 200, 0.5, 0.002)[0];
 
 let voiceAt = 0;
 function voice(count: number): Float32Array {
@@ -286,11 +313,23 @@ describe.each(RINGS)("%s ring replay", (_name, build) => {
 		// The time stretch bends a few percent; it cannot invent the fifty milliseconds the target
 		// is short by, so the ring still runs dry between flushes.
 		const t = trace(600, 5, 5);
-		const result = replay(build, t, WARMUP, 46);
+		const result = replay(build, t, WARMUP, 46, false);
 		expect(result.underruns).toBeGreaterThan(20);
 		// Nothing is thrown away even here: a flush only inflates the ring until it drains again,
 		// which the reader no longer mistakes for a surplus. A target this shallow costs silence,
 		// not audio.
+		expect(result.skipped).toBe(0);
+	});
+
+	it("conceals a target that ignores the arrival spread instead of playing the gaps", () => {
+		// The same too-shallow target with concealment on. Every concealed block hands the ring the
+		// cushion the target was short of, so after a few of them during the warmup the ring stops
+		// running dry at all: what a listener would have heard as a gap every flush is the pitch of
+		// the audio around it, once, and then nothing.
+		const t = trace(600, 5, 5);
+		const result = replay(build, t, WARMUP, 46);
+		expect(result.underruns).toBe(0);
+		expect(result.short).toBe(0);
 		expect(result.skipped).toBe(0);
 	});
 });
@@ -303,9 +342,9 @@ describe.each(RINGS)("%s ring replay", (_name, build) => {
  *
  * The 4k recording is not, and its budget names why rather than rounding it off. It carries real
  * holes in its media, because it was captured through a client whose age budget was skipping
- * groups: no reader can play audio that never arrived, so the ring runs dry where the hole is and
- * the frame that lands after it is entirely older than the playhead. Concealment is the next quest;
- * until then those quanta are silence.
+ * groups. Nobody can play audio that never arrived, so the ring runs dry where a hole is and the
+ * playhead steps over it; what concealment changes is what a listener hears while that happens,
+ * which is why every recording holds zero silent quanta whatever else it does.
  *
  * `measured` is above the round trip, which is the claim about the estimator: the LAN trace has
  * almost no spread, so the round trip is already about the right size there and the only claim
@@ -314,7 +353,7 @@ describe.each(RINGS)("%s ring replay", (_name, build) => {
 interface Budget {
 	/** Times the ring may run dry after the warmup. */
 	underruns: number;
-	/** Samples that may be thrown away after the warmup. */
+	/** Samples that may be stepped over or thrown away after the warmup. */
 	skipped: number;
 	/** Whether the measured target should come out above the 46ms round trip. */
 	deeper: boolean;
@@ -323,8 +362,9 @@ interface Budget {
 const FIXTURES: Array<[string, Fixture, Budget]> = [
 	["lan-bbb", lanBbb as Fixture, { underruns: 0, skipped: 0, deeper: false }],
 	["relay-bbb-7frame", relayBbb7Frame as Fixture, { underruns: 0, skipped: 0, deeper: true }],
-	// One hole in the recording: one dry ring, and one frame that arrived entirely too late.
-	["4k-webm", fourKWebm as Fixture, { underruns: 2, skipped: CHUNK, deeper: true }],
+	// Holes in the recording: the ring runs dry at each one and the playhead steps over the media
+	// that never arrived, which is 400ms of the 92 second capture.
+	["4k-webm", fourKWebm as Fixture, { underruns: 3, skipped: 20 * CHUNK, deeper: true }],
 ];
 
 describe.each(RINGS)("%s ring, recorded traces", (ring, build) => {
@@ -338,12 +378,23 @@ describe.each(RINGS)("%s ring, recorded traces", (ring, build) => {
 			// Printed, because a regression in the estimator shows up as a different target long
 			// before it shows up as an underrun.
 			console.log(
-				`${ring}/${name}: target ${settled}ms, ${measured.underruns} underruns and ${measured.skipped} skipped samples over ${measured.quanta} quanta, with ${measured.accelerates} accelerates and ${measured.expands} expands, against ${rtt.underruns} and ${rtt.skipped} at the 46ms round-trip target`,
+				`${ring}/${name}: target ${settled}ms, ${measured.underruns} underruns and ${measured.skipped} skipped samples over ${measured.quanta} quanta, with ${measured.accelerates} accelerates, ${measured.expands} expands, ${measured.concealed} concealed samples and ${measured.merges} merges, against ${rtt.underruns} and ${rtt.skipped} at the 46ms round-trip target`,
 			);
 
 			expect(settled % Container.Jitter.BUCKET).toBe(0);
 			expect(measured.underruns).toBeLessThanOrEqual(budget.underruns);
 			expect(measured.skipped).toBeLessThanOrEqual(budget.skipped);
+
+			// Whatever else a recording does, nothing reaches the device short: a dry ring is
+			// covered rather than heard.
+			//
+			// Digital silence is a weaker claim, and deliberately not made here. A hole that reaches
+			// the playhead with nothing behind it is concealed, but one that arrives while later
+			// media is already buffered is zero-filled in place, because the ring stores PCM and has
+			// no way to say which of it was invented. The native engine holds frames rather than
+			// samples and does not have that hole; closing it here is a frame buffer, not a
+			// concealment.
+			expect(measured.short).toBe(0);
 
 			if (budget.deeper) {
 				expect(settled).toBeGreaterThan(46);
@@ -355,6 +406,54 @@ describe.each(RINGS)("%s ring, recorded traces", (ring, build) => {
 			}
 		});
 	}
+});
+
+/**
+ * The rare tail, which is what concealment is actually for.
+ *
+ * The traces above are steady: the target covers them and the time stretch closes what is left. The
+ * gaps that made the public player stutter were none of that. They were single outages of 165, 220
+ * and 111ms recorded on the relay, far past anything a stretch can bend and far past the target the
+ * arrivals around them justify, and they arrive as media that simply never comes.
+ */
+const RARE = [165, 220, 111];
+
+/** Drop every arrival inside `holes`, which is what a censored or lost group leaves behind. */
+function holed(t: Arrival[], holes: number[]): Arrival[] {
+	const first = t[0].media;
+	const last = t[t.length - 1].media;
+	const spacing = (last - first) / (holes.length + 1);
+
+	return t.filter(({ media }) =>
+		holes.every((hole, index) => {
+			const from = first + spacing * (index + 1);
+			return media < from || media >= from + hole;
+		}),
+	);
+}
+
+describe.each(RINGS)("%s ring, the rare tail", (_ring, build) => {
+	it("conceals a 165, 220 and 111ms outage rather than playing them as silence", () => {
+		const t = holed(recorded(lanBbb as Fixture), RARE);
+		const measured = replay(build, t, 4000);
+		const ramped = replay(build, t, 4000, undefined, false);
+
+		console.log(
+			`${_ring}/rare-tail: ${measured.concealed} concealed samples over ${measured.merges} merges and ${measured.underruns} underruns, against ${ramped.short} silent quanta with concealment off`,
+		);
+
+		// Every outage is covered end to end: nothing reaches the device short, and nothing in what
+		// was rendered is digital silence.
+		expect(measured.short).toBe(0);
+		expect(zeroRun(measured.played)).toBeLessThanOrEqual(2);
+		expect(measured.merges).toBe(RARE.length);
+		// The three outages, less the 45ms or so the ring still held when each one started.
+		expect(measured.concealed).toBeGreaterThan((RATE * 300) / 1000);
+
+		// The control, which is what the same three outages sound like without it.
+		expect(ramped.short).toBeGreaterThan(0);
+		expect(ramped.concealed).toBe(0);
+	});
 });
 
 // --- The age budget above the decoder ---

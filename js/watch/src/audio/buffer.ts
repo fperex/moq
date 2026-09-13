@@ -204,26 +204,34 @@ export function supportsSharedArrayBuffer(): boolean {
 	return true;
 }
 
+/** How the ring behind the worklet is built. */
+export interface AudioBufferProps {
+	/** Channels of planar PCM the graph runs at. */
+	channels: number;
+	/** Samples per second per channel. */
+	rate: number;
+	/** The initial playout target, in samples. */
+	latency: number;
+	/** Buffered mode: play through the whole lookahead instead of converging on the target. */
+	buffered: boolean;
+	/** Whether the reader conceals a gap with synthesized audio or plays it as a ramp into silence. */
+	conceal: boolean;
+}
+
 /**
  * Create the best audio buffer implementation for the current environment.
  * Picks `SharedAudioBuffer` when possible, falling back to `PostAudioBuffer`.
  */
-export function createAudioBuffer(
-	worklet: AudioWorkletNode,
-	channels: number,
-	rate: number,
-	latencySamples: number,
-	buffered = false,
-): AudioBuffer {
+export function createAudioBuffer(worklet: AudioWorkletNode, props: AudioBufferProps): AudioBuffer {
 	if (supportsSharedArrayBuffer()) {
 		console.log("[audio] using SharedArrayBuffer audio buffer");
-		return new SharedAudioBuffer(worklet, channels, rate, latencySamples, buffered);
+		return new SharedAudioBuffer(worklet, props);
 	}
 	console.warn(
 		"[audio] SharedArrayBuffer unavailable, falling back to the higher latency postMessage audio buffer. " +
 			"Serve the page cross-origin isolated (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp) to avoid this.",
 	);
-	return new PostAudioBuffer(worklet, channels, rate, latencySamples, buffered);
+	return new PostAudioBuffer(worklet, props);
 }
 
 /** SharedArrayBuffer-backed implementation. Writes go directly into shared memory. */
@@ -250,27 +258,31 @@ class SharedAudioBuffer implements AudioBuffer {
 	readonly #clockSource = new ClockSource();
 
 	#backpressure: Backpressure;
+	// Carried so a resize hands the replacement ring the same answer.
+	readonly #conceal: boolean;
 
 	#signals = new Effect();
 
-	constructor(worklet: AudioWorkletNode, channels: number, rate: number, latencySamples: number, buffered: boolean) {
+	constructor(worklet: AudioWorkletNode, props: AudioBufferProps) {
+		const { channels, rate, latency, buffered } = props;
 		this.#worklet = worklet;
 		this.channels = channels;
 		this.rate = rate;
+		this.#conceal = props.conceal;
 
 		// The ring holds the latency floor as decoded PCM (headroom above it for overflow). In
 		// buffered mode the lookahead above the floor stays encoded upstream, held back by `wait()`.
 		// Sized for the estimator's ceiling from the start: an "auto" target climbing past the
 		// initial delay would otherwise hit the overflow path's `capacity` bound and be silently
 		// capped there, which is the one place a deeper target does not deepen the buffer.
-		const capacity = Math.max(rate, ceilingSamples(rate), latencySamples * 2);
-		this.#backpressure = new Backpressure(buffered, samplesToMicro(latencySamples, rate));
+		const capacity = Math.max(rate, ceilingSamples(rate), latency * 2);
+		this.#backpressure = new Backpressure(buffered, samplesToMicro(latency, rate));
 
 		const init = allocSharedRingBuffer(channels, capacity, rate, buffered);
 		this.#ring = new SharedRingBuffer(init);
-		this.#ring.setLatency(latencySamples);
+		this.#ring.setLatency(latency);
 
-		const msg: InitShared = { type: "init-shared", ...init };
+		const msg: InitShared = { type: "init-shared", ...init, conceal: this.#conceal };
 		worklet.port.postMessage(msg);
 
 		// Poll the shared control array and reflect it into signals. Also the clock's cadence: video
@@ -306,7 +318,7 @@ class SharedAudioBuffer implements AudioBuffer {
 			this.#ring = this.#ring.resize(newCapacity);
 			this.#ring.setLatency(samples);
 
-			const msg: InitShared = { type: "init-shared", ...this.#ring.init };
+			const msg: InitShared = { type: "init-shared", ...this.#ring.init, conceal: this.#conceal };
 			this.#worklet.port.postMessage(msg);
 		} else {
 			this.#ring.setLatency(samples);
@@ -370,15 +382,16 @@ class PostAudioBuffer implements AudioBuffer {
 
 	#signals = new Effect();
 
-	constructor(worklet: AudioWorkletNode, channels: number, rate: number, latencySamples: number, buffered: boolean) {
+	constructor(worklet: AudioWorkletNode, props: AudioBufferProps) {
+		const { channels, rate, buffered, conceal } = props;
 		this.#worklet = worklet;
 		this.channels = channels;
 		this.rate = rate;
 
-		this.#backpressure = new Backpressure(buffered, samplesToMicro(latencySamples, rate));
+		this.#backpressure = new Backpressure(buffered, samplesToMicro(props.latency, rate));
 
-		const latency = Time.Milli.fromSecond((latencySamples / rate) as Time.Second);
-		const msg: InitPost = { type: "init-post", channels, rate, latency, buffered };
+		const latency = Time.Milli.fromSecond((props.latency / rate) as Time.Second);
+		const msg: InitPost = { type: "init-post", channels, rate, latency, buffered, conceal };
 		worklet.port.postMessage(msg);
 
 		// Listen for state updates from the worklet.
