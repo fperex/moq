@@ -354,21 +354,57 @@ second afterwards. The regression is in the corpus as `tune-in-stale`.
 The fix is structural rather than a better source for the frame duration. **The
 estimator does not add a frame at all.** The quantile already reports the
 bucket's upper edge, which is up to 20 ms above the delay actually observed, so
-the term it was standing in for is already there.
+the spread the extra term was standing in for is already there.
 
-What the extra frame was really covering is the consumer's own granularity, and
-that belongs above the estimator, in the ring that feeds the output device:
+The term itself is real, though, and it belongs to the ring rather than to the
+estimator. NetEq's target delay counts **the packet being played** as well as
+the ones waiting: its buffer level is the `packet_buffer` span plus what the
+sync buffer still holds. Ours is the audio still waiting to be played, which is
+one chunk less. So the level the ring holds is:
 
-- In the browser, the AudioWorklet renders in fixed 128-sample quanta, so the
-  ring's skip band is `target + chunk + quantum`. `WORKLET_QUANTUM` is 128
-  samples, 2.67 ms at 48 kHz.
-- Natively there is no worklet. The equivalent is the **sink period**, the
-  number of frames the output device asks for per callback, which `cpal`
-  reports per stream. The ring uses that in the same place.
+```
+hold = target + chunk
+```
 
-Keeping it there is what lets one corpus hold both languages. A step that
-carried the browser's render quantum would produce a different target series
-from the same trace on native, and the corpus could not hold.
+where `chunk` is the size of the most recent insert, measured rather than
+learned. That is the difference from the first attempt: the frame duration is
+not derived from timestamp arithmetic that a tune-in artifact can poison, it is
+the length of the audio that just arrived, republished on every insert and
+forgotten on the next one.
+
+It is one rule in four places, and all four have to move together or the ring
+sits at the bottom of its own band:
+
+- The ring un-stalls at `WRITE - READ >= hold`, and a refill after an underrun
+  reaches the same level. Un-stalling at the target alone leaves nothing
+  unplayed, so the first arrival a millisecond late finds an empty ring,
+  re-stalls, refills to empty again, and stutters there for the life of the
+  call.
+- The buffer level filter's band is `low = hold`, `high = hold + 20 ms`, so a
+  ring sitting exactly where it is meant to sit is not read as one that needs
+  expanding.
+- The skip-ahead band is `hold + STRETCH_BOUND`, and a skip lands back on
+  `hold`. The band above the level the ring holds is then exactly what the time
+  stretch closes on its own.
+- The audio age budget's headroom is `BUCKET + frame + STRETCH_BOUND`, which is
+  the same three terms: the bucket the estimator rounded up by, the chunk on top
+  of the target, and the stretch band.
+
+The hold is bounded by what the ring can physically hold. A chunk wider than the
+ring would otherwise name a level no refill could reach; `setLatency` refuses a
+target past capacity outright, so the chunk is the term that gives way.
+
+The consumer's own granularity below one chunk stays out of all of it. The
+browser's AudioWorklet renders in fixed 128-sample quanta (2.67 ms at 48 kHz)
+and a native sink asks for whatever period `cpal` reports; both are inside the
+chunk the ring already holds. Keeping them out of the estimator is what lets one
+corpus hold both languages: a step that carried the browser's render block would
+produce a different target series from the same trace on native.
+
+The reported numbers follow the same split. `Sync.out.delay` stays the
+estimator's answer, which is what the player's "jitter buffer" row shows and
+what the age budget and the video pacing are derived from. What a listener waits
+is `delay + chunk`, which is what the "total buffer" row shows.
 
 ## Parity traps
 
