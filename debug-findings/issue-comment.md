@@ -40,7 +40,7 @@ intact; everything in them except the estimator is kept.
 | [`audio-jitter-target/spec.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/spec.md) | `bdf4f64e0` (doc, estimator, 14-case corpus) |
 | [`audio-jitter-target/watch.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/watch.md) | `8dad5e3c2`, `5f43c0f99` (yours), `c97496853`, `9dcaac2ab`, `b42619ae5` |
 | the budget finding (#3 above) | `4a6680c7d`, `4383a2e09`, `6f3bd3e3c` |
-| [`m1/plan-av-clock.md`](https://github.com/moq-dev/moq/blob/dev/quest/m1/plan-av-clock.md) | `5140c63e2` |
+| [`m1/plan-av-clock.md`](https://github.com/moq-dev/moq/blob/dev/quest/m1/plan-av-clock.md) | `5140c63e2`, `8ea218165` (a hole in the source reaches the decoder) |
 | tune-in defect, found by the harness | `dbb8228e3` (browser), `7ad6b1a5c` (native) |
 | [`audio-jitter-target/native.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/native.md) | `9cadfc19c`, `e9d451cdf`, `1e5ce49b6`, `9deb1db75` |
 | [`watch-audio-time-stretch.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/watch-audio-time-stretch.md) | `6ce7d2bcf`, `ed095f21c`, `c0a3deddf` |
@@ -187,6 +187,19 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
 
 ### Other things worth knowing
 
+- **A decoder swallows a hole in the source, and that puts the whole player behind the live edge.**
+  Found after the branch was finished, from a viewer muting and unmuting and then watching video sit
+  2.8 s ahead of audio. An `AudioDecoder` timestamps its output by accumulating decoded frame
+  durations from the chunk that opened its run, not by copying each chunk's timestamp, so the media
+  a mute never downloaded is simply absorbed: the chunks step 3 s across the gap and the samples out
+  carry on 23.2 ms apart. The PCM lands in the ring 3 s in the past, the ring sees a contiguous
+  stream and never skips, and the playhead never comes back to the live edge. It is the same story
+  one frame wide for every group the age budget skips, so it accumulates. `8ea218165` tells the
+  decoder about the hole (drain, restart, let the next chunk anchor it) and flushes the ring while
+  nothing is draining it. Not yours and not mine: `dev`'s decode loop has no hole handling either.
+  What the A/V clock quest changed is that video now follows the playhead, so the collapse shows up
+  as a stalled picture rather than only late audio. Worst painted-video-minus-audio skew over the
+  reported sequence went from 3418 ms to 50 ms, and the run's underruns from 6 to 0.
 - **`demo/web` pinned `delay="100ms"` on every tile.** That is the "100 ms chip on a fresh session"
   from `watch.md`. No stored preference, nothing restoring anything. Fixed in `0d06ca4e8`.
 - **`ui/components/buffer-control.ts` sets a numeric delay on mousedown**, so a single click on the

@@ -75,7 +75,9 @@ with their author intact.
 | 46 | `393ff294d` | delivery | This report and the issue comment |
 | 47 | `492781763` | shaper defect | Jitter varies the delay without reordering datagrams |
 | 48 | `b31eb9552` | harness | The budgets re-recorded and enforced on the fixed shaper |
-| 49 | `067fa459c`, plus this one | delivery | This report, filled in with the enforced budgets |
+| 49 | `067fa459c` | delivery | This report, filled in with the enforced budgets |
+| 50 | `8ea218165` | `m1/plan-av-clock.md`, user report | A hole in the source reaches the decoder, and a ring nothing is draining is flushed |
+| 51 | this one | delivery | This report and the issue comment, with the A/V desync fix |
 
 Suggested reading order for review: 3, 4, 9 to 11, 21, 22, 31. Those seven are the fix. The native
 half (7, 16 to 20) is the same algorithm again and can be read second or skipped entirely. The
@@ -190,6 +192,56 @@ refill hands the clock back to the wall clock at the last value the playhead gav
 `SyncInput` is down to `{delay, buffer}`. The advertised delay and the measured spread are per-track
 handles now, from `sync.track("audio" | "video" | "text")`, which is also where a track nominates its
 playhead. Captions join without another pair of inputs.
+
+#### The mute that put video 2.8 s ahead
+
+Reported against the frozen site build after the branch was finished: changing the volume and the
+latency presets a few times left the Latency tab showing video about 2.8 s ahead of audio, the two
+visibly out of sync, and the audio bar still sitting on its target.
+
+Neither bar was lying. The audio playhead was three seconds behind the live edge, and since this
+stage the playhead is the clock, video was held back there with it. What put it there is a WebCodecs
+behaviour one layer up. An `AudioDecoder` timestamps its output by accumulating decoded frame
+durations from the chunk that opened its run rather than by copying each chunk's own timestamp, so a
+hole in the source is swallowed. Muting stops the download (`emitter.ts` clears `enabled`), so the
+subscription that resumes starts at the live edge and the media covering the mute was never sent.
+Wrapping `AudioDecoder` on the page shows the swallow exactly: the chunks in step from 54357386 to
+54360428 us across the mute, and the samples out carry on at 54357409, 54357433, 54357456, 23.2 ms
+apart. Every sample after that lands in the ring three seconds in the past, the ring plays a stream
+that is contiguous and so never skips, and the playhead stays behind the live edge for good. It is
+not specific to a mute: a group the age budget skips is the same hole one frame wide, which is why
+the reported sequence ends 843 ms behind live rather than back where it started.
+
+The decode loop on `upstream/dev` has no hole handling either, and `terminal.ts` there is byte
+identical, so the collapse itself predates this branch. What this stage changed is who follows it:
+before, video paced against a wall clock and only the audio was late.
+
+Two changes, both in `8ea218165`. `Terminal.continues()` measures each frame against the last one at the
+decoder's own frame duration and reports a hole; `Audio.Decoder.#reanchor` drains the decoder so the
+frames in flight keep the run that is ending, then restarts it so the next chunk's own timestamp
+opens the new one. `Audio.Decoder.#runFlush` drops what the ring still holds when the download
+stops, because nothing drains it while the graph is disconnected and replaying it on the way back in
+steps the playhead back to where the mute started. A flushed ring stops reporting a clock, so `Sync`
+runs on the wall clock at the last audio-derived value until the ring anchors again.
+
+Driving the reported sequence on this tree's `demo/web` against the local relay in headless
+Chromium, sampling the painted video timestamp against `sync.now()` every 250 ms over 58 s:
+
+| | before | after |
+| --- | ---: | ---: |
+| worst video-minus-audio skew | 3418 ms | 50 ms |
+| samples worse than 200 ms, of 232 | 19 | 0 |
+| video buffer at the end, at auto | 843 ms | 236 ms |
+| underruns over the run | 6 | 0 |
+
+The shared-memory ring and `conceal=false` give the same answer (64 ms and 46 ms worst skew, zero
+underruns). `sync.replay.test.ts` carries the sequence as a regression test: a real ring, a real
+estimator, a real `Sync`, a model decoder that collapses a hole the way Chromium does, and one
+`sync.wait()` per video frame. It asserts the painted frame stays within a video frame plus a poll
+of the playhead and that audio ends at the live edge, then reruns with each of the two changes
+switched off as the control, where the playhead ends 5.9 s behind live and the picture 5.8 s ahead
+of it. `terminal.test.ts` covers the hole test and its re-anchor; `sync.test.ts` covers a clock that
+is lost and re-nominated at a different playhead.
 
 ### The tune-in defect
 
@@ -578,6 +630,7 @@ are `recorded` rows and both are in the residual list above.
 | `just test audio-quality --runtime replay --enforce` | 0 | 6 rows, 74 enforced checks |
 | `just drafts check` | 0 | No draft changed on this branch |
 | privacy grep over the branch's added lines | 0 hits | No home path, name, address, token, or session id |
+| `bun test js/watch` after the A/V desync fix | 0 | 334 tests, including the sequence replay and its two controls |
 
 ## Departures from the quests
 
@@ -743,6 +796,11 @@ No wire change anywhere. All of the below is `dev` material.
 - A CodeRabbit CLI triage per stage, each recorded. The findings that were real became their own
   commits: `64fd96e55`, `9dcaac2ab`, `38c452730`, `b939f2d10`, and part of `5f43c0f99`.
 - Listening rounds by the user after the estimator, after the stretch, and after concealment.
+- The A/V desync the user reported after all of that, reproduced and re-measured in headless
+  Chromium on a fresh `demo/web` build of this tree against the local relay: the user's own sequence
+  of mutes and latency presets, sampled every 250 ms, on both rings and with concealment both ways.
+  Worst painted-video-minus-audio skew 3418 ms before and 50 ms after; the regression test reruns the
+  same sequence with each half of the fix removed.
 - Each of the five re-landed fixes has a test that fails without it and passes with it.
 - One pre-existing flaky `console.error` spy test was fixed on the way past, in `2ecf1c1a1`.
 
