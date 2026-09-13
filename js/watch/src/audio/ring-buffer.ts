@@ -1,6 +1,7 @@
 import { Time } from "@moq/net";
 import { WORKLET_QUANTUM } from "./config";
 import type { Playhead } from "./playhead";
+import type { RingView } from "./playout";
 
 export class AudioRingBuffer {
 	#buffer: Float32Array[];
@@ -24,6 +25,10 @@ export class AudioRingBuffer {
 	#latencySamples: number;
 	// Whether the read/write indices have been anchored to the first inserted sample.
 	#anchored = false;
+
+	// Bumped whenever the media timeline is replaced, so a reader holding a block from the previous
+	// one knows to drop it. The shared transport reads its mutation epoch for the same purpose.
+	#generation = 0;
 
 	constructor(props: {
 		rate: number;
@@ -129,6 +134,7 @@ export class AudioRingBuffer {
 		this.#buffer = newBuffer;
 		this.#readIndex = this.#writeIndex - samplesToKeep;
 		if (samplesToKeep === 0) this.#stalled = true;
+		this.#generation++;
 	}
 
 	write(timestamp: Time.Micro, data: Float32Array[]): void {
@@ -144,6 +150,7 @@ export class AudioRingBuffer {
 			this.#readIndex = start;
 			this.#writeIndex = start;
 			this.#anchored = true;
+			this.#generation++;
 		}
 
 		// Ignore samples that are too old (before the read index)
@@ -231,6 +238,7 @@ export class AudioRingBuffer {
 		if (target >= this.#writeIndex) return;
 		// Never retreat past the playhead: those samples are already due.
 		this.#writeIndex = Math.max(target, this.#readIndex);
+		this.#generation++;
 	}
 
 	/**
@@ -251,33 +259,81 @@ export class AudioRingBuffer {
 		this.#writeIndex = 0;
 		this.#stalled = true;
 		this.#anchored = false;
+		this.#generation++;
 	}
 
+	/**
+	 * Sample the ring, and remember what was sampled. The first of the three calls a read is made of.
+	 *
+	 * This transport has no writer racing the reader (the worklet owns both ends), so there is
+	 * nothing to skip ahead over here: `write` bounds the ring on the way in. The band is reported
+	 * so the reader sees the same shape it does on the shared transport.
+	 */
+	view(): RingView {
+		const buffered = this.#writeIndex - this.#readIndex;
+		return {
+			buffered: this.#stalled ? 0 : buffered,
+			target: this.#latencySamples,
+			chunk: this.#chunk,
+			skip: WORKLET_QUANTUM,
+			stalled: this.#stalled,
+			unstable: false,
+			generation: this.#generation,
+		};
+	}
+
+	/** Copy `count` buffered samples into `dst` at `offset`, without advancing the playhead. */
+	peek(dst: Float32Array[], count: number, offset = 0): void {
+		for (let channel = 0; channel < dst.length; channel++) {
+			const src = this.#buffer[Math.min(channel, this.channels - 1)];
+			const out = dst[channel];
+			for (let i = 0; i < count; i++) {
+				out[offset + i] = src[(this.#readIndex + i) % src.length];
+			}
+		}
+	}
+
+	/**
+	 * Advance the playhead by `count` samples past what {@link view} sampled.
+	 *
+	 * Always succeeds: the writer is the worklet's own message handler, so it cannot move the
+	 * timeline part way through a read the way the shared transport's main thread can.
+	 */
+	commit(count: number): boolean {
+		this.#readIndex += count;
+		return true;
+	}
+
+	/**
+	 * The reader ran dry mid-playback: count the underrun and park until the ring holds the target.
+	 * Only once the caller has seen an empty {@link view}.
+	 */
+	starve(): void {
+		this.#stalled = true;
+		this.#underruns++;
+	}
+
+	/**
+	 * Read audio samples into the output buffers. Returns the number of samples read.
+	 *
+	 * {@link view}, {@link peek}, and {@link commit} in a row, which is what a reader that plays
+	 * the media exactly as it arrives does.
+	 */
 	read(output: Float32Array[]): number {
 		if (output.length !== this.channels) throw new Error("wrong number of channels");
-		if (this.#stalled) return 0;
 
-		const samples = Math.min(this.#writeIndex - this.#readIndex, output[0].length);
+		const view = this.view();
+		if (view.stalled) return 0;
+
+		const samples = Math.min(view.buffered, output[0].length);
 		if (samples <= 0) {
 			// Ran dry mid-playback: re-stall so write() refills to the target before resuming.
-			this.#stalled = true;
-			this.#underruns++;
+			this.starve();
 			return 0;
 		}
 
-		for (let channel = 0; channel < this.channels; channel++) {
-			const dst = output[channel];
-			const src = this.#buffer[channel];
-
-			if (dst.length !== output[0].length) throw new Error("mismatching number of samples");
-
-			for (let i = 0; i < samples; i++) {
-				const readPos = (this.#readIndex + i) % src.length;
-				dst[i] = src[readPos];
-			}
-		}
-
-		this.#readIndex += samples;
+		this.peek(output, samples);
+		this.commit(samples);
 
 		// A short quantum ends in silence, so it counts as an underrun even if a chunk lands before
 		// the next read. It does not park playback: the shortfall is under one quantum, and a

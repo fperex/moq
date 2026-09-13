@@ -1,6 +1,7 @@
 import { Time } from "@moq/net";
 import { WORKLET_QUANTUM } from "./config";
 import type { Playhead } from "./playhead";
+import type { RingView } from "./playout";
 
 // Control array slot indices. The playhead is not here: see `state`.
 const WRITE = 0;
@@ -138,6 +139,11 @@ export class SharedRingBuffer {
 
 	// Whether READ/WRITE have been anchored to the first inserted sample.
 	#anchored = false;
+
+	// What the last `view` sampled: the packed word its exchange has to match, and the cursor the
+	// skip-ahead left it on. Reader thread only, since only the worklet reads.
+	#snapshot = 0n;
+	#cursor = 0;
 
 	// Absolute sample index of that first sample. READ/WRITE are stored relative to it, so
 	// `timestamp` adds it back to recover media time. Main-thread only: the worklet reads by
@@ -335,24 +341,29 @@ export class SharedRingBuffer {
 	}
 
 	/**
-	 * Read audio samples into the output buffers.
-	 * AudioWorklet only. Returns the number of samples read.
+	 * Sample the ring, applying the skip-ahead, and remember what was sampled.
+	 * AudioWorklet only, and the first of the three calls a read is made of.
+	 *
+	 * The word is sampled before admission, not after. A re-anchor publishes the new state and only
+	 * then clears WRITE, so a reader admitted in between would pair a fresh epoch with the previous
+	 * timeline's WRITE and its exchange would succeed. Taken first, a reader admitted before the
+	 * rebase still holds the old word and its exchange fails, while one arriving after sees the
+	 * STALLED that `reset` raised and never starts.
 	 */
-	read(output: Float32Array[]): number {
-		// Sample the word before admission, not after. A re-anchor publishes the new state and
-		// only then clears WRITE, so a reader admitted in between would pair a fresh epoch with
-		// the previous timeline's WRITE and its exchange would succeed. Taken first, a reader
-		// admitted before the rebase still holds the old word and its exchange fails, while one
-		// arriving after sees the STALLED that `reset` raised and never starts.
+	view(): RingView {
 		const state = Atomics.load(this.#state, 0);
-		if (Atomics.load(this.#control, STALLED) === 1) return 0;
+		this.#snapshot = state;
+
+		const stalled = Atomics.load(this.#control, STALLED) === 1;
 		// A retreat is in flight, so WRITE still describes samples `truncate` is dropping and a
 		// later exchange could not tell them apart. Render the quantum as silence instead.
-		if (retreating(state)) return 0;
+		const unstable = retreating(state);
 
 		let read = readOf(state);
 		const write = Atomics.load(this.#control, WRITE);
-		const latency = Atomics.load(this.#control, LATENCY);
+		const target = Atomics.load(this.#control, LATENCY);
+		const chunk = Atomics.load(this.#control, CHUNK);
+		const skip = WORKLET_QUANTUM;
 
 		// Latency skip: skip ahead only once the ring holds a whole chunk plus a render quantum more
 		// than the target, landing back on the target. Frames arrive one chunk at a time, so a ring
@@ -360,46 +371,94 @@ export class SharedRingBuffer {
 		// on that overshoot discards audio on every single insert. The quantum on top is this
 		// reader's own granularity: it drains in whole blocks, so the ring is routinely one block
 		// above the target between reads and that is not late audio either.
-		// CAS ensures we never step backward relative to a concurrent writer advance.
+		// The advance is published by `commit`, so a concurrent writer advance is never stepped back.
 		// Disabled in buffered mode, where we deliberately play through the whole buffer.
-		const buffered = (write - read) | 0;
-		const slack = (Atomics.load(this.#control, CHUNK) + WORKLET_QUANTUM) | 0;
-		if (!this.buffered && latency > 0 && buffered > ((latency + slack) | 0)) {
-			const skipTo = (write - latency) | 0;
-			if (((skipTo - read) | 0) > 0) read = skipTo;
+		if (!stalled && !unstable && !this.buffered && target > 0) {
+			const buffered = (write - read) | 0;
+			if (buffered > ((target + chunk + skip) | 0)) {
+				const skipTo = (write - target) | 0;
+				if (((skipTo - read) | 0) > 0) read = skipTo;
+			}
 		}
 
-		const available = (write - read) | 0;
-		const count = Math.min(available, output[0].length);
-		if (available <= 0) {
-			// Ran dry mid-playback. Re-stall so `insert` refills to the target before playback
-			// resumes: the alternative is playing the next chunk on an empty cushion, which
-			// underruns again on the very next quantum. See STALLED for the write discipline.
-			Atomics.store(this.#control, STALLED, 1);
-			Atomics.add(this.#control, UNDERRUN, 1);
+		this.#cursor = read;
+
+		return {
+			buffered: stalled || unstable ? 0 : (write - read) | 0,
+			target,
+			chunk,
+			skip,
+			stalled,
+			unstable,
+			generation: epochOf(state),
+		};
+	}
+
+	/**
+	 * Copy `count` buffered samples into `dst` at `offset`, without advancing the playhead.
+	 * AudioWorklet only, after a {@link view}.
+	 */
+	peek(dst: Float32Array[], count: number, offset = 0): void {
+		for (let channel = 0; channel < this.channels; channel++) {
+			const src = this.#samples[channel];
+			const out = dst[channel];
+			for (let i = 0; i < count; i++) {
+				out[offset + i] = src[slot((this.#cursor + i) | 0, this.capacity)];
+			}
 		}
+	}
+
+	/**
+	 * Publish an advance of `count` samples past what {@link view} sampled.
+	 * AudioWorklet only. Returns false when the writer moved the timeline in between.
+	 *
+	 * The exchange fails if anything moved the word since the snapshot, which covers both a rebase
+	 * and a concurrent overflow, so samples are only ever counted as played on the timeline they
+	 * came from. A skip-ahead with nothing to read still has to be published, which is why zero is
+	 * a meaningful count.
+	 */
+	commit(count: number): boolean {
+		const state = this.#snapshot;
+		const next = (this.#cursor + count) | 0;
+		if (((next - readOf(state)) | 0) === 0) return true;
+		return Atomics.compareExchange(this.#state, 0, state, pack(epochOf(state), next)) === state;
+	}
+
+	/**
+	 * The reader ran dry mid-playback: count the underrun and park until the ring holds the target.
+	 * AudioWorklet only, and only once the caller has seen an empty {@link view}.
+	 *
+	 * A park is how `insert` gets to refill to the target before playback resumes: the alternative
+	 * is playing the next chunk on an empty cushion, which underruns again on the very next
+	 * quantum. See STALLED for the write discipline.
+	 */
+	starve(): void {
+		Atomics.store(this.#control, STALLED, 1);
+		Atomics.add(this.#control, UNDERRUN, 1);
+	}
+
+	/**
+	 * Read audio samples into the output buffers.
+	 * AudioWorklet only. Returns the number of samples read.
+	 *
+	 * {@link view}, {@link peek}, and {@link commit} in a row, which is what a reader that plays
+	 * the media exactly as it arrives does.
+	 */
+	read(output: Float32Array[]): number {
+		const view = this.view();
+		if (view.stalled || view.unstable) return 0;
+
+		const count = Math.min(view.buffered, output[0].length);
+		if (view.buffered <= 0) this.starve();
 		if (count <= 0) {
 			// A latency skip still has to be published, and still only if nothing moved.
-			if (((read - readOf(state)) | 0) > 0) {
-				Atomics.compareExchange(this.#state, 0, state, pack(epochOf(state), read));
-			}
+			this.commit(0);
 			return 0;
 		}
 
-		// Copy samples
-		for (let channel = 0; channel < this.channels; channel++) {
-			const src = this.#samples[channel];
-			const dst = output[channel];
-			for (let i = 0; i < count; i++) {
-				dst[i] = src[slot((read + i) | 0, this.capacity)];
-			}
-		}
+		this.peek(output, count);
 
-		// Publish. The exchange fails if anything moved the word since the snapshot above, which
-		// covers both a rebase and a concurrent overflow, so these samples are only ever counted
-		// as played on the timeline they came from.
-		const next = pack(epochOf(state), (read + count) | 0);
-		if (Atomics.compareExchange(this.#state, 0, state, next) !== state) {
+		if (!this.commit(count)) {
 			// The worklet takes the return value as an underflow count rather than clearing the
 			// buffer it handed over, so silence the prefix or the discarded audio renders anyway.
 			for (let channel = 0; channel < this.channels; channel++) output[channel].fill(0, 0, count);
