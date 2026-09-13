@@ -24,16 +24,40 @@ Every value in `budgets.json` is a ceiling measured on the playout engine, and a
 at all fails under `--enforce` rather than passing quietly.
 
 A replay ceiling is exactly what was measured and is enforced: nothing in that lane can be unlucky.
-A Chromium ceiling is the worst of five runs of the whole matrix times 1.5, and those rows are
-marked `recorded`, which means a breach is printed and does not fail the run. Five runs of the same
-matrix on one desktop disagreed with each other by more than that 1.5 on a different handful of rows
-every time, up to a row that stalled end to end, so a ceiling wide enough to hold them would say
-nothing and a tight one would fail on the weather. The nightly runner is the machine whose numbers
-are worth enforcing; take the marker off a Chromium row once it has recorded its own. The counters
-the engine has to keep at zero (underrun episodes, skip-aheads, budget aborts) are hard zeros
-wherever every run measured zero and carry a measured ceiling where they did not: those are the work
-that is left, not a bar that was cleared. A ceiling comes down as that work lands and never goes up
-without a reason in review.
+A Chromium ceiling is the worst of two 60 second runs of the whole matrix times 1.5, and whether it
+is enforced depends on whether those two runs agreed. A row whose runs came within that same 1.5 on
+every graded metric is enforced. A row where they did not keeps the `recorded` marker, which prints
+a breach and calls it out without failing the run: a ceiling wide enough to hold a spread the player
+did not cause would say nothing, and a tight one would fail on the weather. The nightly runner is
+the machine whose numbers are worth enforcing; take the marker off a row once it has recorded its
+own.
+
+Ten rows are enforced today:
+
+| Codec | Enforced |
+| --- | --- |
+| opus | `near-zero` plain, `step` plain, `fixed-250` both rings |
+| aac | `near-zero` both rings, `mild` both rings, `high-rtt` isolated, `fixed-250` isolated |
+
+Fourteen keep the marker. On most of them the disagreement is a single event either way, one
+underrun or one skip-ahead in a minute, or a converge time of zero against fifteen seconds. On four
+it is a real spread: both `bursty` AAC cells, opus `bursty` plain, and opus `high-rtt` isolated,
+where the second run of `aac-bursty-plain` stalled for three quarters of its length and the first
+did not. A third run of the matrix under `--enforce` bore the split out: it passed every enforced
+ceiling and breached only on rows that had kept the marker.
+
+A metric one run measured as zero and the other did not counts as a disagreement rather than as
+agreement, because the ratio is unbounded and a third run has nothing to be held to. That is strict
+on purpose: it means an enforced row is one that played the same way twice.
+
+A ceiling is clamped where the metric itself is bounded. A share cannot exceed 1 and a convergence
+time cannot exceed the row's own run, so the worst times 1.5 is capped at those: a ceiling a metric
+cannot reach is a check that can never fail, which reads as a cleared bar and is not one.
+
+The counters the engine has to keep at zero (underrun episodes, skip-aheads, budget aborts) are hard
+zeros wherever both runs measured zero and carry a measured ceiling where they did not: those are
+the work that is left, not a bar that was cleared. A ceiling comes down as that work lands and never
+goes up without a reason in review.
 
 The nightly `audio-quality` job runs the Chromium lane and keeps the run directory of a failure for a
 week: each process's log, the shaper's counters, the raw ndjson, the per-row summaries, and a
