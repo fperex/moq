@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::delay::{BUCKET, Jitter};
+use super::delay::{BUCKET, Jitter, LOWER_DIVISOR};
 
 /// The corpus, checked in beside the tests that consume it.
 const CORPUS: &str = include_str!("../../tests/playout-01.json");
@@ -93,6 +93,7 @@ fn the_constants_match() {
 	assert_eq!(number(constants, "start_ms"), 80.0);
 	assert_eq!(number(constants, "max_catchup"), 60.0);
 	assert_eq!(number(constants, "lower_interval_ms"), 1000.0);
+	assert_eq!(number(constants, "lower_divisor"), LOWER_DIVISOR);
 }
 
 /// Every case the page names, so one silently dropped from the generator shows up
@@ -116,6 +117,7 @@ fn every_case_is_present() {
 		"step-change",
 		"reordered",
 		"tune-in-stale",
+		"tune-in-stall",
 		"pause-10s",
 		"pause-10min",
 		"discontinuity",

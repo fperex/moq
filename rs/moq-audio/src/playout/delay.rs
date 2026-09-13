@@ -59,7 +59,7 @@ const LOWER_INTERVAL: f64 = 1000.0;
 /// same bucket in every language. A sixth a second closes the histogram's whole range
 /// inside the 29s the histogram remembers, so the limiter can never outlast the
 /// observation that raised the target.
-const LOWER_DIVISOR: f64 = 6.0;
+pub(crate) const LOWER_DIVISOR: f64 = 6.0;
 
 /// Width of one histogram bucket in milliseconds, and the resolution of the target.
 ///
