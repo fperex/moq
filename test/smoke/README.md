@@ -144,8 +144,9 @@ camera/microphone permission denial, asserting the gesture gate rather than only
 exercising it, and any claim about physical playback.
 
 The relay's port is reserved for the run rather than fixed, so two checkouts can
-smoke-test at once; `SMOKE_PORT` pins one instead. `MOQ_TEST_KEEP=1` keeps the run
-directory and its logs. See [the harness contract](../README.md).
+smoke-test at once; `SMOKE_PORT` pins one instead. A failing run keeps its
+directory and its logs; `MOQ_TEST_KEEP=1` keeps a passing one too. See [the
+harness contract](../README.md).
 
 ## Layout
 
