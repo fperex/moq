@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
+import * as Catalog from "@moq/hang/catalog";
 import * as Container from "@moq/hang/container";
+import * as Moq from "@moq/net";
 import { Time } from "@moq/net";
+import { Signal } from "@moq/signals";
+import { maxAgeHeadroom } from "./config";
 import fourKWebm from "./fixtures/4k-webm.json" with { type: "json" };
 import lanBbb from "./fixtures/lan-bbb.json" with { type: "json" };
 import relayBbb7Frame from "./fixtures/relay-bbb-7frame.json" with { type: "json" };
@@ -23,6 +27,11 @@ const CHUNK = (RATE * CHUNK_MS) / 1000;
 // What the catalog advertises for 48kHz Opus: one frame. Sync holds this as a floor under the
 // measured target.
 const FLOOR = CHUNK_MS;
+
+/** Let the consumer's spawned group readers and its delivery loop run. */
+function settle(): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 /** Deterministic PRNG, so a trace is the same on every machine. */
 function rng(seed: number): () => number {
@@ -298,4 +307,142 @@ describe.each(RINGS)("%s ring, recorded traces", (ring, build) => {
 			}
 		});
 	}
+});
+
+// --- The age budget above the decoder ---
+
+/** The recording's own frame duration, which is the catalog floor `Sync` holds the target above. */
+function frameFloor(t: Arrival[]): number {
+	const sorted = [...t].map((a) => a.media).sort((a, b) => a - b);
+	const gaps = sorted.slice(1).map((m, i) => m - sorted[i]);
+	// The nominal spacing, not the mean: a hole in the media would drag an average up.
+	return Math.ceil(Math.min(...gaps.filter((g) => g > 0)));
+}
+
+/** Frames that reached the receiver together, which is what a publisher flushes at once. */
+function flushes(t: Arrival[], frame: number): Arrival[][] {
+	const out: Arrival[][] = [];
+	for (const a of t) {
+		const open = out[out.length - 1];
+		// Half a frame of slack: within a flush the arrivals are sub-millisecond apart, between
+		// flushes they are a hundred milliseconds apart.
+		if (open && a.arrival - open[0].arrival < frame / 2) open.push(a);
+		else out.push([a]);
+	}
+	return out;
+}
+
+/**
+ * Replay a recording into a real `Container.Consumer` through a real subscription, and count the
+ * groups the age budget threw away after the estimator settled.
+ *
+ * The wire cursor and `#checkMaxAge` both rule on media timestamps alone, so the replay runs as
+ * fast as the event loop drains rather than on the trace's wall clock; only the estimator reads
+ * arrival times, and it is fed the recorded ones.
+ */
+async function censored(fixture: Fixture, budgetFor: (target: number) => number, warmupMs: number) {
+	const t = recorded(fixture);
+	const floor = frameFloor(t);
+	const jitter = new Container.Jitter();
+
+	const track = new Moq.Track.Producer("audio");
+	const budget = new Signal<Time.Milli>(Time.Milli(budgetFor(floor)));
+	const sub = track.subscribe({ priority: 0, maxAge: budget.peek() });
+	const consumer = new Container.Consumer(sub, { format: new Container.Legacy.Format("audio"), maxAge: budget });
+
+	// The decoder pulls as fast as frames arrive; in live playback the ring, not the consumer,
+	// is what holds the delay.
+	const drain = (async () => {
+		for (;;) {
+			if (!(await consumer.next())) break;
+		}
+	})();
+
+	// The wire numbers a group by where it sits on the media timeline, not by when it turned up.
+	// This recording holds seven reordered arrivals, and numbering those in arrival order would
+	// build a track whose timeline goes backwards, which a consumer refuses outright. Numbering by
+	// media leaves them as what they really are: a low-numbered group that arrived late.
+	const sequenceOf = new Map<Arrival, number>(
+		[...t].sort((x, y) => x.media - y.media).map((a, rank) => [a, rank] as const),
+	);
+
+	let warmed = 0;
+	let groups = 0;
+
+	for (const flush of flushes(t, floor)) {
+		for (const { media, arrival } of flush) {
+			jitter.observe(Time.Micro.fromMilli(media as Time.Milli), arrival as Time.Milli);
+		}
+
+		const target = Time.Milli(budgetFor(Math.max(floor, jitter.value.peek())));
+		budget.set(target);
+		sub.update({ priority: 0, maxAge: target });
+
+		// One group per frame, because every audio frame is a keyframe and the legacy producer
+		// opens a group on each one. A flush therefore delivers a run of groups at once, and the
+		// oldest of them is already the whole flush behind the live edge the moment it lands.
+		for (const arrival of flush) {
+			// Round once here: the fixture records whole microseconds, and the millisecond form
+			// this harness works in cannot always represent them exactly.
+			const timestamp = Math.round(arrival.media * 1000) as Time.Micro;
+			const sequence = sequenceOf.get(arrival);
+			if (sequence === undefined) throw new Error("arrival is not in the recording");
+			const group = new Moq.Group.Producer(sequence);
+			group.writeFrame({
+				payload: Container.Legacy.encodeFrame(new Uint8Array([1]), timestamp),
+				timestamp: Moq.Time.Timestamp.fromMicros(timestamp),
+			});
+			group.close();
+			track.writeGroup(group);
+			if (flush[0].arrival >= warmupMs) groups++;
+		}
+		await settle();
+
+		if (flush[0].arrival < warmupMs) warmed = consumer.skipped.peek();
+	}
+
+	track.close();
+	await drain;
+
+	const skipped = consumer.skipped.peek() - warmed;
+	consumer.close();
+	return { skipped, groups };
+}
+
+// The finding this guards, stated plainly: the age budget is the wire subscription's max age and
+// the container consumer's skip threshold at once, and both rule on media timestamps. A publisher
+// that flushes seven frames together puts the oldest of them a whole flush behind the live edge the
+// moment it lands, so a budget below the flush span convicts content that had already arrived, and
+// the estimator underneath it can then only ever confirm the budget it was cut to.
+describe("budget-censors-the-tail", () => {
+	it("reports what the age budget throws away above the decoder", async () => {
+		const headroom = maxAgeHeadroom(
+			Catalog.AudioConfigSchema.parse({
+				codec: "mp4a.40.2",
+				container: { kind: "legacy" },
+				sampleRate: 44100,
+				numberOfChannels: 2,
+			}),
+		);
+
+		const bare = await censored(relayBbb7Frame as Fixture, (target) => target, 4000);
+		const padded = await censored(relayBbb7Frame as Fixture, (target) => target + headroom, 4000);
+		// What the round-trip formula asked for before the target was measured. The control that
+		// makes the two numbers above mean something: the budget really does censor, it just has
+		// to fall below the publisher's flush span first.
+		const roundTrip = await censored(relayBbb7Frame as Fixture, () => 46, 4000);
+
+		console.log(
+			`budget-censors-the-tail: ${bare.skipped}/${bare.groups} groups convicted at the measured target, ${padded.skipped} with ${headroom}ms of headroom, ${roundTrip.skipped} at the 46ms round-trip budget`,
+		);
+
+		expect(roundTrip.skipped).toBeGreaterThan(0);
+
+		// The measured target already sits far above this publisher's 139ms flush span, so it
+		// censors nothing here with or without the headroom: the headroom is insurance against a
+		// path whose target lands close to the flush, not a fix for this recording. Pinned at zero
+		// so a change that starts convicting at the measured target fails here.
+		expect(bare.skipped).toBe(0);
+		expect(padded.skipped).toBe(0);
+	}, 25_000);
 });

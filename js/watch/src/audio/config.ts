@@ -1,4 +1,5 @@
 import type * as Catalog from "@moq/hang/catalog";
+import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
 
 /**
@@ -57,6 +58,40 @@ export function playbackJitter(config: Catalog.AudioConfig): Time.Milli {
 	// A publisher advertising 0 is claiming frames are never delayed, which no encoder can do, so
 	// fall back to the codec's frame duration the same way an absent field does.
 	return Time.Milli((config.jitter || defaultJitter(config)) ?? 0);
+}
+
+/**
+ * The age budget for audio: the shared max age plus what the ring can absorb past it.
+ *
+ * The budget and the playout target measure the same path, so setting the budget to the target
+ * alone throws away the arrivals the target was sized to cover, and the estimator underneath it
+ * then only ever confirms the budget it was cut to.
+ *
+ * `instant` holds nothing, so there is nothing to absorb the difference with.
+ */
+export function audioMaxAge(maxAge: Time.Milli, config: Catalog.AudioConfig | undefined, instant: boolean): Time.Milli {
+	if (instant || !config) return maxAge;
+	return Time.Milli.add(maxAge, maxAgeHeadroom(config));
+}
+
+/**
+ * How much further than the playout target audio may arrive and still be played, in milliseconds.
+ *
+ * The age budget and the estimator measure the same path but round it differently, so a budget set
+ * to the target alone convicts the arrivals the target was sized to cover. Three terms separate
+ * them, and each is something the ring absorbs without dropping a sample: the estimator reports a
+ * bucket's upper edge, so the real delay sits up to one bucket below it; a frame arrives whole, so
+ * the last one to land carries its own duration; and the ring is read a render quantum at a time.
+ *
+ * Stage 5 replaces the quantum with the time-stretch bound, which is the larger thing the ring will
+ * absorb once it can stretch.
+ */
+export function maxAgeHeadroom(config: Catalog.AudioConfig): Time.Milli {
+	// The codec's own frame duration, not the advertised flush span: a publisher batching ten
+	// frames per flush still delivers them one frame at a time to the ring.
+	const frame = defaultJitter(config) ?? config.jitter ?? 0;
+	const quantum = (WORKLET_QUANTUM / config.sampleRate) * 1000;
+	return Time.Milli(Math.ceil(Container.Jitter.BUCKET + frame + quantum));
 }
 
 // Estimate the minimum jitter (frame duration) based on the audio codec.
