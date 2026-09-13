@@ -136,13 +136,11 @@ pub(super) struct AudioTimeline {
 	written: u64,
 }
 
-/// What the speaker owes before the frame just pushed: silence to play a hole
-/// through, or a fresh sink when the timeline jumped too far to fill.
+/// Where the frame just pushed leaves the speaker: a fresh sink when the timeline
+/// jumped somewhere the buffered audio cannot be carried across.
 pub(super) struct AudioTiming {
 	/// Media time the pushed frame ends at.
 	pub(super) end: Duration,
-	/// Samples of silence to write first.
-	pub(super) silence: u64,
 	/// Whether the buffered sink has to be replaced.
 	pub(super) reset_sink: bool,
 }
@@ -165,11 +163,13 @@ impl AudioTimeline {
 		// Measure every hole from the track origin so timestamp rounding cannot
 		// accumulate into drift. Advancing to `expected` even when the hole is skipped
 		// keeps the next frame contiguous with the new timeline position.
+		//
+		// A hole this player would rather sit through is one playout already
+		// concealed, so what is left here is a timeline that moved: past the cap the
+		// speaker starts over rather than carrying audio across it.
 		let origin = *self.origin.get_or_insert(start);
 		let expected = (start.saturating_sub(origin).as_secs_f64() * sample_rate as f64).round() as u64;
-		let hole = expected.saturating_sub(self.written);
-		let skipped = hole > fill_max;
-		let silence = if skipped { 0 } else { hole };
+		let skipped = expected.saturating_sub(self.written) > fill_max;
 		let reset_sink = rewound || skipped;
 		self.written = self
 			.written
@@ -177,11 +177,7 @@ impl AudioTimeline {
 			.saturating_add(u64::try_from(samples).unwrap_or(u64::MAX));
 		self.end = Some(end);
 
-		AudioTiming {
-			end,
-			silence,
-			reset_sink,
-		}
+		AudioTiming { end, reset_sink }
 	}
 }
 
@@ -335,11 +331,9 @@ mod tests {
 
 		let rewound = timeline.push(Duration::from_secs(5), 960, 48_000, 24_000);
 		assert!(rewound.reset_sink);
-		assert_eq!(rewound.silence, 0);
 
 		let next = timeline.push(Duration::from_millis(5_020), 960, 48_000, 24_000);
 		assert!(!next.reset_sink);
-		assert_eq!(next.silence, 0);
 	}
 
 	#[test]
@@ -358,16 +352,14 @@ mod tests {
 		let mut timeline = AudioTimeline::default();
 		timeline.push(Duration::ZERO, 960, 48_000, 4_800);
 
+		// A hole inside the cap is one playout concealed, so the speaker plays on.
 		let filled = timeline.push(Duration::from_millis(100), 960, 48_000, 4_800);
 		assert!(!filled.reset_sink);
-		assert_eq!(filled.silence, 3_840);
 
 		let skipped = timeline.push(Duration::from_secs(1), 960, 48_000, 4_800);
 		assert!(skipped.reset_sink);
-		assert_eq!(skipped.silence, 0);
 
 		let next = timeline.push(Duration::from_millis(1_020), 960, 48_000, 4_800);
 		assert!(!next.reset_sink);
-		assert_eq!(next.silence, 0);
 	}
 }

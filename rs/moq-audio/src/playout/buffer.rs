@@ -187,19 +187,6 @@ impl Buffer {
 		taken
 	}
 
-	/// Drop everything before `at`, for a hole the caller has decided to splice over
-	/// rather than wait through.
-	pub(crate) fn seek(&mut self, at: Duration) {
-		self.floor = Some(at);
-		while let Some(packet) = self.packets.front() {
-			let count = packet.pcm.len() / self.channels;
-			if packet.timestamp + self.duration(count) > at {
-				break;
-			}
-			self.packets.pop_front();
-		}
-	}
-
 	/// Drop the oldest audio back to `target` once more than `threshold` is held,
 	/// reporting the frames thrown away.
 	///
@@ -323,7 +310,7 @@ mod tests {
 		let mut out = Vec::new();
 		assert_eq!(buffer.take(960, &mut out), 480, "a take stops at the hole");
 
-		buffer.seek(ms(30));
+		// Past the hole the audio is playable again, which is where a splice picks up.
 		assert_eq!(buffer.buffered(), ms(10));
 		assert_eq!(buffer.front(), Some(ms(30)));
 	}

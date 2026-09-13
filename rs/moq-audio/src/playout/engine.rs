@@ -48,7 +48,11 @@ pub(crate) struct Config {
 	pub(crate) conceal: bool,
 }
 
-/// What the engine has been doing, for a caller that reports or tests it.
+/// What the engine has been doing.
+///
+/// Counted always and read by the tests; what a player reports to a viewer, and
+/// through which type, is a decision for whoever builds that panel.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stats {
 	/// Blocks the engine had to invent because nothing was held.
@@ -251,7 +255,20 @@ impl Engine {
 		self.playhead
 	}
 
+	/// Whether there is no media left to play: nothing held, and nothing committed
+	/// but unheard. What is left from here is concealment for audio that is not
+	/// coming.
+	///
+	/// The queue itself is not the test. Concealment commits a block plus the
+	/// overlap the next splice would be aligned against, so a run of it leaves a tail
+	/// queued forever; that tail carries no media, which is what makes it the thing
+	/// to stop on rather than the thing to wait for.
+	pub(crate) fn drained(&self) -> bool {
+		self.buffer.ready() == 0 && self.segments.iter().all(|segment| segment.media.is_zero())
+	}
+
 	/// What the engine has been doing.
+	#[cfg(test)]
 	pub(crate) fn stats(&self) -> Stats {
 		Stats {
 			target: self.target,

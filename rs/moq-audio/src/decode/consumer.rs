@@ -48,11 +48,59 @@ pub struct Consumer {
 	terminal_start: Option<moq_net::Timestamp>,
 	/// Last container playhead generation applied to timeline state.
 	discontinuity: u64,
+	/// The jitter buffer, when [`Config::delay`] asked for one. It holds the target
+	/// estimate either way, since that is what sizes the age budget.
+	playout: Option<Playout>,
+}
+
+/// The jitter buffer and what it takes to drive it from this side.
+struct Playout {
+	engine: crate::playout::engine::Engine,
+	/// Where the arrival clock starts, so the estimator sees plain milliseconds.
+	epoch: std::time::Instant,
+	/// The budget currently on the wire, which follows the target.
+	budget: std::time::Duration,
+	/// Whether the track has ended, so playout drains rather than waits.
+	ended: bool,
+	/// One block of interleaved output, reused every pull.
+	block: Vec<f32>,
 }
 
 struct ActivitySpan {
 	end: moq_net::Timestamp,
 	activity: Activity,
+}
+
+impl Playout {
+	fn new(
+		delay: std::time::Duration,
+		max_age: std::time::Duration,
+		sample_rate: u32,
+		channels: u32,
+		conceal: bool,
+	) -> Result<Self, Error> {
+		let engine = crate::playout::engine::Engine::new(crate::playout::engine::Config {
+			sample_rate,
+			channels,
+			delay,
+			max_age,
+			conceal,
+		})?;
+
+		Ok(Self {
+			block: vec![0.0; engine.block() * channels.max(1) as usize],
+			engine,
+			epoch: std::time::Instant::now(),
+			budget: max_age,
+			ended: false,
+		})
+	}
+
+	/// Now, in milliseconds since this consumer opened, which is the plain
+	/// monotonic clock the estimator measures arrivals on.
+	fn now(&self) -> f64 {
+		self.epoch.elapsed().as_secs_f64() * 1000.0
+	}
 }
 
 impl Consumer {
@@ -117,6 +165,11 @@ impl Consumer {
 		let container = moq_mux::catalog::hang::Container::try_from(catalog)?;
 		let track = moq_mux::container::Consumer::new(track, container);
 
+		let playout = config
+			.delay
+			.map(|delay| Playout::new(delay, max_age, sample_rate, channels, config.conceal))
+			.transpose()?;
+
 		Ok(Self {
 			decoder,
 			track,
@@ -135,6 +188,7 @@ impl Consumer {
 			end: None,
 			terminal_start: None,
 			discontinuity: 0,
+			playout,
 		})
 	}
 
@@ -144,6 +198,10 @@ impl Consumer {
 	}
 
 	/// The effective age budget after clamping to the publisher's retention window.
+	///
+	/// With [`Config::delay`] set this is the ceiling rather than the budget in
+	/// force: the budget on the wire follows [`delay`](Self::delay), staying a little
+	/// above whatever playout currently measures.
 	pub fn max_age(&self) -> std::time::Duration {
 		self.max_age
 	}
@@ -172,16 +230,45 @@ impl Consumer {
 	/// side stay anchored to their own packet timeline, so the hole is there to
 	/// see. "Doesn't continue" allows for the quantization the stamps carry, which
 	/// on a millisecond-stamped ingest is most of a millisecond.
+	///
+	/// With [`Config::delay`] set this reads differently: a frame is one fixed ten
+	/// millisecond block off the jitter buffer, the timeline is continuous because a
+	/// gap is concealed rather than left, the activity is always
+	/// [`Active`](crate::Activity::Active), and only the first call waits on the
+	/// network. Everything after it returns as soon as it is asked, so the caller
+	/// paces the reads against its own device rather than looping on them.
 	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
+		match self.playout.is_some() {
+			true => self.read_playout().await,
+			false => self.read_decoded().await,
+		}
+	}
+
+	/// The decoded packets themselves, which is what playout is fed and what a
+	/// caller without one gets.
+	async fn read_decoded(&mut self) -> Result<Option<Frame>, Error> {
+		moq_net::kio::wait(|waiter| self.poll_decoded(waiter)).await
+	}
+
+	/// [`read_decoded`](Self::read_decoded) as a poll, so playout can take whatever
+	/// has already arrived without waiting for what has not.
+	fn poll_decoded(&mut self, waiter: &moq_net::kio::Waiter) -> std::task::Poll<Result<Option<Frame>, Error>> {
 		loop {
 			if let Some(frame) = self.ready.pop_front() {
-				return Ok(Some(frame));
+				return std::task::Poll::Ready(Ok(Some(frame)));
 			}
 
-			let mux_frame = self.track.read().await?;
+			let mux_frame = std::task::ready!(self.track.poll_read(waiter))?;
+			// One arrival per wire frame, read the moment it comes off the
+			// container and before anything downstream can decide it is too old:
+			// a target measured from what survives the age budget only ever
+			// confirms the budget it was cut to.
+			if let Some(frame) = mux_frame.as_ref() {
+				self.observe(frame.timestamp);
+			}
 			self.apply_discontinuity()?;
 			let Some(mux_frame) = mux_frame else {
-				return self.flush();
+				return std::task::Poll::Ready(self.flush());
 			};
 
 			if let Some(end) = self.track.end()
@@ -299,6 +386,124 @@ impl Consumer {
 		}
 	}
 
+	/// One block of playout, filled whether or not the network had anything to say.
+	///
+	/// The only thing it waits for is the stream starting: until the first packet
+	/// lands there is nothing to play and nothing to conceal from. From there
+	/// everything that has already arrived is folded in and the block comes out of
+	/// the jitter buffer, concealed if it had to be, which is what lets a caller
+	/// drive this from a speaker's clock. It is also why the caller has to pace the
+	/// calls, against how much the device still holds: this returns immediately, so
+	/// a loop that only reads spins.
+	async fn read_playout(&mut self) -> Result<Option<Frame>, Error> {
+		while self
+			.playout
+			.as_ref()
+			.is_some_and(|playout| !playout.ended && playout.engine.playhead().is_none())
+		{
+			match self.read_decoded().await? {
+				Some(frame) => self.hold(frame)?,
+				None => self.end_playout(),
+			}
+		}
+
+		// From here take only what has already arrived: a block is due now, and the
+		// audio that has not turned up is what concealment is for.
+		let waiter = moq_net::kio::Waiter::noop();
+		while !self.playout.as_ref().is_some_and(|playout| playout.ended) {
+			match self.poll_decoded(&waiter) {
+				std::task::Poll::Ready(Ok(Some(frame))) => self.hold(frame)?,
+				std::task::Poll::Ready(Ok(None)) => self.end_playout(),
+				std::task::Poll::Ready(Err(err)) => return Err(err),
+				std::task::Poll::Pending => break,
+			}
+		}
+
+		let channels = self.resolved_channels;
+		let rate = self.resolved_sample_rate;
+		let format = self.config.format;
+		let playout = self.playout.as_mut().expect("playout is on");
+		if playout.ended && playout.engine.drained() {
+			return Ok(None);
+		}
+
+		let at = playout.engine.playhead().unwrap_or_default();
+		let mut block = std::mem::take(&mut playout.block);
+		playout.engine.pull(&mut block);
+		let bytes = format.from_interleaved_f32(&block, channels);
+		playout.block = block;
+
+		Ok(Some(Frame {
+			timestamp: moq_net::Timestamp::from_scale(
+				(at.as_secs_f64() * f64::from(rate)).round() as u64,
+				u64::from(rate),
+			)?,
+			data: Bytes::from(bytes?),
+			// Playout output is continuous by construction: a gap is concealment,
+			// not a codec that stopped coding.
+			activity: Activity::Active,
+		}))
+	}
+
+	/// The track ended, so playout drains what it holds rather than waiting for more.
+	fn end_playout(&mut self) {
+		if let Some(playout) = self.playout.as_mut() {
+			playout.ended = true;
+		}
+	}
+
+	/// Hand one decoded packet to the jitter buffer.
+	fn hold(&mut self, frame: Frame) -> Result<(), Error> {
+		let channels = self.resolved_channels;
+		let pcm = self.config.format.as_interleaved_f32(&frame.data, channels)?;
+		let playout = self.playout.as_mut().expect("playout is on");
+
+		let now = playout.now();
+		playout.engine.insert(frame.timestamp.into(), now, &pcm);
+		Ok(())
+	}
+
+	/// Fold one arrival into the target estimate, and follow it with the age budget.
+	fn observe(&mut self, timestamp: moq_net::Timestamp) {
+		let Some(playout) = self.playout.as_mut() else {
+			return;
+		};
+
+		let now = playout.now();
+		playout.engine.observe(timestamp.into(), now);
+
+		// With a jitter buffer the budget follows the measurement rather than the
+		// config: media older than the target plus what playout absorbs above it can
+		// never be heard, and a budget any tighter than that throws away the very
+		// arrivals the target was sized to cover, leaving an estimator that can only
+		// confirm the budget it was cut to. `Config::max_age` stays the ceiling, which
+		// the target is held a headroom under, so this never rises above it.
+		let wanted = playout.engine.target() + crate::playout::HEADROOM;
+		if wanted != playout.budget {
+			playout.budget = wanted;
+			self.track.set_max_age(wanted);
+		}
+	}
+
+	/// The playout target currently in force, or `None` when this consumer holds no
+	/// jitter buffer.
+	///
+	/// Measured from arrival timing rather than from a round trip, and held between
+	/// the [`Config::delay`] floor and what the age budget leaves room for.
+	pub fn delay(&self) -> Option<std::time::Duration> {
+		self.playout.as_ref().map(|playout| playout.engine.target())
+	}
+
+	/// Where playout has reached on the media timeline, or `None` before it has
+	/// played anything.
+	///
+	/// The clock to present video against: it counts the media that has actually
+	/// left for the speaker, so concealment and time stretching move it by what they
+	/// really moved rather than by the blocks they produced.
+	pub fn playhead(&self) -> Option<std::time::Duration> {
+		self.playout.as_ref().and_then(|playout| playout.engine.playhead())
+	}
+
 	/// A playhead event re-applies startup delay and skip. The decoder is not reset:
 	/// the next group already starts on a keyframe, and pre-skip is a play-path concern.
 	fn apply_discontinuity(&mut self) -> Result<(), Error> {
@@ -308,6 +513,9 @@ impl Consumer {
 		}
 
 		self.discontinuity = discontinuity;
+		if let Some(playout) = self.playout.as_mut() {
+			playout.engine.reanchor();
+		}
 		self.next_start = None;
 		self.spans.clear();
 		self.trailing = Activity::Active;

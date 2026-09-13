@@ -104,6 +104,7 @@ impl Noise {
 	}
 
 	/// Whether a quiet enough window has been seen yet.
+	#[cfg(test)]
 	pub(crate) fn initialised(&self) -> bool {
 		self.initialised
 	}

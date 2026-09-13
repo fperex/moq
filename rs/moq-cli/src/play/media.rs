@@ -21,10 +21,34 @@ use super::window::Event;
 /// that raw frames can't run away with memory.
 const MAX_VIDEO_FRAMES: usize = 30;
 
-/// The floor on the speaker's buffer, whatever delay was asked for. The device
-/// pulls on a fixed clock, so a ring shallower than this drops out on ordinary
-/// network jitter, and one with no depth at all can never be read from.
-const AUDIO_BUFFER_MIN: Duration = Duration::from_millis(50);
+/// How much audio the speaker holds between the decode task and the device.
+///
+/// Not the playout delay: the jitter buffer inside
+/// [`moq_audio::decode::Consumer`] holds that, sized from what actually arrives.
+/// This is only what the device needs to ride out the decode task being scheduled
+/// late, so it is as shallow as that allows and no shallower: a ring with no depth
+/// can never be read from.
+///
+/// The engine runs on the decode task, ahead of this ring, rather than inside the
+/// device callback. The callback mixes every sink on the device and may not
+/// allocate, lock, or log; the engine does all three (it grows its scratch buffers,
+/// and the container read it drains from takes locks), so putting it there would
+/// cost every other sink on the device a dropout whenever one stream had to
+/// conceal. A ring this shallow ahead of it is the price, and the device's own
+/// drain is what paces the pulls.
+const AUDIO_DEVICE_CUSHION: Duration = Duration::from_millis(30);
+
+/// The deepest jitter buffer this player will let the measurement ask for.
+///
+/// A ceiling, not the budget: the consumer keeps the age budget on the wire just
+/// above whatever it currently measures, so nothing is waited on for this long. It
+/// is here to give the estimator somewhere to rise to, since `--delay` is only the
+/// floor. Four thirds of the estimator's own range because playout claims three
+/// quarters of the budget, leaving the rest for the arrivals that land while the
+/// deepest audio is still playing.
+/// Rounded up, so the three quarters taken back off it still cover the range.
+const AUDIO_MAX_AGE: Duration =
+	Duration::from_nanos((moq_audio::decode::Config::DELAY_MAX.as_nanos() as u64 * 4).div_ceil(3));
 
 /// How much audio is handed to the speaker per write.
 ///
@@ -182,14 +206,14 @@ impl Media {
 							continue;
 						}
 					};
-					// The floored depth, not the raw delay: the speaker holds at least
-					// AUDIO_BUFFER_MIN whatever was asked for, so a smaller budget would
-					// skip a group the playhead could still have reached, and would size
-					// the hole fill below to a playhead that does not exist.
-					let depth = self.args.delay.into_std().max(AUDIO_BUFFER_MIN);
+					// `--delay` is the floor under the jitter buffer, not the buffer
+					// itself: the consumer measures what arrives and holds at least
+					// this much, and the budget it keeps on the wire follows that
+					// measurement rather than the ceiling below.
 					let mut decode = moq_audio::decode::Config::new();
 					decode.start = moq_audio::decode::Start::Latest;
-					decode.max_age = depth;
+					decode.delay = Some(self.args.delay.into_std());
+					decode.max_age = AUDIO_MAX_AGE;
 					// The sink and the frame-duration math below both assume f32,
 					// so ask for it rather than inheriting the decoder default.
 					decode.format = moq_audio::Format::F32;
@@ -198,7 +222,6 @@ impl Media {
 							tracing::info!(track = name, "playing audio rendition");
 							let audio = AudioPlayback {
 								presentation: self.presentation.clone(),
-								depth,
 								proxy: self.proxy.clone(),
 							};
 							tasks.spawn(async move { (Kind::Audio, play_audio(consumer, audio).await) });
@@ -258,23 +281,18 @@ async fn play_video(
 
 struct AudioPlayback {
 	presentation: Arc<Mutex<Presentation>>,
-	depth: Duration,
 	proxy: EventLoopProxy<Event>,
 }
 
 async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPlayback) -> anyhow::Result<()> {
-	let AudioPlayback {
-		presentation,
-		depth,
-		proxy,
-	} = playback;
+	let AudioPlayback { presentation, proxy } = playback;
 
-	// `depth` is how much the speaker holds: the playout delay, floored, and the
-	// same value the decoder's age budget was built from. The delay lives in the
-	// sink rather than in the throttle, since a sample handed over now sounds
-	// that much later and waiting for the delayed instant before writing would
-	// take it twice. The window schedules video against where the speaker
-	// actually is, which keeps the two together.
+	// The playout delay lives in the consumer's jitter buffer, which hands back one
+	// block at a time whatever the network is doing; the speaker holds only the
+	// cushion the device needs. Pacing is what keeps the two in step: the loop below
+	// waits for the ring to drain to the cushion before pulling the next block, so
+	// the blocks come out on the device's clock, and the window schedules video
+	// against where the speaker has actually reached.
 	let sample_rate = consumer.sample_rate();
 	let channels = consumer.channels();
 	let engine = moq_audio::playback::Engine::open(Default::default()).await?;
@@ -282,20 +300,15 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 	input.format = moq_audio::Format::F32;
 	input.sample_rate = sample_rate;
 	input.channels = channels;
-	input.latency = depth;
+	input.latency = AUDIO_DEVICE_CUSHION;
 	let mut sink = engine.sink(input.clone())?;
 
-	// One sample across every channel, the unit a write has to stay aligned to.
-	let stride = channels as usize * size_of::<f32>();
-	let chunk = ((AUDIO_CHUNK.as_secs_f64() * sample_rate as f64) as usize * stride).max(stride);
-
-	// The longest hole worth playing through, in samples. A hole this player would
-	// rather sit through is one it is already willing to buffer, which is what the
-	// decoder's latency budget says: anything longer is what that budget chose to
-	// skip, so playing it as silence would hand back the delay the skip avoided.
-	// Past it the sink skips the hole and the clock re-anchors, as it does today.
+	// The furthest the media timeline may step forward between blocks and still be
+	// the same timeline, in samples. Playout splices over the holes it can, so a
+	// step this big is a stream that restarted somewhere else rather than a gap:
+	// the sink starts over and the clock re-anchors, since audio buffered against
+	// the old timeline cannot be carried across.
 	let fill_max = (consumer.max_age().as_secs_f64() * sample_rate as f64) as u64;
-	let silence = vec![0u8; chunk];
 
 	let mut timeline = AudioTimeline::default();
 
@@ -336,33 +349,13 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 			sink = engine.sink(input.clone())?;
 		}
 
-		// A hole in the media is a hole in the audio, not a splice. Handing the next
-		// frame straight to the speaker shortens the track by the missing duration,
-		// which leaves it running ahead of media time until the clock below
-		// re-anchors, taking the video with it. Play the hole instead.
-		if timing.silence > 0 {
-			let mut remaining = usize::try_from(timing.silence)
-				.unwrap_or(usize::MAX / stride)
-				.saturating_mul(stride);
-			while remaining > 0 {
-				if let Some(excess) = sink.buffered().checked_sub(depth) {
-					tokio::time::sleep(excess).await;
-				}
-				let part = remaining.min(silence.len());
-				sink.write(&silence[..part])?;
-				remaining -= part;
-			}
+		// Let the speaker drain back to the cushion before topping it up. This is
+		// what paces the whole task: playout hands back a block the moment it is
+		// asked, so the device's own clock is what decides when to ask.
+		if let Some(excess) = sink.buffered().checked_sub(AUDIO_DEVICE_CUSHION) {
+			tokio::time::sleep(excess).await;
 		}
-
-		for part in frame.data.chunks(chunk) {
-			// Let the speaker drain back to the target depth before topping it up.
-			// This is what paces the whole task: the device drains in real time, so
-			// the writes end up on the media clock and the sink holds the delay.
-			if let Some(excess) = sink.buffered().checked_sub(depth) {
-				tokio::time::sleep(excess).await;
-			}
-			sink.write(part)?;
-		}
+		sink.write(&frame.data)?;
 
 		// Anchor the playout clock on where the speaker has actually reached, which
 		// is the only half of the pipeline that cannot skip ahead. A move has to
@@ -386,10 +379,38 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 			tokio::time::sleep(remaining.max(Duration::from_millis(10))).await;
 		}
 	};
-	// A write tops the ring up to `depth` and then adds a chunk, so that sum is
-	// the deepest it can be when the track ends, and draining it takes exactly
-	// that long in real time.
-	let _ = tokio::time::timeout(depth + AUDIO_CHUNK + AUDIO_DRAIN_GRACE, drain).await;
+	// A write tops the ring up to the cushion and then adds a block, so that sum is
+	// the deepest it can be when the track ends, and draining it takes exactly that
+	// long in real time.
+	let _ = tokio::time::timeout(AUDIO_DEVICE_CUSHION + AUDIO_CHUNK + AUDIO_DRAIN_GRACE, drain).await;
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The ceiling has to leave the estimator its whole range above the floor.
+	///
+	/// Sizing it from `--delay` instead is the trap: playout claims three quarters
+	/// of the budget, so a budget four thirds of the floor pins the target to the
+	/// floor, and a measured jitter buffer that can never measure anything is just a
+	/// fixed one with extra steps.
+	#[test]
+	fn the_budget_leaves_the_estimator_room_to_rise() {
+		assert!(
+			AUDIO_MAX_AGE * 3 / 4 >= moq_audio::decode::Config::DELAY_MAX,
+			"{AUDIO_MAX_AGE:?} caps the target below {:?}",
+			moq_audio::decode::Config::DELAY_MAX
+		);
+	}
+
+	/// The speaker holds only what the device needs, since the delay lives in the
+	/// jitter buffer now. A cushion as deep as the delay would add it twice.
+	#[test]
+	fn the_device_cushion_is_not_the_delay() {
+		assert!(AUDIO_DEVICE_CUSHION < Duration::from_millis(50));
+		assert!(!AUDIO_DEVICE_CUSHION.is_zero(), "a ring with no depth cannot be read");
+	}
 }

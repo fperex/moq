@@ -388,8 +388,17 @@ impl Constraints {
 	}
 
 	/// The deepest target these constraints allow.
+	///
+	/// The budget has to stay a [`HEADROOM`](super::HEADROOM) above the target or it
+	/// convicts the arrivals the target was sized to cover, so that much of it is not
+	/// available to buffer with. At any budget worth running this is the looser of
+	/// the two bounds and the 75% share is what binds; it is the tighter one on a
+	/// budget too shallow for a quarter of itself to cover the headroom.
 	fn ceiling(&self) -> Duration {
-		self.max.min(self.capacity * Self::SHARE / 4).min(CEILING)
+		self.max
+			.saturating_sub(super::HEADROOM)
+			.min(self.capacity * Self::SHARE / 4)
+			.min(CEILING)
 	}
 
 	/// `target` held between the floor and the ceiling.
@@ -606,7 +615,11 @@ mod tests {
 			constraints.apply(Duration::from_millis(200)),
 			Duration::from_millis(200)
 		);
-		assert_eq!(constraints.apply(Duration::from_secs(1)), Duration::from_millis(400));
+		// The budget, less the headroom it has to keep above whatever it allows.
+		assert_eq!(
+			constraints.apply(Duration::from_secs(1)),
+			Duration::from_millis(400) - super::super::HEADROOM
+		);
 	}
 
 	#[test]
@@ -614,6 +627,22 @@ mod tests {
 		let constraints =
 			Constraints::new(Duration::ZERO, Duration::from_secs(10), Duration::from_millis(400)).unwrap();
 		assert_eq!(constraints.apply(Duration::from_secs(1)), Duration::from_millis(300));
+	}
+
+	/// The budget has to stay a headroom above whatever it allows, or it convicts the
+	/// arrivals that target was sized to cover. On a budget too shallow for its own
+	/// quarter to cover that, the headroom is what binds rather than the 75% share.
+	#[test]
+	fn constraints_leave_the_budget_its_headroom_above_the_target() {
+		let shallow = Constraints::new(Duration::ZERO, Duration::from_millis(200), Duration::from_millis(200))
+			.expect("no floor always fits");
+		let target = shallow.apply(Duration::from_secs(1));
+		assert_eq!(target, Duration::from_millis(200) - super::super::HEADROOM);
+		assert!(target + super::super::HEADROOM <= Duration::from_millis(200));
+
+		// Deep enough and the share is the tighter of the two again.
+		let deep = Constraints::new(Duration::ZERO, Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+		assert_eq!(deep.apply(Duration::from_secs(2)), Duration::from_millis(750));
 	}
 
 	#[test]
@@ -626,9 +655,10 @@ mod tests {
 		.unwrap_err();
 		assert!(err.to_string().contains("500ms"), "{err}");
 
+		// A budget has to be deeper than the floor by the headroom it keeps above it.
 		Constraints::new(
 			Duration::from_millis(500),
-			Duration::from_millis(500),
+			Duration::from_millis(500) + super::super::HEADROOM,
 			Duration::from_secs(2),
 		)
 		.unwrap();

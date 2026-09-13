@@ -74,20 +74,29 @@ MKV uses the same flag to cap clusters, which otherwise follow video GOPs.
 
 ```bash
 moq --connect https://relay.example.com/anon --broadcast my-stream.hang play
-moq ... play --delay 500ms          # trade latency for a jittery link
+moq ... play --delay 500ms          # never hold less than half a second
 ```
 
 Decodes H.264, H.265, and AV1 video and Opus, PCM, and AAC-LC audio using
 the platform hardware decoder where available. `--video-name` and
 `--audio-name` pick a rendition.
 
-Playback runs on a clock it owns. `--delay` (default 100 ms) is how far it
-trails the live edge, which is both the jitter a late frame may absorb and the
-point past which a stalled group is skipped. The speaker holds the delay, with a
-50 ms floor under it, and the picture is scheduled against where the speaker
-actually is. While video owns the clock, a frame arriving earlier than predicted
-pulls playback forward, so a late start catches up to live instead of staying
-behind it. Once the speaker owns the clock, video follows the speaker instead.
+Playback runs on a clock it owns. Audio is held in a jitter buffer sized from
+how unevenly the audio actually arrives, so a burst or a late group is absorbed
+rather than heard, and the speaker is fed a block at a time whatever the network
+is doing. `--delay` (default 100 ms, at most 2 s) is the floor under that
+buffer: playback never trails the live edge by less, and the measurement raises
+it whenever the path asks for more. Audio's staleness budget, past which a
+stalled group is skipped, follows that measurement rather than the flag, so the
+arrivals the buffer was sized to cover are not thrown away before it sees them;
+video keeps `--delay` as its own budget, since nothing older than the playhead is
+worth presenting. [Playout](/concept/playout) is the algorithm, shared with the
+browser player.
+
+The picture is scheduled against where the speaker actually is. While video owns
+the clock, a frame arriving earlier than predicted pulls playback forward, so a
+late start catches up to live instead of staying behind it. Once the speaker
+owns the clock, video follows the audio playhead instead.
 
 Each role follows the catalog for as long as it lasts. Each decoder starts at
 the newest cached group, including when a rendition is reopened, so playback

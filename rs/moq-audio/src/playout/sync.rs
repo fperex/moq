@@ -7,11 +7,10 @@
 //! [`expand`](super::expand) and [`merge`](super::merge) both need recent history to
 //! work from.
 //!
-//! It is also where the playhead comes from. [`Self::read`] counts every frame
-//! committed to it and [`Self::queued`] counts the ones still waiting, so the media
-//! position actually being heard is `read - queued`, which is what an A/V clock has
-//! to steer video by. Reading the output frame count instead would drift by exactly
-//! the amount every time stretch has moved.
+//! [`Self::queued`] is what the playhead is read against: the engine records how
+//! much media each run of committed frames carried, and what is still queued here is
+//! how much of that has yet to be heard. Counting output frames instead would drift
+//! by exactly the amount every time stretch has moved.
 
 use std::time::Duration;
 
@@ -26,10 +25,6 @@ pub(crate) struct Sync {
 	cursor: usize,
 	/// Played frames kept behind the cursor.
 	history: usize,
-	/// Frames committed since construction.
-	read: u64,
-	/// Frames played since construction.
-	played: u64,
 }
 
 impl Sync {
@@ -40,15 +35,12 @@ impl Sync {
 			samples: Vec::new(),
 			cursor: 0,
 			history: frames(rate, history),
-			read: 0,
-			played: 0,
 		}
 	}
 
 	/// Commit interleaved PCM to be played after everything already queued.
 	pub(crate) fn push(&mut self, pcm: &[f32]) {
 		self.samples.extend_from_slice(pcm);
-		self.read += (pcm.len() / self.channels) as u64;
 		self.trim();
 	}
 
@@ -62,7 +54,6 @@ impl Sync {
 		let start = self.cursor * self.channels;
 		out.copy_from_slice(&self.samples[start..start + out.len()]);
 		self.cursor += wanted;
-		self.played += wanted as u64;
 		self.trim();
 		true
 	}
@@ -72,17 +63,6 @@ impl Sync {
 		self.samples.len() / self.channels - self.cursor
 	}
 
-	/// Frames committed since construction. The media playhead is this less
-	/// [`Self::queued`].
-	pub(crate) fn read(&self) -> u64 {
-		self.read
-	}
-
-	/// Frames played since construction.
-	pub(crate) fn played(&self) -> u64 {
-		self.played
-	}
-
 	/// The most recent `count` frames of played audio, for concealment to study.
 	/// Shorter than asked for when that much has not been played yet.
 	pub(crate) fn history(&self, count: usize) -> &[f32] {
@@ -90,16 +70,10 @@ impl Sync {
 		&self.samples[(self.cursor - count) * self.channels..self.cursor * self.channels]
 	}
 
-	/// Drop everything, played and queued, keeping the frame counters.
+	/// Drop everything, played and queued.
 	pub(crate) fn flush(&mut self) {
 		self.samples.clear();
 		self.cursor = 0;
-	}
-
-	/// Drop the queued audio without touching the history, for a stream that is about
-	/// to be rebuilt from a different point.
-	pub(crate) fn truncate(&mut self) {
-		self.samples.truncate(self.cursor * self.channels);
 	}
 
 	/// Forget played audio past what concealment needs.
@@ -133,7 +107,6 @@ mod tests {
 		assert!(sync.pull(&mut out));
 		assert_eq!(out, ramp(480, 480));
 		assert_eq!(sync.queued(), 0);
-		assert_eq!(sync.played(), 960);
 	}
 
 	#[test]
@@ -145,17 +118,6 @@ mod tests {
 		assert!(!sync.pull(&mut out));
 		assert_eq!(sync.queued(), 240, "a refused pull consumes nothing");
 		assert!(out.iter().all(|s| *s == 0.0));
-	}
-
-	#[test]
-	fn the_playhead_is_what_has_been_read_less_what_is_queued() {
-		let mut sync = Sync::new(48_000, 1, Duration::from_millis(30));
-		sync.push(&ramp(0, 1440));
-		assert_eq!(sync.read() - sync.queued() as u64, 0);
-
-		let mut out = vec![0.0; 480];
-		assert!(sync.pull(&mut out));
-		assert_eq!(sync.read() - sync.queued() as u64, 480);
 	}
 
 	#[test]
@@ -182,17 +144,5 @@ mod tests {
 		let mut out = vec![0.0; 4];
 		assert!(sync.pull(&mut out));
 		assert_eq!(out, vec![1.0, -1.0, 2.0, -2.0]);
-	}
-
-	#[test]
-	fn truncate_keeps_the_history_and_drops_the_queue() {
-		let mut sync = Sync::new(48_000, 1, Duration::from_millis(30));
-		sync.push(&ramp(0, 960));
-		let mut out = vec![0.0; 480];
-		assert!(sync.pull(&mut out));
-
-		sync.truncate();
-		assert_eq!(sync.queued(), 0);
-		assert_eq!(sync.history(480), ramp(0, 480));
 	}
 }
