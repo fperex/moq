@@ -400,6 +400,8 @@ class DecoderTrack {
 		const consumer = new Container.Consumer(sub, {
 			format,
 			maxAge: this.sync.out.maxAge,
+			// The publisher's declared flush span, which is where the arrival estimate starts.
+			jitter: this.jitter,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -481,6 +483,8 @@ class DecoderTrack {
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
 			maxAge: this.sync.out.maxAge,
+			// The publisher's declared flush span, which is where the arrival estimate starts.
+			jitter: this.jitter,
 		});
 		effect.cleanup(() => consumer.close());
 

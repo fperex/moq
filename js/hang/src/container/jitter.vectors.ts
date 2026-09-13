@@ -40,6 +40,8 @@ export type Arrival = {
 export type Case = {
 	name: string;
 	description: string;
+	/** The publisher's declared flush span this trace starts from, when it declares one. */
+	start_ms?: number;
 	arrivals: Arrival[];
 	/** The target after each arrival, milliseconds, always a whole bucket. */
 	target_ms: number[];
@@ -79,8 +81,8 @@ const CONSTANTS: Corpus["constants"] = {
 };
 
 /** Replay one trace through the estimator and collect the target after each arrival. */
-export function replay(arrivals: Arrival[]): number[] {
-	const jitter = new Jitter();
+export function replay(arrivals: Arrival[], start?: number): number[] {
+	const jitter = new Jitter({ start: start as Time.Milli | undefined });
 	const targets: number[] = [];
 
 	for (const arrival of arrivals) {
@@ -97,11 +99,12 @@ export function generate(): Corpus {
 	return {
 		algorithm: ALGORITHM,
 		constants: CONSTANTS,
-		cases: cases().map(({ name, description, arrivals }) => ({
+		cases: cases().map(({ name, description, start_ms, arrivals }) => ({
 			name,
 			description,
+			...(start_ms === undefined ? {} : { start_ms }),
 			arrivals,
-			target_ms: replay(arrivals),
+			target_ms: replay(arrivals, start_ms),
 		})),
 	};
 }
@@ -170,7 +173,7 @@ function stalled(arrivals: Arrival[], options: { at: number; stall: number; drai
 	});
 }
 
-function cases(): { name: string; description: string; arrivals: Arrival[] }[] {
+function cases(): { name: string; description: string; start_ms?: number; arrivals: Arrival[] }[] {
 	return [
 		{
 			name: "steady",
@@ -327,6 +330,13 @@ function cases(): { name: string; description: string; arrivals: Arrival[] }[] {
 				return arrivals;
 			})(),
 		},
+		{
+			name: "seeded",
+			description:
+				"Twenty seconds of the steady trace on a publisher declaring a 310ms flush span. The declaration is the cold start, rounded up to a whole bucket, and the measurement then walks it down the ordinary fall bound to the same 20ms the unseeded trace settles on: a declaration is a prior, not a floor.",
+			start_ms: 310,
+			arrivals: paced({ frames: 1000, base: 50, spread: 2, seed: 11 }),
+		},
 	];
 }
 
@@ -357,6 +367,7 @@ function format(corpus: Corpus): string {
 			"\t\t{",
 			`\t\t\t"name": ${JSON.stringify(entry.name)},`,
 			`\t\t\t"description": ${JSON.stringify(entry.description)},`,
+			...(entry.start_ms === undefined ? [] : [`\t\t\t"start_ms": ${entry.start_ms},`]),
 			'\t\t\t"arrivals": [',
 			arrivals,
 			"\t\t\t],",

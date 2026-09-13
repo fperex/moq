@@ -55,7 +55,12 @@ fn the_corpus_passes() {
 			targets.len()
 		);
 
-		let mut jitter = Jitter::new();
+		// A case naming a flush span is one that starts from the publisher's declaration;
+		// the rest start from NetEq's guess.
+		let mut jitter = match case["start_ms"].as_f64() {
+			Some(start) => Jitter::seeded(Duration::from_secs_f64(start / 1000.0)),
+			None => Jitter::new(),
+		};
 
 		for (index, (arrival, expected)) in arrivals.iter().zip(targets).enumerate() {
 			if arrival["reanchor_before"].as_bool().unwrap_or(false) {
@@ -123,6 +128,7 @@ fn every_case_is_present() {
 		"discontinuity",
 		"outlier",
 		"sparse",
+		"seeded",
 	] {
 		assert!(names.contains(&expected), "the corpus lost `{expected}`");
 	}

@@ -6,7 +6,7 @@ import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Si
  * How far playback trails the live edge.
  *
  * `"auto"` (the default) sizes the jitter buffer from how late frames actually arrive; a
- * `Time.Milli` fixes it.
+ * `Time.Milli` is the whole delay, with nothing added to it for what the publisher advertises.
  *
  * `"instant"` drops the buffer and the pacing together: nothing is held, and {@link Sync.wait}
  * returns without sleeping, so a frame presents as soon as it exists. It also overrides
@@ -49,21 +49,19 @@ function extrapolate(clock: Clock, now: Time.Milli): Time.Milli {
 /**
  * One of the tracks {@link Sync} keeps in step.
  *
- * Both inputs describe the same buffer from different sides: `advertised` is what the publisher
- * declares it flushes, `spread` is what the receiver measured arriving. See {@link Sync.track}.
+ * See {@link Sync.track}.
  */
 export class SyncTrack {
 	/** Which track this is. */
 	readonly name: "audio" | "video" | "text";
 
-	/** The delay the selected rendition advertises, wired from the per-rendition source. */
-	readonly advertised = new Signal<Time.Milli | undefined>(undefined);
-
 	/**
 	 * How late this track's frames arrive relative to the earliest one, from the container consumer.
 	 *
 	 * This is what `"auto"` sizes the jitter buffer from: it measures what the publisher and the
-	 * network actually deliver, which the round trip does not describe.
+	 * network actually deliver, which the round trip does not describe. The rendition's advertised
+	 * flush span is where that measurement starts, applied by the container consumer, so it needs no
+	 * second term here.
 	 */
 	readonly spread = new Signal<Time.Milli | undefined>(undefined);
 
@@ -185,8 +183,8 @@ export class Sync {
 	/**
 	 * The handle for one of the tracks being kept in step.
 	 *
-	 * Stable for the life of the `Sync`: the decoders wire their advertised delay and measured
-	 * spread into it, and the ones that render on a playhead nominate themselves as the clock.
+	 * Stable for the life of the `Sync`: the decoders wire their measured spread into it, and the
+	 * ones that render on a playhead nominate themselves as the clock.
 	 */
 	track(name: "audio" | "video"): SyncClockTrack;
 	track(name: "text"): SyncTrack;
@@ -233,25 +231,17 @@ export class Sync {
 		this.#out.jitter.set(Time.Milli.min(JITTER_CEILING, spread));
 	}
 
-	// The advertised delay is a publisher-declared floor and the measured jitter is a measurement of
-	// the network, so "auto" is the larger of the two rather than their sum: the receiver measures
-	// the publisher's flush span itself, so adding them would double the buffer for exactly the
-	// publishers that need it most. A fixed delay is what the viewer asked for on top of the floor,
-	// so there the two do add. "instant" holds nothing.
+	// The delay is the jitter and nothing else. The publisher's advertised flush span is not a second
+	// term: it is the same quantity the estimator measures, so it seeds the estimate (see
+	// `Container.Consumer`'s `jitter` prop) rather than flooring or adding to the result. Carrying it
+	// here too made a viewer asking for 100ms on a source declaring 300ms wait 400ms, and pinned a
+	// LAN viewer at whatever the publisher's flush span happened to be however well it delivered.
+	// "instant" holds nothing.
 	#runDelay(effect: Effect): void {
 		const mode = effect.get(this.in.delay);
 		const jitter = effect.get(this.#out.jitter);
 
-		let advertised = Time.Milli.zero;
-		for (const track of Object.values(this.#tracks)) {
-			advertised = Time.Milli.max(advertised, effect.get(track.advertised) ?? Time.Milli.zero);
-		}
-
-		let delay: Time.Milli;
-		if (mode === "instant") delay = Time.Milli.zero;
-		else if (typeof mode === "number") delay = Time.Milli.add(advertised, jitter);
-		else delay = Time.Milli.max(advertised, jitter);
-		this.#out.delay.set(delay);
+		this.#out.delay.set(mode === "instant" ? Time.Milli.zero : jitter);
 
 		this.#wake();
 	}

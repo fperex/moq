@@ -273,9 +273,26 @@ unportable to a runtime with a different timer surface.
 The quantile's upper edge is what the histogram asks for. The published target
 follows it asymmetrically.
 
-**Before any observation**, the target is 80 ms, WebRTC's `kStartDelayMs`. It
-is a guess, held only until the first resampled observation lands half a second
-in.
+**Before any observation**, the target is the publisher's declared flush span,
+rounded up to a whole bucket and never below 80 ms.
+
+The declared span is the best prior a receiver has. It is the same quantity
+this estimator goes on to measure, published by the only party that already
+knows it, and NetEq guesses 80 ms (`kStartDelayMs`) only because RTP carries
+nothing like it. Never below that guess, because the network adds to a flush
+span rather than replacing it, and never above the histogram's range, or the
+declaration would name a target no observation could bring down.
+
+It is a start, not a floor. The measurement owns the target from the first
+resampled observation half a second in, and the ordinary fall bound walks it
+down from there: a publisher declaring 300 ms on a path that turns out to
+deliver inside 20 ms ends at 20 ms, in the same steps every other fall takes.
+A receiver holding audio because of a declaration alone, after measuring the
+path for a minute, is holding it for no reason it can point at; and what
+playback must never go below is the measured p95 plus the chunk the ring holds
+on top of it, which is a measurement, not a declaration.
+
+A receiver that is handed no declaration starts at the 80 ms guess.
 
 **Rise is immediate.** A late frame has already proven the buffer is too
 shallow, and every moment spent ramping up costs an underrun the viewer hears.
@@ -325,12 +342,13 @@ The quantile is a bucket index, so it comes down in handfuls of buckets at a
 time as mass leaves the tail, not smoothly. That is the case the fixed step
 could not follow.
 
-**No floor.** The estimator never applies one. The rendition's advertised
-`jitter` is the publisher's declared flush span, a property of the encoder, and
-the target is a measurement of the network. They are different quantities that
-share a word. Whoever combines them owns that decision: in `@moq/watch` the
-advertised value is the floor and the measured target is the estimate, so auto
-delay is `max(advertised, target)` and a fixed delay is `advertised + target`.
+**No floor.** The estimator never applies one, including to its own start. The
+rendition's advertised `jitter` reaches it as the cold start above and nowhere
+else, so in `@moq/watch` an auto delay is the target and a fixed delay is the
+number the viewer asked for. Carrying the declaration a second time, as a floor
+under auto or a term added to a fixed delay, double-counted it: a viewer asking
+for 100 ms on a source declaring 300 waited 400, and a LAN viewer measuring
+20 ms was pinned at 300 for the length of the session.
 
 ## Re-anchoring
 
@@ -419,7 +437,8 @@ The same list, from the Rust side. Each of these reads correct and is not.
 - Both the resample comparison and the quantile walk use strict `>`.
 - The quantile subtracts bucket 0 before the loop, not inside it.
 - Empty-interval decay runs after the closed interval's maximum, capped at 60.
-- The target starts at 80 ms, not at 0 and not at the first quantile.
+- The target starts at the declared flush span rounded up to a whole bucket, or
+  at 80 ms when nothing is declared. Not at 0 and not at the first quantile.
 - The reading-gap test needs both terms. Idle time alone throws away every
   observation a track slower than two frames a second makes.
 - The reading gap is measured against the previous **admitted** arrival, so a
@@ -444,6 +463,9 @@ Every trace is built procedurally from a seeded PRNG, so a reviewer can read
 the shape rather than a wall of numbers. Every `target_ms` is a whole multiple
 of 20, so an `f64` difference between V8 and rustc can never break parity.
 
+A case carrying `start_ms` is replayed from that declared flush span instead of
+the 80 ms guess; a case without it is replayed from the guess.
+
 The schema:
 
 ```json
@@ -462,9 +484,10 @@ The schema:
 ```
 
 An arrival may carry `reordered: true` to force the reordered path, or
-`reanchor_before: true` to call `reanchor()` first. `target_ms[i]` is the
-target after arrival `i`. There is no catalog input: the estimator sees arrival
-timing and nothing else.
+`reanchor_before: true` to call `reanchor()` first. A case may carry
+`start_ms`, the publisher's declared flush span the estimator starts from.
+`target_ms[i]` is the target after arrival `i`. The declaration aside, there is
+no catalog input: the estimator sees arrival timing and nothing else.
 
 The cases, and what each one holds:
 
@@ -484,3 +507,4 @@ The cases, and what each one holds:
 | `discontinuity` | `reanchor()` keeps the distribution and drops the reference. |
 | `outlier` | A 2500 ms arrival is dropped rather than clamped. |
 | `sparse` | 1 frame per second falls at the same wall-clock rate as 50. |
+| `seeded` | A declared 310 ms flush span starts the target at 320 ms and the measurement walks it down to 20 ms. |

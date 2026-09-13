@@ -72,23 +72,13 @@ struct ActivitySpan {
 }
 
 impl Playout {
-	fn new(
-		delay: std::time::Duration,
-		max_age: std::time::Duration,
-		sample_rate: u32,
-		channels: u32,
-		conceal: bool,
-	) -> Result<Self, Error> {
-		let engine = crate::playout::engine::Engine::new(crate::playout::engine::Config {
-			sample_rate,
-			channels,
-			delay,
-			max_age,
-			conceal,
-		})?;
+	fn new(config: crate::playout::engine::Config) -> Result<Self, Error> {
+		let channels = config.channels.max(1) as usize;
+		let max_age = config.max_age;
+		let engine = crate::playout::engine::Engine::new(config)?;
 
 		Ok(Self {
-			block: vec![0.0; engine.block() * channels.max(1) as usize],
+			block: vec![0.0; engine.block() * channels],
 			engine,
 			epoch: std::time::Instant::now(),
 			budget: max_age,
@@ -167,7 +157,18 @@ impl Consumer {
 
 		let playout = config
 			.delay
-			.map(|delay| Playout::new(delay, max_age, sample_rate, channels, config.conceal))
+			.map(|delay| {
+				Playout::new(crate::playout::engine::Config {
+					sample_rate,
+					channels,
+					delay,
+					max_age,
+					// The publisher's declared flush span, which is where the arrival
+					// estimate starts rather than a floor under it.
+					advertised: catalog.jitter.unwrap_or_default(),
+					conceal: config.conceal,
+				})
+			})
 			.transpose()?;
 
 		Ok(Self {

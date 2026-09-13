@@ -42,7 +42,8 @@ const RESAMPLE: f64 = 500.0;
 /// has.
 const WINDOW: f64 = 2000.0;
 
-/// The target before any observation lands, NetEq's `kStartDelayMs`.
+/// The target before any observation lands, when the publisher declares nothing:
+/// NetEq's `kStartDelayMs`.
 const START: f64 = 80.0;
 
 /// How many empty intervals one arrival may decay. 60 intervals is 30s, past the
@@ -108,6 +109,9 @@ pub(crate) struct Jitter {
 	/// The quantile's upper edge, i.e. what the histogram currently asks for.
 	optimal: Option<f64>,
 
+	/// What the target reads until the first observation lands.
+	start: f64,
+
 	/// The published target, and when it last moved.
 	target: f64,
 	lowered: Option<f64>,
@@ -115,12 +119,29 @@ pub(crate) struct Jitter {
 
 impl Jitter {
 	/// An estimator seeded with a decaying prior, so a cold start has something to
-	/// take a quantile of.
+	/// take a quantile of, and starting at NetEq's guess.
 	pub(crate) fn new() -> Self {
+		Self::seeded(Duration::ZERO)
+	}
+
+	/// The same, starting from what the publisher declares it flushes.
+	///
+	/// A publisher's flush span is exactly the quantity this goes on to measure,
+	/// published by the only party that already knows it, so it is a better cold
+	/// start than a constant. Never below NetEq's 80ms guess, because the network
+	/// adds to a flush span rather than replacing it, and rounded up to a whole
+	/// bucket so the first target reads on the same grid as every later one. It is
+	/// a start, not a floor: the first observation may take the target below it.
+	pub(crate) fn seeded(advertised: Duration) -> Self {
 		let mut buckets = [0.0; BUCKETS];
 		for (i, bucket) in buckets.iter_mut().enumerate() {
 			*bucket = 0.5f64.powi(i as i32 + 1);
 		}
+
+		let start = (advertised.as_secs_f64() * 1000.0)
+			.max(START)
+			.min(BUCKETS as f64 * BUCKET);
+		let start = (start / BUCKET).ceil() * BUCKET;
 
 		Self {
 			min: VecDeque::new(),
@@ -132,7 +153,8 @@ impl Jitter {
 			interval_start: None,
 			interval_max: 0.0,
 			optimal: None,
-			target: START,
+			start,
+			target: start,
 			lowered: None,
 		}
 	}
@@ -297,7 +319,7 @@ impl Jitter {
 	}
 
 	fn publish(&mut self, now: f64) {
-		let optimal = self.optimal.unwrap_or(START);
+		let optimal = self.optimal.unwrap_or(self.start);
 		let current = self.target;
 
 		if optimal >= current {

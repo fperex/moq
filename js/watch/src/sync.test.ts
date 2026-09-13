@@ -95,23 +95,26 @@ describe("delay and buffer", () => {
 });
 
 describe("auto delay", () => {
-	it("starts at the advertised delay and follows the measured arrivals", async () => {
+	it("follows the measured arrivals and nothing else", async () => {
 		const sync = new Sync();
-		sync.track("audio").advertised.set(20 as Time.Milli);
-		sync.track("video").advertised.set(33 as Time.Milli);
 		await flush();
 
-		// Nothing measured yet, so the delay is what the catalog advertises.
+		// Nothing reported yet. The estimator publishes its own cold start, which is seeded from
+		// what the rendition advertises, so there is no second term for it here.
 		expect(sync.out.jitter.peek()).toBe(0 as Time.Milli);
-		expect(sync.out.delay.peek()).toBe(33 as Time.Milli);
+		expect(sync.out.delay.peek()).toBe(0 as Time.Milli);
 
 		// A publisher flushing 250ms of audio at once needs 250ms of buffer, whatever the RTT is.
-		// The measured spread already covers what the catalog advertises, so it replaces the
-		// advertised delay rather than stacking on it.
 		sync.track("audio").spread.set(250 as Time.Milli);
 		await flush();
 		expect(sync.out.jitter.peek()).toBe(250 as Time.Milli);
 		expect(sync.out.delay.peek()).toBe(250 as Time.Milli);
+
+		// And a path that turns out to be clean gets the shallow buffer it measured, rather than
+		// being pinned at whatever the publisher declared.
+		sync.track("audio").spread.set(20 as Time.Milli);
+		await flush();
+		expect(sync.out.delay.peek()).toBe(20 as Time.Milli);
 
 		sync.close();
 	});
@@ -135,26 +138,14 @@ describe("auto delay", () => {
 		sync.close();
 	});
 
-	it("ignores the measured spread when the delay is a fixed number", async () => {
+	it("is exactly the number asked for when the delay is fixed", async () => {
+		// A viewer picking 500ms gets 500ms. Adding the publisher's declared flush span on top made
+		// the 100ms preset read 400ms on a source declaring 300, which is not what the label says.
 		const sync = new Sync({ delay: 500 as Time.Milli });
-		sync.track("audio").advertised.set(20 as Time.Milli);
 		sync.track("audio").spread.set(250 as Time.Milli);
 		await flush();
 		expect(sync.out.jitter.peek()).toBe(500 as Time.Milli);
-		expect(sync.out.delay.peek()).toBe(520 as Time.Milli);
-		sync.close();
-	});
-
-	it("keeps the advertised delay as a floor", async () => {
-		// The advertised value is a publisher-declared flush span and the measurement is of the
-		// network. When the measurement is the smaller of the two the publisher still knows
-		// something the receiver has not seen yet, so it holds.
-		const sync = new Sync();
-		sync.track("audio").advertised.set(250 as Time.Milli);
-		sync.track("audio").spread.set(20 as Time.Milli);
-		await flush();
-		expect(sync.out.jitter.peek()).toBe(20 as Time.Milli);
-		expect(sync.out.delay.peek()).toBe(250 as Time.Milli);
+		expect(sync.out.delay.peek()).toBe(500 as Time.Milli);
 		sync.close();
 	});
 
@@ -171,7 +162,6 @@ describe("auto delay", () => {
 
 	it("holds nothing when instant, whatever the spread says", async () => {
 		const sync = new Sync({ delay: "instant" });
-		sync.track("audio").advertised.set(250 as Time.Milli);
 		sync.track("audio").spread.set(500 as Time.Milli);
 		await flush();
 		expect(sync.out.jitter.peek()).toBe(0 as Time.Milli);

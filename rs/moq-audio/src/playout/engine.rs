@@ -43,6 +43,9 @@ pub(crate) struct Config {
 	/// How stale media may be before it is skipped, which is the ceiling on the
 	/// target: buffering past it holds audio the same budget throws away.
 	pub(crate) max_age: Duration,
+	/// What the rendition's catalog declares it flushes, which is where the arrival
+	/// estimate starts. `ZERO` when the catalog says nothing.
+	pub(crate) advertised: Duration,
 	/// Whether a gap is concealed with synthesized audio or played as a ramp into
 	/// silence.
 	pub(crate) conceal: bool,
@@ -136,7 +139,8 @@ impl Engine {
 		// What the buffer can hold is the age budget: media older than that is
 		// skipped upstream, so it is also the deepest playout could ever fill.
 		let constraints = Constraints::new(config.delay, config.max_age, config.max_age)?;
-		let target = constraints.apply(Duration::from_millis(80));
+		let jitter = Jitter::seeded(config.advertised);
+		let target = constraints.apply(jitter.target());
 
 		Ok(Self {
 			rate,
@@ -150,7 +154,7 @@ impl Engine {
 			expand: Expand::new(rate, channels),
 			merge: Merge::new(rate, channels),
 			noise: Noise::new(channels),
-			jitter: Jitter::new(),
+			jitter,
 			constraints,
 			target,
 			played: None,
@@ -588,6 +592,7 @@ mod tests {
 			channels,
 			delay: Duration::ZERO,
 			max_age: Duration::from_millis(500),
+			advertised: Duration::ZERO,
 			conceal,
 		}
 	}

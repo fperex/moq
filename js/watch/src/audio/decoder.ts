@@ -445,6 +445,8 @@ export class Decoder {
 		const consumer = new Container.Consumer(sub, {
 			format,
 			maxAge: this.#maxAge,
+			// The publisher's declared flush span, which is where the arrival estimate starts.
+			jitter: effect.get(this.source.out.jitter),
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -565,6 +567,8 @@ export class Decoder {
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
 			maxAge: this.#maxAge,
+			// The publisher's declared flush span, which is where the arrival estimate starts.
+			jitter: effect.get(this.source.out.jitter),
 		});
 		effect.cleanup(() => consumer.close());
 
