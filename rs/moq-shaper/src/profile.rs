@@ -77,7 +77,7 @@ pub struct Direction {
 	#[serde(with = "humantime_serde")]
 	pub delay: Duration,
 
-	/// Sigma of a gaussian added to `delay`; the total is clamped so it is never negative.
+	/// Sigma of a gaussian added to `delay`, never negative and never past the datagram in front.
 	#[serde(with = "humantime_serde")]
 	pub jitter: Duration,
 
