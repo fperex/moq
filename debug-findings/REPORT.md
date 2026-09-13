@@ -1,7 +1,8 @@
 # Real-time audio playout: what was wrong, what this branch does about it
 
 Branch: `fperex/moq` `debug-findings-solution`, based on `upstream/dev` (`246a4733f`).
-Tip at the time of writing: `<final-hash>`, this commit. 49 commits, 144 files, +29760/-682.
+This report sits at the branch tip (the docs commits sit on top of the last code commit,
+`b31eb9552`). 49 commits, 144 files, +29760/-682.
 
 ## Summary
 
@@ -74,7 +75,7 @@ with their author intact.
 | 46 | `393ff294d` | delivery | This report and the issue comment |
 | 47 | `492781763` | shaper defect | Jitter varies the delay without reordering datagrams |
 | 48 | `b31eb9552` | harness | The budgets re-recorded and enforced on the fixed shaper |
-| 49 | `<final-hash>` | delivery | This report, filled in with the enforced budgets |
+| 49 | `067fa459c`, plus this one | delivery | This report, filled in with the enforced budgets |
 
 Suggested reading order for review: 3, 4, 9 to 11, 21, 22, 31. Those seven are the fix. The native
 half (7, 16 to 20) is the same algorithm again and can be read second or skipped entirely. The
