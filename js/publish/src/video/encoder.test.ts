@@ -490,3 +490,179 @@ test.each(["encoder lag", "quiet startup"])("marks a rendition stalled for %s", 
 		else Reflect.deleteProperty(globalThis, "VideoEncoder");
 	}
 });
+
+test("paces capture, bounds delayed raw frames, and resets cadence at timing boundaries", async () => {
+	class HoldingVideoEncoder {
+		static current: HoldingVideoEncoder;
+		state: CodecState = "unconfigured";
+		encodeQueueSize = 0;
+		processing = true;
+		readonly encoded: Array<{ timestamp: number; keyFrame: boolean }> = [];
+		readonly #output: VideoEncoderInit["output"];
+
+		constructor(init: VideoEncoderInit) {
+			this.#output = init.output;
+			HoldingVideoEncoder.current = this;
+		}
+
+		static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
+			return { supported: config.codec.startsWith("avc1") };
+		}
+
+		configure(): void {
+			this.state = "configured";
+		}
+
+		encode(frame: VideoFrame, options?: VideoEncoderEncodeOptions): void {
+			this.encoded.push({ timestamp: frame.timestamp, keyFrame: !!options?.keyFrame });
+			if (!this.processing) this.encodeQueueSize++;
+		}
+
+		output(index: number): void {
+			const frame = this.encoded[index];
+			this.#output({
+				timestamp: frame.timestamp,
+				type: frame.keyFrame ? "key" : "delta",
+				byteLength: 1,
+				copyTo: (buffer: Uint8Array) => {
+					buffer[0] = 0;
+				},
+			} as EncodedVideoChunk);
+		}
+
+		close(): void {
+			this.state = "closed";
+		}
+
+		resume(): void {
+			this.processing = true;
+			this.encodeQueueSize = 0;
+		}
+	}
+
+	class Frame {
+		static all: Frame[] = [];
+		readonly codedWidth = 640;
+		readonly codedHeight = 480;
+		readonly timestamp: number;
+		closed = false;
+
+		constructor(timestamp: number) {
+			this.timestamp = timestamp;
+			Frame.all.push(this);
+		}
+
+		clone(): Frame {
+			return new Frame(this.timestamp);
+		}
+
+		close(): void {
+			this.closed = true;
+		}
+	}
+
+	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
+	Object.defineProperty(globalThis, "VideoEncoder", {
+		configurable: true,
+		value: HoldingVideoEncoder,
+		writable: true,
+	});
+
+	const { Fanout } = await import("../fanout");
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const stream = new ReadableStream<VideoFrame>({
+		start: (next) => {
+			controller = next;
+		},
+	});
+	const fanout = new Fanout(stream, {
+		queue: 128,
+		clone: (frame) => frame.clone(),
+		release: (frame) => frame.close(),
+	});
+	const track = new Moq.Track.Producer("video/hd").accept();
+	const sub = track.subscribe();
+	const rendition = {
+		config: new Signal(undefined),
+		track: new Signal<Moq.Track.Producer | undefined>(track),
+		close: () => track.close(),
+	};
+	const capture = {
+		in: {
+			source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) } as never),
+		},
+		out: {
+			display: new Signal({ width: 640, height: 480 }),
+			frames: new Signal(fanout),
+		},
+	};
+	const encoder = new Encoder("video/hd", {
+		enabled: true,
+		broadcast: { video: () => rendition } as never,
+		capture: capture as never,
+		config: { frameRate: 30 },
+	});
+
+	try {
+		await settle();
+		for (let index = 0; index < 12; index++) {
+			controller.enqueue(new Frame(1_000_000 + Math.round((index * 1_000_000) / 60)) as never);
+		}
+		await settle();
+		expect(HoldingVideoEncoder.current.encoded.map((frame) => frame.timestamp)).toEqual([
+			1_000_000, 1_033_333, 1_066_667, 1_100_000, 1_133_333, 1_166_667,
+		]);
+
+		for (const timestamp of [1_200_000, 1_232_000, 1_267_000, 1_299_000, 1_334_000]) {
+			controller.enqueue(new Frame(timestamp) as never);
+		}
+		await settle();
+		expect(HoldingVideoEncoder.current.encoded).toHaveLength(11);
+		HoldingVideoEncoder.current.output(0);
+
+		HoldingVideoEncoder.current.processing = false;
+		for (let index = 0; index < 12; index++) {
+			controller.enqueue(new Frame(2_000_000 + Math.round((index * 1_000_000) / 30)) as never);
+		}
+		await settle();
+		expect(HoldingVideoEncoder.current.encoded).toHaveLength(19);
+		expect(HoldingVideoEncoder.current.encodeQueueSize).toBe(8);
+		expect(Frame.all.every((frame) => frame.closed)).toBe(true);
+
+		HoldingVideoEncoder.current.resume();
+		controller.enqueue(new Frame(4_000_000) as never);
+		await settle();
+		expect(HoldingVideoEncoder.current.encoded).toHaveLength(20);
+		expect(HoldingVideoEncoder.current.encoded.at(-1)).toEqual({ timestamp: 4_000_000, keyFrame: true });
+
+		encoder.config.set({ frameRate: 20 });
+		await settle();
+		controller.enqueue(new Frame(4_001_000) as never);
+		await settle();
+		expect(HoldingVideoEncoder.current.encoded.at(-1)?.timestamp).toBe(4_001_000);
+
+		controller.enqueue(new Frame(100_000) as never);
+		await settle();
+		expect(HoldingVideoEncoder.current.encoded.at(-1)).toEqual({ timestamp: 100_000, keyFrame: true });
+		HoldingVideoEncoder.current.output(19);
+
+		encoder.config.set({ frameRate: 30 });
+		await settle();
+		const jittered = [200_000, 232_000, 267_000, 299_000, 334_000];
+		for (const timestamp of jittered) controller.enqueue(new Frame(timestamp) as never);
+		await settle();
+		expect(HoldingVideoEncoder.current.encoded.slice(-jittered.length).map((frame) => frame.timestamp)).toEqual(
+			jittered,
+		);
+		controller.enqueue(new Frame(2_200_000) as never);
+		await settle();
+		expect(HoldingVideoEncoder.current.encoded.at(-1)).toEqual({ timestamp: 2_200_000, keyFrame: true });
+		expect(Frame.all.every((frame) => frame.closed)).toBe(true);
+	} finally {
+		encoder.close();
+		fanout.close();
+		sub.close();
+		if (original) Object.defineProperty(globalThis, "VideoEncoder", original);
+		else Reflect.deleteProperty(globalThis, "VideoEncoder");
+	}
+});
