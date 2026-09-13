@@ -109,6 +109,9 @@ test("does not construct an AudioWorkletNode when torn down mid worklet load", a
 
 	expect(webaudio.audioWorkletNodes).toBe(0);
 	expect(error).not.toHaveBeenCalled();
+	// Left installed, this spy outlives the file: `spyOn` returns it to every later suite that
+	// spies on console.error, call log and all.
+	error.mockRestore();
 });
 
 // Regression: a Bluetooth mic on macOS reports 44100 after an A2DP flip. Capturing at that rate means

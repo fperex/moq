@@ -524,6 +524,10 @@ test("Consumer skips groups via PTS-span when over the max age", async () => {
 // content had gone missing above the decoder.
 test("Consumer counts a group the budget abandoned instead of failing its task", async () => {
 	const errors = spyOn(console, "error").mockImplementation(() => {});
+	// `spyOn` hands back the mock already installed on a method rather than a fresh one, so this
+	// call log can arrive carrying everything console.error has been passed since some other suite
+	// spied on it. Only what is logged from here on is this test's.
+	errors.mockClear();
 	try {
 		const track = new Track.Producer("test");
 		const consumer = new Consumer(replay(track), {
