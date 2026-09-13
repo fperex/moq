@@ -32,6 +32,22 @@ function num<T>(signal: Peekable<T> | undefined): number | undefined {
 }
 
 /**
+ * Read something that may not be there on the build under test, without taking the probe down.
+ *
+ * The point of reading only public signals is that the same page can measure an older build, and an
+ * older build is exactly where a signal is missing. Optional chaining covers a missing leaf; this
+ * covers a missing branch, where the parent object is undefined and reaching through it throws. One
+ * absent counter must leave every other number in the sample intact.
+ */
+function maybe<T>(read: () => T): T | undefined {
+	try {
+		return read();
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Chromium's render capacity surface, which is not in lib.dom yet.
  *
  * `averageLoad` is the share of each render quantum's budget the graph used. Absent in Safari, which
@@ -80,7 +96,7 @@ export function probe(watch: MoqWatch): Probe {
 	let capacityStarted: AudioContext | undefined;
 
 	const attach = () => {
-		const root = watch.audio.out.root.peek();
+		const root = maybe(() => watch.audio.out.root.peek());
 		if (!root || root === attachedTo) return;
 		try {
 			const node = new AnalyserNode(root.context, { fftSize: 2048 });
@@ -92,7 +108,7 @@ export function probe(watch: MoqWatch): Probe {
 			notes.push(`analyser: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
-		const context = watch.audio.out.context.peek();
+		const context = maybe(() => watch.audio.out.context.peek());
 		if (context && capacityStarted !== context) {
 			capacityStarted = context;
 			const capacity = (context as unknown as { renderCapacity?: RenderCapacity }).renderCapacity;
@@ -127,18 +143,18 @@ export function probe(watch: MoqWatch): Probe {
 		attach();
 		const audio = watch.audio.out;
 		const sync = watch.sync.out;
-		const context = audio.context.peek();
+		const context = maybe(() => audio.context.peek());
 
 		// `buffered` is a list of ranges, not a depth. What the grader wants is how much audio is
 		// ready to play, so the ranges are summed; a gap in the middle is not playable time.
-		const ranges = audio.buffered.peek() ?? [];
+		const ranges = maybe(() => audio.buffered.peek()) ?? [];
 		const buffered = ranges.reduce((total, range) => total + (Number(range.end) - Number(range.start)), 0);
 
 		return {
 			at: performance.now() - started,
 
 			timestamp: num(audio.timestamp),
-			stalled: audio.stalled.peek(),
+			stalled: maybe(() => audio.stalled.peek()),
 			underruns: num(audio.underruns),
 			spread: num(audio.spread),
 			buffered: ranges.length > 0 ? buffered : undefined,
@@ -146,7 +162,7 @@ export function probe(watch: MoqWatch): Probe {
 			// `Container.Consumer.skipped` and surfaces it as `Decoder.out.skipped`; until then
 			// `skipped_groups` and `budget_aborts` are null in every summary. The same goes for
 			// `audio.out.debug()` (short, silent, and discarded quanta), which stage 5 adds.
-			stats: audio.stats.peek() as Record<string, unknown> | undefined,
+			stats: maybe(() => audio.stats.peek()) as Record<string, unknown> | undefined,
 
 			delay: num(sync.delay),
 			jitter: num(sync.jitter),
@@ -183,15 +199,17 @@ export function probe(watch: MoqWatch): Probe {
 		},
 		environment() {
 			const catalog = watch.broadcast.out.catalog.peek();
-			const renditions = catalog?.audio?.renditions ?? {};
-			const track = watch.audio.source.out.track.peek();
-			const config = (track ? renditions[track] : undefined) ?? Object.values(renditions)[0];
-			const transport = watch.connection.transport.peek();
 			// The catalog is what says the session got far enough to be measuring anything.
 			if (!catalog) return null;
+			const renditions = catalog.audio?.renditions ?? {};
+			// `audio.source` is one of the signals an older build may not have, and the rendition it
+			// names only picks between several. Falling back to the first one loses nothing on a
+			// single-rendition broadcast, which is every broadcast this harness publishes.
+			const track = maybe(() => watch.audio.source.out.track.peek());
+			const config = (typeof track === "string" ? renditions[track] : undefined) ?? Object.values(renditions)[0];
 			return {
 				crossOriginIsolated: globalThis.crossOriginIsolated === true,
-				transport,
+				transport: maybe(() => watch.connection.transport.peek()),
 				rtt: rttOf(watch),
 				catalogCodec: config?.codec,
 				catalogRate: config?.sampleRate,

@@ -66,6 +66,17 @@ const stop = sink
 const status = document.createElement("pre");
 status.id = "status";
 document.body.appendChild(status);
+// Every read here goes through `peek`, which throws when an older build does not publish the signal
+// at all. This status is what the driver waits on, so one missing counter must not be the reason a
+// row never starts: the probe's own samples take the same care.
+const peek = <T>(read: () => T): T | undefined => {
+	try {
+		return read();
+	} catch {
+		return undefined;
+	}
+};
+
 setInterval(() => {
 	const environment = collector.environment();
 	status.dataset.ready = environment ? "1" : "0";
@@ -76,10 +87,10 @@ setInterval(() => {
 			webSocket: typeof (globalThis as unknown as { WebSocket?: unknown }).WebSocket,
 			crossOriginIsolated: globalThis.crossOriginIsolated === true,
 			transport: environment?.transport,
-			timestamp: watch.audio.out.timestamp.peek(),
-			stalled: watch.audio.out.stalled.peek(),
-			underruns: watch.audio.out.underruns.peek(),
-			resolved: watch.sync.out.delay.peek(),
+			timestamp: peek(() => watch.audio.out.timestamp.peek()),
+			stalled: peek(() => watch.audio.out.stalled.peek()),
+			underruns: peek(() => watch.audio.out.underruns.peek()),
+			resolved: peek(() => watch.sync.out.delay.peek()),
 		},
 		null,
 		1,
