@@ -4,6 +4,7 @@
  * @module
  */
 export {
+	Expired,
 	FrameTooLarge,
 	GroupTooLarge,
 	NotFound,

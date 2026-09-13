@@ -1,5 +1,5 @@
 import { expect, setSystemTime, test } from "bun:test";
-import { TooFarBehind } from "./error.ts";
+import { Expired, StreamCode, TooFarBehind } from "./error.ts";
 import { Producer as GroupProducer, MAX_GROUP_FRAMES } from "./group.ts";
 import { hooks } from "./internal.ts";
 import { Milli, Timescale, Timestamp } from "./time.ts";
@@ -796,6 +796,63 @@ test("a handed-out frame cancels its in-flight operation when it expires", async
 
 	await expect(guarded).rejects.toThrow("max age budget");
 	release();
+});
+
+// The two ways a reader loses unread content have to stay distinguishable: the budget gave
+// up on delivering it in time, or the cache dropped it before the reader got there. A bare
+// Error for either would read as a crash to a caller that only handles Error.Stream.
+test("a budget verdict on unread content is Expired, an eviction is TooFarBehind", async () => {
+	const producer = new TrackProducer("test").accept({ maxAge: Milli(5000) });
+	const track = producer.subscribe();
+	producer.writeString("old");
+
+	const group = await track.recvGroup();
+	if (!group) throw new Error("missing group");
+	expect(await group.readString()).toBe("old");
+
+	let release!: () => void;
+	const operation = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const guarded = hooks.guardGroup(group, operation);
+	producer.writeString("new");
+
+	const expired = await guarded.then(
+		() => undefined,
+		(err: unknown) => err,
+	);
+	expect(expired).toBeInstanceOf(Expired);
+	expect((expired as Expired).code).toBe(StreamCode.DeliveryTimeout);
+	release();
+
+	// Same shape of loss, different reason: retention drops the unread tail while the
+	// timestamp-only budget has nothing to say about it.
+	const clock = mockMonotonicTime(10_000);
+	try {
+		const second = new TrackProducer("test").accept({ maxAge: Milli(100) });
+		const reader = second.subscribe({ maxAge: Milli(100) });
+		const source = second.appendGroup();
+		source.writeString("first");
+		source.writeString("tail");
+		source.close();
+
+		const held = await reader.recvGroup();
+		if (!held) throw new Error("missing group");
+		expect(await held.readString()).toBe("first");
+
+		clock.set(10_200);
+		second.appendGroup();
+
+		const lagged = await held.readFrame().then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+		expect(lagged).toBeInstanceOf(TooFarBehind);
+		expect(lagged).not.toBeInstanceOf(Expired);
+		expect((lagged as TooFarBehind).code).toBe(StreamCode.TooFarBehind);
+	} finally {
+		clock.restore();
+	}
 });
 
 test("a guarded write keeps the position of the frame removed from the buffer", async () => {

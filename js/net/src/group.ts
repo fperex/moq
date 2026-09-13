@@ -4,7 +4,7 @@
  * @module
  */
 import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
-import { FrameTooLarge, GroupTooLarge, TooFarBehind } from "./error.ts";
+import { Expired, FrameTooLarge, GroupTooLarge, TooFarBehind } from "./error.ts";
 import { hooks, type ReadGroupFrame } from "./internal.ts";
 import { Timestamp } from "./time.ts";
 
@@ -410,7 +410,7 @@ export class Consumer {
 		if (!this.#expiry?.expired()) return false;
 
 		if (unread) {
-			this.#terminal = new Error("group exceeded the subscription max age budget");
+			this.#terminal = new Expired();
 		} else {
 			this.#ended = true;
 		}
