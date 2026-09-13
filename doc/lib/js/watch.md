@@ -198,11 +198,13 @@ stretch can follow.
 A stretch bends a few percent, so it cannot cover a packet that is a whole
 hundred milliseconds late or a group the network gave up on. Rather than play the
 hole as silence, the player carries the audio on: it takes the pitch period of
-the last real audio, repeats it under a noise floor measured from the stream
-itself, and fades toward that floor if the outage runs on, the way WebRTC's NetEq
-conceals one. When the media comes back it is lined up against the concealment
-and crossfaded in, so neither end of the outage is a click. Two seconds of
-concealment is the limit; past that what is left is the room tone alone.
+the last real audio, repeats it, and fades it out if the outage runs on, the way
+WebRTC's NetEq conceals one. When the media comes back it is lined up against the
+concealment and crossfaded in, so neither end of the outage is a click. The fade
+ends in digital silence rather than in room tone, which is what the pinned
+Chromium tree does and what tells a paused talker apart from a dead stream; a
+publisher that means to pause says so on the wire instead, and the player renders
+that as silence with no concealment at all.
 
 The stats panel's `Concealed` row is how much audio was invented and how many
 separate outages that covered. Turn it off with `conceal` on the audio decoder
