@@ -193,6 +193,13 @@ export const METRICS: Record<string, MetricSpec> = {
 		aggregations: ["p95", "max"],
 		description: "AudioContext render capacity load: how much of each render quantum's budget was used.",
 	},
+	worklet_cadence: {
+		unit: "ms",
+		clock: "viewer",
+		aggregations: ["p95", "max"],
+		description:
+			"Wall time a hundred render quanta actually took. The stand-in for render_load where there is no render capacity surface: a render thread that hitched took longer than the hundred quanta were worth.",
+	},
 	media_drift: {
 		unit: "ms",
 		clock: "publisher",
@@ -207,6 +214,12 @@ export const SILENCE_RMS = 0.001;
 
 /** How often the page samples its signals. Every series in a {@link Summary} is on this grid. */
 export const SAMPLE_INTERVAL_MS = 250;
+
+/** Frames in one AudioWorklet render quantum, fixed by the Web Audio specification. */
+export const RENDER_QUANTUM = 128;
+
+/** How many quanta `worklet_cadence` is reported over, so the number is readable at a glance. */
+export const CADENCE_QUANTA = 100;
 
 /**
  * The stages an end-to-end delay is split into, in order, as exclusive spans.
@@ -358,6 +371,14 @@ export type Environment = {
 	catalogRate?: number;
 	/** The publisher's declared flush span, in ms: the `publish_flush` stage, declared not measured. */
 	catalogJitter?: Ms;
+	/**
+	 * `AudioContext.sampleRate`, in Hz: the device's rate, not the stream's.
+	 *
+	 * It is what a render quantum is worth in wall time, so `worklet_cadence` is unreadable without
+	 * it, and it is routinely not the catalog's rate: a 44.1 kHz stream still renders at whatever
+	 * the output device runs at.
+	 */
+	contextRate?: number;
 	/** `performance.timeOrigin`, so the viewer clock can be put on the host epoch. */
 	timeOrigin: number;
 };

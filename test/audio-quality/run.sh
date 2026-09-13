@@ -32,10 +32,17 @@ RERUN="$(harness_env AQ_PROFILE RELAY_BIN)just test audio-quality$(harness_argv 
 # runs a fixed 250ms preset instead of adapting, because a fixed preset is what a viewer lands on
 # today and the rest of the matrix would otherwise pass while it regressed.
 ALL_PROFILES=(near-zero mild bursty step high-rtt fixed-250)
+# Safari has no WebTransport to impair. `@moq/net` refuses it on every WebKit engine, so a Safari
+# session is a WebSocket, which is TCP, which the shaper passes through untouched. Rather than
+# labelling an unimpaired run `bursty`, this runtime offers only the two profiles whose path
+# treatment is already nothing, and its rows record `shaper: none`.
+SAFARI_PROFILES=(near-zero fixed-250)
 ALL_RINGS=(isolated plain)
 ALL_CODECS=(opus aac)
+ALL_RUNTIMES=(chromium safari)
 
-PROFILES=("${ALL_PROFILES[@]}")
+RUNTIME=chromium
+PROFILES=()
 RINGS=("${ALL_RINGS[@]}")
 CODECS=("${ALL_CODECS[@]}")
 DURATION=60
@@ -76,6 +83,11 @@ while [[ $# -gt 0 ]]; do
             need "$1" $# "${2:-}"
             split "$2"
             CODECS=("${SPLIT[@]}")
+            shift 2
+            ;;
+        --runtime)
+            need "$1" $# "${2:-}"
+            RUNTIME="$2"
             shift 2
             ;;
         --duration)
@@ -127,9 +139,22 @@ valid() {
     echo "error: unknown $name '$want' (known: $*)" >&2
     exit 2
 }
-for p in "${PROFILES[@]}"; do valid "$p" profile "${ALL_PROFILES[@]}"; done
+valid "$RUNTIME" runtime "${ALL_RUNTIMES[@]}"
+
+# The runtime decides which profiles exist, so the default is resolved after it is known and an
+# explicit list is checked against that runtime's set rather than against every name the file knows.
+KNOWN_PROFILES=("${ALL_PROFILES[@]}")
+[[ "$RUNTIME" != safari ]] || KNOWN_PROFILES=("${SAFARI_PROFILES[@]}")
+[[ ${#PROFILES[@]} -gt 0 ]] || PROFILES=("${KNOWN_PROFILES[@]}")
+
+for p in "${PROFILES[@]}"; do valid "$p" profile "${KNOWN_PROFILES[@]}"; done
 for r in "${RINGS[@]}"; do valid "$r" ring "${ALL_RINGS[@]}"; done
 for c in "${CODECS[@]}"; do valid "$c" codec "${ALL_CODECS[@]}"; done
+
+if [[ "$RUNTIME" == safari && "$(uname -s)" != Darwin ]]; then
+    echo "error: the safari runtime needs safaridriver, which is macOS only" >&2
+    exit 2
+fi
 
 # `step` exists to move the path part-way through a run, so a run that ends before the step measures
 # a steady profile under the step's name and passes on numbers that mean something else. Refuse it
@@ -187,7 +212,7 @@ for codec in "${CODECS[@]}"; do
     for profile in "${PROFILES[@]}"; do
         for ring in "${RINGS[@]}"; do
             printf -v entry '%s\t%s\t%s\t%s' \
-                "chromium-$codec-$(rate_of "$codec")-$profile-$ring" "$codec" "$profile" "$ring"
+                "$RUNTIME-$codec-$(rate_of "$codec")-$profile-$ring" "$codec" "$profile" "$ring"
             ROWS+=("$entry")
         done
     done
@@ -226,7 +251,13 @@ if [[ ! -f "$MEDIA" ]]; then
 fi
 
 echo "building the page..."
-(cd "$CLIENT" && bun install --frozen-lockfile && bunx playwright install chromium && bunx vite build)
+(
+    cd "$CLIENT"
+    bun install --frozen-lockfile
+    # Playwright drives Chromium and nothing else here; Safari comes from the OS, through safaridriver.
+    [[ "$RUNTIME" == safari ]] || bunx playwright install chromium
+    bunx vite build
+)
 
 # ── relay ───────────────────────────────────────────────────────────────────
 harness_port relay
@@ -243,16 +274,23 @@ fi
 harness_endpoint relay "$RELAY_URL"
 
 # ── sink ────────────────────────────────────────────────────────────────────
-harness_port sink
-SINK_PORT="$HARNESS_PORT"
-SINK_URL="http://127.0.0.1:$SINK_PORT"
-harness_spawn sink "$HARNESS_RUN/sink.log" bun "$CLIENT/sink.ts" --dir "$HARNESS_RUN" --port "$SINK_PORT"
-if ! harness_ready "$SINK_URL/health" 15 "$HARNESS_PID"; then
-    echo "sink never became ready" >&2
-    sed 's/^/  sink: /' "$HARNESS_RUN/sink.log" >&2 || true
-    exit 1
+# Only the Chromium lane posts beacons. Safari's driver drains the page's probe over WebDriver and
+# writes the same ndjson itself, because safaridriver is the only channel it has back to the page.
+if [[ "$RUNTIME" != safari ]]; then
+    harness_port sink
+    SINK_PORT="$HARNESS_PORT"
+    SINK_URL="http://127.0.0.1:$SINK_PORT"
+    harness_spawn sink "$HARNESS_RUN/sink.log" bun "$CLIENT/sink.ts" --dir "$HARNESS_RUN" --port "$SINK_PORT"
+    if ! harness_ready "$SINK_URL/health" 15 "$HARNESS_PID"; then
+        echo "sink never became ready" >&2
+        sed 's/^/  sink: /' "$HARNESS_RUN/sink.log" >&2 || true
+        exit 1
+    fi
+    harness_endpoint sink "$SINK_URL"
+else
+    harness_port webdriver
+    DRIVER_PORT="$HARNESS_PORT"
 fi
-harness_endpoint sink "$SINK_URL"
 
 harness_port web
 WEB_PORT="$HARNESS_PORT"
@@ -296,49 +334,75 @@ echo "running ${#ROWS[@]} rows at ${DURATION}s each (seed $SEED)"
 failed=0
 
 # One shaper port for the whole run: only one row plays at a time, and a reservation per row would
-# walk through two dozen of them for no benefit.
-harness_port shaper
-shaper_port="$HARNESS_PORT"
+# walk through two dozen of them for no benefit. The Safari lane never stands one up.
+if [[ "$RUNTIME" != safari ]]; then
+    harness_port shaper
+    shaper_port="$HARNESS_PORT"
+fi
 
 for entry in "${ROWS[@]}"; do
     IFS=$'\t' read -r tag codec profile ring <<<"$entry"
 
     echo ""
     echo "── $tag ──"
-    harness_spawn "shaper-$tag" "$HARNESS_RUN/shaper-$tag.ndjson" \
-        "$SHAPER" --listen "127.0.0.1:$shaper_port" --upstream "127.0.0.1:$RELAY_PORT" \
-        --profile "$(shaper_of "$profile")" --seed "$SEED" \
-        --report-interval 1s --report "$HARNESS_RUN/shaper-$tag.json"
-    shaper_pid="$HARNESS_PID"
-    if ! harness_ready "http://127.0.0.1:$shaper_port/certificate.sha256" 15 "$shaper_pid"; then
-        echo "shaper never passed TCP through for $tag" >&2
-        failed=1
-        harness_reap "$shaper_pid"
-        continue
+
+    shaper_pid=""
+    page_url="$RELAY_URL"
+    if [[ "$RUNTIME" != safari ]]; then
+        harness_spawn "shaper-$tag" "$HARNESS_RUN/shaper-$tag.ndjson" \
+            "$SHAPER" --listen "127.0.0.1:$shaper_port" --upstream "127.0.0.1:$RELAY_PORT" \
+            --profile "$(shaper_of "$profile")" --seed "$SEED" \
+            --report-interval 1s --report "$HARNESS_RUN/shaper-$tag.json"
+        shaper_pid="$HARNESS_PID"
+        if ! harness_ready "http://127.0.0.1:$shaper_port/certificate.sha256" 15 "$shaper_pid"; then
+            echo "shaper never passed TCP through for $tag" >&2
+            failed=1
+            harness_reap "$shaper_pid"
+            continue
+        fi
+        page_url="http://127.0.0.1:$shaper_port"
     fi
 
     status=0
-    harness_spawn "driver-$tag" - bun "$CLIENT/driver.ts" \
-        --url "http://127.0.0.1:$shaper_port" \
-        --broadcast "bbb-$codec.hang" \
-        --page "$CLIENT/dist" \
-        --port "$WEB_PORT" \
-        --ring "$ring" \
-        --delay "$(delay_of "$profile")" \
-        --duration "$DURATION" \
-        --tag "$tag" \
-        --sink "$SINK_URL/log" \
-        --out "$HARNESS_RUN" || true
+    if [[ "$RUNTIME" == safari ]]; then
+        # Serial by construction: Safari hosts one WebDriver session at a time, and the window it
+        # opens has to stay frontmost for the AudioContext to render.
+        harness_spawn "safari-$tag" - bun "$CLIENT/safari.ts" \
+            --url "$page_url" \
+            --broadcast "bbb-$codec.hang" \
+            --page "$CLIENT/dist" \
+            --port "$WEB_PORT" \
+            --driver-port "$DRIVER_PORT" \
+            --ring "$ring" \
+            --delay "$(delay_of "$profile")" \
+            --duration "$DURATION" \
+            --tag "$tag" \
+            --out "$HARNESS_RUN" || true
+    else
+        harness_spawn "driver-$tag" - bun "$CLIENT/driver.ts" \
+            --url "$page_url" \
+            --broadcast "bbb-$codec.hang" \
+            --page "$CLIENT/dist" \
+            --port "$WEB_PORT" \
+            --ring "$ring" \
+            --delay "$(delay_of "$profile")" \
+            --duration "$DURATION" \
+            --tag "$tag" \
+            --sink "$SINK_URL/log" \
+            --out "$HARNESS_RUN" || true
+    fi
     harness_wait "$HARNESS_PID" || status=$?
     [[ $status -eq 0 ]] || failed=1
 
     # SIGTERM rather than the harness's SIGKILL, because the final report is written on the way out
     # and a killed shaper leaves the row with no impairment evidence at all. The interval lines in
     # the log are the fallback if it never gets there.
-    kill -TERM -- -"$shaper_pid" 2>/dev/null || true
-    harness_wait "$shaper_pid" || true
-    if [[ ! -f "$HARNESS_RUN/shaper-$tag.json" ]]; then
-        tail -n 1 "$HARNESS_RUN/shaper-$tag.ndjson" >"$HARNESS_RUN/shaper-$tag.json" 2>/dev/null || true
+    if [[ -n "$shaper_pid" ]]; then
+        kill -TERM -- -"$shaper_pid" 2>/dev/null || true
+        harness_wait "$shaper_pid" || true
+        if [[ ! -f "$HARNESS_RUN/shaper-$tag.json" ]]; then
+            tail -n 1 "$HARNESS_RUN/shaper-$tag.ndjson" >"$HARNESS_RUN/shaper-$tag.json" 2>/dev/null || true
+        fi
     fi
 
     bun "$CLIENT/analyze.ts" --run "$HARNESS_RUN" --row "$tag" >"$HARNESS_RUN/$tag.analyze.log" 2>&1 || {

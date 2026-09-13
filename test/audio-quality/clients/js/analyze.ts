@@ -28,11 +28,13 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
 	type Beacon,
+	CADENCE_QUANTA,
 	type Drift,
 	type Environment,
 	identityTolerance,
 	MAX_DRIFT_MS_PER_MIN,
 	METRICS,
+	RENDER_QUANTUM,
 	type Row,
 	round1,
 	SAMPLE_INTERVAL_MS,
@@ -129,7 +131,12 @@ if (existsSync(shaperFile)) {
 
 // A profile that silently treated nothing turns an impaired run into an unimpaired pass. near-zero
 // is the control, and zero is the right answer for it, which is what makes it the control.
-if (shaper && row.profile !== "near-zero" && row.profile !== "fixed-250") {
+//
+// `none` is not a profile that treated nothing: it says the shaper was never in the path, which is
+// the Safari lane, whose session is TCP. Recording that is the point of writing the report at all.
+if (shaper?.profile === "none") {
+	notes.push("shaper: not in the path; this lane's session never traversed the UDP shaper");
+} else if (shaper && row.profile !== "near-zero" && row.profile !== "fixed-250") {
 	const delayed = shaper.up.delayed + shaper.down.delayed;
 	if (delayed === 0) {
 		voids.push({
@@ -343,6 +350,37 @@ const silenceShare =
 	rmsWindows.length > 0 ? rmsWindows.filter((r) => r < SILENCE_RMS).length / rmsWindows.length : null;
 const loads = window.map((s) => s.renderLoad).filter((x): x is number => typeof x === "number");
 
+// What a hundred render quanta actually cost in wall time.
+//
+// Chromium publishes `renderCapacity`, and nothing else does, so on Safari `render_load` is null and
+// this is what stands in for it. `AudioContext.currentTime` advances exactly one quantum per render
+// callback, so the quanta between two samples are the context's own advance, and the wall time they
+// took is this clock's. A render thread that kept up spends the nominal 128/rate per quantum; one
+// that hitched spends more, and the max is the hitch.
+//
+// It needs the device's rate, not the stream's: a 44.1 kHz stream still renders at whatever the
+// output device runs at. Without it there is no quantum to count, so the metric is null rather than
+// computed against a guess.
+const contextRate = environment?.contextRate;
+const cadences: number[] = [];
+if (typeof contextRate === "number" && contextRate > 0) {
+	const nominal = (CADENCE_QUANTA * RENDER_QUANTUM * 1000) / contextRate;
+	for (let i = 1; i < window.length; i++) {
+		const prev = window[i - 1]?.contextTime;
+		const cur = window[i]?.contextTime;
+		const wall = (window[i]?.at ?? 0) - (window[i - 1]?.at ?? 0);
+		if (typeof prev !== "number" || typeof cur !== "number") continue;
+		const advanced = cur - prev;
+		// A sample pair across a context that did not advance at all says the graph was not running,
+		// which the clock void already covers; dividing by it here would report an infinity.
+		if (advanced <= 0 || wall <= 0) continue;
+		cadences.push(nominal * (wall / advanced));
+	}
+} else if (window.length > 0) {
+	notes.push("worklet_cadence: no AudioContext.sampleRate was reported, so the quantum has no duration");
+}
+const cadenceStats = stats(cadences);
+
 // ── the clock ───────────────────────────────────────────────────────────────
 
 // Which track's playhead playback was paced against. Audio holding it is what the rest of these
@@ -496,6 +534,8 @@ const metrics: Record<string, number | null> = {
 	wall_clock_share_share: wallClockShare === null ? null : Math.round(wallClockShare * 1000) / 1000,
 	render_load_p95: round1(loadStats.p95),
 	render_load_max: round1(loadStats.max),
+	worklet_cadence_p95: round1(cadenceStats.p95),
+	worklet_cadence_max: round1(cadenceStats.max),
 	media_drift_last: round1(mediaDrift),
 };
 

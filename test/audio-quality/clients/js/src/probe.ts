@@ -218,6 +218,7 @@ export function probe(watch: MoqWatch): Probe {
 				catalogCodec: config?.codec,
 				catalogRate: config?.sampleRate,
 				catalogJitter: config?.jitter,
+				contextRate: maybe(() => watch.audio.out.context.peek()?.sampleRate),
 				timeOrigin: performance.timeOrigin,
 			};
 		},

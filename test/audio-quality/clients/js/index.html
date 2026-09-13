@@ -20,8 +20,15 @@
       //
       // Both names, because qmux prefers `WebSocketStream` where the browser has it and only falls
       // back to `WebSocket`. Removing one and not the other looks like it works and changes nothing.
-      delete window.WebSocketStream;
-      delete window.WebSocket;
+      //
+      // `?fallback=1` keeps them, and is how the Safari lane runs at all: `@moq/net` refuses
+      // WebTransport on every WebKit engine (quest/m0/webkit-webtransport-gate.md), so a Safari row
+      // has nowhere to go but the WebSocket. It is also why that lane runs against the relay
+      // directly: a TCP session never traverses the UDP shaper, so there is no impairment to claim.
+      if (new URLSearchParams(location.search).get("fallback") !== "1") {
+        delete window.WebSocketStream;
+        delete window.WebSocket;
+      }
     </script>
   </head>
   <body>

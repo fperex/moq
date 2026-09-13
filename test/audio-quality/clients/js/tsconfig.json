@@ -8,7 +8,9 @@
 		"compare.ts",
 		"driver.ts",
 		"grade.ts",
+		"safari.ts",
 		"sink.ts",
+		"webdriver.ts",
 		"src",
 		"vite.config.ts",
 		"../../../../js/common/worklet.d.ts"

@@ -32,12 +32,18 @@ export type BeaconProps = {
 
 /** Start shipping. The returned function flushes once more and stops. */
 export function beacon(props: BeaconProps): () => void {
-	let sentEnvironment = false;
+	// The last environment shipped, as JSON, so a change is detectable without a deep compare. It
+	// does change: the catalog is readable before the AudioContext exists, so the first batch that
+	// can report anything cannot yet report the device's rate, and a run whose page never re-sent it
+	// would have no rate to convert a render quantum with.
+	let sent: string | undefined;
 
 	const batch = (final: boolean): Beacon | undefined => {
 		const samples = props.drain();
-		const environment = sentEnvironment ? undefined : (props.environment() ?? undefined);
-		if (environment) sentEnvironment = true;
+		const current = props.environment();
+		const encoded = current === null ? undefined : JSON.stringify(current);
+		const environment = encoded !== undefined && encoded !== sent ? (current ?? undefined) : undefined;
+		if (environment) sent = encoded;
 		// A batch with nothing new in it is not worth a request, but the last one always goes: it is
 		// what tells the sink the row ended rather than the page having died mid-run.
 		if (!final && samples.length === 0 && !environment) return undefined;
