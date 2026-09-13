@@ -138,12 +138,7 @@ const HELD_MS = 1500;
  * The picture, not a status flag, is what a viewer sees stop, so this is what "playback stopped"
  * has to mean. A canvas that goes unreadable counts as stopped too.
  */
-async function waitFrozen(
-	page: Page,
-	errors: BrowserErrors,
-	assertion: string,
-	description: string,
-): Promise<number> {
+async function waitFrozen(page: Page, errors: BrowserErrors, assertion: string, description: string): Promise<number> {
 	const deadline = Date.now() + SETTLE_MS;
 	let frame: number | undefined;
 	let since = Date.now();
@@ -329,7 +324,7 @@ async function subscriber(broadcast: string, label: string): Promise<[Page, Brow
 		// visible="always" because the window is never frontmost in a headless run, and the default
 		// policy would stop downloading video and leave the canvas black.
 		pageUrl(server.origin, "subscribe", { url: relay, broadcast, visible: "always" }),
-		label,
+		{ label },
 	);
 	await waitForWatch(page);
 	return [page, errors];
@@ -346,7 +341,7 @@ try {
 	const [publisher, publisherErrors] = await open(
 		await browserFor(),
 		pageUrl(server.origin, "fixture", { url: relay, broadcast, fault }),
-		"fixture",
+		{ label: "fixture" },
 	);
 
 	console.error("=== capabilities ===");
