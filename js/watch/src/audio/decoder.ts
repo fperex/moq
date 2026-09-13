@@ -166,7 +166,6 @@ export class Decoder {
 
 		this.source = props.source;
 		this.sync = props.sync;
-		this.#signals.cleanup(this.sync.register({ jitter: this.source.out.jitter, spread: this.#out.spread }));
 		this.#identity = this.#signals.computed((effect) => {
 			const config = effect.get(this.source.out.config);
 			return config ? playbackIdentity(config) : undefined;
@@ -183,6 +182,7 @@ export class Decoder {
 
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
+		this.#signals.run(this.#runClock.bind(this));
 		this.#signals.run(this.#runLatency.bind(this));
 		this.#signals.run(this.#runLatencyReanchor.bind(this));
 		this.#signals.run(this.#runDecoder.bind(this));
@@ -283,6 +283,32 @@ export class Decoder {
 		unlockOnGesture(effect, context);
 
 		// NOTE: You should disconnect/reconnect the worklet to save power when disabled.
+	}
+
+	/**
+	 * Drive playback from the ring's playhead while audio is being played.
+	 *
+	 * The ring consumes media on a clock of its own (the AudioContext's), so pacing video against a
+	 * wall clock lets the two drift apart every time the ring re-buffers or skips. Publishing the
+	 * playhead makes it the reference every other track is paced against instead.
+	 *
+	 * Gated on `enabled` rather than on the ring existing: the graph is built up front so unmuting
+	 * is instant, and a muted ring drains to a playhead that stopped meaning anything. `Sync` keeps
+	 * the last value it saw, so handing the clock back costs no jump.
+	 */
+	#runClock(effect: Effect): void {
+		if (!effect.get(this.in.enabled)) return;
+
+		// Gate on the worklet signal so this effect re-runs once the ring is created.
+		const worklet = effect.get(this.#out.root);
+		if (!worklet) return;
+
+		const ring = this.#ring;
+		if (!ring) return;
+
+		const track = this.sync.track("audio");
+		effect.run((inner) => track.clock.set(inner.get(ring.clock)));
+		effect.cleanup(() => track.clock.set(undefined));
 	}
 
 	#runLatency(effect: Effect): void {

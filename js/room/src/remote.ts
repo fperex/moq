@@ -71,14 +71,15 @@ export class Member {
 			audioSource.close();
 		});
 
-		const sync = new Watch.Sync({
-			delay: "auto",
-			probe: connection.probe,
-		});
+		const sync = new Watch.Sync({ delay: "auto" });
 		this.#signals.cleanup(() => sync.close());
 
+		// The decoders measure how late frames arrive, but they need Sync to exist first, so its
+		// per-track handles are what they wire into.
 		this.video = new Watch.Video.Decoder({ source: videoSource, sync, enabled: this.#videoEnabled });
+		this.#signals.proxy(sync.track("video").spread, this.video.out.spread);
 		this.audio = new Watch.Audio.Decoder({ source: audioSource, sync, enabled: this.#audioEnabled });
+		this.#signals.proxy(sync.track("audio").spread, this.audio.out.spread);
 		this.#signals.cleanup(() => {
 			this.video.close();
 			this.audio.close();

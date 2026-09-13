@@ -122,7 +122,6 @@ export class Decoder {
 
 		this.source = props.source;
 		this.sync = props.sync;
-		this.#signals.cleanup(this.sync.register({ jitter: this.out.jitter, spread: this.out.spread }));
 		this.#identity = this.#signals.computed((effect) => {
 			const config = effect.get(this.source.out.config);
 			return config ? playbackIdentity(config) : undefined;

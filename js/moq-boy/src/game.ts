@@ -136,10 +136,12 @@ export class Game {
 		});
 		this.#signals.cleanup(() => this.audioSource.close());
 
-		this.sync = new Watch.Sync({
-			delay: this.delay,
-		});
+		this.sync = new Watch.Sync({ delay: this.delay });
 		this.#signals.cleanup(() => this.sync.close());
+
+		// The decoders own rendition handoffs and measure how late frames arrive, but they need Sync
+		// to exist first, so its per-track handles are what they wire into.
+		this.#signals.proxy(this.sync.track("audio").advertised, this.audioSource.out.jitter);
 
 		this.#signals.run(this.#runPixelBudget.bind(this));
 
@@ -149,6 +151,8 @@ export class Game {
 			sync: this.sync,
 			enabled: videoEnabled,
 		});
+		this.#signals.proxy(this.sync.track("video").advertised, this.videoDecoder.out.jitter);
+		this.#signals.proxy(this.sync.track("video").spread, this.videoDecoder.out.spread);
 		this.#signals.cleanup(() => this.videoDecoder.close());
 
 		// Renderer needs a canvas created by the UI layer, set via `canvas`.
@@ -166,6 +170,7 @@ export class Game {
 			sync: this.sync,
 			enabled: audioEnabled,
 		});
+		this.#signals.proxy(this.sync.track("audio").spread, this.audioDecoder.out.spread);
 		this.#signals.cleanup(() => this.audioDecoder.close());
 
 		const audioPaused = new Moq.Signals.Signal(true);

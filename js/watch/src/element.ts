@@ -221,16 +221,21 @@ export default class MoqWatch extends HTMLElement {
 		});
 		this.signals.cleanup(() => this.text.close());
 
-		// The decoders register their rendition delay and measured arrival spread with Sync
-		// themselves, so it only needs the viewer's controls here.
 		this.sync = new Sync({
 			delay: this.controls.delay,
 			buffer: this.controls.buffer,
 		});
 		this.signals.cleanup(() => this.sync.close());
 
+		// The decoders own rendition handoffs and measure how late frames arrive, but they need Sync
+		// to exist first, so its per-track handles are what they wire into.
+		this.signals.proxy(this.sync.track("audio").advertised, audioSource.out.jitter);
+
 		this.video = new Video.Decoder({ source: videoSource, sync: this.sync, enabled: this.#videoEnabled });
+		this.signals.proxy(this.sync.track("video").advertised, this.video.out.jitter);
+		this.signals.proxy(this.sync.track("video").spread, this.video.out.spread);
 		this.audio = new Audio.Decoder({ source: audioSource, sync: this.sync, enabled: this.#audioEnabled });
+		this.signals.proxy(this.sync.track("audio").spread, this.audio.out.spread);
 		this.signals.cleanup(() => {
 			this.video.close();
 			this.audio.close();

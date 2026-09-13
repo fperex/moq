@@ -1,5 +1,6 @@
 import { Time } from "@moq/net";
 import { WORKLET_QUANTUM } from "./config";
+import type { Playhead } from "./playhead";
 
 // Control array slot indices. The playhead is not here: see `state`.
 const WRITE = 0;
@@ -558,6 +559,21 @@ export class SharedRingBuffer {
 	 */
 	get timestamp(): Time.Micro {
 		return Time.Micro.fromSecond(((this.#anchor + this.#unwrapRead()) / this.rate) as Time.Second);
+	}
+
+	/**
+	 * Where the reader is on the media timeline and how fast it is moving, or undefined until the
+	 * first insert anchors the ring.
+	 *
+	 * Main thread only, and stateful for the same reason {@link timestamp} is.
+	 *
+	 * The rate is the reader's own: it drains a quantum per quantum while playing and nothing at all
+	 * while stalled, so a stall reports zero and whoever follows this playhead parks with it rather
+	 * than running away from the audio it can hear.
+	 */
+	get playhead(): Playhead | undefined {
+		if (!this.#anchored) return undefined;
+		return { timestamp: this.timestamp, rate: this.stalled ? 0 : 1 };
 	}
 
 	/** Whether the buffer is stalled (waiting to fill). */

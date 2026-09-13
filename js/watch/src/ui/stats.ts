@@ -88,6 +88,7 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	const aBitrate = line(audioCard.grid, "Bitrate");
 	const aUnderruns = line(audioCard.grid, "Underruns");
 	const aSkipped = line(audioCard.grid, "Skipped");
+	const aClock = line(audioCard.grid, "Clock");
 	track(parent, audioCard, {
 		catalog: watch.audio.source.out.catalog,
 		flag: watch.controls.muted,
@@ -146,6 +147,10 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 		// Content lost above the decoder, which an underrun count alone cannot show: the ring
 		// never ran dry, the frames simply never got there.
 		aSkipped.textContent = `${watch.audio.out.skipped.peek()}`;
+
+		// Which playhead paces everything else. "wall" means nothing is rendering on a clock of its
+		// own (video only, muted, or audio that stopped), so playback runs on wall time instead.
+		aClock.textContent = watch.sync.out.clock.peek() ?? "wall";
 
 		// Network. "Estimated max" is the congestion controller / PROBE estimate;
 		// "Actual" is the goodput we measure from the video + audio byte counters.
