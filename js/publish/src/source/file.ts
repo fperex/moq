@@ -3,6 +3,7 @@ import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import {
 	ALL_FORMATS,
+	type AudioSample,
 	AudioSampleSink,
 	BlobSource,
 	Input,
@@ -13,6 +14,7 @@ import {
 } from "mediabunny";
 import type * as Audio from "../audio";
 import type * as Video from "../video";
+import { fill } from "./audio";
 import { Timeline } from "./timeline";
 import type { Media } from "./types";
 
@@ -203,72 +205,98 @@ interface Sink<S extends Sample> {
 }
 
 /**
- * Reads decoded samples out of a sink in real time, restarting the file when it ends.
+ * Reads decoded samples out of a sink, restarting the file when it ends.
  *
- * Decoding runs far faster than realtime, so holding each sample until its presentation time is
- * what makes this publish at 1x instead of blasting the whole file out at once. It also applies
- * backpressure: the sink only decodes ahead as far as the reader pulls.
+ * Restamps onto our wall clock, the same epoch live capture uses, so a publish that mixes sources
+ * keeps one timeline. Runs ahead of the pacing so the audio gap filler sees a single continuous
+ * presentation rather than one file pass at a time.
+ */
+async function* repeat<S extends Sample>(sink: Sink<S>, timeline: Timeline): AsyncGenerator<S, void, unknown> {
+	for (let loop = 0; ; loop++) {
+		// A fresh generator seeks back to the start; the offset keeps timestamps rising.
+		const samples = sink.samples();
+		let produced = false;
+		try {
+			for (let next = await samples.next(); !next.done; next = await samples.next()) {
+				produced = true;
+				const sample = next.value;
+				try {
+					sample.setTimestamp(
+						Time.Second.fromMicro(timeline.at(sample.microsecondTimestamp as Time.Micro, loop)),
+					);
+					yield sample;
+				} finally {
+					sample.close();
+				}
+			}
+		} finally {
+			await samples.return();
+		}
+
+		// A pass that decoded nothing would otherwise spin forever.
+		if (!timeline.loops || !produced) return;
+	}
+}
+
+/**
+ * Holds each sample until its presentation time, then hands it to the reader.
+ *
+ * Decoding runs far faster than realtime, so waiting here is what makes this publish at 1x instead
+ * of blasting the whole file out at once. It also applies backpressure: the sink only decodes ahead
+ * as far as the reader pulls. A sample that's already late goes out immediately, letting a stalled
+ * reader catch up.
  */
 function pace<S extends Sample, T>(
-	sink: Sink<S>,
-	timeline: Timeline,
+	samples: AsyncGenerator<S, void, unknown>,
 	convert: (sample: S) => T,
 	signal: AbortSignal,
 ): ReadableStream<T> {
-	let samples = sink.samples();
-	let loop = 0;
+	// Cancellation closes the samples still held by the generator chain, so nothing may be enqueued
+	// after it: cancel() can land while a pull is waiting on the clock.
+	let cancelled = false;
 
 	return new ReadableStream<T>({
 		async pull(controller) {
-			for (;;) {
-				if (signal.aborted) {
-					controller.close();
-					return;
-				}
-
-				let next: IteratorResult<S, void>;
-				try {
-					next = await samples.next();
-				} catch (err) {
-					// Teardown disposes the Input, which makes any decode still in flight throw.
-					if (!signal.aborted) throw err;
-					controller.close();
-					return;
-				}
-
-				if (next.done) {
-					if (!timeline.loops) {
-						controller.close();
-						return;
-					}
-
-					// A fresh generator seeks back to the start; the offset keeps timestamps rising.
-					loop++;
-					samples = sink.samples();
-					continue;
-				}
-
-				const sample = next.value;
-				const timestamp = timeline.at(sample.microsecondTimestamp as Time.Micro, loop);
-
-				// A sample that's already late goes out immediately, letting a stalled reader catch up.
-				await sleepUntil(timestamp, signal);
-				if (signal.aborted) {
-					sample.close();
-					controller.close();
-					return;
-				}
-
-				// Restamp onto our wall clock, the same epoch live capture uses, so a publish that
-				// mixes sources keeps one timeline.
-				sample.setTimestamp(Time.Second.fromMicro(timestamp));
-				controller.enqueue(convert(sample));
-				sample.close();
+			if (signal.aborted) {
+				await samples.return();
+				controller.close();
 				return;
+			}
+
+			let next: IteratorResult<S, void>;
+			try {
+				next = await samples.next();
+			} catch (err) {
+				// Teardown disposes the Input, which makes any decode still in flight throw.
+				if (cancelled) return;
+				if (!signal.aborted) throw err;
+				controller.close();
+				return;
+			}
+
+			if (cancelled) return;
+			if (next.done) {
+				controller.close();
+				return;
+			}
+
+			const sample = next.value;
+			try {
+				await sleepUntil(sample.microsecondTimestamp as Time.Micro, signal);
+				if (cancelled) return;
+				if (signal.aborted) {
+					await samples.return();
+					controller.close();
+					return;
+				}
+				controller.enqueue(convert(sample));
+			} finally {
+				sample.close();
 			}
 		},
 
 		async cancel() {
+			cancelled = true;
 			await samples.return();
 		},
 	});
@@ -284,16 +312,25 @@ function videoSource(
 	const convert = track.rotation === 0 ? (sample: VideoSample) => sample.toVideoFrame() : rotator(track);
 
 	return {
-		frames: pace(sink, timeline, convert, signal),
+		frames: pace(repeat(sink, timeline), convert, signal),
 		frameRate,
 	};
 }
 
 function audioSource(track: InputAudioTrack, timeline: Timeline, signal: AbortSignal): Audio.SampleSource {
 	const sink = new AudioSampleSink(track);
+	const presentation = {
+		timestamp: timeline.at(Time.Micro.zero, 0),
+		sampleRate: track.sampleRate,
+		numberOfChannels: track.numberOfChannels,
+	};
 
 	return {
-		samples: pace(sink, timeline, (sample) => sample.toAudioData(), signal),
+		samples: pace(
+			fill(repeat(sink, timeline), presentation),
+			(sample: AudioSample) => sample.toAudioData(),
+			signal,
+		),
 		sampleRate: track.sampleRate,
 		channelCount: track.numberOfChannels,
 		// A file is whatever the user picked, so leave the Opus tuning to the encoder.

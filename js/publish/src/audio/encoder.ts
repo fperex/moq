@@ -542,8 +542,9 @@ export function resolve(captured: Format, selected: Codec): Resolved {
 function createFramer(resolved: Resolved, sampleRate: number): Framer {
 	const config = resolved.catalog;
 
-	// WebCodecs copies input AudioData timestamps to encoded chunks. Align those inputs to codec frames
-	// because the worklet's 128-sample quanta usually do not align with Opus frame boundaries.
+	// Align the inputs to codec frames because the worklet's 128-sample quanta usually do not align
+	// with Opus frame boundaries. An encoded chunk's timestamp is the encoder's own continuous output
+	// clock, not a copy of one input's: several inputs can land in one packet.
 	if (config.codec.startsWith("mp4a")) {
 		return new Framer({
 			sampleRate,
