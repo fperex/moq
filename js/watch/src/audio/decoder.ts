@@ -5,6 +5,7 @@ import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import {
 	type Computed,
+	Derived,
 	Effect,
 	type Getter,
 	getter,
@@ -16,9 +17,9 @@ import {
 import { base64ToBytes } from "../base64";
 import { accumulate, nextMedia, subscribeMedia } from "../media";
 
-import type { Sync } from "../sync";
+import type { Delay, Sync } from "../sync";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
-import { type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
+import { audioMaxAge, type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
 import { Handover } from "./handover";
 import { ringSamples } from "./latency";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
@@ -139,6 +140,25 @@ export class Decoder {
 	// context, worklet, and ring alone.
 	readonly #config: Computed<DecoderConfig | undefined>;
 
+	/**
+	 * The age budget for audio: `Sync.out.maxAge` plus what the ring can absorb past it.
+	 *
+	 * See {@link audioMaxAge} for what it adds and why.
+	 *
+	 * Audio only, and deliberately not `Sync.out.maxAge` itself. That value is also the lookahead
+	 * cap in `Sync.received`, which bounds how far ahead of the playhead an *early* frame may be
+	 * held before playback skips forward. Widening it would let buffered playback drift a headroom
+	 * further from the live edge to solve a problem that only exists for late arrivals. Video is
+	 * untouched for the same reason: it drops a late frame at render rather than losing the group.
+	 *
+	 * It reads synchronously from the first peek, which is what `subscribeMedia` and
+	 * `Container.Consumer` need at construction.
+	 */
+	readonly #maxAge: Derived<
+		readonly [Getter<Time.Milli>, Getter<Delay>, Getter<Catalog.AudioConfig | undefined>],
+		Time.Milli
+	>;
+
 	constructor(props: DecoderProps) {
 		this.in = {
 			enabled: getter(props?.enabled ?? true),
@@ -155,6 +175,11 @@ export class Decoder {
 			const config = effect.get(this.source.out.config);
 			return config ? decoderConfig(config) : undefined;
 		});
+
+		this.#maxAge = new Derived(
+			[this.sync.out.maxAge, this.sync.in.delay, this.source.out.config] as const,
+			(maxAge, delay, config) => audioMaxAge(maxAge, config, delay === "instant"),
+		);
 
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
@@ -338,7 +363,7 @@ export class Decoder {
 			broadcast: active,
 			track,
 			priority: Catalog.PRIORITY.audio,
-			maxAge: this.sync.out.maxAge,
+			maxAge: this.#maxAge,
 		});
 		if (!sub) return;
 
@@ -359,7 +384,7 @@ export class Decoder {
 		// TODO include JITTER_UNDERHEAD
 		const consumer = new Container.Consumer(sub, {
 			format,
-			maxAge: this.sync.out.maxAge,
+			maxAge: this.#maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -473,7 +498,7 @@ export class Decoder {
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
-			maxAge: this.sync.out.maxAge,
+			maxAge: this.#maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 
