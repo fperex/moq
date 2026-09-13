@@ -5,10 +5,13 @@
  * matrix that grows a cell nobody wrote a budget for would otherwise quietly grade nothing. A void
  * row fails the same way, for the same reason: its numbers are the ones that cannot be trusted.
  *
- * In this stage the budgets are **recorded, not enforced**. The table prints, the results are
- * written, and the exit status is zero unless `--enforce` is passed. The numbers in `budgets.json`
- * are what this machine measured, not what the player is required to achieve, and grading against
- * them before the fix lands would only encode the bug.
+ * A row marked `recorded` in `budgets.json` is graded and its breaches are printed, but it does not
+ * fail the run: its ceilings are what a machine measured rather than what the player is required to
+ * achieve. Every other row is enforced.
+ *
+ * The table prints and the results are written either way; the exit status is zero unless
+ * `--enforce` is passed, which the nightly job does. `budgets.json` says how each ceiling in it was
+ * arrived at.
  *
  *     bun grade.ts --run <run dir> --budgets ../../budgets.json [--enforce]
  *
@@ -58,28 +61,49 @@ const budgetFor = (row: Row): Budget | undefined =>
 /** Every graded key a budget may name, in schema order, so the table reads the same every run. */
 const keys = Object.entries(METRICS).flatMap(([name, spec]) => spec.aggregations.map((a) => `${name}_${a}`));
 
-type Verdict = { row: string; key: string; value: number | null; ceiling: number; over: boolean };
+type Verdict = {
+	row: string;
+	key: string;
+	value: number | null;
+	ceiling: number;
+	over: boolean;
+	/** Whether a breach fails the run, or is only reported. */
+	enforced: boolean;
+};
 
 const verdicts: Verdict[] = [];
 const voided: string[] = [];
+const reportedVoid: string[] = [];
 const unbudgeted: string[] = [];
 
 for (const summary of summaries) {
 	const key = rowKey(summary.row);
-	if (summary.voids.length > 0) {
-		voided.push(`${key}: ${summary.voids.map((v) => `${v.assertion} (${v.detail})`).join("; ")}`);
-		continue;
-	}
 	const budget = budgetFor(summary.row);
 	if (!budget) {
 		unbudgeted.push(key);
+		continue;
+	}
+	if (summary.voids.length > 0) {
+		const reason = `${key}: ${summary.voids.map((v) => `${v.assertion} (${v.detail})`).join("; ")}`;
+		// A recorded row has nothing to enforce, so a run of it that cannot be trusted is reported
+		// rather than failed. An enforced row's void is a failure: the alternative is a green matrix
+		// over a cell that measured the WebSocket fallback, the other ring, or a throttled clock.
+		if (budget.recorded === true) reportedVoid.push(reason);
+		else voided.push(reason);
 		continue;
 	}
 	for (const metric of keys) {
 		const ceiling = budget[metric];
 		if (typeof ceiling !== "number") continue;
 		const value = summary.metrics[metric] ?? null;
-		verdicts.push({ row: key, key: metric, value, ceiling, over: value !== null && value > ceiling });
+		verdicts.push({
+			row: key,
+			key: metric,
+			value,
+			ceiling,
+			over: value !== null && value > ceiling,
+			enforced: budget.recorded !== true,
+		});
 	}
 }
 
@@ -98,17 +122,28 @@ for (const summary of summaries) {
 	);
 }
 
-const over = verdicts.filter((v) => v.over);
+const over = verdicts.filter((v) => v.over && v.enforced);
+const reported = verdicts.filter((v) => v.over && !v.enforced);
 lines.push("");
 if (over.length > 0) {
 	lines.push("over budget:");
 	for (const v of over) lines.push(`- ${v.row} ${v.key}: ${v.value} > ${v.ceiling}`);
 } else {
-	lines.push(`within budget: ${verdicts.length} checks across ${summaries.length - voided.length} rows`);
+	lines.push(
+		`within budget: ${verdicts.filter((v) => v.enforced).length} enforced checks across ${summaries.length - voided.length} rows`,
+	);
+}
+if (reported.length > 0) {
+	lines.push("", "over a recorded ceiling (reported, not enforced):");
+	for (const v of reported) lines.push(`- ${v.row} ${v.key}: ${v.value} > ${v.ceiling}`);
 }
 if (voided.length > 0) {
 	lines.push("", "void rows (not graded):");
 	for (const v of voided) lines.push(`- ${v}`);
+}
+if (reportedVoid.length > 0) {
+	lines.push("", "void rows on a recorded budget (reported, not enforced):");
+	for (const v of reportedVoid) lines.push(`- ${v}`);
 }
 if (unbudgeted.length > 0) {
 	lines.push("", "rows with no budget:");
@@ -120,17 +155,14 @@ console.log(report);
 await Bun.write(join(values.run, "grade.md"), `${report}\n`);
 await Bun.write(
 	join(values.run, "grade.json"),
-	JSON.stringify({ enforced: values.enforce, verdicts, voided, unbudgeted }, null, 1),
+	JSON.stringify({ enforced: values.enforce, verdicts, voided, reportedVoid, unbudgeted }, null, 1),
 );
 
 if (!values.enforce) {
-	console.log("\nrecording only: budgets are not enforced in this stage (pass --enforce to fail on them)");
+	console.log("\nreporting only: pass --enforce to fail the run on these budgets");
 	process.exit(0);
 }
 
-// A void row fails too. It is a row whose numbers cannot be trusted, and letting the run pass on it
-// is the one outcome worse than failing: the matrix would report green for a cell that measured the
-// WebSocket fallback, the other ring, or a throttled clock.
 const failed = over.length > 0 || unbudgeted.length > 0 || voided.length > 0;
 if (failed) {
 	console.error(`FAIL: ${over.length} over budget, ${unbudgeted.length} unbudgeted, ${voided.length} void`);

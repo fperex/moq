@@ -20,9 +20,20 @@ seconds a row. `--profiles`, `--rings`, and `--codecs` take comma-separated list
 a given impairment; `--duration` shortens a row.
 
 `grade.ts` prints the table and exits zero unless `--enforce` is passed, which the nightly job does.
-Every row still marked `recorded` in `budgets.json` is what a machine measured rather than what the
-player is required to achieve, so a ceiling comes down as the work lands and never goes up without a
-reason in review. A row with no budget at all fails under `--enforce` rather than passing quietly.
+Every value in `budgets.json` is a ceiling measured on the playout engine, and a row with no budget
+at all fails under `--enforce` rather than passing quietly.
+
+A replay ceiling is exactly what was measured and is enforced: nothing in that lane can be unlucky.
+A Chromium ceiling is the worst of five runs of the whole matrix times 1.5, and those rows are
+marked `recorded`, which means a breach is printed and does not fail the run. Five runs of the same
+matrix on one desktop disagreed with each other by more than that 1.5 on a different handful of rows
+every time, up to a row that stalled end to end, so a ceiling wide enough to hold them would say
+nothing and a tight one would fail on the weather. The nightly runner is the machine whose numbers
+are worth enforcing; take the marker off a Chromium row once it has recorded its own. The counters
+the engine has to keep at zero (underrun episodes, skip-aheads, budget aborts) are hard zeros
+wherever every run measured zero and carry a measured ceiling where they did not: those are the work
+that is left, not a bar that was cleared. A ceiling comes down as that work lands and never goes up
+without a reason in review.
 
 The nightly `audio-quality` job runs the Chromium lane and keeps the run directory of a failure for a
 week: each process's log, the shaper's counters, the raw ndjson, the per-row summaries, and a
