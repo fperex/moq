@@ -70,7 +70,7 @@ describe("initialization", () => {
 		expect(init.capacity).toBe(128);
 		expect(init.rate).toBe(1000);
 		expect(init.samples.byteLength).toBe(2 * 128 * 4); // 2 channels * 128 samples * Float32
-		expect(init.control.byteLength).toBe(16 * 4); // 16 control slots * Int32
+		expect(init.control.byteLength).toBe(18 * 4); // 18 control slots * Int32
 		expect(init.state.byteLength).toBe(8); // packed epoch + read cursor
 	});
 

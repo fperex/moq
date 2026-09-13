@@ -29,15 +29,27 @@ class Fixed implements RingReader {
 	readonly rate = RATE;
 	readonly channels = 1;
 	readonly #depth: number;
+	// How many blocks out of every `#cycle` the ring is empty for, or zero to never run dry. A
+	// short cycle forces a concealment run and the merge that ends it over and over.
+	readonly #outage: number;
+	readonly #cycle: number;
 	#at = 0;
+	// Blocks the engine has asked for, which is what the outage is counted in: the engine looks at
+	// the ring once per block it produces.
+	#asked = 0;
 
-	constructor(depthMs: number) {
+	constructor(depthMs: number, outage = 0, cycle = 0) {
 		this.#depth = frames(RATE, depthMs);
+		this.#outage = outage;
+		this.#cycle = cycle;
 	}
 
 	view(): RingView {
+		const dry = this.#cycle > 0 && this.#asked % this.#cycle < this.#outage;
+		this.#asked++;
+
 		return {
-			buffered: this.#depth,
+			buffered: dry ? 0 : this.#depth,
 			target: frames(RATE, 100),
 			chunk: CHUNK,
 			skip: frames(RATE, STRETCH_BOUND),
@@ -73,8 +85,8 @@ interface Timing {
 	operations: number;
 }
 
-function measure(depthMs: number): Timing {
-	const ring = new Fixed(depthMs);
+function measure(depthMs: number, outage = 0, cycle = 0): Timing {
+	const ring = new Fixed(depthMs, outage, cycle);
 	const engine = new Stretcher(RATE, 1);
 	const out = [new Float32Array(QUANTUM)];
 	const quanta = Math.floor((RATE * SECONDS) / QUANTUM);
@@ -104,7 +116,7 @@ function measure(depthMs: number): Timing {
 		p999: samples[Math.floor(quanta * 0.999)],
 		over: samples.reduce((n, v) => (v > 0.67 ? n + 1 : n), 0),
 		max: samples[quanta - 1],
-		operations: counters.accelerates + counters.expands,
+		operations: counters.accelerates + counters.expands + counters.merges,
 	};
 }
 
@@ -114,11 +126,15 @@ it("renders a quantum well inside its budget, stretching or not", () => {
 	const stretching = measure(400);
 	// Inside the band, so the engine copies the media through and nothing else.
 	const normal = measure(120);
+	// Three blocks of concealment out of every four, so the minute is one long alternation of
+	// analysing a signal, expanding it, and splicing the media back on.
+	const concealing = measure(120, 3, 4);
 
 	const show = (name: string, timing: Timing) =>
 		`${name}: p50 ${timing.p50.toFixed(4)}ms, p95 ${timing.p95.toFixed(4)}ms, p999 ${timing.p999.toFixed(4)}ms, max ${timing.max.toFixed(4)}ms, ${timing.over} over budget, ${timing.operations} operations`;
 	console.log(show("stretching", stretching));
 	console.log(show("normal", normal));
+	console.log(show("concealing", concealing));
 
 	// One operation per 100ms cooldown over a minute.
 	expect(stretching.operations).toBeGreaterThan(500);
@@ -133,4 +149,9 @@ it("renders a quantum well inside its budget, stretching or not", () => {
 	// The worst stretching quantum against the worst plain one: the search and the splice cost
 	// something, but not the kind of something that shows up as a dropout.
 	expect(stretching.p999 / normal.p999).toBeLessThan(30);
-}, 60_000);
+
+	// And concealment, which is a pitch search, a sixth order fit, and a splice per outage.
+	expect(concealing.operations).toBeGreaterThan(500);
+	expect(concealing.p999).toBeLessThan(BUDGET);
+	expect(concealing.p999 / normal.p999).toBeLessThan(30);
+}, 120_000);

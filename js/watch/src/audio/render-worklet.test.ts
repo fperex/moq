@@ -9,7 +9,7 @@ import {
 	STRETCH_BOUND,
 	Stretcher,
 } from "./playout";
-import { maxStep, tone, zeroRun } from "./playout/fixture";
+import { maxStep, speech, zeroRun } from "./playout/fixture";
 import { AudioRingBuffer } from "./ring-buffer";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -61,8 +61,15 @@ const RINGS: Array<[string, (targetMs: number, buffered?: boolean) => Harness]> 
 	["post", post],
 ];
 
-/** A continuous 200Hz tone, so a splice that is not seamless shows up as a step. */
-const SOURCE = tone(RATE, 40, 200, 0.5)[0];
+/**
+ * A 200Hz tone that pauses, over a quiet room: a splice that is not seamless shows up as a step,
+ * and the pauses are what let the background estimate learn a level for concealment to fade into.
+ */
+const FLOOR = 0.002;
+const SOURCE = speech(RATE, 40, 200, 0.5, FLOOR)[0];
+
+/** The steepest a sample-to-sample step can be and still be the fixture rather than a click. */
+const SLOPE = (0.5 * 2 * Math.PI * 200) / RATE + 2 * FLOOR;
 
 function media(start: number, count: number): Float32Array {
 	return SOURCE.slice(start % (SOURCE.length - count), (start % (SOURCE.length - count)) + count);
@@ -75,6 +82,10 @@ function micro(samples: number): Time.Micro {
 interface Script {
 	/** The playout target, in milliseconds. */
 	target: number;
+	/** Whether a gap is concealed rather than rendered as a ramp into silence. Defaults to on. */
+	conceal?: boolean;
+	/** A hole in the media, as a fraction of the run and a length in milliseconds. */
+	hole?: { at: number; ms: number };
 	/** Media inserted before the first quantum is pulled, in milliseconds. */
 	prefill: number;
 	/** How long to run, in seconds of output. */
@@ -93,7 +104,7 @@ interface Report extends Snapshot {
 	played: Float32Array;
 	/** Quanta that came back short of a full block. */
 	shortQuanta: number;
-	/** Whether `READ == output + stretched + queued + skipped` held on every quantum. */
+	/** Whether `READ == output - concealed + stretched + queued + skipped` held on every quantum. */
 	balanced: boolean;
 	/** Whether the media playhead ever stepped backwards. */
 	monotone: boolean;
@@ -101,7 +112,7 @@ interface Report extends Snapshot {
 
 function run(build: (targetMs: number, buffered?: boolean) => Harness, script: Script): Report {
 	const harness = build(script.target);
-	const engine = new Stretcher(RATE, 1);
+	const engine = new Stretcher(RATE, 1, script.conceal ?? true);
 	const out = [new Float32Array(QUANTUM)];
 
 	const quanta = Math.floor((RATE * script.seconds) / QUANTUM);
@@ -109,11 +120,21 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 	const pace = script.pace ?? 1;
 	const stallAt = script.stallAt === undefined ? undefined : Math.floor(quanta * script.stallAt);
 
+	// Where the sender is on the media timeline, and how far the media it actually sent reaches:
+	// the two differ by a hole, which is the part nobody can account for.
 	let written = 0;
+	let inserted = 0;
 	while (written < ms(script.prefill)) {
 		harness.insert(written, CHUNK);
 		written += CHUNK;
+		inserted = written;
 	}
+
+	// Where the hole sits on the media timeline, and how much of it never arrives.
+	const hole = script.hole && {
+		from: written + Math.floor(quanta * script.hole.at) * QUANTUM,
+		frames: ms(script.hole.ms),
+	};
 
 	let outputFrame = 0;
 	let nextArrival = CHUNK / pace;
@@ -125,7 +146,13 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 
 	for (let q = 0; q < quanta; q++) {
 		while (outputFrame >= nextArrival) {
-			harness.insert(written, CHUNK);
+			// A hole is media that never arrives: the timeline keeps its place, so what lands after
+			// it is the audio that follows the hole rather than the audio inside it.
+			const missing = hole && written >= hole.from && written < hole.from + hole.frames;
+			if (!missing) {
+				harness.insert(written, CHUNK);
+				inserted = written + CHUNK;
+			}
 			written += CHUNK;
 			nextArrival += CHUNK / pace;
 		}
@@ -138,10 +165,12 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 		if (got < QUANTUM) shortQuanta++;
 
 		const debug = harness.debug();
-		// What the ring handed over is what was played, plus what a stretch moved, plus what is
-		// still in flight, plus what a jump passed over. `written - buffered` is READ.
-		const read = written - debug.buffered;
-		if (read !== debug.output + debug.stretched + debug.queued + debug.skipped + debug.discarded) {
+		// What the ring handed over is what was played, less the frames that were made up rather
+		// than read, plus what a stretch moved, plus what is still in flight, plus what a jump
+		// passed over. `inserted - buffered` is READ.
+		const read = inserted - debug.buffered;
+		const heard = debug.output - debug.concealed;
+		if (read !== heard + debug.stretched + debug.queued + debug.skipped + debug.discarded) {
 			balanced = false;
 		}
 		const media = read - debug.queued;
@@ -187,7 +216,7 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 
 		// Every splice landed on a pitch period, so the tone came out a tone.
 		expect(zeroRun(report.played)).toBeLessThanOrEqual(2);
-		expect(maxStep(report.played)).toBeLessThan((1.5 * (0.5 * 2 * Math.PI * 200)) / RATE);
+		expect(maxStep(report.played)).toBeLessThan(1.5 * SLOPE);
 	});
 
 	it("tracks a sender running slow instead of running dry", () => {
@@ -220,12 +249,59 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 	});
 
 	it("parks and resumes without losing the balance", () => {
-		const report = run(build, { target: 100, prefill: 100 + CHUNK_MS, seconds: 6, stallAt: 0.5 });
+		const script: Script = { target: 100, prefill: 100 + CHUNK_MS, seconds: 6, stallAt: 0.5 };
+		const report = run(build, script);
 
 		expect(report.balanced).toBe(true);
 		expect(report.monotone).toBe(true);
 		// The park itself is the one underrun; the refill covers the rest.
 		expect(report.underruns).toBe(1);
+		// Concealment covers the refill, so nothing reaches the device short.
+		expect(report.shortQuanta).toBe(0);
+		expect(report.concealed).toBeGreaterThan(0);
+
+		// And the same park without it is the silence the ramp was written for.
+		const ramped = run(build, { ...script, conceal: false });
+		expect(ramped.balanced).toBe(true);
+		expect(ramped.underruns).toBe(1);
+		expect(ramped.shortQuanta).toBeGreaterThan(0);
+		expect(ramped.concealed).toBe(0);
+	});
+
+	it("conceals a hole in the media instead of playing it as silence", () => {
+		// 150ms of media that never arrives, which is longer than any stretch can cover and is what
+		// a censored group leaves behind.
+		const script: Script = { target: 100, prefill: 100 + CHUNK_MS, seconds: 6, hole: { at: 0.4, ms: 150 } };
+		const report = run(build, script);
+
+		console.log(
+			`${name}: a 150ms hole left ${report.concealed} concealed samples over ${report.merges} merges, ${report.shortQuanta} short quanta and ${report.underruns} underruns`,
+		);
+
+		expect(report.balanced).toBe(true);
+		expect(report.monotone).toBe(true);
+		expect(report.concealed).toBeGreaterThan(ms(100));
+		expect(report.merges).toBeGreaterThan(0);
+		// Nothing reached the device short, and nothing came out as digital silence.
+		expect(report.shortQuanta).toBe(0);
+		expect(zeroRun(report.played)).toBeLessThanOrEqual(2);
+		// The concealment is spliced on a pitch period at both ends, like every other operation.
+		expect(maxStep(report.played)).toBeLessThan(1.5 * SLOPE);
+	});
+
+	it("renders the same hole as a ramped gap with concealment off", () => {
+		const report = run(build, {
+			target: 100,
+			prefill: 100 + CHUNK_MS,
+			seconds: 6,
+			hole: { at: 0.4, ms: 150 },
+			conceal: false,
+		});
+
+		expect(report.balanced).toBe(true);
+		expect(report.concealed).toBe(0);
+		expect(report.merges).toBe(0);
+		// The gap is the thing being measured: quanta that came back short, and the silence after.
 		expect(report.shortQuanta).toBeGreaterThan(0);
 	});
 });

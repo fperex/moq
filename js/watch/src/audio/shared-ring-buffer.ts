@@ -44,7 +44,11 @@ const SKIPS = 13;
 const SKIPPED = 14;
 // Samples the writer dropped: too old for the playhead, or past the ring's capacity. Writer only.
 const DISCARDED = 15;
-const CONTROL_SLOTS = 16;
+// Frames of OUTPUT the reader synthesized to cover a gap, so they carried no media. Reader only.
+const CONCEALED = 16;
+// Times media returning after a concealment was spliced back on. Reader only.
+const MERGES = 17;
+const CONTROL_SLOTS = 18;
 
 /**
  * The playhead and its mutation epoch, packed into one 64-bit word: epoch in the high
@@ -197,6 +201,7 @@ export class SharedRingBuffer implements RingReader {
 	#lastMedia = Number.NEGATIVE_INFINITY;
 	#lastOutput = 0;
 	#lastStretched = 0;
+	#lastConcealed = 0;
 
 	/**
 	 * Wrap the shared memory described by `init`.
@@ -345,11 +350,27 @@ export class SharedRingBuffer implements RingReader {
 		const write = Atomics.load(this.#control, WRITE);
 		const gap = (start - write) | 0;
 		if (gap > 0) {
-			const gapSize = Math.min(gap, this.capacity);
-			for (let channel = 0; channel < this.channels; channel++) {
-				const dst = this.#samples[channel];
-				for (let i = 0; i < gapSize; i++) {
-					dst[slot((write + i) | 0, this.capacity)] = 0;
+			if (!this.buffered && ((readOf(Atomics.load(this.#state, 0)) - write) | 0) >= 0) {
+				// Nothing left to play, so the hole is media that was never sent and the reader is
+				// already covering for it: queueing it as silence would make a listener wait for the
+				// same missing audio a second time. Step the playhead over it instead. Buffered
+				// playback keeps the silence, because a producer writing ahead of the playhead means
+				// the pause it wrote.
+				Atomics.add(this.#control, SKIPS, 1);
+				Atomics.add(this.#control, SKIPPED, gap);
+				// The playhead moves first. The other order leaves a window where WRITE describes
+				// the hole and READ does not, and a reader landing in it would play whatever those
+				// slots still hold.
+				this.#advance(start);
+				Atomics.store(this.#control, WRITE, start);
+			} else {
+				// Fill the gap with zeros: there is audio behind it that still has to play in place.
+				const gapSize = Math.min(gap, this.capacity);
+				for (let channel = 0; channel < this.channels; channel++) {
+					const dst = this.#samples[channel];
+					for (let i = 0; i < gapSize; i++) {
+						dst[slot((write + i) | 0, this.capacity)] = 0;
+					}
 				}
 			}
 		}
@@ -494,8 +515,10 @@ export class SharedRingBuffer implements RingReader {
 		Atomics.store(this.#control, QUEUED, counters.queued | 0);
 		Atomics.store(this.#control, STRETCHED, counters.stretched | 0);
 		Atomics.store(this.#control, OUTPUT, counters.output | 0);
+		Atomics.store(this.#control, CONCEALED, counters.concealed | 0);
 		Atomics.store(this.#control, ACCELERATES, counters.accelerates | 0);
 		Atomics.store(this.#control, EXPANDS, counters.expands | 0);
+		Atomics.store(this.#control, MERGES, counters.merges | 0);
 		Atomics.store(this.#control, SHORT, counters.short | 0);
 	}
 
@@ -672,8 +695,10 @@ export class SharedRingBuffer implements RingReader {
 			QUEUED,
 			STRETCHED,
 			OUTPUT,
+			CONCEALED,
 			ACCELERATES,
 			EXPANDS,
+			MERGES,
 			SHORT,
 			SKIPS,
 			SKIPPED,
@@ -690,6 +715,7 @@ export class SharedRingBuffer implements RingReader {
 		dst.#lastMedia = this.#lastMedia;
 		dst.#lastOutput = this.#lastOutput;
 		dst.#lastStretched = this.#lastStretched;
+		dst.#lastConcealed = this.#lastConcealed;
 
 		return dst;
 	}
@@ -743,10 +769,10 @@ export class SharedRingBuffer implements RingReader {
 	 * Main thread only, and stateful for the same reason {@link timestamp} is: the rate is measured
 	 * between polls.
 	 *
-	 * The rate is the reader's own, `1 + dSTRETCHED/dOUTPUT`: it consumes a sample of media per
-	 * output frame while playing normally, a few percent more or less while a time stretch converges
-	 * on the target, and nothing at all while parked, so a stall reports zero and whoever follows
-	 * this playhead parks with it rather than running away from the audio it can hear.
+	 * The rate is the reader's own, `1 + (dSTRETCHED - dCONCEALED)/dOUTPUT`: it consumes a sample of
+	 * media per output frame while playing normally, a few percent more or less while a time stretch
+	 * converges on the target, and none at all while concealment covers a gap or while parked, so
+	 * whoever follows this playhead waits with the audio rather than running away from it.
 	 */
 	get playhead(): Playhead | undefined {
 		if (!this.#anchored) return undefined;
@@ -754,10 +780,12 @@ export class SharedRingBuffer implements RingReader {
 		const timestamp = this.timestamp;
 		const output = Atomics.load(this.#control, OUTPUT);
 		const stretched = Atomics.load(this.#control, STRETCHED);
+		const concealed = Atomics.load(this.#control, CONCEALED);
 		const elapsed = (output - this.#lastOutput) | 0;
-		const moved = (stretched - this.#lastStretched) | 0;
+		const moved = ((stretched - this.#lastStretched) | 0) - ((concealed - this.#lastConcealed) | 0);
 		this.#lastOutput = output;
 		this.#lastStretched = stretched;
+		this.#lastConcealed = concealed;
 
 		return { timestamp, rate: elapsed > 0 ? 1 + moved / elapsed : 0 };
 	}
@@ -780,8 +808,10 @@ export class SharedRingBuffer implements RingReader {
 			queued: load(QUEUED),
 			stretched: load(STRETCHED),
 			output: load(OUTPUT),
+			concealed: load(CONCEALED),
 			accelerates: load(ACCELERATES),
 			expands: load(EXPANDS),
+			merges: load(MERGES),
 			short: load(SHORT),
 			skips: load(SKIPS),
 			skipped: load(SKIPPED),

@@ -2,11 +2,12 @@ import { Level } from "./level";
 import { frames } from "./stretch";
 
 /**
- * Which way to bend the next block of audio.
+ * Which way to bend the next block of audio, or what to put there when there is none.
  *
- * Mirrors `decision_logic.cc`'s `ExpectedPacketAvailable`, which is the branch that runs whenever
- * the audio the engine wants is already buffered. The other branches are concealment, which is the
- * next stage.
+ * Mirrors `decision_logic.cc` and the Rust twin in `rs/moq-audio/src/playout/decision.rs`. Most
+ * blocks take the `ExpectedPacketAvailable` branch, which is the one that runs whenever the audio
+ * the engine wants is already buffered; the rest are the two concealment operations, which cover a
+ * ring that ran dry and the return from it.
  */
 
 /** The engine's output block, in milliseconds. The granularity every decision is taken at. */
@@ -54,11 +55,15 @@ const FAST = 4;
  * not restart onto an empty buffer. We have no decode to postpone (the ring is fed from the main
  * thread), so the same hysteresis gates expansion instead: below half the target the ring is
  * refilling and stretching would only fight the refill.
+ *
+ * The other half of that rule, not resuming from a concealment until the ring holds a cushion again,
+ * is the ring's: it parks on an underrun and only un-parks once it holds the whole target, which is
+ * stricter than NetEq's half and is one mechanism rather than two.
  */
 const POSTPONE = 0.5;
 
 /** What to do with the next block. */
-export type Operation = "normal" | "accelerate" | "fast-accelerate" | "expand";
+export type Operation = "normal" | "accelerate" | "fast-accelerate" | "expand" | "conceal" | "merge" | "silence";
 
 /** Everything the decision reads about the moment it is taken. */
 export interface Demand {
@@ -72,6 +77,18 @@ export interface Demand {
 	chunk: number;
 	/** The output frame this block starts at, which is what the cooldown is measured in. */
 	outputFrame: number;
+	/** Whether there is no media to play: the ring is parked, mid-rebase, or empty. */
+	starved: boolean;
+	/** Whether a gap is concealed with synthesized audio rather than played as a ramp into silence. */
+	conceal: boolean;
+	/**
+	 * Whether the reader should converge on the target, or play through everything it was given.
+	 *
+	 * Buffered playback holds a lookahead on purpose, so bending the media to reach a target it is
+	 * deliberately far above would throw away the very lookahead that was asked for. It still conceals:
+	 * a ring that ran dry sounds the same whichever mode asked for the audio.
+	 */
+	converge: boolean;
 }
 
 /** The per-block state machine for one stream. */
@@ -87,6 +104,8 @@ export class Decision {
 	#ready = Number.NEGATIVE_INFINITY;
 	// Whether the next observation replaces the filter rather than being folded into it.
 	#seed = true;
+	// Whether the last block was concealed, so the next media is a splice rather than a play.
+	#concealing = false;
 
 	constructor(rate: number) {
 		this.#rate = rate;
@@ -101,6 +120,14 @@ export class Decision {
 
 	/** Fold in the moment and pick the operation for the block about to be produced. */
 	decide(demand: Demand): Operation {
+		if (demand.starved) {
+			// Nothing to play. The level is left alone rather than filtered toward zero: the ring
+			// re-seeds it on the way out, and a filter walked to empty would ask for an expansion on
+			// the first block back.
+			this.#concealing = demand.conceal;
+			return demand.conceal ? "conceal" : "silence";
+		}
+
 		const observed = demand.buffered + demand.queued;
 		this.#level.target((demand.target / this.#rate) * 1000);
 
@@ -114,6 +141,15 @@ export class Decision {
 			this.#level.update(observed, this.#stretched);
 		}
 		this.#stretched = 0;
+
+		if (this.#concealing) {
+			// Media is back. It has to be spliced onto the concealment that stood in for it, whatever
+			// the level says: an arbitrary join between the two is the click concealment was for.
+			this.#concealing = false;
+			return "merge";
+		}
+
+		if (!demand.converge) return "normal";
 
 		const level = this.#level.filtered;
 		const low = demand.target;
@@ -140,10 +176,22 @@ export class Decision {
 		this.#ready = outputFrame + this.#cooldown;
 	}
 
-	/** The timeline moved: forget the level and the cooldown, and adopt the next observation. */
-	discontinuity(): void {
+	/**
+	 * The buffer moved somewhere the filter never walked to: forget the level and the cooldown, and
+	 * adopt the next observation.
+	 *
+	 * A park, a skip-ahead, or a resume. Whether the last block was concealed survives it, because
+	 * that is a fact about the output rather than about the buffer.
+	 */
+	reseed(): void {
 		this.#stretched = 0;
 		this.#ready = Number.NEGATIVE_INFINITY;
 		this.#seed = true;
+	}
+
+	/** The timeline moved: {@link reseed}, and forget that anything was ever concealed. */
+	discontinuity(): void {
+		this.reseed();
+		this.#concealing = false;
 	}
 }
