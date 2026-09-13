@@ -26,6 +26,7 @@ const OBSERVED = [
 	"announced",
 	"delay",
 	"buffer",
+	"conceal",
 	// Released spellings are observed only so assigning them can fail loudly instead of being ignored.
 	"reload",
 	"latency",
@@ -149,6 +150,7 @@ export default class MoqWatch extends HTMLElement {
 	// Broadcast configuration owned here and wired into `broadcast` as inputs.
 	#name = new Signal<Moq.Path.Valid>(Moq.Path.empty());
 	#announced = new Signal(true);
+	#conceal = new Signal(true);
 	#catalogFormat = new Signal<CatalogFormat | undefined>(undefined);
 	#catalog = new Signal<Catalog.Root | undefined>(undefined);
 
@@ -234,7 +236,12 @@ export default class MoqWatch extends HTMLElement {
 		this.video = new Video.Decoder({ source: videoSource, sync: this.sync, enabled: this.#videoEnabled });
 		this.signals.proxy(this.sync.track("video").advertised, this.video.out.jitter);
 		this.signals.proxy(this.sync.track("video").spread, this.video.out.spread);
-		this.audio = new Audio.Decoder({ source: audioSource, sync: this.sync, enabled: this.#audioEnabled });
+		this.audio = new Audio.Decoder({
+			source: audioSource,
+			sync: this.sync,
+			enabled: this.#audioEnabled,
+			conceal: this.#conceal,
+		});
 		this.signals.proxy(this.sync.track("audio").spread, this.audio.out.spread);
 		this.signals.cleanup(() => {
 			this.video.close();
@@ -459,6 +466,8 @@ export default class MoqWatch extends HTMLElement {
 			this.controls.delay.set(parseDelay(newValue));
 		} else if (name === "buffer") {
 			this.controls.buffer.set(parseBuffer(newValue));
+		} else if (name === "conceal") {
+			this.#conceal.set(parseBoolean(newValue, true));
 		} else if (name === "reload") {
 			console.warn("moq-watch: `reload` was renamed to `announced`");
 		} else if (name === "latency" || name === "latency-min" || name === "jitter") {
@@ -533,6 +542,15 @@ export default class MoqWatch extends HTMLElement {
 	/** @internal */
 	set reload(_value: unknown) {
 		throw new Error("moq-watch: `reload` was renamed to `announced`");
+	}
+
+	/** Whether a gap in the audio is concealed rather than played as a gap. See {@link Audio.DecoderInput.conceal}. */
+	get conceal(): boolean {
+		return this.#conceal.peek();
+	}
+
+	set conceal(value: boolean) {
+		this.#conceal.set(value);
 	}
 
 	/**
