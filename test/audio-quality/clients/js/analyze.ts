@@ -244,16 +244,32 @@ for (let i = SKIP_WINDOW; i < lags.length - SKIP_WINDOW; i++) {
 // A build that does not publish it at all reports null, not zero. The difference matters most in
 // exactly the comparison this harness exists for: a baseline without the counter would otherwise
 // show a perfect zero next to the branch's real number and read as a regression.
+/**
+ * How far a cumulative counter rose across the window, or null when the build never published it.
+ *
+ * Positive deltas only: a rebuilt ring or a re-subscribed consumer restarts its counter at zero, and
+ * a restart is not a negative number of events.
+ */
+function rise(counts: (number | undefined)[]): number | null {
+	if (!counts.some((c) => typeof c === "number")) return null;
+	let total = 0;
+	for (let i = 1; i < counts.length; i++) {
+		const prev = counts[i - 1];
+		const cur = counts[i];
+		if (typeof prev !== "number" || typeof cur !== "number") continue;
+		total += Math.max(0, cur - prev);
+	}
+	return total;
+}
+
 const underrunCounts = window.map((s) => s.underruns);
 const hasCounter = underrunCounts.some((c) => typeof c === "number");
-let underruns: number | null = hasCounter ? 0 : null;
-for (let i = 1; hasCounter && i < underrunCounts.length; i++) {
-	const prev = underrunCounts[i - 1];
-	const cur = underrunCounts[i];
-	if (typeof prev !== "number" || typeof cur !== "number") continue;
-	// Sum positive deltas only: a rebuilt ring restarts the counter.
-	underruns = (underruns ?? 0) + Math.max(0, cur - prev);
-}
+const underruns = rise(underrunCounts);
+
+// Groups that lost content above the decoder, from the container consumer's own counter. It cannot
+// say why: the local age budget skipping a group and the transport giving up on one land in the same
+// number, which is why `budget_aborts` stays null rather than being read off this.
+const skippedGroups = rise(window.map((s) => s.skipped));
 
 // An episode is a maximal run of consecutive samples in which that counter was still rising: one
 // audible gap, however many quanta it spanned. Forty scattered episodes and one long one grade the
@@ -326,6 +342,22 @@ const rmsWindows = window.map((s) => s.rms).filter((x): x is number => typeof x 
 const silenceShare =
 	rmsWindows.length > 0 ? rmsWindows.filter((r) => r < SILENCE_RMS).length / rmsWindows.length : null;
 const loads = window.map((s) => s.renderLoad).filter((x): x is number => typeof x === "number");
+
+// ── the clock ───────────────────────────────────────────────────────────────
+
+// Which track's playhead playback was paced against. Audio holding it is what the rest of these
+// numbers assume: while nothing does, the reference follows the wall clock and the ring is chasing
+// it, which is the arrangement the underruns came from in the first place. A sample whose `clock`
+// field is absent came from a build without the signal and is left out of the denominator entirely,
+// so an old build reports null instead of a flattering zero.
+const clocks = window.flatMap((s) => (s.clock === undefined ? [] : [s.clock]));
+const wallClockShare = clocks.length > 0 ? clocks.filter((c) => c === "none").length / clocks.length : null;
+if (clocks.length === 0) {
+	notes.push("clock: this build does not publish sync.out.clock");
+} else {
+	const sources = [...new Set(clocks)].sort().join(", ");
+	if (sources !== "audio") notes.push(`clock: playback was paced by ${sources}`);
+}
 
 // ── clocks and stages ───────────────────────────────────────────────────────
 
@@ -451,8 +483,8 @@ const metrics: Record<string, number | null> = {
 	expands_per_min: null,
 	stretched_samples_total: null,
 	stretched_samples_per_min: null,
-	skipped_groups_total: null,
-	skipped_groups_per_min: null,
+	skipped_groups_total: skippedGroups,
+	skipped_groups_per_min: skippedGroups === null ? null : round1(skippedGroups / minutes),
 	budget_aborts_total: null,
 	budget_aborts_per_min: null,
 	target_ms_p50: round1(targetStats.p50),
@@ -461,6 +493,7 @@ const metrics: Record<string, number | null> = {
 	target_ms_last: round1(lastSample?.delay),
 	converge_s_seconds: round1(convergeS),
 	silence_share_share: silenceShare === null ? null : Math.round(silenceShare * 1000) / 1000,
+	wall_clock_share_share: wallClockShare === null ? null : Math.round(wallClockShare * 1000) / 1000,
 	render_load_p95: round1(loadStats.p95),
 	render_load_max: round1(loadStats.max),
 	media_drift_last: round1(mediaDrift),

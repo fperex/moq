@@ -70,8 +70,9 @@ comparable to this one by construction rather than by agreement.
 
 ### Units and clocks
 
-Every duration is milliseconds as a float. Every count is an integer. Every share is a fraction of
-1. A sample count is converted at the rate it was counted at and reported as ms next to the count.
+Every duration is milliseconds as a float. Every count is an integer. Every share is a fraction
+of 1. A sample count is converted at the rate it was counted at and reported as ms next to the
+count.
 
 Four clocks are named: `viewer`, `publisher`, `relay`, `shaper`. Only the viewer's is readable from
 a browser page, so the others are reported as unmeasured rather than as zero, with one exception:
@@ -105,24 +106,39 @@ definition is a judgement call are:
 
 - **`underruns`** is the ring's own cumulative count of partly-filled quanta. It is authoritative,
   because it sees the gaps that begin and end between two 250 ms samples.
+
 - **`underrun_episodes`** is a maximal run of consecutive samples in which that counter was still
   rising: one audible gap, however many quanta it spanned. Both are reported because forty scattered
   episodes and one long one grade the same by quanta and sound nothing alike.
+
 - **`stalled_quanta`** is the share of the run the ring spent re-stalled, refilling rather than
   playing. Graded separately from underruns: it is silence the player chose.
+
 - **`skip_aheads`** is a step in the lag between wall time and the playhead, not a single large
   advance. See "What the sampling grid can and cannot see" below.
+
 - **`silence_share`** is the share of sampled windows whose RMS at the graph output was below about
   -60 dBFS. It is the only metric read from the audio itself rather than from a counter: a counter
   says the ring was fed, and only the PCM says the listener heard anything.
+
 - **`converge_s`** is measured backwards from the end of the run, to the last moment the resolved
   target was more than one bucket from its final value. A target that settles and then moves again
   has not converged.
 
+- **`skipped_groups`** is the container consumer's own count of groups abandoned with content still
+  unread, read through `audio.out.skipped`. A group the next one already covers is not counted,
+  because nothing was lost there. It cannot say why one was abandoned: the local age budget skipping
+  a stale group and the transport giving up on a slow one land in the same counter, which is why
+  `budget_aborts` stays null rather than being read off this.
+
+- **`wall_clock_share`** is the share of the graded window in which no track's playhead was driving
+  playback, from `sync.out.clock`. A sample from a build without that signal is left out of the
+  denominator rather than counted as a zero, so an older build reports `null`.
+
 `short_quanta`, `silent_quanta`, `discarded_samples`, `accelerates`, `expands`,
-`stretched_samples`, `skipped_groups`, and `budget_aborts` are in the schema and report `null`: the
-signals they need do not exist on the player yet. They are null rather than zero, and the summary
-says which change would fill each one in.
+`stretched_samples`, and `budget_aborts` are in the schema and report `null`: the signals they need
+do not exist on the player yet. They are null rather than zero, and the summary says which change
+would fill each one in.
 
 ### What the sampling grid can and cannot see
 

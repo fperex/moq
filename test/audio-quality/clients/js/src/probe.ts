@@ -158,10 +158,9 @@ export function probe(watch: MoqWatch): Probe {
 			underruns: num(audio.underruns),
 			spread: num(audio.spread),
 			buffered: ranges.length > 0 ? buffered : undefined,
-			// TODO: `audio.out.skipped` does not exist on this build. Stage 3 adds
-			// `Container.Consumer.skipped` and surfaces it as `Decoder.out.skipped`; until then
-			// `skipped_groups` and `budget_aborts` are null in every summary. The same goes for
-			// `audio.out.debug()` (short, silent, and discarded quanta), which stage 5 adds.
+			skipped: num(audio.skipped),
+			// TODO: `audio.out.debug()` (short, silent, and discarded quanta) does not exist yet, so
+			// those three metrics stay null in every summary until stage 5 adds it.
 			stats: maybe(() => audio.stats.peek()) as Record<string, unknown> | undefined,
 
 			delay: num(sync.delay),
@@ -169,6 +168,11 @@ export function probe(watch: MoqWatch): Probe {
 			maxAge: num(sync.maxAge),
 			reference: num(sync.reference),
 			syncTimestamp: num(sync.timestamp),
+			// The clock's source, where an absent signal and an absent source are different answers:
+			// on a build without `sync.out.clock` the field is missing from the sample, and on one
+			// with it an undefined value means playback ran on the wall clock. `maybe` collapses both
+			// to undefined, so the branch is checked once here rather than guessed at in the analyzer.
+			clock: "clock" in sync ? ((maybe(() => sync.clock.peek()) ?? "none") as Sample["clock"]) : undefined,
 
 			rms: rms(),
 			renderLoad,
