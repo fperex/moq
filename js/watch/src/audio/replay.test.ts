@@ -8,10 +8,19 @@ import { maxAgeHeadroom } from "./config";
 import fourKWebm from "./fixtures/4k-webm.json" with { type: "json" };
 import lanBbb from "./fixtures/lan-bbb.json" with { type: "json" };
 import relayBbb7Frame from "./fixtures/relay-bbb-7frame.json" with { type: "json" };
-import { type RingReader, type Snapshot, Stretcher } from "./playout";
-import { speech, zeroRun } from "./playout/fixture";
-import { AudioRingBuffer } from "./ring-buffer";
-import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
+import { zeroRun } from "./playout/fixture";
+import {
+	type Arrival,
+	type Build,
+	CHUNK_MS,
+	type Fixture,
+	replay as play,
+	type Result,
+	recorded,
+	rings,
+	target as targetOf,
+	trace,
+} from "./replay";
 
 // Replay arrival traces through the real estimator and both rings, and count what a listener would
 // hear: quanta rendered short (an underrun) and samples the ring threw away (a skip). Both rings
@@ -23,8 +32,6 @@ import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 // broke; the recordings say whether it broke in the field.
 
 const RATE = 48000;
-const QUANTUM = 128; // an AudioWorklet render quantum
-const CHUNK_MS = 20; // one Opus frame
 const CHUNK = (RATE * CHUNK_MS) / 1000;
 // What the catalog advertises for 48kHz Opus: one frame. Sync holds this as a floor under the
 // measured target.
@@ -35,252 +42,19 @@ function settle(): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-/** Deterministic PRNG, so a trace is the same on every machine. */
-function rng(seed: number): () => number {
-	let a = seed >>> 0;
-	return () => {
-		a = (a + 0x6d2b79f5) >>> 0;
-		let t = Math.imul(a ^ (a >>> 15), 1 | a);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
+/** The trace's settled target, at this suite's rate and floor. */
+const target = (t: Arrival[]): number => targetOf(t, FLOOR);
 
-/** One frame of a trace: when it was captured, and the wall time it reached us. */
-interface Arrival {
-	media: number;
-	arrival: number;
-}
-
-/**
- * A sender emitting a frame every `CHUNK_MS`, holding `burst - 1` of them back and flushing the
- * run at once, plus `spread` ms of per-flush network jitter. `burst` of 1 is an evenly paced
- * sender; anything above it is the PES packing an importer produces.
- */
-function trace(frames: number, burst: number, spread: number, seed = 7): Arrival[] {
-	const rand = rng(seed);
-	const out: Arrival[] = [];
-	let held: number[] = [];
-	for (let i = 0; i < frames; i++) {
-		const media = i * CHUNK_MS;
-		held.push(media);
-		if (held.length < burst) continue;
-		// Every frame keeps its own capture time; the whole run shares one arrival.
-		const arrival = media + 50 + rand() * spread;
-		for (const m of held) out.push({ media: m, arrival });
-		held = [];
-	}
-	return out;
-}
-
-/** A recorded fixture, as trimmed into `./fixtures`. */
-interface Fixture {
-	source: string;
-	description: string;
-	arrivals: { timestamp_us: number; arrival_ms: number }[];
-}
-
-function recorded(fixture: Fixture): Arrival[] {
-	return fixture.arrivals.map(({ timestamp_us, arrival_ms }) => ({
-		media: timestamp_us / 1000,
-		arrival: arrival_ms,
-	}));
-}
-
-/**
- * The target the estimator settles on for a trace: the real `Jitter`, fed the same arrivals, held
- * above the catalog floor the way `Sync` holds it.
- *
- * Also the whole point of the exercise. Nothing here approximates the estimator, so a change that
- * moves it moves what these rings are sized to.
- */
-function target(t: Arrival[]): number {
-	const jitter = new Container.Jitter();
-	for (const { media, arrival } of t) {
-		jitter.observe(Time.Micro.fromMilli(media as Time.Milli), arrival as Time.Milli);
-	}
-	return Math.max(FLOOR, jitter.value.peek());
-}
-
-/** The two rings behind one interface, since the harness drives them identically. */
-interface Ring {
-	readonly reader: RingReader;
-	insert(timestamp: Time.Micro, data: Float32Array[]): void;
-	setLatency(ms: number): void;
-	debug(): Snapshot;
-	readonly length: number;
-}
-
-// Sized for the estimator's ceiling up front, the way `SharedAudioBuffer` does, so a rising target
-// never reallocates.
-function shared(latencyMs: number): Ring {
-	const ceiling = Math.ceil((RATE * Container.Jitter.CEILING) / 1000);
-	const ring = new SharedRingBuffer(allocSharedRingBuffer(1, ceiling, RATE));
-	ring.setLatency(Math.ceil((RATE * latencyMs) / 1000));
-	return {
-		reader: ring,
-		insert: (timestamp, data) => ring.insert(timestamp, data),
-		setLatency: (ms) => ring.setLatency(Math.ceil((RATE * ms) / 1000)),
-		debug: () => ring.debug(),
-		get length() {
-			return ring.length;
-		},
-	};
-}
-
-function post(latencyMs: number): Ring {
-	const ring = new AudioRingBuffer({ rate: RATE, channels: 1, latency: latencyMs as Time.Milli });
-	return {
-		reader: ring,
-		insert: (timestamp, data) => ring.write(timestamp, data),
-		setLatency: (ms) => ring.resize(ms as Time.Milli),
-		debug: () => ring.debug(),
-		get length() {
-			return ring.length;
-		},
-	};
-}
-
-interface Result {
-	/** Times the reader ran dry mid-playback after the warmup. */
-	underruns: number;
-	/** Samples thrown away after the warmup: the reader skipped them or the writer dropped them. */
-	skipped: number;
-	/** Quanta rendered after the warmup, so `underruns` can be read as a rate. */
-	quanta: number;
-	/** Quanta that came back short of a full block after the warmup. */
-	short: number;
-	/** Blocks the time stretch shortened and lengthened after the warmup. */
-	accelerates: number;
-	expands: number;
-	/** Samples synthesized to cover a gap after the warmup, and the splices that ended them. */
-	concealed: number;
-	merges: number;
-	/** Everything the engine emitted after the warmup, so silence can be looked for in it. */
-	played: Float32Array;
-}
-
-/**
- * How many samples each frame carries, taken from the distance to the next frame on the media
- * timeline. A recorded AAC trace is 23.22ms per frame, not the 20ms a synthetic Opus trace uses, and
- * inserting the wrong count leaves the ring gap-filling silence between every pair of frames.
- */
-function frameSamples(t: Arrival[]): number[] {
-	const sorted = [...t].sort((a, b) => a.media - b.media);
-	const spacing = new Map<number, number>();
-
-	for (let i = 0; i < sorted.length - 1; i++) {
-		const gap = sorted[i + 1].media - sorted[i].media;
-		// A gap far past one frame is missing media, not a long frame: keep the frame its own size
-		// and let the ring fill the hole.
-		spacing.set(sorted[i].media, gap > 0 && gap < 100 ? gap : 0);
-	}
-
-	const nominal = Math.max(...spacing.values().filter((v) => v > 0));
-	return t.map(({ media }) => Math.round((RATE * (spacing.get(media) || nominal)) / 1000));
-}
-
-/**
- * Play `t` through `ring` in real time: insert every frame the moment it arrives, and pull one
- * render quantum every quantum's worth of wall time through the real playout engine, which is what
- * the AudioWorklet does.
- */
-function replay(
-	build: (latencyMs: number) => Ring,
-	t: Arrival[],
-	warmupMs: number,
-	fixed?: number,
-	conceal = true,
-): Result {
-	const step = (QUANTUM / RATE) * 1000;
-	const output = [new Float32Array(QUANTUM)];
-	const end = t[t.length - 1].arrival;
-	const samples = frameSamples(t);
-
-	// The estimator runs live, exactly as `Container.Consumer` drives it: observe at arrival, and
-	// let `Sync` and `Decoder.#runLatency` push the new target into the ring. A settled number
-	// measured up front would hide the thing the design turns on, which is that the target rises the
-	// moment an arrival proves the buffer too shallow.
-	const jitter = new Container.Jitter();
-	const latency = () => fixed ?? Math.max(FLOOR, jitter.value.peek());
-
-	const ring = build(latency());
-	const engine = new Stretcher(RATE, 1, conceal);
-
-	let next = 0;
-	let outputFrame = 0;
-	let started = false;
-	let quanta = 0;
-	let short = 0;
-	let mark: { quanta: number; short: number; debug: Snapshot } | undefined;
-
-	// Everything rendered after the warmup, so a gap can be looked for as silence rather than only
-	// counted as a short quantum.
-	const played = new Float32Array(Math.ceil(((end + step) * RATE) / 1000));
-	let length = 0;
-
-	for (let now = 0; now < end; now += step) {
-		while (next < t.length && t[next].arrival <= now) {
-			const count = samples[next];
-			jitter.observe(Time.Micro.fromMilli(t[next].media as Time.Milli), now as Time.Milli);
-			ring.setLatency(latency());
-			// A 200Hz tone rather than a constant: a splice on a constant is seamless whatever the
-			// correlation search decides, which would hide a kernel that picked the wrong lag.
-			ring.insert(Time.Micro.fromMilli(t[next].media as Time.Milli), [voice(count)]);
-			next++;
-		}
-
-		const count = engine.render(ring.reader, output, outputFrame);
-		outputFrame += QUANTUM;
-		quanta++;
-		if (started && count < QUANTUM) short++;
-		if (count > 0) started = true;
-		if (mark && length + count <= played.length) {
-			played.set(output[0].subarray(0, count), length);
-			length += count;
-		}
-
-		if (now >= warmupMs && !mark) mark = { quanta, short, debug: ring.debug() };
-	}
-
-	const debug = ring.debug();
-	const from = mark ?? { quanta, short, debug };
-	return {
-		underruns: debug.underruns - from.debug.underruns,
-		skipped: debug.skipped - from.debug.skipped + (debug.discarded - from.debug.discarded),
-		quanta: quanta - from.quanta,
-		short: short - from.short,
-		accelerates: debug.accelerates - from.debug.accelerates,
-		expands: debug.expands - from.debug.expands,
-		concealed: debug.concealed - from.debug.concealed,
-		merges: debug.merges - from.debug.merges,
-		played: played.subarray(0, length),
-	};
-}
-
-/**
- * A 200Hz tone the correlation search can find a period in, pausing over a quiet room so the
- * background estimate has something to learn from. A pure sine trains nothing, and concealment
- * built on one fades into digital silence rather than into the room.
- */
-const TONE = speech(RATE, 2, 200, 0.5, 0.002)[0];
-
-let voiceAt = 0;
-function voice(count: number): Float32Array {
-	const start = voiceAt % (TONE.length - count);
-	voiceAt += count;
-	return TONE.slice(start, start + count);
-}
+/** One replay at this suite's rate and floor, keeping what it rendered so silence can be found in it. */
+const replay = (build: Build, t: Arrival[], warmupMs: number, fixed?: number, conceal = true): Result =>
+	play(build, t, { rate: RATE, floorMs: FLOOR, warmupMs, fixed, conceal, capture: true });
 
 /** Drop everything but what a listener would notice, so a clean run compares as a whole object. */
 function clean({ underruns, skipped }: Result): { underruns: number; skipped: number } {
 	return { underruns, skipped };
 }
 
-const RINGS: Array<[string, (latencyMs: number) => Ring]> = [
-	["shared", shared],
-	["post", post],
-];
+const RINGS = rings(RATE);
 
 describe.each(RINGS)("%s ring replay", (_name, build) => {
 	// The target starts at the cold-start guess and falls once a second, and a fall costs the ring
@@ -432,14 +206,14 @@ function holed(t: Arrival[], holes: number[]): Arrival[] {
 	);
 }
 
-describe.each(RINGS)("%s ring, the rare tail", (_ring, build) => {
+describe.each(RINGS)("%s ring, the rare tail", (ring, build) => {
 	it("conceals a 165, 220 and 111ms outage rather than playing them as silence", () => {
 		const t = holed(recorded(lanBbb as Fixture), RARE);
 		const measured = replay(build, t, 4000);
 		const ramped = replay(build, t, 4000, undefined, false);
 
 		console.log(
-			`${_ring}/rare-tail: ${measured.concealed} concealed samples over ${measured.merges} merges and ${measured.underruns} underruns, against ${ramped.short} silent quanta with concealment off`,
+			`${ring}/rare-tail: ${measured.concealed} concealed samples over ${measured.merges} merges and ${measured.underruns} underruns, against ${ramped.short} silent quanta with concealment off`,
 		);
 
 		// Every outage is covered end to end: nothing reaches the device short, and nothing in what

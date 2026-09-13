@@ -8,6 +8,7 @@
 		"compare.ts",
 		"driver.ts",
 		"grade.ts",
+		"replay.ts",
 		"safari.ts",
 		"sink.ts",
 		"webdriver.ts",

@@ -28,12 +28,16 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
 	type Beacon,
+	BUCKET_MS,
 	CADENCE_QUANTA,
+	convergence,
 	type Drift,
 	type Environment,
+	episodes as episodesOf,
 	identityTolerance,
 	MAX_DRIFT_MS_PER_MIN,
 	METRICS,
+	type Point,
 	RENDER_QUANTUM,
 	type Row,
 	round1,
@@ -285,35 +289,19 @@ const skippedGroups = rise(window.map((s) => s.skipped));
 // Where the counter is absent the fallback is a playhead plateau, which can only see a gap that
 // lasted a whole sample interval and is therefore a lower bound. The build under test has the
 // counter; the fallback is what lets an older one still produce a number rather than a zero.
-const episodes: number[] = [];
-let openEpisode: { at: number } | undefined;
 if (!hasCounter) notes.push("underruns: this build publishes no counter; episodes are the coarser playhead plateaus");
-for (let i = 1; i < window.length; i++) {
+const points: Point[] = window.map((cur, i) => {
 	const prev = window[i - 1];
-	const cur = window[i];
-	if (!prev || !cur) continue;
-
-	let underrunning: boolean;
-	if (hasCounter) {
-		const a = prev.underruns;
-		const b = cur.underruns;
-		underrunning = typeof a === "number" && typeof b === "number" && b > a;
-	} else {
-		const a = prev.timestamp;
-		const b = cur.timestamp;
-		underrunning = typeof a === "number" && typeof b === "number" && b - a < PLATEAU_MS;
-	}
-
+	const rising = hasCounter
+		? typeof prev?.underruns === "number" && typeof cur.underruns === "number" && cur.underruns > prev.underruns
+		: typeof prev?.timestamp === "number" &&
+			typeof cur.timestamp === "number" &&
+			cur.timestamp - prev.timestamp < PLATEAU_MS;
 	// A stalled ring is deliberately not playing and is graded separately; an episode open when the
 	// stall began is closed at it rather than being credited with the refill.
-	if (underrunning && !cur.stalled && !prev.stalled) {
-		openEpisode ??= { at: prev.at };
-	} else if (openEpisode) {
-		episodes.push(cur.at - openEpisode.at);
-		openEpisode = undefined;
-	}
-}
-if (openEpisode) episodes.push(t1 - openEpisode.at);
+	return { at: cur.at, rising, excluded: cur.stalled === true };
+});
+const episodes = episodesOf(points, t1);
 
 const underrunMs = episodes.reduce((a, b) => a + b, 0);
 const stalledShare = window.length > 0 ? stalledSamples / window.length : null;
@@ -325,23 +313,7 @@ const targetSeries = samples
 	.map((s) => ({ at: s.at, ms: s.delay as number }));
 const targets = window.map((s) => s.delay).filter((x): x is number => typeof x === "number");
 
-/** One estimator bucket. A target within this of its final value is settled, not still moving. */
-const BUCKET_MS = 20;
-let convergeS: number | null = null;
-if (targetSeries.length > 0) {
-	const final = targetSeries.at(-1)?.ms ?? 0;
-	// Walk backwards to the last sample that was still outside the band: everything after it stayed
-	// settled, so that sample is when convergence ended.
-	let last = -1;
-	for (let i = targetSeries.length - 1; i >= 0; i--) {
-		if (Math.abs((targetSeries[i]?.ms ?? 0) - final) > BUCKET_MS) {
-			last = i;
-			break;
-		}
-	}
-	const at = last < 0 ? (targetSeries[0]?.at ?? 0) : (targetSeries[last + 1]?.at ?? t1);
-	convergeS = Math.max(0, (at - (firstAudio?.at ?? 0)) / 1000);
-}
+const convergeS = convergence(targetSeries, firstAudio?.at ?? 0, BUCKET_MS, t1);
 
 // ── silence and load ────────────────────────────────────────────────────────
 
