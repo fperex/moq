@@ -22,6 +22,8 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import fourKWebm from "../../../../js/watch/src/audio/fixtures/4k-webm.json" with { type: "json" };
 import lanBbb from "../../../../js/watch/src/audio/fixtures/lan-bbb.json" with { type: "json" };
+import micLocal from "../../../../js/watch/src/audio/fixtures/mic-local.json" with { type: "json" };
+import micRemote from "../../../../js/watch/src/audio/fixtures/mic-remote.json" with { type: "json" };
 import relayBbb7Frame from "../../../../js/watch/src/audio/fixtures/relay-bbb-7frame.json" with { type: "json" };
 import { type Fixture, post, recorded, replay, shared } from "../../../../js/watch/src/audio/replay.ts";
 import {
@@ -47,7 +49,8 @@ import {
  * The codec and rate are the recording's, not a choice: a trace carries no bitstream, but the frame
  * spacing in it is the codec's frame duration, and running the ring at a rate the recording never
  * had would grade a stream that never existed. `lan-bbb` and `relay-bbb-7frame` are 23.22 ms apart,
- * which is 1024 samples at 44.1 kHz; `4k-webm` is 20 ms, which is Opus.
+ * which is 1024 samples at 44.1 kHz; `4k-webm` and the two microphone recordings are 20 ms, which is
+ * Opus.
  */
 type Recording = {
 	/** The trace, which is the row's `profile`: what the path did, recorded rather than shaped. */
@@ -61,6 +64,8 @@ const RECORDINGS: Recording[] = [
 	{ name: "lan-bbb", fixture: lanBbb as Fixture, codec: "aac", rate: 44100 },
 	{ name: "relay-bbb-7frame", fixture: relayBbb7Frame as Fixture, codec: "aac", rate: 44100 },
 	{ name: "4k-webm", fixture: fourKWebm as Fixture, codec: "opus", rate: 48000 },
+	{ name: "mic-local", fixture: micLocal as Fixture, codec: "opus", rate: 48000 },
+	{ name: "mic-remote", fixture: micRemote as Fixture, codec: "opus", rate: 48000 },
 ];
 
 /**

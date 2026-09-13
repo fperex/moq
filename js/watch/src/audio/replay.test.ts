@@ -7,6 +7,8 @@ import { Signal } from "@moq/signals";
 import { maxAgeHeadroom } from "./config";
 import fourKWebm from "./fixtures/4k-webm.json" with { type: "json" };
 import lanBbb from "./fixtures/lan-bbb.json" with { type: "json" };
+import micLocal from "./fixtures/mic-local.json" with { type: "json" };
+import micRemote from "./fixtures/mic-remote.json" with { type: "json" };
 import relayBbb7Frame from "./fixtures/relay-bbb-7frame.json" with { type: "json" };
 import { zeroRun } from "./playout/fixture";
 import {
@@ -134,11 +136,17 @@ interface Budget {
 }
 
 const FIXTURES: Array<[string, Fixture, Budget]> = [
-	["lan-bbb", lanBbb as Fixture, { underruns: 0, skipped: 0, deeper: false }],
+	// One sample over twelve seconds: the AAC frame is 23.22ms, so a rounded frame boundary
+	// eventually lands a sample behind the playhead. Twenty microseconds of audio.
+	["lan-bbb", lanBbb as Fixture, { underruns: 0, skipped: 1, deeper: false }],
 	["relay-bbb-7frame", relayBbb7Frame as Fixture, { underruns: 0, skipped: 0, deeper: true }],
 	// Holes in the recording: the ring runs dry at each one and the playhead steps over the media
 	// that never arrived, which is 400ms of the 92 second capture.
 	["4k-webm", fourKWebm as Fixture, { underruns: 3, skipped: 20 * CHUNK, deeper: true }],
+	// The two real-microphone recordings, which are the shape a conference call has: 20ms Opus, one
+	// frame per group, and an arrival spread so narrow the estimator sits on its lowest value.
+	["mic-local", micLocal as Fixture, { underruns: 0, skipped: 0, deeper: false }],
+	["mic-remote", micRemote as Fixture, { underruns: 0, skipped: 0, deeper: false }],
 ];
 
 describe.each(RINGS)("%s ring, recorded traces", (ring, build) => {
@@ -177,6 +185,65 @@ describe.each(RINGS)("%s ring, recorded traces", (ring, build) => {
 				// was never given time to hold.
 				expect(measured.underruns).toBeLessThan(rtt.underruns);
 				expect(measured.skipped).toBeLessThan(rtt.skipped);
+			}
+		});
+	}
+});
+
+/**
+ * The two microphone recordings replayed at the target the estimator settles on for them, which is
+ * its lowest value: 20ms, one Opus frame.
+ *
+ * This is the moment the ring's own rule decides everything. The target counts the frame being
+ * played, the way NetEq's does, so what the ring has to hold is the target plus one chunk; holding
+ * the target alone leaves nothing unplayed and the first arrival a millisecond late finds an empty
+ * ring, re-stalls, refills to the same empty level, and stutters there for as long as the call
+ * lasts. That is what a listener reported hearing at "jitter buffer 20ms".
+ *
+ * The `fixed` target is what makes the lens: the estimator's own warmup starts at 80ms and leaves
+ * the ring a cushion it never spends inside a twelve second window, which hides the steady state a
+ * real call reaches within a minute.
+ */
+const MIC: Array<[string, Fixture, { underruns: number; short: number; trough: number }]> = [
+	// One arrival 31ms late, which is past the 95th percentile the estimator reports and past what a
+	// 40ms level covers. Concealment carries it: zero quanta reach the device short.
+	["mic-local", micLocal as Fixture, { underruns: 1, short: 0, trough: 2 }],
+	["mic-remote", micRemote as Fixture, { underruns: 0, short: 0, trough: 19 }],
+];
+
+describe.each(RINGS)("%s ring, a microphone at the settled target", (ring, build) => {
+	for (const [name, fixture, budget] of MIC) {
+		it(`holds a chunk above the target on ${name}`, () => {
+			const t = recorded(fixture);
+			const level = (result: Result) =>
+				result.samples
+					.filter((sample) => sample.at >= 1000 && !sample.debug.stalled)
+					.map((sample) => ((sample.debug.buffered + sample.debug.queued) / RATE) * 1000);
+
+			for (const conceal of [true, false]) {
+				const measured = play(build, t, {
+					rate: RATE,
+					floorMs: FLOOR,
+					warmupMs: 1000,
+					fixed: CHUNK_MS,
+					conceal,
+					sampleMs: 2,
+				});
+				const held = level(measured);
+
+				console.log(
+					`${ring}/${name}/conceal=${conceal}: ${measured.underruns} underruns, ${measured.short} short quanta, ${measured.skipped} skipped samples, level ${Math.min(...held).toFixed(1)} to ${Math.max(...held).toFixed(1)}ms`,
+				);
+
+				expect(measured.underruns).toBeLessThanOrEqual(budget.underruns);
+				expect(measured.short).toBeLessThanOrEqual(conceal ? 0 : 7);
+				expect(measured.skipped).toBe(0);
+				// The trough, which is the whole point: the ring is one chunk deeper than the target
+				// it was told to hold, so the ordinary cadence never takes it to empty.
+				expect(Math.min(...held)).toBeGreaterThanOrEqual(budget.trough);
+				// And it settles inside the band rather than above it: the target, the chunk, and the
+				// 20ms the decision loop tolerates on top before it accelerates.
+				expect(Math.max(...held)).toBeLessThanOrEqual(CHUNK_MS + CHUNK_MS + 20 + CHUNK_MS);
 			}
 		});
 	}
