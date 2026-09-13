@@ -14,7 +14,7 @@ import {
 	Signal,
 } from "@moq/signals";
 import { base64ToBytes } from "../base64";
-import { nextMedia, subscribeMedia } from "../media";
+import { accumulate, nextMedia, subscribeMedia } from "../media";
 
 import type { Sync } from "../sync";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
@@ -58,6 +58,10 @@ type DecoderOutput = {
 	// How many times the ring ran dry mid-playback, so the UI can show that the target is too low.
 	underruns: Signal<number>;
 
+	// Groups that lost content above the decoder: the age budget skipped them, or the transport
+	// gave up on delivering them in time.
+	skipped: Signal<number>;
+
 	// Combined buffered ranges (network jitter + decode buffer)
 	buffered: Signal<Container.BufferedRanges>;
 
@@ -90,6 +94,7 @@ export class Decoder {
 		timestamp: new Signal<Time.Milli | undefined>(undefined),
 		stalled: new Signal<boolean>(true),
 		underruns: new Signal<number>(0),
+		skipped: new Signal<number>(0),
 		buffered: new Signal<Container.BufferedRanges>([]),
 		spread: new Signal<Time.Milli | undefined>(undefined),
 	};
@@ -356,6 +361,8 @@ export class Decoder {
 		effect.run((inner) => this.#out.spread.set(inner.get(consumer.spread)));
 		effect.cleanup(() => this.#out.spread.set(undefined));
 
+		accumulate(effect, this.#out.skipped, consumer.skipped);
+
 		effect.spawn(async () => {
 			const loaded = await Util.Libav.polyfill();
 			if (!loaded) return; // cancelled
@@ -467,6 +474,8 @@ export class Decoder {
 		// stops holding the buffer open.
 		effect.run((inner) => this.#out.spread.set(inner.get(consumer.spread)));
 		effect.cleanup(() => this.#out.spread.set(undefined));
+
+		accumulate(effect, this.#out.skipped, consumer.skipped);
 
 		effect.spawn(async () => {
 			const loaded = await Util.Libav.polyfill();
