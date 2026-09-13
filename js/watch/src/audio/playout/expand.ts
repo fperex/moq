@@ -1,4 +1,4 @@
-import { type Noise, Rng } from "./noise";
+import { Rng } from "./noise";
 import { DECIMATED, fade, frames, MAX_LAG, OVERLAP, peak } from "./stretch";
 
 /**
@@ -10,18 +10,19 @@ import { DECIMATED, fade, frames, MAX_LAG, OVERLAP, peak } from "./stretch";
  * filter for the unvoiced part, and a mix between them set by how periodic the signal actually was.
  * A held vowel is nearly all period; a fricative is nearly all noise.
  *
- * Every block after the first is quieter than the last, so a stream that never comes back fades into
- * the room instead of buzzing forever, and after {@link MAX_CONSECUTIVE_EXPANDS} blocks there is
- * nothing left but comfort noise.
+ * Every block after the first is quieter than the last, and once the muting slope has taken the gain
+ * to zero the output is digital silence, so an outage that never ends is not a sound. That is what
+ * the pinned Chromium tree does: `Expand::Process` scales each block by `mute_factor`, drops the
+ * factor by the muting slope every block, and pins it to zero outright past the third consecutive
+ * expansion once the slope would no longer lower it; `BackgroundNoise::GenerateBackgroundNoise`
+ * ignores both the slope and `TooManyExpands()` it is handed and never raises its own mute factor,
+ * which `ChannelParameters::Reset` leaves at 0, so the noise term contributes nothing at any point.
+ * Comfort noise belongs to a codec that says it is sending comfort noise; if hang ever carries a
+ * DTX/CNG signal, that is where it goes, not here.
  *
- * Two simplifications against the original, both audible only on a long outage, which the muting
- * slope covers anyway:
- *
- * - NetEq keeps three candidate lags and alternates between them so a long concealment does not
- *   sound metronomic. We keep one.
- * - The pinned tree leaves its background noise muted for the whole expand period, which makes the
- *   tail fade to digital silence. We fade the noise in as the voiced part fades out, which is what
- *   the muting slope was for and what the older `GenerateBackgroundNoise` unmuting did.
+ * One simplification against the original, audible only on a long outage, which the muting slope
+ * covers anyway: NetEq keeps three candidate lags and alternates between them so a long concealment
+ * does not sound metronomic. We keep one.
  */
 
 /** Order of the filter that shapes the unvoiced part, NetEq's `kUnvoicedLpcOrder`. */
@@ -56,7 +57,7 @@ const MUTE_FLOOR_MIX = 0.8;
  */
 const NETEQ_BLOCK = 10;
 
-/** Concealment blocks produced back to back before the output is comfort noise and nothing else. */
+/** Concealment blocks produced back to back before the output is silence and nothing else. */
 export const MAX_CONSECUTIVE_EXPANDS = 200;
 
 /** One channel's concealment: a period to repeat, a filter to drive, and the gains between them. */
@@ -272,7 +273,6 @@ export class Expand {
 
 	readonly #rng = new Rng();
 	readonly #excitation: Float32Array;
-	readonly #background: Float32Array[] = [];
 	readonly #scratch: Float32Array;
 
 	/** Concealment for planar `channels` channel PCM at `rate`, producing `block` millisecond blocks. */
@@ -289,7 +289,6 @@ export class Expand {
 
 		for (let i = 0; i < this.channels; i++) {
 			this.#channels.push(new Channel(this.#maxLag));
-			this.#background.push(new Float32Array(this.block));
 		}
 	}
 
@@ -308,7 +307,7 @@ export class Expand {
 		return this.#ready;
 	}
 
-	/** Whether the ceiling is reached and the output is comfort noise from here. */
+	/** Whether the ceiling is reached and the output is silence from here. */
 	get exhausted(): boolean {
 		return this.#concealed >= this.#ceiling;
 	}
@@ -317,7 +316,7 @@ export class Expand {
 	 * Study the tail of the real signal. Call once, when a concealment run starts.
 	 *
 	 * `history` holds `length` frames per channel, of which at least {@link history} must be real
-	 * audio; anything less and the run plays comfort noise instead.
+	 * audio; anything less and the run plays silence instead.
 	 */
 	analyse(history: Float32Array[], length: number): void {
 		const reference = history[0];
@@ -337,22 +336,22 @@ export class Expand {
 	}
 
 	/** Write one block of concealment into `out` at `offset`. */
-	process(noise: Noise, out: Float32Array[], offset: number): void {
+	process(out: Float32Array[], offset: number): void {
 		if (!this.#ready || this.exhausted) {
-			// Nothing to repeat, or nothing left worth repeating: room tone only.
-			noise.generate(out, offset, this.block, 1, this.#rng);
+			// Nothing to repeat, or nothing left worth repeating. Silence, not room tone: an outage
+			// this long is not a quiet room, and a listener who can hear the noise cannot tell
+			// whether the talker went quiet or the stream died.
+			for (const plane of out) plane.fill(0, offset, offset + this.block);
 			this.#grow();
 			return;
 		}
 
 		// One excitation for every channel, so a correlated image stays correlated.
 		for (let i = 0; i < this.block; i++) this.#excitation[i] = this.#rng.sample();
-		noise.generate(this.#background, 0, this.block, 1, this.#rng);
 
 		for (let index = 0; index < this.channels; index++) {
 			const state = this.#channels[index];
 			const plane = out[Math.min(index, out.length - 1)];
-			const room = this.#background[index];
 			state.escalate(this.#concealed, this.rate);
 
 			let position = this.#position;
@@ -361,7 +360,9 @@ export class Expand {
 				const unvoiced = state.unvoiced(this.#excitation[frame]);
 				const mixed = voiced * state.currentMix + unvoiced * (1 - state.currentMix);
 
-				plane[offset + frame] = mixed * state.mute + room[frame] * (1 - state.mute);
+				// The muting slope is the whole ramp: it reaches zero within ~100ms of the
+				// escalations, and there is nothing underneath it to fade into.
+				plane[offset + frame] = mixed * state.mute;
 
 				position = position + 1 < state.length ? position + 1 : 0;
 				state.advance();

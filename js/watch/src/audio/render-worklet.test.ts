@@ -283,9 +283,11 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 		expect(report.monotone).toBe(true);
 		expect(report.concealed).toBeGreaterThan(ms(100));
 		expect(report.merges).toBeGreaterThan(0);
-		// Nothing reached the device short, and nothing came out as digital silence.
+		// Nothing reached the device short. The concealment fades out under the muting slope, so
+		// the tail of a hole this long is digital silence rather than room tone, and the silence is
+		// shorter than the hole it covers.
 		expect(report.shortQuanta).toBe(0);
-		expect(zeroRun(report.played)).toBeLessThanOrEqual(2);
+		expect(zeroRun(report.played)).toBeLessThan(ms(150));
 		// The concealment is spliced on a pitch period at both ends, like every other operation.
 		expect(maxStep(report.played)).toBeLessThan(1.5 * SLOPE);
 	});

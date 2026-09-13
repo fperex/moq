@@ -1,10 +1,11 @@
 /**
  * What the stream sounds like when nobody is talking.
  *
- * Mirrors `background_noise.cc` and the Rust twin in `rs/moq-audio/src/playout/noise.rs`. Two
- * consumers: the time stretch asks for {@link Noise.energy} to decide whether a block is speech or
- * room tone, and concealment asks for {@link Noise.generate} so a long outage fades into the room
- * rather than into silence.
+ * Mirrors the estimator half of `background_noise.cc` and the Rust twin in
+ * `rs/moq-audio/src/playout/noise.rs`. One consumer: the time stretch asks for
+ * {@link Noise.energy} to decide whether a block is speech or room tone. The synthesis half is not
+ * here, because nothing plays comfort noise: an outage fades to silence. If hang ever carries a
+ * DTX/CNG signal, a generator driven by this estimate belongs with it.
  *
  * The estimate only moves on a window that is quieter than everything accepted so far and whose
  * spectrum is flat enough to be noise, which is what keeps a held vowel or a sustained tone out of
@@ -60,7 +61,7 @@ const MAX_RATIO = 1 / 1_048_576;
 const FLATNESS = 16 / (5 * RESIDUAL);
 
 /**
- * The deterministic noise source behind the unvoiced and comfort noise parts.
+ * The deterministic noise source behind concealment's unvoiced part.
  *
  * NetEq draws from a fixed table plus a linear congruential step so its output is reproducible
  * across builds (`random_vector.cc`). A xorshift gives us the same property without the table; the
@@ -84,15 +85,11 @@ export class Rng {
 	}
 }
 
-/** One channel's estimate: a level, a one pole spectrum, and the search state that replaces them. */
+/** One channel's estimate: a level, and the search state that replaces it. */
 class Channel {
 	energy = 2500 / (32768 * 32768);
 	maxEnergy = 0;
 	threshold = THRESHOLD;
-	reflection = 0;
-	gain = 0;
-	// The one pole filter's memory, so consecutive calls to `generate` are one continuous signal.
-	state = 0;
 
 	/** Fold in one window, returning whether it replaced the estimate. */
 	update(window: Float32Array): boolean {
@@ -131,8 +128,6 @@ class Channel {
 		if (residual < energy * FLATNESS) return false;
 
 		this.energy = Math.max(energy, MIN_ENERGY);
-		this.reflection = reflection;
-		this.gain = Math.sqrt(residual);
 		return true;
 	}
 }
@@ -142,7 +137,6 @@ export class Noise {
 	#channels: Channel[];
 	#initialised = false;
 	#window: Float32Array;
-	#excitation = new Float32Array(0);
 
 	/** An estimate that reports the fixed floor until it sees a quiet window. */
 	constructor(channels: number) {
@@ -172,35 +166,6 @@ export class Noise {
 	energy(channel: number): number {
 		if (!this.#initialised) return UNINITIALISED;
 		return this.#channels[Math.min(channel, this.#channels.length - 1)].energy;
-	}
-
-	/**
-	 * Write `count` frames of background noise into `out` at `offset`, scaled by `gain`.
-	 *
-	 * `out` carries one plane per channel. Silence until the estimate initialises, matching NetEq:
-	 * inventing a room tone we have never heard would be worse than the gap.
-	 */
-	generate(out: Float32Array[], offset: number, count: number, gain: number, rng: Rng): void {
-		if (!this.#initialised) {
-			for (const plane of out) plane.fill(0, offset, offset + count);
-			return;
-		}
-
-		// One excitation for every channel, as `expand.cc` does, so noise added to a correlated
-		// stereo image does not decorrelate it.
-		if (this.#excitation.length < count) this.#excitation = new Float32Array(count);
-		const excitation = this.#excitation;
-		for (let i = 0; i < count; i++) excitation[i] = rng.sample();
-
-		for (let index = 0; index < this.#channels.length; index++) {
-			const channel = this.#channels[index];
-			const plane = out[Math.min(index, out.length - 1)];
-			for (let i = 0; i < count; i++) {
-				const next = channel.gain * excitation[i] + channel.reflection * channel.state;
-				channel.state = Math.max(-1, Math.min(1, next));
-				plane[offset + i] = channel.state * gain;
-			}
-		}
 	}
 
 	/** Forget everything, for a stream that restarted somewhere else. */
