@@ -30,13 +30,14 @@
 //! | [`noise`] background estimate and comfort noise | `background_noise.cc` | here |
 //! | [`level`] smoothed buffer level | `buffer_level_filter.cc` | here |
 //! | [`sync`] committed-but-unplayed PCM | `sync_buffer.cc` | here |
-//! | target delay estimator | `delay_manager.cc`, `underrun_optimizer.cc` | next: `doc/concept/playout.md` |
+//! | [`delay`] target estimator and constraints | `delay_manager.cc`, `underrun_optimizer.cc`, `delay_constraints.cc` | here, to `doc/concept/playout.md` |
 //! | frame buffer and flushing | `packet_buffer.cc` | next |
 //! | per-block decision loop | `decision_logic.cc` | next |
 //! | engine and its wiring into `decode` / `playback` | `neteq_impl.cc` | next |
 
 use std::time::Duration;
 
+pub(crate) mod delay;
 pub(crate) mod expand;
 pub(crate) mod level;
 pub(crate) mod merge;
@@ -44,6 +45,8 @@ pub(crate) mod noise;
 pub(crate) mod stretch;
 pub(crate) mod sync;
 
+#[cfg(test)]
+mod corpus;
 #[cfg(test)]
 mod fixture;
 

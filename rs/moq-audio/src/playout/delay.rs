@@ -1,0 +1,522 @@
+//! How much buffer playout needs, measured from when frames arrive.
+//!
+//! The algorithm is written down in `doc/concept/playout.md` and held to it by the
+//! conformance corpus at `rs/moq-audio/tests/playout-01.json`, which the browser
+//! estimator in `js/hang/src/container/jitter.ts` generates. Both languages are held
+//! to the page rather than to each other.
+//!
+//! The design is WebRTC's NetEq (`modules/audio_coding/neteq/`:
+//! `underrun_optimizer.cc`, `packet_arrival_history.cc`, `histogram.cc`,
+//! `delay_manager.cc`, `delay_constraints.cc`), reimplemented in `f64` from the
+//! described algorithm rather than ported: the fixed point exists for 2010-era DSPs
+//! and is where a cross-language parity bug would live.
+//!
+//! Each frame is measured against the fastest recent arrival rather than against the
+//! previous one, so a path that slowly gets worse reads as a delay climbing to its
+//! real size instead of as a string of tiny inter-arrival deltas. Those delays feed a
+//! histogram read at a high quantile, because network delay is one-sided and
+//! heavy-tailed.
+
+use std::collections::VecDeque;
+use std::time::Duration;
+
+/// Buckets in the histogram.
+const BUCKETS: usize = 100;
+
+/// The fraction of arrivals the target covers.
+const QUANTILE: f64 = 0.95;
+
+/// Steady-state forget factor, applied once per resampled observation rather than
+/// per arrival. `500ms / (1 - 0.983)` is about 29s of wall-clock memory.
+const FORGET: f64 = 0.983;
+
+/// Cold-start ramp: the first observations replace the seeded prior instead of
+/// nudging it.
+const START_FORGET_WEIGHT: f64 = 2.0;
+
+/// One observation per interval, the maximum delay seen in it.
+const RESAMPLE: f64 = 500.0;
+
+/// How much media the arrival reference covers. Measured on the media axis, not the
+/// wall clock, so a stalled sender cannot age out the only arrivals the reference
+/// has.
+const WINDOW: f64 = 2000.0;
+
+/// The target before any observation lands, NetEq's `kStartDelayMs`.
+const START: f64 = 80.0;
+
+/// How many empty intervals one arrival may decay. 60 intervals is 30s, past the
+/// histogram's own memory, so a longer pause converges to the same near-reset for a
+/// bounded amount of work.
+const MAX_CATCHUP: usize = 60;
+
+/// How long the target holds before it may step down by another bucket.
+const LOWER_INTERVAL: f64 = 1000.0;
+
+/// Width of one histogram bucket in milliseconds, and the resolution of the target.
+///
+/// The target is always a whole number of buckets, so a consumer asking whether the
+/// estimate really moved compares the change against this.
+pub(crate) const BUCKET: f64 = 20.0;
+
+/// The widest delay the histogram can hold, so the widest target it can produce.
+///
+/// An observation above this is dropped rather than clamped, which makes it a real
+/// ceiling on the estimate rather than a saturation point.
+pub(crate) const CEILING: Duration = Duration::from_millis((BUCKETS * BUCKET as usize) as u64);
+
+/// One admitted arrival, on both axes in milliseconds.
+#[derive(Clone, Copy)]
+struct Arrival {
+	timestamp: f64,
+	arrival: f64,
+}
+
+/// The playout target for one track, in milliseconds of buffer.
+pub(crate) struct Jitter {
+	/// Admitted arrivals within [`WINDOW`] of media, ascending by
+	/// `arrival - timestamp`, so the front is the fastest recent arrival.
+	min: VecDeque<Arrival>,
+
+	/// The newest timestamp admitted so far. Anything not strictly newer is
+	/// reordered.
+	newest: Option<f64>,
+
+	/// Weighted probability per delay bucket, summing to 1.
+	buckets: [f64; BUCKETS],
+
+	/// Observations folded in so far, and the factor the next one decays by.
+	adds: u64,
+	forget: f64,
+
+	/// The resample interval currently open, and the largest delay seen inside it.
+	interval_start: Option<f64>,
+	interval_max: f64,
+
+	/// The quantile's upper edge, i.e. what the histogram currently asks for.
+	optimal: Option<f64>,
+
+	/// The published target, and when it last moved.
+	target: f64,
+	lowered: Option<f64>,
+}
+
+impl Jitter {
+	/// An estimator seeded with a decaying prior, so a cold start has something to
+	/// take a quantile of.
+	pub(crate) fn new() -> Self {
+		let mut buckets = [0.0; BUCKETS];
+		for (i, bucket) in buckets.iter_mut().enumerate() {
+			*bucket = 0.5f64.powi(i as i32 + 1);
+		}
+
+		Self {
+			min: VecDeque::new(),
+			newest: None,
+			buckets,
+			adds: 0,
+			forget: 0.0,
+			interval_start: None,
+			interval_max: 0.0,
+			optimal: None,
+			target: START,
+			lowered: None,
+		}
+	}
+
+	/// Fold one frame into the estimate, given its media timestamp and the wall time
+	/// it arrived, in milliseconds on a monotonic local clock.
+	///
+	/// Pass `reordered` when the caller already knows the frame came out of order; a
+	/// frame whose timestamp is not strictly newer than the newest admitted one is
+	/// treated the same way. Either way it is excluded from both the reference and
+	/// the histogram: its arrival is early relative to its timestamp, so counting it
+	/// would add the media-time distance between the two into a delay measurement.
+	pub(crate) fn observe(&mut self, timestamp: Duration, now: f64, reordered: bool) {
+		// Milliseconds on both axes from here down, so the unit is visible in the
+		// arithmetic. The two clocks are never compared: every formula below is a
+		// difference of differences, so a constant offset between them cancels.
+		let ts = timestamp.as_secs_f64() * 1000.0;
+
+		if reordered || self.newest.is_some_and(|newest| ts <= newest) {
+			// Costing a reordered arrival as delay against loss is a separate step,
+			// not yet written.
+			self.publish(now);
+			return;
+		}
+		self.newest = Some(ts);
+
+		// Drop arrivals the timeline has moved past. The window is media, so this
+		// prunes by how much content has been delivered rather than by how long the
+		// receiver has been running.
+		while self.min.front().is_some_and(|front| front.timestamp + WINDOW < ts) {
+			self.min.pop_front();
+		}
+
+		// Maintain the monotone deque: anything at least as slow as this arrival can
+		// never be the minimum again.
+		while let Some(back) = self.min.back() {
+			if now - ts > back.arrival - back.timestamp {
+				break;
+			}
+			self.min.pop_back();
+		}
+		self.min.push_back(Arrival {
+			timestamp: ts,
+			arrival: now,
+		});
+
+		let reference = self.min.front().copied().expect("an arrival was just pushed");
+		let delay = (now - reference.arrival - (ts - reference.timestamp)).max(0.0);
+
+		self.resample(now, delay);
+		self.publish(now);
+	}
+
+	/// Forget the arrival reference, keeping the measured distribution.
+	///
+	/// A discontinuity moves the media timeline underneath the measurement, so every
+	/// arrival in the reference describes a timeline that no longer exists and the
+	/// open interval spans the jump. The histogram holds delays, which the jump does
+	/// not move, so it survives.
+	pub(crate) fn reanchor(&mut self) {
+		self.min.clear();
+		self.newest = None;
+		self.interval_start = None;
+		self.interval_max = 0.0;
+	}
+
+	/// The current target: enough buffer to play [`QUANTILE`] of arrivals on time.
+	pub(crate) fn target(&self) -> Duration {
+		Duration::from_secs_f64(self.target / 1000.0)
+	}
+
+	// Take at most one observation per RESAMPLE, the largest delay in the interval.
+	// That decorrelates the observations and turns the forget factor into a
+	// wall-clock time constant, so a 50 fps track and a 1 fps track converge at the
+	// same speed.
+	fn resample(&mut self, arrival: f64, delay: f64) {
+		let start = *self.interval_start.get_or_insert(arrival);
+
+		let elapsed = arrival - start;
+		if elapsed > RESAMPLE {
+			self.add(self.interval_max);
+
+			// Intervals that passed with no arrival still decay. A normalised
+			// histogram cannot forget without an observation, so a pause would
+			// otherwise preserve whatever the path looked like before it; a timer
+			// instead of this would be untestable and unportable.
+			let empty = ((elapsed / RESAMPLE).floor() as i64 - 1).clamp(0, MAX_CATCHUP as i64);
+			for _ in 0..empty {
+				self.add(0.0);
+			}
+
+			self.interval_start = Some(arrival);
+			self.interval_max = 0.0;
+		}
+
+		// The arrival that closed an interval belongs to the new one, not to the one
+		// it closed.
+		self.interval_max = self.interval_max.max(delay);
+	}
+
+	// Fold one resampled observation into the histogram and read the quantile back
+	// out.
+	fn add(&mut self, ms: f64) {
+		let index = (ms / BUCKET).floor();
+
+		// Past the histogram's range the observation is dropped rather than clamped
+		// into the last bucket, so one absurd arrival cannot pin the target at the
+		// ceiling for a whole minute.
+		if index < BUCKETS as f64 {
+			let index = index as usize;
+			let forget = self.forget;
+			for bucket in &mut self.buckets {
+				*bucket *= forget;
+			}
+			self.buckets[index] += 1.0 - forget;
+
+			self.adds += 1;
+			// `2.0 / ((adds + 1) as f64)`: integer division here makes the start ramp
+			// jump straight to a forget factor of 1.
+			self.forget = (1.0 - START_FORGET_WEIGHT / ((self.adds + 1) as f64)).clamp(0.0, FORGET);
+		}
+
+		// The bucket's upper edge, because the delay it holds is somewhere inside it
+		// and covering the whole bucket is what covers the quantile.
+		self.optimal = Some((self.quantile() + 1) as f64 * BUCKET);
+	}
+
+	// The lowest bucket whose tail mass has dropped to 1 - QUANTILE. Bucket 0 is
+	// subtracted before the loop, not inside it, and the comparison is strict.
+	fn quantile(&self) -> usize {
+		let mut sum = 1.0 - self.buckets[0];
+		let mut index = 0;
+		while sum > 1.0 - QUANTILE && index < BUCKETS - 1 {
+			index += 1;
+			sum -= self.buckets[index];
+		}
+		index
+	}
+
+	fn publish(&mut self, now: f64) {
+		let optimal = self.optimal.unwrap_or(START);
+		let current = self.target;
+
+		if optimal >= current {
+			// Rise at once: a late frame has already proven the buffer is too
+			// shallow, and waiting costs an underrun the viewer hears. The
+			// histogram's range bounds how far one observation can take it.
+			self.lowered = Some(now);
+			self.target = optimal.max(current);
+			return;
+		}
+
+		// Fall one bucket per second, in as many steps as the elapsed time allows so
+		// a 1 fps track and a 50 fps one shrink at the same wall-clock rate.
+		// Shrinking faster than this drops the playhead onto a buffer the network
+		// has not refilled yet.
+		let lowered = *self.lowered.get_or_insert(now);
+		let steps = ((now - lowered) / LOWER_INTERVAL).floor();
+		if steps <= 0.0 {
+			return;
+		}
+
+		self.lowered = Some(lowered + steps * LOWER_INTERVAL);
+		self.target = optimal.max(current - steps * BUCKET);
+	}
+}
+
+impl Default for Jitter {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+/// What the caller allows the estimate to become, from `delay_constraints.cc`.
+///
+/// The estimator measures the network and carries no floor of its own. Everything
+/// that is a policy rather than a measurement lives here: how much buffer the caller
+/// insists on, how stale media may be before it is skipped instead of played, and
+/// how much of what the buffer can physically hold playout may claim.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Constraints {
+	/// The caller's floor: the target never lands under this.
+	min: Duration,
+	/// The age budget: media older than this is skipped, so buffering past it
+	/// would hold audio that is going to be thrown away.
+	max: Duration,
+	/// NetEq's `kMaxNumberOfPackets` rule: playout may claim three quarters of what
+	/// the buffer can hold, leaving a quarter for the arrivals that have to land
+	/// while the deepest one is still playing.
+	capacity: Duration,
+}
+
+impl Constraints {
+	/// The share of the buffer playout may claim, NetEq's 75%.
+	const SHARE: u32 = 3;
+
+	/// Constraints for a caller wanting at least `min` of buffer, skipping media
+	/// older than `max`, out of a buffer holding `capacity`.
+	///
+	/// Fails when the floor is above either ceiling: a floor deeper than the age
+	/// budget asks to hold media the same config throws away, and one deeper than
+	/// the buffer asks for audio there is nowhere to put. Both are contradictions a
+	/// caller has to resolve, so neither is clamped silently.
+	pub(crate) fn new(min: Duration, max: Duration, capacity: Duration) -> Result<Self, crate::Error> {
+		let constraints = Self { min, max, capacity };
+		let ceiling = constraints.ceiling();
+
+		if min > ceiling {
+			return Err(crate::Error::Unsupported(format!(
+				"a playout delay of {min:?} does not fit: the age budget is {max:?} and the buffer holds {capacity:?}"
+			)));
+		}
+
+		Ok(constraints)
+	}
+
+	/// The deepest target these constraints allow.
+	fn ceiling(&self) -> Duration {
+		self.max.min(self.capacity * Self::SHARE / 4).min(CEILING)
+	}
+
+	/// The caller's floor.
+	pub(crate) fn min(&self) -> Duration {
+		self.min
+	}
+
+	/// `target` held between the floor and the ceiling.
+	pub(crate) fn apply(&self, target: Duration) -> Duration {
+		target.clamp(self.min, self.ceiling().max(self.min))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Feed `count` frames at `spacing` milliseconds, arriving `delay` late.
+	fn steady(jitter: &mut Jitter, count: usize, spacing: f64, delay: f64, from: f64) -> f64 {
+		let mut now = from;
+		for i in 0..count {
+			let timestamp = Duration::from_secs_f64((from + i as f64 * spacing) / 1000.0);
+			now = from + i as f64 * spacing + delay;
+			jitter.observe(timestamp, now, false);
+		}
+		now
+	}
+
+	#[test]
+	fn starts_at_the_guess() {
+		let jitter = Jitter::new();
+		assert_eq!(jitter.target(), Duration::from_millis(80));
+	}
+
+	#[test]
+	fn a_clean_path_falls_to_one_bucket() {
+		let mut jitter = Jitter::new();
+		steady(&mut jitter, 2000, 20.0, 0.0, 0.0);
+		assert_eq!(jitter.target(), Duration::from_millis(20));
+	}
+
+	#[test]
+	fn a_constant_path_delay_is_not_jitter() {
+		let mut clean = Jitter::new();
+		steady(&mut clean, 600, 20.0, 0.0, 0.0);
+
+		let mut far = Jitter::new();
+		steady(&mut far, 600, 20.0, 2000.0, 0.0);
+
+		assert_eq!(clean.target(), far.target());
+	}
+
+	#[test]
+	fn a_build_up_is_visible() {
+		let mut jitter = Jitter::new();
+		// Two milliseconds worse per frame, which an inter-arrival estimator reads
+		// as a string of 2ms deltas.
+		for i in 0..300 {
+			let timestamp = Duration::from_millis(i * 20);
+			jitter.observe(timestamp, (i * 20 + i * 2) as f64, false);
+		}
+		assert!(jitter.target() >= Duration::from_millis(200), "{:?}", jitter.target());
+	}
+
+	#[test]
+	fn an_absurd_arrival_is_dropped() {
+		let mut jitter = Jitter::new();
+		let now = steady(&mut jitter, 600, 20.0, 0.0, 0.0);
+		let settled = jitter.target();
+
+		// 2500ms past the reference: above the histogram's range, so discarded.
+		jitter.observe(Duration::from_secs_f64(now / 1000.0 + 0.02), now + 20.0 + 2500.0, false);
+		// Close the interval it landed in.
+		steady(&mut jitter, 60, 20.0, 0.0, now + 600.0);
+		assert_eq!(jitter.target(), settled);
+	}
+
+	#[test]
+	fn a_reordered_arrival_moves_nothing() {
+		let mut jitter = Jitter::new();
+		let now = steady(&mut jitter, 600, 20.0, 0.0, 0.0);
+		let settled = jitter.target();
+
+		// An old timestamp landing now would read as a delay the size of the gap
+		// between the two if it were admitted.
+		jitter.observe(Duration::from_millis(0), now + 10.0, false);
+		assert_eq!(jitter.target(), settled);
+	}
+
+	#[test]
+	fn the_target_falls_one_bucket_per_second() {
+		let mut jitter = Jitter::new();
+
+		// A publisher flushing 15 frames at a time, so the oldest frame of each
+		// flush lands 280ms after it was made.
+		for i in 0..150u64 {
+			let arrival = ((i / 15) + 1) * 300;
+			jitter.observe(Duration::from_millis(i * 20), arrival as f64, false);
+		}
+		let raised = jitter.target();
+		assert!(raised >= Duration::from_millis(280), "{raised:?}");
+
+		// Then it stops flushing and the target walks back down, a bucket a second.
+		let mut now = 3000.0;
+		let mut fell = vec![raised];
+		for i in 0..2000u64 {
+			now = 3000.0 + (i * 20) as f64;
+			jitter.observe(Duration::from_millis(3000 + i * 20), now, false);
+			if i % 50 == 49 {
+				fell.push(jitter.target());
+			}
+		}
+		assert!(now > 3000.0);
+
+		assert!(fell.last().unwrap() < &raised, "{fell:?}");
+		for pair in fell.windows(2) {
+			let step = pair[0].saturating_sub(pair[1]);
+			assert!(
+				step <= Duration::from_millis(20),
+				"fell {step:?} in one second: {fell:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn reanchoring_keeps_the_distribution() {
+		let mut jitter = Jitter::new();
+		steady(&mut jitter, 600, 20.0, 0.0, 0.0);
+		let settled = jitter.target();
+
+		jitter.reanchor();
+		assert_eq!(jitter.target(), settled, "the histogram was thrown away");
+
+		// A timeline that starts over somewhere else is measured from there.
+		let now = steady(&mut jitter, 100, 20.0, 0.0, 100_000.0);
+		assert!(now > 0.0);
+		assert_eq!(jitter.target(), settled);
+	}
+
+	#[test]
+	fn constraints_hold_the_target_between_the_floor_and_the_budget() {
+		let constraints = Constraints::new(
+			Duration::from_millis(100),
+			Duration::from_millis(400),
+			Duration::from_secs(2),
+		)
+		.unwrap();
+
+		assert_eq!(constraints.apply(Duration::from_millis(20)), Duration::from_millis(100));
+		assert_eq!(
+			constraints.apply(Duration::from_millis(200)),
+			Duration::from_millis(200)
+		);
+		assert_eq!(constraints.apply(Duration::from_secs(1)), Duration::from_millis(400));
+	}
+
+	#[test]
+	fn constraints_leave_a_quarter_of_the_buffer() {
+		let constraints =
+			Constraints::new(Duration::ZERO, Duration::from_secs(10), Duration::from_millis(400)).unwrap();
+		assert_eq!(constraints.apply(Duration::from_secs(1)), Duration::from_millis(300));
+	}
+
+	#[test]
+	fn a_floor_above_the_budget_is_refused() {
+		let err = Constraints::new(
+			Duration::from_millis(500),
+			Duration::from_millis(200),
+			Duration::from_secs(2),
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("500ms"), "{err}");
+
+		Constraints::new(
+			Duration::from_millis(500),
+			Duration::from_millis(500),
+			Duration::from_secs(2),
+		)
+		.unwrap();
+	}
+}
