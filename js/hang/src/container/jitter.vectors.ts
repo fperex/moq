@@ -19,7 +19,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Time } from "@moq/net";
-import { BUCKET, Jitter } from "./jitter.ts";
+import { Jitter } from "./jitter.ts";
 
 /** The corpus format, so a reader can tell a schema change from a value change. */
 export const ALGORITHM = "moq-playout-01";
@@ -64,7 +64,7 @@ export type Corpus = {
 };
 
 const CONSTANTS: Corpus["constants"] = {
-	bucket_ms: BUCKET,
+	bucket_ms: Jitter.BUCKET,
 	buckets: 100,
 	quantile: 0.95,
 	forget: 0.983,

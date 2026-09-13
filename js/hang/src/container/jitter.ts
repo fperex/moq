@@ -1,25 +1,8 @@
 import { Time } from "@moq/net";
 import { type Getter, Signal } from "@moq/signals";
 
-/**
- * Width of one histogram bucket in milliseconds, and the resolution of the target.
- *
- * The target is always a whole number of buckets, so a consumer that wants to know whether the
- * estimate really moved compares the change against this.
- */
-export const BUCKET = 20;
-
 // Buckets in the histogram.
 const BUCKETS = 100;
-
-/**
- * The widest delay the histogram can hold, so the widest target it can produce.
- *
- * An observation above this is dropped rather than clamped, which makes this a real ceiling on the
- * estimate rather than a saturation point. Whoever sizes a buffer from the estimate can allocate
- * for it once instead of growing as the target climbs.
- */
-export const CEILING = BUCKETS * BUCKET;
 
 // The fraction of arrivals the target covers.
 const QUANTILE = 0.95;
@@ -71,6 +54,23 @@ type Arrival = { timestamp: number; arrival: number };
  * `histogram.cc`, `delay_manager.cc`), reimplemented in f64 rather than copied.
  */
 export class Jitter {
+	/**
+	 * Width of one histogram bucket in milliseconds, and the resolution of the target.
+	 *
+	 * The target is always a whole number of buckets, so a consumer that wants to know whether the
+	 * estimate really moved compares the change against this.
+	 */
+	static readonly BUCKET = 20;
+
+	/**
+	 * The widest delay the histogram can hold, so the widest target it can produce.
+	 *
+	 * An observation above this is dropped rather than clamped, which makes this a real ceiling on
+	 * the estimate rather than a saturation point. Whoever sizes a buffer from the estimate can
+	 * allocate for it once instead of growing as the target climbs.
+	 */
+	static readonly CEILING = BUCKETS * Jitter.BUCKET;
+
 	// Admitted arrivals within WINDOW of media, ascending by `arrival - timestamp`, so the front is
 	// the fastest recent arrival: the best-case path everything else is measured against.
 	#min: Arrival[] = [];
@@ -188,7 +188,7 @@ export class Jitter {
 
 	// Fold one resampled observation into the histogram and read the quantile back out.
 	#add(ms: number): void {
-		const index = Math.floor(ms / BUCKET);
+		const index = Math.floor(ms / Jitter.BUCKET);
 
 		// Past the histogram's range the observation is dropped rather than clamped into the last
 		// bucket, so one absurd arrival cannot pin the target at the ceiling for a whole minute.
@@ -202,7 +202,7 @@ export class Jitter {
 		}
 
 		// The bucket's upper edge, because the delay it holds is somewhere inside it.
-		this.#optimal = (this.#quantile() + 1) * BUCKET;
+		this.#optimal = (this.#quantile() + 1) * Jitter.BUCKET;
 	}
 
 	// The lowest bucket whose tail mass has dropped to 1 - QUANTILE.
@@ -237,7 +237,7 @@ export class Jitter {
 		if (steps <= 0) return;
 
 		this.#lowered += steps * LOWER_INTERVAL;
-		this.#set(Math.max(optimal, current - steps * BUCKET));
+		this.#set(Math.max(optimal, current - steps * Jitter.BUCKET));
 	}
 
 	#set(target: number): void {

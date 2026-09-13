@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Time } from "@moq/net";
-import { BUCKET, Jitter } from "./jitter";
+import { Jitter } from "./jitter";
 import { load, replay } from "./jitter.vectors.ts";
 
 const FRAME = 20;
@@ -68,7 +68,7 @@ describe("steady state", () => {
 		expect(jitter.value.peek()).toBe(START as Time.Milli);
 
 		flush(jitter, { frames: 500 });
-		expect(jitter.value.peek()).toBe(BUCKET as Time.Milli);
+		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
 	});
 
 	it("does not follow the absolute path delay", () => {
@@ -176,7 +176,7 @@ describe("the histogram", () => {
 		// them, more than a minute, before it reaches the first bucket.
 		const jitter = new Jitter();
 		flush(jitter, { frames: 200 });
-		expect(jitter.value.peek()).toBe(BUCKET as Time.Milli);
+		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
 	});
 });
 
@@ -221,7 +221,7 @@ describe("rise and fall", () => {
 	it("rises as soon as an arrival proves the buffer is too shallow", () => {
 		const jitter = new Jitter();
 		flush(jitter, { frames: 500 });
-		expect(jitter.value.peek()).toBe(BUCKET as Time.Milli);
+		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
 
 		// One second of 7-frame bursts, two resample intervals, takes it straight to the span.
 		flush(jitter, { frames: 56, burst: 7, start: 500 * FRAME });
@@ -245,11 +245,11 @@ describe("rise and fall", () => {
 
 			const value = jitter.value.peek();
 			expect(value).toBeLessThanOrEqual(previous);
-			expect(from - value).toBeLessThanOrEqual(Math.floor((media + 50 - anchor) / 1000) * BUCKET);
+			expect(from - value).toBeLessThanOrEqual(Math.floor((media + 50 - anchor) / 1000) * Jitter.BUCKET);
 			previous = value;
 		}
 
-		expect(jitter.value.peek()).toBe(BUCKET as Time.Milli);
+		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
 	});
 });
 
@@ -274,7 +274,7 @@ describe("re-anchoring", () => {
 
 		jitter.reanchor();
 		flush(jitter, { frames: 500 });
-		expect(jitter.value.peek()).toBe(BUCKET as Time.Milli);
+		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
 	});
 });
 

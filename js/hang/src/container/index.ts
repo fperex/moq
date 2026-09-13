@@ -9,7 +9,7 @@ export * as Loc from "@moq/loc";
 export * as Cmaf from "./cmaf";
 export { Consumer, type ConsumerProps } from "./consumer";
 export type { Format } from "./format";
-export * as Jitter from "./jitter";
+export { Jitter } from "./jitter";
 export * as Legacy from "./legacy";
 export { type TrackInfoOptions, trackInfo } from "./track";
 export * from "./types";
