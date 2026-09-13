@@ -489,6 +489,66 @@ export function stats(values: number[]): Stats {
 	return { n: values.length, p50: at(50), p95: at(95), max: at(100), min: at(0) };
 }
 
+/** One sample of "was the ring underrunning here", on whatever grid the lane samples at. */
+export type Point = {
+	/** When the sample was taken, on the viewer clock. */
+	at: Ms;
+	/** Whether the underrun counter rose between the previous sample and this one. */
+	rising: boolean;
+	/** Whether this sample is not gradeable: a stalled ring is silent on purpose. */
+	excluded?: boolean;
+};
+
+/**
+ * Maximal runs of consecutive rising samples, as durations in ms: one audible gap each.
+ *
+ * A run open at the last sample is closed at `endAt`. An excluded sample closes any run it lands in
+ * rather than extending it, because a stall is silence the player chose and is graded on its own.
+ *
+ * Shared by every lane so "one long gap" and "forty scattered ones" are separated the same way
+ * whether the samples came from a page, from a replay, or later from a native run.
+ */
+export function episodes(points: Point[], endAt: Ms): Ms[] {
+	const out: Ms[] = [];
+	let open: Ms | undefined;
+	for (let i = 1; i < points.length; i++) {
+		const prev = points[i - 1];
+		const cur = points[i];
+		if (!prev || !cur) continue;
+		if (cur.rising && !cur.excluded && !prev.excluded) {
+			open ??= prev.at;
+		} else if (open !== undefined) {
+			out.push(cur.at - open);
+			open = undefined;
+		}
+	}
+	if (open !== undefined) out.push(endAt - open);
+	return out;
+}
+
+/**
+ * Seconds from `startAt` until `series` stayed within `band` of its final value for the rest of it.
+ *
+ * Measured backwards from the end, because a target that settles and then moves again has not
+ * converged: the question is when the last move was, not when the first plateau began.
+ */
+export function convergence(series: { at: Ms; ms: Ms }[], startAt: Ms, band: Ms, endAt: Ms): number | null {
+	if (series.length === 0) return null;
+	const final = series.at(-1)?.ms ?? 0;
+	let last = -1;
+	for (let i = series.length - 1; i >= 0; i--) {
+		if (Math.abs((series[i]?.ms ?? 0) - final) > band) {
+			last = i;
+			break;
+		}
+	}
+	const at = last < 0 ? (series[0]?.at ?? 0) : (series[last + 1]?.at ?? endAt);
+	return Math.max(0, (at - startAt) / 1000);
+}
+
+/** One estimator bucket. A target within this of its final value is settled, not still moving. */
+export const BUCKET_MS = 20;
+
 /** Round to one decimal, passing null through, so a summary diff is readable. */
 export const round1 = (x: number | null | undefined): number | null =>
 	x === null || x === undefined || Number.isNaN(x) ? null : Math.round(x * 10) / 10;

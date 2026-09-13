@@ -12,6 +12,7 @@ just test audio-quality --codecs opus --rings plain        # the production path
 just test audio-quality --out ~/runs/after                 # keep the run directory
 just test audio-quality --enforce                          # fail on the budgets
 just test audio-quality --runtime safari                   # real Safari, local only
+just test audio-quality --runtime replay                   # the recorded traces, in a second
 ```
 
 The matrix is codec x jitter profile x ring path: 24 rows, about 30 minutes at the default 60
@@ -106,6 +107,34 @@ have posted. `analyze.ts` cannot tell which lane produced a file, which is the p
 `render_load` is null here: `AudioContext.renderCapacity` is Chromium's. `worklet_cadence` stands in
 for it, below.
 
+## The replay lane
+
+`--runtime replay` grades the recorded arrival traces in
+[`js/watch/src/audio/fixtures`](../../js/watch/src/audio/fixtures): no relay, no shaper, no browser,
+no clock. The trace's own arrival times drive a simulated one, and everything above it is the real
+thing, from [`js/watch/src/audio/replay.ts`](../../js/watch/src/audio/replay.ts): the same
+`Container.Jitter`, the same two rings, the same `Stretcher`. That module is also what
+`js/watch/src/audio/replay.test.ts` drives, so the unit suite and this lane cannot drift into
+measuring different players.
+
+The whole run takes about a second, and it is deterministic: the same recording, the same
+estimator, the same engine, the same numbers every time, on any machine. So its budgets are what was
+measured rather than what was measured plus headroom, and the counters that should be zero are
+pinned at zero rather than at a comfortable margin.
+
+Each recording is one row's `profile`, because that is what it is: what the path did on the day it
+was captured, rather than something a shaper applied. Its codec and rate come from the recording
+too. A trace carries no bitstream, but the frame spacing in it is the codec's frame duration, so
+`lan-bbb` and `relay-bbb-7frame` are 23.22 ms apart, which is 1024 samples at 44.1 kHz, and
+`4k-webm` is 20 ms, which is Opus. `--codecs`, `--duration` and `--seed` are refused here rather
+than ignored: the recording decides all three.
+
+What it cannot say is anything about the transport, the container consumer, the device, or the wall
+clock, because there is no session and no audio hardware. Those metrics report null. What it can say
+exactly, and the browser lanes cannot, is what the ring and the engine did: `short_quanta`,
+`discarded_samples`, `accelerates`, `expands` and `stretched_samples` are read straight off the
+counters rather than inferred from a 250 ms sampling grid.
+
 ## The metric schema
 
 [`clients/js/src/schema.ts`](clients/js/src/schema.ts) is the contract, not a description of one.
@@ -190,9 +219,10 @@ definition is a judgement call are:
   denominator rather than counted as a zero, so an older build reports `null`.
 
 `short_quanta`, `silent_quanta`, `discarded_samples`, `accelerates`, `expands`,
-`stretched_samples`, and `budget_aborts` are in the schema and report `null`: the signals they need
-do not exist on the player yet. They are null rather than zero, and the summary says which change
-would fill each one in.
+`stretched_samples`, and `budget_aborts` are in the schema and report `null` in the browser lanes:
+the signals they need are not on the element's public surface yet. They are null rather than zero,
+and the summary says which change would fill each one in. The replay lane reads five of them
+straight off the ring, because there is no page between the counter and the summary.
 
 ### What the sampling grid can and cannot see
 
@@ -259,6 +289,7 @@ clients/js/
   src/beacon.ts             batches to the sink, sendBeacon on pagehide
   src/schema.ts             the metric contract
   driver.ts                 one row in headless Chromium, and the void checks
+  replay.ts                 the recorded traces, with no relay, shaper, or browser
   safari.ts                 one row in real Safari, and the void checks it needs instead
   webdriver.ts              a dependency-free W3C WebDriver client over safaridriver
   sink.ts                   one ndjson file per row
@@ -294,7 +325,6 @@ from a shell script driving the OS, and now comes from `moq-shaper` with a seed 
 
 ## Not covered here
 
-The replay lane over the recorded traces, and the nightly job. iOS: no device, and desktop Safari is
-the closest proxy this lane has. Video: the stage breakdown is defined generically so video can adopt
+The nightly job. iOS: no device, and desktop Safari is the closest proxy this lane has. Video: the stage breakdown is defined generically so video can adopt
 it, but nothing here asserts on it. No perceptual scoring: the grade is glitches and latency, not an
 opinion about how it sounds.

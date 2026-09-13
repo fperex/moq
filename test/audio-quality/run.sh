@@ -37,16 +37,22 @@ ALL_PROFILES=(near-zero mild bursty step high-rtt fixed-250)
 # labelling an unimpaired run `bursty`, this runtime offers only the two profiles whose path
 # treatment is already nothing, and its rows record `shaper: none`.
 SAFARI_PROFILES=(near-zero fixed-250)
+# The replay runtime's "profile" is which recording was replayed: the path is what it did on the day
+# it was captured, not something a shaper applied. `replay.ts` owns what each one was recorded off.
+REPLAY_PROFILES=(lan-bbb relay-bbb-7frame 4k-webm)
 ALL_RINGS=(isolated plain)
 ALL_CODECS=(opus aac)
-ALL_RUNTIMES=(chromium safari)
+ALL_RUNTIMES=(chromium safari replay)
 
 RUNTIME=chromium
 PROFILES=()
 RINGS=("${ALL_RINGS[@]}")
 CODECS=("${ALL_CODECS[@]}")
+CODECS_SET=0
 DURATION=60
+DURATION_SET=0
 SEED=7
+SEED_SET=0
 OUT=""
 LIST=0
 ENFORCE=0
@@ -83,6 +89,7 @@ while [[ $# -gt 0 ]]; do
             need "$1" $# "${2:-}"
             split "$2"
             CODECS=("${SPLIT[@]}")
+            CODECS_SET=1
             shift 2
             ;;
         --runtime)
@@ -93,11 +100,13 @@ while [[ $# -gt 0 ]]; do
         --duration)
             need "$1" $# "${2:-}"
             DURATION="$2"
+            DURATION_SET=1
             shift 2
             ;;
         --seed)
             need "$1" $# "${2:-}"
             SEED="$2"
+            SEED_SET=1
             shift 2
             ;;
         --out)
@@ -145,6 +154,7 @@ valid "$RUNTIME" runtime "${ALL_RUNTIMES[@]}"
 # explicit list is checked against that runtime's set rather than against every name the file knows.
 KNOWN_PROFILES=("${ALL_PROFILES[@]}")
 [[ "$RUNTIME" != safari ]] || KNOWN_PROFILES=("${SAFARI_PROFILES[@]}")
+[[ "$RUNTIME" != replay ]] || KNOWN_PROFILES=("${REPLAY_PROFILES[@]}")
 [[ ${#PROFILES[@]} -gt 0 ]] || PROFILES=("${KNOWN_PROFILES[@]}")
 
 for p in "${PROFILES[@]}"; do valid "$p" profile "${KNOWN_PROFILES[@]}"; done
@@ -154,6 +164,18 @@ for c in "${CODECS[@]}"; do valid "$c" codec "${ALL_CODECS[@]}"; done
 if [[ "$RUNTIME" == safari && "$(uname -s)" != Darwin ]]; then
     echo "error: the safari runtime needs safaridriver, which is macOS only" >&2
     exit 2
+fi
+
+# A replay row's codec, rate, and length come from the recording, and its impairment is whatever the
+# path did on the day it was captured. A flag that says otherwise would be silently ignored, so it is
+# refused instead.
+if [[ "$RUNTIME" == replay ]]; then
+    for flag in "--codecs:$CODECS_SET" "--duration:$DURATION_SET" "--seed:$SEED_SET"; do
+        [[ "${flag#*:}" -eq 0 ]] || {
+            echo "error: ${flag%:*} means nothing to the replay runtime: the recording decides it" >&2
+            exit 2
+        }
+    done
 fi
 
 # `step` exists to move the path part-way through a run, so a run that ends before the step measures
@@ -203,6 +225,55 @@ shaper_of() {
         *) echo "$1" ;;
     esac
 }
+
+# Grade what the run produced and, if asked, keep the directory it produced it in. Both lanes end
+# here, so the two cannot disagree about what a run leaves behind.
+finish() {
+    local status="$1"
+    echo ""
+    local grade=(bun "$CLIENT/grade.ts" --run "$HARNESS_RUN" --budgets "$AQ_DIR/budgets.json")
+    [[ $ENFORCE -eq 0 ]] || grade+=(--enforce)
+    "${grade[@]}" || status=1
+
+    # The run directory is the deliverable, not a by-product: the summaries, the shaper reports, and
+    # the raw ndjson are what a before/after table is built from later.
+    if [[ -n "$OUT" ]]; then
+        mkdir -p "$OUT"
+        cp -R "$HARNESS_RUN/." "$OUT/"
+        echo ""
+        echo "saved: $OUT"
+    fi
+    exit "$status"
+}
+
+# ── replay ──────────────────────────────────────────────────────────────────
+# No relay, no shaper, no browser, no clock: the recordings go straight through the real estimator,
+# the real rings, and the real playout engine on a simulated clock. `replay.ts` owns the row keys,
+# because the codec and rate of each row are the recording's rather than a choice.
+if [[ "$RUNTIME" == replay ]]; then
+    replay_args=(--rings "$(
+        IFS=,
+        echo "${RINGS[*]}"
+    )" --fixtures "$(
+        IFS=,
+        echo "${PROFILES[*]}"
+    )")
+
+    command -v bun >/dev/null 2>&1 || {
+        echo "error: bun not found; run inside 'nix develop'" >&2
+        exit 1
+    }
+    (cd "$CLIENT" && bun install --frozen-lockfile >/dev/null)
+
+    if [[ $LIST -eq 1 ]]; then
+        bun "$CLIENT/replay.ts" --list "${replay_args[@]}"
+        exit 0
+    fi
+
+    harness_begin audio-quality "$RERUN"
+    bun "$CLIENT/replay.ts" --out "$HARNESS_RUN" "${replay_args[@]}"
+    finish 0
+fi
 
 # One entry per row: the tag, then the fields the row needs, tab separated. The tag encodes the same
 # fields (the analyzer parses it back out, and it names every file the row produces), but the loop
@@ -413,18 +484,4 @@ for entry in "${ROWS[@]}"; do
 done
 
 # ── grade ───────────────────────────────────────────────────────────────────
-echo ""
-grade=(bun "$CLIENT/grade.ts" --run "$HARNESS_RUN" --budgets "$AQ_DIR/budgets.json")
-[[ $ENFORCE -eq 0 ]] || grade+=(--enforce)
-"${grade[@]}" || failed=1
-
-# The run directory is the deliverable, not a by-product: the summaries, the shaper reports, and the
-# raw ndjson are what a before/after table is built from later.
-if [[ -n "$OUT" ]]; then
-    mkdir -p "$OUT"
-    cp -R "$HARNESS_RUN/." "$OUT/"
-    echo ""
-    echo "saved: $OUT"
-fi
-
-exit "$failed"
+finish "$failed"
