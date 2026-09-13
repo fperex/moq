@@ -113,6 +113,29 @@ verdicts `Lagged` and `GroupTooLarge` carried stream codes. `Container.Consumer`
 `Effect.spawn` logged `spawn error`, the `finally` advanced the cursor anyway, and content
 disappeared above the decoder with no counter anywhere.
 
+### 4. The ring held the target minus one frame
+
+Reported after the three above, from a browser publisher's own microphone: 20 ms Opus, one frame per
+group, watched at auto on a local relay. The Latency panel read `jitter buffer 20ms (auto)`, `total
+buffer 20ms`, and the audio stuttered through continuous speech, while the `bbb` sources with their
+300 ms floors played clean on the same build.
+
+The estimator was right. 20 ms is its lowest value, the upper edge of the first histogram bucket, and
+that microphone path really does deliver inside 20 ms. The ring was what was wrong: it un-stalled at
+`WRITE - READ >= LATENCY`, refilled to the same after an underrun, and the level filter's lower bound
+was the target itself. But the ring holds *unplayed* audio, and the engine takes a whole chunk out of
+it to produce each block. A ring holding exactly the target therefore holds nothing unplayed at the
+moment the engine asks, so it runs dry on the first arrival a millisecond late, re-stalls, refills to
+the same empty level, and stutters there for as long as the call lasts.
+
+NetEq does not have this: its target delay counts *the packet being played* as well as the ones
+waiting, because its buffer level is the `packet_buffer` span plus what the sync buffer still holds.
+The maintainer's #3517 carried a "+ one frame" for exactly this reason; the objection recorded in
+`quest/m2/audio-jitter-target/spec.md` was to *learning* that frame from timestamp gaps, not to the
+term. The branch's own `doc/concept/playout.md` had already decided that the term belongs to the
+ring's slack, but the slack had only ever been applied to the skip band, never to the level the ring
+holds.
+
 ### What upstream had already done
 
 \#3478 is fixed by #3508. #3479 is fixed by #3513 and #3516. #3477 was closed as a re-plan (#3576).
@@ -368,6 +391,33 @@ floor, and a measured buffer that can never measure anything is a fixed one with
 Replaying the same trimmed traces, the native engine settles on the same 80 ms and 240 ms targets the
 browser does, and the corpus passes 14 of 14.
 
+### The chunk above the target
+
+One rule, in the same four places in both engines: the level a ring holds is `target + chunk`, where
+`chunk` is the size of the most recent insert, measured on the way in and republished on every
+arrival rather than learned from timestamp arithmetic.
+
+- Both rings un-stall at `WRITE - READ >= target + chunk` and a refill after an underrun reaches the
+  same level, bounded by what the ring can physically hold so an oversized decode cannot name a level
+  no refill could reach.
+- The buffer level filter's band becomes `low = target + chunk`, `high = low + 20 ms`. `high` does
+  not move: it was already `target + chunk + 20 ms`. What moves is the floor, so a ring sitting
+  exactly where it is meant to sit is no longer read as one that needs expanding.
+- The skip band stays where it was, so the band above the level the ring holds is exactly the stretch
+  bound: everything inside it is something the time stretch closes without dropping a sample.
+- `rs/moq-audio` gets the same rule in `decision.rs` (`Decision::hold`), and the engine's two flush
+  paths are collapsed onto one so a target that has just fallen does not convict from the pull side
+  what it tolerates on the insert side.
+
+The audio age budget's headroom is unchanged and still exactly covers it: `Jitter.BUCKET + frame +
+STRETCH_BOUND` is the bucket the estimator rounded up by, the chunk held on top of the target, and
+the stretch band.
+
+`Sync.out.delay` stays the estimator's answer, because it is also the wire subscription's age budget
+and what video paces against. The player's Latency panel now separates the two: "Jitter buffer" is
+that value and "Total buffer" is `delay + chunk`, which is what a listener actually waits. The chunk
+comes from the ring's own `audio.out.debug` snapshot, so no new public signal was added for it.
+
 ### The harness
 
 `test/audio-quality` plays a broadcast in headless Chromium over an impaired UDP path and counts what
@@ -459,6 +509,78 @@ frame, which are holes in the recording itself.
 The A/V clock, replaying the recorded LAN trace through the real ring: video runs 7.1 ms ahead and
 64.3 ms behind the audio a listener can hear, against 34.2 ms and 80.0 ms when it paced itself
 against a wall clock.
+
+### The microphone traces
+
+Two new fixtures, trimmed the same way as the other three: `mic-local` is a browser publisher's
+microphone over a local relay, `mic-remote` the same publisher through the public relay at a 45 ms
+round trip. Both are 20 ms Opus, one frame per group, and both settle the estimator on its lowest
+value, 20 ms, in both languages.
+
+Replayed at that settled target, which is the state a call reaches within a minute and stays in
+(`fixed: 20`, counted after 1 s, identical on both rings):
+
+| trace | concealment | underruns | short quanta | level trough |
+| --- | --- | ---: | ---: | ---: |
+| `mic-local` | on | 1 -> 1 | 0 -> 0 | 0.0 -> 2.3 ms |
+| `mic-local` | off | 2 -> 1 | 11 -> 7 | 0.0 -> 2.3 ms |
+| `mic-remote` | on | 0 -> 0 | 0 -> 0 | 14.7 -> 19.7 ms |
+| `mic-remote` | off | 1 -> 0 | 1 -> 0 | 0.0 -> 19.7 ms |
+
+The trough is the number the finding is about: before, the ordinary cadence took the ring to empty;
+after, it rests a chunk higher and the floor is the target. `mic-local` keeps one underrun either
+way, and it is not the rule: the trace carries one arrival 31 ms late, past the 95th percentile the
+estimator reports by design, and past what 40 ms covers. Concealment carries it, which is why no
+quantum reaches the device short.
+
+At the estimator's own target with its cold-start cushion still in the ring (the `auto` lane, counted
+after 4 s) both traces are clean before and after: zero underruns, zero short quanta, zero skipped
+samples. Twelve seconds is not long enough for a 20 ms ring to be pinned by an underrun, which is why
+the fixed lens is the one that shows it.
+
+In the harness replay lane the same change moves the recordings that already had underruns:
+`4k-webm` on the shared ring goes from 14.1 to 7.0 underrun episodes per minute and from 2.9% stalled
+quanta to none. `lan-bbb` on the postMessage ring picks up one underrun in a ten second window where
+it had none; that trace's arrivals run slower than its own media at the tail, so its buffer sits
+within a few milliseconds of empty either way. Every replay budget was re-recorded from the measured
+run and the lane is enforced.
+
+### The real microphone, headed
+
+Real Chromium with a window on the screen, the machine's own microphone through
+`--use-fake-ui-for-media-stream` (the fake *device* is not used: its synthetic signal breaks the
+encoder), one `publish.html` publishing camera and microphone and one `watch.html` watching it, both
+against the local relay, sampled every 250 ms for 60 s and counted over the last 50.
+
+| build | ring | target | held | level min / p50 / max | underruns | A/V skew p50 |
+| --- | --- | ---: | ---: | --- | ---: | ---: |
+| before | shared | 40 ms | 60 ms | 22.2 / 69.1 / 114.7 ms | 0 | 1.8 ms |
+| after | shared | 20 ms | 40 ms | 35.7 / 55.7 / 67.7 ms | 0 | -0.2 ms |
+| before | postMessage | 40 ms | 60 ms | 53.7 / 77.0 / 97.0 ms | 0 | -14.6 ms |
+| after | postMessage | 40 ms | 60 ms | 34.5 / 47.8 / 61.2 ms | 0 | -15.3 ms |
+
+Stated plainly: this path is clean enough that neither build stuttered in a minute. What the runs do
+show is where the ring rests. Before, the shared ring ran down to 22 ms of unplayed audio against a
+40 ms target, which is the state one late arrival turns into silence. After, its floor is 36 ms
+against a 20 ms target, and the whole band is narrower: the engine is holding the level it was asked
+to hold instead of drifting between the target and empty.
+
+### Conferencing targets
+
+The thresholds a WebRTC conference is held to, applied to the same runs. "Held" is the estimator's
+target plus the chunk the ring keeps on top of it, which is what the listener waits.
+
+| case | jitter target (20-100 ms) | held (LAN < 150, relay < 200 ms) | underruns after convergence | A/V skew (< one frame) |
+| --- | ---: | ---: | ---: | ---: |
+| headed real mic, shared ring | 20 ms | 40 ms | 0 | -0.2 ms p50, 30.5 ms p95 |
+| headed real mic, postMessage ring | 40 ms | 60 ms | 0 | -15.3 ms p50, 4.4 ms p95 |
+| `mic-local` fixture, both rings | 20 ms | 40 ms | 0 | not measured: arrival-only trace |
+| `mic-remote` fixture, both rings | 20 ms | 40 ms | 0 | not measured: arrival-only trace |
+
+Every case is inside every threshold. The LAN total is 40 to 60 ms against a 150 ms ceiling, so the
+question of why it might sit above does not arise. The A/V skew is the rendered video timestamp less
+the audio playhead, sampled on the same 250 ms grid; one sample in each headed run reaches about
+50 ms, which is a video frame arriving between two samples rather than a drift.
 
 ### The budget
 
@@ -624,13 +746,20 @@ are `recorded` rows and both are in the residual list above.
 | --- | ---: | --- |
 | `just fix` | 0 | No tracked change outside this branch's own untracked notes |
 | `just check upstream/dev` | 0 | Every package the branch touches, scoped as CI scopes it |
-| `just test default upstream/dev` | 0 | 4545 Rust tests (7 skipped), 1587 Bun tests across nine packages, 58 Python |
-| `cargo nextest run -p moq-shaper -p moq-audio` | 0 | 191 tests |
+| `just test default upstream/dev` | 0 | 4548 Rust tests, 1597 Bun tests across nine packages, 58 Python |
+| `cargo nextest run -p moq-audio` | 0 | 169 tests |
+| `cargo clippy --locked --all-targets -p moq-audio -- -D warnings` | 0 | No warning |
 | `just test audio-quality --enforce` | 0 | 24 Chromium rows at 60 s, 120 enforced checks, no void row |
-| `just test audio-quality --runtime replay --enforce` | 0 | 6 rows, 74 enforced checks |
+| `just test audio-quality --runtime replay --enforce` | 0 | 10 rows, 120 enforced checks |
 | `just drafts check` | 0 | No draft changed on this branch |
 | privacy grep over the branch's added lines | 0 hits | No home path, name, address, token, or session id |
 | `bun test js/watch` after the A/V desync fix | 0 | 334 tests, including the sequence replay and its two controls |
+
+The Chromium row of that table is the one recorded before the one-frame hold; the replay lane, the
+scoped check, the scoped test, and `moq-audio` were re-run on the tree as it stands. One caveat on
+the CPU bench in `stretch.bench.test.ts`: it fails on this machine whenever a full workspace build is
+running beside it, and passes with 0.09 ms at the 99.9th percentile against its 0.67 ms budget when
+nothing else is competing. It is a wall-clock budget on a shared machine, not a regression.
 
 ## Departures from the quests
 

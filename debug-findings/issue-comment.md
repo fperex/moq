@@ -11,7 +11,7 @@ last code commit, `b31eb9552`). 49 commits.
 Full write-up:
 [`debug-findings/REPORT.md`](https://github.com/fperex/moq/blob/debug-findings-solution/debug-findings/REPORT.md).
 
-### Three root causes
+### Four root causes
 
 Confirmed against `dev` at `246a4733f`. Each one alone is audible.
 
@@ -19,16 +19,34 @@ Confirmed against `dev` at `246a4733f`. Each one alone is audible.
    `buffered > latency` and never re-stalls after running dry (`ring-buffer.ts` mirrors it). Early
    arrivals are discarded, and once the ring empties it resumes on an empty cushion, so the next late
    arrival is another stall. That is the stutter that never settles.
+
 2. **The auto target comes from the round trip.** `max(20ms, 1.25 x minRtt)` says nothing about how
    evenly a publisher flushes. The public `bbb.hang` arrives in 7-frame bursts of about 162 ms,
    because ffmpeg packs roughly seven AAC frames per PES and the TS importer forwards every frame of
    a PES in one pass. No round-trip formula can see that.
+
 3. **The budget censors the estimator.** `Sync.out.maxAge` is both the wire `Subscription.maxAge` and
    the `Container.Consumer` skip threshold, so anything measuring below it can only confirm the budget
    it was cut to. And `js/net/src/group.ts` raised a bare `Error` for a group that missed its
    deadline, while `Lagged` and `GroupTooLarge` carry stream codes, so `Container.Consumer` rethrew
    it, `Effect.spawn` logged `spawn error`, the `finally` advanced the cursor anyway, and content
    vanished above the decoder with no counter anywhere.
+
+4. **The ring holds the target minus one frame.** Found last, from a browser publisher's own
+   microphone: 20 ms Opus, one frame per group, watched at auto on a local relay reads `jitter buffer
+   20ms`, `total buffer 20ms`, and stutters through continuous speech. The estimator is right; 20 ms
+   is its lowest value and that path really is that clean. The ring is wrong. It un-stalls at
+   `WRITE - READ >= LATENCY`, refills to the same after an underrun, and the level filter's lower
+   bound is the target. But the ring holds *unplayed* audio and the engine takes a whole chunk out of
+   it per block, so a ring holding exactly the target holds nothing unplayed, runs dry on the first
+   arrival a millisecond late, refills to the same empty level, and stutters there for the length of
+   the call. NetEq's target counts the packet being played as well as the ones waiting (its buffer
+   level is the `packet_buffer` span plus the sync buffer), which is what the "+ one frame" in #3517
+   was for. The fix keeps your objection: the frame is not learned from timestamp gaps, it is the
+   size of the insert that just landed, republished on every arrival. The level a ring holds becomes
+   `target + chunk`, in both engines, in all four places that referred to the target alone (the
+   un-stall, the refill, the level filter's floor, and where a skip lands). The skip band does not
+   move, so the band above the level the ring holds is exactly the stretch bound.
 
 ### The branch, and how to read it
 
@@ -78,6 +96,20 @@ The budget finding has its own control. Replaying the recorded `relay-bbb-7frame
 real subscription and a real `Container.Consumer`: 0 of 443 groups convicted in steady state at the
 measured target, 0 with the headroom, and **91 at the 46 ms round-trip budget the estimator
 replaced**. That 91 is the censoring mechanism, measured.
+
+**The microphone shape, which is what a conference call is.** Two new trimmed fixtures,
+`mic-local` and `mic-remote`, both 20 ms Opus one frame per group, both settling the estimator on its
+lowest value in both languages. Replayed at that settled target, the level the ring rests at goes
+from 0.0 ms to 2.3 ms on the local trace and from 0.0 ms to 19.7 ms on the remote one with
+concealment off, and the underruns halve. `mic-local` keeps one either way, and it is not the rule:
+that trace carries one arrival 31 ms late, which is past the 95th percentile the estimator reports by
+design. Concealment covers it, so nothing reaches the device short.
+
+Headed Chromium with the machine's own microphone, one `publish.html` and one `watch.html` against a
+local relay for 60 s: neither build stutters on a path this clean, but before the fix the shared ring
+ran down to 22 ms of unplayed audio against a 40 ms target, and after it rests at 36 ms against a
+20 ms target with a narrower band. Audio and video stay within a millisecond of each other at the
+median.
 
 ### The harness, and what it will and will not enforce
 
