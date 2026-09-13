@@ -44,10 +44,10 @@ export type DecoderInput = {
 	 * Whether a gap in the audio is concealed with synthesized audio rather than played as a ramp
 	 * into silence. Defaults to true.
 	 *
-	 * Concealment repeats the pitch period of the last real audio under a noise floor measured from
-	 * the stream, fading toward that floor over a long outage, and splices the media back on where it
-	 * lines up. Turning it off leaves a gap audible as a gap, which is what a listener who would
-	 * rather hear the loss than hear invented audio wants.
+	 * Concealment repeats the pitch period of the last real audio, fades it out over a long outage
+	 * and ends in digital silence, and splices the media back on where it lines up. Turning it off
+	 * leaves a gap audible as a gap, which is what a listener who would rather hear the loss than
+	 * hear invented audio wants.
 	 *
 	 * Read when the audio graph is built, since it belongs to the reader running inside the worklet.
 	 */

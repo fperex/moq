@@ -1,13 +1,13 @@
 # Real-time audio playout: what was wrong, what this branch does about it
 
-Branch: `fperex/moq` `debug-findings-solution`, based on `upstream/dev` (`246a4733f`).
-This report sits at the branch tip (the docs commits sit on top of the last code commit,
-`5dacdd1b3`). 53 commits, 146 files.
+Branch: `fperex/moq` `debug-findings-solution`, rebased onto `upstream/dev` (`8f41d4d82`).
+This report sits at the branch tip (the docs commit sits on top of the last code commit,
+`3d2182594`). 62 commits, 152 files.
 
 ## Summary
 
 1. `<moq-watch>` at the "Real-time" / auto preset stutters (moq-dev/moq#2812, #3477).
-2. Three separate defects produce it, and each one alone is enough to be heard.
+2. Five separate defects produce it, and each one alone is enough to be heard.
 3. The auto delay came from the round trip, which cannot see how unevenly a publisher flushes.
 4. The audio ring skipped whenever it ran long and never re-stalled after running dry.
 5. The age budget was also the container's skip threshold, so the estimator under it could only confirm the budget it was cut to.
@@ -31,65 +31,68 @@ with their author intact.
 
 | # | Commit | Quest / stage | What it is |
 | --- | --- | --- | --- |
-| 1 | `8dad5e3c2` | #3517 (kixelated) | Auto sized from measured arrivals, ring slack, re-stall, `stall()`, underrun counter |
-| 2 | `5f43c0f99` | #3517 (kixelated) | Short quantum counts as an underrun, stale arrival minimum expires |
-| 3 | `bdf4f64e0` | `audio-jitter-target/spec.md` | `doc/concept/playout.md`, the NetEq estimator, the 14-case corpus and its generator |
-| 4 | `c97496853` | `audio-jitter-target/watch.md` | Auto sized from the target, render quantum moved into the ring, advertised jitter the floor and 2 s the ceiling |
-| 5 | `9dcaac2ab` | review follow-up | Arrival clock read before the container is parsed; the arrival test made real |
-| 6 | `863d39c32` | `transport-impairment-profile.md` | `rs/moq-shaper`, a seeded userspace UDP path impairment with counters |
-| 7 | `6ce7d2bcf` | `watch-audio-time-stretch.md` (native half) | Accelerate, preemptive expand, expand, merge, background noise, in Rust |
-| 8 | `b42619ae5` | review follow-up | `Container.Jitter` is the class, not a namespace |
-| 9 | `4a6680c7d` | budget finding, part 1 | `Expired` on `StreamCode.DeliveryTimeout` |
-| 10 | `4383a2e09` | budget finding, part 2 | A censored group is counted, not a `spawn error` |
-| 11 | `6f3bd3e3c` | budget finding, part 3 (fork addition) | Audio subscribes and consumes at `maxAge + headroom` |
-| 12 | `0d06ca4e8` | finding | `demo/web` tiles start in auto instead of a hard-coded `100ms` |
-| 13 | `64fd96e55` | CodeRabbit | Buzz fixture period sized from the signal it built |
-| 14 | `5140c63e2` | `m1/plan-av-clock.md` | The audio playhead drives `Sync.reference`; `sync.track()` replaces the flat inputs |
-| 15 | `dbb8228e3` | tune-in defect (browser) | A receiver's own reading stall stays out of the target; proportional fall |
-| 16 | `9cadfc19c` | `audio-jitter-target/native.md` | The native estimator, same corpus, `f64` |
-| 17 | `e9d451cdf` | `audio-jitter-target/native.md` | The native engine: frame buffer, decision loop, playhead |
-| 18 | `7ad6b1a5c` | tune-in defect (native) | The same two rules in Rust |
-| 19 | `1e5ce49b6` | `audio-jitter-target/native.md` | `decode::Config::delay` turns it on; `moq play --delay` becomes a floor |
-| 20 | `9deb1db75` | native test | The native guards hold to the fourteenth corpus case |
-| 21 | `ed095f21c` | `watch-audio-time-stretch.md` | The ring reader splits into `view`, `peek`, `commit` |
-| 22 | `c0a3deddf` | `watch-audio-time-stretch.md` | The browser engine: the ring converges by stretch rather than by skipping |
-| 23 | `f4c9da0b2` | `qa-failure-artifacts.md` | A failing run keeps its directory |
-| 24 | `e103f0d80` | `audio-quality-harness/browser.md` | `test/audio-quality`: page, probe, driver, sink, analyzer, grader, schema |
-| 25 | `aa0069373` | harness | The page denies the WebSocket fallback so the shaper is in the path |
-| 26 | `ae2fe4256` | harness | Budgets recorded from the full matrix, not enforced |
-| 27 | `527d3a0d2` | harness | The probe can read a build it was not written against |
-| 28 | `41b86931e` | harness | The probe's generic helper is a function declaration, not an arrow |
-| 29 | `5425bf3c1` | harness | `skipped_groups` and the clock source become real numbers |
-| 30 | `38c452730` | CodeRabbit | A void row fails the run; the probe's remaining reads are guarded |
-| 31 | `dfd568613` | concealment (user decision) | The browser twin of expand and merge, behind `conceal`, default on |
-| 32 | `42fefae05` | re-land | MPEG-TS importer keeps fractional sample ticks |
-| 33 | `6bc60d12e` | re-land | Authored audio gaps render as silence before encoding |
-| 34 | `ddda15ab2` | re-land | A file's audio format is learned from its first decoded sample |
-| 35 | `23d310dcd` | re-land | The video encoder's admission queue is bounded |
-| 36 | `0f775995d` | re-land | Native chunks bridge into the Libav polyfill when one codec is missing |
-| 37 | `69c233696` | `audio-quality-harness/browser.md` | A real Safari lane over safaridriver |
-| 38 | `673da3fef` | `audio-quality-harness/browser.md` | A deterministic replay lane, graded on its own rows |
-| 39 | `20b2fcbb9` | `audio-quality-harness/browser.md` | The nightly `audio-quality` job |
-| 40 | `38d4123e1` | harness | The device's own rate is sampled; the unearned Safari budgets go |
-| 41 | `b939f2d10` | harness | An underrun episode ends at the last sample that underran |
-| 42 | `a472947be` | concealment (user decision) | `conceal` as an element attribute, settable before connect |
-| 43 | `2ecf1c1a1` | flake | The `console.error` spy is isolated in the consumer test |
-| 44 | `00596e813` | harness | The budgets enforced, measured on the playout engine |
-| 45 | `dececbf81` | review | The review pass over the branch |
-| 46 | `393ff294d` | delivery | This report and the issue comment |
-| 47 | `492781763` | shaper defect | Jitter varies the delay without reordering datagrams |
-| 48 | `b31eb9552` | harness | The budgets re-recorded and enforced on the fixed shaper |
-| 49 | `067fa459c`, `6a9ea6ac0` | delivery | This report, filled in with the enforced budgets |
-| 50 | `8ea218165` | `m1/plan-av-clock.md`, user report | A hole in the source reaches the decoder, and a ring nothing is draining is flushed |
-| 51 | `f8ce3e6b1` | delivery | This report and the issue comment, with the A/V desync fix |
-| 52 | `a5280e11c` | mic hold (user report) | Both rings hold one chunk above the playout target |
-| 53 | `f9b50db59` | mic hold (user report) | The same one-frame hold in the native engine |
-| 54 | `ac9f13cbb` | harness | The real-microphone traces replayed and graded |
-| 55 | `2c50b3abd` | delivery | This report and the issue comment, with the one-frame hold finding |
-| 56 | `b3f0c219d` | mute (user report) | A long outage ends in silence, not comfort noise |
-| 57 | `ed9318afa` | mute (user report) | A muted audio track declares its endpoint, both ends |
-| 58 | `5dacdd1b3` | mute (user report) | The same silence in the native engine |
-| 59 | this one | delivery | This report and the issue comment, with the mute finding |
+| 1 | `faea4e7dd` | #3517 (kixelated) | Auto sized from measured arrivals, ring slack, re-stall, `stall()`, underrun counter |
+| 2 | `d89129c0c` | #3517 (kixelated) | Short quantum counts as an underrun, stale arrival minimum expires |
+| 3 | `c807bf719` | `audio-jitter-target/spec.md` | `doc/concept/playout.md`, the NetEq estimator, the 14-case corpus and its generator |
+| 4 | `b7b6d2291` | `audio-jitter-target/watch.md` | Auto sized from the target, render quantum moved into the ring, advertised jitter the floor and 2 s the ceiling |
+| 5 | `ad332ab3b` | review follow-up | Arrival clock read before the container is parsed; the arrival test made real |
+| 6 | `d87d61d99` | `transport-impairment-profile.md` | `rs/moq-shaper`, a seeded userspace UDP path impairment with counters |
+| 7 | `64bb9df46` | `watch-audio-time-stretch.md` (native half) | Accelerate, preemptive expand, expand, merge, background noise, in Rust |
+| 8 | `c51c2ddcf` | review follow-up | `Container.Jitter` is the class, not a namespace |
+| 9 | `a4b5f67ed` | budget finding, part 1 | `Expired` on `StreamCode.DeliveryTimeout` |
+| 10 | `029041c19` | budget finding, part 2 | A censored group is counted, not a `spawn error` |
+| 11 | `524e7001a` | budget finding, part 3 (fork addition) | Audio subscribes and consumes at `maxAge + headroom` |
+| 12 | `d2b8d0133` | finding | `demo/web` tiles start in auto instead of a hard-coded `100ms` |
+| 13 | `a08a308a7` | CodeRabbit | Buzz fixture period sized from the signal it built |
+| 14 | `65b243321` | `m1/plan-av-clock.md` | The audio playhead drives `Sync.reference`; `sync.track()` replaces the flat inputs |
+| 15 | `8c6cc2565` | tune-in defect (browser) | A receiver's own reading stall stays out of the target; proportional fall |
+| 16 | `4de73282f` | `audio-jitter-target/native.md` | The native estimator, same corpus, `f64` |
+| 17 | `fa0db311f` | `audio-jitter-target/native.md` | The native engine: frame buffer, decision loop, playhead |
+| 18 | `919e35c54` | tune-in defect (native) | The same two rules in Rust |
+| 19 | `72d68711e` | `audio-jitter-target/native.md` | `decode::Config::delay` turns it on; `moq play --delay` becomes a floor |
+| 20 | `9623deb7c` | native test | The native guards hold to the fourteenth corpus case |
+| 21 | `691c3ad35` | `watch-audio-time-stretch.md` | The ring reader splits into `view`, `peek`, `commit` |
+| 22 | `f5dc706e5` | `watch-audio-time-stretch.md` | The browser engine: the ring converges by stretch rather than by skipping |
+| 23 | `8a31fea4b` | `qa-failure-artifacts.md` | A failing run keeps its directory |
+| 24 | `8a70fc4d2` | `audio-quality-harness/browser.md` | `test/audio-quality`: page, probe, driver, sink, analyzer, grader, schema |
+| 25 | `11000b41e` | harness | The page denies the WebSocket fallback so the shaper is in the path |
+| 26 | `cbad4c766` | harness | Budgets recorded from the full matrix, not enforced |
+| 27 | `462ca07c1` | harness | The probe can read a build it was not written against |
+| 28 | `7b2bd7411` | harness | The probe's generic helper is a function declaration, not an arrow |
+| 29 | `bad63a277` | harness | `skipped_groups` and the clock source become real numbers |
+| 30 | `970e348dd` | CodeRabbit | A void row fails the run; the probe's remaining reads are guarded |
+| 31 | `bf9eee985` | concealment (user decision) | The browser twin of expand and merge, behind `conceal`, default on |
+| 32 | `f2a05dc14` | re-land | MPEG-TS importer keeps fractional sample ticks |
+| 33 | `4b2f95faf` | re-land | Authored audio gaps render as silence before encoding |
+| 34 | `88f58c5f1` | re-land | A file's audio format is learned from its first decoded sample |
+| 35 | `393ca7305` | re-land | The video encoder's admission queue is bounded |
+| 36 | `bfc353c5e` | re-land | Native chunks bridge into the Libav polyfill when one codec is missing |
+| 37 | `168b9c33b` | `audio-quality-harness/browser.md` | A real Safari lane over safaridriver |
+| 38 | `e151dd15c` | `audio-quality-harness/browser.md` | A deterministic replay lane, graded on its own rows |
+| 39 | `cfffb4250` | `audio-quality-harness/browser.md` | The nightly `audio-quality` job |
+| 40 | `14ba83e79` | harness | The device's own rate is sampled; the unearned Safari budgets go |
+| 41 | `b7f18deb8` | harness | An underrun episode ends at the last sample that underran |
+| 42 | `83d369106` | concealment (user decision) | `conceal` as an element attribute, settable before connect |
+| 43 | `a4187712a` | flake | The `console.error` spy is isolated in the consumer test |
+| 44 | `3745d028b` | harness | The budgets enforced, measured on the playout engine |
+| 45 | `e84cb740b` | review | The review pass over the branch |
+| 46 | `c96861034` | delivery | This report and the issue comment |
+| 47 | `1157fa9a2` | shaper defect | Jitter varies the delay without reordering datagrams |
+| 48 | `411ca585c` | harness | The budgets re-recorded and enforced on the fixed shaper |
+| 49 | `7259477c3`, `f7c5018b3` | delivery | This report, filled in with the enforced budgets |
+| 50 | `f3355b2e9` | `m1/plan-av-clock.md`, user report | A hole in the source reaches the decoder, and a ring nothing is draining is flushed |
+| 51 | `840fccf2a` | delivery | This report and the issue comment, with the A/V desync fix |
+| 52 | `73b3f0196` | mic hold (user report) | Both rings hold one chunk above the playout target |
+| 53 | `b93dfe910` | mic hold (user report) | The same one-frame hold in the native engine |
+| 54 | `5f7ede85d` | harness | The real-microphone traces replayed and graded |
+| 55 | `b3b885fae` | delivery | This report and the issue comment, with the one-frame hold finding |
+| 56 | `07283facd` | mute (user report) | A long outage ends in silence, not comfort noise |
+| 57 | `3b17cb651` | mute (user report) | A muted audio track declares its endpoint, both ends |
+| 58 | `f10b35208` | mute (user report) | The same silence in the native engine |
+| 59 | `bda8c3927` | delivery | This report and the issue comment, with the mute finding |
+| 60 | `f58d13eda` | cold start (user decision) | The catalog jitter seeds the playout target instead of flooring it |
+| 61 | `3d2182594` | harness | The budgets re-recorded on the rebased tree |
+| 62 | this one | delivery | This report and the issue comment, with the cold-start rule |
 
 Suggested reading order for review: 3, 4, 9 to 11, 21, 22, 31. Those seven are the fix. The native
 half (7, 16 to 20) is the same algorithm again and can be read second or skipped entirely. The
@@ -98,7 +101,8 @@ player changes.
 
 ## Root causes
 
-Three defects, confirmed against `upstream/dev` at `246a4733f`.
+Five defects. The first three were confirmed against `upstream/dev` at `8f41d4d82`; the last two are
+this branch's own, found by a listener on builds of it.
 
 ### 1. The ring cap has no hysteresis and no refill
 
@@ -147,6 +151,20 @@ The maintainer's #3517 carried a "+ one frame" for exactly this reason; the obje
 term. The branch's own `doc/concept/playout.md` had already decided that the term belongs to the
 ring's slack, but the slack had only ever been applied to the skip band, never to the level the ring
 holds.
+
+### 5. The advertised jitter was carried twice
+
+The rendition's catalog `jitter` is the publisher's declared flush span. `Sync` used it twice: as a
+floor under `auto` and as a term added to a fixed delay. The TS importer advertises 302 to 372 ms on
+the `bbb` sources; the estimator on the same path reads 40 to 180. So `auto` never came below the
+declaration for the length of a session however well the path delivered, and the demo's `100ms`
+preset actually waited 402 ms.
+
+It is one quantity, not two. A flush span is exactly what the estimator goes on to measure, published
+by the party that already knows it before the first frame lands. That makes it the best prior a
+receiver has and a poor floor: a floor asserts something about the path that the receiver has since
+measured for itself. NetEq guesses 80 ms (`kStartDelayMs`) at the same point only because RTP carries
+nothing like a declared flush span.
 
 ### What upstream had already done
 
@@ -251,7 +269,7 @@ The decode loop on `upstream/dev` has no hole handling either, and `terminal.ts`
 identical, so the collapse itself predates this branch. What this stage changed is who follows it:
 before, video paced against a wall clock and only the audio was late.
 
-Two changes, both in `8ea218165`. `Terminal.continues()` measures each frame against the last one at the
+Two changes, both in `f3355b2e9`. `Terminal.continues()` measures each frame against the last one at the
 decoder's own frame duration and reports a hole; `Audio.Decoder.#reanchor` drains the decoder so the
 frames in flight keep the run that is ending, then restarts it so the next chunk's own timestamp
 opens the new one. `Audio.Decoder.#runFlush` drops what the ring still holds when the download
@@ -432,6 +450,27 @@ and what video paces against. The player's Latency panel now separates the two: 
 that value and "Total buffer" is `delay + chunk`, which is what a listener actually waits. The chunk
 comes from the ring's own `audio.out.debug` snapshot, so no new public signal was added for it.
 
+### The cold start
+
+The declaration moves from `Sync` into the estimator, in both languages. `Container.Jitter` takes a
+`start`, rounded up to a whole bucket, never below NetEq's 80 ms guess and never above the
+histogram's 2 s range; `Container.Consumer` takes it as a `jitter` prop from the rendition config,
+and `decode::Consumer` reads `catalog.jitter` for `Jitter::seeded`. From the first resampled
+observation the measurement owns the target and the ordinary fall bound walks it down, so a
+publisher declaring 300 ms on a path that turns out to deliver inside 20 ms ends at 20 ms, in the
+same steps every other fall takes.
+
+`Sync` is then one term: `auto` is the measurement and a fixed delay is the number the viewer asked
+for. `SyncTrack.advertised` has no reader left and goes.
+
+`playout-01.json` gains a fifteenth case, `seeded`: a 310 ms declaration starts the target at 320 ms
+and twenty seconds of the steady trace takes it to 20 ms. A case carrying `start_ms` is replayed
+from it in both languages, and the fourteen existing cases are byte-identical, so the corpus still
+says the unseeded algorithm did not move.
+
+The native `--delay` floor is untouched. That one is a caller asserting something the arrivals do
+not say, which is a different thing from a publisher describing its own encoder.
+
 ### The harness
 
 `test/audio-quality` plays a broadcast in headless Chromium over an impaired UDP path and counts what
@@ -579,6 +618,35 @@ show is where the ring rests. Before, the shared ring ran down to 22 ms of unpla
 against a 20 ms target, and the whole band is narrower: the engine is holding the level it was asked
 to hold instead of drifting between the target and empty.
 
+### The three pages, live, after the cold start
+
+One 60 s headless run per cell on the rebased tree, unmuted at `delay="auto"`. `demo/web` served
+plain is the production path and gets the postMessage ring; the same build with COOP/COEP gets the
+shared one; the third is the copied moq.dev site aliased at this checkout's `js/`.
+
+| Page | Source | Delay | Underruns | Skipped | Concealed | Accel | Expand | RTT |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| demo, postMessage | `bbb-smooth.hang`, local | 60 ms | 0 | 1 | 0 | 32 | 6 | 1 ms |
+| demo, postMessage | `bbb.hang`, local | 160 ms | 0 | 0 | 0 | 75 | 71 | 1 ms |
+| demo, postMessage | `bbb.hang`, cdn.moq.pro | 200 ms | 0 | 6 | 6174 | 45 | 53 | 45 ms |
+| demo, shared | `bbb-smooth.hang`, local | 60 ms | 0 | 0 | 0 | 42 | 6 | 1 ms |
+| demo, shared | `bbb.hang`, local | 180 ms | 0 | 0 | 0 | 31 | 9 | 1 ms |
+| demo, shared | `bbb.hang`, cdn.moq.pro | 200 ms | 1 | 1 | 11466 | 25 | 15 | 45 ms |
+| site, postMessage | `bbb-smooth.hang`, local | 60 ms | 0 | 0 | 0 | 60 | 0 | 1 ms |
+| site, postMessage | `bbb.hang`, local | 160 ms | 0 | 0 | 0 | 54 | 37 | 1 ms |
+| site, postMessage | `bbb.hang`, cdn.moq.pro | 200 ms | 3 | 2 | 7938 | 62 | 30 | 44 ms |
+
+The smooth publisher settles at 60 ms on all three pages against the 302 ms its catalog advertises,
+which is the whole point of the cold-start change: the declaration is where the estimate starts and
+the measurement takes it from there. The bursty one settles at 160 to 180 ms, which is its real
+140 ms flush span plus a bucket. The public relay settles at 200 ms with a 45 ms round trip and is
+the only source that needs concealment at all, 6 to 11 k samples over one to four outages in a
+minute, about 0.2 percent of the run.
+
+Every row negotiated WebTransport, and only the isolated page reports `crossOriginIsolated`, so each
+one ran the ring it was meant to. `sync.out.delay` is the estimator's answer alone now, so what a
+listener waits is that plus the chunk the ring holds, 23 ms of AAC on these sources.
+
 ### Conferencing targets
 
 The thresholds a WebRTC conference is held to, applied to the same runs. "Held" is the estimator's
@@ -707,7 +775,8 @@ of work on the engine, not something this branch claims.
 
 ### Before and after, on the fixed shaper
 
-`upstream/dev` at `246a4733f` against this branch, same desktop, one row at a time. **The two sides
+`upstream/dev` at `246a4733f` (the base the before-run was taken on) against this branch, same
+desktop, one row at a time. **The two sides
 are not the same length**: the baseline was recorded in Stage 8a at 40 s a row and this branch's
 rows are 60 s. The per-minute counters are comparable; `target p95` and `silence` are not strictly,
 because the target has 50% more run to settle in and the silence share is taken over a longer
@@ -756,24 +825,24 @@ are `recorded` rows and both are in the residual list above.
 
 ### Gates on the final tree
 
+Every row below was run on the rebased tree, in this order, one at a time.
+
 | Gate | Exit | What it covered |
 | --- | ---: | --- |
-| `just fix` | 0 | No tracked change outside this branch's own untracked notes |
+| `just fix` | 0 | No tracked change |
 | `just check upstream/dev` | 0 | Every package the branch touches, scoped as CI scopes it |
-| `just test default upstream/dev` | 0 | 4548 Rust tests, 1597 Bun tests across nine packages, 58 Python |
-| `cargo nextest run -p moq-audio` | 0 | 169 tests |
-| `cargo clippy --locked --all-targets -p moq-audio -- -D warnings` | 0 | No warning |
-| `just test audio-quality --enforce` | 0 | 24 Chromium rows at 60 s, 120 enforced checks, no void row |
+| `just check-all` | 0 | Every package, every language, including the bindings and the docs site |
+| `just test all` | 0 | 4617 Rust tests (8 skipped), 1876 Bun tests across fifteen packages, 59 Python |
+| `just test smoke-full` | 0 | 32/32 cross-language publish/subscribe pairs |
+| `just drafts check` | 0 | Every draft, including the hang draft this branch changes |
 | `just test audio-quality --runtime replay --enforce` | 0 | 10 rows, 120 enforced checks |
-| `just drafts check` | 0 | No draft changed on this branch |
+| `just test audio-quality --enforce` | 0 | 24 Chromium rows at 60 s, no void row |
 | privacy grep over the branch's added lines | 0 hits | No home path, name, address, token, or session id |
-| `bun test js/watch` after the A/V desync fix | 0 | 334 tests, including the sequence replay and its two controls |
 
-The Chromium row of that table is the one recorded before the one-frame hold; the replay lane, the
-scoped check, the scoped test, and `moq-audio` were re-run on the tree as it stands. One caveat on
-the CPU bench in `stretch.bench.test.ts`: it fails on this machine whenever a full workspace build is
-running beside it, and passes with 0.09 ms at the 99.9th percentile against its 0.67 ms budget when
-nothing else is competing. It is a wall-clock budget on a shared machine, not a regression.
+One caveat on the CPU bench in `stretch.bench.test.ts`: its ratio assertion
+(`max(stretch) / max(normal) < 30`) fails about one run in fifteen on this machine and passes the
+rest, with the absolute budget (0.67 ms) never close. It is a wall-clock ratio on a shared machine
+rather than a regression, and it is the one flake left in the suite.
 
 ## Departures from the quests
 
@@ -781,7 +850,7 @@ Each of these is deliberate and each is isolated so it can be dropped.
 
 **Concealment is core here.** `watch-audio-time-stretch.md` keeps an underrun a ramped gap and says
 no packet loss concealment. The user asked for NetEq's expand and merge. It is its own commit
-(`dfd568613`), it is switchable with `conceal` on the audio decoder, and turning it off restores the
+(`bf9eee985`), it is switchable with `conceal` on the audio decoder, and turning it off restores the
 ramp byte for byte. The stretch commit before it passes its own budgets alone.
 
 **The audio headroom is this fork's addition.** The quests only require observing above the budget,
@@ -815,13 +884,13 @@ Things found while working that are separate from the fix.
 
 1. **`demo/web` pinned `delay="100ms"` on every tile.** That is the "100 ms chip on a fresh session"
    from `watch.md`. Nothing was restoring anything, and no storage was involved. Fixed in
-   `0d06ca4e8`.
+   `d2b8d0133`.
 
 2. **`ui/components/buffer-control.ts` sets a numeric delay on mousedown.** A single click on the bar
    therefore leaves auto without the user asking for a value. Not changed here; it is a UI decision.
 
 3. **The released `latency` attribute falls back to a silent 100 ms** for an unparseable value, where
-   its `delay` sibling warns and falls back to the element default. Made consistent in `c97496853`.
+   its `delay` sibling warns and falls back to the element default. Made consistent in `b7b6d2291`.
 
 4. **`js/net` races a WebSocket against WebTransport after a 500 ms head start.** Any path that slows
    the QUIC handshake past that head start silently falls back to TCP. On the harness's `bursty`
@@ -843,7 +912,7 @@ Things found while working that are separate from the fix.
    `bursty`.
 
 7. **`conceal` needed an element attribute** to be settable from a page before connect, so
-   `<moq-watch conceal>` exists (`a472947be`). It is the only new attribute.
+   `<moq-watch conceal>` exists (`83d369106`). It is the only new attribute.
 
 8. **The shaper's own jitter was reordering datagrams, and it was grading the wrong thing.** Each
    datagram drew its release time as `now + delay + jitter * gaussian`, independently of every other
@@ -851,7 +920,7 @@ Things found while working that are separate from the fix.
    earlier one. QUIC read that as loss, retransmitted, and backed off, so a profile named `mild` was
    measuring congestion response. Real jitter is queueing delay on a FIFO path: it varies the delay
    and preserves the order, and only the reorder draw is meant to overtake, which is what makes a
-   reorder a deliberate act the counters can attribute. Fixed in `492781763`: each lane remembers
+   reorder a deliberate act the counters can attribute. Fixed in `1157fa9a2`: each lane remembers
    when the datagram in front of it leaves and clamps the next one to that, before any reorder delay.
    On the 60 s opus plain rows, target p95 falls from 1960 ms to 420 ms on `mild` and from 1760 ms to
    360 ms on `high-rtt`.
@@ -951,12 +1020,19 @@ the bytes are the empty frame and the empty group that both already define. All 
 
 - `Container.Jitter` is now a class, not a namespace. `Container.Jitter.BUCKET` and
   `Container.Jitter.CEILING` are static readonly members rather than module exports.
+- `Container.Jitter`'s constructor takes an optional `JitterProps` with a `start`, the publisher's
+  declared flush span the cold-start target is taken from. `JitterProps` is a new export.
+- New `ConsumerProps.jitter`, which passes that declaration through from the rendition config.
 - New `Container.Consumer.spread` and `Container.Consumer.skipped`.
 
 **`@moq/watch`**
 
 - `SyncInput` is reduced to `{delay, buffer}`; it loses `probe`, `audio`, `video`, `audioSpread` and
   `videoSpread`.
+- `SyncTrack.advertised` is removed. The rendition's declared flush span reaches the estimator as its
+  cold start instead, so there is nothing left here to read it.
+- A numeric `delay` is now the whole delay. It used to have the advertised flush span added to it, so
+  a viewer asking for 100 ms on a source declaring 300 waited 400.
 - `Sync.track()` is new, and `Sync.out.clock` names whichever track is driving playback.
 - `Clock`, `SyncTrack` and `SyncClockTrack` are new exports.
 - `Audio.Decoder.out` gains `spread`, `underruns`, `skipped` and `debug`.
@@ -976,6 +1052,9 @@ the bytes are the empty frame and the empty group that both already define. All 
 - `decode::Config::delay`, `decode::Config::conceal`, `decode::Config::DELAY_MAX`. `Config` is
   `#[non_exhaustive]`, so these are additive for callers who build through `new`.
 - `decode::Consumer::delay` and `decode::Consumer::playhead`.
+- The catalog's `jitter` seeds the native estimator's cold start, which is behaviour rather than
+  surface. The `delay` floor is untouched: a caller who knows something the arrivals do not say is a
+  different thing from a publisher describing its own encoder.
 - `Consumer::read` returns one 10 ms block rather than a decoder packet when `delay` is set.
 
 **`moq play`**
@@ -1013,7 +1092,7 @@ the bytes are the empty frame and the empty group that both already define. All 
 - `just test audio-quality --runtime replay --enforce`, which is a second and grades six rows
   against ceilings that are exactly what was measured.
 - A CodeRabbit CLI triage per stage, each recorded. The findings that were real became their own
-  commits: `64fd96e55`, `9dcaac2ab`, `38c452730`, `b939f2d10`, and part of `5f43c0f99`.
+  commits: `a08a308a7`, `ad332ab3b`, `970e348dd`, `b7f18deb8`, and part of `d89129c0c`.
 - Listening rounds by the user after the estimator, after the stretch, and after concealment.
 - The A/V desync the user reported after all of that, reproduced and re-measured in headless
   Chromium on a fresh `demo/web` build of this tree against the local relay: the user's own sequence
@@ -1021,13 +1100,13 @@ the bytes are the empty frame and the empty group that both already define. All 
   Worst painted-video-minus-audio skew 3418 ms before and 50 ms after; the regression test reruns the
   same sequence with each half of the fix removed.
 - Each of the five re-landed fixes has a test that fails without it and passes with it.
-- One pre-existing flaky `console.error` spy test was fixed on the way past, in `2ecf1c1a1`.
+- One pre-existing flaky `console.error` spy test was fixed on the way past, in `a4187712a`.
 
 ### What was not run, or not verified
 
 - **No iOS device.** Desktop Safari over safaridriver is the closest proxy this branch has. iOS is
   not measured, and nothing here should be read as a claim about it.
-- **The nightly job has never run on the nightly runner.** `20b2fcbb9` adds the `audio-quality` job
+- **The nightly job has never run on the nightly runner.** `cfffb4250` adds the `audio-quality` job
   to `.github/workflows/nightly.yml` and it runs `--enforce`, but every number in `budgets.json` was
   measured on one desktop. The first nightly run is what says whether these ceilings hold on the
   runner's hardware, and the rows that are still `recorded` are the ones waiting for it.
@@ -1043,7 +1122,17 @@ the bytes are the empty frame and the empty group that both already define. All 
 - **The `4k-webm` fixture has real holes**, so it keeps 1 to 2 underruns, now concealed. That is the
   recording, not the player.
 - **`just test smoke-full` is the cross-language gate** for the `moq play` change and should be run
-  before any of the native commits are adopted.
+  before any of the native commits are adopted. It was run on the rebased tree: 32/32.
+- **The `mild`, `bursty` and `step` Chromium rows do not reproduce themselves.** Two 60 s runs of the
+  same tree disagree by 2.2 against 36 skip-aheads a minute and by 460 against 1700 ms of target p95,
+  which is why twenty-one of twenty-four rows keep the `recorded` marker. Part of that is the cold
+  start: an `auto` row now spends part of its window walking the declaration down, and a target that
+  is still moving is one the ring skips against. Letting a seeded start fall faster than a measured
+  one, since a declaration is a prior rather than an observation, is the obvious next move and is a
+  change to `doc/concept/playout.md` rather than to the budgets.
+- **An intermittent `DataError: Failed to execute 'decode' on 'AudioDecoder'`** shows up on roughly
+  one `opus-mild-isolated` run in three, always right after a rendition handover re-subscribes. It
+  predates this pass (it is in the stage 8b logs too) and it is not diagnosed.
 
 ## How to run
 
@@ -1098,7 +1187,7 @@ shapes are theirs; the fixed point is not carried over, because it exists to tar
 point for the Rust side. Nothing was adapted from it. Its time stretch removes the longest low-energy
 run rather than a pitch period, its expand emits quiet noise rather than concealment, and its buffer
 level filter adds a jump detector NetEq does not have, so it is not the port it looks like. The
-reasoning is in the module header of `6ce7d2bcf`.
+reasoning is in the module header of `64bb9df46`.
 
 **PR #3517.** The two cherry-picked commits keep their author. The arrival observation point, the
 `spread` plumbing, the ring slack, the re-stall, `stall()`, the underrun counter, the worklet ramp,

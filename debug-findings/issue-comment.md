@@ -6,14 +6,15 @@ to be merged as a unit. It exists so the work is readable and measurable, and so
 slices you want.
 
 Branch: [`fperex/moq` `debug-findings-solution`](https://github.com/fperex/moq/tree/debug-findings-solution),
-based on `upstream/dev` at `246a4733f`, read at the branch tip (the docs commits sit on top of the
-last code commit, `5dacdd1b3`). 53 commits.
+rebased onto `upstream/dev` at `8f41d4d82`, read at the branch tip (the docs commit sits on top of
+the last code commit, `3d2182594`). 62 commits.
 Full write-up:
 [`debug-findings/REPORT.md`](https://github.com/fperex/moq/blob/debug-findings-solution/debug-findings/REPORT.md).
 
-### Four root causes
+### Five root causes
 
-Confirmed against `dev` at `246a4733f`. Each one alone is audible.
+The first three were confirmed against `dev`. The last two are this branch's own, found by a
+listener on builds of it. Each one alone is audible.
 
 1. **The ring cap has no hysteresis and no refill.** `shared-ring-buffer.ts` skips ahead whenever
    `buffered > latency` and never re-stalls after running dry (`ring-buffer.ts` mirrors it). Early
@@ -48,6 +49,17 @@ Confirmed against `dev` at `246a4733f`. Each one alone is audible.
    un-stall, the refill, the level filter's floor, and where a skip lands). The skip band does not
    move, so the band above the level the ring holds is exactly the stretch bound.
 
+5. **The advertised jitter was carried twice.** The rendition's catalog `jitter` is the publisher's
+   declared flush span, and `Sync` used it as a floor under `auto` and as a term added to a fixed
+   delay. The TS importer advertises 302 to 372 ms on the `bbb` sources while the estimator on the
+   same path reads 40 to 180, so `auto` never came below the declaration however well the path
+   delivered, and the demo's `100ms` preset actually waited 402 ms. It is one quantity, not two: a
+   flush span is exactly what the estimator goes on to measure, published by the party that already
+   knows it before the first frame lands. That makes it the best prior a receiver has and a poor
+   floor. It now seeds the estimator's cold start instead (`max(advertised, 80ms)`, rounded up to a
+   bucket, in both languages), the measurement takes over from the first resampled observation, and
+   `Sync` is one term: `auto` is the measurement, a fixed delay is the number asked for.
+
 ### The branch, and how to read it
 
 One commit per quest slice. The two oldest are your own #3517 commits, cherry-picked with the author
@@ -55,23 +67,25 @@ intact; everything in them except the estimator is kept.
 
 | Quest | Commits |
 | --- | --- |
-| [`audio-jitter-target/spec.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/spec.md) | `bdf4f64e0` (doc, estimator, 14-case corpus) |
-| [`audio-jitter-target/watch.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/watch.md) | `8dad5e3c2`, `5f43c0f99` (yours), `c97496853`, `9dcaac2ab`, `b42619ae5` |
-| the budget finding (#3 above) | `4a6680c7d`, `4383a2e09`, `6f3bd3e3c` |
-| [`m1/plan-av-clock.md`](https://github.com/moq-dev/moq/blob/dev/quest/m1/plan-av-clock.md) | `5140c63e2`, `8ea218165` (a hole in the source reaches the decoder) |
-| tune-in defect, found by the harness | `dbb8228e3` (browser), `7ad6b1a5c` (native) |
-| [`audio-jitter-target/native.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/native.md) | `9cadfc19c`, `e9d451cdf`, `1e5ce49b6`, `9deb1db75` |
-| [`watch-audio-time-stretch.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/watch-audio-time-stretch.md) | `6ce7d2bcf`, `ed095f21c`, `c0a3deddf` |
-| concealment (my call, see below) | `dfd568613`, `a472947be` (the element attribute) |
-| [`transport-impairment-profile.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/transport-impairment-profile.md) | `863d39c32` (`rs/moq-shaper`) |
-| [`audio-quality-harness/browser.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-quality-harness/browser.md) | `e103f0d80`, `aa0069373`, `ae2fe4256`, `527d3a0d2`, `41b86931e`, `5425bf3c1`, `38c452730`, `69c233696`, `673da3fef` (replay lane), `20b2fcbb9` (nightly), `38d4123e1`, `b939f2d10`, `00596e813`, `b31eb9552` |
-| [`qa-failure-artifacts.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/qa-failure-artifacts.md) | `f4c9da0b2` |
-| re-landed narrow fixes, each with a failing-then-passing test | `42fefae05`, `6bc60d12e`, `ddda15ab2`, `23d310dcd`, `0f775995d` |
-| the shaper defect found while re-measuring | `492781763` |
-| review, flake and delivery | `2ecf1c1a1`, `dececbf81`, `393ff294d`, `067fa459c`, plus this one |
+| [`audio-jitter-target/spec.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/spec.md) | `c807bf719` (doc, estimator, 14-case corpus) |
+| [`audio-jitter-target/watch.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/watch.md) | `faea4e7dd`, `d89129c0c` (yours), `b7b6d2291`, `ad332ab3b`, `c51c2ddcf` |
+| the budget finding (#3 above) | `a4b5f67ed`, `029041c19`, `524e7001a` |
+| [`m1/plan-av-clock.md`](https://github.com/moq-dev/moq/blob/dev/quest/m1/plan-av-clock.md) | `65b243321`, `f3355b2e9` (a hole in the source reaches the decoder) |
+| tune-in defect, found by the harness | `8c6cc2565` (browser), `919e35c54` (native) |
+| [`audio-jitter-target/native.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-jitter-target/native.md) | `4de73282f`, `fa0db311f`, `72d68711e`, `9623deb7c` |
+| [`watch-audio-time-stretch.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/watch-audio-time-stretch.md) | `64bb9df46`, `691c3ad35`, `f5dc706e5` |
+| concealment (my call, see below) | `bf9eee985`, `83d369106` (the element attribute) |
+| [`transport-impairment-profile.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/transport-impairment-profile.md) | `d87d61d99` (`rs/moq-shaper`) |
+| [`audio-quality-harness/browser.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/audio-quality-harness/browser.md) | `8a70fc4d2`, `11000b41e`, `cbad4c766`, `462ca07c1`, `7b2bd7411`, `bad63a277`, `970e348dd`, `168b9c33b`, `e151dd15c` (replay lane), `cfffb4250` (nightly), `14ba83e79`, `b7f18deb8`, `3745d028b`, `411ca585c` |
+| [`qa-failure-artifacts.md`](https://github.com/moq-dev/moq/blob/dev/quest/m2/qa-failure-artifacts.md) | `8a31fea4b` |
+| re-landed narrow fixes, each with a failing-then-passing test | `f2a05dc14`, `4b2f95faf`, `88f58c5f1`, `393ca7305`, `bfc353c5e` |
+| the shaper defect found while re-measuring | `1157fa9a2` |
+| the one-frame hold, and the mute (root causes 4 and 5 in the branch's own numbering) | `73b3f0196`, `b93dfe910`, `5f7ede85d`, `07283facd`, `3b17cb651`, `f10b35208` |
+| the cold start, so a declaration is a prior rather than a floor | `f58d13eda`, `3d2182594` (the budgets it moved) |
+| review, flake and delivery | `a4187712a`, `e84cb740b`, `c96861034`, `7259477c3`, plus this one |
 
-If you only read seven: `bdf4f64e0`, `c97496853`, `4a6680c7d`, `4383a2e09`, `6f3bd3e3c`,
-`c0a3deddf`, `dfd568613`. The native half is the same algorithm again. The harness stands alone and
+If you only read seven: `c807bf719`, `b7b6d2291`, `a4b5f67ed`, `029041c19`, `524e7001a`,
+`f5dc706e5`, `bf9eee985`. The native half is the same algorithm again. The harness stands alone and
 can be adopted without touching the player.
 
 The estimator is the NetEq delay manager, written down once in `doc/concept/playout.md` and held by
@@ -202,7 +216,7 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
   commit, it is behind `conceal` on the audio decoder which defaults on, and turning it off restores
   the ramp byte for byte. The stretch commit before it passes on its own.
 - **The audio age headroom is mine, not the quests'.** Your quests only require observing above the
-  budget, which `4a6680c7d` and `4383a2e09` already do. `6f3bd3e3c` additionally widens the audio
+  budget, which `a4b5f67ed` and `029041c19` already do. `524e7001a` additionally widens the audio
   subscription and consumer to `maxAge + headroom`. It is droppable with no other change, and on the
   recording it buys nothing: it is insurance for a path whose target lands close to the flush span.
 - **The fall bound is not NetEq's.** It closes a sixth of the remaining distance per second rather
@@ -226,7 +240,7 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
   a mute never downloaded is simply absorbed: the chunks step 3 s across the gap and the samples out
   carry on 23.2 ms apart. The PCM lands in the ring 3 s in the past, the ring sees a contiguous
   stream and never skips, and the playhead never comes back to the live edge. It is the same story
-  one frame wide for every group the age budget skips, so it accumulates. `8ea218165` tells the
+  one frame wide for every group the age budget skips, so it accumulates. `f3355b2e9` tells the
   decoder about the hole (drain, restart, let the next chunk anchor it) and flushes the ring while
   nothing is draining it. Not yours and not mine: `dev`'s decode loop has no hole handling either.
   What the A/V clock quest changed is that video now follows the playhead, so the collapse shows up
@@ -250,7 +264,7 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
   mic, RMS p50 went from 2.2e-4 to 0, reaching digital silence 0.2 s in and staying there, largest
   sample step 9.2e-5, audio back in the first 100 ms bucket after the resume.
 - **`demo/web` pinned `delay="100ms"` on every tile.** That is the "100 ms chip on a fresh session"
-  from `watch.md`. No stored preference, nothing restoring anything. Fixed in `0d06ca4e8`.
+  from `watch.md`. No stored preference, nothing restoring anything. Fixed in `d2b8d0133`.
 - **`ui/components/buffer-control.ts` sets a numeric delay on mousedown**, so a single click on the
   bar silently leaves auto. Not changed, it is your UI call.
 - **`js/net` races a WebSocket against WebTransport after a 500 ms head start**, so an impaired UDP
@@ -264,7 +278,7 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
   lane written as a patch and did not land it on a file that does not compile.
 - **My own shaper was reordering datagrams, and that is worth reading even if you never run it.**
   Every datagram drew `now + delay + jitter * gaussian` independently, so any profile with jitter
-  released datagrams out of order; QUIC read that as loss and backed off. Fixed in `492781763`.
+  released datagrams out of order; QUIC read that as loss and backed off. Fixed in `1157fa9a2`.
   What it exposed is about the player, not the shaper: the reordering hurt the *video* stream, not
   audio, and the measured audio spread stayed at 100 to 180 ms while the video spread ran at 1.6 to
   2.0 s. `Sync` in auto takes the larger spread across tracks, so the audio buffer was dragged to 1.5
@@ -286,15 +300,18 @@ resumes. The draft and `doc/concept/hang.md` say so; the bytes are the empty fra
 group both already define. All of the below is `dev` material.
 
 - `@moq/net`: new `Expired extends StreamError` on `DELIVERY_TIMEOUT`, re-exported beside `Lagged`.
-- `@moq/hang`: `Container.Jitter` is a class now (with `BUCKET` and `CEILING` as statics), plus
-  `Container.Consumer.spread` and `Container.Consumer.skipped`.
+- `@moq/hang`: `Container.Jitter` is a class now (with `BUCKET` and `CEILING` as statics) and takes
+  an optional `{start}`, plus `Container.Consumer.spread`, `Container.Consumer.skipped` and a
+  `ConsumerProps.jitter` that seeds the estimate from the rendition's declared flush span.
 - `@moq/watch`: `SyncInput` reduced to `{delay, buffer}`; new `Sync.track()`, `Sync.out.clock`, and
-  the `Clock` / `SyncTrack` / `SyncClockTrack` exports; `Audio.Decoder.out` gains `spread`,
+  the `Clock` / `SyncTrack` / `SyncClockTrack` exports; `SyncTrack.advertised` removed and a fixed
+  `delay` no longer has the advertised flush span added to it; `Audio.Decoder.out` gains `spread`,
   `underruns`, `skipped`, `debug`; `Video.Decoder.out` gains `skipped`; new `DecoderInput.conceal`
   and the `<moq-watch conceal>` attribute. Internal to the ring, not exported: `AudioBuffer.end()`,
   `RingView.ended`, and an `ENDED` control slot that takes the shared ring from 18 to 19.
 - `rs/moq-audio`: `decode::Config::{delay, conceal, DELAY_MAX}` on a `#[non_exhaustive]` struct, and
-  `Consumer::{delay, playhead}`.
+  `Consumer::{delay, playhead}`. The catalog's `jitter` now seeds the native estimator too; the
+  `delay` floor is unchanged.
 - `moq play --delay` becomes a floor capped at 2 s rather than the delay capped at 10 s. That is the
   one `!` break.
 - New crate `rs/moq-shaper` (`publish = false`) and new private workspace member
@@ -307,7 +324,7 @@ group both already define. All of the below is `dev` material.
 Stating this plainly, because some of it matters for how much weight the numbers carry.
 
 - **No iOS device.** Desktop Safari through safaridriver is the closest proxy. iOS is not measured.
-- **The nightly job has never run on your runner.** `20b2fcbb9` adds it and it passes `--enforce`,
+- **The nightly job has never run on your runner.** `cfffb4250` adds it and it passes `--enforce`,
   but every ceiling in `budgets.json` was measured on one desktop. The rows still marked `recorded`
   are the ones I would not ask a different machine to clear yet.
 - **Local measurements were taken on a loaded machine** (load average 13 to 23 at times). One control
