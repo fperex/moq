@@ -837,6 +837,125 @@ the estimator and the skip band still argue, and it is the same cell that would 
 itself across two runs. `opus-step-plain` skips 1481 ms against 1112 ms at a 1500 ms target. Both
 are `recorded` rows and both are in the residual list above.
 
+### Browser coverage
+
+Chromium is not the only engine a viewer brings, and Firefox and Safari matter more than their share
+here because the WebSocket fallback has an arrival shape of its own. So the same build was played in
+four engines against three sources, 90 s a row, sampled every 250 ms, with a browser publisher on a
+real microphone for the first source. The reference is a WebRTC conference: a 20 to 100 ms jitter
+target, under 150 ms held on the LAN and under 200 ms through the public relay, audio and video
+within a frame, and no underruns once converged.
+
+Engines: Chromium 153.0.8010.12, Firefox 155.0, Playwright WebKit 26.6, and real Safari 26.6 driven
+through `safaridriver`. Held is the settled target plus the chunk the ring holds, which is what a
+listener actually waits. Skew is the painted video timestamp minus the audio playhead, so a negative
+number is video behind audio.
+
+| Source | Engine | Transport | Target | Held | Level p50/p95 | Underruns | Short | Concealed | Skips | Skew p50/p95 | Meets |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| microphone, LAN | Firefox | webtransport | 40 ms | 60 ms | 73/87 ms | 3 | 0 | 60 ms | 0 | -18/3 ms | target and held yes, underruns no |
+| microphone, LAN | WebKit | websocket | 40 ms | 60 ms | 62/74 ms | 0 | 0 | 0 | 0 | -7/19 ms | yes |
+| microphone, LAN | Safari | websocket | 40 ms | 60 ms | 65/77 ms | 0 | 1 | 0 | 0 | -6/18 ms | yes, after a 2.2 s video stall |
+| `bbb-smooth.hang`, LAN | Firefox | webtransport | 100 ms | 123 ms | 95/146 ms | 1 | 0 | 40 ms | 0 | -24/3 ms | target and held yes, underruns no |
+| `bbb-smooth.hang`, LAN | WebKit | websocket | 80 ms | 103 ms | 91/112 ms | 0 | 0 | 0 | 0 | -21/2 ms | yes |
+| `bbb-smooth.hang`, LAN | Safari | websocket | 60 ms | 83 ms | 87/111 ms | 0 | 0 | 0 | 0 | -22/3 ms | yes |
+| `bbb.hang`, cdn.moq.pro | Firefox | webtransport | 200 ms | 223 ms | 251/337 ms | 0 | 0 | 0 | 0 | -26/1 ms | held 223 ms, 23 ms over |
+| `bbb.hang`, cdn.moq.pro | WebKit | websocket | 200 ms | 223 ms | 224/298 ms | 0 | 0 | 0 | 0 | -20/-1 ms | held 223 ms, 23 ms over |
+| `bbb.hang`, cdn.moq.pro | Safari | websocket | 200 ms | 223 ms | 232/302 ms | 1 | 0 | 60 ms | 2 | -21/2 ms | held 223 ms, 23 ms over |
+
+Counters are the delta over the settled window, which starts 20 s in. The microphone rows are one
+Chromium publisher on the real device with echo cancellation, auto gain, noise suppression and Opus
+DTX all off, confirmed on the element's own track rather than on a second `getUserMedia`.
+
+Three things the table says. The estimator lands in the 20 to 100 ms band on every engine for both
+LAN sources, and the engines agree with each other to within one 20 ms bucket. The A/V skew is
+within one frame at p50 and p95 everywhere, on both transports. And the public relay settles at 200
+ms on all three, which with a 23 ms AAC chunk is 223 ms held: 23 ms over the 200 ms target, and the
+overshoot is the chunk rather than the estimator.
+
+Firefox negotiated WebTransport on every row rather than the WebSocket fallback, because the
+user-agent gate in `js/net/src/connection/browser.ts` admits Firefox from 153.0 and this is 155.0.
+So the WebSocket lane here is WebKit and Safari, not Firefox.
+
+Firefox is also the only engine that underran after convergence: 3 episodes and 60 ms of concealment
+on the microphone row, 1 and 40 ms on `bbb-smooth`, against zero for both WebKit and Safari on the
+same sources. Every other counter is level with theirs, so this is arrival jitter Firefox's
+WebTransport delivers and the other two do not, not a deeper buffer doing the work.
+
+### The mute and preset sequence, per engine
+
+The user's sequence on the microphone broadcast: ten seconds at auto, mute for three, unmute, then
+2000 ms, 100 ms and auto presets for eight seconds each, five quick mute/unmute pairs, and ten
+seconds idle. Skew is measured from the mute onwards, because the opening ten seconds are the cold
+start rather than the toggle.
+
+| Engine | Worst skew | Where | Skew p50 | Underruns |
+| --- | ---: | --- | ---: | ---: |
+| Firefox | 3256 ms | 0.2 s after unmute | -14 ms | 0 |
+| WebKit | 3076 ms | 0.1 s after unmute | 3 ms | 0 |
+| Safari | not measured | the ring never started, see below | - | - |
+
+Both engines that ran it spike the same way at the same place: unmuting after three seconds of mute
+leaves video roughly three seconds ahead of the audio playhead for about a second, then it recovers.
+It is the muted interval reappearing as skew, and it is the same shape in an engine on WebTransport
+and an engine on a WebSocket, so it is the player rather than the transport. It survives this
+branch's fixes and is the strongest remaining lead on the user's original desync report.
+
+### Browser publishers
+
+| Publisher | Watcher | Result |
+| --- | --- | --- |
+| Firefox 155 | Chromium | published; target 20 ms, held 40 ms, level p50 40 ms, zero underruns, skew -19/-2 ms |
+| WebKit 26.6 | Chromium | could not run: `no video permission`, `no audio permission` |
+
+The Firefox publisher is the tightest row in this whole pass: a 20 ms target over a 20 ms Opus
+chunk, 40 ms held end to end on the LAN. Its track reports `echoCancellation`, `autoGainControl` and
+`noiseSuppression` all false, so that is the raw device.
+
+WebKit could not be made a publisher here, and the reason is the harness rather than the engine.
+Playwright's WebKit rejects `newContext({ permissions: ["microphone"] })` with `Unknown permission:
+microphone`, and it has no `--use-fake-ui-for-media-stream` equivalent, so `getUserMedia` is denied
+and the publish element logs `no video permission` / `no audio permission` and never announces. What
+the engine does support was checked directly: `AudioEncoder` and `VideoEncoder` both exist and
+`AudioEncoder.isConfigSupported({codec: "opus"})` is true, and the session itself reaches
+`connected` over a WebSocket. `MediaStreamTrackProcessor` is absent, which
+`js/publish/src/video/processor.ts` already has a fallback for. So WebKit publishing is untested
+rather than broken.
+
+### Real Safari never gets a browser publisher's catalog
+
+The one hard engine defect this pass found, and it is not diagnosed to a line.
+
+In real Safari, on the same page, the same session and the same relay, a broadcast published from a
+browser never delivers its catalog, while the two ffmpeg-published broadcasts on that session deliver
+theirs in under five seconds. Sixty seconds of it, sampled every five:
+
+```text
+demo/bbb-smooth.hang catalog=yes video=yes | demo/bbb.hang catalog=yes video=yes | demo/mic-chromium-*.hang catalog=no video=no
+```
+
+That line is identical at 5 s and at 60 s. `connection.status` is `connected` and
+`connection.transport` is `websocket` throughout, the announcement arrives (the tile is on the page),
+and neither `console.error` nor `window.onerror` nor `unhandledrejection` reports anything. With no
+catalog there is no audio config, so no `AudioContext` is ever built, so no amount of clicking can
+start audio: the row plays nothing at all. Playwright WebKit 26.6, on the same WebSocket transport
+against the same broadcast, has the catalog in about 2 s.
+
+What it is not: not `WebSocketStream` (neither WebKit nor Safari has it, so both take the same plain
+WebSocket path, while Chromium is the only engine that has it); not the JSON snapshot producer
+holding a group open for deltas, because `CatalogProducer.serve` in `js/publish/src/catalog.ts`
+passes `deltaRatio: 0` and every catalog group is closed after one frame; not the compressed
+`catalog.json.z` track, which `js/watch/src/broadcast.ts` makes opt-in and never auto-detects; and
+not head-of-line blocking behind the 4 Mbps `bbb.hang`, because that broadcast is one of the two that
+works on the same session. It is reproducible on demand and it is the next thing to chase.
+
+One softer Safari note from the same runs: the `moq-watch` element builds its `AudioContext` only
+once the catalog names an audio rendition, and `unlockOnGesture` is armed at that moment, so the
+click that selected the tile has already passed. In Chromium and Firefox the unconditional
+`resume()` succeeds anyway; in real Safari it does not, and a viewer has to click a second time after
+the video appears before they hear anything. On `bbb-smooth.hang` the catalog arrives before the
+click and one click is enough, which is why this only shows up on a slow-starting broadcast.
+
 ### Gates on the final tree
 
 Every row below was run on the rebased tree, in this order, one at a time.
