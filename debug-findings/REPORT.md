@@ -92,7 +92,9 @@ with their author intact.
 | 59 | `bda8c3927` | delivery | This report and the issue comment, with the mute finding |
 | 60 | `f58d13eda` | cold start (user decision) | The catalog jitter seeds the playout target instead of flooring it |
 | 61 | `3d2182594` | harness | The budgets re-recorded on the rebased tree |
-| 62 | this one | delivery | This report and the issue comment, with the cold-start rule |
+| 62 | `435307744` | delivery | This report and the issue comment, with the cold-start rule |
+| 63 | `58f79a8e2` | cold start (user decision) | The first measurement replaces the seeded playout target, as NetEq does |
+| 64 | this one | harness (intermittent) | The re-anchored decoder is never handed a chunk it refuses |
 
 Suggested reading order for review: 3, 4, 9 to 11, 21, 22, 31. Those seven are the fix. The native
 half (7, 16 to 20) is the same algorithm again and can be read second or skipped entirely. The
@@ -295,6 +297,10 @@ of the playhead and that audio ends at the live edge, then reruns with each of t
 switched off as the control, where the playhead ends 5.9 s behind live and the picture 5.8 s ahead
 of it. `terminal.test.ts` covers the hole test and its re-anchor; `sync.test.ts` covers a clock that
 is lost and re-nominated at a different playhead.
+
+Re-anchoring mid-group also has to hand the restarted decoder a chunk it will accept, which this
+stage did not, and which killed the decode loop outright about one harness run in three. See finding
+11\.
 
 ### The tune-in defect
 
@@ -1010,6 +1016,68 @@ Things found while working that are separate from the fix.
     `audio.out.debug.concealed` over the same sequence went from 46,244 samples before to 0 after.
     The endpoint's own path is covered by unit tests on both rings instead.
 
+11. **The re-anchor above handed the decoder a chunk it refuses, and the audio never came back.**
+    `DataError: Failed to execute 'decode' on 'AudioDecoder'` in roughly one run in three of
+    `chromium-opus-48000-mild-isolated`, always within a second of a rendition handover. This one is
+    the branch's own: `f3355b2e9` introduced it, and it does not pre-exist upstream. `upstream/dev`'s
+    audio decode loop has no `#reanchor` and no `Terminal.continues`, so the throwing call site is
+    not there at all; its only reset site is the container discontinuity in `#onNext`, which is
+    always followed by a group's first frame. The harness agrees: no run recorded before the hole fix
+    carries it (`aq-final-1` at 02:14, `aq-enforce` at 03:13), and every run after it carries exactly
+    one (`aq-int-1` at 16:20, `aq-int-2` at 16:45, `aq-int-enforce` at 17:12). `f3355b2e9` is dated
+    13:02, between the two groups, and a sweep of every recorded run directory finds the string in
+    those three and nowhere else.
+
+    The mechanism is one line. `Container.Consumer` marks only a group's *first* frame `keyframe:
+    true`, and deliberately so: `Cmaf.Format` never reports an audio keyframe, because packagers flag
+    every audio sample a sync sample and each one would otherwise open an epoch. WebCodecs is the
+    other way round: a decoder that was just configured, reset, or flushed accepts only a chunk
+    marked `key`. `#reanchor` resets and reconfigures the decoder and then the loop decodes the very
+    frame that reported the hole, and that frame is mid-group far more often than not, so Chromium
+    threw. The throw escaped `effect.spawn`, which ends the decode loop for the life of the session:
+    the ring drains, `stalled` latches true, and RMS sits at zero for the rest of the run. The
+    DataError is not a symptom of the audio dying, it is what kills it.
+
+    Instrumented and reproduced deterministically at 240 s, where the publisher's catalog update at
+    about 183 s replaces the audio subscription:
+
+    ```
+    received catalog / subscribe close id=1 / subscribe start id=3   the handover
+    decode ts=182860000 key=true  grp=79 idx=0    first frame of the run, forced key
+    decode ts=182903229 key=false grp=79 idx=1    43.2 ms later, no hole reported yet:
+                                                  nothing had decoded, so there was no
+                                                  frame duration to measure one against
+    reanchor at ts=182946438 key=false grp=79     43.2 ms again, now measurable: a hole
+    reanchored state=configured                   flush, reset, configure
+    decode ts=182946438 key=false ...             DataError
+    ```
+
+    The 43.2 ms spacing is the handover joining a group already in flight under the subscription's
+    own max age, which is why the re-anchor was right to fire. What was wrong is the chunk it was
+    then handed.
+
+    Fixed by `audio/anchor.ts`: a small `Anchor` that remembers the decoder was restarted and types
+    the chunk that reopens the run `key`, whatever the container called it. That is the same claim
+    the container already makes at every group boundary, and it is sound for exactly the reason
+    re-anchoring on an arbitrary frame is sound: every frame of Opus, AAC and MP3 is independently
+    decodable. Nothing is wrapped in a catch, so a decode that still fails surfaces the way it does
+    today. Both decode loops and both drain sites (`#reanchor`, `#declareEnd`) mark it, since a flush
+    alone ends the run the decoder will accept a chunk into.
+
+    `anchor.test.ts` drives a mock decoder that refuses a non-key chunk the way Chromium does; four
+    of its five cases fail against the old `frame.keyframe ? "key" : "delta"`. Six 240 s harness runs
+    of the row after the fix, each of which reached the handover, record zero occurrences.
+
+    One nuance worth passing on. The observed failure is this branch's, but the class of it is not
+    quite. The `#onNext` epoch reset exists on `upstream/dev` too, and it also resets, reconfigures,
+    and then decodes whatever the consumer hands back. That is normally a group's first frame, so it
+    is normally a key. The exception is `Consumer.#checkReset`: a publisher rewind resumes from the
+    earliest surviving group, and a survivor may already be part delivered, in which case the frame
+    after the discontinuity is mid-group. No run here has hit it, so this is a reading of the code
+    rather than a measurement, but the `Anchor` closes it wherever it is adopted. `Video.Decoder` has
+    no equivalent exposure: it configures once per run and never resets, and its frames are not all
+    independently decodable anyway, so it keeps the container's own flag.
+
 ## Public API and wire impact
 
 No wire format change anywhere. One wire *semantics* addition: an audio endpoint bounds the source
@@ -1139,9 +1207,12 @@ the bytes are the empty frame and the empty group that both already define. All 
   `doc/concept/playout.md` rather than in the budgets: the first measurement replaces the seed
   outright, so an `auto` row is on its measured target within a second. `budgets.json` still holds
   the numbers recorded before that change and has to be re-recorded against it.
-- **An intermittent `DataError: Failed to execute 'decode' on 'AudioDecoder'`** shows up on roughly
-  one `opus-mild-isolated` run in three, always right after a rendition handover re-subscribes. It
-  predates this pass (it is in the stage 8b logs too) and it is not diagnosed.
+- **The intermittent `DataError: Failed to execute 'decode' on 'AudioDecoder'` is diagnosed and
+  fixed.** See finding 11. It did not predate the hole fix: the earlier note that it appears in the
+  stage 8b logs is wrong, and a sweep of every recorded run directory finds it only in the three runs
+  taken after `f3355b2e9`. It was reproduced deterministically at 240 s, where the publisher's catalog
+  update near 183 s replaces the audio subscription, and six 240 s runs after the fix, each reaching
+  that handover, record zero.
 
 ## How to run
 

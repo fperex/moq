@@ -18,6 +18,7 @@ import { base64ToBytes } from "../base64";
 import { accumulate, nextMedia, subscribeMedia } from "../media";
 
 import type { Delay, Sync } from "../sync";
+import { Anchor } from "./anchor";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
 import { audioMaxAge, type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
 import { Handover } from "./handover";
@@ -469,6 +470,7 @@ export class Decoder {
 			if (!loaded) return; // cancelled
 
 			const warmup = new Warmup(LEGACY_WARMUP_CALLBACKS);
+			const anchor = new Anchor();
 
 			const decoder = new AudioDecoder({
 				output: (data) => {
@@ -507,9 +509,10 @@ export class Decoder {
 				if (this.#onNext(next)) {
 					decoder.reset();
 					decoder.configure(decoderConfig);
+					anchor.restarted();
 				}
 				if (next.end !== undefined) {
-					await this.#declareEnd(decoder);
+					await this.#declareEnd(decoder, anchor);
 					continue;
 				}
 
@@ -522,7 +525,7 @@ export class Decoder {
 
 				// A hole in the source has to reach the decoder as one. See #reanchor.
 				if (!this.#terminal.continues(frame.timestamp as Time.Micro)) {
-					await this.#reanchor(decoder, decoderConfig);
+					await this.#reanchor(decoder, anchor, decoderConfig);
 				}
 
 				this.#out.stats.update((stats) => ({
@@ -534,7 +537,7 @@ export class Decoder {
 				await this.#ring?.wait(frame.timestamp as Time.Micro);
 
 				const chunk = new EncodedAudioChunk({
-					type: frame.keyframe ? "key" : "delta",
+					type: anchor.type(frame.keyframe),
 					data: frame.payload,
 					timestamp: frame.timestamp,
 				});
@@ -606,6 +609,7 @@ export class Decoder {
 				description,
 			};
 			decoder.configure(decoderConfig);
+			const anchor = new Anchor();
 
 			for (;;) {
 				const next = await nextMedia(consumer);
@@ -615,10 +619,11 @@ export class Decoder {
 				if (this.#onNext(next)) {
 					decoder.reset();
 					decoder.configure(decoderConfig);
+					anchor.restarted();
 				}
 
 				if (next.end !== undefined) {
-					await this.#declareEnd(decoder);
+					await this.#declareEnd(decoder, anchor);
 					continue;
 				}
 
@@ -630,7 +635,7 @@ export class Decoder {
 
 				// A hole in the source has to reach the decoder as one. See #reanchor.
 				if (!this.#terminal.continues(frame.timestamp)) {
-					await this.#reanchor(decoder, decoderConfig);
+					await this.#reanchor(decoder, anchor, decoderConfig);
 				}
 
 				this.#out.stats.update((stats) => ({
@@ -644,7 +649,7 @@ export class Decoder {
 				if (decoder.state === "closed") break;
 				decoder.decode(
 					new EncodedAudioChunk({
-						type: frame.keyframe ? "key" : "delta",
+						type: anchor.type(frame.keyframe),
 						data: frame.payload,
 						timestamp: frame.timestamp,
 					}),
@@ -666,9 +671,12 @@ export class Decoder {
 	 *
 	 * Draining first keeps the frames still in flight, which belong to the run that is ending.
 	 */
-	async #reanchor(decoder: AudioDecoder, config: AudioDecoderConfig): Promise<void> {
+	async #reanchor(decoder: AudioDecoder, anchor: Anchor, config: AudioDecoderConfig): Promise<void> {
 		// Teardown rejects a flush in progress; the decode loop checks `state` before its next decode.
 		await decoder.flush().catch(() => {});
+		// The flush alone already ends the run the decoder will accept a chunk into, so the next chunk
+		// has to open a new one whether or not the reset below runs.
+		anchor.restarted();
 		if (decoder.state !== "configured") return;
 
 		this.#terminal.reanchor();
@@ -785,7 +793,7 @@ export class Decoder {
 	 * flight, and the ring may only render silence once it holds all of it. Each hang audio frame is
 	 * independently decodable, so flushing costs nothing but the wait.
 	 */
-	async #declareEnd(decoder: AudioDecoder): Promise<void> {
+	async #declareEnd(decoder: AudioDecoder, anchor: Anchor): Promise<void> {
 		if (decoder.state === "configured") {
 			// A flush rejects only when the decoder is torn down under it, in which case the ring is
 			// going away too and there is no endpoint left to declare.
@@ -793,6 +801,8 @@ export class Decoder {
 				() => true,
 				() => false,
 			);
+			// A flushed decoder starts a new run, so whatever follows the endpoint has to open it.
+			anchor.restarted();
 			if (!flushed) return;
 		}
 		this.#ring?.end();
