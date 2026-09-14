@@ -877,7 +877,15 @@ mod tests {
 		player.play(100);
 		let after = player.engine.playhead().expect("audio has played");
 		assert!(after > during);
-		assert!(after < Duration::from_millis(1600), "playout ran ahead of the media");
+
+		// The publisher's clock runs with ours here, so it has produced exactly as
+		// much media as the wall clock has run. A playhead past that is playout
+		// counting concealment as media.
+		let produced = Duration::from_secs_f64(player.now / 1000.0);
+		assert!(
+			after < produced,
+			"playout ran ahead of the media: {after:?} of {produced:?}"
+		);
 	}
 
 	/// A floor the age budget cannot hold is a contradiction the caller has to

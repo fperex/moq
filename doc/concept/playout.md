@@ -283,16 +283,32 @@ nothing like it. Never below that guess, because the network adds to a flush
 span rather than replacing it, and never above the histogram's range, or the
 declaration would name a target no observation could bring down.
 
-It is a start, not a floor. The measurement owns the target from the first
-resampled observation half a second in, and the ordinary fall bound walks it
-down from there: a publisher declaring 300 ms on a path that turns out to
-deliver inside 20 ms ends at 20 ms, in the same steps every other fall takes.
-A receiver holding audio because of a declaration alone, after measuring the
-path for a minute, is holding it for no reason it can point at; and what
-playback must never go below is the measured p95 plus the chunk the ring holds
-on top of it, which is a measurement, not a declaration.
-
 A receiver that is handed no declaration starts at the 80 ms guess.
+
+**The first observation replaces it outright**, however far below it that
+lands. A seed is a prior, not an observation, and the fall bound below exists
+to protect a measurement from the next one; there is no measurement here for it
+to protect. NetEq does exactly this:
+
+```
+target_level_ms_ = underrun_optimizer_.GetOptimalDelayMs().value_or(kStartDelayMs);
+```
+
+`delay_manager.cc`. The start delay is the value used while the optimizer has
+none, and the first one it produces takes over whole. There is no fall bound in
+NetEq at all.
+
+Walking the seed down instead is what the first version did, and it costs a
+viewer the difference for as long as the walk takes: a 310 ms declaration
+coming down a sixth a second sits above a 20 ms path for tens of seconds, on
+every tune-in, while nothing that was measured asked for any of it. A receiver
+holding audio because of a declaration alone is holding it for no reason it can
+point at; what playback must never go below is the measured p95 plus the chunk
+the ring holds on top of it, which is a measurement, not a declaration.
+
+So the seed is a start: not a floor under the target, and not a brake on how
+fast it leaves. From the first resampled observation half a second in, the
+target is a measurement, and the two rules below apply between measurements.
 
 **Rise is immediate.** A late frame has already proven the buffer is too
 shallow, and every moment spent ramping up costs an underrun the viewer hears.
@@ -300,8 +316,8 @@ There is no rise limiter because there does not need to be one: the histogram's
 range caps the target at 2000 ms, and a single observation can only move the
 quantile by the mass one add carries.
 
-**Fall is once a second**, by a sixth of the distance left or one bucket,
-whichever is more, and multi-step:
+**Fall is once a second**, between two measured values, by a sixth of the
+distance left or one bucket, whichever is more, and multi-step:
 
 ```
 steps = floor((now - lowered) / 1000)
@@ -343,9 +359,9 @@ time as mass leaves the tail, not smoothly. That is the case the fixed step
 could not follow.
 
 **No floor.** The estimator never applies one, including to its own start. The
-rendition's advertised `jitter` reaches it as the cold start above and nowhere
-else, so in `@moq/watch` an auto delay is the target and a fixed delay is the
-number the viewer asked for. Carrying the declaration a second time, as a floor
+rendition's advertised `jitter` reaches it as the cold-start prior above and
+nowhere else, so in `@moq/watch` an auto delay is the target and a fixed delay
+is the number the viewer asked for. Carrying the declaration a second time, as a floor
 under auto or a term added to a fixed delay, double-counted it: a viewer asking
 for 100 ms on a source declaring 300 waited 400, and a LAN viewer measuring
 20 ms was pinned at 300 for the length of the session.
@@ -439,6 +455,9 @@ The same list, from the Rust side. Each of these reads correct and is not.
 - Empty-interval decay runs after the closed interval's maximum, capped at 60.
 - The target starts at the declared flush span rounded up to a whole bucket, or
   at 80 ms when nothing is declared. Not at 0 and not at the first quantile.
+- That start is replaced by the first quantile outright, in one step and with no
+  bound. Running it through the fall bound instead leaves every unseeded trace
+  sitting at 80 ms for three seconds and a seeded one for far longer.
 - The reading-gap test needs both terms. Idle time alone throws away every
   observation a track slower than two frames a second makes.
 - The reading gap is measured against the previous **admitted** arrival, so a
@@ -507,4 +526,4 @@ The cases, and what each one holds:
 | `discontinuity` | `reanchor()` keeps the distribution and drops the reference. |
 | `outlier` | A 2500 ms arrival is dropped rather than clamped. |
 | `sparse` | 1 frame per second falls at the same wall-clock rate as 50. |
-| `seeded` | A declared 310 ms flush span starts the target at 320 ms and the measurement walks it down to 20 ms. |
+| `seeded` | A declared 310 ms flush span starts the target at 320 ms and the first observation replaces it with 20 ms. |

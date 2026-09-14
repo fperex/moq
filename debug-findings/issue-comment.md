@@ -57,8 +57,12 @@ listener on builds of it. Each one alone is audible.
    flush span is exactly what the estimator goes on to measure, published by the party that already
    knows it before the first frame lands. That makes it the best prior a receiver has and a poor
    floor. It now seeds the estimator's cold start instead (`max(advertised, 80ms)`, rounded up to a
-   bucket, in both languages), the measurement takes over from the first resampled observation, and
-   `Sync` is one term: `auto` is the measurement, a fixed delay is the number asked for.
+   bucket, in both languages), and the first resampled observation half a second in replaces that
+   seed outright rather than walking down to it: a seed is a prior, not an observation, so there is
+   no earlier measurement for the fall bound to protect. NetEq does the same with `kStartDelayMs`
+   (`target_level_ms_ = underrun_optimizer_.GetOptimalDelayMs().value_or(kStartDelayMs)` in
+   `delay_manager.cc`, with no fall bound at all). `Sync` is then one term: `auto` is the
+   measurement, a fixed delay is the number asked for.
 
 ### The branch, and how to read it
 
@@ -81,7 +85,7 @@ intact; everything in them except the estimator is kept.
 | re-landed narrow fixes, each with a failing-then-passing test | `f2a05dc14`, `4b2f95faf`, `88f58c5f1`, `393ca7305`, `bfc353c5e` |
 | the shaper defect found while re-measuring | `1157fa9a2` |
 | the one-frame hold, and the mute (root causes 4 and 5 in the branch's own numbering) | `73b3f0196`, `b93dfe910`, `5f7ede85d`, `07283facd`, `3b17cb651`, `f10b35208` |
-| the cold start, so a declaration is a prior rather than a floor | `f58d13eda`, `3d2182594` (the budgets it moved) |
+| the cold start, so a declaration is a prior the first measurement replaces | `f58d13eda`, `3d2182594` (the budgets it moved), and the seed-replacement commit |
 | review, flake and delivery | `a4187712a`, `e84cb740b`, `c96861034`, `7259477c3`, plus this one |
 
 If you only read seven: `c807bf719`, `b7b6d2291`, `a4b5f67ed`, `029041c19`, `524e7001a`,
@@ -89,8 +93,8 @@ If you only read seven: `c807bf719`, `b7b6d2291`, `a4b5f67ed`, `029041c19`, `524
 can be adopted without touching the player.
 
 The estimator is the NetEq delay manager, written down once in `doc/concept/playout.md` and held by
-a checked-in corpus at `rs/moq-audio/tests/playout-01.json` that both languages replay exactly, 14 of
-14\. No frame term: the quantile already reports the bucket's upper edge, and the consumer's own
+a checked-in corpus at `rs/moq-audio/tests/playout-01.json` that both languages replay exactly, 15 of
+15\. No frame term: the quantile already reports the bucket's upper edge, and the consumer's own
 granularity belongs to the ring. That is what removes the timestamp arithmetic that gave #3517 its
 14.56 s target.
 
@@ -220,10 +224,11 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
   subscription and consumer to `maxAge + headroom`. It is droppable with no other change, and on the
   recording it buys nothing: it is insurance for a path whose target lands close to the flush span.
 - **The fall bound is not NetEq's.** It closes a sixth of the remaining distance per second rather
-  than one bucket per step. The reasoning is in `doc/concept/playout.md`: the quantile is a bucket
-  index and comes down in handfuls of buckets, and a fixed step made the time to undo an overshoot
-  grow with the overshoot. This is what fixed a tune-in target that sat at 1.2 to 1.9 s for over a
-  minute.
+  than one bucket per step, and it applies only between two measured values. The reasoning is in
+  `doc/concept/playout.md`: the quantile is a bucket index and comes down in handfuls of buckets, and
+  a fixed step made the time to undo an overshoot grow with the overshoot. This is what fixed a
+  tune-in target that sat at 1.2 to 1.9 s for over a minute. NetEq has no fall bound, and it has none
+  on the cold start either, which is the one place this now matches it exactly.
 - **`kPostponeDecodingLevel` gates expansion, not decoding**, so it does not fight the ring's
   re-stall, which already holds until the full target is back.
 - **No frame-buffer smart flushing in the browser.** The trough-based skip band is stricter, and both

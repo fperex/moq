@@ -45,9 +45,9 @@ export type JitterProps = {
 	/**
 	 * What the publisher declares it flushes, from the rendition's catalog `jitter`.
 	 *
-	 * The cold-start target, not a floor: it is the only thing a receiver knows about the path
-	 * before the first frame lands, and it is a better guess than a constant. The measurement takes
-	 * over from the first resampled observation and may take the target below it.
+	 * A prior, not an observation: it is the only thing a receiver knows about the path before the
+	 * first frame lands, and it is a better guess than a constant. The first resampled observation
+	 * replaces it outright, however far below it that lands.
 	 */
 	start?: Time.Milli;
 };
@@ -63,9 +63,9 @@ export type JitterProps = {
  *
  * The estimate rises the moment a late frame proves the buffer is too shallow and falls once a
  * second by a share of the distance left, so a refinement shrinks a viewer's buffer in steps it can
- * absorb without taking longer to undo than the histogram remembers. It carries no floor: the
- * rendition's advertised jitter is where it starts ({@link JitterProps.start}), and the measurement
- * owns the target from the first observation onwards.
+ * absorb without taking longer to undo than the histogram remembers. That bound holds between two
+ * measurements. It carries no floor: the rendition's advertised jitter is the prior it starts from
+ * ({@link JitterProps.start}), and the first measurement replaces it outright.
  *
  * Time the receiver spends not reading is not the path's fault, so a gap in the receiver's own
  * reading drops the arrival reference rather than reading as a delay the size of the gap.
@@ -117,8 +117,8 @@ export class Jitter {
 	// The quantile's upper edge, i.e. what the histogram currently asks for.
 	#optimal?: number;
 
-	// What the target reads until the first observation lands.
-	readonly #start: number;
+	// Whether the target is a measurement yet, or still the seeded prior.
+	#measured = false;
 
 	// The published target, and when it last moved.
 	#target: number;
@@ -133,9 +133,8 @@ export class Jitter {
 	constructor(props?: JitterProps) {
 		for (let i = 0; i < BUCKETS; i++) this.#buckets[i] = 0.5 ** (i + 1);
 
-		this.#start = startTarget(props?.start);
-		this.#target = this.#start;
-		this.#value = new Signal<Time.Milli>(Time.Milli(this.#start));
+		this.#target = startTarget(props?.start);
+		this.#value = new Signal<Time.Milli>(Time.Milli(this.#target));
 		this.value = this.#value;
 	}
 
@@ -250,10 +249,13 @@ export class Jitter {
 
 			this.#adds++;
 			this.#forget = Math.max(0, Math.min(FORGET, 1 - START_FORGET_WEIGHT / (this.#adds + 1)));
-		}
 
-		// The bucket's upper edge, because the delay it holds is somewhere inside it.
-		this.#optimal = (this.#quantile() + 1) * Jitter.BUCKET;
+			// The bucket's upper edge, because the delay it holds is somewhere inside it. Read
+			// inside the guard: a dropped observation leaves the histogram alone, so re-reading the
+			// quantile would return what it already says, and before the first real one it would
+			// publish the bare prior as though something had measured it.
+			this.#optimal = (this.#quantile() + 1) * Jitter.BUCKET;
+		}
 	}
 
 	// The lowest bucket whose tail mass has dropped to 1 - QUANTILE.
@@ -268,7 +270,22 @@ export class Jitter {
 	}
 
 	#publish(now: number): void {
-		const optimal = this.#optimal ?? this.#start;
+		const optimal = this.#optimal;
+
+		// A seed is a prior, not an observation. It holds the target until the histogram has
+		// measured something, and the first measurement then replaces it outright however far below
+		// it that lands: there is no earlier measurement for the fall bound to protect, and walking
+		// down from a guess keeps a viewer above their real buffer for tens of seconds. NetEq does
+		// the same, replacing `kStartDelayMs` with the first optimal delay it gets rather than
+		// approaching it (`delay_manager.cc`).
+		if (optimal === undefined) return;
+		if (!this.#measured) {
+			this.#measured = true;
+			this.#lowered = now;
+			this.#set(optimal);
+			return;
+		}
+
 		const current = this.#target;
 
 		if (optimal >= current) {
@@ -307,7 +324,7 @@ export class Jitter {
 	}
 }
 
-// Where the target sits before anything has been measured.
+// Where the target sits until the first observation replaces it.
 //
 // A publisher's declared flush span is the best prior a receiver has: it is exactly the quantity
 // the estimator goes on to measure, published by the only party that already knows it. NetEq has to

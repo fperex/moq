@@ -109,8 +109,8 @@ pub(crate) struct Jitter {
 	/// The quantile's upper edge, i.e. what the histogram currently asks for.
 	optimal: Option<f64>,
 
-	/// What the target reads until the first observation lands.
-	start: f64,
+	/// Whether the target is a measurement yet, or still the seeded prior.
+	measured: bool,
 
 	/// The published target, and when it last moved.
 	target: f64,
@@ -131,7 +131,8 @@ impl Jitter {
 	/// start than a constant. Never below NetEq's 80ms guess, because the network
 	/// adds to a flush span rather than replacing it, and rounded up to a whole
 	/// bucket so the first target reads on the same grid as every later one. It is
-	/// a start, not a floor: the first observation may take the target below it.
+	/// a prior, not an observation: the first measurement replaces it outright,
+	/// however far below it that lands.
 	pub(crate) fn seeded(advertised: Duration) -> Self {
 		let mut buckets = [0.0; BUCKETS];
 		for (i, bucket) in buckets.iter_mut().enumerate() {
@@ -153,7 +154,7 @@ impl Jitter {
 			interval_start: None,
 			interval_max: 0.0,
 			optimal: None,
-			start,
+			measured: false,
 			target: start,
 			lowered: None,
 		}
@@ -299,11 +300,15 @@ impl Jitter {
 			// `2.0 / ((adds + 1) as f64)`: integer division here makes the start ramp
 			// jump straight to a forget factor of 1.
 			self.forget = (1.0 - START_FORGET_WEIGHT / ((self.adds + 1) as f64)).clamp(0.0, FORGET);
-		}
 
-		// The bucket's upper edge, because the delay it holds is somewhere inside it
-		// and covering the whole bucket is what covers the quantile.
-		self.optimal = Some((self.quantile() + 1) as f64 * BUCKET);
+			// The bucket's upper edge, because the delay it holds is somewhere inside
+			// it and covering the whole bucket is what covers the quantile. Read
+			// inside the guard: a dropped observation leaves the histogram alone, so
+			// re-reading the quantile would return what it already says, and before
+			// the first real one it would publish the bare prior as though something
+			// had measured it.
+			self.optimal = Some((self.quantile() + 1) as f64 * BUCKET);
+		}
 	}
 
 	// The lowest bucket whose tail mass has dropped to 1 - QUANTILE. Bucket 0 is
@@ -319,7 +324,23 @@ impl Jitter {
 	}
 
 	fn publish(&mut self, now: f64) {
-		let optimal = self.optimal.unwrap_or(self.start);
+		// A seed is a prior, not an observation. It holds the target until the
+		// histogram has measured something, and the first measurement then replaces
+		// it outright however far below it that lands: there is no earlier
+		// measurement for the fall bound to protect, and walking down from a guess
+		// keeps a viewer above their real buffer for tens of seconds. NetEq does the
+		// same, replacing `kStartDelayMs` with the first optimal delay it gets rather
+		// than approaching it (`delay_manager.cc`).
+		let Some(optimal) = self.optimal else {
+			return;
+		};
+		if !self.measured {
+			self.measured = true;
+			self.lowered = Some(now);
+			self.target = optimal;
+			return;
+		}
+
 		let current = self.target;
 
 		if optimal >= current {
@@ -448,6 +469,68 @@ mod tests {
 	fn starts_at_the_guess() {
 		let jitter = Jitter::new();
 		assert_eq!(jitter.target(), Duration::from_millis(80));
+	}
+
+	/// A seed is a prior, not an observation. The first resampled observation lands
+	/// half a second in and replaces it outright, however far below it that is: the
+	/// fall bound exists to protect an earlier measurement and a declaration is not
+	/// one. Walking a 320ms guess down instead leaves a viewer holding a buffer
+	/// nothing measured asked for, for tens of seconds.
+	#[test]
+	fn the_first_measurement_replaces_a_declared_start() {
+		let mut jitter = Jitter::seeded(Duration::from_millis(310));
+		assert_eq!(jitter.target(), Duration::from_millis(320));
+
+		// One second of evenly paced frames on a clean path.
+		steady(&mut jitter, 50, 20.0, 50.0, 0.0);
+
+		let measured = jitter.target();
+		assert!(measured >= Duration::from_millis(20), "{measured:?}");
+		assert!(measured <= Duration::from_millis(60), "{measured:?}");
+	}
+
+	/// Replacing the seed is a one-off. From the first measurement onwards the target
+	/// is something an arrival proved, so it walks down at the ordinary bound rather
+	/// than jumping to whatever the histogram last asked for.
+	#[test]
+	fn a_measured_target_still_falls_by_the_bound() {
+		let mut jitter = Jitter::seeded(Duration::from_millis(310));
+
+		// Two seconds of 7-frame bursts: the seed is long gone and the flush span is
+		// measured.
+		for i in 0..100u64 {
+			let flush = (i / 7) * 7 + 6;
+			jitter.observe(Duration::from_millis(i * 20), (flush * 20 + 50) as f64, false);
+		}
+		assert_eq!(jitter.target(), Duration::from_millis(140));
+
+		// Then a clean path, whose quantile drops to one bucket long before the
+		// target may.
+		let start = 100 * 20;
+		let mut previous = jitter.target();
+		let mut bottom = None;
+
+		for i in 0..1000u64 {
+			let media = start + i * 20;
+			jitter.observe(Duration::from_millis(media), (media + 50) as f64, false);
+
+			let target = jitter.target();
+			// A sixth of the distance left from 140ms is under a bucket, so the
+			// bucket is the step.
+			assert!(
+				previous.saturating_sub(target) <= Duration::from_millis(BUCKET as u64),
+				"fell {:?} at once",
+				previous - target
+			);
+			previous = target;
+			if bottom.is_none() && target == Duration::from_millis(BUCKET as u64) {
+				bottom = Some(media);
+			}
+		}
+
+		// Six buckets at a bucket a second: the fall cannot be quicker than that.
+		let bottom = bottom.expect("the target never reached one bucket");
+		assert!(bottom >= start + 6000, "reached one bucket after {}ms", bottom - start);
 	}
 
 	#[test]
