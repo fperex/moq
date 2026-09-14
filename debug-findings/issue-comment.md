@@ -251,6 +251,22 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
   What the A/V clock quest changed is that video now follows the playhead, so the collapse shows up
   as a stalled picture rather than only late audio. Worst painted-video-minus-audio skew over the
   reported sequence went from 3418 ms to 50 ms, and the run's underruns from 6 to 0.
+- **That hole fix then handed the restarted decoder a chunk WebCodecs refuses, and the audio never
+  came back.** Mine, not yours: `DataError: Failed to execute 'decode' on 'AudioDecoder'` in about
+  one run in three of the `chromium-opus-48000-mild-isolated` harness row, always within a second of
+  a rendition handover, and absent from every run recorded before `f3355b2e9`. `dev` cannot hit it,
+  because the throwing call site does not exist there. `Container.Consumer` marks only a group's
+  first frame `keyframe: true`, on purpose, since `Cmaf.Format` never reports an audio keyframe and
+  packagers flag every audio sample a sync sample. WebCodecs wants the opposite: a decoder that was
+  just configured, reset, or flushed accepts only a `key` chunk. Re-anchoring mid-group therefore
+  decoded a `delta` into a freshly reset decoder, Chromium threw, the throw escaped `effect.spawn`,
+  and the decode loop was gone for the rest of the session: ring drained, `stalled` latched, RMS zero.
+  The DataError was not a symptom of the audio dying, it was the cause. Fixed by typing the chunk
+  that reopens a run `key` whatever the container called it, which is the same claim the container
+  already makes at every group boundary and is sound for the same reason re-anchoring is: every Opus,
+  AAC and MP3 frame is independently decodable. Nothing is caught or retried. Reproduced
+  deterministically at 240 s, where the publisher's catalog update near 183 s replaces the
+  subscription; six 240 s runs after the fix, all reaching the handover, record zero.
 - **Publisher mute played as concealment, then room noise, for as long as the mute lasted.** Found by
   a listener on `publish.html` with a real microphone: mute it and the watcher keeps making sound.
   Two halves. On the wire a mute is invisible: the encoder stops and nothing says whether the next
