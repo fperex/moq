@@ -333,7 +333,7 @@ function cases(): { name: string; description: string; start_ms?: number; arriva
 		{
 			name: "seeded",
 			description:
-				"Twenty seconds of the steady trace on a publisher declaring a 310ms flush span. The declaration is the cold start, rounded up to a whole bucket, and the measurement then walks it down the ordinary fall bound to the same 20ms the unseeded trace settles on: a declaration is a prior, not a floor.",
+				"Twenty seconds of the steady trace on a publisher declaring a 310ms flush span. The declaration is the cold start, rounded up to a whole bucket, and the first resampled observation replaces it outright with the 20ms the unseeded trace settles on: a declaration is a prior, not an observation, so the fall bound has nothing to protect yet.",
 			start_ms: 310,
 			arrivals: paced({ frames: 1000, base: 50, spread: 2, seed: 11 }),
 		},

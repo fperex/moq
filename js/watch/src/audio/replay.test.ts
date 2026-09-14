@@ -59,8 +59,9 @@ function clean({ underruns, skipped }: Result): { underruns: number; skipped: nu
 const RINGS = rings(RATE);
 
 describe.each(RINGS)("%s ring replay", (_name, build) => {
-	// The target starts at the cold-start guess and falls once a second, and a fall costs the ring
-	// the bucket it lands on. Counting starts once it has settled; the traces are 12s long.
+	// The target starts at the cold-start guess, is replaced by the first measurement half a second
+	// in, and falls once a second from there; every fall costs the ring the bucket it lands on.
+	// Counting starts once it has settled; the traces are 12s long.
 	const WARMUP = 6000;
 
 	it("plays an evenly paced sender without underruns or skips", () => {
@@ -138,7 +139,12 @@ interface Budget {
 const FIXTURES: Array<[string, Fixture, Budget]> = [
 	// One sample over twelve seconds: the AAC frame is 23.22ms, so a rounded frame boundary
 	// eventually lands a sample behind the playhead. Twenty microseconds of audio.
-	["lan-bbb", lanBbb as Fixture, { underruns: 0, skipped: 1, deeper: false }],
+	//
+	// One underrun, 20ms of concealment, 13s in and 700ms before the path degrades enough to take
+	// the target back up to 80ms. The settled target is the same 40ms it always was; the estimator
+	// now reaches it within a second instead of within three, so the ring accelerates its surplus
+	// away that much earlier and holds exactly what 40ms asks for when the dip lands.
+	["lan-bbb", lanBbb as Fixture, { underruns: 1, skipped: 1, deeper: false }],
 	["relay-bbb-7frame", relayBbb7Frame as Fixture, { underruns: 0, skipped: 0, deeper: true }],
 	// Holes in the recording: the ring runs dry at each one and the playhead steps over the media
 	// that never arrived, which is 400ms of the 92 second capture.

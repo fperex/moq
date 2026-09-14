@@ -80,23 +80,30 @@ describe("tune-in", () => {
 		expect(new Jitter({ start: 9000 as Time.Milli }).value.peek()).toBe(Jitter.CEILING as Time.Milli);
 	});
 
+	it("replaces a declared start with the first measurement", () => {
+		// A prior, not an observation. The first resampled observation lands half a second in and
+		// takes the target straight to what it measured, because the fall bound exists to protect
+		// an earlier measurement and a declaration is not one. Walking a 320ms guess down instead
+		// leaves a viewer holding a buffer nothing measured asked for, for tens of seconds.
+		const jitter = new Jitter({ start: 310 as Time.Milli });
+		expect(jitter.value.peek()).toBe(320 as Time.Milli);
+
+		// One second of evenly paced frames on a clean path.
+		flush(jitter, { frames: 50 });
+
+		const measured = jitter.value.peek();
+		expect(measured).toBeGreaterThanOrEqual(Jitter.BUCKET as Time.Milli);
+		expect(measured).toBeLessThanOrEqual(60 as Time.Milli);
+	});
+
 	it("falls from a declared start to what it measures", () => {
-		// The declaration is a prior, not a floor: a path that turns out to be clean walks the
-		// target down to the same bucket the unseeded estimator settles on, at the ordinary bound.
+		// The declaration is a prior, not a floor: a path that turns out to be clean settles on the
+		// same bucket the unseeded estimator does.
 		const jitter = new Jitter({ start: 302 as Time.Milli });
 		expect(jitter.value.peek()).toBe(320 as Time.Milli);
 
-		// 20s of evenly paced frames, which is more than the fall bound needs from 320ms.
 		flush(jitter, { frames: 1000 });
 		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
-	});
-
-	it("holds a declared start for as long as the fall bound says", () => {
-		// One second of clean arrivals cannot undo a 320ms start: the bound is a sixth of the
-		// distance per second, so a viewer never has the buffer pulled out from under them.
-		const jitter = new Jitter({ start: 302 as Time.Milli });
-		flush(jitter, { frames: 50 });
-		expect(jitter.value.peek()).toBeGreaterThanOrEqual(280 as Time.Milli);
 	});
 });
 
@@ -322,6 +329,36 @@ describe("rise and fall", () => {
 		// One second of 7-frame bursts, two resample intervals, takes it straight to the span.
 		flush(jitter, { frames: 56, burst: 7, start: 500 * FRAME });
 		expect(jitter.value.peek()).toBe(140 as Time.Milli);
+	});
+
+	it("still bounds the fall once the target is a measurement", () => {
+		// Replacing the seed is a one-off. From the first measurement onwards the target is
+		// something an arrival proved, so it walks down at the ordinary bound rather than jumping
+		// to whatever the histogram last asked for.
+		const jitter = new Jitter({ start: 310 as Time.Milli });
+
+		// Two seconds of 7-frame bursts: the seed is long gone and the flush span is measured.
+		flush(jitter, { frames: 100, burst: 7 });
+		expect(jitter.value.peek()).toBe(140 as Time.Milli);
+
+		// Then a clean path, whose quantile drops to one bucket long before the target may.
+		const start = 100 * FRAME;
+		let previous = jitter.value.peek();
+		let bottom: number | undefined;
+
+		for (let i = 0; i < 1000; i++) {
+			const media = start + i * FRAME;
+			observe(jitter, media, media + 50);
+
+			const value = jitter.value.peek();
+			// A sixth of the distance left from 140ms is under a bucket, so the bucket is the step.
+			expect(previous - value).toBeLessThanOrEqual(Jitter.BUCKET);
+			previous = value;
+			if (bottom === undefined && value === Jitter.BUCKET) bottom = media;
+		}
+
+		// Six buckets at a bucket a second: the fall cannot be quicker than that.
+		expect(bottom).toBeGreaterThanOrEqual(start + 6000);
 	});
 
 	it("falls no faster than one bucket per second while it is close", () => {
