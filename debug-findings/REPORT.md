@@ -922,32 +922,60 @@ the engine does support was checked directly: `AudioEncoder` and `VideoEncoder` 
 `js/publish/src/video/processor.ts` already has a fallback for. So WebKit publishing is untested
 rather than broken.
 
-### Real Safari never gets a browser publisher's catalog
+### Retracted: real Safari does get a browser publisher's catalog
 
-The one hard engine defect this pass found, and it is not diagnosed to a line.
+An earlier pass recorded this as the one hard engine defect: real Safari 26.6 on the WebSocket
+transport never receiving the catalog of a broadcast published from a browser, while the two
+ffmpeg broadcasts on the same session delivered theirs in under five seconds. That conclusion does
+not hold. Re-tested against the same relay, the same page and the same headed Chromium publisher
+(real microphone and camera, Opus at 16 kHz and `avc1.640028`), real Safari gets the catalog every
+time, in about the same 140 ms as the ffmpeg broadcasts on the same session.
 
-In real Safari, on the same page, the same session and the same relay, a broadcast published from a
-browser never delivers its catalog, while the two ffmpeg-published broadcasts on that session deliver
-theirs in under five seconds. Sixty seconds of it, sampled every five:
+| Run | Publisher age when Safari connected | Result |
+| --- | --- | --- |
+| 30 s, no interaction | 2 min | catalog at 143 ms, against 140 ms and 141 ms for the two ffmpeg broadcasts |
+| 90 s, publisher started 30 s in | 0 | catalog within 5 s of the announcement, then stable |
+| 60 s, alongside a non-browser subscriber | 5 min | both got it; the non-browser client at 4 ms |
+| 60 s, tile clicked and muted/unmuted every 5 s | 25 min | catalog and video for the whole run |
+
+Subscriber churn does not degrade it either: 24 cycles of connect, subscribe to `catalog.json` and
+leave, a quarter of them abandoning the session without closing anything, answered in 3 ms to 9 ms
+every time.
+
+What does reproduce the reported symptom exactly, and reproduces it for any engine, is subscribing
+to a broadcast whose publisher has died without closing its session. Killing the publisher's browser
+process outright leaves the relay with a WebTransport session it has no way to know is gone, and for
+the length of the QUIC idle timeout it keeps the broadcast announced and keeps accepting
+subscriptions to it:
 
 ```text
-demo/bbb-smooth.hang catalog=yes video=yes | demo/bbb.hang catalog=yes video=yes | demo/mic-chromium-*.hang catalog=no video=no
+  1s announced=true  catalog=TIMEOUT
+ ...
+ 35s announced=true  catalog=TIMEOUT
+ 36s announced=false catalog=reset(StreamError: remote error: 33)
 ```
 
-That line is identical at 5 s and at 60 s. `connection.status` is `connected` and
-`connection.transport` is `websocket` throughout, the announcement arrives (the tile is on the page),
-and neither `console.error` nor `window.onerror` nor `unhandledrejection` reports anything. With no
-catalog there is no audio config, so no `AudioContext` is ever built, so no amount of clicking can
-start audio: the row plays nothing at all. Playwright WebKit 26.6, on the same WebSocket transport
-against the same broadcast, has the catalog in about 2 s.
+Thirty seconds of `subscribe ok` followed by silence, then a retraction and a loud RESET_STREAM once
+`DEFAULT_IDLE_TIMEOUT` in `rs/moq-tokio/src/quic.rs` expires. That reset carries stream code `0x33`,
+which `js/net/src/error.ts` names `NotFound`. Inside that window the tile is on the
+page, the session is `connected`, no group ever arrives, and nothing is written to the console: the
+reported signature, line for line. The subscriber in the trace above is a Bun `@moq/net` client on
+the WebSocket transport, so none of it is Safari. `rs/moq-relay/src/websocket.rs` says the same thing
+from the other side, in the comment explaining why the WebSocket path needs its own keep-alive:
+without one, "every broadcast it published stays announced for that entire window".
 
-What it is not: not `WebSocketStream` (neither WebKit nor Safari has it, so both take the same plain
-WebSocket path, while Chromium is the only engine that has it); not the JSON snapshot producer
-holding a group open for deltas, because `CatalogProducer.serve` in `js/publish/src/catalog.ts`
-passes `deltaRatio: 0` and every catalog group is closed after one frame; not the compressed
-`catalog.json.z` track, which `js/watch/src/broadcast.ts` makes opt-in and never auto-detects; and
-not head-of-line blocking behind the 4 Mbps `bbb.hang`, because that broadcast is one of the two that
-works on the same session. It is reproducible on demand and it is the next thing to chase.
+The original evidence supports that reading rather than the engine one. `check2.json` from that pass
+is a Chromium watcher on the native WebTransport transport showing the identical all-null shape, on
+`demo/mic-chromium-mu0hvt72.hang`, recorded at a point where the publisher log shows that name had
+already been replaced by `demo/mic-chromium-mu0j4p5m.hang`. And the Safari-versus-WebKit comparison
+that the claim rested on was not simultaneous: WebKit passed on `mu0j4p5m` at 20:56, Safari failed on
+it at 21:00 and 21:02, and no non-Safari watcher was run inside that window to tell a broken engine
+apart from a publisher that had stopped serving.
+
+Nothing here is a defect in `js/net`, `js/watch`, `js/publish` or the relay's WebSocket path. What is
+left is a diagnosability gap worth its own scope: a subscribe to an announced broadcast whose
+publisher is gone is acknowledged and then silent for the whole idle-timeout window, which a viewer
+cannot tell apart from a publisher that is merely slow to produce its first group.
 
 One softer Safari note from the same runs: the `moq-watch` element builds its `AudioContext` only
 once the catalog names an audio rendition, and `unlockOnGesture` is armed at that moment, so the

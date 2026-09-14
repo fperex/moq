@@ -171,17 +171,35 @@ unmute, then the presets) the worst A/V skew is 3256 ms in Firefox and 3076 ms i
 either side of it. Two engines on two different transports produce the same spike in the same place,
 so it is the player, and it is the strongest remaining lead on the original desync report.
 
-**One hard engine defect, not diagnosed.** In real Safari a browser-published broadcast never
-delivers its catalog, while the two ffmpeg-published broadcasts on the same page, same session and
-same relay deliver theirs in under five seconds. Sixty seconds of sampling gives the identical line
-at 5 s and at 60 s: `bbb-smooth.hang catalog=yes | bbb.hang catalog=yes | mic-*.hang catalog=no`.
-The session is `connected` over `websocket`, the announcement arrives, and nothing is logged to
-`console.error`, `window.onerror` or `unhandledrejection`. With no catalog there is no audio config
-and no `AudioContext`, so the broadcast plays nothing at all. Playwright WebKit 26.6 on the same
-transport has that catalog in about 2 s. It is not `WebSocketStream` (neither WebKit engine has it),
-not an open snapshot group (`CatalogProducer.serve` passes `deltaRatio: 0`), not the compressed
-catalog track (opt-in only), and not head-of-line blocking behind `bbb.hang` (which works on the same
-session). Reproducible on demand.
+**Retracted: the Safari catalog defect.** An earlier pass recorded real Safari 26.6 on the WebSocket
+transport as never receiving the catalog of a browser-published broadcast. It does receive it. Four
+runs against the same relay, page and headed Chromium publisher, with the publisher between 0 and 25
+minutes old and one run clicking the tile and toggling mute every 5 s, all delivered the catalog in
+about 140 ms, alongside the ffmpeg broadcasts on the same session. Twenty-four cycles of connect,
+subscribe and leave, a quarter of them abandoning the session without closing anything, answered in
+3 ms to 9 ms every time.
+
+What reproduces the reported signature exactly, for any engine, is subscribing to a broadcast whose
+publisher died without closing its session. The relay cannot know, so for the length of the QUIC idle
+timeout (`DEFAULT_IDLE_TIMEOUT`, 30 s, in `rs/moq-tokio/src/quic.rs`) it keeps the broadcast
+announced and keeps answering `subscribe ok`, and no group ever arrives:
+
+```text
+  1s announced=true  catalog=TIMEOUT
+ 35s announced=true  catalog=TIMEOUT
+ 36s announced=false catalog=reset(StreamError: remote error: 33)
+```
+
+Tile on the page, session `connected`, nothing on the console. The subscriber in that trace is a Bun
+`@moq/net` client on the WebSocket transport, so none of it is Safari, and `check2.json` from the
+original pass shows the same all-null shape on a Chromium watcher over native WebTransport, recorded
+against a broadcast name the publisher log shows had already been retired. The Safari-versus-WebKit
+comparison the claim rested on was four minutes apart rather than simultaneous.
+
+No defect in `js/net`, `js/watch`, `js/publish` or the relay's WebSocket path. What remains is a
+diagnosability gap: a subscribe to an announced broadcast whose publisher is gone is acknowledged and
+then silent for the whole idle-timeout window, which a viewer cannot tell apart from a publisher that
+is slow to produce its first group.
 
 Smaller, same engine: `moq-watch` builds its `AudioContext` only once the catalog names an audio
 rendition and arms `unlockOnGesture` then, so the click that selected the tile has already passed. In
