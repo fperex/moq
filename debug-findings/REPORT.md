@@ -913,6 +913,7 @@ re-anchors it. A timestamp comparison would not do in either case, because the s
 a position the ring really was at, and one the reader will never resume from does not look any
 different from one it has not reached yet. `sync.replay.test.ts` replays the sequence over the
 fallback transport with that message delivered, and the skew it measures goes from 2992 ms to 37 ms.
+
 <!-- after: Firefox X ms, WebKit Y ms, measured in step 2 -->
 
 ### Browser publishers
@@ -969,7 +970,7 @@ subscriptions to it:
  36s announced=false catalog=reset(StreamError: remote error: 33)
 ```
 
-Thirty seconds of `subscribe ok` followed by silence, then a retraction and a loud RESET_STREAM once
+Thirty seconds of `subscribe ok` followed by silence, then a retraction and a loud RESET\_STREAM once
 `DEFAULT_IDLE_TIMEOUT` in `rs/moq-tokio/src/quic.rs` expires. That reset carries stream code `0x33`,
 which `js/net/src/error.ts` names `NotFound`. Inside that window the tile is on the
 page, the session is `connected`, no group ever arrives, and nothing is written to the console: the
