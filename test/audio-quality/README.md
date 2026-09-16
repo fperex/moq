@@ -36,7 +36,7 @@ Three rows are enforced today:
 
 | Codec | Enforced |
 | --- | --- |
-| opus | `fixed-250` plain |
+| opus | `fixed-250` isolated |
 | aac | `fixed-250` both rings |
 
 Twenty-one keep the marker, which is more than the ten this table held before the playout target
