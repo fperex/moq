@@ -1,7 +1,7 @@
 //! Recorded arrivals, replayed through the estimator the way the consumer drives it.
 //!
 //! The corpus next door is synthetic and holds the algorithm to the page. These are
-//! two of the traces the browser replays in `js/watch/src/audio/replay.test.ts`,
+//! the traces the browser replays in `js/watch/src/audio/replay.test.ts`,
 //! trimmed from the recordings attached to moq-dev/moq#3477, and they answer a
 //! different question: on a real path, do the two languages size the buffer the
 //! same?
