@@ -687,6 +687,46 @@
 			"target_ms_p95": 20,
 			"converge_s_seconds": 0.8,
 			"note": "Deterministic: the recording, the estimator, the rings, and the engine are the same every run, so the ceiling is exactly what was measured rather than a measurement plus headroom."
+		},
+		{
+			"runtime": "replay",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "mic-firefox",
+			"ring": "isolated",
+			"underruns_per_min": 30.9,
+			"underrun_episodes_per_min": 7.7,
+			"short_quanta_per_min": 0,
+			"stalled_quanta_share": 0.188,
+			"discarded_samples_per_min": 0,
+			"skip_aheads_per_min": 30.9,
+			"skipped_samples_per_min": 11814.5,
+			"accelerates_per_min": 54,
+			"expands_per_min": 23.2,
+			"stretched_samples_per_min": 266.9,
+			"target_ms_p95": 300,
+			"converge_s_seconds": 8.5,
+			"note": "Deterministic: the recording, the estimator, the rings, and the engine are the same every run, so the ceiling is exactly what was measured rather than a measurement plus headroom. The receiver in this recording stopped executing in bursts, and the marks it left let the estimator discount them: 300ms of target rather than the 1600ms the same arrivals read as without them. What is left is a ring that cannot cover a few hundred milliseconds of its own process being frozen, which is the block itself rather than anything playout can size for."
+		},
+		{
+			"runtime": "replay",
+			"codec": "opus",
+			"rate": 48000,
+			"profile": "mic-firefox",
+			"ring": "plain",
+			"underruns_per_min": 30.9,
+			"underrun_episodes_per_min": 0,
+			"short_quanta_per_min": 1459.3,
+			"stalled_quanta_share": 0.219,
+			"discarded_samples_per_min": 13204.6,
+			"skip_aheads_per_min": 0,
+			"skipped_samples_per_min": 0,
+			"accelerates_per_min": 92.7,
+			"expands_per_min": 30.9,
+			"stretched_samples_per_min": 303.2,
+			"target_ms_p95": 300,
+			"converge_s_seconds": 8.5,
+			"note": "Deterministic: the recording, the estimator, the rings, and the engine are the same every run, so the ceiling is exactly what was measured rather than a measurement plus headroom. The receiver in this recording stopped executing in bursts, and the marks it left let the estimator discount them: 300ms of target rather than the 1600ms the same arrivals read as without them. What is left is a ring that cannot cover a few hundred milliseconds of its own process being frozen, which is the block itself rather than anything playout can size for."
 		}
 	]
 }
