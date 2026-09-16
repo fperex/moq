@@ -992,12 +992,32 @@ left is a diagnosability gap worth its own scope: a subscribe to an announced br
 publisher is gone is acknowledged and then silent for the whole idle-timeout window, which a viewer
 cannot tell apart from a publisher that is merely slow to produce its first group.
 
-One softer Safari note from the same runs: the `moq-watch` element builds its `AudioContext` only
-once the catalog names an audio rendition, and `unlockOnGesture` is armed at that moment, so the
-click that selected the tile has already passed. In Chromium and Firefox the unconditional
-`resume()` succeeds anyway; in real Safari it does not, and a viewer has to click a second time after
-the video appears before they hear anything. On `bbb-smooth.hang` the catalog arrives before the
-click and one click is enough, which is why this only shows up on a slow-starting broadcast.
+One softer Safari note from the same runs, now fixed: the `moq-watch` element built its
+`AudioContext` only once the catalog named an audio rendition, and `unlockOnGesture` was armed at
+that moment, so the click that selected the tile had already passed. In Chromium and Firefox the
+unconditional `resume()` succeeded anyway; in real Safari it did not, and a viewer had to click a
+second time after the video appeared before they heard anything. The listeners are now armed from the
+moment audio is enabled, before any context exists, and `resume()` runs when one appears and on every
+gesture until it is running.
+
+Measured with one Element Click on a tile for a broadcast that had not started yet, so the click
+always preceded the catalog: 6 of 6 runs play on one click, counting a run only when the context
+reached `running` and rendered output grew. Real Safari 26 is 4 of 4, twice on a 48kHz broadcast and
+twice on a 16kHz one, with Chromium and Firefox 1 of 1 each, every run on a Bluetooth headset whose
+own rate is 44100Hz and so matches neither. The measurement settled two things about WebKit. A page's
+activation does carry to a context created later: the context appears about 2.3 seconds after the
+click, far outside any handler, and `resume()` on it succeeds. But one activation starts only one context, which is why
+building a context inside the gesture handler was tried and rejected: at 16kHz the primed 48kHz
+context was still open and `running` when the graph rebuilt at the decoded rate, and the replacement
+stayed `suspended` with nothing ever rendered, 0 of 2, where arming alone is 2 of 2. A primed context
+takes the device's rate, so on the 44100Hz headset no broadcast would have matched it and every one
+would have rebuilt into a locked context.
+
+The muted-tile path is one click too, measured the same way: the listeners are armed only while audio
+is enabled, so a tile that starts muted arms nothing until the unmute click itself, and that click
+still plays in 4 of 4 runs (Safari twice, Chromium and Firefox once each, on a broadcast already
+publishing so the graph was pre-built while muted, `suspended` before the click everywhere except
+Chromium, where its autoplay policy had already started it, and `running` within 572ms after).
 
 ### Gates on the final tree
 
