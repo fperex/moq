@@ -39,6 +39,7 @@ export type BeaconProps = {
 /** Start shipping. The returned function flushes once more and stops. */
 export function beacon(props: BeaconProps): () => void {
 	let sentEnvironment = false;
+	let sentFinal = false;
 
 	const batch = (final: boolean): Beacon | undefined => {
 		const samples = props.drain();
@@ -51,14 +52,23 @@ export function beacon(props: BeaconProps): () => void {
 	};
 
 	const post = (final: boolean) => {
+		// The final batch is what tells the sink the row ended, so it goes exactly once however
+		// the page got here: `pagehide` and the returned stop function both arrive in a normal run.
+		if (final) {
+			if (sentFinal) return;
+			sentFinal = true;
+		}
 		const body = batch(final);
 		if (!body) return;
 		const text = JSON.stringify(body);
 		if (final && navigator.sendBeacon) {
 			// A Blob rather than a string, so the type is text/plain and the request stays a simple
 			// one: a preflight cannot be answered once the document is gone.
-			navigator.sendBeacon(props.url, new Blob([text], { type: "text/plain" }));
-			return;
+			//
+			// sendBeacon refuses rather than throws when the payload is too large or the queue is
+			// full, and a dropped final batch reads downstream as a page that died mid-run, so a
+			// refusal falls through to fetch instead.
+			if (navigator.sendBeacon(props.url, new Blob([text], { type: "text/plain" }))) return;
 		}
 		void fetch(props.url, { method: "POST", body: text, keepalive: final }).catch(() => {});
 	};

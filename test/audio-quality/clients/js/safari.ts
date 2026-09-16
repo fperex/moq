@@ -128,9 +128,16 @@ const note = (assertion: string, detail: string) => {
 // never ran, and it is reported as a void rather than as an unhandled rejection with a live server
 // still bound behind it.
 const driver = await WebDriver.start(values.binary, driverPort, join(out, `${values.tag}.safaridriver.log`)).catch(
-	(err: unknown) => {
+	async (err: unknown) => {
+		const message = err instanceof Error ? err.message : String(err);
+		console.error(`FAIL ${values.tag}: ${message}`);
+		note("driver", message);
 		server.stop();
-		throw err;
+		// The same void file every other failure writes. Rethrowing here left the row with no
+		// `.voids.json` at all, so a driver that never started read downstream as a row that was
+		// never asked for rather than one that failed.
+		await Bun.write(join(out, `${values.tag}.voids.json`), JSON.stringify(voids, null, 1));
+		process.exit(1);
 	},
 );
 

@@ -394,7 +394,7 @@ export type Environment = {
 export type Beacon = {
 	/** The row this page is playing, as a directory-safe key. */
 	tag: string;
-	/** Reported on the first batch and whenever it changes. */
+	/** Sent on the first batch that has it, and not again. */
 	environment?: Environment;
 	/** The samples in this batch. */
 	samples: Sample[];

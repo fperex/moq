@@ -106,6 +106,9 @@ export function probe(watch: MoqWatch): Probe {
 			attachedTo = root;
 		} catch (err) {
 			notes.push(`analyser: ${err instanceof Error ? err.message : String(err)}`);
+			// Claim the root even though the analyser never attached, or every later sample retries
+			// the same failing construction and pushes the same note again.
+			attachedTo = root;
 		}
 
 		const context = maybe(() => watch.audio.out.context.peek());

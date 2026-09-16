@@ -3,7 +3,9 @@
  *
  * Every budget value is a ceiling, and a row with no budget is a failure rather than a pass: a
  * matrix that grows a cell nobody wrote a budget for would otherwise quietly grade nothing. A void
- * row fails the same way, for the same reason: its numbers are the ones that cannot be trusted.
+ * row fails the same way, for the same reason: its numbers are the ones that cannot be trusted. A
+ * budgeted metric the run never measured fails too, since a ceiling with nothing to compare it
+ * against grades nothing while looking like a pass.
  *
  * A row marked `recorded` in `budgets.json` is graded and its breaches are printed, but it does not
  * fail the run: its ceilings are what a machine measured rather than what the player is required to
@@ -67,6 +69,8 @@ type Verdict = {
 	value: number | null;
 	ceiling: number;
 	over: boolean;
+	/** Whether the run produced no value for a metric this row budgets. */
+	missing: boolean;
 	/** Whether a breach fails the run, or is only reported. */
 	enforced: boolean;
 };
@@ -102,6 +106,9 @@ for (const summary of summaries) {
 			value,
 			ceiling,
 			over: value !== null && value > ceiling,
+			// A ceiling with nothing to compare it against is not a pass. The run was asked to
+			// measure this and did not, which is the same silent hole as a row with no budget.
+			missing: value === null,
 			enforced: budget.recorded !== true,
 		});
 	}
@@ -124,10 +131,17 @@ for (const summary of summaries) {
 
 const over = verdicts.filter((v) => v.over && v.enforced);
 const reported = verdicts.filter((v) => v.over && !v.enforced);
+const missing = verdicts.filter((v) => v.missing && v.enforced);
 lines.push("");
-if (over.length > 0) {
-	lines.push("over budget:");
-	for (const v of over) lines.push(`- ${v.row} ${v.key}: ${v.value} > ${v.ceiling}`);
+if (over.length > 0 || missing.length > 0) {
+	if (over.length > 0) {
+		lines.push("over budget:");
+		for (const v of over) lines.push(`- ${v.row} ${v.key}: ${v.value} > ${v.ceiling}`);
+	}
+	if (missing.length > 0) {
+		lines.push("budgeted but never measured:");
+		for (const v of missing) lines.push(`- ${v.row} ${v.key}: no value, ceiling was ${v.ceiling}`);
+	}
 } else {
 	lines.push(
 		`within budget: ${verdicts.filter((v) => v.enforced).length} enforced checks across ${summaries.length - voided.length} rows`,
@@ -163,8 +177,10 @@ if (!values.enforce) {
 	process.exit(0);
 }
 
-const failed = over.length > 0 || unbudgeted.length > 0 || voided.length > 0;
+const failed = over.length > 0 || missing.length > 0 || unbudgeted.length > 0 || voided.length > 0;
 if (failed) {
-	console.error(`FAIL: ${over.length} over budget, ${unbudgeted.length} unbudgeted, ${voided.length} void`);
+	console.error(
+		`FAIL: ${over.length} over budget, ${missing.length} budgeted but never measured, ${unbudgeted.length} unbudgeted, ${voided.length} void`,
+	);
 }
 process.exit(failed ? 1 : 0);
