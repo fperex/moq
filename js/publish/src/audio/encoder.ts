@@ -435,7 +435,13 @@ export class Encoder {
 					// frame hang already defines as an endpoint. Closing discards whatever the
 					// codec still held, so the last chunk that reached the output callback is
 					// where it really stops. A reconfigure keeps encoding, so it declares nothing.
-					if (end === undefined || this.in.enabled.peek()) return;
+					//
+					// Capture or its format going away stops the pipeline just as surely as muting
+					// does, and can happen while `enabled` stays true, so what decides this is
+					// whether anything is still feeding the encoder rather than the mute alone.
+					const capture = this.in.capture.peek();
+					const stopped = !this.in.enabled.peek() || !capture || !capture.out.format.peek();
+					if (end === undefined || !stopped) return;
 					const producer = track.peek();
 					if (!producer) return;
 

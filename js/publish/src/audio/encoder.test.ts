@@ -144,7 +144,7 @@ describe("a rendition that stops encoding", () => {
 		});
 
 		await settle();
-		return { encoder, enabled, written, groups };
+		return { encoder, enabled, capture, written, groups };
 	}
 
 	test("declares where the timeline stops when it is muted", async () => {
@@ -224,6 +224,28 @@ describe("a rendition that stops encoding", () => {
 			encoder.codec.set({ mime: "opus", bitrate: 24_000 });
 			await settle();
 			expect(written).toHaveLength(1);
+		} finally {
+			encoder.close();
+		}
+	});
+
+	test("declares where the timeline stops when the source ends while it is still enabled", async () => {
+		using _codecs = installFakeAudioCodecs();
+		const { encoder, capture, written } = await encoding();
+
+		try {
+			FakeAudioEncoder.last?.output(chunk(0, 20_000));
+			expect(written).toHaveLength(1);
+
+			// Removing the source without muting stops the pipeline just as a mute does, and a
+			// subscriber still has no way to tell audio that stopped from audio that is late.
+			capture.out.format.set(undefined);
+			await settle();
+
+			expect(written).toHaveLength(2);
+			const [timestamp, payload] = Moq.Varint.decode(written[1].payload);
+			expect(timestamp).toBe(20_000);
+			expect(payload.byteLength).toBe(0);
 		} finally {
 			encoder.close();
 		}
