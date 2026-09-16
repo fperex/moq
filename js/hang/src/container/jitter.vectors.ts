@@ -32,6 +32,8 @@ export type Arrival = {
 	arrival_ms: number;
 	/** Force the reordered path, for a trace whose delivery order the timestamps do not show. */
 	reordered?: boolean;
+	/** The receiver was blocked before this arrival, which its timing alone cannot show. */
+	stalled?: boolean;
 	/** Call `reanchor()` before observing, i.e. a timeline discontinuity landed here. */
 	reanchor_before?: boolean;
 };
@@ -87,7 +89,10 @@ export function replay(arrivals: Arrival[], start?: number): number[] {
 
 	for (const arrival of arrivals) {
 		if (arrival.reanchor_before) jitter.reanchor();
-		jitter.observe(arrival.timestamp_us as Time.Micro, arrival.arrival_ms as Time.Milli, arrival.reordered);
+		jitter.observe(arrival.timestamp_us as Time.Micro, arrival.arrival_ms as Time.Milli, {
+			reordered: arrival.reordered,
+			stalled: arrival.stalled,
+		});
 		targets.push(jitter.value.peek());
 	}
 
@@ -161,15 +166,23 @@ function shift(arrivals: Arrival[], ms: number): Arrival[] {
 // A receiver whose read loop stops for `stall` ms at `at`. The path is untouched: frames keep
 // landing on time, they just queue until the loop runs again and then come back out of it one every
 // `drain` ms, which is far faster than the media they carry.
-function stalled(arrivals: Arrival[], options: { at: number; stall: number; drain: number }): Arrival[] {
-	const { at, stall, drain } = options;
+//
+// `flag` marks the frames that came out of the block, which is what a receiver watching its own
+// event loop reports and what the timing alone cannot show.
+function stalled(
+	arrivals: Arrival[],
+	options: { at: number; stall: number; drain: number; flag?: boolean },
+): Arrival[] {
+	const { at, stall, drain, flag = false } = options;
 	let cursor = at + stall;
 
 	return arrivals.map((a) => {
 		if (a.arrival_ms < at) return a;
 		const read = Math.max(a.arrival_ms, cursor);
 		cursor = read + drain;
-		return { ...a, arrival_ms: grid(read) };
+		// A frame read later than it landed waited for the loop; one read as it lands did not.
+		const queued = read > a.arrival_ms;
+		return { ...a, arrival_ms: grid(read), ...(flag && queued ? { stalled: true } : {}) };
 	});
 }
 
@@ -329,6 +342,27 @@ function cases(): { name: string; description: string; start_ms?: number; arriva
 				}
 				return arrivals;
 			})(),
+		},
+		{
+			name: "receiver-stall",
+			description:
+				"Six seconds of evenly paced 20ms frames, then the receiver's own event loop blocks for 400ms and the backlog comes back out at 2ms a frame, then paced again. The block is shorter than the resample interval, so the spacing rule cannot discount it, but the receiver watched its own loop and says so: every frame of the burst carries `stalled`, each drops the arrival reference, and the target stays where the path put it.",
+			arrivals: stalled(paced({ frames: 600, base: 50, spread: 1, seed: 79 }), {
+				at: 6000,
+				stall: 400,
+				drain: 2,
+				flag: true,
+			}),
+		},
+		{
+			name: "receiver-stall-unflagged",
+			description:
+				"The same arrivals with nothing watching the loop, which is what a receiver with no monitor is left with. The burst reads as path delay, the target climbs to 400ms, and the histogram still remembers why for the rest of the trace: the documented fallback, and the contrast that says what the flag is worth.",
+			arrivals: stalled(paced({ frames: 600, base: 50, spread: 1, seed: 79 }), {
+				at: 6000,
+				stall: 400,
+				drain: 2,
+			}),
 		},
 		{
 			name: "seeded",

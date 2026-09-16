@@ -150,6 +150,23 @@ histogram is fed in. A gap shorter than one cannot be the whole of an
 observation, and what it can inject into the one it lands in is bounded by its
 own length.
 
+**A receiver that can see it was blocked says so, rather than leaving the
+spacing to infer it.** `observe` takes a `stalled` input alongside `reordered`,
+and an arrival carrying it drops the reference exactly as the rule above does.
+It exists because the spacing cannot decide anything under the threshold: a
+content process blocked for 400 ms and a publisher flushing every 400 ms produce
+the same arrivals, so a lower threshold buys the second one's damage to catch
+the first. What separates them is whether this receiver was running, which is
+not in the arrival timing at all but is directly observable where the receiver
+lives. In the browser `Container.Consumer` watches its own event loop with a
+50 ms timer, reads the lag each firing measures, and calls anything past 100 ms
+a block (`js/hang/src/container/stall.ts`); the estimator itself stays free of
+timers and of any clock but the one an arrival is stamped with, which is what
+lets one corpus hold every language. A receiver with nothing watching it is left
+with the spacing rule, which is why that rule stays. The `receiver-stall` and
+`receiver-stall-unflagged` corpus cases are the same arrivals with and without
+the input.
+
 **A path that stalls and then bursts is indistinguishable from this** and is
 therefore also discounted. That is a deliberate false negative. The receiver
 cannot tell "nobody handed me anything" from "I was not asking", and the
@@ -502,7 +519,8 @@ The schema:
 }
 ```
 
-An arrival may carry `reordered: true` to force the reordered path, or
+An arrival may carry `reordered: true` to force the reordered path,
+`stalled: true` to declare that the receiver itself was blocked before it, or
 `reanchor_before: true` to call `reanchor()` first. A case may carry
 `start_ms`, the publisher's declared flush span the estimator starts from.
 `target_ms[i]` is the target after arrival `i`. The declaration aside, there is
@@ -526,4 +544,6 @@ The cases, and what each one holds:
 | `discontinuity` | `reanchor()` keeps the distribution and drops the reference. |
 | `outlier` | A 2500 ms arrival is dropped rather than clamped. |
 | `sparse` | 1 frame per second falls at the same wall-clock rate as 50. |
+| `receiver-stall` | A 400 ms block the receiver reports, which the spacing rule is too coarse to see. |
+| `receiver-stall-unflagged` | The same arrivals unreported, which is what a receiver with no monitor measures. |
 | `seeded` | A declared 310 ms flush span starts the target at 320 ms and the first observation replaces it with 20 ms. |

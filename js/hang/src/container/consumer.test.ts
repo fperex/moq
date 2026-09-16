@@ -7,7 +7,7 @@ import { createAudioInitSegment, encodeDataSegment } from "./cmaf/encode.ts";
 import { Format as CmafFormat } from "./cmaf/format.ts";
 import { Consumer } from "./consumer.ts";
 import type { Format as ContainerFormat } from "./format.ts";
-import { Jitter } from "./jitter.ts";
+import { Jitter, type JitterObservation } from "./jitter.ts";
 import { Format as LegacyFormat, Producer as LegacyProducer } from "./legacy.ts";
 import type { Frame } from "./types.ts";
 
@@ -615,18 +615,85 @@ test("Consumer starts its measurement at what the rendition advertises", async (
 });
 
 // The arrival observation point is load-bearing enough to guard directly: a spy on the estimator
-// says exactly which frames were measured, at which arrival time.
-function watchArrivals(): { calls: { timestamp: number; now: number }[]; restore: () => void } {
-	const calls: { timestamp: number; now: number }[] = [];
+// says exactly which frames were measured, at which arrival time, and what the consumer knew about
+// each of them.
+function watchArrivals(): {
+	calls: { timestamp: number; now: number; stalled: boolean }[];
+	restore: () => void;
+} {
+	const calls: { timestamp: number; now: number; stalled: boolean }[] = [];
 	const spy = spyOn(Jitter.prototype, "observe").mockImplementation(function (
 		this: Jitter,
 		timestamp: Time.Micro,
 		now: Time.Milli,
+		observation?: JitterObservation,
 	) {
-		calls.push({ timestamp, now });
+		calls.push({ timestamp, now, stalled: observation?.stalled === true });
 	});
 	return { calls, restore: () => spy.mockRestore() };
 }
+
+/** Block this process's event loop for `ms`, the way a content process blocks its own. */
+function block(ms: number): void {
+	const until = performance.now() + ms;
+	while (performance.now() < until) {
+		// Nothing runs while this spins: no timer, no read loop, no arrival gets stamped.
+	}
+}
+
+test("Consumer tells the estimator its own event loop was blocked", async () => {
+	const { calls, restore } = watchArrivals();
+	try {
+		const track = new Track.Producer("test");
+		const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 500 as Time.Milli });
+
+		writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro, 20_000 as Time.Micro]);
+		await settle(60);
+
+		// The media keeps landing while the loop is blocked, and every frame of the backlog is
+		// stamped with the clock after it. 200ms is well under the resample interval the spacing
+		// rule needs, which is the whole reason the consumer has to say so itself.
+		writeGroupWithLegacyFrames(track, 1, [40_000 as Time.Micro, 60_000 as Time.Micro]);
+		block(200);
+		await settle(60);
+		track.close();
+		await drainFrames(consumer, 200);
+
+		const before = calls.filter((c) => c.timestamp < 40_000);
+		const after = calls.filter((c) => c.timestamp >= 40_000);
+		expect(before.length).toBeGreaterThan(0);
+		expect(after.length).toBeGreaterThan(0);
+		expect(before.every((c) => !c.stalled)).toBe(true);
+		expect(after.every((c) => c.stalled)).toBe(true);
+
+		consumer.close();
+	} finally {
+		restore();
+	}
+});
+
+test("Consumer does not call an ordinary burst a stall", async () => {
+	const { calls, restore } = watchArrivals();
+	try {
+		const track = new Track.Producer("test");
+		const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 500 as Time.Milli });
+
+		// A publisher flushing a run of frames at once, which lands on the read loop as one burst and
+		// reads exactly like a backlog. The loop was running throughout, so none of it is the
+		// receiver's.
+		await settle(60);
+		writeGroupWithLegacyFrames(track, 0, [0, 20_000, 40_000, 60_000, 80_000] as Time.Micro[]);
+		track.close();
+		await drainFrames(consumer, 200);
+
+		expect(calls).toHaveLength(5);
+		expect(calls.every((c) => !c.stalled)).toBe(true);
+
+		consumer.close();
+	} finally {
+		restore();
+	}
+});
 
 test("Consumer observes a frame before the age budget can skip its group", async () => {
 	const { calls, restore } = watchArrivals();

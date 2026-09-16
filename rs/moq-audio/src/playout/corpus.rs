@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::delay::{BUCKET, Jitter, LOWER_DIVISOR};
+use super::delay::{BUCKET, Jitter, LOWER_DIVISOR, Observation};
 
 /// The corpus, checked in beside the tests that consume it.
 const CORPUS: &str = include_str!("../../tests/playout-01.json");
@@ -68,8 +68,11 @@ fn the_corpus_passes() {
 			}
 
 			let timestamp = Duration::from_nanos((number(arrival, "timestamp_us") * 1000.0).round() as u64);
-			let reordered = arrival["reordered"].as_bool().unwrap_or(false);
-			jitter.observe(timestamp, number(arrival, "arrival_ms"), reordered);
+			let observation = Observation {
+				reordered: arrival["reordered"].as_bool().unwrap_or(false),
+				stalled: arrival["stalled"].as_bool().unwrap_or(false),
+			};
+			jitter.observe(timestamp, number(arrival, "arrival_ms"), observation);
 
 			let expected = expected.as_f64().expect("a target is a number");
 			let actual = jitter.target().as_secs_f64() * 1000.0;
@@ -128,6 +131,8 @@ fn every_case_is_present() {
 		"discontinuity",
 		"outlier",
 		"sparse",
+		"receiver-stall",
+		"receiver-stall-unflagged",
 		"seeded",
 	] {
 		assert!(names.contains(&expected), "the corpus lost `{expected}`");

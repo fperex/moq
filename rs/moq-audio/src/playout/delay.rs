@@ -81,6 +81,26 @@ struct Arrival {
 	arrival: f64,
 }
 
+/// What the caller already knows about one arrival, beyond the two clocks it carries.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Observation {
+	/// The frame came out of order, whatever its timestamp says.
+	///
+	/// It is excluded from both the reference and the histogram: its arrival is early
+	/// relative to its timestamp, so counting it would add the media-time distance
+	/// between the two into a delay measurement.
+	pub reordered: bool,
+
+	/// The receiver itself was blocked before this arrival, so the wait in it is not
+	/// the path's.
+	///
+	/// The estimator infers the same thing from arrival spacing, but spacing alone
+	/// cannot separate a blocked receiver from a bursty path; whoever watched the
+	/// receiver can. Set it and the arrival reference is dropped, exactly as the
+	/// reading-gap rule does.
+	pub stalled: bool,
+}
+
 /// The playout target for one track, in milliseconds of buffer.
 pub(crate) struct Jitter {
 	/// Admitted arrivals within [`WINDOW`] of media, ascending by
@@ -163,18 +183,17 @@ impl Jitter {
 	/// Fold one frame into the estimate, given its media timestamp and the wall time
 	/// it arrived, in milliseconds on a monotonic local clock.
 	///
-	/// Pass `reordered` when the caller already knows the frame came out of order; a
-	/// frame whose timestamp is not strictly newer than the newest admitted one is
-	/// treated the same way. Either way it is excluded from both the reference and
-	/// the histogram: its arrival is early relative to its timestamp, so counting it
-	/// would add the media-time distance between the two into a delay measurement.
-	pub(crate) fn observe(&mut self, timestamp: Duration, now: f64, reordered: bool) {
+	/// What the caller knows and the two clocks do not show goes in `observation`:
+	/// that the frame came out of order, or that the receiver itself was blocked
+	/// before it landed. A frame whose timestamp is not strictly newer than the newest
+	/// admitted one is treated as reordered whatever the caller says.
+	pub(crate) fn observe(&mut self, timestamp: Duration, now: f64, observation: Observation) {
 		// Milliseconds on both axes from here down, so the unit is visible in the
 		// arithmetic. The two clocks are never compared: every formula below is a
 		// difference of differences, so a constant offset between them cancels.
 		let ts = timestamp.as_secs_f64() * 1000.0;
 
-		if reordered || self.newest.is_some_and(|newest| ts <= newest) {
+		if observation.reordered || self.newest.is_some_and(|newest| ts <= newest) {
 			// Costing a reordered arrival as delay against loss is a separate step,
 			// not yet written.
 			self.publish(now);
@@ -193,7 +212,14 @@ impl Jitter {
 		// arrival is the point: every frame in a backlog is equally late against a
 		// reference taken before the gap, so skipping the first would leave the
 		// second to set the same interval maximum.
-		if let Some(previous) = self.previous {
+		//
+		// A caller that watched the receiver knows this outright and says so, which is
+		// the only way to tell a block shorter than the interval from a path that
+		// flushes in bursts: the two have the same arrival spacing. The action is the
+		// same either way.
+		if observation.stalled {
+			self.min.clear();
+		} else if let Some(previous) = self.previous {
 			let idle = now - previous.arrival;
 			let progress = ts - previous.timestamp;
 			if idle > RESAMPLE && idle - progress > RESAMPLE {
@@ -460,7 +486,7 @@ mod tests {
 		for i in 0..count {
 			let timestamp = Duration::from_secs_f64((from + i as f64 * spacing) / 1000.0);
 			now = from + i as f64 * spacing + delay;
-			jitter.observe(timestamp, now, false);
+			jitter.observe(timestamp, now, Observation::default());
 		}
 		now
 	}
@@ -500,7 +526,11 @@ mod tests {
 		// measured.
 		for i in 0..100u64 {
 			let flush = (i / 7) * 7 + 6;
-			jitter.observe(Duration::from_millis(i * 20), (flush * 20 + 50) as f64, false);
+			jitter.observe(
+				Duration::from_millis(i * 20),
+				(flush * 20 + 50) as f64,
+				Observation::default(),
+			);
 		}
 		assert_eq!(jitter.target(), Duration::from_millis(140));
 
@@ -512,7 +542,11 @@ mod tests {
 
 		for i in 0..1000u64 {
 			let media = start + i * 20;
-			jitter.observe(Duration::from_millis(media), (media + 50) as f64, false);
+			jitter.observe(
+				Duration::from_millis(media),
+				(media + 50) as f64,
+				Observation::default(),
+			);
 
 			let target = jitter.target();
 			// A sixth of the distance left from 140ms is under a bucket, so the
@@ -558,7 +592,7 @@ mod tests {
 		// as a string of 2ms deltas.
 		for i in 0..300 {
 			let timestamp = Duration::from_millis(i * 20);
-			jitter.observe(timestamp, (i * 20 + i * 2) as f64, false);
+			jitter.observe(timestamp, (i * 20 + i * 2) as f64, Observation::default());
 		}
 		assert!(jitter.target() >= Duration::from_millis(200), "{:?}", jitter.target());
 	}
@@ -570,7 +604,11 @@ mod tests {
 		let settled = jitter.target();
 
 		// 2500ms past the reference: above the histogram's range, so discarded.
-		jitter.observe(Duration::from_secs_f64(now / 1000.0 + 0.02), now + 20.0 + 2500.0, false);
+		jitter.observe(
+			Duration::from_secs_f64(now / 1000.0 + 0.02),
+			now + 20.0 + 2500.0,
+			Observation::default(),
+		);
 		// Close the interval it landed in.
 		steady(&mut jitter, 60, 20.0, 0.0, now + 600.0);
 		assert_eq!(jitter.target(), settled);
@@ -584,7 +622,7 @@ mod tests {
 
 		// An old timestamp landing now would read as a delay the size of the gap
 		// between the two if it were admitted.
-		jitter.observe(Duration::from_millis(0), now + 10.0, false);
+		jitter.observe(Duration::from_millis(0), now + 10.0, Observation::default());
 		assert_eq!(jitter.target(), settled);
 	}
 
@@ -603,7 +641,7 @@ mod tests {
 		now += 1500.0;
 		let mut peak = settled;
 		for _ in 0..75 {
-			jitter.observe(Duration::from_secs_f64(ts / 1000.0), now, false);
+			jitter.observe(Duration::from_secs_f64(ts / 1000.0), now, Observation::default());
 			peak = peak.max(jitter.target());
 			ts += 20.0;
 			now += 3.25;
@@ -611,7 +649,7 @@ mod tests {
 
 		// Then paced again, on a path that never changed.
 		for _ in 0..200 {
-			jitter.observe(Duration::from_secs_f64(ts / 1000.0), now + 5.0, false);
+			jitter.observe(Duration::from_secs_f64(ts / 1000.0), now + 5.0, Observation::default());
 			peak = peak.max(jitter.target());
 			ts += 20.0;
 			now += 20.0;
@@ -621,6 +659,59 @@ mod tests {
 		// asking for the whole block and then walking it back down for a minute.
 		assert_eq!(peak, settled, "the block raised the target");
 		assert!(jitter.target() <= settled, "{:?}", jitter.target());
+	}
+
+	/// A block shorter than the resample interval has the same arrival spacing as a
+	/// publisher flushing that often, so the spacing rule leaves it alone. A caller
+	/// that watched its own receiver says so instead, and the target stays where the
+	/// path put it.
+	#[test]
+	fn an_explicit_stall_is_not_the_paths_delay() {
+		let block = 400.0;
+		let drain = 2.0;
+
+		let mut flagged = Jitter::new();
+		let mut unflagged = Jitter::new();
+		let mut now = steady(&mut flagged, 400, 20.0, 50.0, 0.0);
+		steady(&mut unflagged, 400, 20.0, 50.0, 0.0);
+
+		let settled = flagged.target();
+		assert_eq!(settled, Duration::from_millis(BUCKET as u64));
+
+		let mut cursor = now + block;
+		let mut peak = settled;
+		let mut control = settled;
+
+		for i in 400..900u64 {
+			let ts = (i * 20) as f64;
+			// Read at the later of when the frame landed and when the loop got to it.
+			let read = (ts + 50.0).max(cursor);
+			// Every frame the loop was late to is one the loop was late to, not one the
+			// path held.
+			let stalled = read > ts + 50.0;
+			cursor = read + drain;
+			now = read;
+
+			let timestamp = Duration::from_secs_f64(ts / 1000.0);
+			flagged.observe(
+				timestamp,
+				read,
+				Observation {
+					stalled,
+					..Default::default()
+				},
+			);
+			unflagged.observe(timestamp, read, Observation::default());
+
+			peak = peak.max(flagged.target());
+			control = control.max(unflagged.target());
+		}
+
+		assert!(now > 0.0);
+		assert_eq!(peak, settled, "the block raised the target");
+		// The same arrivals with nothing watching the loop, which is what the flag is
+		// worth: most of the block lands in the target and stays there.
+		assert!(control >= Duration::from_millis(300), "{control:?}");
 	}
 
 	/// The media term is what tells the two apart: a track that genuinely sends one
@@ -633,7 +724,7 @@ mod tests {
 		// One frame a second, arriving 150ms late every time.
 		for i in 0..60u64 {
 			let ts = (i * 1000) as f64;
-			jitter.observe(Duration::from_secs(i), ts + 150.0, false);
+			jitter.observe(Duration::from_secs(i), ts + 150.0, Observation::default());
 		}
 
 		// The path's own delay is steady, so the reference holds and the spread it
@@ -653,7 +744,7 @@ mod tests {
 		// flush lands 280ms after it was made.
 		for i in 0..150u64 {
 			let arrival = ((i / 15) + 1) * 300;
-			jitter.observe(Duration::from_millis(i * 20), arrival as f64, false);
+			jitter.observe(Duration::from_millis(i * 20), arrival as f64, Observation::default());
 		}
 		let raised = jitter.target();
 		assert!(raised >= Duration::from_millis(280), "{raised:?}");
@@ -663,7 +754,7 @@ mod tests {
 		let mut fell = vec![raised];
 		for i in 0..2000u64 {
 			now = 3000.0 + (i * 20) as f64;
-			jitter.observe(Duration::from_millis(3000 + i * 20), now, false);
+			jitter.observe(Duration::from_millis(3000 + i * 20), now, Observation::default());
 			if i % 50 == 49 {
 				fell.push(jitter.target());
 			}

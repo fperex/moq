@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::delay::Jitter;
+use super::delay::{Jitter, Observation};
 
 /// Where the browser keeps the recordings, relative to this crate.
 const FIXTURES: &str = "../../js/watch/src/audio/fixtures";
@@ -33,7 +33,11 @@ fn replay(name: &str) -> Duration {
 	for arrival in arrivals {
 		let timestamp = arrival["timestamp_us"].as_f64().expect("a timestamp");
 		let now = arrival["arrival_ms"].as_f64().expect("an arrival");
-		jitter.observe(Duration::from_nanos((timestamp * 1000.0).round() as u64), now, false);
+		jitter.observe(
+			Duration::from_nanos((timestamp * 1000.0).round() as u64),
+			now,
+			Observation::default(),
+		);
 	}
 
 	jitter.target()

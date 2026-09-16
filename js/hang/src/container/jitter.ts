@@ -40,6 +40,26 @@ const LOWER_DIVISOR = 6;
 // One admitted arrival, on both axes in milliseconds.
 type Arrival = { timestamp: number; arrival: number };
 
+/** What the caller already knows about one arrival, beyond the two clocks it carries. */
+export type JitterObservation = {
+	/**
+	 * The frame came out of order, whatever its timestamp says.
+	 *
+	 * It is excluded from both the reference and the histogram: its arrival is early relative to its
+	 * timestamp, so counting it would add the media-time distance between the two to a delay.
+	 */
+	reordered?: boolean;
+
+	/**
+	 * The receiver itself was blocked before this arrival, so the wait in it is not the path's.
+	 *
+	 * The estimator infers the same thing from arrival spacing, but spacing alone cannot separate a
+	 * blocked receiver from a bursty path; whoever watched the receiver can. Set it and the arrival
+	 * reference is dropped, exactly as the reading-gap rule does.
+	 */
+	stalled?: boolean;
+};
+
 /** How to start a {@link Jitter} that has not measured anything yet. */
 export type JitterProps = {
 	/**
@@ -68,7 +88,9 @@ export type JitterProps = {
  * ({@link JitterProps.start}), and the first measurement replaces it outright.
  *
  * Time the receiver spends not reading is not the path's fault, so a gap in the receiver's own
- * reading drops the arrival reference rather than reading as a delay the size of the gap.
+ * reading drops the arrival reference rather than reading as a delay the size of the gap. A caller
+ * that can see the receiver was blocked says so with {@link JitterObservation.stalled}; the spacing
+ * the estimator infers it from covers a caller that cannot.
  *
  * The algorithm is written down in `doc/concept/playout.md` and held to it by the conformance
  * corpus at `rs/moq-audio/tests/playout-01.json`. The design is WebRTC's NetEq
@@ -141,13 +163,12 @@ export class Jitter {
 	/**
 	 * Fold one frame into the estimate, given its media timestamp and the wall time it arrived.
 	 *
-	 * Pass `reordered` when the caller already knows the frame came out of order; a frame whose
-	 * timestamp is not strictly newer than the newest admitted one is treated the same way. Either
-	 * way it is excluded from both the reference and the histogram: its arrival is early relative to
-	 * its timestamp, so counting it would add the media-time distance between the two to a delay
-	 * measurement.
+	 * What the caller knows and the two clocks do not show goes in `observation`: that the frame came
+	 * out of order, or that the receiver itself was blocked before it landed.
 	 */
-	observe(timestamp: Time.Micro, now: Time.Milli, reordered = false): void {
+	observe(timestamp: Time.Micro, now: Time.Milli, observation: JitterObservation = {}): void {
+		const { reordered = false, stalled = false } = observation;
+
 		// Plain numbers from here down. The branded time types are structurally numbers, so mixing
 		// a media axis with a wall axis type-checks; keeping both in ms and unbranded makes the unit
 		// visible in the arithmetic instead.
@@ -171,9 +192,15 @@ export class Jitter {
 		// sends one frame a second is idle for longer than the interval too, but its timeline
 		// advances by as much as the wall clock does; a receiver that was not reading comes back to
 		// a backlog, so its idle time exceeds the media it covered.
+		//
+		// A caller that watched the receiver knows this outright and says so, which is the only way
+		// to tell a block shorter than the interval from a path that flushes in bursts: the two have
+		// the same arrival spacing. The action is the same either way.
 		const previous = this.#previous;
 		this.#previous = { timestamp: ts, arrival };
-		if (previous !== undefined) {
+		if (stalled) {
+			this.#min.length = 0;
+		} else if (previous !== undefined) {
 			const idle = arrival - previous.arrival;
 			if (idle > RESAMPLE && idle - (ts - previous.timestamp) > RESAMPLE) this.#min.length = 0;
 		}
