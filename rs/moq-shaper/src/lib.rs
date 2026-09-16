@@ -85,7 +85,7 @@ pub struct Report {
 	/// The profile that was active.
 	pub profile: String,
 
-	/// The seed both directions were started from.
+	/// The profile seed both directions derived their own from.
 	pub seed: u64,
 
 	/// Counters for datagrams travelling from the client to the upstream.
@@ -405,9 +405,13 @@ impl State {
 			queue: BinaryHeap::new(),
 			seq: 0,
 			start,
+			// One seed per direction, or the two lanes draw the same sequence and a symmetric
+			// profile loses and reorders the same datagrams both ways. SmallRng runs the seed
+			// through SplitMix64, so adjacent values start it well apart and the run still
+			// replays from the profile's one seed.
 			lanes: [
 				Lane::new(profile.up, profile.seed, start),
-				Lane::new(profile.down, profile.seed, start),
+				Lane::new(profile.down, profile.seed.wrapping_add(1), start),
 			],
 		}
 	}
@@ -904,5 +908,41 @@ mod tests {
 		assert_eq!(first, second);
 		assert_eq!(first_queue, second_queue);
 		assert!(first.dropped > 0 && first.reordered > 0);
+	}
+
+	#[tokio::test]
+	async fn each_direction_draws_its_own_sequence() {
+		let socket = socket().await;
+		let now = Instant::now();
+		let shape = Direction {
+			loss: 0.5,
+			..Default::default()
+		};
+		let profile = Profile {
+			name: "test".to_string(),
+			seed: 7,
+			up: shape,
+			down: shape,
+		};
+		let mut state = State::new(&profile, now);
+
+		// The same datagrams both ways through the same treatment, so the only thing that can
+		// tell the two lanes apart is the sequence each one draws. Recorded per datagram
+		// rather than as a total, because two independent lanes can still drop the same count.
+		let mut dropped = [Vec::new(), Vec::new()];
+		for id in 0..64u32 {
+			for dir in [Dir::Up, Dir::Down] {
+				let before = state.lanes[dir.index()].counters.dropped;
+				state.accept(dir, id.to_be_bytes().to_vec(), socket.clone(), None, now);
+				let after = state.lanes[dir.index()].counters.dropped;
+				dropped[dir.index()].push(after > before);
+			}
+		}
+
+		assert!(
+			dropped[0].iter().any(|&d| d),
+			"the up lane never dropped, so the test proves nothing"
+		);
+		assert_ne!(dropped[0], dropped[1], "both directions drew the same sequence");
 	}
 }
