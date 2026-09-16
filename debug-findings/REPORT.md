@@ -1,25 +1,40 @@
 # Real-time audio playout: what was wrong, what this branch does about it
 
-Branch: `fperex/moq` `debug-findings-solution`, rebased onto `upstream/dev` (`8f41d4d82`).
-This report sits at the branch tip (the docs commit sits on top of the last code commit,
-`3d2182594`). 62 commits, 152 files.
+Branch: `fperex/moq` `debug-findings-solution`, rebased onto `upstream/dev` (`877a561d8`, was
+`8f41d4d82`). This report sits at the branch tip: the docs commit sits on top of `5484970e1`, which
+is a CI change, and the last change to the player itself is `d5886766f`. 81 commits, 160 files.
 
 ## Summary
 
 1. `<moq-watch>` at the "Real-time" / auto preset stutters (moq-dev/moq#2812, #3477).
+
 2. Five separate defects produce it, and each one alone is enough to be heard.
+
 3. The auto delay came from the round trip, which cannot see how unevenly a publisher flushes.
+
 4. The audio ring skipped whenever it ran long and never re-stalled after running dry.
+
 5. The age budget was also the container's skip threshold, so the estimator under it could only confirm the budget it was cut to.
+
 6. This branch replaces the estimator with the algorithm NetEq uses, written down in `doc/concept/playout.md` and held by a checked-in corpus that both languages replay.
+
 7. The ring then converges by time stretch rather than by skipping, and conceals an outage rather than playing silence.
+
 8. `rs/moq-audio` gets the same engine, so `moq play` has a jitter buffer for the first time.
+
 9. `test/audio-quality` measures all of it over a seeded impaired path, in Chromium, in real Safari, and against the recorded traces on a simulated clock, and grades it nightly.
+
 10. On the public relay at auto, over 120 s: 36 underruns before the engine, 1 after.
+
 11. A user then muted a real microphone and kept hearing the room. Concealment had no end: it faded
     into the measured background level and stayed there. It now ends in silence, as current WebRTC
     does, and a muted publisher says on the wire that its timeline paused instead of leaving the
     watcher to guess. See finding 10.
+
+12. Firefox then underran where Chromium did not, on the same broadcast over the same relay at the
+    same moment. That is not the path either: the Firefox content process stops executing for two
+    to five hundred milliseconds at a time, and the estimator was reading the block as delay. The
+    estimator now takes an explicit "the receiver was blocked" input. See finding 12.
 
 No PR is intended. This is a proof of concept the maintainer can adopt one commit at a time.
 
@@ -31,80 +46,97 @@ with their author intact.
 
 | # | Commit | Quest / stage | What it is |
 | --- | --- | --- | --- |
-| 1 | `faea4e7dd` | #3517 (kixelated) | Auto sized from measured arrivals, ring slack, re-stall, `stall()`, underrun counter |
-| 2 | `d89129c0c` | #3517 (kixelated) | Short quantum counts as an underrun, stale arrival minimum expires |
-| 3 | `c807bf719` | `audio-jitter-target/spec.md` | `doc/concept/playout.md`, the NetEq estimator, the 14-case corpus and its generator |
-| 4 | `b7b6d2291` | `audio-jitter-target/watch.md` | Auto sized from the target, render quantum moved into the ring, advertised jitter the floor and 2 s the ceiling |
-| 5 | `ad332ab3b` | review follow-up | Arrival clock read before the container is parsed; the arrival test made real |
-| 6 | `d87d61d99` | `transport-impairment-profile.md` | `rs/moq-shaper`, a seeded userspace UDP path impairment with counters |
-| 7 | `64bb9df46` | `watch-audio-time-stretch.md` (native half) | Accelerate, preemptive expand, expand, merge, background noise, in Rust |
-| 8 | `c51c2ddcf` | review follow-up | `Container.Jitter` is the class, not a namespace |
-| 9 | `a4b5f67ed` | budget finding, part 1 | `Expired` on `StreamCode.DeliveryTimeout` |
-| 10 | `029041c19` | budget finding, part 2 | A censored group is counted, not a `spawn error` |
-| 11 | `524e7001a` | budget finding, part 3 (fork addition) | Audio subscribes and consumes at `maxAge + headroom` |
-| 12 | `d2b8d0133` | finding | `demo/web` tiles start in auto instead of a hard-coded `100ms` |
-| 13 | `a08a308a7` | CodeRabbit | Buzz fixture period sized from the signal it built |
-| 14 | `65b243321` | `m1/plan-av-clock.md` | The audio playhead drives `Sync.reference`; `sync.track()` replaces the flat inputs |
-| 15 | `8c6cc2565` | tune-in defect (browser) | A receiver's own reading stall stays out of the target; proportional fall |
-| 16 | `4de73282f` | `audio-jitter-target/native.md` | The native estimator, same corpus, `f64` |
-| 17 | `fa0db311f` | `audio-jitter-target/native.md` | The native engine: frame buffer, decision loop, playhead |
-| 18 | `919e35c54` | tune-in defect (native) | The same two rules in Rust |
-| 19 | `72d68711e` | `audio-jitter-target/native.md` | `decode::Config::delay` turns it on; `moq play --delay` becomes a floor |
-| 20 | `9623deb7c` | native test | The native guards hold to the fourteenth corpus case |
-| 21 | `691c3ad35` | `watch-audio-time-stretch.md` | The ring reader splits into `view`, `peek`, `commit` |
-| 22 | `f5dc706e5` | `watch-audio-time-stretch.md` | The browser engine: the ring converges by stretch rather than by skipping |
-| 23 | `8a31fea4b` | `qa-failure-artifacts.md` | A failing run keeps its directory |
-| 24 | `8a70fc4d2` | `audio-quality-harness/browser.md` | `test/audio-quality`: page, probe, driver, sink, analyzer, grader, schema |
-| 25 | `11000b41e` | harness | The page denies the WebSocket fallback so the shaper is in the path |
-| 26 | `cbad4c766` | harness | Budgets recorded from the full matrix, not enforced |
-| 27 | `462ca07c1` | harness | The probe can read a build it was not written against |
-| 28 | `7b2bd7411` | harness | The probe's generic helper is a function declaration, not an arrow |
-| 29 | `bad63a277` | harness | `skipped_groups` and the clock source become real numbers |
-| 30 | `970e348dd` | CodeRabbit | A void row fails the run; the probe's remaining reads are guarded |
-| 31 | `bf9eee985` | concealment (user decision) | The browser twin of expand and merge, behind `conceal`, default on |
-| 32 | `f2a05dc14` | re-land | MPEG-TS importer keeps fractional sample ticks |
-| 33 | `4b2f95faf` | re-land | Authored audio gaps render as silence before encoding |
-| 34 | `88f58c5f1` | re-land | A file's audio format is learned from its first decoded sample |
-| 35 | `393ca7305` | re-land | The video encoder's admission queue is bounded |
-| 36 | `bfc353c5e` | re-land | Native chunks bridge into the Libav polyfill when one codec is missing |
-| 37 | `168b9c33b` | `audio-quality-harness/browser.md` | A real Safari lane over safaridriver |
-| 38 | `e151dd15c` | `audio-quality-harness/browser.md` | A deterministic replay lane, graded on its own rows |
-| 39 | `cfffb4250` | `audio-quality-harness/browser.md` | The nightly `audio-quality` job |
-| 40 | `14ba83e79` | harness | The device's own rate is sampled; the unearned Safari budgets go |
-| 41 | `b7f18deb8` | harness | An underrun episode ends at the last sample that underran |
-| 42 | `83d369106` | concealment (user decision) | `conceal` as an element attribute, settable before connect |
-| 43 | `a4187712a` | flake | The `console.error` spy is isolated in the consumer test |
-| 44 | `3745d028b` | harness | The budgets enforced, measured on the playout engine |
-| 45 | `e84cb740b` | review | The review pass over the branch |
-| 46 | `c96861034` | delivery | This report and the issue comment |
-| 47 | `1157fa9a2` | shaper defect | Jitter varies the delay without reordering datagrams |
-| 48 | `411ca585c` | harness | The budgets re-recorded and enforced on the fixed shaper |
-| 49 | `7259477c3`, `f7c5018b3` | delivery | This report, filled in with the enforced budgets |
-| 50 | `f3355b2e9` | `m1/plan-av-clock.md`, user report | A hole in the source reaches the decoder, and a ring nothing is draining is flushed |
-| 51 | `840fccf2a` | delivery | This report and the issue comment, with the A/V desync fix |
-| 52 | `73b3f0196` | mic hold (user report) | Both rings hold one chunk above the playout target |
-| 53 | `b93dfe910` | mic hold (user report) | The same one-frame hold in the native engine |
-| 54 | `5f7ede85d` | harness | The real-microphone traces replayed and graded |
-| 55 | `b3b885fae` | delivery | This report and the issue comment, with the one-frame hold finding |
-| 56 | `07283facd` | mute (user report) | A long outage ends in silence, not comfort noise |
-| 57 | `3b17cb651` | mute (user report) | A muted audio track declares its endpoint, both ends |
-| 58 | `f10b35208` | mute (user report) | The same silence in the native engine |
-| 59 | `bda8c3927` | delivery | This report and the issue comment, with the mute finding |
-| 60 | `f58d13eda` | cold start (user decision) | The catalog jitter seeds the playout target instead of flooring it |
-| 61 | `3d2182594` | harness | The budgets re-recorded on the rebased tree |
-| 62 | `435307744` | delivery | This report and the issue comment, with the cold-start rule |
-| 63 | `58f79a8e2` | cold start (user decision) | The first measurement replaces the seeded playout target, as NetEq does |
-| 64 | this one | harness (intermittent) | The re-anchored decoder is never handed a chunk it refuses |
+| 1 | `8ec63fe74` | #3517 (kixelated) | Auto sized from measured arrivals, ring slack, re-stall, `stall()`, underrun counter |
+| 2 | `647d15b82` | #3517 (kixelated) | Short quantum counts as an underrun, stale arrival minimum expires |
+| 3 | `76387d714` | `audio-jitter-target/spec.md` | `doc/concept/playout.md`, the NetEq estimator, the 14-case corpus and its generator |
+| 4 | `12e015af5` | `audio-jitter-target/watch.md` | Auto sized from the target, render quantum moved into the ring, advertised jitter the floor and 2 s the ceiling |
+| 5 | `6087621b6` | review follow-up | Arrival clock read before the container is parsed; the arrival test made real |
+| 6 | `42c87a855` | `transport-impairment-profile.md` | `rs/moq-shaper`, a seeded userspace UDP path impairment with counters |
+| 7 | `50e70f5b8` | `watch-audio-time-stretch.md` (native half) | Accelerate, preemptive expand, expand, merge, background noise, in Rust |
+| 8 | `f05ea7e1e` | review follow-up | `Container.Jitter` is the class, not a namespace |
+| 9 | `ce0d6d0ef` | budget finding, part 1 | `Expired` on `StreamCode.DeliveryTimeout` |
+| 10 | `2f7c575a9` | budget finding, part 2 | A censored group is counted, not a `spawn error` |
+| 11 | `85d39db8e` | budget finding, part 3 (fork addition) | Audio subscribes and consumes at `maxAge + headroom` |
+| 12 | `a7c1a8182` | finding | `demo/web` tiles start in auto instead of a hard-coded `100ms` |
+| 13 | `c6a256aaa` | CodeRabbit | Buzz fixture period sized from the signal it built |
+| 14 | `4ab24271e` | `m1/plan-av-clock.md` | The audio playhead drives `Sync.reference`; `sync.track()` replaces the flat inputs |
+| 15 | `6951b7d26` | tune-in defect (browser) | A receiver's own reading stall stays out of the target; proportional fall |
+| 16 | `242ae8aa8` | `audio-jitter-target/native.md` | The native estimator, same corpus, `f64` |
+| 17 | `edeef0297` | `audio-jitter-target/native.md` | The native engine: frame buffer, decision loop, playhead |
+| 18 | `943a48c00` | tune-in defect (native) | The same two rules in Rust |
+| 19 | `9db068e08` | `audio-jitter-target/native.md` | `decode::Config::delay` turns it on; `moq play --delay` becomes a floor |
+| 20 | `1823f309a` | native test | The native guards hold to the fourteenth corpus case |
+| 21 | `2201b7b30` | `watch-audio-time-stretch.md` | The ring reader splits into `view`, `peek`, `commit` |
+| 22 | `c2d32a2db` | `watch-audio-time-stretch.md` | The browser engine: the ring converges by stretch rather than by skipping |
+| 23 | `6b568e223` | `qa-failure-artifacts.md` | A failing run keeps its directory |
+| 24 | `51c9a0647` | `audio-quality-harness/browser.md` | `test/audio-quality`: page, probe, driver, sink, analyzer, grader, schema |
+| 25 | `1526eff93` | harness | The page denies the WebSocket fallback so the shaper is in the path |
+| 26 | `744f0c38b` | harness | Budgets recorded from the full matrix, not enforced |
+| 27 | `b098b17e0` | harness | The probe can read a build it was not written against |
+| 28 | `3b2dbcd31` | harness | The probe's generic helper is a function declaration, not an arrow |
+| 29 | `b3498efdc` | harness | `skipped_groups` and the clock source become real numbers |
+| 30 | `ef9f11e06` | CodeRabbit | A void row fails the run; the probe's remaining reads are guarded |
+| 31 | `e50230451` | concealment (user decision) | The browser twin of expand and merge, behind `conceal`, default on |
+| 32 | `eedcfa5d1` | re-land | MPEG-TS importer keeps fractional sample ticks |
+| 33 | `03820021b` | re-land | Authored audio gaps render as silence before encoding |
+| 34 | `060f7de48` | re-land | A file's audio format is learned from its first decoded sample |
+| 35 | `127febcac` | re-land | The video encoder's admission queue is bounded |
+| 36 | `dd891b956` | re-land | Native chunks bridge into the Libav polyfill when one codec is missing |
+| 37 | `3c4f0f6e9` | `audio-quality-harness/browser.md` | A real Safari lane over safaridriver |
+| 38 | `6184239e7` | `audio-quality-harness/browser.md` | A deterministic replay lane, graded on its own rows |
+| 39 | `2b9d492f0` | `audio-quality-harness/browser.md` | The nightly `audio-quality` job |
+| 40 | `860aeac3d` | harness | The device's own rate is sampled; the unearned Safari budgets go |
+| 41 | `b336e5d86` | harness | An underrun episode ends at the last sample that underran |
+| 42 | `e5d36eb1f` | concealment (user decision) | `conceal` as an element attribute, settable before connect |
+| 43 | `fcce8af55` | flake | The `console.error` spy is isolated in the consumer test |
+| 44 | `697a67635` | harness | The budgets enforced, measured on the playout engine |
+| 45 | `1af4609eb` | review | The review pass over the branch |
+| 46 | `928ec4abf` | delivery | This report and the issue comment |
+| 47 | `f65ab9351` | shaper defect | Jitter varies the delay without reordering datagrams |
+| 48 | `b418434f6` | harness | The budgets re-recorded and enforced on the fixed shaper |
+| 49 | `3f0e3221d`, `20480cbf3` | delivery | This report, filled in with the enforced budgets |
+| 50 | `c153b2a69` | `m1/plan-av-clock.md`, user report | A hole in the source reaches the decoder, and a ring nothing is draining is flushed |
+| 51 | `2a79fed4a` | delivery | This report and the issue comment, with the A/V desync fix |
+| 52 | `014f74897` | mic hold (user report) | Both rings hold one chunk above the playout target |
+| 53 | `5b144e010` | mic hold (user report) | The same one-frame hold in the native engine |
+| 54 | `c3c95f06e` | harness | The real-microphone traces replayed and graded |
+| 55 | `fbbac54b6` | delivery | This report and the issue comment, with the one-frame hold finding |
+| 56 | `7ba93d562` | mute (user report) | A long outage ends in silence, not comfort noise |
+| 57 | `44599d39f` | mute (user report) | A muted audio track declares its endpoint, both ends |
+| 58 | `5ea2ec0ab` | mute (user report) | The same silence in the native engine |
+| 59 | `cd2a4b456` | delivery | This report and the issue comment, with the mute finding |
+| 60 | `aeaaf8908` | cold start (user decision) | The catalog jitter seeds the playout target instead of flooring it |
+| 61 | `0014daca9` | harness | The budgets re-recorded on the rebased tree |
+| 62 | `c6efeefef` | delivery | This report and the issue comment, with the cold-start rule |
+| 63 | `99b62150d` | cold start (user decision) | The first measurement replaces the seeded playout target, as NetEq does |
+| 64 | `9e2dabe74` | harness (intermittent) | The re-anchored decoder is never handed a chunk it refuses |
+| 65 | `ce2e13112` | harness | The budgets re-recorded after the seed and the decoder fixes |
+| 66 | `ec6d9761a` | delivery | Cross-browser results: four engines, three sources |
+| 67 | `85583de68` | delivery | The Safari catalog defect retracted |
+| 68 | `3c9388e56` | delivery | The handoff for whoever continues the branch |
+| 69 | `8cabb3507` | harness (rebase) | The harness relay admits anonymous sessions under upstream's lease model |
+| 70 | `8700f1fcc` | unmute spike (user report) | A flushed ring reports no playhead until it is re-anchored |
+| 71 | `3dcea2ab4` | delivery | remark's own formatting over the report |
+| 72 | `b86b03c94` | Safari unlock (user report) | The audio unlock is armed on the first gesture, so one click plays |
+| 73 | `a8cbc93bb` | CodeRabbit | Each shaper direction draws its own seed, and a reorder without a delay is refused |
+| 74 | `97c7afb76` | CodeRabbit | A capture that ends while still enabled declares an audio endpoint |
+| 75 | `b85e57431` | CodeRabbit | The grader, beacon, probe and Safari lane fail loudly where they were silent |
+| 76 | `02f3f143a` | CodeRabbit | The stereo merge case uses a distinct signal per channel |
+| 77 | `f5087814b` | CodeRabbit | The native replay module's doc comment says four traces, not two |
+| 78 | `d5886766f` | finding 12 | The estimator is told when the receiver itself was blocked |
+| 79 | `a8fe99aeb` | finding 12 | The recorded Firefox window replayed and graded |
+| 80 | `5484970e1` | CI | The nightly job runs the replay lane ahead of the Chromium matrix |
+| 81 | this one | delivery | This report, the issue comment and the handoff, refreshed for the rebased tip |
 
-Suggested reading order for review: 3, 4, 9 to 11, 21, 22, 31. Those seven are the fix. The native
-half (7, 16 to 20) is the same algorithm again and can be read second or skipped entirely. The
-harness (6, 23 to 30, 37 to 39, 44, 47, 48) stands alone and can be adopted without any of the
-player changes.
+Suggested reading order for review: 3, 4, 9 to 11, 21, 22, 31, 78. Those eight are the fix. The
+native half (7, 16 to 20) is the same algorithm again and can be read second or skipped entirely.
+The harness (6, 23 to 30, 37 to 39, 44, 47, 48, 65, 69, 75, 79, 80) stands alone and can be adopted
+without any of the player changes.
 
 ## Root causes
 
-Five defects. The first three were confirmed against `upstream/dev` at `8f41d4d82`; the last two are
-this branch's own, found by a listener on builds of it.
+Five defects. The first three were confirmed against `upstream/dev` when it was at `8f41d4d82`; the
+last two are this branch's own, found by a listener on builds of it.
 
 ### 1. The ring cap has no hysteresis and no refill
 
@@ -187,10 +219,10 @@ reordered-arrival rule without sequence numbers, 500 ms max-over-interval resamp
 rise and fall rules, re-anchoring, the "plus one frame" decision, a parity-trap list, and the corpus
 contract.
 
-The corpus is `rs/moq-audio/tests/playout-01.json`, 15 cases, generated by
+The corpus is `rs/moq-audio/tests/playout-01.json`, 17 cases, generated by
 `js/hang/src/container/jitter.vectors.ts` and freshness-checked in both languages. Every expected
 target is an integer multiple of 20 ms, so an `f64` difference between V8 and rustc cannot break
-parity. Both implementations replay it exactly, 15 of 15.
+parity. Both implementations replay it exactly, 17 of 17.
 
 The corpus lives in `rs/moq-audio` for the same reason `moq-json`'s vectors live where they do: the
 crate that must `include_str!` it owns it, and `cargo package` cannot reach outside a package root.
@@ -271,7 +303,7 @@ The decode loop on `upstream/dev` has no hole handling either, and `terminal.ts`
 identical, so the collapse itself predates this branch. What this stage changed is who follows it:
 before, video paced against a wall clock and only the audio was late.
 
-Two changes, both in `f3355b2e9`. `Terminal.continues()` measures each frame against the last one at the
+Two changes, both in `c153b2a69`. `Terminal.continues()` measures each frame against the last one at the
 decoder's own frame duration and reports a hole; `Audio.Decoder.#reanchor` drains the decoder so the
 frames in flight keep the run that is ending, then restarts it so the next chunk's own timestamp
 opens the new one. `Audio.Decoder.#runFlush` drops what the ring still holds when the download
@@ -427,7 +459,7 @@ playout claims three quarters of it, so a budget four thirds of the floor would 
 floor, and a measured buffer that can never measure anything is a fixed one with extra steps.
 
 Replaying the same trimmed traces, the native engine settles on the same 80 ms and 240 ms targets the
-browser does, and the corpus passes 15 of 15.
+browser does, and the corpus passes 17 of 17.
 
 ### The chunk above the target
 
@@ -476,7 +508,7 @@ the target is a measurement, and rise and fall apply between measurements from t
 `Sync` is then one term: `auto` is the measurement and a fixed delay is the number the viewer asked
 for. `SyncTrack.advertised` has no reader left and goes.
 
-`playout-01.json` gains a fifteenth case, `seeded`: a 310 ms declaration starts the target at 320 ms
+`playout-01.json` gains a `seeded` case: a 310 ms declaration starts the target at 320 ms
 and the first resampled observation takes it to the 20 ms the steady trace settles on. A case
 carrying `start_ms` is replayed from it in both languages. The 80 ms default is a seed on the same
 rule, so nine of the fourteen existing cases lose their first seconds of walk-down too; every one of
@@ -716,76 +748,121 @@ are re-measured on the fixed shaper and on 60 s rows.
 
 ### The enforced budgets
 
-`budgets.json`, re-recorded on the fixed shaper from two 60 second runs of the whole matrix: the
-worst of the two times 1.5, a hard 0 on the counters the engine has to keep at zero wherever both
-runs measured zero, a share capped at 1 and a convergence time capped at the row's own run.
+`budgets.json` was last re-recorded in `ce2e13112`, after the cold-start change and the decoder
+anchor, from two 60 second runs of the whole matrix: the worst of the two times 1.5, a hard 0 on the
+counters the engine has to keep at zero wherever both runs measured zero, a share capped at 1 and a
+convergence time capped at the row's own run. `a8fe99aeb` then added the two `mic-firefox` replay
+rows.
 
 A row is enforced when its two runs agreed within that same 1.5 on every graded metric, which is a
 strict test: a metric one run measured as zero and the other did not is a disagreement, because the
-ratio is unbounded. Ten rows clear it. The fourteen that do not keep the `recorded` marker, which
-prints a breach and calls it out without failing the run, until the nightly runner records its own.
+ratio is unbounded. **Three Chromium rows clear it**, all three of them `fixed-250`, which is the
+profile that adds a constant delay and nothing else. The other twenty-one keep the `recorded`
+marker, which prints a breach and calls it out without failing the run, until the nightly runner
+records its own. An earlier version of this report said ten of twenty-four rows were enforced with
+120 checks; that was the previous recording, and the re-record on a tree whose targets settle within
+a second rather than walking a declaration down for 40 s moved most of the rows out of agreement
+with themselves.
 
 | Row | Enforced | underrun ep/min | skipped ms/min | silence | target p95 | converge s |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| opus, near-zero, isolated | | 1.7 | 944.4 | 0.191 | 180 | 34.5 |
-| opus, near-zero, plain | yes | 0 | 0 | 0.38 | 120 | 0 |
-| opus, mild, isolated | | 0 | 67.1 | 0.573 | 630 | 60 |
-| opus, mild, plain | | 0 | 65.7 | 0.15 | 330 | 60 |
-| opus, bursty, isolated | | 4.9 | 1082.1 | 0.15 | 840 | 60 |
-| opus, bursty, plain | | 1.7 | 6834.3 | 0.573 | 3000 | 60 |
-| opus, step, isolated | | 1.7 | 0 | 0.096 | 450 | 60 |
-| opus, step, plain | yes | 0 | 2221.6 | 0.387 | 2250 | 60 |
-| opus, high-rtt, isolated | | 0 | 69 | 0 | 420 | 60 |
-| opus, high-rtt, plain | | 1.7 | 66.4 | 0.109 | 270 | 23.7 |
-| opus, fixed-250, isolated | yes | 0 | 0 | 0.393 | 441 | 0 |
-| opus, fixed-250, plain | yes | 0 | 0 | 0.436 | 441 | 0 |
-| aac, near-zero, isolated | yes | 0 | 0 | 0.252 | 558 | 0 |
-| aac, near-zero, plain | yes | 0 | 0 | 0.075 | 558 | 0 |
-| aac, mild, isolated | yes | 0 | 0 | 0.361 | 558 | 0 |
-| aac, mild, plain | yes | 0 | 0 | 0.471 | 558 | 0 |
-| aac, bursty, isolated | | 0 | 6185.2 | 0.464 | 1500 | 60 |
-| aac, bursty, plain | | 0 | 2446.4 | 1 | 2760 | 60 |
-| aac, step, isolated | | 0 | 0 | 0.048 | 570 | 0 |
-| aac, step, plain | | 1.7 | 0 | 0.191 | 600 | 22.5 |
-| aac, high-rtt, isolated | yes | 0 | 0 | 0.401 | 558 | 0 |
-| aac, high-rtt, plain | | 0 | 0 | 0.532 | 690 | 30.5 |
-| aac, fixed-250, isolated | yes | 0 | 0 | 0.177 | 933 | 0 |
-| aac, fixed-250, plain | | 0 | 0 | 0.211 | 933 | 0 |
+| opus, near-zero, isolated | | 1.7 | 989.1 | 0.183 | 240 | 84 |
+| opus, near-zero, plain | | 0 | 0 | 0.389 | 240 | 46.5 |
+| opus, mild, isolated | | 0 | 0 | 0.477 | 480 | 60.3 |
+| opus, mild, plain | | 0 | 662.8 | 0.177 | 2160 | 73.5 |
+| opus, bursty, isolated | | 0 | 1959.3 | 0.15 | 1020 | 87.8 |
+| opus, bursty, plain | | 0 | 3295 | 0.564 | 2520 | 81.3 |
+| opus, step, isolated | | 0 | 419.4 | 0.088 | 690 | 73.8 |
+| opus, step, plain | | 0 | 4377.9 | 0.436 | 2880 | 88.2 |
+| opus, high-rtt, isolated | | 1.7 | 70.5 | 0.007 | 480 | 85.2 |
+| opus, high-rtt, plain | | 0 | 947.1 | 0.102 | 510 | 78.8 |
+| opus, fixed-250, isolated | yes | 0 | 0 | 0.41 | 375 | 0 |
+| opus, fixed-250, plain | | 0 | 0 | 0.422 | 375 | 0 |
+| aac, near-zero, isolated | | 0 | 0 | 0.21 | 420 | 71.6 |
+| aac, near-zero, plain | | 0 | 134.4 | 0.075 | 270 | 3 |
+| aac, mild, isolated | | 0 | 351.5 | 0.402 | 990 | 60.8 |
+| aac, mild, plain | | 0 | 2238 | 0.552 | 1710 | 87.8 |
+| aac, bursty, isolated | | 0 | 2762.7 | 0.464 | 2640 | 87.8 |
+| aac, bursty, plain | | 1.7 | 5172.9 | 0.075 | 1770 | 81 |
+| aac, step, isolated | | 1.7 | 140.2 | 0.061 | 540 | 54.8 |
+| aac, step, plain | | 1.7 | 818.2 | 0.177 | 480 | 60.4 |
+| aac, high-rtt, isolated | | 0 | 85.9 | 0.401 | 330 | 11.6 |
+| aac, high-rtt, plain | | 0 | 555.6 | 0.45 | 570 | 57.3 |
+| aac, fixed-250, isolated | yes | 0 | 0 | 0.171 | 375 | 0 |
+| aac, fixed-250, plain | yes | 0 | 0 | 0.191 | 375 | 0 |
 
-A third run of the matrix under `--enforce` passed all 120 enforced checks across 24 rows with no
-void row, and breached only where the marker had been kept: `aac-bursty-isolated` on skip-aheads,
-`aac-bursty-plain` on an underrun episode, `aac-step-plain` on skip-aheads and convergence, and
-`opus-mild-plain` on four. That is the split doing exactly what it is for, and it is the reason the
-fourteen are not enforced yet rather than pinned at a number that would fail on the weather.
+The matrix run at the branch tip passed all 36 enforced checks across the 24 rows and breached 17
+recorded ceilings. Those breaches are the reason the twenty-one are not enforced yet, rather than
+pinned at a number that would fail on the weather.
 
-The replay lane is enforced in full, because it is deterministic: 74 checks across six rows, every
-ceiling exactly what was measured. `lan-bbb` and `relay-bbb-7frame` hold zero underruns, zero skips
-and zero discarded samples on both rings at an 80 ms and a 240 ms target. `4k-webm` keeps 7 to 14
-underrun episodes a minute and 1548.8 skipped ms, which are the holes in the recording.
+| Row | Metric | Measured | Ceiling |
+| --- | --- | ---: | ---: |
+| aac, bursty, isolated | underrun episodes/min | 1.1 | 0 |
+| aac, bursty, isolated | underrun ms/min | 272.1 | 0 |
+| aac, bursty, isolated | skipped ms/min | 3609.7 | 2762.7 |
+| aac, bursty, plain | skipped groups/min | 21.8 | 9.8 |
+| aac, high-rtt, isolated | target p95 | 340 | 330 |
+| aac, high-rtt, isolated | converge s | 42.7 | 11.6 |
+| aac, high-rtt, plain | skipped ms/min | 2895.3 | 555.6 |
+| aac, near-zero, plain | converge s | 3.5 | 3 |
+| opus, bursty, isolated | underrun episodes/min | 1.1 | 0 |
+| opus, bursty, isolated | underrun ms/min | 272.5 | 0 |
+| opus, bursty, plain | underrun episodes/min | 1.1 | 0 |
+| opus, bursty, plain | underrun ms/min | 273.6 | 0 |
+| opus, mild, isolated | stalled quanta share | 0.005 | 0 |
+| opus, mild, isolated | skip-aheads/min | 1.1 | 0 |
+| opus, mild, isolated | skipped ms/min | 44 | 0 |
+| opus, step, isolated | underrun episodes/min | 1.1 | 0 |
+| opus, step, isolated | underrun ms/min | 271 | 0 |
 
-**Residuals.** Twelve rows carry a measured ceiling on a counter the engine is supposed to keep at
-zero. Each is work that is left, not a bar that was cleared.
+Two observations about that list. `aac-high-rtt-isolated` converging in 42.7 s against an 11.6 s
+ceiling is well outside the run-to-run spread the rest of the table shows, and it is open: nothing
+here explains it. The rest is one shape repeated. Ten of the seventeen are a hard zero breached by a
+single episode at 1.1 a minute and the 272 ms of concealment that episode cost, and a hard zero is
+what the recording rule produces when both recorded runs happened to measure zero on a counter that
+is not reliably zero. That is a recording artefact rather than a regression, and it is what the
+`recorded` marker exists to absorb.
+
+One row voided on the same run: `opus-near-zero-isolated`, on the clock guard, with
+`AudioContext.currentTime` drifting 4.92 percent from wall clock over 10 s. A void row is reported
+rather than enforced on a recorded budget, and a drifting context is exactly the state that would
+otherwise produce a full set of plausible counters.
+
+The replay lane is enforced in full, because it is deterministic: 148 checks across twelve rows,
+every ceiling exactly what was measured, no void row. `lan-bbb` and `relay-bbb-7frame` hold zero
+skips and zero discarded samples on both rings at an 80 ms and a 240 ms target. `4k-webm` keeps 7
+underrun episodes a minute and 1267.2 skipped ms, which are the holes in the recording. `mic-local`
+and `mic-remote` are clean at 40 ms and 20 ms. `mic-firefox` is the receiver-stall recording from
+finding 12, at a 300 ms target.
+
+**Residuals.** Seventeen rows carry a measured ceiling on a counter the engine is supposed to keep
+at zero. Each is work that is left, not a bar that was cleared.
 
 | Row | skip-aheads/min | underrun episodes/min |
 | --- | ---: | ---: |
-| opus, near-zero, isolated | 11.4 | 1.7 |
-| opus, mild, isolated | 1.7 | |
-| opus, mild, plain | 1.7 | |
-| opus, bursty, isolated | 11.4 | 4.9 |
-| opus, bursty, plain | 58.9 | 1.7 |
-| opus, step, isolated | | 1.7 |
-| opus, step, plain | 32.7 | |
-| opus, high-rtt, isolated | 1.7 | |
-| opus, high-rtt, plain | 1.7 | 1.7 |
-| aac, bursty, isolated | 3.3 | |
-| aac, bursty, plain | 14.7 | |
-| aac, step, plain | | 1.7 |
+| opus, near-zero, isolated | 13.0 | 1.7 |
+| opus, mild, plain | 8.2 | |
+| opus, bursty, isolated | 13.0 | |
+| opus, bursty, plain | 41.0 | |
+| opus, step, isolated | 4.9 | |
+| opus, step, plain | 63.8 | |
+| opus, high-rtt, isolated | 1.7 | 1.7 |
+| opus, high-rtt, plain | 4.9 | |
+| aac, near-zero, plain | 3.3 | |
+| aac, mild, isolated | 4.9 | |
+| aac, mild, plain | 24.6 | |
+| aac, bursty, isolated | 34.3 | |
+| aac, bursty, plain | 18.0 | 1.7 |
+| aac, step, isolated | 3.3 | 1.7 |
+| aac, step, plain | 13.0 | 1.7 |
+| aac, high-rtt, isolated | 1.7 | |
+| aac, high-rtt, plain | 11.4 | |
 
-Eight of the sixteen entries are a ceiling of 1.7, which is one event in a minute measured once and
-not the other time. The three that are the real remainder are the `bursty` skip-ahead ceilings and
-`opus-step-plain`'s 32.7: a 160 ms flush arriving as one burst still outruns what 15 ms of stretch
-per 100 ms of output can absorb, so the band still fires. Bringing those to zero is the next piece
-of work on the engine, not something this branch claims.
+Seven of the twenty-two entries are a ceiling of 1.7, which is one event in a minute measured once
+and not the other time. The real remainder is the `bursty` and `step` skip-ahead ceilings,
+`opus-step-plain`'s 63.8 worst of all: a 160 ms flush arriving as one burst still outruns what 15 ms
+of stretch per 100 ms of output can absorb, so the band still fires. Bringing those to zero is the
+next piece of work on the engine, not something this branch claims.
 
 ### Before and after, on the fixed shaper
 
@@ -853,10 +930,10 @@ number is video behind audio.
 
 | Source | Engine | Transport | Target | Held | Level p50/p95 | Underruns | Short | Concealed | Skips | Skew p50/p95 | Meets |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| microphone, LAN | Firefox | webtransport | 40 ms | 60 ms | 73/87 ms | 3 | 0 | 60 ms | 0 | -18/3 ms | target and held yes, underruns no |
+| microphone, LAN | Firefox | webtransport | 40 ms | 60 ms | 73/87 ms | 3 | 0 | 60 ms | 0 | -18/3 ms | target and held yes, underruns no: finding 12 |
 | microphone, LAN | WebKit | websocket | 40 ms | 60 ms | 62/74 ms | 0 | 0 | 0 | 0 | -7/19 ms | yes |
 | microphone, LAN | Safari | websocket | 40 ms | 60 ms | 65/77 ms | 0 | 1 | 0 | 0 | -6/18 ms | yes, after a 2.2 s video stall |
-| `bbb-smooth.hang`, LAN | Firefox | webtransport | 100 ms | 123 ms | 95/146 ms | 1 | 0 | 40 ms | 0 | -24/3 ms | target and held yes, underruns no |
+| `bbb-smooth.hang`, LAN | Firefox | webtransport | 100 ms | 123 ms | 95/146 ms | 1 | 0 | 40 ms | 0 | -24/3 ms | target and held yes, underruns no: finding 12 |
 | `bbb-smooth.hang`, LAN | WebKit | websocket | 80 ms | 103 ms | 91/112 ms | 0 | 0 | 0 | 0 | -21/2 ms | yes |
 | `bbb-smooth.hang`, LAN | Safari | websocket | 60 ms | 83 ms | 87/111 ms | 0 | 0 | 0 | 0 | -22/3 ms | yes |
 | `bbb.hang`, cdn.moq.pro | Firefox | webtransport | 200 ms | 223 ms | 251/337 ms | 0 | 0 | 0 | 0 | -26/1 ms | held 223 ms, 23 ms over |
@@ -879,8 +956,10 @@ So the WebSocket lane here is WebKit and Safari, not Firefox.
 
 Firefox is also the only engine that underran after convergence: 3 episodes and 60 ms of concealment
 on the microphone row, 1 and 40 ms on `bbb-smooth`, against zero for both WebKit and Safari on the
-same sources. Every other counter is level with theirs, so this is arrival jitter Firefox's
-WebTransport delivers and the other two do not, not a deeper buffer doing the work.
+same sources. Every other counter is level with theirs. An earlier version of this report read that
+as arrival jitter Firefox's WebTransport delivers and the other two do not. It is not. It is the
+Firefox content process blocking its own read loop, and the estimator taking the block as path
+delay. See finding 12, which is the diagnosis and the fix.
 
 ### The mute and preset sequence, per engine
 
@@ -914,7 +993,8 @@ a position the ring really was at, and one the reader will never resume from doe
 different from one it has not reached yet. `sync.replay.test.ts` replays the sequence over the
 fallback transport with that message delivered, and the skew it measures goes from 2992 ms to 37 ms.
 
-<!-- after: Firefox X ms, WebKit Y ms, measured in step 2 -->
+The Firefox and WebKit after numbers on a served build are not yet measured; the regression test's
+2992 ms to 37 ms is the current evidence.
 
 ### Browser publishers
 
@@ -1021,19 +1101,41 @@ Chromium, where its autoplay policy had already started it, and `running` within
 
 ### Gates on the final tree
 
-Every row below was run on the rebased tree, in this order, one at a time.
+Two passes, each stated with the tip it ran on, one command at a time.
+
+At `3dcea2ab4`, 72 commits above `upstream/dev`:
 
 | Gate | Exit | What it covered |
 | --- | ---: | --- |
-| `just fix` | 0 | No tracked change |
 | `just check upstream/dev` | 0 | Every package the branch touches, scoped as CI scopes it |
 | `just check-all` | 0 | Every package, every language, including the bindings and the docs site |
-| `just test all` | 0 | 4617 Rust tests (8 skipped), 1876 Bun tests across fifteen packages, 59 Python |
-| `just test smoke-full` | 0 | 32/32 cross-language publish/subscribe pairs |
-| `just drafts check` | 0 | Every draft, including the hang draft this branch changes |
-| `just test audio-quality --runtime replay --enforce` | 0 | 10 rows, 120 enforced checks |
-| `just test audio-quality --enforce` | 0 | 24 Chromium rows at 60 s, no void row |
+| `just test all` | 0 | 4569 Rust tests (8 skipped), 1942 Bun tests across fifteen packages, 63 Python |
+| `just test smoke-full` | 0 | 32 of 32 cross-language publish/subscribe pairs |
+| `just drafts check` | 0 | 10 drafts, including the hang draft this branch changes |
+| `just test audio-quality --runtime replay --enforce` | 0 | 10 rows, 124 enforced checks |
 | privacy grep over the branch's added lines | 0 hits | No home path, name, address, token, or session id |
+| CodeRabbit CLI, per directory | 22 findings | 18 fixed, 4 rejected with reasons; see finding 13 |
+
+At the tip `5484970e1`, 81 commits above `upstream/dev`:
+
+| Gate | Exit | What it covered |
+| --- | ---: | --- |
+| `just fix upstream/dev` | 0 | No tracked change |
+| `just check upstream/dev` | 0 | Every package the branch touches, scoped as CI scopes it |
+| `just test default upstream/dev` | 0 | 4573 Rust tests (8 skipped), 1956 Bun tests across fifteen packages, 63 Python |
+| `cargo nextest run -p moq-audio -p moq-shaper` | 0 | 200 tests |
+| `just test audio-quality --runtime replay --enforce` | 0 | 12 rows, 148 enforced checks, 0 void |
+| `just test audio-quality --enforce` | 0 | 24 Chromium rows at 60 s, 36 enforced checks, 0 enforced breaches |
+
+The Chromium matrix at the tip breached 17 recorded ceilings and voided one recorded row,
+`opus-near-zero-isolated`, on `AudioContext.currentTime` drifting 4.92 percent from wall clock over
+10 s. Both are in the enforced-budgets section above, with every measured value against its ceiling.
+
+**`check-all`, `test all` and `smoke-full` were last run nine commits below the tip.** Those nine
+commits touch `js/watch`, `js/hang`, `js/publish`, `rs/moq-shaper`, `rs/moq-audio`, the harness and
+the nightly workflow. Every one of those is inside the scope the `check` and `test` at the tip cover,
+so nothing in them is unchecked; what is not re-run is the rest of the workspace, which they do not
+touch, and the cross-language interop lane.
 
 One caveat on the CPU bench in `stretch.bench.test.ts`: its ratio assertion
 (`max(stretch) / max(normal) < 30`) fails about one run in fifteen on this machine and passes the
@@ -1046,7 +1148,7 @@ Each of these is deliberate and each is isolated so it can be dropped.
 
 **Concealment is core here.** `watch-audio-time-stretch.md` keeps an underrun a ramped gap and says
 no packet loss concealment. The user asked for NetEq's expand and merge. It is its own commit
-(`bf9eee985`), it is switchable with `conceal` on the audio decoder, and turning it off restores the
+(`e50230451`), it is switchable with `conceal` on the audio decoder, and turning it off restores the
 ramp byte for byte. The stretch commit before it passes its own budgets alone.
 
 **The audio headroom is this fork's addition.** The quests only require observing above the budget,
@@ -1080,13 +1182,13 @@ Things found while working that are separate from the fix.
 
 1. **`demo/web` pinned `delay="100ms"` on every tile.** That is the "100 ms chip on a fresh session"
    from `watch.md`. Nothing was restoring anything, and no storage was involved. Fixed in
-   `d2b8d0133`.
+   `a7c1a8182`.
 
 2. **`ui/components/buffer-control.ts` sets a numeric delay on mousedown.** A single click on the bar
    therefore leaves auto without the user asking for a value. Not changed here; it is a UI decision.
 
 3. **The released `latency` attribute falls back to a silent 100 ms** for an unparseable value, where
-   its `delay` sibling warns and falls back to the element default. Made consistent in `b7b6d2291`.
+   its `delay` sibling warns and falls back to the element default. Made consistent in `12e015af5`.
 
 4. **`js/net` races a WebSocket against WebTransport after a 500 ms head start.** Any path that slows
    the QUIC handshake past that head start silently falls back to TCP. On the harness's `bursty`
@@ -1108,7 +1210,7 @@ Things found while working that are separate from the fix.
    `bursty`.
 
 7. **`conceal` needed an element attribute** to be settable from a page before connect, so
-   `<moq-watch conceal>` exists (`83d369106`). It is the only new attribute.
+   `<moq-watch conceal>` exists (`e5d36eb1f`). It is the only new attribute.
 
 8. **The shaper's own jitter was reordering datagrams, and it was grading the wrong thing.** Each
    datagram drew its release time as `now + delay + jitter * gaussian`, independently of every other
@@ -1116,7 +1218,7 @@ Things found while working that are separate from the fix.
    earlier one. QUIC read that as loss, retransmitted, and backed off, so a profile named `mild` was
    measuring congestion response. Real jitter is queueing delay on a FIFO path: it varies the delay
    and preserves the order, and only the reorder draw is meant to overtake, which is what makes a
-   reorder a deliberate act the counters can attribute. Fixed in `1157fa9a2`: each lane remembers
+   reorder a deliberate act the counters can attribute. Fixed in `f65ab9351`: each lane remembers
    when the datagram in front of it leaves and clamps the next one to that, before any reorder delay.
    On the 60 s opus plain rows, target p95 falls from 1960 ms to 420 ms on `mild` and from 1760 ms to
    360 ms on `high-rtt`.
@@ -1201,12 +1303,12 @@ Things found while working that are separate from the fix.
 11. **The re-anchor above handed the decoder a chunk it refuses, and the audio never came back.**
     `DataError: Failed to execute 'decode' on 'AudioDecoder'` in roughly one run in three of
     `chromium-opus-48000-mild-isolated`, always within a second of a rendition handover. This one is
-    the branch's own: `f3355b2e9` introduced it, and it does not pre-exist upstream. `upstream/dev`'s
+    the branch's own: `c153b2a69` introduced it, and it does not pre-exist upstream. `upstream/dev`'s
     audio decode loop has no `#reanchor` and no `Terminal.continues`, so the throwing call site is
     not there at all; its only reset site is the container discontinuity in `#onNext`, which is
     always followed by a group's first frame. The harness agrees: no run recorded before the hole fix
     carries it (`aq-final-1` at 02:14, `aq-enforce` at 03:13), and every run after it carries exactly
-    one (`aq-int-1` at 16:20, `aq-int-2` at 16:45, `aq-int-enforce` at 17:12). `f3355b2e9` is dated
+    one (`aq-int-1` at 16:20, `aq-int-2` at 16:45, `aq-int-enforce` at 17:12). `c153b2a69` is dated
     13:02, between the two groups, and a sweep of every recorded run directory finds the string in
     those three and nowhere else.
 
@@ -1260,6 +1362,64 @@ Things found while working that are separate from the fix.
     no equivalent exposure: it configures once per run and never resets, and its frames are not all
     independently decodable anyway, so it keeps the container's own flag.
 
+12. **Firefox's underruns after convergence are not the path.** Watching the same broadcast over the
+    same relay at the same moment, Chromium's worst reading gap was 46 ms against Firefox's 499 ms,
+    and a second Firefox round was clean at 32 ms. What Firefox records as a late arrival is its own
+    content process stalling for two to five hundred milliseconds at a time: the worklet keeps
+    rendering, `context.currentTime` advances 24 ms over 924 ms of wall clock, the painted video
+    timestamp barely moves, and the decoder's p99 of 402 ms is the length of the stall its callback
+    waited behind rather than any work the codec did. The damage lands in the estimator.
+    `Jitter.observe` already discards a receiver's own reading gap, dropping the arrival reference
+    when `idle` and `idle - progress` both exceed one resample interval, and in this trace it never
+    fired once: the worst gap was `idle - progress` of 499 ms against a 500 ms threshold, with six
+    more between 150 and 500 ms. Each one entered the delay measurement at full weight and stayed in
+    the histogram for about twenty-nine seconds of wall-clock memory, so the target climbed from
+    40 ms to 780 ms and took about forty seconds to decay back, one bucket per sample. Replaying the
+    recorded arrival series through the real estimator, ring and stretcher on the simulated clock
+    reproduces it with no browser present: four underruns and an 820 ms peak from the Firefox trace,
+    none and 80 ms from the Chromium trace recorded beside it. The guard's shape is right and its
+    media term does its job. Only the threshold missed, and widening the target is the symptom
+    rather than the fix. Spacing alone cannot separate a 400 ms receiver block from a 400 ms flush,
+    so the fix observes the receiver directly: a 50 ms event-loop timer beside the consumer marks
+    the arrivals read in the tick after a block of 100 ms or more, and `Container.Jitter.observe`
+    takes that as an explicit input, in both languages, and drops the reference for it. The corpus
+    gains `receiver-stall` (target stays at 20 ms) and `receiver-stall-unflagged` (the same arrivals
+    reach 400 ms, the documented fallback), and the recorded Firefox window is `mic-firefox.json` in
+    the replay lane: the estimator peak falls from 1600 ms to 300 ms, the residual being blocks the
+    recording's 250 ms sampler could not resolve, and the underruns during the block itself remain,
+    because a receiver that stops executing for 674 ms cannot be buffered for without the 1.6 s of
+    latency the old target hid it with.
+
+    Two rounds of 120 s each, one Chromium publisher on a pinned USB microphone feeding a Firefox
+    watcher and a Chromium watcher of the same broadcast at the same moment, both on the plain page.
+    Counters are deltas from 20 s in.
+
+    | Round | Engine | Target p50/max | Level p50/p95/min | Underruns after 20 s | Concealed | A/V skew p50/p95 | Worst gap |
+    | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+    | 1 | Firefox | 40/780 ms | 70.9/751.7/0 ms | 1 | 1240 ms | 20.1/39.4 ms | 499 ms |
+    | 1 | Chromium | 40/40 ms | 68/81.3/41.3 ms | 0 | 0 | 21.7/41.6 ms | 46 ms |
+    | 2 | Firefox | 40/40 ms | 67.8/81.2/47.3 ms | 0 | 0 | 18.4/38 ms | 32 ms |
+    | 2 | Chromium | 40/40 ms | 71/84.8/44.1 ms | 0 | 0 | 20/40 ms | 14 ms |
+
+    The microphone is a USB device at 48 kHz, 2 channels, with echo cancellation, noise suppression,
+    auto gain and DTX all off. This machine has no built-in microphone, so the publisher is pinned to
+    that device by `deviceId` and the run aborts if the live track is on anything else.
+
+13. **CodeRabbit over the whole branch: 22 findings, 18 fixed, 4 rejected.** The review exceeded the
+    free plan's 150-file cap, so it ran per top-level directory instead. The eighteen real ones
+    became `a8cbc93bb`, `97c7afb76`, `b85e57431`, `02f3f143a`, `f5087814b` and this docs commit. The
+    four rejected: a suggested `max_age` clamp on the native target that
+    `playout::delay::Constraints::ceiling()` already applies one layer down; a claim that
+    `playwright@^1.63.0` is unpublished, which `bun.lock` and two sibling harnesses contradict; and
+    two on the same line asking for `runs-on: ubuntu-24.04` where the comment above it explains that
+    `ubuntu-latest` is deliberate parity with `smoke.yml` and `wasm.yml`.
+
+14. **Upstream's `moq-auth` lease changed what an empty `public` means.** `#3688` made `auth.public`
+    a path pattern rather than a prefix, so the harness relay's `public = ""` went from granting
+    everything to granting nothing, and every Chromium row would have been voided on a rejected
+    session. `8cabb3507` gives it the `"**"` upstream gave the demo and smoke configs. Worth knowing
+    for any other config in the wild that still carries the empty string.
+
 ## Public API and wire impact
 
 No wire format change anywhere. One wire *semantics* addition: an audio endpoint bounds the source
@@ -1280,6 +1440,13 @@ the bytes are the empty frame and the empty group that both already define. All 
   `Container.Jitter.CEILING` are static readonly members rather than module exports.
 - `Container.Jitter`'s constructor takes an optional `JitterProps` with a `start`, the publisher's
   declared flush span the cold-start target is taken from. `JitterProps` is a new export.
+- `Container.Jitter.observe(timestamp, now, observation)` takes a `JitterObservation` of
+  `{reordered?, stalled?}` where it used to take a bare `reordered` boolean. That is a breaking
+  change to a published method signature, which is the one reason this slice belongs on `dev` rather
+  than `main`. `JitterObservation` is a new export.
+- `js/hang/src/container/stall.ts` is new: a `Stall` monitor, one 50 ms event-loop timer per
+  document, that tells a consumer whether this receiver was blocked. It is **not** exported from
+  `@moq/hang/container`; `Container.Consumer` owns the only instance.
 - New `ConsumerProps.jitter`, which passes that declaration through from the rendition config.
 - New `Container.Consumer.spread` and `Container.Consumer.skipped`.
 
@@ -1294,6 +1461,13 @@ the bytes are the empty frame and the empty group that both already define. All 
 - `Sync.track()` is new, and `Sync.out.clock` names whichever track is driving playback.
 - `Clock`, `SyncTrack` and `SyncClockTrack` are new exports.
 - `Audio.Decoder.out` gains `spread`, `underruns`, `skipped` and `debug`.
+- `AudioBuffer.timestamp` is `Getter<Time.Micro | undefined>` rather than `Getter<Time.Micro>`: a
+  ring that has been flushed and not yet re-anchored has no playhead, and zero is not that.
+  `audio.out.timestamp` keeps its type and is simply undefined for longer. The `timeline` field on
+  the postMessage ring's state and reset messages, which is what lets the main thread drop a message
+  composed before a flush, is internal to that transport and not exported.
+- `unlockOnGesture` takes a `Getter<AudioContext | undefined>` rather than a context, so the gesture
+  listeners are armed before any context exists. Internal to `js/watch`, not exported.
 - `Video.Decoder.out` gains `skipped`.
 - `DecoderInput.conceal` is new, with the element attribute `<moq-watch conceal>`.
 - `audioMaxAge` and `maxAgeHeadroom` are new in the audio config module.
@@ -1310,6 +1484,10 @@ the bytes are the empty frame and the empty group that both already define. All 
 - `decode::Config::delay`, `decode::Config::conceal`, `decode::Config::DELAY_MAX`. `Config` is
   `#[non_exhaustive]`, so these are additive for callers who build through `new`.
 - `decode::Consumer::delay` and `decode::Consumer::playhead`.
+- The native estimator's `Jitter::observe(timestamp, now, Observation)` takes the same
+  `{reordered, stalled}` pair as the browser's. Both the method and
+  `playout::delay::Observation` are `pub(crate)`, so this is parity rather than public surface, and
+  nothing sets `stalled` natively: a tokio task that stops polling stops reading the socket with it.
 - The catalog's `jitter` seeds the native estimator's cold start, which is behaviour rather than
   surface. The `delay` floor is untouched: a caller who knows something the arrivals do not say is a
   different thing from a publisher describing its own encoder.
@@ -1340,17 +1518,20 @@ the bytes are the empty frame and the empty group that both already define. All 
 ### What was run
 
 - `just fix`, `just check`, `just test` at every stage, scoped to the branch the way CI scopes them.
-- The 15-case corpus, replayed in Bun and in nextest, exact integer equality on both sides.
+- The 17-case corpus, replayed in Bun and in nextest, exact integer equality on both sides.
 - `bun test` over `js/hang/src/container`, `js/watch/src/audio`, and the sync tests.
 - `just rs test -p moq-audio`.
 - `just test audio-quality` over the full 24-row matrix, twice: once against `upstream/dev` and once
   against this tree.
 - `just test audio-quality --runtime safari`, one 60 s run per row on macOS 26.6 Safari 26: eight
   rows graded, no voids, both rings.
-- `just test audio-quality --runtime replay --enforce`, which is a second and grades six rows
+- `just test audio-quality --runtime replay --enforce`, which is a second and grades twelve rows
   against ceilings that are exactly what was measured.
 - A CodeRabbit CLI triage per stage, each recorded. The findings that were real became their own
-  commits: `a08a308a7`, `ad332ab3b`, `970e348dd`, `b7f18deb8`, and part of `d89129c0c`.
+  commits: `c6a256aaa`, `6087621b6`, `ef9f11e06`, `b336e5d86`, and part of `647d15b82`.
+- A CodeRabbit CLI pass over the whole branch against `upstream/dev`, run per top-level directory
+  because the branch is past the free plan's 150-file cap: 22 findings, 18 fixed, 4 rejected. See
+  finding 13.
 - Listening rounds by the user after the estimator, after the stretch, and after concealment.
 - The A/V desync the user reported after all of that, reproduced and re-measured in headless
   Chromium on a fresh `demo/web` build of this tree against the local relay: the user's own sequence
@@ -1358,13 +1539,13 @@ the bytes are the empty frame and the empty group that both already define. All 
   Worst painted-video-minus-audio skew 3418 ms before and 50 ms after; the regression test reruns the
   same sequence with each half of the fix removed.
 - Each of the five re-landed fixes has a test that fails without it and passes with it.
-- One pre-existing flaky `console.error` spy test was fixed on the way past, in `a4187712a`.
+- One pre-existing flaky `console.error` spy test was fixed on the way past, in `fcce8af55`.
 
 ### What was not run, or not verified
 
 - **No iOS device.** Desktop Safari over safaridriver is the closest proxy this branch has. iOS is
   not measured, and nothing here should be read as a claim about it.
-- **The nightly job has never run on the nightly runner.** `cfffb4250` adds the `audio-quality` job
+- **The nightly job has never run on the nightly runner.** `2b9d492f0` adds the `audio-quality` job
   to `.github/workflows/nightly.yml` and it runs `--enforce`, but every number in `budgets.json` was
   measured on one desktop. The first nightly run is what says whether these ceilings hold on the
   runner's hardware, and the rows that are still `recorded` are the ones waiting for it.
@@ -1387,12 +1568,27 @@ the bytes are the empty frame and the empty group that both already define. All 
   start: an `auto` row spent 20 to 40 s of its window walking the declaration down, and a target that
   is still moving is one the ring skips against. That is fixed above, in the estimator and in
   `doc/concept/playout.md` rather than in the budgets: the first measurement replaces the seed
-  outright, so an `auto` row is on its measured target within a second. `budgets.json` still holds
-  the numbers recorded before that change and has to be re-recorded against it.
+  outright, so an `auto` row is on its measured target within a second. `budgets.json` was
+  re-recorded against that in `ce2e13112`, and the rows still disagree with themselves: three clear
+  the test now where ten did before, which is the honest answer rather than a better one.
+- **The Firefox and WebKit mute-sequence after numbers were never measured on a served build.** The
+  fix in `8700f1fcc` is held by `sync.replay.test.ts`, which takes the same sequence over the
+  fallback transport from 2992 ms of skew to 37 ms. What has not been done is running the user's
+  sequence again in a real Firefox and a real WebKit against a served page, which is what would say
+  the 3256 ms and 3076 ms spikes are gone rather than only accounted for.
+- **No listening round has happened on this tip.** The user last listened several commits ago. The
+  unlock fix, the flushed-ring fix, the receiver-stall input and the five CodeRabbit commits have
+  all landed since, and none of them has been heard.
+- **`test/audio-quality/clients/js` has no unit test target.** The grader, the beacon, the probe and
+  the Safari lane are exercised only by running the harness end to end, which is why the six
+  fail-quietly defects in `b85e57431` were found by a reviewer rather than by a test. Giving that
+  package a `bun test` target is a follow-up this branch did not take.
+- **`aac-high-rtt-isolated` converging in 42.7 s against an 11.6 s ceiling is unexplained.** It is
+  the one breach in the matrix run that is outside ordinary run-to-run spread, and it is open.
 - **The intermittent `DataError: Failed to execute 'decode' on 'AudioDecoder'` is diagnosed and
   fixed.** See finding 11. It did not predate the hole fix: the earlier note that it appears in the
   stage 8b logs is wrong, and a sweep of every recorded run directory finds it only in the three runs
-  taken after `f3355b2e9`. It was reproduced deterministically at 240 s, where the publisher's catalog
+  taken after `c153b2a69`. It was reproduced deterministically at 240 s, where the publisher's catalog
   update near 183 s replaces the audio subscription, and six 240 s runs after the fix, each reaching
   that handover, record zero.
 
@@ -1449,7 +1645,7 @@ shapes are theirs; the fixed point is not carried over, because it exists to tar
 point for the Rust side. Nothing was adapted from it. Its time stretch removes the longest low-energy
 run rather than a pitch period, its expand emits quiet noise rather than concealment, and its buffer
 level filter adds a jump detector NetEq does not have, so it is not the port it looks like. The
-reasoning is in the module header of `64bb9df46`.
+reasoning is in the module header of `50e70f5b8`.
 
 **PR #3517.** The two cherry-picked commits keep their author. The arrival observation point, the
 `spread` plumbing, the ring slack, the re-stall, `stall()`, the underrun counter, the worklet ramp,
