@@ -33,10 +33,16 @@ fn replay(name: &str) -> Duration {
 	for arrival in arrivals {
 		let timestamp = arrival["timestamp_us"].as_f64().expect("a timestamp");
 		let now = arrival["arrival_ms"].as_f64().expect("an arrival");
+		// A recording that watched its own event loop says which frames came out of a
+		// block; one that did not carries nothing and is read the same way as before.
+		let observation = Observation {
+			stalled: arrival["stalled"].as_bool().unwrap_or(false),
+			..Default::default()
+		};
 		jitter.observe(
 			Duration::from_nanos((timestamp * 1000.0).round() as u64),
 			now,
-			Observation::default(),
+			observation,
 		);
 	}
 
@@ -72,4 +78,14 @@ fn a_local_microphone_settles_where_the_browser_settles() {
 #[test]
 fn a_remote_microphone_settles_where_the_browser_settles() {
 	assert_eq!(replay("mic-remote"), Duration::from_millis(20));
+}
+
+/// A receiver whose own content process froze in bursts, which the recording marks
+/// because its debug sampler was blocked alongside the read loop. The path was clean
+/// throughout, so a target the size of the freeze is one nothing measured asked for:
+/// reading the marks takes it from 1600ms to the 300ms the blocks too short for that
+/// sampler to resolve still leave behind.
+#[test]
+fn a_blocked_receiver_settles_where_the_browser_settles() {
+	assert_eq!(replay("mic-firefox"), Duration::from_millis(300));
 }

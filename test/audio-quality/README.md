@@ -184,6 +184,24 @@ too. A trace carries no bitstream, but the frame spacing in it is the codec's fr
 `4k-webm` is 20 ms, which is Opus. `--codecs`, `--duration` and `--seed` are refused here rather
 than ignored: the recording decides all three.
 
+| Recording | What it holds |
+| --- | --- |
+| `lan-bbb` | Big Buck Bunny over a LAN relay: a well paced publisher and local scheduling noise. |
+| `relay-bbb-7frame` | The public relay serving `bbb.hang`, in ~160 ms flushes of seven AAC frames. |
+| `4k-webm` | A 4K WebM whose audio shares a connection with a video track big enough to queue, holes included. |
+| `mic-local` | A browser microphone over a local relay: the shallowest spread a real path produces. |
+| `mic-remote` | The same microphone through the public relay: more delay, the same spread. |
+| `mic-firefox` | A Firefox watcher whose own content process froze in bursts while the path stayed clean. |
+
+`mic-firefox` is the one recording whose arrivals are not all the path's. Its receiver stopped
+executing for a few hundred milliseconds at a time, so the frames that queued behind each block were
+read in one burst and stamped after it. The fixture marks those frames with `stalled`, which is what
+the player's own event-loop monitor tells the estimator at runtime, and the estimator discounts them
+rather than sizing a buffer for a path that did nothing. The marks come from the recording's debug
+sampler, a 250 ms timer on the same main thread, so they cover the blocks that delayed one of its
+firings by more than 100 ms and not the shorter ones it could sit between: the row is a lower bound
+on what the runtime monitor sees. Without them the same arrivals take the target to 1600 ms.
+
 What it cannot say is anything about the transport, the container consumer, the device, or the wall
 clock, because there is no session and no audio hardware. Those metrics report null. What it can say
 exactly, and the browser lanes cannot, is what the ring and the engine did: `short_quanta`,

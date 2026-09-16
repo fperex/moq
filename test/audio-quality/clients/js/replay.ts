@@ -22,6 +22,7 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import fourKWebm from "../../../../js/watch/src/audio/fixtures/4k-webm.json" with { type: "json" };
 import lanBbb from "../../../../js/watch/src/audio/fixtures/lan-bbb.json" with { type: "json" };
+import micFirefox from "../../../../js/watch/src/audio/fixtures/mic-firefox.json" with { type: "json" };
 import micLocal from "../../../../js/watch/src/audio/fixtures/mic-local.json" with { type: "json" };
 import micRemote from "../../../../js/watch/src/audio/fixtures/mic-remote.json" with { type: "json" };
 import relayBbb7Frame from "../../../../js/watch/src/audio/fixtures/relay-bbb-7frame.json" with { type: "json" };
@@ -66,6 +67,7 @@ const RECORDINGS: Recording[] = [
 	{ name: "4k-webm", fixture: fourKWebm as Fixture, codec: "opus", rate: 48000 },
 	{ name: "mic-local", fixture: micLocal as Fixture, codec: "opus", rate: 48000 },
 	{ name: "mic-remote", fixture: micRemote as Fixture, codec: "opus", rate: 48000 },
+	{ name: "mic-firefox", fixture: micFirefox as Fixture, codec: "opus", rate: 48000 },
 ];
 
 /**

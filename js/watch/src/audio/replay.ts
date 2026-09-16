@@ -32,6 +32,8 @@ export interface Arrival {
 	media: number;
 	/** Wall time the frame arrived, in ms from the start of the trace. */
 	arrival: number;
+	/** The recorder's own event loop was blocked before this frame was read. */
+	stalled?: boolean;
 }
 
 /** A recorded trace, as trimmed into `./fixtures`. */
@@ -40,15 +42,22 @@ export interface Fixture {
 	source: string;
 	/** What it is, and what makes it worth keeping. */
 	description: string;
-	/** Arrival timing only: no payload, no codec, nothing identifying. */
-	arrivals: { timestamp_us: number; arrival_ms: number }[];
+	/**
+	 * Arrival timing only: no payload, no codec, nothing identifying.
+	 *
+	 * `stalled` is the recording's own answer to a question the timing cannot settle: whether the
+	 * receiver was blocked before it read this frame, which the estimator discounts rather than
+	 * measuring. A recording that never watched its loop simply omits it.
+	 */
+	arrivals: { timestamp_us: number; arrival_ms: number; stalled?: boolean }[];
 }
 
 /** A fixture's arrivals in the units this module works in. */
 export function recorded(fixture: Fixture): Arrival[] {
-	return fixture.arrivals.map(({ timestamp_us, arrival_ms }) => ({
+	return fixture.arrivals.map(({ timestamp_us, arrival_ms, stalled }) => ({
 		media: timestamp_us / 1000,
 		arrival: arrival_ms,
+		stalled,
 	}));
 }
 
@@ -94,8 +103,8 @@ export function trace(frames: number, burst: number, spread: number, seed = 7): 
  */
 export function target(t: Arrival[], floorMs: number): number {
 	const jitter = new Container.Jitter();
-	for (const { media, arrival } of t) {
-		jitter.observe(Time.Micro.fromMilli(media as Time.Milli), arrival as Time.Milli);
+	for (const { media, arrival, stalled } of t) {
+		jitter.observe(Time.Micro.fromMilli(media as Time.Milli), arrival as Time.Milli, { stalled });
 	}
 	return Math.max(floorMs, jitter.value.peek());
 }
@@ -290,7 +299,9 @@ export function replay(build: Build, t: Arrival[], options: Options): Result {
 	for (let now = 0; now < end; now += step) {
 		while (next < t.length && t[next].arrival <= now) {
 			const count = samples[next];
-			jitter.observe(Time.Micro.fromMilli(t[next].media as Time.Milli), now as Time.Milli);
+			jitter.observe(Time.Micro.fromMilli(t[next].media as Time.Milli), now as Time.Milli, {
+				stalled: t[next].stalled,
+			});
 			ring.setLatency(latency());
 			// A 200Hz tone rather than a constant: a splice on a constant is seamless whatever the
 			// correlation search decides, which would hide a kernel that picked the wrong lag.
