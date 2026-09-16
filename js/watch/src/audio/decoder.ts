@@ -313,12 +313,11 @@ export class Decoder {
 			return;
 		}
 
-		const context = effect.get(this.#out.context);
-		if (!context) return;
-
-		// The context is built at page load (see #runWorklet), before any user gesture, so it
-		// must be started from a real interaction. See unlockOnGesture.
-		unlockOnGesture(effect, context);
+		// The context is built without a user gesture (see #runWorklet), so it must be started from a
+		// real interaction. Deliberately not gated on the context: it does not exist until the catalog
+		// names an audio rendition, and the click that started playback is usually before that. See
+		// unlockOnGesture.
+		unlockOnGesture(effect, this.#out.context);
 
 		// NOTE: You should disconnect/reconnect the worklet to save power when disabled.
 	}
