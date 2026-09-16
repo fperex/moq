@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use super::buffer::Buffer;
 use super::decision::{Action, Decision};
-use super::delay::{Constraints, Jitter};
+use super::delay::{Constraints, Jitter, Observation};
 use super::expand::Expand;
 use super::merge::Merge;
 use super::noise::Noise;
@@ -181,7 +181,10 @@ impl Engine {
 	/// budget only ever confirms the budget it was cut to. `now` is milliseconds on
 	/// any monotonic local clock.
 	pub(crate) fn observe(&mut self, timestamp: Duration, now: f64) {
-		self.jitter.observe(timestamp, now, false);
+		// Nothing here reports a stalled receiver: a task that stops polling stops
+		// reading the socket with it, so the frames queue in the transport rather than
+		// behind a blocked event loop the way a browser content process queues them.
+		self.jitter.observe(timestamp, now, Observation::default());
 		self.observed = Some(self.observed.map_or(timestamp, |newest| newest.max(timestamp)));
 		self.retarget();
 	}

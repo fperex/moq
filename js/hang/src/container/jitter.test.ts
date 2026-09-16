@@ -1,14 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { Time } from "@moq/net";
-import { Jitter } from "./jitter";
+import { Jitter, type JitterObservation } from "./jitter";
 import { load, replay } from "./jitter.vectors.ts";
 
 const FRAME = 20;
 const START = 80;
 
 /** Feed one arrival, in milliseconds on both axes. */
-function observe(jitter: Jitter, media: number, arrival: number, reordered?: boolean): void {
-	jitter.observe(Time.Micro.fromMilli(media as Time.Milli), arrival as Time.Milli, reordered);
+function observe(jitter: Jitter, media: number, arrival: number, observation?: JitterObservation): void {
+	jitter.observe(Time.Micro.fromMilli(media as Time.Milli), arrival as Time.Milli, observation);
 }
 
 /**
@@ -176,7 +176,7 @@ describe("reordering", () => {
 
 		// A frame the caller already knows arrived out of order. Half a second late, so it would
 		// otherwise raise the target by a lot.
-		observe(jitter, 500 * FRAME, 500 * FRAME + 550, true);
+		observe(jitter, 500 * FRAME, 500 * FRAME + 550, { reordered: true });
 		expect(jitter.value.peek()).toBe(settled);
 	});
 });
@@ -236,6 +236,46 @@ describe("the receiver's own reading gap", () => {
 		}
 
 		expect(jitter.value.peek()).toBeGreaterThanOrEqual(400 as Time.Milli);
+	});
+
+	it("takes an explicit stalled flag for a block the spacing cannot see", () => {
+		// 400ms is under the resample interval, so the spacing rule leaves it alone however plainly
+		// it was the receiver: a publisher flushing every 400ms produces the same arrivals. The
+		// receiver watched its own event loop, so it knows, and says so.
+		const BLOCK = 400;
+		const DRAIN = 2;
+
+		const flagged = new Jitter();
+		const unflagged = new Jitter();
+		for (const jitter of [flagged, unflagged]) flush(jitter, { frames: 400 });
+
+		const settled = flagged.value.peek();
+		expect(settled).toBe(Jitter.BUCKET as Time.Milli);
+
+		let cursor = 400 * FRAME + BLOCK;
+		let max = settled;
+		let control = settled;
+
+		for (let i = 400; i < 900; i++) {
+			const media = i * FRAME;
+			const read = Math.max(media + 50, cursor);
+			// Every frame the loop was late to is one the loop was late to, not one the path held.
+			const stalled = read > media + 50;
+			cursor = read + DRAIN;
+
+			observe(flagged, media, read, { stalled });
+			observe(unflagged, media, read);
+
+			max = Time.Milli.max(max, flagged.value.peek());
+			control = Time.Milli.max(control, unflagged.value.peek());
+		}
+
+		// The flagged run drops the reference on every frame of the burst, so none of them measures
+		// the block and none of them reaches the histogram as anything but zero.
+		expect(max).toBe(settled);
+		// And the same arrivals with nothing watching the loop, which is what the flag is worth: most
+		// of the block lands in the target, where the histogram then remembers it for half a minute.
+		expect(control).toBeGreaterThanOrEqual(300 as Time.Milli);
 	});
 });
 

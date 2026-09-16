@@ -4,6 +4,7 @@ import { Effect, type Getter, type GetterInit, getter, Once, Signal } from "@moq
 
 import type { Format } from "./format";
 import { Jitter } from "./jitter";
+import { Stall } from "./stall";
 import type { BufferedRanges, Frame } from "./types";
 
 /** Options for constructing a {@link Consumer}. */
@@ -114,6 +115,10 @@ export class Consumer {
 	// age budget would only ever confirm the budget it was cut to.
 	#spread: Jitter;
 
+	// Whether this receiver's own event loop was blocked before an arrival. The estimator cannot see
+	// that in the arrival timing, since a blocked receiver and a bursty path read the same there.
+	#stall = Stall.acquire();
+
 	/**
 	 * How late frames arrive relative to the earliest one, measured as they land.
 	 *
@@ -141,6 +146,7 @@ export class Consumer {
 
 		this.#signals.spawn(this.#run.bind(this));
 		this.#signals.cleanup(() => {
+			this.#stall.close();
 			this.#track.close();
 			for (const group of this.#groups) {
 				group.consumer.close();
@@ -208,6 +214,9 @@ export class Consumer {
 				// sample would fold this receiver's decode cost into a measurement of the path, and
 				// fold it in proportionally to the segment size.
 				const now = Moq.Time.Milli.now();
+				// Asked at the same instant, because the answer is about this arrival: a block that
+				// ended a tick ago is what this frame spent queued rather than in flight.
+				const stalled = this.#stall.blocked(now);
 				const decoded = this.#format.decode(next.payload);
 
 				for (const sample of decoded) {
@@ -254,7 +263,7 @@ export class Consumer {
 					// the group: a reneged straggler is already gone, a rewound group has already
 					// aborted the track above, and a target derived from what survives the budget
 					// would only ever confirm the budget it was cut to.
-					if (!marker) this.#spread.observe(frame.timestamp, now);
+					if (!marker) this.#spread.observe(frame.timestamp, now, { stalled });
 
 					let skipped = false;
 					if (group.consumer.sequence !== this.#active) {
