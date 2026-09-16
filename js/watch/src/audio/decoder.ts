@@ -282,11 +282,14 @@ export class Decoder {
 				this.#ring = undefined;
 			});
 
-			// Mirror ring state (timestamp/stalled) onto our public signals.
+			// Mirror ring state (timestamp/stalled) onto our public signals. A flushed ring reports no
+			// playhead until the next insert re-anchors it, and there is nothing to trim against in
+			// the meantime: the ranges it held went with the flush.
 			effect.run((inner) => {
-				const ts = Time.Milli.fromMicro(inner.get(ring.timestamp));
+				const timestamp = inner.get(ring.timestamp);
+				const ts = timestamp === undefined ? undefined : Time.Milli.fromMicro(timestamp);
 				this.#out.timestamp.set(ts);
-				this.#trimDecodeBuffered(ts);
+				if (ts !== undefined) this.#trimDecodeBuffered(ts);
 			});
 			effect.run((inner) => {
 				this.#out.stalled.set(inner.get(ring.stalled));

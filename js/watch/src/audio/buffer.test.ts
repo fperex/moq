@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Time } from "@moq/net";
-import { ClockSource } from "./buffer";
+import { Effect } from "@moq/signals";
+import { type AudioBuffer, ClockSource, createAudioBuffer } from "./buffer";
 import type { Playhead } from "./playhead";
+import type { Message, State } from "./render";
 
 // `Time.Milli.now()` reads `performance.now()` on every call, so stubbing it puts the park timer
 // under the test's control.
@@ -112,5 +114,174 @@ describe("ClockSource", () => {
 		clock.advance(10);
 		source.filling();
 		expect(source.sample(playhead(500, 0))?.rate).toBe(0);
+	});
+});
+
+/**
+ * A stand-in for the worklet node the buffer talks to: a port that records what was sent and can
+ * hand back a state message on demand, which is what makes the postMessage path's ordering testable.
+ */
+class FakeWorklet extends EventTarget {
+	readonly sent: Message[] = [];
+	readonly port = this;
+
+	postMessage(msg: Message): void {
+		this.sent.push(msg);
+	}
+
+	start(): void {}
+
+	/** Deliver a state message as the worklet's render quantum would. */
+	deliver(state: State): void {
+		this.dispatchEvent(Object.assign(new Event("message"), { data: state }));
+	}
+
+	/** The timeline of the last flush it was told about, as the worklet echoes it back. */
+	get timeline(): number {
+		let timeline = 0;
+		for (const msg of this.sent) if (msg.type === "reset") timeline = msg.timeline;
+		return timeline;
+	}
+}
+
+function state(worklet: FakeWorklet, reader: Playhead | undefined, stalled: boolean): State {
+	return {
+		type: "state",
+		timeline: worklet.timeline,
+		playhead: reader,
+		debug: {
+			buffered: 0,
+			target: 0,
+			chunk: 0,
+			skip: 0,
+			stalled,
+			underruns: 0,
+			skips: 0,
+			skipped: 0,
+			discarded: 0,
+			queued: 0,
+			stretched: 0,
+			output: 0,
+			concealed: 0,
+			accelerates: 0,
+			expands: 0,
+			merges: 0,
+			short: 0,
+		},
+	};
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Record every value the buffer publishes, so a stale one cannot slip through between assertions. */
+function record(buffer: AudioBuffer, effect: Effect): Array<Time.Micro | undefined> {
+	const seen: Array<Time.Micro | undefined> = [];
+	effect.run((inner) => seen.push(inner.get(buffer.timestamp)));
+	return seen;
+}
+
+describe("AudioBuffer, flushed", () => {
+	it("never reports the old playhead once the postMessage ring is flushed", async () => {
+		const worklet = new FakeWorklet();
+		const shared = globalThis.SharedArrayBuffer;
+		// Taking the global away is how the factory is made to pick the fallback transport.
+		(globalThis as { SharedArrayBuffer?: SharedArrayBufferConstructor }).SharedArrayBuffer = undefined;
+		let buffer: AudioBuffer;
+		try {
+			buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+				channels: 1,
+				rate: 48000,
+				latency: 4800,
+				buffered: false,
+				conceal: true,
+			});
+		} finally {
+			globalThis.SharedArrayBuffer = shared;
+		}
+
+		// A signal write notifies on the microtask, so each step settles before the next one.
+		const settle = () => sleep(0);
+
+		const effect = new Effect();
+		const seen = record(buffer, effect);
+		await settle();
+
+		const before = { timestamp: 3_000_000 as Time.Micro, rate: 1 };
+		worklet.deliver(state(worklet, before, false));
+		expect(buffer.timestamp.peek()).toBe(before.timestamp);
+		expect(buffer.clock.peek()?.timestamp).toBe(before.timestamp);
+		await settle();
+
+		// The mute: the flush takes the ring's contents and its playhead with it.
+		buffer.reset();
+		expect(buffer.timestamp.peek()).toBeUndefined();
+		expect(buffer.clock.peek()).toBeUndefined();
+		await settle();
+
+		// A state message composed before the worklet saw the flush. It carries a real playhead of
+		// the timeline that is gone, and taking it would put the reported position a whole mute
+		// behind the video paced against it.
+		worklet.deliver({ ...state(worklet, before, false), timeline: worklet.timeline - 1 });
+		expect(buffer.timestamp.peek()).toBeUndefined();
+		expect(buffer.clock.peek()).toBeUndefined();
+		await settle();
+
+		// The worklet's own post-flush messages, before anything has re-anchored the ring.
+		worklet.deliver(state(worklet, undefined, true));
+		expect(buffer.timestamp.peek()).toBeUndefined();
+		await settle();
+
+		// The unmute: the first insert re-anchors the ring at the live edge, and that is the first
+		// position reported since the flush.
+		const after = { timestamp: 6_000_000 as Time.Micro, rate: 1 };
+		worklet.deliver(state(worklet, after, false));
+		expect(buffer.timestamp.peek()).toBe(after.timestamp);
+		expect(buffer.clock.peek()?.timestamp).toBe(after.timestamp);
+		await settle();
+
+		expect(seen).toEqual([undefined, before.timestamp, undefined, after.timestamp]);
+
+		effect.close();
+		buffer.close();
+	});
+
+	it("never reports the old playhead once the shared ring is flushed", async () => {
+		const worklet = new FakeWorklet();
+		const buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+			channels: 1,
+			rate: 48000,
+			latency: 4800,
+			buffered: false,
+			conceal: true,
+		});
+
+		const effect = new Effect();
+		const seen = record(buffer, effect);
+
+		// The shared ring is polled rather than pushed, so each step waits out a poll interval.
+		const poll = () => sleep(120);
+
+		const before = 3_000_000 as Time.Micro;
+		buffer.insert(before, [new Float32Array(4800)]);
+		await poll();
+		expect(buffer.timestamp.peek()).toBe(before);
+
+		buffer.reset();
+		expect(buffer.timestamp.peek()).toBeUndefined();
+		expect(buffer.clock.peek()).toBeUndefined();
+
+		// Polling a flushed ring must not bring the old position back.
+		await poll();
+		expect(buffer.timestamp.peek()).toBeUndefined();
+
+		const after = 6_000_000 as Time.Micro;
+		buffer.insert(after, [new Float32Array(4800)]);
+		await poll();
+		expect(buffer.timestamp.peek()).toBe(after);
+
+		expect(seen).toEqual([undefined, before, undefined, after]);
+
+		effect.close();
+		buffer.close();
 	});
 });
