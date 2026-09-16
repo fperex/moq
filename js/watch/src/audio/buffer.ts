@@ -186,8 +186,15 @@ export interface AudioBuffer {
 	 */
 	wait(timestamp: Time.Micro): Promise<void>;
 
-	/** Current playback timestamp (derived from reader position). */
-	readonly timestamp: Getter<Time.Micro>;
+	/**
+	 * Where the reader has played up to, or undefined while the ring has no playhead.
+	 *
+	 * The playhead's own timestamp, so it is undefined for exactly as long as {@link clock} is: before
+	 * the first insert anchors the ring, and from a flush until the next insert re-anchors it. Holding
+	 * the position the flush threw away would report a playhead the reader is never going to resume
+	 * from, which reads as the whole flushed interval's worth of A/V skew.
+	 */
+	readonly timestamp: Getter<Time.Micro | undefined>;
 
 	/**
 	 * The playhead as a clock for `Sync`, or undefined while it is not one.
@@ -261,8 +268,8 @@ class SharedAudioBuffer implements AudioBuffer {
 	#worklet: AudioWorkletNode;
 	#ring: SharedRingBuffer;
 
-	readonly #timestamp = new Signal<Time.Micro>(0 as Time.Micro);
-	readonly timestamp: Getter<Time.Micro> = this.#timestamp;
+	readonly #timestamp = new Signal<Time.Micro | undefined>(undefined);
+	readonly timestamp: Getter<Time.Micro | undefined> = this.#timestamp;
 
 	readonly #stalled = new Signal<boolean>(true);
 	readonly stalled: Getter<boolean> = this.#stalled;
@@ -310,15 +317,19 @@ class SharedAudioBuffer implements AudioBuffer {
 		// wait costs no shared-memory read at all.
 		this.#signals.interval(() => {
 			const stalled = this.#ring.stalled;
-			this.#timestamp.set(this.#ring.timestamp);
+			// One read: the getter is stateful (it measures the reader's rate between polls) and it
+			// is the only thing that knows whether the ring is anchored, so the timestamp published
+			// here is its timestamp rather than a second, unguarded read of the same position.
+			const playhead = this.#ring.playhead;
+			this.#timestamp.set(playhead?.timestamp);
 			this.#stalled.set(stalled);
 			this.#underruns.set(this.#ring.underruns);
 			this.#debug.set(this.#ring.debug());
-			this.#clock.set(this.#clockSource.sample(this.#ring.playhead));
+			this.#clock.set(this.#clockSource.sample(playhead));
 			// While stalled the playhead is parked, so release the decode loop to refill the floor;
 			// once playing, hold it to ~the floor ahead.
-			if (stalled) this.#backpressure.flush();
-			else this.#backpressure.advance(this.#ring.timestamp);
+			if (stalled || !playhead) this.#backpressure.flush();
+			else this.#backpressure.advance(playhead.timestamp);
 		}, 50);
 	}
 
@@ -352,7 +363,9 @@ class SharedAudioBuffer implements AudioBuffer {
 	reset(): void {
 		this.#ring.reset();
 		// A flushed ring has no playhead until the next insert anchors it. Publishing the one it had
-		// would leave `Sync` extrapolating from a position the reader is never going to resume from.
+		// would leave `Sync` extrapolating from a position the reader is never going to resume from,
+		// and leave every consumer of the timestamp a flush's worth of media behind.
+		this.#timestamp.set(undefined);
 		this.#clock.set(undefined);
 		this.#backpressure.flush(); // the old timeline is gone; let the decode loop re-anchor
 	}
@@ -373,12 +386,16 @@ class SharedAudioBuffer implements AudioBuffer {
 		// explicit reset): let frames through so the ring refills to the floor. This is the single
 		// re-buffer path; the ring un-stalls itself on the insert that reaches the floor, so the
 		// gate closes again within one frame rather than draining the whole lookahead.
-		if (this.#ring.stalled) return Promise.resolve();
+		//
+		// A ring with no playhead is one the next insert re-anchors, so it is the same case: gating
+		// on the position a flush threw away would hold the frame that would have re-anchored it.
+		if (this.#ring.stalled || this.#timestamp.peek() === undefined) return Promise.resolve();
 		return this.#backpressure.wait(timestamp, this.#ring.timestamp);
 	}
 
 	close(): void {
 		this.#backpressure.flush(); // never leave a decode loop awaiting a closed buffer
+		this.#timestamp.set(undefined); // a closed buffer has no playhead
 		this.#clock.set(undefined); // a closed buffer is not a clock
 		this.#signals.close();
 	}
@@ -390,8 +407,8 @@ class PostAudioBuffer implements AudioBuffer {
 	readonly channels: number;
 	#worklet: AudioWorkletNode;
 
-	readonly #timestamp = new Signal<Time.Micro>(0 as Time.Micro);
-	readonly timestamp: Getter<Time.Micro> = this.#timestamp;
+	readonly #timestamp = new Signal<Time.Micro | undefined>(undefined);
+	readonly timestamp: Getter<Time.Micro | undefined> = this.#timestamp;
 
 	readonly #stalled = new Signal<boolean>(true);
 	readonly stalled: Getter<boolean> = this.#stalled;
@@ -408,6 +425,11 @@ class PostAudioBuffer implements AudioBuffer {
 
 	// Backpressure runs off the playhead the worklet reports in its state messages.
 	#backpressure: Backpressure;
+
+	// Which timeline this end is on, bumped by every flush and echoed by the worklet. A state message
+	// is already on the port when `reset` posts, so it describes the ring the flush threw away: this
+	// is what tells the two apart. See `State.timeline`.
+	#timeline = 0;
 
 	#signals = new Effect();
 
@@ -427,9 +449,14 @@ class PostAudioBuffer implements AudioBuffer {
 		this.#signals.event(worklet.port, "message", (ev: Event) => {
 			const data = (ev as MessageEvent<State>).data;
 			if (data?.type === "state") {
-				// A flushed ring has no playhead until the next insert anchors it: report where it
-				// stopped rather than the start of the timeline, which is not a position it was at.
-				const timestamp = data.playhead?.timestamp ?? this.#timestamp.peek();
+				// Composed before the worklet saw our flush, so everything in it describes the ring
+				// the flush threw away. The next one is a few quanta behind it.
+				if (data.timeline !== this.#timeline) return;
+
+				// A flushed ring has no playhead until the next insert anchors it, and neither does
+				// one that has never been written to. Publishing undefined is what keeps every
+				// consumer off a position the reader is never going to resume from.
+				const timestamp = data.playhead?.timestamp;
 				this.#timestamp.set(timestamp);
 				this.#stalled.set(data.debug.stalled);
 				this.#underruns.set(data.debug.underruns);
@@ -439,7 +466,7 @@ class PostAudioBuffer implements AudioBuffer {
 				this.#clock.set(this.#clockSource.sample(data.playhead));
 				// While stalled the playhead is parked, so release the decode loop to refill the floor;
 				// once playing, hold it to ~the floor ahead.
-				if (data.debug.stalled) this.#backpressure.flush();
+				if (data.debug.stalled || timestamp === undefined) this.#backpressure.flush();
 				else this.#backpressure.advance(timestamp);
 			}
 		});
@@ -472,11 +499,13 @@ class PostAudioBuffer implements AudioBuffer {
 	}
 
 	reset(): void {
-		const msg: Reset = { type: "reset" };
+		this.#timeline++;
+		const msg: Reset = { type: "reset", timeline: this.#timeline };
 		this.#worklet.port.postMessage(msg);
 		// A flushed ring has no playhead until the next insert anchors it. Mirror it locally rather
 		// than waiting for the worklet's next state message, which still describes the old one.
 		this.#stalled.set(true);
+		this.#timestamp.set(undefined);
 		this.#clock.set(undefined);
 		this.#backpressure.flush(); // the old timeline is gone; let the decode loop re-anchor
 	}
@@ -503,14 +532,16 @@ class PostAudioBuffer implements AudioBuffer {
 	wait(timestamp: Time.Micro): Promise<void> {
 		// Stalled = still filling the floor (bootstrap, an underrun the reader re-stalled on, or an
 		// explicit reset): let frames through so the ring refills to the floor. See SharedAudioBuffer.
-		if (this.#stalled.peek()) return Promise.resolve();
+		const playhead = this.#timestamp.peek();
+		if (this.#stalled.peek() || playhead === undefined) return Promise.resolve();
 		// Uses the worklet-reported playhead, which lags by a state-message interval; the floor's
 		// headroom covers that. The worklet still drops the oldest if a frame slips through.
-		return this.#backpressure.wait(timestamp, this.#timestamp.peek());
+		return this.#backpressure.wait(timestamp, playhead);
 	}
 
 	close(): void {
 		this.#backpressure.flush(); // never leave a decode loop awaiting a closed buffer
+		this.#timestamp.set(undefined); // a closed buffer has no playhead
 		this.#clock.set(undefined); // a closed buffer is not a clock
 		this.#signals.close();
 	}

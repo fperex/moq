@@ -15,6 +15,9 @@ class Render extends AudioWorkletProcessor {
 	#engine?: Stretcher;
 	#underflow = 0;
 	#stateCounter = 0;
+	// The timeline the last applied flush started, echoed back so the main thread can drop a state
+	// message that was already in flight when it flushed. See `State.timeline`.
+	#timeline = 0;
 	// Whether the previous quantum ended short, so the next one fades back in.
 	#short = false;
 
@@ -43,6 +46,7 @@ class Render extends AudioWorkletProcessor {
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.truncate(msg.timestamp);
 			} else if (msg.type === "reset") {
 				// Only meaningful in post mode; shared mode resets via the control array.
+				this.#timeline = msg.timeline;
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.reset();
 			} else if (msg.type === "stall") {
 				// Only meaningful in post mode; shared mode stalls via the control array.
@@ -113,6 +117,7 @@ class Render extends AudioWorkletProcessor {
 				this.#stateCounter = 0;
 				const state: State = {
 					type: "state",
+					timeline: this.#timeline,
 					playhead: backend.playhead,
 					debug: backend.debug(),
 				};

@@ -898,8 +898,22 @@ start rather than the toggle.
 Both engines that ran it spike the same way at the same place: unmuting after three seconds of mute
 leaves video roughly three seconds ahead of the audio playhead for about a second, then it recovers.
 It is the muted interval reappearing as skew, and it is the same shape in an engine on WebTransport
-and an engine on a WebSocket, so it is the player rather than the transport. It survives this
-branch's fixes and is the strongest remaining lead on the user's original desync report.
+and an engine on a WebSocket, so it is the player rather than the transport. It survived the fixes
+the branch had at the time of this run, and the paragraph below is what it turned out to be.
+
+The mechanism is the port hop the postMessage ring reports its playhead over, which is the ring a
+page gets unless it is cross-origin isolated. A mute flushes the ring, and the state message already
+on the port when `reset` posts describes the ring the flush threw away, so its playhead is a whole
+mute behind the one the reader resumes from. It was also the last thing the main thread heard until
+the graph was connected again, because a disconnected worklet is never pulled and so never sends
+another, which is the second the spike lasts. The worklet now echoes the timeline of the flush it
+last applied and the main thread drops any message from an older one. The shared ring needs no
+counter: a flushed ring is unanchored and simply publishes no playhead until the next insert
+re-anchors it. A timestamp comparison would not do in either case, because the stale message carries
+a position the ring really was at, and one the reader will never resume from does not look any
+different from one it has not reached yet. `sync.replay.test.ts` replays the sequence over the
+fallback transport with that message delivered, and the skew it measures goes from 2992 ms to 37 ms.
+<!-- after: Firefox X ms, WebKit Y ms, measured in step 2 -->
 
 ### Browser publishers
 

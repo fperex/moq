@@ -311,7 +311,13 @@ export type Sample = {
 	/** Milliseconds since the page started sampling, on the viewer clock. */
 	at: Ms;
 
-	/** `audio.out.timestamp`: the playhead, in ms of media time. Undefined before audio starts. */
+	/**
+	 * `audio.out.timestamp`: the playhead, in ms of media time.
+	 *
+	 * Undefined whenever the ring has no playhead: before the first insert anchors it, and from a
+	 * flush until the next insert re-anchors it. That is a missing position rather than a zero one,
+	 * so `analyze.ts` skips those samples rather than reading them as a plateau or a step.
+	 */
 	timestamp?: Ms;
 	/** `audio.out.stalled`: the ring is refilling rather than playing. */
 	stalled?: boolean;

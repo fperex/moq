@@ -2,9 +2,10 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
 import { Signal } from "@moq/signals";
-import { ClockSource } from "./audio/buffer";
+import { type AudioBuffer, ClockSource, createAudioBuffer } from "./audio/buffer";
 import lanBbb from "./audio/fixtures/lan-bbb.json" with { type: "json" };
 import { ringSamples } from "./audio/latency";
+import type { Message, State } from "./audio/render";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./audio/shared-ring-buffer";
 import { Terminal } from "./audio/terminal";
 import { type Delay, Sync } from "./sync";
@@ -282,6 +283,75 @@ interface Session {
 	lag: number;
 	/** Frames video presented. */
 	rendered: number;
+	/**
+	 * The worst the painted frame was ahead of the playhead the ring *reported*, in ms.
+	 *
+	 * This is the A/V skew a viewer sees and the harness measures, sampled only while audio is on
+	 * and only after the first mute, which is the window the report grades. A ring with no playhead
+	 * contributes no sample: there is no position to be skewed against.
+	 */
+	skew: number;
+}
+
+/**
+ * The worklet end of the fallback transport: it owns the ring, applies what the buffer posts, and
+ * hands state back only when asked.
+ *
+ * Delivery is the thing the real port decides, so driving it from the test is what makes a state
+ * message that crossed a flush reproducible.
+ */
+class FakeWorklet extends EventTarget {
+	readonly port = this;
+	readonly #ring: SharedRingBuffer;
+	#timeline = 0;
+
+	constructor(ring: SharedRingBuffer) {
+		super();
+		this.#ring = ring;
+	}
+
+	postMessage(msg: Message): void {
+		if (msg.type === "data") this.#ring.insert(msg.timestamp, msg.data);
+		else if (msg.type === "reset") {
+			this.#timeline = msg.timeline;
+			this.#ring.reset();
+		} else if (msg.type === "stall") this.#ring.stall();
+		else if (msg.type === "latency") this.#ring.setLatency(Math.round(RATE * Time.Second.fromMilli(msg.latency)));
+	}
+
+	start(): void {}
+
+	/** The state message the worklet would compose from the ring as it stands. */
+	compose(): State {
+		return {
+			type: "state",
+			timeline: this.#timeline,
+			playhead: this.#ring.playhead,
+			debug: this.#ring.debug(),
+		};
+	}
+
+	/** Deliver one, as the port would. */
+	deliver(state: State): void {
+		this.dispatchEvent(Object.assign(new Event("message"), { data: state }));
+	}
+}
+
+/** Build the fallback buffer: taking the global away is how the factory is made to pick it. */
+function postAudioBuffer(worklet: FakeWorklet, latency: number): AudioBuffer {
+	const shared = globalThis.SharedArrayBuffer;
+	(globalThis as { SharedArrayBuffer?: SharedArrayBufferConstructor }).SharedArrayBuffer = undefined;
+	try {
+		return createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+			channels: 1,
+			rate: RATE,
+			latency,
+			buffered: false,
+			conceal: true,
+		});
+	} finally {
+		globalThis.SharedArrayBuffer = shared;
+	}
 }
 
 /**
@@ -289,8 +359,12 @@ interface Session {
  *
  * `reanchor` is `Audio.Decoder.#reanchor`, `flush` is `Audio.Decoder.#runFlush`; both are what this
  * is regression-testing, so each can be switched off to reproduce the desync it fixes.
+ *
+ * `port` runs the playhead through the real fallback transport instead of reading the ring directly:
+ * the buffer only learns where the reader is from state messages, so every mute has one composed
+ * before the worklet saw the flush.
  */
-async function session({ reanchor = true, flush: doFlush = true } = {}): Promise<Session> {
+async function session({ reanchor = true, flush: doFlush = true, port = false } = {}): Promise<Session> {
 	const time = fakeClock();
 	clock = time;
 
@@ -309,6 +383,11 @@ async function session({ reanchor = true, flush: doFlush = true } = {}): Promise
 	ring.setLatency(ringSamples(RATE, sync.out.delay.peek()));
 	const output = [new Float32Array(QUANTUM)];
 
+	// The fallback transport, when asked for. The ring above stands in for the one the worklet owns,
+	// and everything the player does to it goes over the port.
+	const worklet = port ? new FakeWorklet(ring) : undefined;
+	const buffer = worklet ? postAudioBuffer(worklet, ringSamples(RATE, sync.out.delay.peek())) : undefined;
+
 	const end = SEQUENCE[SEQUENCE.length - 1].at;
 	const pending: Promise<void>[] = [];
 	let controls = 0;
@@ -319,9 +398,14 @@ async function session({ reanchor = true, flush: doFlush = true } = {}): Promise
 	let media = 0; // the next audio frame's timestamp, in ms
 	let ahead = 0;
 	let behind = 0;
+	let skew = 0;
 	let rendered = 0;
 	let poll = -POLL;
 	let running = true;
+	let toggled = false; // the cold start is graded by the replay above, not here
+	// The playhead the ring publishes, which is what `Audio.Decoder` mirrors onto `audio.out
+	// .timestamp` and what every consumer of it reads. Undefined while the ring has none.
+	let heard: Time.Micro | undefined;
 
 	for (let now = 0; now < end; now += STEP) {
 		time.set(now);
@@ -331,11 +415,28 @@ async function session({ reanchor = true, flush: doFlush = true } = {}): Promise
 			if (control.delay !== undefined) delay.set(control.delay);
 			if (control.muted === undefined) continue;
 			enabled = !control.muted;
-			if (enabled) continue;
+			if (enabled) {
+				// What `Audio.Decoder.#runClock` does the moment the track is enabled again: it
+				// follows the ring's clock, whatever the ring is publishing right then.
+				if (buffer) track.clock.set(buffer.clock.peek());
+				continue;
+			}
+			toggled = true;
 			// What the decoder does on the way out: the graph is disconnected, so nothing drains the
 			// ring and it stops being a clock.
 			track.clock.set(undefined);
-			if (doFlush) ring.reset();
+			if (!doFlush) continue;
+			// The flush takes the playhead with it, and the shared path only re-reads on its poll.
+			heard = undefined;
+			if (worklet && buffer) {
+				// The message the worklet composed a port hop before the flush reached it, which is
+				// therefore the last thing the main thread hears until the graph is connected again.
+				const inflight = worklet.compose();
+				buffer.reset();
+				worklet.deliver(inflight);
+			} else {
+				ring.reset();
+			}
 		}
 
 		// The publisher keeps producing whether or not anyone is listening, so the media a mute
@@ -356,10 +457,14 @@ async function session({ reanchor = true, flush: doFlush = true } = {}): Promise
 			}
 			const span = terminal.span(decoder.decode(timestamp, PACKET));
 			if (span.frames > 0) {
-				// What `SharedAudioBuffer.insert` does: a park with media still landing in it is a
+				// What `insert` does on either transport: a park with media still landing in it is a
 				// refill, so the clock waits it out rather than handing playback back to the wall.
-				source.filling();
-				ring.insert(span.timestamp, [new Float32Array(span.frames).fill(0.5)]);
+				const data = [new Float32Array(span.frames).fill(0.5)];
+				if (buffer) buffer.insert(span.timestamp, data);
+				else {
+					source.filling();
+					ring.insert(span.timestamp, data);
+				}
 			}
 
 			media += 1000 / 50;
@@ -388,17 +493,41 @@ async function session({ reanchor = true, flush: doFlush = true } = {}): Promise
 		};
 		present();
 
+		// Every quantum, not every poll: the whole defect lives between an unmute and the next state
+		// message, which is a fraction of one. A signal read costs nothing, so the postMessage path
+		// reads what the buffer publishes directly; the shared ring's playhead getter is stateful, so
+		// that path reuses the one read the poll below makes.
+		if (buffer) heard = buffer.timestamp.peek();
+		if (toggled && enabled && painted !== undefined && heard !== undefined) {
+			skew = Math.max(skew, painted - Time.Milli.fromMicro(heard));
+		}
+
 		if (now - poll < POLL) continue;
 		poll = now;
-		if (enabled) track.clock.set(source.sample(ring.playhead));
+
+		if (enabled) {
+			if (worklet && buffer) {
+				worklet.deliver(worklet.compose());
+				track.clock.set(buffer.clock.peek());
+			} else {
+				// Read once: the getter is stateful, since it measures the reader's rate between reads.
+				const playhead = ring.playhead;
+				heard = playhead?.timestamp;
+				track.clock.set(source.sample(playhead));
+			}
+		}
 		await flush();
 
 		const next = sync.out.delay.peek();
 		// `Audio.Decoder.#runLatencyReanchor`: a deepening target parks the ring so it refills
 		// rather than keeping on at its old depth.
-		if (next - target > 2 * Container.Jitter.BUCKET) ring.stall();
+		if (next - target > 2 * Container.Jitter.BUCKET) {
+			if (buffer) buffer.stall();
+			else ring.stall();
+		}
 		target = next;
-		ring.setLatency(ringSamples(RATE, next));
+		if (buffer) buffer.setLatency(ringSamples(RATE, next));
+		else ring.setLatency(ringSamples(RATE, next));
 
 		// One sample of what the viewer sees: the frame on the canvas against the audio being
 		// played, both settled on the position this poll published.
@@ -416,8 +545,9 @@ async function session({ reanchor = true, flush: doFlush = true } = {}): Promise
 	sync.reset();
 	await Promise.all(pending);
 	sync.close();
+	buffer?.close();
 
-	return { ahead, behind, lag, rendered };
+	return { ahead, behind, lag, rendered, skew };
 }
 
 describe("mutes and latency presets keep video on the audio", () => {
@@ -451,5 +581,29 @@ describe("mutes and latency presets keep video on the audio", () => {
 		expect(collapsed.lag).toBeGreaterThan(2000);
 		expect(collapsed.ahead).toBeGreaterThan(1000);
 		expect(stale.ahead).toBeGreaterThan(500);
+	}, 120_000);
+
+	// The same sequence over the fallback transport, which is what an engine without cross-origin
+	// isolation runs: Firefox and WebKit both spiked about three seconds of skew for about a second
+	// after every unmute, and Chromium on the shared ring did not. The difference is the port hop.
+	// The buffer flushes and the message already on the wire describes the ring the flush threw
+	// away, so it is the last playhead the main thread hears until the graph is connected again,
+	// and it is a whole mute behind the one the reader resumes from.
+	it("ignores the playhead in a state message that crossed the flush", async () => {
+		const fixed = await session({ port: true });
+
+		console.log(
+			`sync sequence (postMessage): painted frame at most ${fixed.skew.toFixed(1)}ms ahead of the reported playhead, ${fixed.ahead.toFixed(1)}ms ahead of the sync position, ending ${fixed.lag.toFixed(0)}ms behind the live edge`,
+		);
+
+		expect(fixed.rendered).toBeGreaterThan(800);
+
+		// One video frame is the resolution the picture has, and the reported playhead is up to a
+		// poll stale on top of that. Anything beyond is a position the reader never resumed from.
+		expect(fixed.skew).toBeLessThan(FRAME + POLL);
+		expect(fixed.ahead).toBeLessThan(FRAME + POLL);
+
+		// And the audio itself still ends at the live edge.
+		expect(fixed.lag).toBeLessThan(500);
 	}, 120_000);
 });
