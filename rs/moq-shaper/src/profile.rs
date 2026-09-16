@@ -21,7 +21,8 @@ pub struct Profile {
 	/// The profile's name, recorded alongside a run's counters.
 	pub name: String,
 
-	/// Seeds both directions' generators, so the same run makes the same decisions.
+	/// Seeds both directions' generators, each deriving its own, so the same run makes the
+	/// same decisions.
 	pub seed: u64,
 
 	/// Treatment of datagrams travelling from the client to the upstream.
@@ -112,6 +113,10 @@ impl Direction {
 			(0.0..=1.0).contains(&self.reorder),
 			"{which}.reorder must be between 0 and 1, got {}",
 			self.reorder
+		);
+		anyhow::ensure!(
+			self.reorder == 0.0 || !self.reorder_delay.is_zero(),
+			"{which}.reorder_delay must be greater than 0 when {which}.reorder is set"
 		);
 
 		if let Some(burst) = self.burst {
@@ -205,6 +210,23 @@ mod tests {
 			..Default::default()
 		};
 		assert!(dir.validate("up").is_err());
+	}
+
+	#[test]
+	fn a_reorder_without_a_delay_is_refused() {
+		let dir = Direction {
+			reorder: 0.5,
+			..Default::default()
+		};
+		let err = dir.validate("up").unwrap_err().to_string();
+		assert!(err.contains("reorder_delay"), "{err}");
+
+		let dir = Direction {
+			reorder: 0.5,
+			reorder_delay: Duration::from_millis(20),
+			..Default::default()
+		};
+		assert!(dir.validate("up").is_ok());
 	}
 
 	#[test]
