@@ -500,6 +500,14 @@ with anything below one bucket reading zero: below the estimator's own
 resolution this is noise, and a term that flickered by a millisecond would
 re-park the ring for nothing.
 
+It is capped at 200 ms. The term exists to bring the picture back inside the
+window a viewer notices (ITU-R BT.1359 puts that at 45 ms of picture-ahead and
+125 ms of picture-behind), and past that a hold cannot buy it back: a picture
+seconds late is out of sync whatever the sound does. Measured on an impaired
+path, an uncapped term reached 2 s during tune-in, where the video track is
+still replaying the span between the last keyframe and the live edge and every
+arrival honestly looks that late.
+
 It is deliberately one-directional. Audio is the clock and video is painted when
 the playhead reaches its timestamp, so a picture that arrives *early* is already
 held for free and needs no term; only a picture that arrives late does, and the

@@ -504,6 +504,23 @@ describe("the cross-track arrival offset", () => {
 		}
 	});
 
+	it("stops holding past what lip sync is worth", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(40) });
+		try {
+			// Tune-in on an impaired path: the video track is still replaying the span between the
+			// last keyframe and the live edge, so every arrival honestly looks seconds late. A
+			// picture that far behind is out of sync whatever the sound does, and holding the sound
+			// with it just makes everything late.
+			deliver(sync, clock, 2_000);
+			await flush();
+
+			expect(sync.out.offset.peek()).toBe(Time.Milli(200));
+		} finally {
+			sync.close();
+		}
+	});
+
 	it("lets go once the picture stops arriving", async () => {
 		clock = fakeClock();
 		const sync = new Sync({ delay: Time.Milli(40) });
