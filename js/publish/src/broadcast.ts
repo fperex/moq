@@ -252,13 +252,16 @@ export class Broadcast {
 				// of the media it describes. Matches `hang::Catalog::default_track_info`.
 				const track = request.accept({ priority: Catalog.PRIORITY.catalog });
 
-				// Serve from a per-subscription child scope. Releasing it when this subscriber leaves keeps
-				// serving state from piling up on the connection-lifetime effect as viewers come and go.
+				// Serve from a per-subscription child scope, released when this subscriber leaves: it
+				// keeps serving state from piling up on the connection-lifetime effect as viewers come
+				// and go, and frees the track so the next subscription raises a fresh request and is
+				// seeded with the current catalog. Cleanups drain in registration order, so the
+				// snapshot producer finishes before the track it writes into closes.
 				const dispose = effect.run((effect) => {
-					effect.cleanup(() => track.close());
 					this.catalog.serve(track, effect, { compression });
+					effect.cleanup(() => track.close());
 				});
-				void track.closed.then(dispose);
+				void Promise.race([track.closed, track.unused()]).then(dispose);
 				continue;
 			}
 
