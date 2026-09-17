@@ -21,7 +21,7 @@ import { AudioRingBuffer } from "./ring-buffer";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 
 /** An AudioWorklet render quantum, in frames. */
-export const QUANTUM = 128;
+const QUANTUM = 128;
 
 /** One Opus frame, which is the chunk a synthetic trace is built from. */
 export const CHUNK_MS = 20;
@@ -214,7 +214,7 @@ export interface Progress {
  * A recorded AAC trace is 23.22ms per frame, not the 20ms a synthetic Opus trace uses, and inserting
  * the wrong count leaves the ring gap-filling silence between every pair of frames.
  */
-export function frameSamples(t: Arrival[], rate: number): number[] {
+function frameSamples(t: Arrival[], rate: number): number[] {
 	const sorted = [...t].sort((a, b) => a.media - b.media);
 	const spacing = new Map<number, number>();
 

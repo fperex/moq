@@ -378,9 +378,6 @@ function cases(): { name: string; description: string; start_ms?: number; arriva
 
 const PATH = join(dirname(fileURLToPath(import.meta.url)), "../../../../rs/moq-audio/tests/playout-01.json");
 
-/** Where the corpus lives, so the test suite and the generator cannot disagree about it. */
-export const CORPUS_PATH = PATH;
-
 /** Read the corpus from disk. */
 export function load(): Corpus {
 	return JSON.parse(readFileSync(PATH, "utf8")) as Corpus;
