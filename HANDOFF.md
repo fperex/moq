@@ -1,9 +1,11 @@
 # Real-time audio playout: what was wrong, what this branch does about it
 
 Branch: `fperex/moq` `debug-findings-solution`, rebased onto `upstream/dev` (`877a561d8`, was
-`8f41d4d82`). This document sits at the branch tip: 96 commits and 185 files at the time of writing,
-one docs commit above. The last change to the player itself is `35459ad52`; everything above it is
-delivery.
+`8f41d4d82`). This document sits at the branch tip: 105 commits and 200 files at the time of
+writing, one docs commit above. The last change to the code is `17ff71750`. The eight commits above
+the previous docs pass touch `js/watch`, `js/hang`, `js/publish`, `js/net`, `rs/moq-tokio`,
+`rs/moq-relay`, `rs/moq-ffi`, `go/wrapper`, `dart/moq_ffi`, and `doc/concept/playout.md` and
+`doc/bin/relay/` beside them.
 
 This is a **draft pull request on a fork, opened so the work can be read, and not a submission**. No
 pull request on `moq-dev/moq` is intended and nothing here asks to be merged as a unit. It exists so
@@ -26,13 +28,17 @@ maintainer" is the part that is worth reading even if none of the code is adopte
 total under 150 ms on the LAN and under 200 ms through the public relay, audio and video within one
 frame, and zero underruns after convergence. Firefox and Safari are graded like Chromium.
 
-**Work in progress at this tip.** The four topics an earlier revision listed as in progress are
-done, and they are findings 18 to 25 below, each with the commit that fixes it: what a stopped video
-track does to a watcher and what a capture stop does to a publisher's catalog, the fill and the
-spinner after an unmute, hiding and showing video, and the console noise a watcher produces. What is
-still running is the cross-browser resilience matrix: each engine publishing and watching, hide and
-show, mute and unmute, an impaired path, a relay restart and a long run. Its results will be
-appended here, so anyone reading an intermediate push should expect this document to grow again.
+**State at this tip.** The four topics an earlier revision listed as in progress are done, and they
+are findings 18 to 25 below, each with the commit that fixes it: what a stopped video track does to a
+watcher and what a capture stop does to a publisher's catalog, the fill and the spinner after an
+unmute, hiding and showing video, and the console noise a watcher produces. The cross-browser
+resilience matrix has since run: 49 rows over five engines, publishing and watching, hide and show,
+mute and unmute, a device change, an impaired path, a relay restart and a 30 minute run. Its
+failures were sorted into defects and bench artefacts, the defects were fixed and the affected rows
+re-run, and findings 26 to 31 are what came out. What is still open is listed under "Open items and
+follow-ups": a quiet re-run of the `mild` shaper profile, real Safari and Playwright WebKit as
+publishers, and the maintainer questions each fix left behind. **The user's listening round on this
+tip has not happened yet**, so every number below is an instrument reading.
 
 **Contents**
 
@@ -196,7 +202,16 @@ with their author intact.
 | 93 | `ff4da0042` | finding 22 | A camera that is only busy is asked again instead of spending the retry budget, and the reason reaches the buttons |
 | 94 | `aba98fd21` | finding 19 | A video rendition's track stays open while it is not encoding, so a re-subscription is not answered from a finished track |
 | 95 | `35459ad52` | finding 23 | The audio context is built on the first gesture, or when the app turns audio on, and never at load for a muted tile |
-| 96 | this one | delivery | Findings 18 to 25, the measurements behind them, the API impact and the gates |
+| 96 | `7be1b8fed` | delivery | Findings 18 to 25, the measurements behind them, the API impact and the gates |
+| 97 | `e8d3cad3b` | finding 26 | A group is judged by how far it could still reach, so a long GOP whose tail is late is not convicted, and the video estimator lives as long as the rendition |
+| 98 | `cdb52f0aa` | finding 27 | A test that a replaced session does raise a second video request, which refuted the reading of the relay-restart row |
+| 99 | `317b59ec2` | finding 27 | The video download gate is re-armed when the tile reconnects, so a rebuilt or moved tile asks for video again |
+| 100 | `afbba9b1c` | finding 30 | The broadcast stays announced while a device is replaced, so a switch does not drop every subscription |
+| 101 | `b1a1fbe01` | finding 28 | `Sync.out.offset`: the sound is held for a picture that arrives later |
+| 102 | `7b6bdb6ec` | finding 28 | That hold is capped at what lip sync is worth |
+| 103 | `2b3191f94` | finding 31 | A draining relay refuses new sessions with 503, a drain is named as a drain, and the give-up window outlasts a restart |
+| 104 | `17ff71750` | finding 31 | The FFI and the Go wrapper follow the native give-up default |
+| 105 | this one | delivery | The resilience matrix, findings 26 to 31, the API impact and the gates |
 
 Row 49 carries two commits, so the numbered rows cover one hash more than there are rows. Every hash
 `git log --oneline upstream/dev..HEAD` prints is in the table, in that order, and the last row is
@@ -1444,6 +1459,121 @@ The user's own observation was taken while agents were running headed encoder se
 machine, which is recorded rather than explained away: a loaded machine is the case the report came
 from, and the matrix's long run is what will say whether it returns under load.
 
+### The cross-browser resilience matrix, 2026-09-17
+
+49 rows, one publisher and one watcher each, the publisher restarted before every row, run serially
+at `35459ad52` with both served pages built from that tip. Each row is graded against the same
+checks: a jitter target of 20 to 100 ms, held under 150 ms, zero underruns after a 10 s warmup, the
+signed skew inside a frame plus a display refresh (-55 ms at 30 fps, -38 ms at 60), zero video
+stalls after the first keyframe, painted at 80 percent of the nominal rate, and recovery inside
+2.5 s where the row interrupts something. **24 rows passed and 25 failed**, and the 25 are eight
+distinct causes rather than 25.
+
+Publisher across the top, watcher down the side.
+
+| Watcher \ Publisher | chromium | brave | firefox | real Safari |
+| --- | --- | --- | --- | --- |
+| chromium | pass 720p30, 1080p30, 1080p60, foreground and backgrounded | pass | fail: the picture 94 ms behind the sound | not run, nobody to click Allow |
+| brave | pass | pass at 720p30 and 1080p30; 1080p60 foreground painted 47.2 of 60 | fail: 98 ms behind | not run |
+| firefox | pass | pass | pass at 720p30 both ways and 1080p30 foreground; fail at 1080p30 backgrounded and both 1080p60 | not run |
+| webkit | pass | pass | pass | not run |
+| real Safari | pass | pass | pass | not run |
+
+Interactions, all with a chromium publisher:
+
+| Scenario | chromium | brave | firefox | webkit | real Safari |
+| --- | --- | --- | --- | --- | --- |
+| hide and show video | picture back in 1.96 s | 1.99 s | 1.95 s | 1.95 s | 2.00 s |
+| mute, unmute, presets, five fast pairs | 0 underruns, one 1.45 s stall at the 2000 ms preset | 0 underruns, 1.50 s | 0 underruns, 1.47 s | 0 underruns, 1.51 s | 0 underruns, 1.51 s |
+
+The whole-system rows, chromium on both sides: the device switch failed on every publisher engine,
+the relay restart left the tile with no picture, the impaired path failed on `mild` and `step`, and
+the 30 minute run held 30 fps with two underruns.
+
+**The 25 failures, grouped.** Five product defects, three bench or grading artefacts, and one open
+measurement.
+
+| Rows | What failed | Verdict |
+| --- | --- | --- |
+| `shaper-mild`, `shaper-step` | 7 and 12 video stalls, 9.9 s and 20.3 s, 1 and 4 decoder rebuilds, the picture 1.5 to 1.8 s behind | Defect: finding 26, fixed in `e8d3cad3b` |
+| `relay-restart` | painted 0 fps for the last 66 s while audio recovered completely | Defect: finding 27, fixed in `317b59ec2`, and a page-layout cause besides |
+| `device-switch-chromium`, `-brave`, `-firefox` | no samples at all, or a watcher painting 0 fps, after the switch | Defect: finding 30, fixed in `afbba9b1c` |
+| `cross-firefox-to-chromium`, `cross-firefox-to-brave`, `self-firefox-1080p30-bg`, `self-firefox-1080p60-fg`, `self-firefox-1080p60-bg` | the picture 86 to 109 ms behind the sound, against a -55 ms envelope | Defect: finding 28, fixed in `b1a1fbe01` and `7b6bdb6ec` |
+| not a row: the native `moq` file publishers during the restart | both exited with `reconnect timed out after 10s: peer redirected immediately` | Defect: finding 31, fixed in `2b3191f94` and `17ff71750` |
+| `hideshow-chromium`, `-brave`, `-firefox`, `-webkit`, `-safari` | `recovered <2.5s` over 0 events | Artefact: the recovery happened in every engine, 1.95 to 2.00 s, and the schedule put it before the graded window opened |
+| `toggle-chromium`, `-brave`, `-firefox`, `-webkit`, `-safari` | one video stall of 1.45 to 1.51 s | Artefact: it opens 0.6 to 0.7 s after the `delay 2000ms` marker and is the renderer holding the two seconds it was asked for. `toggle-chromium` also flagged a spinner 1.94 s after an unmute, at the very end of the attribution window and 69 ms before that marker, which no other engine shows |
+| `shaper-bursty`, `shaper-high-rtt` | `negotiated websocket transport, expected webtransport` | Artefact: the WebTransport handshake did not complete through the impaired port and the page fell back to TCP, so both rows were unimpaired rows wearing a profile's name. The driver caught it |
+| `self-brave-1080p60-fg` | painted 47.2 fps against a 48.0 threshold | Artefact: the backgrounded twin of the same row paints 59.1 and chromium passes both |
+| `long-run` | 2 underruns in 30 minutes | Open. Counters otherwise flat: 52079 painted of 52080 decoded, 0 stalls, 0 rebuilds, skew -36.1 to 4.1 ms throughout |
+
+**The re-run, 2026-09-17 11:00 to 12:08**, rows in `out10/` against `out9/` as the before. Target
+and lag in milliseconds, `stalled` the total stalled time in milliseconds, `vskip` the video groups
+the age budget or the transport threw away.
+
+| Row | | target | under | skew lag | fps | stalls | stalled | rebuilds | vskip |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cross-firefox-to-chromium 720p30 | before | 40 | 0 | -94.2 | 29.9 | 0 | 0 | 0 | 2 |
+| | after | 60 | 0 | -35.9 | 29.9 | 0 | 0 | 0 | 0 |
+| cross-firefox-to-chromium 1080p30 | before | 40 | 0 | -98.0 | 30.1 | 0 | 0 | 0 | - |
+| | after | 140 | 1 | -39.2 | 29.9 | 0 | 0 | 0 | 0 |
+| shaper-mild | before | 140 | 0 | -1508.3 | 29.7 | 7 | 9875 | 1 | 7 |
+| | after | 540 | 0 | -4092.2 | 29.9 | 5 | 14991 | 2 | 1 |
+| shaper-step | before | 140 | 1 | -1834.5 | 29.5 | 12 | 20326 | 4 | 11 |
+| | after | 220 | 0 | -39.1 | 30.0 | 1 | 116 | 0 | 0 |
+| shaper-bursty | before | 20 | 0 | -35.7 | 30.0 | 0 | 0 | 0 | 0 |
+| | after | 280 | 4 | -5370.7 | 0 | 1 | 58841 | 9 | 0 |
+| shaper-high-rtt | before | 20 | 0 | -38.5 | 30.0 | 0 | 0 | 0 | 1 |
+| | after | 120 | 0 | -36.8 | 30.0 | 0 | 0 | 0 | 0 |
+| device-switch-chromium | before | - | - | - | - | - | - | - | - |
+| | after | 100 | 1 | -52.5 | 26.4 | 0 | 0 | 0 | 0 |
+| device-switch there and back | after | 20 | 0 | -45.9 | 30.0 | 1 | 26 | 0 | 0 |
+| relay-restart | before | 20 | 0 | -34.3 | 0 | 1 | 66291 | 0 | -4 |
+| | after, pass 1 | 80 | 0 | -37.2 | 0 | 1 | 66412 | 0 | 0 |
+| | after, pass 3, `visible="always"` | 20 | 0 | -34.9 | 30.0 | 1 | 66450 | 0 | 0 |
+
+`device-switch-chromium` before produced no samples at all. Every shaper row still reads FAIL,
+and three of them fail only against the LAN targets: the grader applies `target 20-100ms` and
+`held <150ms` to every row, and a shaped path is supposed to widen past that. `shaper-high-rtt` at a
+target of 120 and a held total of 140 on a 150 ms round trip is the estimator being right.
+
+**The bitrate confound, stated because it cuts both ways.** The chromium publisher's picture in the
+re-run is 117 times heavier than in the earlier matrix. From the publisher heartbeats, bytes per
+video frame:
+
+| | out9, the earlier matrix | out10, the re-run |
+| --- | ---: | ---: |
+| chromium publisher | about 67 B per frame, about 16 kbps | about 7.9 KB per frame, about 1.9 Mbps |
+| firefox publisher | about 67 B per frame | about 67 B per frame |
+
+So no chromium-published video row is a like-for-like comparison. Where such a row improved it did
+so while carrying 117 times the load, which makes it stronger; where one got worse, the bitrate is
+the first thing to rule out and usually cannot be. The firefox rows are like for like, and the
+67 B per frame they carry in both runs is finding 29.
+
+**The load caveat.** The user's other session runs a continuous headed Chromium public stream on
+this machine, two 1080p60 encoders with a supervisor that restarts them, and it cannot be paused
+from here. The load average over the re-run ran 2.5 to 10.7, and the per-row `uptime` is in
+`out10/load.log`. Every timing number taken since mid-morning is an upper bound. Functional verdicts
+(a subscription raised, a picture back, an announcement held) do not move with load; skews, stalls
+and targets do. One row is contaminated outright and says so: the third relay restart overlapped a
+`just fix` running `cargo clippy --fix`, which is the last section of finding 31.
+
+**Rows not re-run.** The self-publish, hide-and-show and toggle families, the other cross-engine
+pairs, and the 30 minute long run. None of them was a watcher-side failure this work touches, and
+the machine was never quiet enough for a 30 minute row. The matrix above remains their reference.
+
+**Two coverage gaps, both recorded rather than worked around.** Real Safari as a *publisher* was not
+run: `safaridriver` can drive it, but its camera prompt needs a hand on the mouse and no user was
+available to click Allow. Playwright's WebKit refuses the `getUserMedia` permission outright, so
+there are no WebKit publisher rows either. Both engines ran as watchers in five rows each and passed
+everything except the two artefacts above.
+
+**One harness defect worth a demo-page owner's eye.** All five hide-and-show rows first died with
+`<canvas> from <slot> subtree intercepts pointer events`: on `demo/web/src/publish.html` the preview
+canvas sits over the publish controls, so a real mouse click cannot reach the camera button there
+either. The driver falls back to `dispatchEvent`; a person cannot. That is a page layout question
+rather than a `js/publish` one, and this run only establishes that a hit test refuses the click.
+
 ## Findings for the maintainer
 
 Things found while working that are separate from the fix.
@@ -2075,7 +2205,300 @@ Things found while working that are separate from the fix.
     `js/publish/src/video/processor.ts`, which is the difference between it and the three engines
     that paint. Nothing on this branch touches it, and it is recorded here so the matrix's Firefox
     self-publish rows are not read as a regression. Whether a watcher of that publisher sees the
-    picture is what those rows will say.
+    picture is what those rows will say. **Answered in finding 29**, from the wire rather than from
+    the canvas: it does not.
+
+26. **The age budget convicted a group for being long, not for being late, and it cost the picture
+    once per GOP.** Under path jitter the picture collapsed while the sound held: seven stalls
+    totalling 9.9 s in 90 s on the shaper's `mild` profile, twelve totalling 20.3 s on `step`, four
+    decoder rebuilds, and the picture 1.5 to 1.8 s behind the audio playhead at the worst.
+
+    `Container.Consumer` measured a group's age as the span from its oldest undelivered frame to the
+    newest frame the track had reached, so the verdict was a function of the group's length. An
+    audio group holds one frame, so that span reads as lateness and the rule looked right. A 2 s
+    video GOP whose tail was merely late was convicted the moment its successor opened: the rest of
+    the GOP was thrown away, the decoder then had to wait for the next keyframe, and the picture was
+    out until one arrived. Once per GOP, for as long as the path stayed slow.
+
+    The wire half of the same budget already had the right rule. `Subscription::max_age` measures a
+    group by how far it could still reach, which its successor's first timestamp bounds, against the
+    newest frame the track has reached (`is_stale`, `rs/moq-net/src/model/track.rs`). The consumer
+    now uses that rule verbatim, which is the point: the two halves of one budget cannot be allowed
+    to disagree.
+
+    One thing landed with it. The video decoder built a fresh arrival estimator per subscription and
+    cleared `out.spread` while a track was being rebuilt. Every reason to rebuild is a path that has
+    just proved it delivers late, so starting the measurement over at the publisher's declaration
+    collapsed the shared delay to whatever audio had measured and handed the replacement
+    subscription a budget the picture could never meet. The estimator is now one per rendition and
+    outlives any one subscription, exactly as the audio decoder already keeps its own.
+
+    Fixed in `e8d3cad3b`, with the consumer's cases in `js/hang` and the decoder's in `js/watch`.
+
+    Measured on the `step` profile, counting the `skipping slow group: track=video` lines the
+    watcher logged: **30 convictions before, 0 after**. The picture went from 12 stalls totalling
+    20.3 s, 4 decoder rebuilds, one underrun and 9.68 s concealed to **one 116 ms stall**, no
+    rebuilds, no underruns and 60 ms concealed, with the skew lag falling from -1834 ms to -39 ms.
+    On `mild` the convictions fell from 14 to 2. It did all of that while carrying **117 times the
+    video bitrate** of the run it is compared against, which is the confound recorded under the
+    matrix above and which here only makes the result stronger: the earlier matrix's chromium
+    publisher was sending about 67 bytes per frame and the re-run about 7.9 KB. `high-rtt` (75 ms
+    each way plus 30 ms of jitter, every one of 67863 downstream datagrams delayed, the queue
+    peaking at 577) is now clean outright: no stalls, no rebuilds, no convictions, 30.0 fps, nothing
+    concealed.
+
+27. **The video download gate was armed once, on a canvas that was not in a document yet, and never
+    re-armed.** A tile that was rebuilt, or whose node the page moved, played audio and never asked
+    for video again. The relay-restart row reproduced it: after the restart the watcher
+    re-subscribed to `catalog.json`, `meta.json` and `audio`, and never to `video`, for the rest of
+    the row. The device-switch rows carry the same signature once the publisher's announcement
+    flaps.
+
+    The first reading was that the video decoder does not rebuild its subscription when the session
+    under it is replaced. It does. `cdb52f0aa` drives a fake broadcast whose consumer is swapped the
+    way a reconnect swaps it, and shows video raising a second request on the new session. The test
+    is on the branch so the next reader of that row does not spend the time again.
+
+    The gate is one layer up: `Renderer`'s `IntersectionObserver` on the `<canvas>`, armed by an
+    effect keyed on the canvas and the configured distance. Neither changes when the element's node
+    leaves a document and comes back, so nothing re-evaluated it. A custom element may not touch its
+    children in its constructor, so `createElement`, `appendChild(canvas)`, then insert is the
+    ordinary order, and that arms the gate on a canvas that is not in a document yet. A page that
+    re-appends its tiles to reorder them is one disconnect and one connect in the same task, which a
+    boolean input would coalesce away, so the gate kept whatever it had last decided. With `visible`
+    false the decoder's `enabled` is false, so `#runPending` never opens a subscription and
+    `#runBuffering` never even labels the tile stalled: no picture, no spinner, nothing in the log.
+
+    Fixed in `317b59ec2`: the element republishes the canvas on every connect, which forces the
+    notification because the object is unchanged and its place in the document is not, and drops it
+    on disconnect so a removed tile stops downloading. The test drives a fake observer.
+
+    **And the relay-restart row is not what it was read as.** Three passes, each with more
+    instrumentation. Pass 1 reproduced it exactly, and the instrumented sampler named the layer: at
+    66.6 s the page replaced the `<moq-watch>` element, and the fresh tile reported
+    `videoEnabled: false` and `rendererVisible: false` for the remaining 50 s, with `paused: false`,
+    a rendition selected and no source error. Pass 2 added canvas geometry and settled it:
+
+    ```text
+    before the swap: canvas y=420  h=413 in a 720-high viewport, scrollY=638,  rendererVisible=true
+    after  the swap: canvas y=-871 h=413,                        scrollY=1423, rendererVisible=false
+    ```
+
+    The canvas is 871 pixels above the top of the screen, connected, laid out at 734x413, with the
+    document not hidden. The relay restart makes the demo page rebuild its tile list; the list
+    re-sorts while the page keeps its scroll, so the `me.hang` tile lands off screen and
+    `<moq-watch>` correctly stops downloading video at its default `visible="20%"` while audio keeps
+    playing. Pass 3 pinned every tile to `visible="always"` through an init script, so the row
+    measures the reconnect and nothing else, and the picture comes back: painted rises 1617 to 2036,
+    **30.0 fps, 0 underruns, 0 convictions, 0 rebuilds**, the target back at 20 ms and the skew lag
+    at -34.9 ms, where the row before it read 0 fps.
+
+    So the verdict on this row, and on the user's U1 in this form: **the player recovers a relay
+    restart completely**, and what the matrix recorded as lost video was the demo page re-sorting its
+    tiles and leaving this one 871 px above the viewport, where the default `visible="20%"` correctly
+    stops downloading. `317b59ec2` is still right and still needed, and its test proves the gate was
+    never re-armed on a reconnect at all, but it cannot make an off-screen canvas download and should
+    not. The row still grades FAIL on `0 video stalls` and `recovered <2.5s`, because the picture
+    cannot return before the page rebuilds its tile: 12 s in pass 1, 52 s in pass 3 under a
+    concurrent clippy. That gap is the reconnect and the re-announcement, not the player.
+
+    **A question for the maintainer, an API one rather than a bug.** A tile that is not downloading
+    because it is off screen is indistinguishable from outside from one that is playing. With
+    `enabled` false the decoder's buffering watchdog bails before it labels the tile stalled, so
+    `video.out.stalled` keeps whatever value it last held, there is no error, and nothing reports
+    "not downloading". The demo's badge says `stalled: recovering` and cannot know better. The
+    information does exist publicly, in `renderer.out.visible`, so there are two shapes: leave the
+    join to the page, which already holds both halves, or give the decoder an explicit "not
+    downloading, and why" output. Recommended: leave it to the page unless a second consumer wants
+    it, since the alternative adds a public signal to a surface that is already wide, and the page
+    is the only thing that knows why it moved the tile.
+
+28. **Nothing measured one track being uniformly later than the other, so a Firefox publisher's
+    picture ran about 100 ms behind its sound.** Rows `cross-firefox-to-chromium` (-94.2 ms),
+    `cross-firefox-to-brave` (-97.8), `self-firefox-1080p30-bg` (-98.0), `self-firefox-1080p60-fg`
+    (-86.4) and `self-firefox-1080p60-bg` (-109.4), against an envelope of a frame plus a refresh.
+    It is not the watcher: the same publisher is inside the envelope at WebKit (-38.3) and at real
+    Safari (-36.1), and every Chromium or Brave publisher is inside it at every watcher. A capture
+    probe accounts for about 22 ms of it, Firefox stamping its video 10 ms behind its audio where
+    Chromium stamps it 12 ms ahead; the rest is the video path simply delivering later.
+
+    The watcher paints a frame when the playhead reaches its timestamp, so a picture that has not
+    arrived by then is painted as soon as it decodes, which is late. Nothing in the player could see
+    it, because every existing measurement compares a track against *itself*: each arrival is
+    measured against that track's own fastest recent arrival, so a track uniformly later than the
+    other reads a spread of zero and the shared delay cannot tell them apart.
+
+    `b1a1fbe01` adds the missing quantity, as **option B** of the shapes that were on the table.
+    `Sync` measures each track's arrival floor, the windowed minimum of arrival minus timestamp over
+    two rotating 2 s windows, and publishes their difference as `Sync.out.offset`: how much later the
+    picture arrives than the sound for the same media timestamp. It covers both halves of the cause
+    at once, the path and a publisher that stamps its two timelines differently, because both move a
+    frame's arrival relative to its timestamp. The rotating windows are so that a muted or hidden
+    track drops out rather than holding the sound deep for the rest of the session; the term is
+    cleared on a rewind, as the estimator clears its own reference, and quantised to a whole bucket,
+    with less than a bucket reading zero.
+
+    Four decisions inside it, each of which was tried the other way:
+
+    - **One-directional.** Audio is the clock and video is painted when the playhead reaches its
+      timestamp, so a picture that arrives early is already held for free and needs no term. Only a
+      late picture needs one. Delaying the earlier track is what WebRTC does, in
+      `modules/video_coding/stream_synchronization.cc`. An absolute term regressed the 350 ms epoch
+      case that finding 14 fixed, which is why the sign is deliberate rather than incidental.
+    - **Capped at 200 ms** (`7b6bdb6ec`). Uncapped, the term reached 2 s during a jittery tune-in
+      and held there for 25 s, and it was not wrong about the world: the video track was still
+      replaying the span between the last keyframe and the live edge while the shaper's queue built,
+      so every arrival honestly looked that late. Holding the sound to match is the wrong trade. A
+      picture two seconds behind is out of sync whatever the sound does, and the hold just makes
+      everything late. 200 ms covers the window a viewer notices, ITU-R BT.1359 putting that at
+      45 ms of picture-ahead and 125 ms of picture-behind, with margin over every publisher offset
+      the matrix measured, the worst of them 109 ms.
+    - **Spent in two places that have to move together**: the audio ring holds
+      `delay + offset + chunk`, and the age budget reaches back over `delay + offset + buffer`,
+      because a budget sized without the term convicts the very group the deeper hold is waiting
+      for.
+    - **`Sync.out.delay` is untouched.** It stays the estimator's answer, which is what the corpus
+      describes and what both languages are held to. This is a property of a *pair* of tracks and
+      `rs/moq-audio` has only one, so the native side needs no change and the conformance corpus is
+      unmoved.
+
+    The rule is written down in a new section of `doc/concept/playout.md`, beside the estimator it
+    sits next to, with the cap and its reasoning.
+
+    Measured: `cross-firefox-to-chromium` moves from -94.2 ms to **-35.9 ms** at 720p30, inside the
+    envelope, and the 1080p30 pair from -98.0 ms to **-39.2 ms**. The offset contributed 160 ms of
+    hold at 720p30. On the capped re-run the term takes only 0 and 200, which is the cap doing
+    exactly what it was added for.
+
+29. **The Firefox publisher's picture is blank on the wire, at about 67 bytes per frame.** Finding
+    25 recorded that the preview canvas never paints in Playwright Firefox and left open what a
+    watcher of that publisher sees. The matrix answers it without a canvas: across both runs the
+    Firefox publisher's heartbeats give about **67 bytes per video frame**, roughly 16 kbps at
+    720p30, against about 7.9 KB per frame from the Chromium publisher on the same bench in the
+    re-run. That is an encoder being handed blank pictures, not a codec being efficient, and it is
+    the same fact the preview readback reports from the other side. Firefox has no
+    `MediaStreamTrackProcessor` and takes the polyfill path in `js/publish/src/video/processor.ts`,
+    which is the one difference between it and the three engines that paint.
+
+    It predates this branch and nothing here touches it, but it bounds two things that are in here.
+    A Firefox self-publish row is not a picture test. And the cross-engine rows behind finding 28
+    measure the timing of a stream that carries no picture: the timing is still real, since when a
+    frame arrives relative to its timestamp does not depend on what is in it, but no row on this
+    branch says a Firefox publisher's video *looks* right to anybody. Pinning it down belongs to
+    whoever owns the polyfill path, and it is in the follow-ups.
+
+30. **A device replacement un-announced the whole broadcast, and every subscriber was dropped for the
+    tenth of a second it took to open the next device.** A device change stops one capture and opens
+    another, so the element holds no live track at all for as long as the browser takes to answer,
+    measured here at 100 to 500 ms. `announce="source"` recomputed "any track live" on every change
+    and read that gap as an empty broadcast: the relay dropped every subscription, the catalog with
+    it, and answered the next request with `unroutable` until the re-announce landed. One switch of
+    both sources in Chromium flapped the announcement twice in a second and cost the watcher its
+    catalog, its audio and its video, and the whole broadcast went down because a *second microphone*
+    could not be opened.
+
+    Fixed in `afbba9b1c`: the mode latches. It still waits for the first live track, so a broadcast
+    with no permission is never advertised, and from then on it stays announced until the selected
+    source changes. A track that stops is one source being switched or re-acquired, not the end of
+    the broadcast, and the other renditions keep serving through it. A device that cannot be opened
+    still fails loudly on its own track, through `MoqPublish.errors` and the red button, and drops
+    its own rendition from the catalog. That is the shape the rule should have had: a failure scoped
+    to the thing that failed.
+
+    Measured on the bench, publisher and watcher both browsers. Before: two `unannounce
+    route=me.hang` lines, four subscriptions ending `err=dropped`, and one `track info error ...
+    err=unroutable` in a single row. After: zero, zero and zero, in Chromium, Brave and Firefox
+    alike, each keeping its catalog subscription for the whole row. The switch to the OBS Virtual
+    Camera and back, at 20 s and 35 s: `announce: true` across both legs, the catalog back at
+    `avc1.640028` within about 200 ms each time, and on the watcher 0 underruns, 0 convictions, 0
+    rebuilds, 30.0 fps and one 26 ms stall with a 29.6 ms recovery, with the painted counter rising
+    through both switches and no plateau.
+
+    **A correction to the earlier reading of these rows.** The matrix's device-switch rows ran
+    against a UGREEN FineCam 4K that handed every opener a track which ended immediately, and an
+    earlier note said the camera was simply switched off. That is retracted: the user switched it on
+    and a probe holding it by `deviceId` still saw both its camera and its microphone report
+    `readyState: "ended"` at the 1000 ms poll, twice, with 2.5 s and 1.5 s of release time after the
+    warm-up so the probe was not racing itself. The camera does report settings (640x480 at 30)
+    before it ends. The likeliest explanation is not hardware: the user's own Brave has had a video
+    capture utility process alive since 04:21:31 that day
+    (`utility-sub-type=video_capture.mojom.VideoCaptureService`), which Chromium spawns on demand
+    when a page starts capturing, so Brave has most likely been holding a camera for about seven
+    hours, spanning both runs, and a device already captured by another page can hand a second
+    opener a track that ends at once. That is a hypothesis and is recorded as one: the service can
+    also linger after capture stops, so its presence does not prove this device is held now, and it
+    does not on its own explain the UGREEN microphone ending too. The fix stands either way, which
+    is the point of scoping the failure to the track.
+
+31. **The native client could not survive the relay's own graceful restart, and three defects lined
+    up to make certain of it.** During the matrix's relay-restart row both native `moq` file
+    publishers died, 10 s into a 20 s restart, with `reconnect timed out after 10s: peer redirected
+    immediately`. The browser in the same row reconnected fine, which is how this was nearly
+    dismissed as a native-only curiosity. It is not: that is the browser scraping through on timing.
+
+    Three defects, one per layer:
+
+    - **The relay kept accepting during its own drain.** On SIGTERM it drains for its whole window
+      and waved every new session away with a GOAWAY naming no URI.
+    - **The client read that wave-off as a redirect.** A GOAWAY with an empty URI is not a redirect
+      at all, and the client took each one as the replacement, retired the predecessor that was
+      still carrying its groups 56 ms into the handover window it should have ridden, and called it
+      `peer redirected immediately`.
+    - **The give-up window equalled the drain window.** Both were 10 s, so the budget was spent on an
+      endpoint that had already said it was leaving, before a replacement could exist.
+
+    Fixed in `2b3191f94`, and in `17ff71750` for the bindings. A relay that has started draining
+    refuses a new session with `503` on every transport, the code a client retries, through a new
+    `moq_relay::Shutdown::draining()` the listeners consult. A GOAWAY naming no URI is reported as
+    the drain it is, logged `peer is draining` rather than as a redirect nobody asked for, and a
+    replacement waved away before it ever served never displaces a predecessor that is still serving.
+    The give-up window moves from 10 s to 60 s in Rust, in JS and in the FFI.
+
+    **That last one is a documented default change, and it is a maintainer judgement item.** The
+    reasoning is plain: the shipped client could not survive the shipped relay's own graceful
+    restart, because the relay drains for 10 s before its process even exits, so a 10 s give-up
+    budget is spent before the relay has finished leaving, let alone come back. The browser only
+    scraped through by riding the drained session to the force-close and reconnecting on its last
+    in-flight attempt, which is luck rather than design. Past a restart the window is still
+    deliberately short, so a failure that has not cleared is still reported rather than retried in
+    silence, and a loop nobody watches still wants `timeout: 0`. If the number should be smaller, or
+    should be derived from the peer's own drain deadline rather than picked, say which; the defect
+    under it is fixed either way.
+
+    Four Rust tests and one in JS, each failing without the fix:
+    `a_draining_relay_refuses_a_new_session` in `rs/moq-relay/tests/shutdown_signal.rs`, and in
+    `rs/moq-tokio/tests/reconnect.rs`
+    `an_immediately_drained_replacement_keeps_the_serving_session`,
+    `a_peer_draining_every_session_names_the_drain` and
+    `a_peer_away_longer_than_a_relay_restart_is_reconnected_to`, with the JS twin of the last one in
+    `js/net/src/connection/reload.test.ts`.
+
+    Measured on the bench, both file publishers through one relay restart at 15:42:03:
+
+    ```text
+    15:42:03.458  received goaway uri=            the drain begins
+    15:42:03.468  session error err=app code=503  the replacement is refused, not accepted
+                  ... nine refusals across both publishers, backing off 0.8 s to 4.9 s
+    15:42:13.461  old session did not drain in time; closing      10.0 s of serving kept
+    15:42:20.347  listening addr=[::]:4443 kind="quic"            the new relay binds
+    15:42:20.886  announce route=demo/bbb.hang/**
+    15:42:22.570  announce route=bbb.hang/**
+    ```
+
+    Nine `relay shutting down; refusing a new session` lines on the relay side, the serving session
+    kept for the full 10.0 s of the drain instead of being retired 56 ms in, both broadcasts
+    re-announced within 0.5 s and 2.2 s of the new relay binding, and **zero `reconnect timed out`
+    anywhere in the window**.
+
+    **The honest part.** A later, third restart in the same session did kill both publishers, at
+    `reconnect timed out after 60s: ... tcp connect error: Connection refused`. That was a
+    scheduling error of this bench's own making, not a product one: a concurrent `just fix` running
+    `cargo clippy --fix` had invalidated the build cache, so `cargo run` spent 48.8 s recompiling
+    `moq-relay`, the relay did not finish listening until 15:53:10.869, and the publishers gave up
+    at 15:53:09.139. They **missed it by 1.7 seconds**. What the run does show is that the failure
+    mode changed from a 10 s budget spent on a redirect that never happened to an honest 60 s budget
+    and a truthful reason. The lesson for the next matrix is written down: never run a Rust gate
+    during a restart row.
 
 ## Public API and wire impact
 
@@ -2089,11 +2512,19 @@ The eight commits of 2026-09-17 change no wire format and no message. The one th
 the wire at all is that a video rendition's track is no longer finished when it stops encoding
 (`aba98fd21`), which is a lifetime rather than a byte.
 
+The eight commits above `7be1b8fed` change no wire format and no message either. What they change is
+one new output, one corrected doc comment, two behaviours, and a default that moves in five places
+at once. No draft is touched, and no `moq-net` or `hang` byte moves.
+
 **`@moq/net`**
 
 - New `Expired extends StreamError`, re-exported as `Moq.Group.Expired` beside `Lagged`. A peer's
   `DELIVERY_TIMEOUT` reset now decodes to it rather than to a plain `StreamError`: same code, same
   base class.
+- `ReloadDelay.timeout` defaults to **60000 ms rather than 10000** (`2b3191f94`). A caller who set
+  it is unaffected; a caller who did not now rides a relay restart instead of surfacing an error
+  part way through one. `0` still means unlimited, and giving up still does not dispose the loop.
+  See finding 31 for why the number moved and what the maintainer is being asked.
 
 **`@moq/hang`**
 
@@ -2113,6 +2544,12 @@ the wire at all is that a video rendition's track is no longer finished when it 
   publisher's declaration, and a `Jitter` is an estimate already measuring that the consumer
   continues through `reanchor()`. Additive, one prop with one meaning; every existing caller compiles
   untouched.
+- `ConsumerProps.maxAge` keeps its type and its name, and its *meaning* is corrected
+  (`e8d3cad3b`). It documented the span from the oldest buffered frame to the newest; it now
+  documents the rule the wire budget has always used, a group measured by how far it could still
+  present, which its successor's first timestamp bounds, against the newest frame the track has
+  reached. A caller passing the same number gets a different and better verdict on a long group,
+  which is the fix in finding 26. No signature moves.
 - New `Container.Consumer.spread` and `Container.Consumer.skipped`.
 
 **`@moq/watch`**
@@ -2152,6 +2589,18 @@ the wire at all is that a video rendition's track is no longer finished when it 
   when the app turns audio on for an unmuted tile, rather than as soon as the catalog names a rate.
   That is visible to a page only as the warnings it no longer prints and the contexts it no longer
   holds; see finding 23.
+- `Sync.out.offset` is new and additive (`b1a1fbe01`): how much later the picture arrives than the
+  sound for the same media timestamp, one-directional, bounded at 200 ms by `7b6bdb6ec`.
+  `Sync.out.delay` and `out.jitter` keep their meanings exactly; `out.maxAge` is now derived from
+  the offset as well. `<moq-watch>` gains no attribute. The player's "total buffer" row and the live
+  badge report the third term. See finding 28.
+- `Video.Decoder.out.spread` is unchanged in type and gains a lifetime (`e8d3cad3b`): it is
+  published per rendition and stays published across a subscription being rebuilt, where it used to
+  be cleared with the subscription. A reader that treated an absent spread as "no measurement yet"
+  sees one fewer gap.
+- `317b59ec2` adds no surface. `<moq-watch>` gains no attribute and the renderer's inputs are
+  unchanged; the element republishes its canvas on every connect and drops it on disconnect, so the
+  download gate is re-evaluated when a tile is rebuilt or moved. See finding 27.
 - `Video.Decoder.out` gains `skipped`.
 - `DecoderInput.conceal` is new, with the element attribute `<moq-watch conceal>`.
 - `audioMaxAge` and `maxAgeHeadroom` are new in the audio config module.
@@ -2179,6 +2628,12 @@ the wire at all is that a video rendition's track is no longer finished when it 
   closed when it stops encoding, so the same groups and frames go out with the subscription left open
   instead of finished. That is behaviour, not format; it is the difference between a peer that can
   come back and one that cannot.
+- `afbba9b1c` adds and removes nothing either, and changes what `announce="source"` means.
+  The mode still waits for the first live track, and then it **latches**: the broadcast stays
+  announced until the selected source changes, rather than un-announcing itself whenever no track is
+  live. A device being switched or re-acquired therefore keeps its subscribers, and a device that
+  cannot be opened fails only its own track. `doc/lib/js/publish.md` says so in the attribute table.
+  See finding 30.
 
 **`rs/moq-audio`**
 
@@ -2193,6 +2648,36 @@ the wire at all is that a video rendition's track is no longer finished when it 
   surface. The `delay` floor is untouched: a caller who knows something the arrivals do not say is a
   different thing from a publisher describing its own encoder.
 - `Consumer::read` returns one 10 ms block rather than a decoder packet when `delay` is set.
+
+**`rs/moq-relay`**
+
+- `Shutdown::draining()` is new and additive: whether the drain has already begun. The listeners
+  consult it, and a relay that has started draining now refuses a new session with `503` on every
+  transport (QUIC, WebTransport and WebSocket) instead of accepting one and waving it away with an
+  empty-URI GOAWAY. That is a behaviour change visible to any client that redials during a restart,
+  and it is the one the 503 exists for. `doc/bin/relay/index.md` states it beside `trigger.start()`,
+  and `doc/bin/relay/config.md` records that an empty redirect URI is a drain rather than a
+  redirect. See finding 31.
+
+**`rs/moq-tokio`**
+
+- `Backoff::timeout` defaults to **60s rather than 10s**, which moves `--backoff-timeout`, the
+  `MOQ_BACKOFF_TIMEOUT` environment variable and the `connect.backoff.timeout` setting with it. A
+  caller who set the value is unaffected; `0` still means unlimited.
+- A GOAWAY naming no URI is no longer treated or logged as a redirect. The client reports `peer is
+  draining` and redials the same address with backoff, and a replacement session waved away before
+  it ever served does not displace a predecessor that is still serving. Behaviour, not surface.
+
+**`rs/moq-ffi` and the bindings**
+
+- `MoqBackoff.timeout_us` defaults to **60000000 rather than 10000000** (`17ff71750`), because the record
+  mirrors `moq_tokio::Backoff` and its doc claimed a default it no longer matched. The Go wrapper
+  resolves its own unset fields before the FFI call, since a Go zero means "retry forever" on the
+  wire, so it carries the number too. The Dart bindings are generated but checked in, and only that
+  one line is regenerated. The Swift, Kotlin and Python bindings are generated into gitignored paths
+  at build time and pick up the default and the doc line on the next build.
+- **Judgement item**: the FFI default follows the native one rather than staying put, so a binding
+  caller who never set `timeout_us` now gets 60 s.
 
 **`moq play`**
 
@@ -2291,6 +2776,18 @@ than discarded, so the band is not evaluated on the instantaneous level the ques
   the re-subscribe fix.
 - Tests with each of those fixes, in `js/hang`, `js/net`, `js/publish` and `js/watch`; the counts are
   in the two gate passes below.
+- **The cross-browser resilience matrix**, 49 rows at `35459ad52`, 08:01 to 10:01, one browser at a
+  time with the publisher restarted before every row: five engines publishing and watching, hide and
+  show, mute and unmute, a device change, four shaper profiles, a relay restart and a 30 minute run.
+  24 passed, 25 failed, and the failures are the eight causes the Evidence section groups.
+- **The re-run of the affected rows**, 10:59 to 12:08, after the four watcher-side fixes and the
+  publisher's announce latch: the two Firefox cross-engine pairs, all four shaper profiles with the
+  WebSocket fallback denied, the device switch and a there-and-back switch, and the relay restart
+  three times over with the sampler instrumented further on each pass. Its table is in the Evidence
+  section, with the bitrate confound and the load caveat that bound it.
+- **The native reconnect on a real relay restart**, read out of the two file publishers' logs and
+  the relay's own: nine refusals with `503`, the serving session kept for the full 10.0 s drain, and
+  both broadcasts re-announced within 0.5 s and 2.2 s of the new relay binding. Finding 31.
 
 ### Gates on the final tree
 
@@ -2367,12 +2864,41 @@ At the code tip `35459ad52`, 96 commits above `upstream/dev`, covering `5a4ed9e2
 | `demo/web` and the copied site rebuilt | 0 | Both served pages come from the final tip |
 
 **What was not re-run above `ba7a68789`**: the deterministic replay lane, the 24-row Chromium matrix,
-`just test default`, `check-all` at the final tip, and `smoke-full`. The eight commits touch
-`js/hang`, `js/net`, `js/publish`, `js/watch` and one paragraph of `doc/concept/playout.md`, and no
-Rust, no wire and nothing `moq play` reaches, so the cross-language lane has nothing new to cover.
-The replay lane and the Chromium matrix do cover the player, and they are the gap: what stands in
-their place is `just js test` at both passes and the bench rows above, which are instrument readings
-on one machine rather than a graded run.
+`just test default`, `check-all` at that tip, and `smoke-full`. The eight commits of the morning
+touch `js/hang`, `js/net`, `js/publish`, `js/watch` and one paragraph of `doc/concept/playout.md`,
+and no Rust, no wire and nothing `moq play` reaches, so the cross-language lane had nothing new to
+cover. The replay lane and the Chromium matrix do cover the player, and they are the gap: what
+stands in their place is `just js test` at both passes and the bench rows above, which are
+instrument readings on one machine rather than a graded run.
+
+At the code tip `17ff71750`, 105 commits above `upstream/dev`, covering `e8d3cad3b`, `cdb52f0aa`,
+`317b59ec2`, `afbba9b1c`, `b1a1fbe01`, `7b6bdb6ec`, `2b3191f94` and `17ff71750`:
+
+| Gate | Exit | What it covered |
+| --- | ---: | --- |
+| `just fix upstream/dev` | 0 | No tracked change |
+| `just check` | 0 | Every package, every language: the root orchestration moved, so it checked everything rather than the branch's scope |
+| `just js test` | 0 | 806 `@moq/net`, 231 `@moq/hang`, 391 `@moq/watch`, 155 `@moq/publish`, and every other JS package, each exiting 0 |
+| `just test default upstream/dev` | **100** | 4365 of 4366 Rust tests passed and **one failed**, see below |
+
+**One Rust test is failing at this tip, and it is one of the new ones.**
+`moq-tokio::reconnect a_peer_away_longer_than_a_relay_restart_is_reconnected_to` panics at
+`rs/moq-tokio/tests/reconnect.rs:251` with `the client gave up on a peer that was away for 20s:
+Elapsed(())`. It reproduces in a scoped `cargo nextest run -p moq-tokio` as well as in the full run,
+so it is not the machine's load. The other three cases of finding 31 pass, including
+`an_immediately_drained_replacement_keeps_the_serving_session` and
+`a_peer_draining_every_session_names_the_drain`, and the behaviour the failing case guards is what
+the bench measured on a real restart: the 60 s budget carried both publishers across a 20 s outage
+with zero give-ups. The test drives that on a paused clock against a port nothing is listening on,
+and something in that arrangement gives up where the real client did not. **It is open**, it is
+named here rather than left for a reader to find, and nothing in this document should be read as
+claiming a green Rust suite at this tip.
+
+The replay lane, the Chromium harness matrix and `smoke-full` were not re-run above `7be1b8fed`
+either. `2b3191f94` and `17ff71750` are the first Rust on this branch since, and they touch the
+relay's shutdown path and the client's reconnect loop rather than anything on the wire, so
+`smoke-full` has no new pair to cover; the `moq-relay` and `moq-tokio` tests are what covers them,
+with the one failure above.
 
 One caveat on the CPU bench in `stretch.bench.test.ts`: its ratio assertion
 (`max(stretch) / max(normal) < 30`) fails about one run in fifteen on this machine and passes the
@@ -2424,12 +2950,24 @@ ceiling, and every residual is in "The enforced budgets" above.
   outright, so an `auto` row is on its measured target within a second. `budgets.json` was
   re-recorded against that in `ce2e13112`, and the rows still disagree with themselves: three clear
   the test now where ten did before, which is the honest answer rather than a better one.
-- **No listening round has happened on this tip, `35459ad52`.** The user listened on a build of
-  `de641c6b5` and reported the nine things findings 18 to 25 answer. Every one of the eight commits
-  since is measured and none is heard, so every number above is an instrument reading.
-- **The cross-browser resilience matrix is still running** as this is written: each engine
-  publishing and watching, hide and show, mute and unmute, a device change, an impaired path through
-  `moq-shaper`, a relay restart and a 30 minute run. Nothing here claims its rows.
+- **No listening round has happened on this tip, `17ff71750`.** The user listened on a build of
+  `de641c6b5` and reported the nine things findings 18 to 25 answer. Nothing since has been heard:
+  not the eight commits that answered those nine reports, and not the eight above them that answer
+  the matrix. Every number in this document is an instrument reading.
+- **The cross-browser resilience matrix has run**, and what it did not cover is named rather than
+  implied: real Safari as a *publisher* (its camera prompt needs a hand on the mouse), Playwright
+  WebKit as a publisher (it refuses the `getUserMedia` permission outright), and the self-publish,
+  hide-and-show, toggle and 30 minute families in the re-run, none of which was a watcher-side
+  failure the fixes touch.
+- **The `mild` shaper profile is not a usable before-and-after.** Its third run carried a third more
+  traffic and double the queue of the second, on a machine the foreign stream never left alone:
+  47103 downstream datagrams and a queue peaking at 41 in the old run, 62744 and 90 in the re-run.
+  Convictions did fall from 14 to 2, which is the thing the fix claims, and the stall and target
+  columns say nothing either way until it is re-run quiet. `bursty` is not a jitter row at all any
+  more: the profile paces about 0.42 Mbps against a 1.9 Mbps publisher, so it is a capacity cap four
+  times below the stream, and the row measures what the player does when the path cannot carry the
+  picture. Both are recorded in the matrix section as bench properties rather than as player
+  findings.
 - **The two cdn rows from the demo pages could not be run as written.** `https://cdn.moq.pro` with no
   path is what `demo/web` points at, and the public relay closes a session opened at its root, so
   both rows failed to start twice and are recorded that way. `cdn.moq.pro/demo` stands in on both
@@ -2591,9 +3129,8 @@ listed below, and it is the same follow-up as giving that package a `bun test` t
 ### The state of the branch
 
 `debug-findings-solution` on the fork `fperex/moq`, base `dev`, opened as draft pull request #3 there
-and nowhere else. The last change to the player itself is `35459ad52`; the commit above it is this
-document, and the cross-browser matrix that is still running will be another. An earlier state of
-the work is archived on `debug-findings-solution-wip-20260912`.
+and nowhere else. The last change to the code is `17ff71750`; the commit above it is this document.
+An earlier state of the work is archived on `debug-findings-solution-wip-20260912`.
 
 Two things that produced numbers above are deliberately not on the branch: the full run matrix the
 quiet re-measure wrote, and the bench driver scripts. Every number from the matrix that matters is
@@ -2631,9 +3168,10 @@ listening bench" and have a home proposed below.
   bench drivers count. `Video.Decoder`'s generation and the `DecoderTrack.failed` signal behind it
   are both private; a counter beside `video.out.skipped` would let a harness grade recovery rather
   than parse a log line.
-- **The publisher preview on the `MediaStreamTrackProcessor` polyfill path.** Finding 25: in
-  Playwright Firefox the frames arrive and the canvas never paints. Pre-existing, and worth pinning
-  down before anyone reads a Firefox self-publish row as a regression.
+- **The publisher preview on the `MediaStreamTrackProcessor` polyfill path.** Findings 25 and 29: in
+  Playwright Firefox the frames arrive, the canvas never paints, and the encoder sends about 67
+  bytes per frame, so the picture is blank on the wire as well as on the preview. Pre-existing, and
+  the reason no row on this branch says a Firefox publisher's video looks right to anybody.
 - **A `bun test` target for `test/audio-quality/clients/js`**, and the bench drivers folded in beside
   `driver.ts`, `safari.ts` and `webdriver.ts` while it happens. The grader, the beacon, the probe and
   the Safari lane are exercised only by running the harness end to end, which is why the six
@@ -2658,12 +3196,61 @@ listening bench" and have a home proposed below.
   impaired second lane is written as a patch and was deliberately not landed on top of a test file
   that does not build.
 
+The questions the afternoon's fixes leave for the maintainer, each with what it costs to answer the
+other way:
+
+- **How a tile should report that it is not downloading.** Finding 27. Off screen and playing look
+  the same from outside: `video.out.stalled` keeps its last value, there is no error, and the demo's
+  badge guesses. `renderer.out.visible` already carries the fact, so the page can join them.
+  Recommended: leave it to the page. The alternative is an explicit "not downloading, and why"
+  output on the decoder, which is a new public signal on a wide surface.
+- **The 60 s reconnect give-up default.** Finding 31. It moved from 10 s because the shipped client
+  could not survive the shipped relay's own graceful restart, and the relay drains for 10 s before
+  its process exits. It could instead be derived from the peer's drain deadline, or left at 10 s
+  with the three defects under it fixed and the restart simply lost. The number is the maintainer's;
+  the defects are fixed either way.
+- **The FFI default following the native one.** Finding 31, `17ff71750`. A binding caller who never
+  set `timeout_us` now gets 60 s. The alternative is to leave the bindings at 10 s and let their doc
+  stop claiming to mirror `moq_tokio::Backoff`, which is worse in a different way.
+- **The announce latch.** Finding 30. `announce="source"` now latches after the first live track and
+  holds until the selected source changes. That is a behaviour change to a published attribute: a
+  page that relied on an un-announce when every track stopped no longer gets one. The alternative
+  shapes are a debounce, which is a timeout standing in for a fact, and a separate
+  `announce="latched"` value, which is a second way to spell the sensible default.
+- **The 200 ms cap on the cross-track hold.** Finding 28. It is a judgement about what lip sync is
+  worth, taken from ITU-R BT.1359 with margin over the worst publisher offset measured here. A
+  deployment with a consistently later video path would want more, and a conferencing one might want
+  less. It is one constant in `js/watch/src/sync.ts` and it is documented at the site.
+- **A public rebuild counter on `video.out`**, which the bench drivers still get by counting a warn
+  line. Unchanged from below, and finding 27's question is the same surface.
+- **`#tryDurationSkip`'s warning on the happy path.** `js/hang/src/container/consumer.ts` prints
+  `skipping covered group` at `console.warn` every time a group is dropped because its successor has
+  already started, which after finding 26 is an ordinary event on any jittery path rather than a
+  fault. It belongs at debug, the way the relay's `Cancel` was moved in `20c6756eb`, and it was left
+  alone here only to keep that commit about the budget.
+- **The `Stall` monitor is a module singleton, and `stall.test.ts` knows it.**
+  `js/hang/src/container/stall.ts` keeps one `current` for the whole document, which is right for a
+  page and awkward for a suite: the acquire and release cases share one instance and depend on the
+  order they run in and on nothing else in the file holding a handle. A reset hook for tests, or an
+  injectable registry, would make them independent.
+- **The `bursty` shaper profile cannot test bunching at a realistic bitrate.** It paces about
+  0.42 Mbps, and a browser publisher on this bench sends about 1.9 Mbps, so the row is a capacity
+  cap rather than a jitter shape. Either the profile needs a wider window or the row needs a lower
+  publisher bitrate; as it stands it measures a different thing from the one it is named for.
+
 ### Open measurements
 
-- **The cross-browser resilience matrix is running as this is written.** Each engine as publisher and
-  as watcher, foreground and backgrounded, 720p30 through 1080p60, hide and show, mute and unmute, a
-  device change, an impaired path through `moq-shaper`, a relay restart mid-session and a 30 minute
-  run. Its rows are appended to this document when it finishes, and nothing above claims them.
+- **A quiet re-run of the `mild` shaper profile.** It is the one row whose before and after cannot be
+  compared: the re-run carried a third more traffic and double the queue on a machine the foreign
+  stream never left alone. Convictions fell from 14 to 2; nothing else in that row should be read
+  either way yet.
+- **Real Safari and Playwright WebKit as publishers.** Neither was run: Safari's camera prompt needs
+  a hand on the mouse and WebKit refuses the permission outright. Both ran as watchers and passed.
+  A real-Safari publisher row needs one click from a person and is worth having.
+- **One failing Rust test at the tip**, `moq-tokio::reconnect
+  a_peer_away_longer_than_a_relay_restart_is_reconnected_to`, which is written down in full under
+  "Gates on the final tree". It reproduces scoped as well as in the full run, the behaviour it
+  guards is bench-proven, and the test itself is open.
 - **The twenty-one `recorded` harness rows.** They print a breach and do not fail a run. What would
   move them is the nightly runner recording its own budgets on its own hardware; every ceiling in
   `budgets.json` today was measured on one desktop.
@@ -2700,15 +3287,18 @@ listening bench" and have a home proposed below.
 ### The listening state, plainly
 
 **Nothing on this tip has been heard.** The last listening round was on a build of `de641c6b5`, and
-it is the round that produced the nine reports findings 18 to 25 answer. Since then the eight commits
-of 2026-09-17 have landed: the arrival estimate kept across a mute (`b63519ba8`), the spinner
-(`9b2f794c9`), the ring fallback line (`48c9d5302`), the video track that stopped (`20c6756eb`), the
-live edge (`5a4ed9e21`), the busy camera (`ff4da0042`), the rendition's track staying open
-(`aba98fd21`) and the audio context on the gesture (`35459ad52`). None of them has been listened to,
-and the cross-browser matrix is still running, so every number in this document is an instrument
-reading. The bench above is what a listening round is run on: the relay, the plain page, the copied
-site page, one smooth `bbb.hang` publisher on the fixed recipe, and a browser publisher of the USB
-camera and microphone for the self-publish half.
+it is the round that produced the nine reports findings 18 to 25 answer. Sixteen commits have landed
+since. Eight in the morning, answering those nine reports: the arrival estimate kept across a mute
+(`b63519ba8`), the spinner (`9b2f794c9`), the ring fallback line (`48c9d5302`), the video track that
+stopped (`20c6756eb`), the live edge (`5a4ed9e21`), the busy camera (`ff4da0042`), the rendition's
+track staying open (`aba98fd21`) and the audio context on the gesture (`35459ad52`). Eight more
+after the matrix, answering what it found: the age budget (`e8d3cad3b`), the re-subscribe test
+(`cdb52f0aa`), the download gate (`317b59ec2`), the announce latch (`afbba9b1c`), the cross-track
+hold and its cap (`b1a1fbe01`, `7b6bdb6ec`), and the native reconnect in both the client and the
+bindings (`2b3191f94`, `17ff71750`). None of the sixteen has been listened to, so every number in
+this document is an instrument reading. The bench above is what a listening round is run on: the
+relay, the plain page, the copied site page, one smooth `bbb.hang` publisher on the fixed recipe,
+and a browser publisher of the USB camera and microphone for the self-publish half.
 
 ## Attribution and licensing
 
