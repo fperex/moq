@@ -1686,7 +1686,7 @@ class MoqBackoff {
     this.initialUs = 1000000,
     this.multiplier = 2,
     this.maxUs = 5000000,
-    this.timeoutUs = 10000000,
+    this.timeoutUs = 60000000,
   });
 }
 

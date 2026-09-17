@@ -250,7 +250,7 @@ mod tests {
 /// attempt, and caps at `max_us`. After `timeout_us` of consecutive failures the
 /// connection gives up for good (0 retries forever); the window resets whenever a
 /// session stays up past `initial_us`. The defaults mirror the native
-/// [`moq_tokio::Backoff`]: 1s, x2, 5s, and a 10s window.
+/// [`moq_tokio::Backoff`]: 1s, x2, 5s, and a 60s window.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MoqBackoff {
@@ -264,7 +264,7 @@ pub struct MoqBackoff {
 	#[uniffi(default = 5000000)]
 	pub max_us: u64,
 	/// Time spent retrying before giving up, in microseconds. 0 retries forever.
-	#[uniffi(default = 10000000)]
+	#[uniffi(default = 60000000)]
 	pub timeout_us: u64,
 }
 

@@ -40,7 +40,7 @@ type Backoff struct {
 	Initial    time.Duration // delay before the first retry (default 1s)
 	Multiplier uint32        // applied to the delay after each failure (default 2)
 	Max        time.Duration // ceiling on the delay (default 5s)
-	Timeout    time.Duration // give up after this long (default 10s)
+	Timeout    time.Duration // give up after this long (default 60s)
 }
 
 // RetryForever, passed as Backoff.Timeout, keeps a reconnecting session retrying
@@ -51,7 +51,7 @@ const (
 	defaultBackoffInitial    = time.Second
 	defaultBackoffMultiplier = 2
 	defaultBackoffMax        = 5 * time.Second
-	defaultBackoffTimeout    = 10 * time.Second
+	defaultBackoffTimeout    = 60 * time.Second
 )
 
 // ffi resolves the unset fields, which is load-bearing rather than cosmetic:
