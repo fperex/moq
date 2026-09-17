@@ -7,7 +7,7 @@ slices you want.
 
 Branch: [`fperex/moq` `debug-findings-solution`](https://github.com/fperex/moq/tree/debug-findings-solution),
 rebased onto `upstream/dev` at `877a561d8`, read at the branch tip (this docs commit sits on top of
-`5484970e1`, a CI change; the last change to the player itself is `d5886766f`). 81 commits.
+`de641c6b5`, which is the last change to the player itself). 85 commits plus the docs one, 165 files.
 Full write-up:
 [`debug-findings/REPORT.md`](https://github.com/fperex/moq/blob/debug-findings-solution/debug-findings/REPORT.md).
 
@@ -88,9 +88,10 @@ intact; everything in them except the estimator is kept.
 | the cold start, so a declaration is a prior the first measurement replaces | `aeaaf8908`, `0014daca9` (the budgets it moved), and the seed-replacement commit |
 | the unmute transient and the Safari unlock | `8700f1fcc` (a flushed ring reports no playhead), `b86b03c94` (the unlock is armed on the first gesture), `de641c6b5` (the context outlives a catalog update) |
 | the receiver stall (Firefox), found by watching two engines at once | `d5886766f` (the estimator takes a stalled input), `a8fe99aeb` (the recorded window replayed and graded) |
+| the browser publisher's catalog and its clock | `cb10a2a66` (a served catalog track is released when its last subscriber leaves), `eb4331877` (captured audio is stamped on the context clock) |
 | CodeRabbit fixes over the whole branch | `a8cbc93bb`, `97c7afb76`, `b85e57431`, `02f3f143a`, `f5087814b` |
 | CI, and the rebase onto the lease model | `2b9d492f0`, `5484970e1` (the nightly job), `8cabb3507` (the harness relay under `moq-auth`) |
-| review, flake and delivery | `fcce8af55`, `1af4609eb`, `928ec4abf`, `3f0e3221d`, `ec6d9761a`, `85583de68`, `3c9388e56`, `3dcea2ab4`, plus this one |
+| review, flake and delivery | `fcce8af55`, `1af4609eb`, `928ec4abf`, `3f0e3221d`, `ec6d9761a`, `85583de68`, `3c9388e56`, `3dcea2ab4`, `0b2e4cad7`, plus this one |
 
 If you only read seven: `76387d714`, `12e015af5`, `ce0d6d0ef`, `2f7c575a9`, `85d39db8e`,
 `c2d32a2db`, `e50230451`. The native half is the same algorithm again. The harness stands alone and
@@ -319,7 +320,7 @@ that is the honest answer rather than a better one.
 | aac, fixed-250, isolated | yes | 0 | 0 | 0.171 | 375 | 0 |
 | aac, fixed-250, plain | yes | 0 | 0 | 0.191 | 375 | 0 |
 
-The run at the branch tip passed all 36 enforced checks and breached 17 recorded ceilings, with one
+The run at `5484970e1` passed all 36 enforced checks and breached 17 recorded ceilings, with one
 recorded row voided on the clock guard (`AudioContext.currentTime` drifting 4.92 percent from wall
 clock over 10 s). Ten of the seventeen are a hard zero breached by a single underrun episode at
 1.1 a minute, which is what the recording rule produces when both recorded runs happened to measure
@@ -363,9 +364,9 @@ and `opus-step-plain` are both `recorded` rows and both are in the residual list
 
 ### Gates
 
-Two passes, each stated with the tip it ran on.
+Three passes, each stated with the tip it ran on.
 
-At `3dcea2ab4`, nine commits below the tip:
+At `3dcea2ab4`, thirteen commits below the tip:
 
 | Gate | Exit | What it covered |
 | --- | ---: | --- |
@@ -378,7 +379,7 @@ At `3dcea2ab4`, nine commits below the tip:
 | privacy grep over the branch's added lines | 0 hits | No home path, name, address, token or session id |
 | CodeRabbit CLI, per directory | 22 findings | 18 fixed, 4 rejected |
 
-At the tip `5484970e1`:
+At `5484970e1`, four commits below the tip:
 
 | Gate | Exit | What it covered |
 | --- | ---: | --- |
@@ -389,10 +390,26 @@ At the tip `5484970e1`:
 | `just test audio-quality --runtime replay --enforce` | 0 | 12 rows, 148 enforced checks, 0 void |
 | `just test audio-quality --enforce` | 0 | 24 Chromium rows at 60 s, 36 enforced checks, 0 enforced breaches |
 
-`check-all`, `test all` and `smoke-full` were last run nine commits below the tip. Those nine commits
-touch `js/watch`, `js/hang`, `js/publish`, `rs/moq-shaper`, `rs/moq-audio`, the harness and the
-nightly workflow, all of which the scoped `check` and `test` at the tip cover; what is not re-run is
-the rest of the workspace, which they do not touch, and the interop lane.
+At the tip `de641c6b5`, 85 commits above `upstream/dev`, after the publisher catalog release, the
+capture clock and the audio context fixes:
+
+| Gate | Exit | What it covered |
+| --- | ---: | --- |
+| `just fix upstream/dev` | 0 | No tracked change beyond the three delivery documents |
+| `just check upstream/dev` | 0 | Every package the branch touches, scoped as CI scopes it |
+| `just test default upstream/dev` | 0 | 4573 Rust tests (8 skipped), 1965 Bun tests across fifteen packages, 63 Python |
+| `just test audio-quality --runtime replay --enforce` | 0 | 12 rows, 148 enforced checks, 0 void |
+| `bun test` in `js/publish` | 0 | 141 tests across 20 files |
+| `bun test` in `js/watch` | 0 | 366 tests across 31 files |
+
+The Chromium matrix was not re-run at the tip: the three fixes above `5484970e1` are one `js/watch`
+effect and two `js/publish` capture changes, and the matrix has no browser publisher in it, so no
+row's inputs moved. The replay lane, which does cover the player, is re-run above and is clean.
+
+`check-all`, `test all` and `smoke-full` were last run thirteen commits below the tip. Those thirteen
+commits touch `js/watch`, `js/hang`, `js/publish`, `rs/moq-shaper`, `rs/moq-audio`, the harness, the
+nightly workflow and the delivery documents, all of which the scoped `check` and `test` at the tip
+cover; what is not re-run is the rest of the workspace, which they do not touch, and the interop lane.
 
 ### Where I departed from the quests
 
