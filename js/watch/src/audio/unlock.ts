@@ -3,18 +3,19 @@ import { type Effect, type Getter, Signal } from "@moq/signals";
 /**
  * Resume a suspended {@link AudioContext} from a real user gesture.
  *
- * Takes the context as a getter rather than a context, because the gesture that unlocks it usually
- * happens before it exists: the graph is built when the catalog names an audio rendition, which on a
+ * Takes the context as a getter rather than a context, because the gesture that unlocks it can
+ * happen before it exists: the graph is built when the catalog names an audio rendition, which on a
  * slow-starting broadcast is seconds after the click that started playback. Listeners armed with the
  * context would miss that click, and the viewer would have to click a second time to hear anything.
- * Armed here from the moment audio is enabled, the first gesture anywhere on the page counts.
+ * Armed for the caller's lifetime instead, the first gesture anywhere on the page counts.
  *
- * Arming early is enough because the activation belongs to the page, not to a particular context: a
- * context built seconds after the click still starts. Building one inside the handler instead was
- * measured and rejected, since one activation starts one context, and a graph rebuilt at the rate the
- * decoder turns out to emit would then be born locked with the activation already spent.
+ * Arm it before anything can be clicked, not as a consequence of the click. WebKit does start a
+ * context resumed outside a handler, but only while the page's activation is still live, which is a
+ * few seconds; past that the context stays suspended for good and nothing is ever rendered. So a
+ * gesture is only reliably spent on the context that exists when it lands, which is also why the
+ * caller keeps that context rather than rebuilding the graph around it.
  *
- * So this attempts `resume()` whenever the context is not running (for autoplay-permissive browsers
+ * This attempts `resume()` whenever the context is not running (for autoplay-permissive browsers
  * like Chrome with prior engagement, and for a page that has already had its gesture), and again on
  * every `pointerdown`/`keydown` until the context is actually running. A single unconditional attempt
  * would fire once, be rejected, and never retry, leaving audio silent. `pointerdown` and `keydown`
@@ -27,6 +28,10 @@ import { type Effect, type Getter, Signal } from "@moq/signals";
  * Scoped to `effect`: the listeners are removed when the effect reruns or closes.
  */
 export function unlockOnGesture(effect: Effect, context: Getter<AudioContext | undefined>): void {
+	// Nothing to arm where there is no document (server rendering, a test runner): no gestures reach
+	// this build, and no audio plays out of it either.
+	if (typeof document === "undefined") return;
+
 	// Armed before anything reads the context, so a gesture is never lost to the order these run in.
 	effect.event(document, "pointerdown", () => resume(context.peek()));
 	effect.event(document, "keydown", () => resume(context.peek()));
