@@ -398,9 +398,7 @@ export class Publisher {
 			}
 
 			console.debug(`publish done: broadcast=${name} track=${track.name}`);
-			if (publishError) {
-				console.warn(`publish error: broadcast=${name} track=${track.name} error=${reason(publishError)}`);
-			}
+			if (publishError) publishFailed(name, track.name, publishError);
 
 			// PUBLISH_DONE is required for every supported draft. The peer may have already
 			// closed its side to unsubscribe, in which case there is nowhere to send it.
@@ -426,7 +424,7 @@ export class Publisher {
 			stream.close();
 		} catch (err: unknown) {
 			const e = error(err);
-			console.warn(`publish error: broadcast=${name} track=${track.name} error=${reason(e)}`);
+			publishFailed(name, track.name, e);
 			stream.abort(e);
 		} finally {
 			track.close();
@@ -1319,4 +1317,13 @@ function fillRange(fill: Filter.Fill, subscription: Filter.Filter, largest?: Loc
 		skip: start.object,
 		until: end.object === undefined ? undefined : end.object + 1n,
 	};
+}
+
+// Report a subscription that ended badly. A subscriber leaving resets the stream with Cancel, which
+// is the normal end of a subscription rather than a fault: logging it as a warning trains people to
+// ignore the line that does mean something.
+function publishFailed(broadcast: string, track: string, err: Error): void {
+	const line = `publish error: broadcast=${broadcast} track=${track} error=${reason(err)}`;
+	if (err instanceof StreamError && err.code === StreamCode.Cancel) console.debug(line);
+	else console.warn(line);
 }

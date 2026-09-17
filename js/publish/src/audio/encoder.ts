@@ -399,7 +399,14 @@ export class Encoder {
 						}));
 
 						const producer = track.peek();
-						if (!producer) return;
+						if (!producer) {
+							// Demand went away between framing and encoding, so this chunk is
+							// dropped like the ones the gate below never framed. Either way the
+							// timeline now has a hole in it. See that gate for why it has to be
+							// declared.
+							this.#paused = true;
+							return;
+						}
 
 						if (this.#paused) {
 							// The last run declared where the timeline stopped, which trims
@@ -466,7 +473,16 @@ export class Encoder {
 						for (const data of framer.push(input)) {
 							// The demand gate. The framer still consumes every sample so its timestamps stay
 							// on the capture clock, but there is nowhere to send a chunk with no subscriber.
-							if (!track.peek()) continue;
+							if (!track.peek()) {
+								// The gap this leaves is a real break in the timeline, not a pause in
+								// delivery. Without declaring it, the first frame after the gate
+								// reopens reads as continuing the last one, and a subscriber holds it
+								// at the old anchor: its playhead ends up the whole gated interval
+								// behind. It is the same break a mute already declares below, and the
+								// pipeline outlives any one subscription, so nothing else notices.
+								this.#paused = true;
+								continue;
+							}
 
 							const joinedLength = data.channels.reduce((total, channel) => total + channel.length, 0);
 							const joined = new Float32Array(joinedLength);
