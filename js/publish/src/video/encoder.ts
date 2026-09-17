@@ -238,7 +238,12 @@ export class Encoder {
 		this.#lastCaptureWall = performance.now();
 
 		const producer = new Container.Legacy.Producer(track, new Container.Legacy.Format("video"));
-		effect.cleanup(() => producer.close());
+		// Stopping (hidden, capture gone, reconfigured) ends the group, not the track: closing the
+		// track FINs the subscription, which a peer reads as the track being over for good, so
+		// every later subscription completes the moment it starts while the catalog still
+		// advertises the rendition. The Broadcast owns the producer and closes it when the
+		// rendition is superseded or unregistered; the audio encoder stops the same way.
+		effect.cleanup(() => producer.cut());
 
 		let lastKeyframe: Time.Micro | undefined;
 		let pacingRate: number | undefined;
