@@ -646,7 +646,13 @@ export class Publisher {
 			await Promise.all([datagrams, controls.decoding]);
 		} catch (err: unknown) {
 			const e = error(err);
-			console.warn(`publish error: broadcast=${msg.broadcast} track=${track.name} error=${reason(e)}`);
+			// A subscriber leaving resets the stream with Cancel, which is the normal end of a
+			// subscription rather than a fault: logging it as a warning trains people to ignore the
+			// line that does mean something.
+			const routine = e instanceof StreamError && e.code === StreamCode.Cancel;
+			const line = `publish error: broadcast=${msg.broadcast} track=${track.name} error=${reason(e)}`;
+			if (routine) console.debug(line);
+			else console.warn(line);
 			track.close(e);
 			stream.abort(e);
 			await Promise.all([datagrams, controls?.decoding]);

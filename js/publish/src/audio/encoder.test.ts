@@ -115,10 +115,10 @@ async function settle() {
 }
 
 describe("a rendition that stops encoding", () => {
-	async function encoding() {
-		const written: Array<{ payload: Uint8Array }> = [];
-		const groups: Array<{ frames: number }> = [];
-		const track = {
+	// A stand-in for the track producer a subscription hands the rendition, recording what it is
+	// asked to publish.
+	function trackOf(written: Array<{ payload: Uint8Array }>, groups: Array<{ frames: number }>) {
+		return {
 			writeFrame: (frame: { payload: Uint8Array }) => written.push(frame),
 			// An empty group is how a publisher declares a break in the timeline.
 			appendGroup: () => {
@@ -127,7 +127,13 @@ describe("a rendition that stops encoding", () => {
 				return { close: () => {} };
 			},
 		};
-		const rendition = { config: new Signal(undefined), track: new Signal(track), close: () => {} };
+	}
+
+	async function encoding() {
+		const written: Array<{ payload: Uint8Array }> = [];
+		const groups: Array<{ frames: number }> = [];
+		const track = trackOf(written, groups);
+		const rendition = { config: new Signal(undefined), track: new Signal<unknown>(track), close: () => {} };
 		const capture = {
 			in: { source: new Signal(undefined) },
 			out: {
@@ -144,7 +150,7 @@ describe("a rendition that stops encoding", () => {
 		});
 
 		await settle();
-		return { encoder, enabled, capture, written, groups };
+		return { encoder, enabled, capture, rendition, written, groups };
 	}
 
 	test("declares where the timeline stops when it is muted", async () => {
@@ -207,6 +213,40 @@ describe("a rendition that stops encoding", () => {
 			enabled.set(false);
 			await settle();
 			expect(written).toHaveLength(0);
+		} finally {
+			encoder.close();
+		}
+	});
+
+	test("declares the break after an interval with no subscriber", async () => {
+		using _codecs = installFakeAudioCodecs();
+		const { encoder, rendition, written, groups } = await encoding();
+
+		try {
+			FakeAudioEncoder.last?.output(chunk(0, 20_000));
+			expect(written).toHaveLength(1);
+
+			// The last subscriber leaves. The pipeline deliberately outlives any one subscription, so
+			// nothing tears down and nothing writes an endpoint: the frames encoded meanwhile are
+			// simply dropped, leaving a hole in the timeline.
+			rendition.track.set(undefined);
+			await settle();
+			FakeAudioEncoder.last?.output(chunk(20_000, 20_000));
+			expect(written).toHaveLength(1);
+			expect(groups).toHaveLength(0);
+
+			// A new subscriber arrives. Its first frame has to declare the break: without it the
+			// frame reads as continuing the last one, and the subscriber holds it at the old anchor
+			// with its playhead the whole gated interval behind.
+			rendition.track.set(trackOf(written, groups));
+			await settle();
+			FakeAudioEncoder.last?.output(chunk(40_000_000, 20_000));
+			expect(groups).toHaveLength(1);
+			expect(written).toHaveLength(2);
+
+			// And only once: the timeline is open again.
+			FakeAudioEncoder.last?.output(chunk(40_020_000, 20_000));
+			expect(groups).toHaveLength(1);
 		} finally {
 			encoder.close();
 		}

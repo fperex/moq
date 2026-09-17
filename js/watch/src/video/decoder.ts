@@ -31,6 +31,28 @@ import type { Source } from "./source";
 // The amount of time to wait before considering the video to be buffering.
 const BUFFERING = Time.Milli(500);
 
+// How long the picture may sit frozen before the track is rebuilt from scratch.
+//
+// The 500ms watchdog above only labels the stall; nothing acts on it, so a subscription that stops
+// producing leaves the tile frozen for as long as the viewer is willing to look at it. Long enough
+// that an ordinary keyframe wait (a 2s GOP, plus the flush the publisher declares) never trips it,
+// short enough that a viewer does not sit through it twice.
+const RECOVER = Time.Milli(5_000);
+
+// The ceiling the recovery window backs off to when rebuilding does not help.
+//
+// A publisher that advertises a video rendition and sends nothing would otherwise be re-subscribed
+// every RECOVER for as long as the tab is open. Backing off keeps a hopeless case cheap without
+// giving up on it; the window resets the moment a picture lands.
+const RECOVER_MAX = Time.Milli(60_000);
+
+// How long to wait before rebuilding a track whose codec errored.
+//
+// Not zero: a config the hardware refuses fails again the moment it is configured, and rebuilding
+// within the same tick would spin. This is the floor on that retry, not a delay anything healthy
+// pays.
+const RETRY = Time.Milli(1_000);
+
 export type DecoderInput = {
 	/** Whether to download the video track. Defaults to true; the parent may wire it from the renderer's output. */
 	enabled: Getter<boolean>;
@@ -105,6 +127,17 @@ export class Decoder {
 	#pendingJitter = new Signal<Time.Milli | undefined>(undefined);
 	readonly #identity: Computed<PlaybackIdentity | undefined>;
 
+	// Bumped to rebuild the track without anything else about the rendition changing: a codec that
+	// errored, or a picture that stayed frozen past RECOVER. `#runPending` reads it, so a bump tears
+	// the old subscription down and opens a new one at the live edge.
+	#generation = new Signal(0);
+
+	// How long the next stall is given before the track is rebuilt. Doubles on each rebuild that
+	// does not produce a picture, and resets as soon as one lands. A plain field: `#runRecover`
+	// re-runs on the stall, and making the backoff itself reactive would re-arm the timer it just
+	// set.
+	#recover = RECOVER;
+
 	#signals = new Effect();
 
 	#clearCurrentFrame(): void {
@@ -132,6 +165,19 @@ export class Decoder {
 		this.#signals.run(this.#runActive.bind(this));
 		this.#signals.run(this.#runDisplay.bind(this));
 		this.#signals.run(this.#runBuffering.bind(this));
+		this.#signals.run(this.#runRecover.bind(this));
+	}
+
+	// Rebuild the active track: drop it, then bump the generation so `#runPending` opens a fresh
+	// subscription. The held frame stays on screen, so the tile keeps its last picture instead of
+	// flashing empty while the new keyframe is fetched.
+	//
+	// Dropping `#active` first is load-bearing: `#runPending` holds a replacement back until it has
+	// caught up with the picture it replaces, and a track that is already dead never gets there.
+	#rebuild(reason: string): void {
+		console.warn(`video: rebuilding the track: ${reason}`);
+		this.#active.set(undefined);
+		this.#generation.update((generation) => generation + 1);
 	}
 
 	#runJitter(effect: Effect): void {
@@ -141,6 +187,9 @@ export class Decoder {
 	}
 
 	#runPending(effect: Effect): void {
+		// A bump rebuilds the track even though nothing about the rendition changed. See `#rebuild`.
+		effect.get(this.#generation);
+
 		const values = effect.getAll([
 			this.in.enabled,
 			this.source.in.broadcast,
@@ -177,6 +226,21 @@ export class Decoder {
 		effect.set(this.#pendingJitter, pending.jitter);
 
 		effect.cleanup(() => pending?.close());
+
+		// A codec error tears the track's own effect down, subscription included, and leaves
+		// `#active` pointing at the corpse, so nothing below ever rebuilds: the relay sees the
+		// subscription cancelled and never sees another, and the tile stalls for good while audio
+		// keeps playing. Watch the track for it here instead, through promotion (the reference
+		// outlives `pending`, which is cleared once it is promoted).
+		const built = pending;
+		effect.run((inner) => {
+			const failed = inner.get(built.failed);
+			if (!failed) return;
+
+			// Rebuild after a beat: a config the hardware refuses fails again on configure, and an
+			// immediate retry would spin within the tick.
+			inner.timer(() => this.#rebuild(`decoder error: ${failed.message}`), RETRY);
+		});
 
 		effect.run((effect) => {
 			if (!pending) return;
@@ -258,10 +322,29 @@ export class Decoder {
 		}
 
 		this.#out.stalled.set(false);
+		// A picture landed, so whatever the last stall was, it is over and the next one starts from
+		// the full window again.
+		this.#recover = RECOVER;
 
 		effect.timer(() => {
 			this.#out.stalled.set(true);
 		}, BUFFERING);
+	}
+
+	// Act on a stall that lasts. `#runBuffering` only labels one, which left a subscription that
+	// stopped producing frozen for as long as the viewer kept looking at it. Only a track we
+	// believe is playing is worth replacing: with nothing active there is no subscription to
+	// rebuild, and `#runPending` is already the thing waiting for the broadcast to come back.
+	#runRecover(effect: Effect): void {
+		if (!effect.get(this.in.enabled)) return;
+		if (!effect.get(this.#active)) return;
+		if (!effect.get(this.#out.stalled)) return;
+
+		const after = this.#recover;
+		effect.timer(() => {
+			this.#recover = Time.Milli(Math.min(RECOVER_MAX, after * 2));
+			this.#rebuild(`no frame for ${after}ms`);
+		}, after);
 	}
 
 	close() {
@@ -302,6 +385,14 @@ class DecoderTrack {
 
 	// Groups this track lost to the age budget or a transport that gave up.
 	skipped = new Signal<number>(0);
+
+	/**
+	 * Why this track stopped producing frames for good, once it has.
+	 *
+	 * A codec error ends the decode loop and the subscription with it, which no amount of waiting
+	 * undoes. The parent {@link Decoder} watches this and builds a replacement.
+	 */
+	readonly failed = new Signal<Error | undefined>(undefined);
 
 	// Decoded frames waiting to be rendered.
 	#buffered = new Signal<Container.BufferedRanges>([]);
@@ -381,9 +472,10 @@ class DecoderTrack {
 					frame.close();
 				}
 			},
-			// TODO bubble up error
 			error: (error) => {
-				console.error("video decoder error", error);
+				// Record it before tearing down: closing the effect ends the decode loop and the
+				// subscription, so the parent's rebuild is the only way this track comes back.
+				this.failed.set(error);
 				effect.close();
 			},
 		});
@@ -436,6 +528,8 @@ class DecoderTrack {
 		});
 
 		let previous: Time.Micro | undefined;
+		// Nothing has been decoded yet, so the first thing fed to the codec has to be a keyframe.
+		let keyframeNeeded = true;
 
 		effect.spawn(async () => {
 			for (;;) {
@@ -443,10 +537,27 @@ class DecoderTrack {
 				if (!next) break;
 
 				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
-				if (this.#onDiscontinuity(next.discontinuity)) previous = undefined;
+				if (this.#onDiscontinuity(next.discontinuity)) {
+					previous = undefined;
+					keyframeNeeded = true;
+				}
 
 				const { frame } = next;
 				if (!frame) continue; // The group is done
+
+				if (!next.continuous) keyframeNeeded = true;
+				if (keyframeNeeded) {
+					// A hole in delivery (the age budget skipped a group, the transport gave up on
+					// one) leaves the frames after it referring to pictures that were never decoded.
+					// A delta fed across that hole is garbage at best, and at worst a decoder error
+					// that ends this track's decode loop and its subscription for good. Wait for the
+					// keyframe that makes the stream decodable again.
+					if (!frame.keyframe) {
+						previous = undefined;
+						continue;
+					}
+					keyframeNeeded = false;
+				}
 
 				// Mark that we received this frame right now.
 				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
@@ -520,6 +631,8 @@ class DecoderTrack {
 		});
 
 		let previous: Time.Micro | undefined;
+		// See `#runLegacy`: nothing has been decoded yet, so the codec needs a keyframe first.
+		let keyframeNeeded = true;
 
 		effect.spawn(async () => {
 			for (;;) {
@@ -527,10 +640,23 @@ class DecoderTrack {
 				if (!next) break;
 
 				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
-				if (this.#onDiscontinuity(next.discontinuity)) previous = undefined;
+				if (this.#onDiscontinuity(next.discontinuity)) {
+					previous = undefined;
+					keyframeNeeded = true;
+				}
 
 				const { frame } = next;
 				if (!frame) continue;
+
+				// A hole in delivery makes every following delta undecodable. See `#runLegacy`.
+				if (!next.continuous) keyframeNeeded = true;
+				if (keyframeNeeded) {
+					if (!frame.keyframe) {
+						previous = undefined;
+						continue;
+					}
+					keyframeNeeded = false;
+				}
 
 				// Mark that we received this frame right now.
 				const timestamp = Time.Milli.fromMicro(frame.timestamp);
