@@ -263,9 +263,19 @@ test("unmuting continues the arrival estimate rather than starting over at the d
 	await flush();
 	expect(built.out.spread.peek()).toBe(measured);
 
+	// The publisher keeps going while nobody is listening, so by the time the download comes back
+	// the track is holding far more media than the age budget allows anyone to play.
+	for (let i = 0; i < 20; i++) writeGroup(track, 3 + i, 60_000 + i * 20_000);
+	await flush();
+
 	enabled.set(true);
 	await flush();
 	expect(built.out.spread.peek()).toBe(measured);
+
+	// The replacement subscription starts at the live edge, so there is no stale backlog for the
+	// age budget to convict. Replaying it is the `skipping slow group: track=audio` a viewer sees
+	// on every unmute.
+	expect(built.out.skipped.peek()).toBe(0);
 
 	close();
 	producer.close();
