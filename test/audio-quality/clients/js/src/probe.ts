@@ -165,8 +165,9 @@ export function probe(watch: MoqWatch): Probe {
 			spread: num(audio.spread),
 			buffered: ranges.length > 0 ? buffered : undefined,
 			skipped: num(audio.skipped),
-			// TODO: `audio.out.debug()` (short, silent, and discarded quanta) does not exist yet, so
-			// those three metrics stay null in every summary until stage 5 adds it.
+			// `audio.out.debug` carries the ring's own short, discarded and stretch counters. This
+			// probe does not read it, so those metrics are null on the browser lanes and filled only
+			// by the replay lane, which drives the engine directly.
 			stats: maybe(() => audio.stats.peek()) as Record<string, unknown> | undefined,
 
 			delay: num(sync.delay),

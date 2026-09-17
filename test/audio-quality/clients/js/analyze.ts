@@ -279,7 +279,7 @@ const underruns = rise(underrunCounts);
 
 // Groups that lost content above the decoder, from the container consumer's own counter. It cannot
 // say why: the local age budget skipping a group and the transport giving up on one land in the same
-// number, which is why `budget_aborts` stays null rather than being read off this.
+// number, so `budget_aborts` stays null rather than being read off this.
 const skippedGroups = rise(window.map((s) => s.skipped));
 
 // An episode is a maximal run of consecutive samples in which that counter was still rising: one
