@@ -40,8 +40,10 @@ re-run, and findings 26 to 31 are what came out. Ten of those rows have since be
 machine with nothing else on it, and that run is the last table in the Evidence section. What is
 still open is listed under "Open items and follow-ups": real Safari and Playwright WebKit as
 publishers, the 30 minute long run on a quiet machine, and the maintainer questions each fix left
-behind. **The user's listening round on this tip has not happened yet**, so every number below is an
-instrument reading.
+behind. **The user listened at this tip on 2026-09-17 and reported it clean**: no stutter, no spinner
+on an unmute, video and audio together, and hide and show and self-publish working, on both served
+pages with a real microphone and camera. That is one listener, one machine and one session, so the
+measured rows below are the evidence and the ear is the confirmation.
 
 **Contents**
 
@@ -2969,6 +2971,9 @@ than discarded, so the band is not evaluated on the instantaneous level the ques
   two engines, hide and show, and a relay restart. Every resilience target is met in every row, and
   the four rows that still read FAIL fail against the grader's single envelope rather than against
   the player. Its table is the last one in the Evidence section.
+- **A listening round by the user at this tip**, on 2026-09-17, on the bench's own pages with a real
+  microphone and camera and a headset, which reported it clean. Nothing was recorded from it, so it
+  confirms the rows above rather than adding a number to them.
 
 ### Gates on the final tree
 
@@ -3138,12 +3143,13 @@ ceiling, and every residual is in "The enforced budgets" above.
   outright, so an `auto` row is on its measured target within a second. `budgets.json` was
   re-recorded against that in `ce2e13112`, and the rows still disagree with themselves: three clear
   the test now where ten did before, which is the honest answer rather than a better one.
-- **The user's listening round on this tip has not happened.** The user listened on a build of
-  `de641c6b5` and reported the nine things findings 18 to 25 answer. Nothing since has been heard:
-  not the eight commits that answered those nine reports, and not the eight above them that answer
-  the matrix. Every number in this document is an instrument reading. The pages served on the bench,
-  the plain one on 4400 and the copied site on 4402, are built from the code tip, so a listening
-  round runs the tip rather than an older build.
+- **The listening round at this tip has happened, and it is one listener.** On 2026-09-17 the user
+  listened and watched on the bench built from the code tip, in their own browser with a headset, a
+  real microphone and a real camera, on both served pages: the plain one on 4400 and the copied site
+  on 4402. Everything was reported fine: no stutter, no spinner on an unmute, video and audio
+  together, and hide and show and self-publish working. It is one listener, one machine and one
+  session, and nothing was recorded from it, so it confirms the measured rows rather than replacing
+  them; every number in this document is still an instrument reading.
 - **The cross-browser resilience matrix has run**, and what it did not cover is named rather than
   implied: real Safari as a *publisher* (its camera prompt needs a hand on the mouse), Playwright
   WebKit as a publisher (it refuses the `getUserMedia` permission outright), and the self-publish,
@@ -3489,21 +3495,27 @@ other way:
 
 ### The listening state, plainly
 
-**Nothing on this tip has been heard.** The last listening round was on a build of `de641c6b5`, and
-it is the round that produced the nine reports findings 18 to 25 answer. Sixteen commits have landed
-since. Eight in the morning, answering those nine reports: the arrival estimate kept across a mute
+**This tip has been heard.** On 2026-09-17 the user listened and watched on the bench built from the
+code tip, in their own browser with a headset, a real microphone and a real camera, on the plain page
+on 4400 and on the copied site page on 4402, and reported everything fine: no stutter, no spinner on
+an unmute, video and audio together, and hide and show and self-publish working.
+
+That round is the first to reach the sixteen commits above the previous one. Eight in the morning,
+answering the nine reports findings 18 to 25 come from: the arrival estimate kept across a mute
 (`b63519ba8`), the spinner (`9b2f794c9`), the ring fallback line (`48c9d5302`), the video track that
 stopped (`20c6756eb`), the live edge (`5a4ed9e21`), the busy camera (`ff4da0042`), the rendition's
 track staying open (`aba98fd21`) and the audio context on the gesture (`35459ad52`). Eight more
 after the matrix, answering what it found: the age budget (`e8d3cad3b`), the re-subscribe test
 (`cdb52f0aa`), the download gate (`317b59ec2`), the announce latch (`afbba9b1c`), the cross-track
 hold and its cap (`b1a1fbe01`, `7b6bdb6ec`), and the native reconnect in both the client and the
-bindings (`2b3191f94`, `17ff71750`). None of the sixteen has been listened to, and the commit above
-them, `27d68bb14`, is a test fix that changes nothing audible, so every number in
-this document is an instrument reading. Both served pages are built from the code tip, so a
-listening round runs it. The bench above is what a listening round is run on: the
-relay, the plain page, the copied site page, one smooth `bbb.hang` publisher on the fixed recipe,
-and a browser publisher of the USB camera and microphone for the self-publish half.
+bindings (`2b3191f94`, `17ff71750`); the commit above them, `27d68bb14`, is a test fix that changes
+nothing audible.
+
+It is one listener, one machine and one session, and nothing was recorded from it, so every number in
+this document is still an instrument reading: the measured rows are the evidence and the ear is the
+confirmation. The bench above is what the round was run on: the relay, the plain page, the copied
+site page, one smooth `bbb.hang` publisher on the fixed recipe, and a browser publisher of the USB
+camera and microphone for the self-publish half.
 
 ## Attribution and licensing
 
