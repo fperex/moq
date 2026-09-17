@@ -9,12 +9,14 @@ export function bufferingIndicator(parent: Effect, watch: MoqWatch): HTMLElement
 	container.appendChild(spinner);
 
 	parent.run((effect) => {
-		// Audio re-buffers on its own once the ring runs dry, which is just as much a stall as a
-		// video one. Gate it on audio actually being downloaded: the ring reports stalled from
-		// construction and drains once the download stops, so a video-only broadcast or a muted
-		// player would otherwise show the spinner forever.
+		// Only what the viewer would call an interruption. Audio re-buffering once the ring has run
+		// dry is just as much a stall as a video one, but the fill a cold start or an unmute costs
+		// interrupts nothing: it is playback arriving, over video that never stopped painting.
+		// Gate it on audio actually being downloaded, since a video-only broadcast has no ring to
+		// speak for it.
 		const audio = effect.get(watch.audio.in.enabled) && effect.get(watch.audio.source.out.config) !== undefined;
-		const buffering = effect.get(watch.video.out.stalled) || (audio && effect.get(watch.audio.out.stalled));
+		const video = effect.get(watch.video.out.stalled) && !effect.get(watch.controls.paused);
+		const buffering = video || (audio && effect.get(watch.audio.out.interrupted));
 		const offline = effect.get(watch.broadcast.out.status) === "offline";
 		const unsupported = effect.get(watch.video.source.out.error) === "unsupported";
 		container.style.display = buffering && !offline && !unsupported ? "" : "none";
