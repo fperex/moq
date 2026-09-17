@@ -89,8 +89,8 @@ type DecoderOutput = {
 	// Combined buffered ranges (network jitter + decode buffer)
 	buffered: Signal<Container.BufferedRanges>;
 
-	// How late audio frames arrive relative to the earliest one, measured by the container
-	// consumer. Wired into Sync by the parent, which sizes the "auto" delay from it.
+	// How late audio frames arrive relative to the earliest one, measured for as long as the
+	// rendition lasts. Wired into Sync by the parent, which sizes the "auto" delay from it.
 	spread: Signal<Time.Milli | undefined>;
 
 	/**
@@ -226,7 +226,7 @@ export class Decoder {
 		this.#signals.run(this.#runClock.bind(this));
 		this.#signals.run(this.#runLatency.bind(this));
 		this.#signals.run(this.#runLatencyReanchor.bind(this));
-		this.#signals.run(this.#runDecoder.bind(this));
+		this.#signals.run(this.#runSpread.bind(this));
 	}
 
 	/**
@@ -432,7 +432,40 @@ export class Decoder {
 		}, LATENCY_REANCHOR_DEBOUNCE_MS);
 	}
 
-	#runDecoder(effect: Effect): void {
+	/**
+	 * Measure how late frames arrive, for as long as the rendition lasts.
+	 *
+	 * One estimator per rendition rather than per subscription. Muting stops the download and the
+	 * container consumer goes with it, but what the path was measured at did not change while
+	 * nobody was reading it: a replacement consumer continues this measurement instead of starting
+	 * over at the publisher's declaration, which is a prior the estimator has already improved on.
+	 * Starting over costs the viewer the difference as a cold fill on every unmute, which is the
+	 * declared span plus a chunk of parked playhead. NetEq keeps its delay manager across a pause
+	 * for the same reason (`modules/audio_coding/neteq/delay_manager.cc`).
+	 *
+	 * The declaration seeds it again when the rendition itself changes, since that is a different
+	 * path with a different publisher's claim about it.
+	 */
+	#runSpread(effect: Effect): void {
+		const identity = effect.get(this.#identity);
+		if (!identity) return;
+
+		const spread = new Container.Jitter({ start: effect.get(this.source.out.jitter) });
+
+		// Published for as long as the estimator lives, not for as long as a subscription does. A
+		// mute would otherwise drop what Sync knows about this track and hand it back a moment
+		// later, which reads as the delay collapsing and then deepening: Sync re-derives its
+		// reference, and the decoder parks the playhead a second time to rebuild a cushion it
+		// never actually lost. Cleared when the rendition goes, so a departed track stops holding
+		// the buffer open.
+		effect.run((inner) => this.#out.spread.set(inner.get(spread.value)));
+		effect.cleanup(() => this.#out.spread.set(undefined));
+
+		// Nested, so the subscription can come and go (mute, reconnect) under one estimator.
+		effect.run((inner) => this.#runDecoder(inner, identity, spread));
+	}
+
+	#runDecoder(effect: Effect, identity: PlaybackIdentity, spread: Container.Jitter): void {
 		const enabled = effect.get(this.in.enabled);
 		if (!enabled) return;
 		if (effect.get(this.sync.in.delay) === "instant") return;
@@ -442,9 +475,6 @@ export class Decoder {
 
 		const track = effect.get(this.source.out.track);
 		if (!track) return;
-
-		const identity = effect.get(this.#identity);
-		if (!identity) return;
 
 		const config = identity.decoder;
 
@@ -469,13 +499,18 @@ export class Decoder {
 		if (!sub) return;
 
 		if (config.container.kind === "cmaf") {
-			this.#runCmafDecoder(effect, sub, config);
+			this.#runCmafDecoder(effect, sub, config, spread);
 		} else {
-			this.#runLegacyDecoder(effect, sub, config);
+			this.#runLegacyDecoder(effect, sub, config, spread);
 		}
 	}
 
-	#runLegacyDecoder(effect: Effect, sub: Moq.Track.Subscriber, config: DecoderConfig): void {
+	#runLegacyDecoder(
+		effect: Effect,
+		sub: Moq.Track.Subscriber,
+		config: DecoderConfig,
+		spread: Container.Jitter,
+	): void {
 		const preSkip =
 			config.codec === "opus" && config.description ? Util.Opus.preSkip(Util.Hex.toBytes(config.description)) : 0;
 		this.#terminal.clear(preSkip);
@@ -486,8 +521,8 @@ export class Decoder {
 		const consumer = new Container.Consumer(sub, {
 			format,
 			maxAge: this.#maxAge,
-			// The publisher's declared flush span, which is where the arrival estimate starts.
-			jitter: effect.get(this.source.out.jitter),
+			// The estimator for this rendition, which outlives any one subscription. See #runSpread.
+			jitter: spread,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -497,11 +532,6 @@ export class Decoder {
 			const decode = inner.get(this.#decodeBuffered);
 			this.#out.buffered.update(() => Container.mergeBufferedRanges(network, decode));
 		});
-
-		// Publish the measured arrival spread for Sync. Cleared on teardown so a departed track
-		// stops holding the buffer open.
-		effect.run((inner) => this.#out.spread.set(inner.get(consumer.spread)));
-		effect.cleanup(() => this.#out.spread.set(undefined));
 
 		accumulate(effect, this.#out.skipped, consumer.skipped);
 
@@ -590,7 +620,7 @@ export class Decoder {
 		});
 	}
 
-	#runCmafDecoder(effect: Effect, sub: Moq.Track.Subscriber, config: DecoderConfig): void {
+	#runCmafDecoder(effect: Effect, sub: Moq.Track.Subscriber, config: DecoderConfig, spread: Container.Jitter): void {
 		if (config.container.kind !== "cmaf") return; // just to help typescript
 
 		const initSegment = base64ToBytes(config.container.init);
@@ -610,8 +640,8 @@ export class Decoder {
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
 			maxAge: this.#maxAge,
-			// The publisher's declared flush span, which is where the arrival estimate starts.
-			jitter: effect.get(this.source.out.jitter),
+			// The estimator for this rendition, which outlives any one subscription. See #runSpread.
+			jitter: spread,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -621,11 +651,6 @@ export class Decoder {
 			const decode = inner.get(this.#decodeBuffered);
 			this.#out.buffered.update(() => Container.mergeBufferedRanges(network, decode));
 		});
-
-		// Publish the measured arrival spread for Sync. Cleared on teardown so a departed track
-		// stops holding the buffer open.
-		effect.run((inner) => this.#out.spread.set(inner.get(consumer.spread)));
-		effect.cleanup(() => this.#out.spread.set(undefined));
 
 		accumulate(effect, this.#out.skipped, consumer.skipped);
 

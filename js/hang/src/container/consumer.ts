@@ -22,13 +22,19 @@ export interface ConsumerProps {
 	maxAge?: GetterInit<Time.Milli>;
 
 	/**
-	 * What the rendition advertises it flushes, from its catalog `jitter` (default: none).
+	 * Where {@link Consumer.spread} starts: the rendition's declared flush span, or an estimator
+	 * already measuring this rendition (default: neither, so the estimator's own guess).
 	 *
-	 * Seeds {@link Consumer.spread} so a cold start reads the publisher's own declaration rather
-	 * than a constant. A plain value, not a getter: a rendition that changes it is a different
+	 * A duration is the publisher's catalog `jitter`, a prior the first measurement replaces. A
+	 * {@link Jitter} is a measurement already made: a receiver that stops and restarts reading the
+	 * same rendition hands its estimator to the replacement consumer rather than starting over at
+	 * the declaration, which is a guess it has already improved on. The consumer reanchors it,
+	 * since the arrival reference describes a stretch of timeline nobody was reading.
+	 *
+	 * A plain value, not a getter: a rendition that changes its declaration is a different
 	 * rendition and gets a new consumer.
 	 */
-	jitter?: Time.Milli;
+	jitter?: Time.Milli | Jitter;
 }
 
 interface Group {
@@ -123,8 +129,9 @@ export class Consumer {
 	 * How late frames arrive relative to the earliest one, measured as they land.
 	 *
 	 * Size the playback buffer with this rather than with the round trip, which says nothing about
-	 * how evenly a publisher emits frames. Starts at {@link ConsumerProps.jitter}, the publisher's
-	 * own declaration, until the first arrivals replace it.
+	 * how evenly a publisher emits frames. Starts at {@link ConsumerProps.jitter}: the publisher's
+	 * own declaration until the first arrivals replace it, or what a handed-in estimator already
+	 * measured.
 	 */
 	readonly spread: Getter<Time.Milli>;
 
@@ -141,7 +148,14 @@ export class Consumer {
 		this.#track = track;
 		this.#format = props.format;
 		this.#maxAge = getter(props.maxAge ?? Moq.Time.Milli.zero);
-		this.#spread = new Jitter({ start: props.jitter });
+		if (props.jitter instanceof Jitter) {
+			// Continuing a measurement: keep the distribution, drop the arrival reference, which
+			// describes a stretch of timeline this receiver was not reading.
+			this.#spread = props.jitter;
+			this.#spread.reanchor();
+		} else {
+			this.#spread = new Jitter({ start: props.jitter });
+		}
 		this.spread = this.#spread.value;
 
 		this.#signals.spawn(this.#run.bind(this));

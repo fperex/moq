@@ -302,6 +302,16 @@ declaration would name a target no observation could bring down.
 
 A receiver that is handed no declaration starts at the 80 ms guess.
 
+The declaration starts a rendition, not a subscription. A receiver that stops
+reading and starts again on the same rendition, which is what muting a player
+does, carries its estimator across: the target it comes back with is the one it
+measured, and only the arrival reference is dropped, the way a discontinuity
+drops it. What the path does while nobody is listening is not a reason to
+believe the publisher's guess again, and reseeding costs the viewer the
+difference as a cold fill on every unmute. NetEq keeps its delay manager across
+a pause for the same reason. A rendition whose catalog entry changes is a
+different path with a different declaration, and starts over.
+
 **The first observation replaces it outright**, however far below it that
 lands. A seed is a prior, not an observation, and the fall bound below exists
 to protect a measurement from the next one; there is no measurement here for it
