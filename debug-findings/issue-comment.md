@@ -86,7 +86,7 @@ intact; everything in them except the estimator is kept.
 | the shaper defect found while re-measuring | `f65ab9351` |
 | the one-frame hold, and the mute (root causes 4 and 5 in the branch's own numbering) | `014f74897`, `5b144e010`, `c3c95f06e`, `7ba93d562`, `44599d39f`, `5ea2ec0ab` |
 | the cold start, so a declaration is a prior the first measurement replaces | `aeaaf8908`, `0014daca9` (the budgets it moved), and the seed-replacement commit |
-| the unmute transient and the Safari unlock | `8700f1fcc` (a flushed ring reports no playhead), `b86b03c94` (the unlock is armed on the first gesture) |
+| the unmute transient and the Safari unlock | `8700f1fcc` (a flushed ring reports no playhead), `b86b03c94` (the unlock is armed on the first gesture), `de641c6b5` (the context outlives a catalog update) |
 | the receiver stall (Firefox), found by watching two engines at once | `d5886766f` (the estimator takes a stalled input), `a8fe99aeb` (the recorded window replayed and graded) |
 | CodeRabbit fixes over the whole branch | `a8cbc93bb`, `97c7afb76`, `b85e57431`, `02f3f143a`, `f5087814b` |
 | CI, and the rebase onto the lease model | `2b9d492f0`, `5484970e1` (the nightly job), `8cabb3507` (the harness relay under `moq-auth`) |
@@ -143,9 +143,10 @@ video minus the audio playhead, so negative is video behind.
 
 | Source | Engine | Transport | Target | Held | Underruns | Concealed | Skew p50/p95 |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| microphone, LAN | Firefox | webtransport | 40 ms | 60 ms | 3 | 60 ms | -18/3 ms |
-| microphone, LAN | WebKit | websocket | 40 ms | 60 ms | 0 | 0 | -7/19 ms |
-| microphone, LAN | Safari | websocket | 40 ms | 60 ms | 0 | 0 | -6/18 ms |
+| microphone, LAN | Chromium | webtransport | 40 ms | 60 ms | 0 | 0 | -19.2/33.9 ms |
+| microphone, LAN | Firefox | webtransport | 40 ms | 60 ms | 0 | 0 | -15.2/36.2 ms |
+| microphone, LAN | WebKit | websocket | 40 ms | 60 ms | 0 | 0 | -11.2/30.1 ms |
+| microphone, LAN | Safari | websocket | 40 ms | 60 ms | 0 | 0 | -17.4/36.5 ms |
 | `bbb-smooth.hang`, LAN | Firefox | webtransport | 100 ms | 123 ms | 1 | 40 ms | -24/3 ms |
 | `bbb-smooth.hang`, LAN | WebKit | websocket | 80 ms | 103 ms | 0 | 0 | -21/2 ms |
 | `bbb-smooth.hang`, LAN | Safari | websocket | 60 ms | 83 ms | 0 | 0 | -22/3 ms |
@@ -154,15 +155,31 @@ video minus the audio playhead, so negative is video behind.
 | `bbb.hang`, cdn.moq.pro | Safari | websocket | 200 ms | 223 ms | 1 | 60 ms | -21/2 ms |
 
 The microphone rows are a Chromium publisher on the real device with echo cancellation, auto gain,
-noise suppression and Opus DTX off. Counters are the delta over the settled window, from 20 s in.
+noise suppression and Opus DTX off, and they were re-measured at the tip after the two publisher
+fixes below, one row at a time on a quiet machine. The file rows are from the earlier build. Counters
+are the delta over the settled window, from 20 s in.
 
 The estimator lands in the 20 to 100 ms band on every engine for both LAN sources and the engines
-agree to within one 20 ms bucket, and A/V skew is inside one frame at p50 and p95 everywhere on both
-transports. The public relay settles at 200 ms on all three, which is 223 ms held once the 23 ms AAC
-chunk is counted. Firefox took WebTransport on every row, not the fallback, because the gate in
-`js/net/src/connection/browser.ts` admits it from 153.0. It is also the only engine that underran
-after convergence, with every other counter level with the other two, and that turned out not to be
-the path at all.
+agree to within one 20 ms bucket. The public relay settles at 200 ms on all three, which is 223 ms
+held once the 23 ms AAC chunk is counted. Firefox took WebTransport on every row, not the fallback,
+because the gate in `js/net/src/connection/browser.ts` admits it from 153.0. On the earlier build it
+was also the only engine that underran after convergence, with every other counter level with the
+other two, and that turned out not to be the path at all; on this tip no microphone row underran on
+any engine.
+
+**Read the skew column against what the sampler can resolve.** Skew is the painted video timestamp
+less the audio playhead the player reports, on a 250 ms grid. The painted frame is the newest one due
+and it was painted at the last vsync, so the metric has a floor of one frame plus one display
+refresh: 58 ms at 24 fps, 50 ms at 30 fps. The reported playhead is not extrapolated while the one
+video is paced against is, so it has a ceiling of one reporting interval: 14.5 ms of worklet state
+messages at 44.1 kHz, 13.3 ms at 48 kHz, one 50 ms poll on the shared ring. Every settled sample on
+every row is inside that envelope to within 3 ms, and the largest positive sample on any postMessage
+row anywhere is +14.4 ms, one state message. So the pair worth grading is signed: the lead (signed
+p95) is -13.6 to +5.7 ms on every row but the two shared-ring microphone rows, which read +39.4 and
++44.3 ms and are the 50 ms poll's frozen phase rather than a lead, and the lag (signed p05) is inside
+the floor everywhere. The `p95` printed above is the p95 of the absolute value, which over that
+distribution is 41 to 49 ms by construction, so every row is at or below the metric's own worst case.
+Audio and video are within one frame on every row.
 
 **Firefox's underruns are its own content process, and the estimator was believing them.** Watching
 the same broadcast over the same relay at the same moment, Chromium's worst reading gap was 46 ms
@@ -190,8 +207,16 @@ sends another. `8700f1fcc` has the worklet echo the timeline of the flush it las
 thread can drop an older one, and has both rings publish no playhead at all until an insert
 re-anchors them, which is the shared ring's whole answer. `sync.replay.test.ts` replays the sequence
 over the fallback transport with that stale message delivered and the skew goes from 2992 ms to
-37 ms. The Firefox and WebKit numbers have not been re-measured on a served build, so the test is
-the evidence rather than a second browser pass.
+37 ms. Run again on a served build of the tip, against one Chromium publisher on the real microphone,
+the worst skew over the same sequence is -41.1 ms in real Safari (1.3 s after the `100ms` preset),
+64.3 ms in WebKit and 73.7 ms in Chromium on the shared ring (both 0.2 s after a quick unmute), and
+-46.8 ms in Firefox, each of them about one held interval wide against a 200 ms rule, with zero
+underruns on all four. That is the first time the sequence has been measured in real Safari at all.
+The WebKit run's single idle-tail underrun from the previous pass did not repeat. Chromium's
+shared-ring row records one skip of 1900 ms, 0.3 s after the `100ms` preset, which is the ring
+discarding the 1.9 s it was holding for the `2000ms` preset the sequence had just left. The 332.9 ms
+Firefox still showed after that fix was not the player: it was the publisher's own two epochs, which
+is a note of its own below.
 
 **Retracted: the Safari catalog defect.** An earlier pass recorded real Safari 26.6 on the WebSocket
 transport as never receiving the catalog of a browser-published broadcast. It does receive it. Four
@@ -223,17 +248,38 @@ diagnosability gap: a subscribe to an announced broadcast whose publisher is gon
 then silent for the whole idle-timeout window, which a viewer cannot tell apart from a publisher that
 is slow to produce its first group.
 
-**Real Safari needed two clicks to hear anything, and that is fixed too.** `moq-watch` built its
-`AudioContext` only once the catalog named an audio rendition and armed `unlockOnGesture` at that
-moment, so the click that selected the tile had already passed; Chromium and Firefox let the
-unconditional `resume()` through anyway, real Safari did not. `b86b03c94` arms the listeners from the
-moment audio is enabled, before any context exists, which works because a page's activation carries
-to a context created later: measured on Safari 26 the context appears about 2.3 s after the click and
-starts anyway, and one click now plays in 6 of 6 gesture-first runs and 4 of 4 muted-tile runs across
-Safari, Chromium and Firefox, every one of them on a headset whose 44100Hz rate matches neither
-broadcast. Building the context inside the gesture handler was measured and rejected: one activation
-starts one context, so a graph rebuilt at the rate the decoder turns out to emit is born locked, 0 of
-2 at 16kHz against 2 of 2 for arming alone.
+**Real Safari needed two clicks to hear anything, then played one run in eight in silence, and both
+are fixed.** `moq-watch` built its `AudioContext` only once the catalog named an audio rendition and
+armed `unlockOnGesture` at that moment, so the click that selected the tile had already passed;
+Chromium and Firefox let the unconditional `resume()` through anyway, real Safari did not.
+`b86b03c94` armed the listeners earlier, which fixed the second click, and a later pass found that
+it had not fixed the silence: 1 of 8 real-Safari runs still reached a tile, a catalog and a painting
+video with the `AudioContext` stuck `suspended` for good.
+
+Two things were spending the activation. The graph was rebuilt whenever anything in the decoder
+config changed, and a browser publisher's Opus rendition gains its `description` in a *later* catalog
+frame, so the context the click had just started was closed and replaced about 30 ms later by one
+born suspended; and the unlock was armed only while audio was enabled, so the click that unmutes a
+tile armed its listeners a microtask after its own gesture had already passed. Both only ever worked
+because WebKit honours a `resume()` outside a handler while the page's activation is still live,
+which is a few seconds, and past that the context stays suspended and nothing is rendered while video
+keeps painting. An earlier version of this comment read that grace as a page activation carrying to a
+context created later; it does not, and correcting it is the finding.
+
+`de641c6b5` builds the context in an effect keyed on the rate it runs at and nothing else, so a later
+catalog frame rebuilds the worklet and ring under a context that is already playing, and arms the
+unlock for the decoder's lifetime rather than as a consequence of the click. Measured through
+`safaridriver` with exactly one Element Click per run against a microphone broadcast: **8 of 8 reach
+`running` 4 to 12 ms after the click**, with a single context per run, against 7 of 8 before.
+Chromium, Firefox and the real-Safari mute sequence are unchanged. No public API change, but one
+behaviour change worth your call: a gesture anywhere on the page now starts the context of every tile
+that has one, not only of an unmuted tile, which on the five-tile demo page is five idle contexts on
+the first click. The alternatives are to start only the clicked tile and arm the rest (the unlock
+would have to know about elements) or to build contexts lazily behind one shared silent unlock
+context (a different shape for the whole graph). I would keep it as it is and document it; an idle
+context is cheap next to a viewer who hears nothing. Building the context inside the gesture handler
+was measured and rejected separately: one activation starts one context, so a graph rebuilt at the
+rate the decoder turns out to emit is born locked, 0 of 2 at 16kHz against 2 of 2 for arming alone.
 
 ### The harness, and what it will and will not enforce
 
@@ -420,6 +466,37 @@ the rest of the workspace, which they do not touch, and the interop lane.
   the watcher renders as silence with no concealment and no underrun. Over a 12 s pause on a real
   mic, RMS p50 went from 2.2e-4 to 0, reaching digital silence 0.2 s in and staying there, largest
   sample step 9.2e-5, audio back in the first 100 ms bucket after the resume.
+- **A browser publisher stops seeding catalogs once its first viewer leaves**, which makes it single
+  use: the first watcher plays, every later one gets `subscribe ok` and no catalog frame, and only a
+  restart clears it. Yours, not mine. `broadcast.ts`'s `subscribe()` caches the track producer it
+  requested and drops the entry only when that producer closes, and the publishing wire takes that
+  path although the comment says it does not. Nothing closed the producer, so the next SUBSCRIBE
+  fanned out from a catalog track nobody writes to between updates and the retained seed aged out
+  after `DEFAULT_MAX_AGE_MS`. The relay's 30 s cache hides it until a viewer arrives after that.
+  Fixed in `js/publish` by releasing the serving scope on `Promise.race([track.closed,
+  track.unused()])`, with two tests; three sequential watchers 50 s apart all play. The other shape
+  is a weak dedup in `js/net`, the way `rs/moq-net` uses a `WeakCache`, which I did not take because
+  the subscribing side leans on the strong entry to resume a quickly unmuted tile. Your call which
+  layer owns it. Next to it, `Rendition.track` documents a demand gate that no longer exists, and
+  making it real exposes two more defects; those three want one quest.
+- **A browser publish puts its audio and video on two different epochs, so sound leads picture by a
+  third of a second.** Also yours. `audio/capture.ts` handed the worklet `performance.now()` at
+  construction and counted quanta from there, but a capture graph renders its first quanta before
+  the device opens and its clock then stalls about 245 ms while the microphone comes up, so sample 0
+  carried the wall time of the node rather than of the audio. Video anchors on the first camera
+  frame's arrival, within a millisecond of the wall clock. A probe on both captures read 235 to
+  272 ms across the probe runs (235.0, 238.9 and 249.3 ms in the saved files; 272 ms is the run the
+  commit message quotes), and the watcher-side video lead was 352 to 464 ms across five publisher
+  runs against 0 on the
+  ffmpeg broadcasts. The skew metric cannot see it, because video is painted at the audio playhead,
+  and it is also the whole unmute transient: the mute takes the clock away, the picture runs to the
+  live edge, and the unmute walks it back by the offset. The worklet now reports `currentFrame` and
+  the main thread pairs the context clock with `performance.now()`, re-deriving the pairing when the
+  context clock stalls and refusing an unusable one rather than shipping a silent offset. After:
+  5.0, 5.1 and -8.2 ms over three runs, a video lead of 68 to 91 ms which is the playout hold, and
+  the worst skew over the mute sequence from 333 ms to one held interval in every engine. What
+  is left is the camera's own pipeline latency, inside the arrival anchor, which needs an external
+  reference to measure.
 - **`demo/web` pinned `delay="100ms"` on every tile.** That is the "100 ms chip on a fresh session"
   from `watch.md`. No stored preference, nothing restoring anything. Fixed in `a7c1a8182`.
 - **`ui/components/buffer-control.ts` sets a numeric delay on mousedown**, so a single click on the
@@ -493,11 +570,13 @@ Stating this plainly, because some of it matters for how much weight the numbers
 - **The nightly job has never run on your runner.** `2b9d492f0` adds it and it passes `--enforce`,
   but every ceiling in `budgets.json` was measured on one desktop. The rows still marked `recorded`
   are the ones I would not ask a different machine to clear yet.
-- **The Firefox and WebKit mute-sequence numbers were not re-measured on a served build.** The fix
-  is held by a regression test (2992 ms to 37 ms); a second browser pass is what would confirm the
-  3256 ms and 3076 ms spikes are gone.
-- **No listening round has happened on this tip.** The unlock fix, the flushed-ring fix, the
-  receiver-stall input and the CodeRabbit commits have all landed since the last one.
+- **No listening round has happened on this tip.** The flushed-ring fix, the receiver-stall input,
+  the CodeRabbit commits, both publisher fixes and the audio-context fix have all landed since the
+  last one, so every number here is an instrument reading.
+- **The two cdn rows from `demo/web` could not be run as written.** The page points at
+  `https://cdn.moq.pro` with no path, the public relay closes a session opened at its root, and the
+  page reconnect-loops without ever showing a tile. `cdn.moq.pro/demo` stands in, and the site page
+  reaches the same relay on its own project path.
 - **`test/audio-quality/clients/js` has no unit test target.** The grader, beacon, probe and Safari
   lane are exercised only end to end, which is why six fail-quietly defects there were found by a
   reviewer rather than by a test. Giving that package a `bun test` target is a follow-up.
