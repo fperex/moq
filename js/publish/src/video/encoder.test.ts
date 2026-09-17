@@ -783,3 +783,160 @@ test("a probe that has not answered does not hold the encoder through a toggle",
 		sub.close();
 	}
 });
+
+// A rendition that stops encoding (video hidden, capture stopped) must not close its track
+// producer. Closing it FINs the subscribe stream, and a peer reads that FIN as the track being over
+// for good (`rs/moq-net/src/lite/subscriber.rs:3381`, `ServeEnd::Finished`), so every later
+// subscription is answered from the finished track: the relay logs `subscribed started` and
+// `subscribed complete` milliseconds apart, over and over, while the catalog still advertises the
+// rendition and the tile stays black. The track producer belongs to the Broadcast, which closes it
+// when the rendition is superseded or unregistered; the encoder only writes into it.
+test("a rendition that stops encoding keeps its track open for the next subscriber", async () => {
+	class InstantVideoEncoder {
+		static current: InstantVideoEncoder | undefined;
+		state: CodecState = "unconfigured";
+		encodeQueueSize = 0;
+		readonly #output: VideoEncoderInit["output"];
+
+		constructor(init: VideoEncoderInit) {
+			this.#output = init.output;
+			InstantVideoEncoder.current = this;
+		}
+
+		static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
+			return { supported: config.codec.startsWith("avc1") };
+		}
+
+		configure(): void {
+			this.state = "configured";
+		}
+
+		// Straight through: what this test cares about is the track the chunks land in.
+		encode(frame: VideoFrame, options?: VideoEncoderEncodeOptions): void {
+			this.#output({
+				timestamp: frame.timestamp,
+				type: options?.keyFrame ? "key" : "delta",
+				byteLength: 1,
+				copyTo: (buffer: Uint8Array) => {
+					buffer[0] = 0;
+				},
+			} as EncodedVideoChunk);
+		}
+
+		close(): void {
+			this.state = "closed";
+		}
+	}
+
+	class TestFrame {
+		readonly codedWidth = 640;
+		readonly codedHeight = 480;
+		readonly timestamp: number;
+
+		constructor(timestamp: number) {
+			this.timestamp = timestamp;
+		}
+
+		clone(): TestFrame {
+			return new TestFrame(this.timestamp);
+		}
+		close(): void {}
+	}
+
+	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
+	Object.defineProperty(globalThis, "VideoEncoder", {
+		configurable: true,
+		value: InstantVideoEncoder,
+		writable: true,
+	});
+
+	const { Fanout } = await import("../fanout");
+	const { Broadcast } = await import("../broadcast");
+
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const stream = new ReadableStream<VideoFrame>({
+		start: (next) => {
+			controller = next;
+		},
+	});
+	const fanout = new Fanout(stream, {
+		queue: 128,
+		clone: (frame) => (frame as unknown as TestFrame).clone() as never,
+		release: (frame) => frame.close(),
+	});
+
+	const capture = {
+		in: {
+			source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) } as never),
+		},
+		out: {
+			display: new Signal({ width: 640, height: 480 }),
+			frames: new Signal(fanout),
+		},
+	};
+	const enabled = new Signal(true);
+	const broadcast = new Broadcast({
+		enabled: true,
+		origin: new Moq.Origin.Producer(),
+		name: Moq.Path.from("toggle.hang"),
+	});
+	const encoder = new Encoder("video", {
+		enabled,
+		broadcast,
+		capture: capture as never,
+		config: { frameRate: 30 },
+	});
+
+	let front: Moq.Broadcast.Consumer | undefined;
+	let first: Moq.Track.Subscriber | undefined;
+	let second: Moq.Track.Subscriber | undefined;
+
+	try {
+		await settle();
+
+		const net = broadcast.net.peek();
+		if (!net) throw new Error("expected a network producer");
+		front = net.consume();
+
+		// The watcher subscribes, and the encoder starts feeding the accepted producer.
+		first = front.subscribe("video");
+		await settle();
+		controller.enqueue(new TestFrame(1_000_000) as never);
+		await settle();
+		expect((await first.recvGroup())?.sequence).toBe(0);
+
+		// The user hides video, so the rendition stops encoding. It stays registered, and a
+		// subscriber is meant to get an idle track rather than a track that is over.
+		enabled.set(false);
+		await settle();
+		expect(first.closed.peek()).toBeUndefined();
+
+		// Video comes back: the rendition is advertised again and the same subscription resumes on
+		// a keyframe. A track closed by the hide is over for good on the wire, so the watcher would
+		// be left subscribing to a finished track while the catalog says the rendition is there.
+		enabled.set(true);
+		await settle();
+		expect(encoder.out.catalog.peek()).toBeDefined();
+		controller.enqueue(new TestFrame(4_000_000) as never);
+		await settle();
+		const resumed = await first.recvGroup();
+		expect(resumed?.sequence).toBeGreaterThan(0);
+
+		// And a subscription opened after the stop is served rather than completing at once.
+		second = front.subscribe("video");
+		await settle();
+		controller.enqueue(new TestFrame(7_000_000) as never);
+		await settle();
+		expect(second.closed.peek()).toBeUndefined();
+		expect(await second.recvGroup()).toBeDefined();
+	} finally {
+		first?.close();
+		second?.close();
+		front?.close();
+		encoder.close();
+		broadcast.close();
+		fanout.close();
+		if (original) Object.defineProperty(globalThis, "VideoEncoder", original);
+		else Reflect.deleteProperty(globalThis, "VideoEncoder");
+	}
+});

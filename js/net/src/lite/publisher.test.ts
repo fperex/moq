@@ -1378,3 +1378,60 @@ test("a version without the latency field serves a non-dropping budget", async (
 		}
 	}
 });
+
+// A watcher that re-subscribes (a decoder rebuild, a hide and show) opens a second SUBSCRIBE while
+// the first track is still live. The publishing wire layer subscribes through the broadcast
+// consumer, so the second one fans out from the producer the first raised rather than raising a
+// fresh request: the track handed over on accept serves every later subscription too, and closing
+// it ends all of them, and every one that follows, for good.
+test("a repeat subscription fans out from the live track instead of raising a request", async () => {
+	const pair = createMockTransportPair(ALPN_05);
+	const origin = new OriginProducer();
+	const publisher = new Publisher(pair.server, Version.DRAFT_05, randomHop(), origin.consume());
+	const broadcast = publish(origin, Path.from("test"));
+
+	const first = await Stream.open(pair.client);
+	const firstServer = await Stream.accept(pair.server);
+	if (!firstServer) throw new Error("publisher never accepted the subscribe stream");
+	void publisher.runSubscribe(
+		replaySubscribe({ id: 0n, broadcast: Path.from("test"), track: "video", priority: 0 }),
+		firstServer,
+	);
+
+	const request = await broadcast.requested();
+	if (!request) throw new Error("expected a track request");
+	expect(request.name).toBe("video");
+	const track = request.accept();
+
+	const opened = pair.client.incomingUnidirectionalStreams.getReader();
+	const second = await Stream.open(pair.client);
+
+	try {
+		const secondServer = await Stream.accept(pair.server);
+		if (!secondServer) throw new Error("publisher never accepted the second subscribe stream");
+		void publisher.runSubscribe(
+			replaySubscribe({ id: 1n, broadcast: Path.from("test"), track: "video", priority: 0 }),
+			secondServer,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		// No second request: the live producer answers it.
+		const none = Symbol("none");
+		expect(await Promise.race([broadcast.requested(), Promise.resolve(none)])).toBe(none);
+
+		// And it is served: one group written now opens a stream for each subscription.
+		const group = new GroupProducer(0);
+		group.writeString("hello");
+		track.writeGroup(group);
+		await servingNextGroup(opened);
+		await servingNextGroup(opened);
+		expect(pair.server.sendStreams.uni).toHaveLength(2);
+		group.close();
+	} finally {
+		opened.releaseLock();
+		track.close();
+		publisher.close();
+		second.close();
+		first.close();
+	}
+});

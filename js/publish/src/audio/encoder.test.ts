@@ -252,6 +252,81 @@ describe("a rendition that stops encoding", () => {
 		}
 	});
 
+	// The mute sequence, through the real broadcast and net path rather than a stand-in track: the
+	// watcher drops its audio subscription, the publisher keeps capturing, and the subscription that
+	// replaces it three seconds later has to land on the same live track at the live timestamp. A
+	// release of the serving scope on `unused()` closes the producer here instead, which both ends
+	// the track for good on the wire and restarts the timeline, so the resumed audio plays out
+	// seconds behind the video.
+	test("keeps the track and the timeline across a dropped and resumed subscription", async () => {
+		using _codecs = installFakeAudioCodecs();
+
+		const { Broadcast } = await import("../broadcast");
+		const broadcast = new Broadcast({
+			enabled: true,
+			origin: new Moq.Origin.Producer(),
+			name: Moq.Path.from("mute.hang"),
+		});
+		const capture = {
+			in: { source: new Signal(undefined) },
+			out: {
+				root: new Signal(undefined),
+				format: new Signal<Format | undefined>({ sampleRate: 48_000, channelCount: 1 }),
+				frames: new Signal(undefined),
+			},
+		};
+		const encoder = new Audio.Encoder("audio", { enabled: true, broadcast, capture: capture as never });
+
+		let front: Moq.Broadcast.Consumer | undefined;
+		let first: Moq.Track.Subscriber | undefined;
+		let second: Moq.Track.Subscriber | undefined;
+
+		try {
+			await settle();
+			const net = broadcast.net.peek();
+			if (!net) throw new Error("expected a network producer");
+			front = net.consume();
+
+			first = front.subscribe("audio");
+			await settle();
+			FakeAudioEncoder.last?.output(chunk(0, 20_000));
+			expect(await readTimestamp(first)).toBe(0);
+
+			// The user mutes: the watcher drops the subscription with the reset it sends when it
+			// leaves. The publisher keeps capturing throughout.
+			first.close(new Error("remote error: 1"));
+			await settle();
+
+			for (let timestamp = 20_000; timestamp <= 3_000_000; timestamp += 20_000) {
+				FakeAudioEncoder.last?.output(chunk(timestamp, 20_000));
+			}
+			await settle();
+
+			// Unmute. The subscription is served rather than answered from a finished track, and it
+			// reaches the live timestamp: the pipeline never re-anchored, so the audio is where the
+			// video is.
+			second = front.subscribe("audio");
+			await settle();
+			expect(second.closed.peek()).toBeUndefined();
+
+			// The live edge is waiting for it: this is the track that kept running, so the unmute
+			// starts three seconds on rather than at the timestamp the mute stopped at.
+			const drain = draining(second);
+			expect(await drain()).toBe(3_000_000);
+
+			// And it stays on that timeline: the next frame follows it.
+			FakeAudioEncoder.last?.output(chunk(3_020_000, 20_000));
+			await settle();
+			expect(await drain()).toBe(3_020_000);
+		} finally {
+			first?.close();
+			second?.close();
+			front?.close();
+			encoder.close();
+			broadcast.close();
+		}
+	});
+
 	test("keeps the timeline open across a reconfigure", async () => {
 		using _codecs = installFakeAudioCodecs();
 		const { encoder, written } = await encoding();
@@ -291,3 +366,34 @@ describe("a rendition that stops encoding", () => {
 		}
 	});
 });
+
+// The timestamp of the next frame a subscriber reads, as the legacy container stamps it.
+async function readTimestamp(subscriber: Moq.Track.Subscriber): Promise<number | undefined> {
+	const group = await subscriber.recvGroup();
+	const payload = await group?.readFrame();
+	return payload ? Number(Moq.Varint.decode(payload.payload)[0]) : undefined;
+}
+
+// Drains whatever a subscriber can read without waiting and reports the newest timestamp it
+// reached, keeping the read it had to abandon so the next drain starts where this one stopped:
+// recvGroup hands each group out exactly once, including to a read nobody waited for.
+function draining(subscriber: Moq.Track.Subscriber): () => Promise<number | undefined> {
+	let pending: Promise<Moq.Group.Consumer | undefined> | undefined;
+
+	return async () => {
+		let latest: number | undefined;
+		for (;;) {
+			pending ??= subscriber.recvGroup();
+			const read = pending;
+			// Everything written has settled by the time this is called, so a read that has to wait
+			// for the next macrotask is a read past the live edge.
+			const idle = new Promise<"idle">((resolve) => setTimeout(() => resolve("idle"), 0));
+			const group = await Promise.race([read, idle]);
+			if (group === "idle") return latest;
+			pending = undefined;
+			if (!group) return latest;
+			const payload = await group.readFrame();
+			if (payload) latest = Number(Moq.Varint.decode(payload.payload)[0]);
+		}
+	};
+}
