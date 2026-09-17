@@ -39,11 +39,11 @@ Three rows are enforced today:
 | opus | `fixed-250` isolated |
 | aac | `fixed-250` both rings |
 
-Twenty-one keep the marker, which is more than the ten this table held before the playout target
-started at the publisher's declared flush span. That is the cost of the cold start rather than a
-fault in the measurement: an `auto` row now spends part of its window walking the declaration down
-to what the path delivers, and where inside a sixty second window that walk lands is timing
-sensitive. The `fixed-250` rows, whose target never moves, are exactly the ones that still agree.
+Twenty-one keep the marker, and the reason is the target rather than a fault in the measurement: an
+`auto` row's target follows the path for the whole window, so where inside sixty seconds the path's
+worst stretch lands moves its percentiles between runs. The declared flush span it starts from is
+not what the spread is, because the first resampled observation half a second in replaces it
+outright. The `fixed-250` rows, whose target never moves, are exactly the ones that still agree.
 The two runs behind this file differ by 2.2 against 36 skip-aheads a minute on `aac-step-isolated`
 and by 460 against 1700 ms of target p95 on `aac-bursty-isolated`. A third run under `--enforce`
 bore the split out: it passed every enforced ceiling and breached only on rows that kept the marker.

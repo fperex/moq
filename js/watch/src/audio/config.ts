@@ -52,9 +52,9 @@ export function playbackIdentity(config: Catalog.AudioConfig): PlaybackIdentity 
 /**
  * The delay a rendition advertises, in milliseconds: the publisher's declared flush span.
  *
- * A floor, not a measurement. The render quantum used to be added here, which read 48kHz Opus as
- * 23ms rather than 20ms; it is the ring's granularity rather than the publisher's, so it lives in
- * the ring's slack now.
+ * A declaration, not a measurement. It is where the playout estimator starts, and the first arrival
+ * it resamples replaces it outright, so it neither floors the target nor adds to it. The render
+ * quantum is the ring's granularity rather than the publisher's, and lives in the ring's slack.
  */
 export function playbackJitter(config: Catalog.AudioConfig): Time.Milli {
 	// A publisher advertising 0 is claiming frames are never delayed, which no encoder can do, so

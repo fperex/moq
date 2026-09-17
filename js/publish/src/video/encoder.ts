@@ -186,7 +186,7 @@ export class Encoder {
 		// Publish the resolved catalog config; undefined (while disabled) drops it from the catalog.
 		effect.proxy(rendition.config, this.out.catalog);
 
-		// Encode only while enabled and a subscriber is attached (the demand gate).
+		// Encode only while enabled and the rendition has a track to write into.
 		effect.run((effect) => {
 			const enabled = effect.get(this.in.enabled);
 			const track = effect.get(rendition.track);

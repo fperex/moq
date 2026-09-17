@@ -89,14 +89,14 @@ export const METRICS: Record<string, MetricSpec> = {
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Quanta delivered with fewer samples than the render quantum asked for.",
-		pending: "needs AudioBuffer.debug() from the ring, stage 5",
+		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	silent_quanta: {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Quanta filled entirely with silence because nothing was buffered.",
-		pending: "needs AudioBuffer.debug() from the ring, stage 5",
+		pending: "no counter for it on either lane: the ring reports short quanta, not silent ones",
 	},
 	stalled_quanta: {
 		unit: "share",
@@ -110,7 +110,7 @@ export const METRICS: Record<string, MetricSpec> = {
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Buffered samples thrown away without being played, reported in ms.",
-		pending: "needs AudioBuffer.debug() from the ring, stage 5",
+		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	skip_aheads: {
 		unit: "count",
@@ -129,21 +129,21 @@ export const METRICS: Record<string, MetricSpec> = {
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Time-stretch decisions that played the buffer down faster than real time.",
-		pending: "time stretch lands in stage 5",
+		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	expands: {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Concealment decisions that generated audio to cover a gap.",
-		pending: "concealment lands in stage 6",
+		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	stretched_samples: {
 		unit: "samples",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Samples whose duration was altered by stretching or concealment, reported in ms.",
-		pending: "time stretch lands in stage 5",
+		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	skipped_groups: {
 		unit: "count",
@@ -158,7 +158,7 @@ export const METRICS: Record<string, MetricSpec> = {
 		aggregations: ["total", "per_min"],
 		description: "Groups abandoned specifically because they exceeded the subscription's age budget.",
 		pending:
-			"skipped_groups counts the age budget and a transport give-up as one; separating them needs a typed verdict",
+			"skipped_groups counts the age budget and a transport give-up as one; separating them needs its own counter",
 	},
 	target_ms: {
 		unit: "ms",

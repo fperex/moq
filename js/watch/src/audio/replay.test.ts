@@ -35,8 +35,8 @@ import {
 
 const RATE = 48000;
 const CHUNK = (RATE * CHUNK_MS) / 1000;
-// What the catalog advertises for 48kHz Opus: one frame. Sync holds this as a floor under the
-// measured target.
+// What the catalog advertises for 48kHz Opus: one frame, which is the floor this harness holds the
+// measured target above.
 const FLOOR = CHUNK_MS;
 
 /** Let the consumer's spawned group readers and its delivery loop run. */
@@ -306,7 +306,7 @@ describe.each(RINGS)("%s ring, the rare tail", (ring, build) => {
 
 // --- The age budget above the decoder ---
 
-/** The recording's own frame duration, which is the catalog floor `Sync` holds the target above. */
+/** The recording's own frame duration, which is the floor this harness holds the target above. */
 function frameFloor(t: Arrival[]): number {
 	const sorted = [...t].map((a) => a.media).sort((a, b) => a - b);
 	const gaps = sorted.slice(1).map((m, i) => m - sorted[i]);

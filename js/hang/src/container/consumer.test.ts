@@ -500,19 +500,22 @@ test("Consumer throws on concurrent next() calls", async () => {
 	consumer.close();
 });
 
-test("Consumer skips groups via PTS-span when over the max age", async () => {
+test("Consumer skips a group via PTS-span when over the max age", async () => {
 	const track = new Track.Producer("test");
-	// Zero max age = skip everything that's not the latest
+	// A zero max age lets a group stand only until its successor overtakes it.
 	const consumer = new Consumer(replay(track), { format: new LegacyFormat("data"), maxAge: 0 as Time.Milli });
 
-	// Write groups with increasing timestamps. With a 0 max age, any PTS span > 0 triggers skip.
+	// Write groups with increasing timestamps. A group whose successor has already started is over
+	// any budget of zero, so the consumer advances instead of waiting for the rest of it.
 	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro]);
 	writeGroupWithLegacyFrames(track, 1, [100_000 as Time.Micro]);
 	writeGroupWithLegacyFrames(track, 2, [200_000 as Time.Micro]);
 	track.close();
 
 	const frames = await drainFrames(consumer, 300);
-	// With a zero max age, the consumer should skip to the latest group
+	// Delivery reaches the newest group. Each group here holds one frame, already readable when the
+	// budget convicts it, so nothing is lost; the frames a skipped group had not delivered are what
+	// the counter in the next test measures.
 	const groups = [...new Set(frames.map((f) => f.group))];
 	expect(groups.at(-1)).toBe(2);
 	consumer.close();

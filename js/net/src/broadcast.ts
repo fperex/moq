@@ -53,13 +53,16 @@ function closeState(state: BroadcastState, abort?: Error) {
 	});
 }
 
-// `register` is set on the subscribing (consumer) side: the fresh producer is cached in
-// `state.tracks` so repeat subscriptions to the same track fan out from one upstream subscription
-// instead of opening a new one, mirroring the Rust `broadcast::Consumer::track` weak-dedup. The
-// consumer wire watches the producer's demand ({@link track.Producer.used}) and tears the upstream
-// down once its last subscriber leaves, closing the producer, which evicts the cache entry below.
-// The publishing side leaves `register` false: `state.tracks` there holds only the tracks the app
-// inserted, and a dynamic serve stays one request per peer subscription.
+// `register` caches the fresh producer in `state.tracks`, so repeat subscriptions to the same track
+// fan out from one upstream subscription instead of opening a new one, mirroring the Rust
+// `broadcast::Consumer::track` weak-dedup. The wire watches the producer's demand ({@link
+// track.Producer.used}) and tears the upstream down once its last subscriber leaves, closing the
+// producer, which evicts the cache entry below.
+//
+// Only a {@link Consumer}'s wire sets it, and both wire layers reach a broadcast through a
+// `Consumer`: the subscribing side over the network, and the publishing side over
+// {@link Producer.consume}, which shares this same state. A second peer subscribing to a track
+// already being served therefore shares the one producer instead of raising another request.
 function subscribe(
 	state: BroadcastState,
 	name: string,

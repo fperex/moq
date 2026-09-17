@@ -96,7 +96,7 @@ export function trace(frames: number, burst: number, spread: number, seed = 7): 
 
 /**
  * The target the estimator settles on for a trace: the real `Jitter`, fed the same arrivals, held
- * above the catalog floor the way `Sync` holds it.
+ * above `floorMs`.
  *
  * Also the whole point of the exercise. Nothing here approximates the estimator, so a change that
  * moves it moves what these rings are sized to.
@@ -233,7 +233,7 @@ function frameSamples(t: Arrival[], rate: number): number[] {
 export interface Options {
 	/** Sample rate the ring and the engine run at, in Hz. */
 	rate: number;
-	/** The catalog floor `Sync` holds the target above, in ms. */
+	/** A floor under the measured target, in ms: the recording's own frame duration. */
 	floorMs: number;
 	/** Wall time to play before counting starts, in ms: the target is still converging before it. */
 	warmupMs: number;
