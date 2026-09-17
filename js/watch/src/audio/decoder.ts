@@ -194,6 +194,9 @@ export class Decoder {
 	 * It reads synchronously from the first peek, which is what `subscribeMedia` and
 	 * `Container.Consumer` need at construction.
 	 */
+	// The ring's depth: `sync.out.delay` plus `sync.out.offset`. See the constructor.
+	readonly #target: Derived<readonly [Getter<Time.Milli>, Getter<Time.Milli>], Time.Milli>;
+
 	readonly #maxAge: Derived<
 		readonly [Getter<Time.Milli>, Getter<Delay>, Getter<Catalog.AudioConfig | undefined>],
 		Time.Milli
@@ -221,6 +224,13 @@ export class Decoder {
 			return effect.get(this.#decodedSampleRate) ?? config.sampleRate;
 		});
 
+		// What the ring holds on top of the chunk: the estimator's answer plus however much later
+		// the picture arrives than the sound for the same timestamp. `sync.out.delay` stays the
+		// estimator's answer alone, which is what the player's jitter buffer row reports; this is
+		// the quantity the listener actually waits, and the one that puts the picture back in sync.
+		this.#target = new Derived([sync.out.delay, sync.out.offset] as const, (delay, offset) =>
+			Time.Milli.add(delay, offset),
+		);
 		this.#maxAge = new Derived(
 			[this.sync.out.maxAge, this.sync.in.delay, this.source.out.config] as const,
 			(maxAge, delay, config) => audioMaxAge(maxAge, config, delay === "instant"),
@@ -357,7 +367,7 @@ export class Decoder {
 			effect.cleanup(() => worklet.disconnect());
 
 			// Initial ring depth in samples.
-			const delay = this.sync.out.delay.peek();
+			const delay = this.#target.peek();
 			const latencySamples = ringSamples(sampleRate, delay);
 			const buffered = this.sync.out.buffered.peek();
 
@@ -468,7 +478,7 @@ export class Decoder {
 		const ring = this.#ring;
 		if (!ring) return;
 
-		const delay = effect.get(this.sync.out.delay);
+		const delay = effect.get(this.#target);
 		ring.setLatency(ringSamples(ring.rate, delay));
 	}
 
@@ -490,7 +500,7 @@ export class Decoder {
 	// The debounce coalesces a slider drag or a converging estimate into a single stall. Decreases
 	// are left to natural catch-up.
 	#runLatencyReanchor(effect: Effect): void {
-		const target = effect.get(this.sync.out.delay);
+		const target = effect.get(this.#target);
 		const step = Time.Milli(2 * Container.Jitter.BUCKET);
 		if (this.#prevTarget === undefined) {
 			// Startup: the initial fill already builds the cushion; just record the baseline.

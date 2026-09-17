@@ -19,6 +19,29 @@ export type Delay = "instant" | "auto" | Time.Milli;
 // The widest measured jitter "auto" sizes a buffer from, which is the estimator's own ceiling.
 const JITTER_CEILING = Time.Milli(Container.Jitter.CEILING);
 
+// How long one track's arrival floor stands before it stops counting.
+//
+// Two of these are kept and rotated, so a track that stops delivering (a muted tile, a hidden
+// canvas) drops out of the comparison within two windows rather than holding the buffer deep for
+// the rest of the session. Wide enough that an ordinary group cadence refreshes it many times over.
+const OFFSET_WINDOW = Time.Milli(2_000);
+
+/**
+ * One track's arrival floor, as two rotating windows.
+ *
+ * A minimum rather than a mean, for the same reason the estimator measures each arrival against
+ * the fastest recent one: the floor is the path, and everything above it is jitter the estimator
+ * already covers.
+ */
+type Arrival = {
+	/** The floor seen since the window opened. */
+	current: number;
+	/** The previous window's floor, so the reading spans at least one full window. */
+	previous: number;
+	/** When the current window opened. */
+	opened: Time.Milli;
+};
+
 /**
  * A sample of a track's playhead: where it is on the media timeline, and when it was there.
  *
@@ -119,6 +142,10 @@ type SyncOutput = {
 	// When the delay is a number, jitter equals that number.
 	jitter: Signal<Time.Milli>;
 
+	// How much later the picture arrives than the sound, for the same media timestamp. Zero when
+	// they arrive together, which is the ordinary case. See `#observeArrival`.
+	offset: Signal<Time.Milli>;
+
 	// The media timestamp of the most recently received frame.
 	timestamp: Signal<Time.Milli | undefined>;
 
@@ -146,6 +173,7 @@ export class Sync {
 		clock: new Signal<"audio" | "video" | undefined>(undefined),
 		delay: new Signal<Time.Milli>(Time.Milli.zero),
 		jitter: new Signal<Time.Milli>(Time.Milli.zero),
+		offset: new Signal<Time.Milli>(Time.Milli.zero),
 		timestamp: new Signal<Time.Milli | undefined>(undefined),
 		buffered: new Signal<boolean>(false),
 		maxAge: new Signal<Time.Milli>(Time.Milli.zero),
@@ -163,6 +191,10 @@ export class Sync {
 
 	// Per-label late-frame tracking: accumulate count and max lateness, flush on recovery.
 	#late = new Map<string, { count: number; maxMs: number }>();
+
+	// Per-track arrival floors, for the cross-track offset. Only the tracks that render on the
+	// shared clock: captions render on `now()`, so holding sound for a late one would be wrong.
+	#arrivals = new Map<"audio" | "video", Arrival>();
 
 	#signals = new Effect();
 
@@ -192,14 +224,29 @@ export class Sync {
 		return this.#tracks[name];
 	}
 
-	// Derive `buffered` / `maxAge` from the resolved delay and the configured lookahead.
+	// Derive `buffered` / `maxAge` from how far playback trails and the configured lookahead.
+	//
+	// The offset is in here because the budget has to reach as far back as playback waits: a
+	// picture the deeper hold is still waiting for would otherwise be convicted as stale before
+	// it was ever due.
 	#runMaxAge(effect: Effect): void {
-		const delay = effect.get(this.#out.delay);
+		const trail = Time.Milli.add(effect.get(this.#out.delay), effect.get(this.#out.offset));
 		// "instant" holds nothing, so a configured lookahead doesn't apply.
 		const buffer = effect.get(this.in.delay) === "instant" ? Time.Milli.zero : effect.get(this.in.buffer);
 
 		this.#out.buffered.set(buffer > 0);
-		this.#out.maxAge.set(Time.Milli.add(delay, buffer));
+		this.#out.maxAge.set(Time.Milli.add(trail, buffer));
+	}
+
+	/**
+	 * How far behind the live edge playback runs: the estimator's answer plus the cross-track offset.
+	 *
+	 * `out.delay` stays the estimator's answer alone, which is what the player's jitter buffer row
+	 * reports and what the conformance corpus holds both languages to. This is what the clock, the
+	 * age budget and the audio ring are actually sized from.
+	 */
+	#trail(): Time.Milli {
+		return Time.Milli.add(this.#out.delay.peek(), this.#out.offset.peek());
 	}
 
 	// "auto" sizes the buffer from what arrives, not from the round trip. A retransmit costs an RTT,
@@ -240,6 +287,9 @@ export class Sync {
 	#runDelay(effect: Effect): void {
 		const mode = effect.get(this.in.delay);
 		const jitter = effect.get(this.#out.jitter);
+		// Read so a moved offset wakes everything parked in `wait()` too; it moves the playhead
+		// exactly as the delay does.
+		effect.get(this.#out.offset);
 
 		this.#out.delay.set(mode === "instant" ? Time.Milli.zero : jitter);
 
@@ -257,8 +307,10 @@ export class Sync {
 	#runClock(effect: Effect): void {
 		const audio = effect.get(this.#tracks.audio.clock);
 		const video = effect.get(this.#tracks.video.clock);
-		// The reference is expressed relative to the delay, so a changed delay re-derives it.
-		const delay = effect.get(this.#out.delay);
+		// The reference is expressed relative to how far playback trails, so a change re-derives it.
+		effect.get(this.#out.delay);
+		effect.get(this.#out.offset);
+		const delay = this.#trail();
 
 		let source: "audio" | "video" | undefined;
 		if (audio) source = "audio";
@@ -289,7 +341,74 @@ export class Sync {
 
 		const reference = this.#out.reference.peek();
 		if (reference === undefined) return undefined;
-		return Time.Milli.sub(Time.Milli.sub(now, reference), this.#out.delay.peek());
+		return Time.Milli.sub(Time.Milli.sub(now, reference), this.#trail());
+	}
+
+	/**
+	 * Measure how much later one track arrives than the other for the same media timestamp.
+	 *
+	 * Sound and picture are meant to leave the device together. Each track's own spread is measured
+	 * against that track's fastest recent arrival, so a track that is uniformly later than the other
+	 * measures a spread of zero and nothing in the estimator can see it. This is that difference,
+	 * and it covers both halves of it at once: the path (one track's frames simply take longer) and
+	 * the publisher (an engine that stamps its video behind its audio, which is 22ms of the Firefox
+	 * case on its own). Both show up as the same quantity here because both move the frame's arrival
+	 * relative to its timestamp.
+	 *
+	 * Delaying the earlier track to match the later one is what WebRTC does in
+	 * `modules/video_coding/stream_synchronization.cc`, and for the same reason: the picture cannot
+	 * be pulled forward, so the sound has to wait.
+	 *
+	 * A whole bucket or nothing. Below the estimator's own resolution this is noise, and a term that
+	 * flickered by a millisecond would re-park the audio ring for nothing.
+	 */
+	#observeArrival(name: "audio" | "video", timestamp: Time.Milli, now: Time.Milli): void {
+		const floor = Time.Milli.sub(now, timestamp);
+
+		const entry = this.#arrivals.get(name);
+		if (!entry) {
+			this.#arrivals.set(name, { current: floor, previous: Number.POSITIVE_INFINITY, opened: now });
+		} else if (Time.Milli.sub(now, entry.opened) >= 2 * OFFSET_WINDOW) {
+			// Gone for longer than the pair of windows: nothing it measured before describes the
+			// path it is on now, so start over rather than walking empty windows.
+			entry.current = floor;
+			entry.previous = Number.POSITIVE_INFINITY;
+			entry.opened = now;
+		} else if (Time.Milli.sub(now, entry.opened) >= OFFSET_WINDOW) {
+			entry.previous = entry.current;
+			entry.current = floor;
+			entry.opened = Time.Milli.add(entry.opened, OFFSET_WINDOW);
+		} else {
+			entry.current = Math.min(entry.current, floor);
+		}
+
+		const floors = new Map<"audio" | "video", number>();
+		for (const [track, arrival] of this.#arrivals) {
+			// A track that stopped delivering stops counting, so muting a tile or scrolling its
+			// canvas away does not hold the other deep for the rest of the session.
+			if (Time.Milli.sub(now, arrival.opened) >= 2 * OFFSET_WINDOW) {
+				this.#arrivals.delete(track);
+				continue;
+			}
+			const reading = Math.min(arrival.current, arrival.previous);
+			if (Number.isFinite(reading)) floors.set(track, reading);
+		}
+
+		// Only video's excess over audio, never the other way round. Audio is the clock and video
+		// is painted when the playhead reaches its timestamp, so a picture that arrives early is
+		// already held for free and one that arrives late is the only thing needing a term. Sound
+		// cannot be pulled forward either; the earlier track is the one that waits.
+		const audio = floors.get("audio");
+		const video = floors.get("video");
+		if (audio === undefined || video === undefined) {
+			this.#out.offset.set(Time.Milli.zero);
+			return;
+		}
+
+		const behind = Math.max(0, video - audio);
+		const bucket = Container.Jitter.BUCKET;
+		const quantised = behind < bucket ? 0 : Math.ceil(behind / bucket) * bucket;
+		this.#out.offset.set(Time.Milli(Math.min(JITTER_CEILING, quantised)));
 	}
 
 	// Fold a newly received frame into the reference. The reference anchors playback to the
@@ -297,6 +416,7 @@ export class Sync {
 	received(timestamp: Time.Milli, label = ""): void {
 		this.#out.timestamp.update((current) => (current === undefined || timestamp > current ? timestamp : current));
 		const now = Time.Milli.now();
+		if (label === "audio" || label === "video") this.#observeArrival(label, timestamp, now);
 		const playhead = this.#playhead(now);
 
 		// First frame anchors the reference.
@@ -344,7 +464,7 @@ export class Sync {
 		if (sleep <= cap) return; // within budget: let the buffer grow instead of skipping ahead
 
 		// Over the cap: re-anchor down so the resulting lookahead is exactly the cap.
-		this.#setReference(Time.Milli.add(ref, Time.Milli.sub(cap, this.#out.delay.peek())));
+		this.#setReference(Time.Milli.add(ref, Time.Milli.sub(cap, this.#trail())));
 	}
 
 	#setReference(ref: Time.Milli): void {
@@ -369,6 +489,10 @@ export class Sync {
 		this.#out.clock.set(undefined);
 		this.#clock = undefined;
 		this.#late.clear();
+		// A rewind moves the media axis, so every arrival floor describes a timeline that no longer
+		// exists. The estimator drops its own reference on a discontinuity for the same reason.
+		this.#arrivals.clear();
+		this.#out.offset.set(Time.Milli.zero);
 		this.#wake();
 	}
 

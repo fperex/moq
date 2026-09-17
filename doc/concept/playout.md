@@ -463,9 +463,63 @@ corpus hold both languages: a step that carried the browser's render block would
 produce a different target series from the same trace on native.
 
 The reported numbers follow the same split. `Sync.out.delay` stays the
-estimator's answer, which is what the player's "jitter buffer" row shows and
-what the age budget and the video pacing are derived from. What a listener waits
-is `delay + chunk`, which is what the "total buffer" row shows.
+estimator's answer, which is what the player's "jitter buffer" row shows. What a
+listener waits is `delay + offset + chunk`, which is what the "total buffer" row
+shows; the middle term is the next section and is zero in the ordinary case.
+
+## Holding the sound for a later picture
+
+Everything above measures one track against itself. Each arrival is compared to
+that track's own fastest recent arrival, so a track that is *uniformly* later
+than another measures a spread of zero, and nothing the estimator produces can
+see the difference between them.
+
+That difference is audible. The watcher paints a frame when the playhead reaches
+its timestamp, so a picture that has not arrived by then is painted as soon as
+it decodes, which is late. Measured on a browser matrix: a Firefox publisher put
+the picture 86 to 109 ms behind the sound at Chromium, Brave and Firefox
+watchers, where every Chromium publisher was inside a frame at every watcher.
+About 22 ms of that is the engine stamping its two timelines differently (a
+capture probe puts Firefox's video 10 ms behind its audio and Chromium's 12 ms
+ahead); the rest is the video path simply delivering later.
+
+So there is a second quantity, measured across tracks rather than within one:
+
+```
+floor(track)  = min over a window of (arrival - timestamp)
+offset        = max(0, floor(video) - floor(audio))
+```
+
+A minimum, for the same reason each arrival is measured against the fastest
+recent one: the floor is the path, and everything above it is jitter the
+estimator already covers. Two rotating windows of 2 s, so a track that stops
+delivering drops out of the comparison within two windows instead of holding the
+sound deep for the rest of the session, and a rewind clears both the way
+`reanchor()` clears the estimator's reference. Quantised up to a whole bucket,
+with anything below one bucket reading zero: below the estimator's own
+resolution this is noise, and a term that flickered by a millisecond would
+re-park the ring for nothing.
+
+It is deliberately one-directional. Audio is the clock and video is painted when
+the playhead reaches its timestamp, so a picture that arrives *early* is already
+held for free and needs no term; only a picture that arrives late does, and the
+only way to wait for it is to hold the sound. WebRTC reaches the same place from
+the same argument, computing the relative delay between the two streams and
+slowing the earlier one
+(`modules/video_coding/stream_synchronization.cc`).
+
+The term is published as `Sync.out.offset` and spent in two places, which have
+to move together:
+
+- the audio ring holds `delay + offset + chunk`, which is the whole point: the
+  sound waits for the picture.
+- the age budget reaches back over `delay + offset + buffer`. A budget sized
+  without it convicts the very group the deeper hold is waiting for, so the
+  picture never arrives and the hold is paid for nothing.
+
+`Sync.out.delay` is untouched by it. The estimator's answer is what the corpus
+describes and what both languages are held to, and this is not an estimator
+quantity: it is a property of a pair of tracks, and `moq-audio` has only one.
 
 ## Parity traps
 

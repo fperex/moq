@@ -62,9 +62,12 @@ export function latencyTab(parent: Effect, watch: MoqWatch): HTMLElement {
 		const playout = effect.get(watch.audio.out.debug);
 		const rate = effect.get(watch.audio.out.sampleRate);
 		const chunk = playout && rate ? Moq.Time.Milli((playout.chunk / rate) * 1000) : Moq.Time.Milli.zero;
+		// A publisher whose picture reaches the viewer later than its sound is held for here too,
+		// and the listener waits that as well. Zero whenever the two arrive together.
+		const offset = effect.get(watch.sync.out.offset);
 
 		jitterVal.textContent = `${formatMillis(jitter)}${mode === "auto" ? " (auto)" : ""}`;
-		bufferVal.textContent = formatMillis(Moq.Time.Milli.add(delay, chunk));
+		bufferVal.textContent = formatMillis(Moq.Time.Milli.add(Moq.Time.Milli.add(delay, offset), chunk));
 	});
 
 	const hint = DOM.create(

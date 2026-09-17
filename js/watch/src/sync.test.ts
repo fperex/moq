@@ -462,3 +462,97 @@ describe("clock", () => {
 		sync.close();
 	});
 });
+
+describe("the cross-track arrival offset", () => {
+	// Feed both tracks the same media timeline in real time, with the picture landing `late`
+	// milliseconds after the sound for every timestamp. Returns the sync afterwards.
+	function deliver(sync: Sync, tick: ReturnType<typeof fakeClock>, late: number, seconds = 6) {
+		for (let media = 0; media < seconds * 1000; media += 20) {
+			// The sound for this instant, on time.
+			tick.advance(20);
+			sync.received(media as Time.Milli, "audio");
+
+			// The picture for the same instant, `late` milliseconds behind it. Sent on the sound's
+			// grid so the two are measured against the same wall clock rather than drifting apart.
+			if (media % 40 === 0) {
+				sync.received(Math.max(0, media - late) as Time.Milli, "video");
+			}
+		}
+	}
+
+	it("holds the sound for a picture that arrives later, and only for that", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(40) });
+		try {
+			deliver(sync, clock, 70);
+			await flush();
+
+			// A whole bucket at a time, so 70ms of lateness is covered by 80ms of hold rather than
+			// by a term that flickers by a millisecond and re-parks the ring.
+			expect(sync.out.offset.peek()).toBe(Time.Milli(80));
+
+			// The estimator's answer is untouched: the jitter buffer row still reports what the
+			// viewer asked for, and the corpus still describes the whole of `out.delay`.
+			expect(sync.out.delay.peek()).toBe(Time.Milli(40));
+
+			// What playback actually waits, and what the age budget has to reach back over, both
+			// grow by it. Otherwise the deeper hold waits for a group the budget already convicted.
+			expect(sync.out.maxAge.peek()).toBe(Time.Milli(120));
+		} finally {
+			sync.close();
+		}
+	});
+
+	it("adds nothing when the two tracks arrive together", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(40) });
+		try {
+			deliver(sync, clock, 0);
+			await flush();
+
+			expect(sync.out.offset.peek()).toBe(Time.Milli.zero);
+			expect(sync.out.delay.peek()).toBe(Time.Milli(40));
+			expect(sync.out.maxAge.peek()).toBe(Time.Milli(40));
+		} finally {
+			sync.close();
+		}
+	});
+
+	it("adds nothing for a picture that arrives early, which the playhead already holds", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(40) });
+		try {
+			// The publisher stamps its camera ahead of its microphone, so the picture lands before
+			// the sound for the same timestamp. Video is painted when the playhead reaches it, so it
+			// is held for free; deepening the sound here would push the picture further behind.
+			deliver(sync, clock, -70);
+			await flush();
+
+			expect(sync.out.offset.peek()).toBe(Time.Milli.zero);
+		} finally {
+			sync.close();
+		}
+	});
+
+	it("lets go once the picture stops arriving", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(40) });
+		try {
+			deliver(sync, clock, 70);
+			await flush();
+			expect(sync.out.offset.peek()).toBe(Time.Milli(80));
+
+			// The tile is muted, the canvas scrolls away, the picture stops. A term measured
+			// against a track nobody is downloading would hold the sound deep for the session.
+			for (let media = 6000; media < 12000; media += 20) {
+				clock.advance(20);
+				sync.received(media as Time.Milli, "audio");
+			}
+			await flush();
+
+			expect(sync.out.offset.peek()).toBe(Time.Milli.zero);
+		} finally {
+			sync.close();
+		}
+	});
+});
