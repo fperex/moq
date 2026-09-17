@@ -160,9 +160,13 @@ export class Decoder {
 	// The catalog fields that require a replacement subscription or decoder.
 	readonly #identity: Computed<PlaybackIdentity | undefined>;
 
-	// The decoder fields that require a new audio graph. Routing and metadata changes leave the
-	// context, worklet, and ring alone.
+	// The decoder fields that require a new worklet and ring. Routing and metadata changes leave
+	// them alone.
 	readonly #config: Computed<DecoderConfig | undefined>;
+
+	// The rate the graph runs at: what the decoder turns out to emit, else what the catalog claims.
+	// Deduped, so a decoded rate confirming the catalog's does not count as a change.
+	readonly #rate: Computed<number | undefined>;
 
 	/**
 	 * The age budget for audio: `Sync.out.maxAge` plus what the ring can absorb past it.
@@ -199,19 +203,59 @@ export class Decoder {
 			const config = effect.get(this.source.out.config);
 			return config ? decoderConfig(config) : undefined;
 		});
+		this.#rate = this.#signals.computed((effect) => {
+			const config = effect.get(this.#config);
+			if (!config) return undefined;
+			return effect.get(this.#decodedSampleRate) ?? config.sampleRate;
+		});
 
 		this.#maxAge = new Derived(
 			[this.sync.out.maxAge, this.sync.in.delay, this.source.out.config] as const,
 			(maxAge, delay, config) => audioMaxAge(maxAge, config, delay === "instant"),
 		);
 
+		// The context is built without a user gesture (see #runContext), so it must be started from a
+		// real interaction. Armed for the decoder's lifetime rather than while audio is enabled: the
+		// click that unmutes a tile is the activation, and listeners armed as a consequence of it are
+		// armed one microtask too late to hear it. See unlockOnGesture.
+		unlockOnGesture(this.#signals, this.#out.context);
+
+		this.#signals.run(this.#runContext.bind(this));
 		this.#signals.run(this.#runWorklet.bind(this));
-		this.#signals.run(this.#runEnabled.bind(this));
 		this.#signals.run(this.#runFlush.bind(this));
 		this.#signals.run(this.#runClock.bind(this));
 		this.#signals.run(this.#runLatency.bind(this));
 		this.#signals.run(this.#runLatencyReanchor.bind(this));
 		this.#signals.run(this.#runDecoder.bind(this));
+	}
+
+	/**
+	 * Build the AudioContext the graph runs in, keyed on the rate it runs at and nothing else.
+	 *
+	 * A context is the only thing here a user gesture starts, and an activation lasts seconds, so a
+	 * context built after it lapses can never be started: WebKit leaves it suspended and renders
+	 * nothing while video keeps painting. Anything else that rebuilds the graph (a later catalog
+	 * frame carrying the codec description, a channel count change) therefore has to rebuild the
+	 * worklet and ring *under* the context that is already playing, not replace it.
+	 *
+	 * Pre-built at the catalog rate so warm-up starts before the first frame arrives. The decoder's
+	 * actual output rate is the source of truth (see #emit); if it differs, #emit sets
+	 * #decodedSampleRate and this rebuilds at the real rate, which is the one case worth a new
+	 * context, since a context's rate is fixed for its lifetime.
+	 */
+	#runContext(effect: Effect): void {
+		const rate = effect.get(this.#rate);
+		if (rate === undefined) return;
+
+		const context = new AudioContext({
+			latencyHint: "interactive", // We don't use real-time because of the buffer.
+			sampleRate: rate,
+		});
+		effect.cleanup(() => context.close());
+
+		// Expose the rate the graph actually runs at.
+		effect.set(this.#out.sampleRate, context.sampleRate);
+		effect.set(this.#out.context, context);
 	}
 
 	#runWorklet(effect: Effect): void {
@@ -221,25 +265,14 @@ export class Decoder {
 		//const enabled = effect.get(this.enabled);
 		//if (!enabled) return;
 
+		const context = effect.get(this.#out.context);
+		if (!context) return;
+
 		const config = effect.get(this.#config);
 		if (!config) return;
 
-		// Pre-build the graph at the catalog rate so warm-up starts before the first frame arrives. The
-		// decoder's actual output rate is the source of truth (see #emit); if it differs, #emit sets
-		// #decodedSampleRate, which re-runs this effect and rebuilds the graph at the real rate.
-		const sampleRate = effect.get(this.#decodedSampleRate) ?? config.sampleRate;
+		const sampleRate = context.sampleRate;
 		const channelCount = config.numberOfChannels;
-
-		// Expose the rate the graph actually runs at.
-		effect.set(this.#out.sampleRate, sampleRate);
-
-		const context = new AudioContext({
-			latencyHint: "interactive", // We don't use real-time because of the buffer.
-			sampleRate,
-		});
-		effect.set(this.#out.context, context);
-
-		effect.cleanup(() => context.close());
 
 		effect.spawn(async () => {
 			// Register the AudioWorklet processor, racing the load against teardown. If teardown wins,
@@ -305,23 +338,6 @@ export class Decoder {
 		});
 	}
 
-	#runEnabled(effect: Effect): void {
-		const enabled = effect.get(this.in.enabled);
-		if (!enabled) return;
-		if (effect.get(this.sync.in.delay) === "instant") {
-			this.reset();
-			return;
-		}
-
-		// The context is built without a user gesture (see #runWorklet), so it must be started from a
-		// real interaction. Deliberately not gated on the context: it does not exist until the catalog
-		// names an audio rendition, and the click that started playback is usually before that. See
-		// unlockOnGesture.
-		unlockOnGesture(effect, this.#out.context);
-
-		// NOTE: You should disconnect/reconnect the worklet to save power when disabled.
-	}
-
 	/**
 	 * Flush the ring when the download stops.
 	 *
@@ -332,6 +348,15 @@ export class Decoder {
 	 */
 	#runFlush(effect: Effect): void {
 		if (!effect.get(this.in.enabled)) return;
+
+		// "instant" holds nothing, so the decoder refuses it (see #runDecoder) and whatever the ring
+		// still holds stops being filled: drop it now rather than playing it against video that just
+		// jumped to the live edge.
+		if (effect.get(this.sync.in.delay) === "instant") {
+			this.reset();
+			return;
+		}
+
 		effect.cleanup(() => this.#ring?.reset());
 	}
 
