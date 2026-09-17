@@ -144,10 +144,14 @@ export class Decoder {
 	// Audio ring bridging main thread and worklet (shared memory or postMessage transport).
 	#ring: AudioBuffer | undefined;
 
+	// The AudioContext the graph runs in, owned here rather than by an effect: it is built by the
+	// gesture that starts it (see #buildContext) and outlives every other change to the graph.
+	#context: AudioContext | undefined;
+
 	// The rate the decoder actually outputs, learned from the first decoded frame. This is the source
 	// of truth for the graph: a decoder can output a different rate than it was configured with (e.g.
 	// Opus decodes to 48kHz on Chrome/Firefox but to the configured rate on Safari). Until a frame
-	// arrives we pre-build the graph from the catalog rate; if the real rate differs we rebuild it.
+	// arrives the graph is built at the catalog rate; if the real rate differs we rebuild it.
 	#decodedSampleRate = new Signal<number | undefined>(undefined);
 
 	// Ordered discontinuity and endpoint state from the container consumer.
@@ -222,11 +226,12 @@ export class Decoder {
 			(maxAge, delay, config) => audioMaxAge(maxAge, config, delay === "instant"),
 		);
 
-		// The context is built without a user gesture (see #runContext), so it must be started from a
-		// real interaction. Armed for the decoder's lifetime rather than while audio is enabled: the
-		// click that unmutes a tile is the activation, and listeners armed as a consequence of it are
-		// armed one microtask too late to hear it. See unlockOnGesture.
-		unlockOnGesture(this.#signals, this.#out.context);
+		// There is no context until a user gesture builds one (see #buildContext). Armed for the
+		// decoder's lifetime rather than while audio is enabled: the click that unmutes a tile is the
+		// activation, and listeners armed as a consequence of it are armed one microtask too late to
+		// hear it. See unlockOnGesture.
+		unlockOnGesture(this.#signals, this.#out.context, () => this.#context ?? this.#buildContext(this.#rate.peek()));
+		this.#signals.cleanup(() => this.#closeContext());
 
 		this.#signals.run(this.#runContext.bind(this));
 		this.#signals.run(this.#runWorklet.bind(this));
@@ -238,37 +243,84 @@ export class Decoder {
 	}
 
 	/**
-	 * Build the AudioContext the graph runs in, keyed on the rate it runs at and nothing else.
+	 * Build the context for a tile whose audio is on, and replace it when the rate it must run at
+	 * changes.
 	 *
-	 * A context is the only thing here a user gesture starts, and an activation lasts seconds, so a
-	 * context built after it lapses can never be started: WebKit leaves it suspended and renders
-	 * nothing while video keeps painting. Anything else that rebuilds the graph (a later catalog
-	 * frame carrying the codec description, a channel count change) therefore has to rebuild the
-	 * worklet and ring *under* the context that is already playing, not replace it.
-	 *
-	 * Pre-built at the catalog rate so warm-up starts before the first frame arrives. The decoder's
-	 * actual output rate is the source of truth (see #emit); if it differs, #emit sets
-	 * #decodedSampleRate and this rebuilds at the real rate, which is the one case worth a new
-	 * context, since a context's rate is fixed for its lifetime.
+	 * A context's rate is fixed for its lifetime, so the rate the decoder turns out to emit (see
+	 * #emit) is the one change worth a new context. Everything else that rebuilds the graph (a later
+	 * catalog frame carrying the codec description, a channel count change) rebuilds the worklet and
+	 * ring *under* the context that is already playing, since replacing it would spend a gesture
+	 * that may never come again. The replacement here is built outside a handler, so it starts only
+	 * while the page's activation is still live; unlockOnGesture stays armed and spends the next
+	 * gesture on it otherwise.
 	 */
 	#runContext(effect: Effect): void {
 		const rate = effect.get(this.#rate);
-		if (rate === undefined) return;
+		const enabled = effect.get(this.in.enabled);
+
+		const context = this.#context;
+		if (!context) {
+			// Audio is asked for, so build the graph and let unlockOnGesture try to start it: a
+			// permissive autoplay policy runs it with no gesture at all (the audio-quality lane
+			// launches Chromium that way and never clicks), a strict one leaves it suspended until the
+			// next gesture, and a tile unmuted by a click the listeners never saw is still inside that
+			// click's activation. A muted tile builds nothing, which is the load-time cost the viewer
+			// sees: three muted tiles were three contexts nothing could start and three autoplay
+			// warnings. Waits for the rate, unlike the gesture path, which cannot.
+			if (enabled && rate !== undefined) this.#buildContext(rate);
+			return;
+		}
+
+		if (rate !== undefined && context.sampleRate !== rate) this.#buildContext(rate);
+	}
+
+	/**
+	 * Build the AudioContext the graph runs in, replacing the one it has.
+	 *
+	 * Called from the gesture handler, synchronously, because a context is the only thing here a
+	 * user gesture starts: one built later can only be started while the page's activation lasts, a
+	 * few seconds in WebKit, and past that it stays suspended and nothing is ever rendered while
+	 * video keeps painting. Building one at load instead costs an autoplay warning per tile in
+	 * Chromium and a render thread per muted tile, for a graph nobody has asked to hear yet.
+	 *
+	 * `rate` is what the catalog claims, or what the decoder turns out to emit once a frame has
+	 * arrived (see #emit). It is undefined when the gesture lands before the catalog does, and the
+	 * context then runs at the device default until a rate that differs replaces it.
+	 */
+	#buildContext(rate: number | undefined): AudioContext {
+		this.#closeContext();
 
 		const context = new AudioContext({
 			latencyHint: "interactive", // We don't use real-time because of the buffer.
-			sampleRate: rate,
+			// Absent rather than undefined, so the browser picks the device default.
+			...(rate !== undefined && { sampleRate: rate }),
 		});
-		effect.cleanup(() => context.close());
+		this.#context = context;
 
 		// Expose the rate the graph actually runs at.
-		effect.set(this.#out.sampleRate, context.sampleRate);
-		effect.set(this.#out.context, context);
+		this.#out.sampleRate.set(context.sampleRate);
+		this.#out.context.set(context);
+
+		return context;
+	}
+
+	/** Tear down the context and everything built against it, which the graph rebuilds without. */
+	#closeContext(): void {
+		const context = this.#context;
+		if (!context) return;
+
+		this.#context = undefined;
+		this.#out.context.set(undefined);
+		this.#out.sampleRate.set(undefined);
+
+		// A context closed twice rejects, and there is nothing to do about a close that fails anyway.
+		context.close().catch(() => {});
 	}
 
 	#runWorklet(effect: Effect): void {
-		// It takes a second or so to initialize the AudioContext/AudioWorklet, so do it even if disabled.
-		// This is less efficient for video-only playback but makes muting/unmuting instant.
+		// It takes a second or so to initialize the AudioWorklet, so do it even if disabled. This is
+		// less efficient for video-only playback but makes muting/unmuting instant, since the first
+		// gesture on the page builds a context for every tile whether or not it is the one clicked.
 
 		//const enabled = effect.get(this.enabled);
 		//if (!enabled) return;
@@ -785,7 +837,10 @@ export class Decoder {
 
 		const ring = this.#ring;
 		if (!ring) {
-			// We're probably in the process of closing.
+			// There is nowhere to play this: either we are closing, or no gesture has built the
+			// context yet (see #buildContext) and there is no graph under it. Downloading and
+			// decoding continues either way, so the arrival estimate is already measured when the
+			// gesture lands rather than starting cold from the publisher's declaration.
 			sample.close();
 			return;
 		}

@@ -40,10 +40,15 @@ function armed(ctx: MockContext): Signal<AudioContext | undefined> {
 	return new Signal<AudioContext | undefined>(asContext(ctx));
 }
 
+/** A builder that must not be called, since these cases already have a context. */
+const never = (): AudioContext => {
+	throw new Error("built a second context");
+};
+
 test("retries resume() on a user gesture until the context is running", async () => {
 	const ctx = new MockContext();
 	const effect = new Effect();
-	unlockOnGesture(effect, armed(ctx));
+	unlockOnGesture(effect, armed(ctx), never);
 	await flush();
 
 	// The at-load attempt fires once. Browsers requiring a gesture reject it, but we still
@@ -70,7 +75,7 @@ test("retries resume() on a user gesture until the context is running", async ()
 test("re-arms when Safari drops the context to interrupted", async () => {
 	const ctx = new MockContext();
 	const effect = new Effect();
-	unlockOnGesture(effect, armed(ctx));
+	unlockOnGesture(effect, armed(ctx), never);
 	await flush();
 
 	ctx.transition("running");
@@ -89,21 +94,47 @@ test("re-arms when Safari drops the context to interrupted", async () => {
 	effect.close();
 });
 
-test("arms before the context exists, so the first gesture on the page is not lost", async () => {
-	// The arming order that matters: audio is enabled long before the catalog names a rendition, so
-	// the context is built after the click that selected the tile. Listeners armed with the context
-	// would miss that click and the viewer would have to click a second time to hear anything.
+test("builds the context inside the gesture, not from an effect the gesture schedules", async () => {
+	// Nothing is built at load: a context built there is one nothing can start, and it costs an
+	// autoplay warning and a render thread per tile. The gesture is the moment it is built, and it
+	// has to be built and resumed before the handler returns, because an effect scheduled here runs
+	// a microtask later, by which point WebKit is relying on the grace that follows the activation.
+	const context = new Signal<AudioContext | undefined>(undefined);
+	let built = 0;
+	const effect = new Effect();
+	unlockOnGesture(effect, context, () => {
+		built++;
+		const ctx = new MockContext();
+		context.set(asContext(ctx));
+		return asContext(ctx);
+	});
+	await flush();
+
+	expect(built).toBe(0);
+	expect(context.peek()).toBeUndefined();
+
+	document.dispatchEvent(new Event("pointerdown"));
+
+	const ctx = context.peek() as unknown as MockContext;
+	expect(built).toBe(1);
+	expect(ctx.resumeCalls).toBe(1);
+
+	// The context it built is the one the next gesture is spent on.
+	document.dispatchEvent(new Event("keydown"));
+	expect(built).toBe(1);
+	expect(ctx.resumeCalls).toBe(2);
+
+	effect.close();
+});
+
+test("resumes a context that replaced the one the gesture started", async () => {
+	// The caller rebuilds the context when the rate the graph runs at changes. That one is born
+	// outside a handler, so it is armed again here rather than assumed started.
 	const context = new Signal<AudioContext | undefined>(undefined);
 	const effect = new Effect();
-	unlockOnGesture(effect, context);
+	unlockOnGesture(effect, context, never);
 	await flush();
 
-	// A gesture with no context yet does nothing, and must not throw.
-	document.dispatchEvent(new Event("pointerdown"));
-	await flush();
-
-	// The catalog arrives and the graph is built. The context is resumed without waiting for
-	// another gesture, and the listeners armed above are already serving it.
 	const ctx = new MockContext();
 	context.set(asContext(ctx));
 	await flush();
@@ -123,7 +154,7 @@ test("arms before the context exists, so the first gesture on the page is not lo
 test("stops resuming after the effect closes", async () => {
 	const ctx = new MockContext();
 	const effect = new Effect();
-	unlockOnGesture(effect, armed(ctx));
+	unlockOnGesture(effect, armed(ctx), never);
 	await flush();
 
 	effect.close();

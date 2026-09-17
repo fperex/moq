@@ -1,19 +1,21 @@
 import { type Effect, type Getter, Signal } from "@moq/signals";
 
 /**
- * Resume a suspended {@link AudioContext} from a real user gesture.
+ * Build and start an {@link AudioContext} from a real user gesture.
  *
- * Takes the context as a getter rather than a context, because the gesture that unlocks it can
- * happen before it exists: the graph is built when the catalog names an audio rendition, which on a
- * slow-starting broadcast is seconds after the click that started playback. Listeners armed with the
- * context would miss that click, and the viewer would have to click a second time to hear anything.
- * Armed for the caller's lifetime instead, the first gesture anywhere on the page counts.
+ * A context is the only thing here a user gesture starts, so a tile that has none builds one inside
+ * the handler, by `build`, at the moment the gesture lands. Building one for every tile at load
+ * instead makes a muted tile pay for a graph nobody has asked to hear: Chromium logs "The
+ * AudioContext was not allowed to start" for each one and each holds a render thread. Building it
+ * later, from an effect the gesture schedules, is worse than either: WebKit only starts a context
+ * resumed outside a handler while the page's activation is still live, a few seconds, and past that
+ * the context stays suspended for good while video keeps painting.
  *
- * Arm it before anything can be clicked, not as a consequence of the click. WebKit does start a
- * context resumed outside a handler, but only while the page's activation is still live, which is a
- * few seconds; past that the context stays suspended for good and nothing is ever rendered. So a
- * gesture is only reliably spent on the context that exists when it lands, which is also why the
- * caller keeps that context rather than rebuilding the graph around it.
+ * `context` is the context that already exists, tracked rather than passed by value because the
+ * caller builds one of its own when the app asks for audio without waiting to be clicked, and
+ * replaces it when the rate the graph must run at changes. Either is born outside a handler, so it
+ * starts on its own only where the autoplay policy is permissive or the activation is still live;
+ * the listeners stay armed regardless and spend the next gesture on it.
  *
  * This attempts `resume()` whenever the context is not running (for autoplay-permissive browsers
  * like Chrome with prior engagement, and for a page that has already had its gesture), and again on
@@ -27,14 +29,19 @@ import { type Effect, type Getter, Signal } from "@moq/signals";
  *
  * Scoped to `effect`: the listeners are removed when the effect reruns or closes.
  */
-export function unlockOnGesture(effect: Effect, context: Getter<AudioContext | undefined>): void {
+export function unlockOnGesture(
+	effect: Effect,
+	context: Getter<AudioContext | undefined>,
+	build: () => AudioContext,
+): void {
 	// Nothing to arm where there is no document (server rendering, a test runner): no gestures reach
 	// this build, and no audio plays out of it either.
 	if (typeof document === "undefined") return;
 
 	// Armed before anything reads the context, so a gesture is never lost to the order these run in.
-	effect.event(document, "pointerdown", () => resume(context.peek()));
-	effect.event(document, "keydown", () => resume(context.peek()));
+	const spend = () => resume(context.peek() ?? build());
+	effect.event(document, "pointerdown", spend);
+	effect.event(document, "keydown", spend);
 
 	effect.run((inner) => {
 		const current = inner.get(context);
