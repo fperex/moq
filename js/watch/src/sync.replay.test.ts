@@ -363,8 +363,16 @@ function postAudioBuffer(worklet: FakeWorklet, latency: number): AudioBuffer {
  * `port` runs the playhead through the real fallback transport instead of reading the ring directly:
  * the buffer only learns where the reader is from state messages, so every mute has one composed
  * before the worklet saw the flush.
+ *
+ * `videoOffset` is the publisher's audio/video epoch offset, which is what a mute exposes. See
+ * the video feed below.
  */
-async function session({ reanchor = true, flush: doFlush = true, port = false } = {}): Promise<Session> {
+async function session({
+	reanchor = true,
+	flush: doFlush = true,
+	port = false,
+	videoOffset = 0,
+} = {}): Promise<Session> {
 	const time = fakeClock();
 	clock = time;
 
@@ -394,6 +402,7 @@ async function session({ reanchor = true, flush: doFlush = true, port = false } 
 	let enabled = true;
 	let target = sync.out.delay.peek();
 	let frame = 0; // the next video frame's timestamp
+	let videoMedia = 0; // the next video frame's capture instant, on the audio timeline
 	let painted: number | undefined;
 	let media = 0; // the next audio frame's timestamp, in ms
 	let ahead = 0;
@@ -437,6 +446,20 @@ async function session({ reanchor = true, flush: doFlush = true, port = false } 
 			} else {
 				ring.reset();
 			}
+		}
+
+		// Video keeps downloading through a mute, and the decoder hands every arrival to `received()`.
+		// With nothing nominating a clock that is the only thing moving the reference, so the mute
+		// decides where the picture runs: the lookahead a held frame would need is over `maxAge`, so
+		// playback skips ahead to the live edge and stays there until the clock comes back.
+		//
+		// `videoOffset` is the publisher's audio/video epoch offset. `js/publish` pins the video
+		// timeline on the first camera frame's arrival (`video/processor.ts`'s `Epoch`), so whatever
+		// sat between capture and that anchor leaves every video timestamp that far ahead of the
+		// audio for the same instant, and the viewer holds the picture that much longer to match.
+		while (videoMedia + PATH <= now) {
+			sync.received((videoMedia + videoOffset) as Time.Milli, "video");
+			videoMedia += FRAME;
 		}
 
 		// The publisher keeps producing whether or not anyone is listening, so the media a mute
@@ -581,6 +604,34 @@ describe("mutes and latency presets keep video on the audio", () => {
 		expect(collapsed.lag).toBeGreaterThan(2000);
 		expect(collapsed.ahead).toBeGreaterThan(1000);
 		expect(stale.ahead).toBeGreaterThan(500);
+	}, 120_000);
+
+	// What is left after the flush fix: the step the picture takes when the clock changes hands.
+	// While audio is the clock the picture is painted at the audio playhead, so a publisher whose
+	// two timelines disagree costs nothing visible. A mute takes the clock away and the video
+	// arrivals re-anchor playback to the live edge; the unmute hands it back and the picture returns
+	// to the playhead. The step between those two positions is the publisher's epoch offset, so a
+	// broadcast whose clocks agree returns within a frame and one whose clocks are 350ms apart takes
+	// 350ms to walk back. Measured on a browser publisher whose camera anchored 350 to 465ms ahead
+	// of its microphone: worst skew 332.9ms, 0.3s after the unmute, converging inside a frame in
+	// 0.8s, with no underruns.
+	it("returns the picture to the playhead within a frame when the publisher's clocks agree", async () => {
+		const aligned = await session({ port: true, videoOffset: 0 });
+		clock?.restore();
+		const offset = await session({ port: true, videoOffset: 350 });
+
+		console.log(
+			`sync sequence (unmute): worst skew ${aligned.skew.toFixed(1)}ms with the publisher's clocks aligned, ${offset.skew.toFixed(1)}ms with them 350ms apart`,
+		);
+
+		// One video frame is the resolution the picture has, and the reported playhead is up to a
+		// poll stale on top of that.
+		expect(aligned.skew).toBeLessThan(FRAME + POLL);
+
+		// The offset and nothing else: hold the viewer adds of its own would show here rather than
+		// hiding behind the publisher's.
+		expect(offset.skew).toBeGreaterThan(350 - FRAME);
+		expect(offset.skew).toBeLessThan(350 + FRAME + POLL);
 	}, 120_000);
 
 	// The same sequence over the fallback transport, which is what an engine without cross-origin

@@ -237,3 +237,222 @@ test("rejects the removed source prop instead of publishing nothing", async () =
 		"moved to Audio.Capture",
 	);
 });
+
+// Models the worklet path the fake above deliberately never reaches: a context that renders, a node
+// whose port delivers quanta, and a clock the test moves by hand.
+function installRenderingWebAudio() {
+	class FakePort extends EventTarget {
+		start(): void {}
+		postMessage(): void {}
+	}
+
+	class FakeAudioWorkletNode {
+		port = new FakePort();
+		constructor(_context: unknown, _name: string) {
+			node = this;
+		}
+		connect(): void {}
+		disconnect(): void {}
+	}
+
+	class FakeAudioContext {
+		state: AudioContextState = "running";
+		// Zero until the device opens and the context starts rendering, which is the whole point.
+		currentTime = 0;
+		sampleRate: number;
+		audioWorklet = { addModule: () => Promise.resolve() };
+		constructor(options?: AudioContextOptions) {
+			context = this;
+			this.sampleRate = options?.sampleRate ?? 48_000;
+		}
+		close(): Promise<void> {
+			return Promise.resolve();
+		}
+	}
+
+	class FakeGraphNode {
+		channelCount = 2;
+		connect(): void {}
+		disconnect(): void {}
+	}
+
+	let node: FakeAudioWorkletNode | undefined;
+	let context: FakeAudioContext | undefined;
+	let now = 1_000;
+	const clock = spyOn(performance, "now").mockImplementation(() => now);
+
+	const globals: Record<string, unknown> = {
+		AudioContext: FakeAudioContext,
+		MediaStream: class {},
+		MediaStreamAudioSourceNode: FakeGraphNode,
+		AudioWorkletNode: FakeAudioWorkletNode,
+	};
+
+	const originals = new Map<string, PropertyDescriptor | undefined>();
+	for (const [name, value] of Object.entries(globals)) {
+		originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+		Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+	}
+
+	return {
+		/** Move the wall clock and the context clock to `atMs`, the way a rendering context does. */
+		render(atMs: number, contextSeconds: number) {
+			now = atMs;
+			if (context) context.currentTime = contextSeconds;
+		},
+		/** Break the context clock, so the capture has nothing to anchor against. */
+		breakClock() {
+			if (context) context.currentTime = Number.NaN;
+		},
+		/** Push one quantum from the audio thread, starting at context sample frame `frame`. */
+		deliver(frame: number, samples = 128, channels = 2) {
+			if (!node) throw new Error("no AudioWorkletNode was constructed");
+			node.port.dispatchEvent(
+				new MessageEvent("message", {
+					data: { frame, channels: Array.from({ length: channels }, () => new Float32Array(samples)) },
+				}),
+			);
+		},
+		[Symbol.dispose]() {
+			clock.mockRestore();
+			for (const [name, original] of originals) {
+				if (original) Object.defineProperty(globalThis, name, original);
+				else Reflect.deleteProperty(globalThis, name);
+			}
+		},
+	};
+}
+
+// Subscribe before anything is pushed: a Fanout only distributes to the readers it already has.
+async function captureReader(capture: InstanceType<typeof Capture>, effect: Effect) {
+	await settle();
+	const fanout = capture.out.frames.peek();
+	if (!fanout) throw new Error("the capture never produced a fanout");
+	return fanout.subscribe(effect).getReader();
+}
+
+// Regression: the worklet used to be handed `performance.now()` at construction and stamp sample 0
+// with it, although the device opens and the context starts rendering hundreds of milliseconds
+// later. Every audio timestamp was backdated by that delay while video was anchored on arrival, so
+// a browser publish shipped sound ahead of picture for every viewer.
+test("stamps a quantum where the context clock says it was captured, not where the node was built", async () => {
+	using webaudio = installRenderingWebAudio();
+	const effect = new Effect();
+
+	try {
+		const capture = new Capture({ enabled: true, source: new Signal(fakeSource()) as never });
+		const reader = await captureReader(capture, effect);
+
+		// The node was built at 1000ms, but the device took 400ms to open, so the context has only
+		// just rendered its first quantum.
+		webaudio.render(1_400, 128 / 48_000);
+		webaudio.deliver(0);
+
+		const first = (await reader.read()).value;
+		// 1400ms less the quantum already rendered, in microseconds. The construction-time anchor
+		// would say 1_000_000.
+		expect(first?.timestamp).toBeGreaterThan(1_390_000);
+		expect(first?.timestamp).toBeLessThanOrEqual(1_400_000);
+
+		// Sample-count continuity is what keeps the framer from re-anchoring: consecutive quanta are
+		// exactly 128 samples apart however late the messages are handled.
+		webaudio.render(1_412, 384 / 48_000);
+		webaudio.deliver(128);
+
+		const second = (await reader.read()).value;
+		expect((second?.timestamp ?? 0) - (first?.timestamp ?? 0)).toBeCloseTo((128 / 48_000) * 1_000_000, 3);
+
+		capture.close();
+	} finally {
+		effect.close();
+	}
+});
+
+// The other half of the same defect, measured on a Chromium publisher: the graph renders a couple of
+// quanta as soon as it is built, then the context clock stops for a quarter of a second while the
+// microphone opens, then runs in real time. Pairing the two clocks once, on a quantum from before
+// that stall, anchors the whole capture 245ms before the audio it describes.
+test("re-anchors when the context clock stalls for the device to open", async () => {
+	using webaudio = installRenderingWebAudio();
+	const effect = new Effect();
+
+	try {
+		const capture = new Capture({ enabled: true, source: new Signal(fakeSource()) as never });
+		const reader = await captureReader(capture, effect);
+
+		// Two priming quanta, rendered back to back before the device is streaming.
+		webaudio.render(1_005, 128 / 48_000);
+		webaudio.deliver(0);
+		webaudio.render(1_007, 256 / 48_000);
+		webaudio.deliver(128);
+		const primed = (await reader.read()).value;
+		await reader.read();
+
+		// The device opens 245ms later and the context clock picks up where it left off.
+		webaudio.render(1_252, 384 / 48_000);
+		webaudio.deliver(256);
+		const live = (await reader.read()).value;
+
+		expect(live?.timestamp).toBeGreaterThan(1_240_000);
+		expect(live?.timestamp).toBeLessThanOrEqual(1_252_000);
+
+		// The framer sees the stall as the discontinuity it is rather than 5ms of contiguous audio.
+		expect((live?.timestamp ?? 0) - (primed?.timestamp ?? 0)).toBeGreaterThan(200_000);
+
+		capture.close();
+	} finally {
+		effect.close();
+	}
+});
+
+// A dropped quantum has to reach the framer as a gap, so it re-anchors rather than sliding the whole
+// timeline earlier by the length of the drop.
+test("carries an audio thread drop through as a timestamp gap", async () => {
+	using webaudio = installRenderingWebAudio();
+	const effect = new Effect();
+
+	try {
+		const capture = new Capture({ enabled: true, source: new Signal(fakeSource()) as never });
+		const reader = await captureReader(capture, effect);
+
+		webaudio.render(1_400, 128 / 48_000);
+		webaudio.deliver(0);
+		const first = (await reader.read()).value;
+
+		// The audio thread skipped four quanta, so the next one starts 640 samples in.
+		webaudio.render(1_415, 768 / 48_000);
+		webaudio.deliver(640);
+		const second = (await reader.read()).value;
+
+		expect((second?.timestamp ?? 0) - (first?.timestamp ?? 0)).toBeCloseTo((640 / 48_000) * 1_000_000, 3);
+
+		capture.close();
+	} finally {
+		effect.close();
+	}
+});
+
+// Supported or refused: a context that can't say where it is in time can't be put on the wall clock,
+// and guessing would ship a silent A/V offset instead.
+test("fails the capture stream when the context clock is unusable", async () => {
+	using webaudio = installRenderingWebAudio();
+	const effect = new Effect();
+	// The fanout reports a failed source, which is the point; keep it out of the test output.
+	const error = spyOn(console, "error").mockImplementation(() => {});
+
+	try {
+		const capture = new Capture({ enabled: true, source: new Signal(fakeSource()) as never });
+		const reader = await captureReader(capture, effect);
+
+		webaudio.breakClock();
+		webaudio.deliver(0);
+
+		expect(reader.read()).rejects.toThrow("unusable AudioContext clock");
+		expect(error).toHaveBeenCalled();
+
+		capture.close();
+	} finally {
+		error.mockRestore();
+		effect.close();
+	}
+});

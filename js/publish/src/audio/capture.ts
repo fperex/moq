@@ -1,8 +1,9 @@
 import * as Util from "@moq/hang/util";
-import type { Time } from "@moq/net";
+import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import { Fanout } from "../fanout";
+import type { Quantum } from "./capture-worklet";
 import CaptureWorklet from "./capture-worklet.ts?worklet";
 import { isSampleSource, normalizeSource, type SampleSource, type Source, type SourceConfig } from "./types";
 
@@ -27,6 +28,12 @@ export interface Format {
 // How many capture quanta a rendition may fall behind before it starts losing the oldest. A worklet
 // pushes on the audio thread and can't be told to wait. Roughly 85ms at 48kHz.
 const QUEUE = 32;
+
+// How far the context clock may fall behind the wall clock before it counts as a stall rather than a
+// stale reading. `currentTime` is refreshed once per device callback, so a reading taken just before
+// the next one lands is a few milliseconds old; a device opening or a context suspending is two
+// orders of magnitude more than that.
+const STALL = Time.Micro.fromMilli(Time.Milli(20));
 
 // The rate to run the capture graph at when nothing asks for another.
 //
@@ -176,15 +183,12 @@ export class Capture {
 				// worklet sees it. The default "max" just follows the input, which is the unreliable
 				// path on macOS. Only force it when we actually have a requested count to honor.
 				channelCountMode: requestedChannels !== undefined ? "explicit" : "max",
-				// Stamp audio against the same wall clock as video (see video/processor.ts), so both
-				// tracks share an epoch and stay in sync.
-				processorOptions: { zero: performance.now() * 1000 },
 			});
 			effect.cleanup(() => worklet.disconnect());
 
 			root.connect(worklet);
 
-			const fanout = new Fanout(this.#drain(worklet, context.sampleRate, effect), { queue: QUEUE });
+			const fanout = new Fanout(this.#drain(worklet, context, effect), { queue: QUEUE });
 			effect.cleanup(() => fanout.close());
 
 			effect.set(this.#out.root, root);
@@ -192,16 +196,23 @@ export class Capture {
 		});
 	}
 
-	// Turn the quanta the worklet pushes into a stream. The audio thread can't be asked to wait, so
-	// this never applies backpressure; the fanout above bounds each reader instead. A drop shows up
-	// downstream as a timestamp gap, which the framer re-anchors on rather than silently sliding.
-	#drain(worklet: AudioWorkletNode, sampleRate: number, effect: Effect): ReadableStream<AudioFrame> {
+	// Turn the quanta the worklet pushes into a stream, stamped against the same wall clock as video
+	// (see video/processor.ts) so both tracks share an epoch. The audio thread can't be asked to
+	// wait, so this never applies backpressure; the fanout above bounds each reader instead. A drop
+	// shows up downstream as a timestamp gap, which the framer re-anchors on rather than silently
+	// sliding.
+	#drain(worklet: AudioWorkletNode, context: AudioContext, effect: Effect): ReadableStream<AudioFrame> {
+		const sampleRate = context.sampleRate;
+
+		// The wall clock, in microseconds, that the context's frame 0 sits on.
+		let zero: Time.Micro | undefined;
+
 		return new ReadableStream<AudioFrame>(
 			{
 				start: (controller) => {
 					effect.event(worklet.port, "message", (event: Event) => {
-						const frame = (event as MessageEvent<AudioFrame>).data;
-						const channelCount = frame.channels.length;
+						const quantum = (event as MessageEvent<Quantum>).data;
+						const channelCount = quantum.channels.length;
 						if (!channelCount) return;
 
 						// The channel count is unreliable on some platforms (Apple's Safari), so
@@ -210,7 +221,26 @@ export class Capture {
 							this.#out.format.set({ sampleRate, channelCount });
 						}
 
-						if ((controller.desiredSize ?? 0) > 0) controller.enqueue(frame);
+						// Both clocks are read at the same instant, so the pairing only moves when the
+						// context clock stalls against the wall clock: the device opening, a suspend,
+						// the machine sleeping. A graph renders its first quanta before the device has
+						// opened, so pairing once and never looking again anchors the whole timeline a
+						// fifth of a second before the audio it describes.
+						let observed: Time.Micro;
+						try {
+							observed = anchor(context);
+						} catch (error) {
+							controller.error(error);
+							return;
+						}
+						if (zero === undefined || observed - zero > STALL) zero = observed;
+
+						const elapsed = Time.Micro.fromSecond((quantum.frame / sampleRate) as Time.Second);
+						const timestamp = (zero + elapsed) as Time.Micro;
+
+						if ((controller.desiredSize ?? 0) > 0) {
+							controller.enqueue({ timestamp, channels: quantum.channels });
+						}
 					});
 					worklet.port.start();
 				},
@@ -242,6 +272,21 @@ function planar(): TransformStream<AudioData, AudioFrame> {
 			data.close();
 		},
 	});
+}
+
+// The wall clock, in microseconds, that a context's frame 0 sits on.
+//
+// `currentTime` only advances while the context renders, so pairing it with `performance.now()` is
+// what puts the captured samples on the clock video is stamped against. Refuse an unusable reading
+// instead of guessing: a bad pairing offsets every timestamp the publisher sends, which a listener
+// hears as sound running ahead of picture.
+function anchor(context: AudioContext): Time.Micro {
+	const elapsed = context.currentTime;
+	if (!Number.isFinite(elapsed) || elapsed < 0) {
+		throw new Error(`unusable AudioContext clock: currentTime is ${elapsed}`);
+	}
+
+	return (Time.Micro.now() - Time.Micro.fromSecond(elapsed as Time.Second)) as Time.Micro;
 }
 
 // getConstraints() echoes the constraints applied via getUserMedia, which (unlike getSettings)
