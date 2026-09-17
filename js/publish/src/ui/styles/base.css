@@ -31,6 +31,7 @@
 	--color-orange-500: #f97316;
 	--color-orange-900: #4d301b;
 	--color-red-400: #f87171;
+	--color-red-400-alpha-20: rgba(248, 113, 113, 0.2);
 	--color-amber-600: #d97706;
 	--color-orange-500-alpha-60: rgba(249, 115, 22, 0.6);
 	--color-black-alpha-10: rgba(0, 0, 0, 0.1);
@@ -107,6 +108,12 @@
 
 .control--off {
 	color: var(--color-red-400);
+}
+
+/* Switched on but not capturing: distinct from the deliberate off above. */
+.control--error {
+	color: var(--color-red-400);
+	background-color: var(--color-red-400-alpha-20);
 }
 
 .control:disabled {

@@ -447,7 +447,10 @@ export class Encoder {
 		const required = effect.get(this.#codecFilter) ?? "";
 
 		effect.spawn(async () => {
-			const detected = await this.#bestCodec(required, dimensions);
+			// A rerun waits for this task, so a probe that outlives its run holds the encoder at the
+			// old answer: showing video again while one is still running would wait out the whole
+			// probe before the rendition came back. The probe itself stops at its next step.
+			const detected = await Promise.race([this.#bestCodec(effect, required, dimensions), effect.cancel]);
 			if (!detected) return;
 
 			effect.set(this.#codec, { ...detected, required, ...dimensions });
@@ -583,8 +586,10 @@ export class Encoder {
 		effect.set(this.#dimensions, { width, height });
 	}
 
-	// Try to determine the best config for the given settings.
+	// Try to determine the best config for the given settings, stopping early once `effect` is torn
+	// down: every candidate costs a round trip to the GPU process, and the answer is already stale.
 	async #bestCodec(
+		effect: Effect,
 		required: string,
 		dimensions: { width: number; height: number },
 	): Promise<
@@ -653,6 +658,7 @@ export class Encoder {
 		// VideoToolbox anyway regardless of the hint.
 		if (hardwareReliable()) {
 			for (const codec of HARDWARE_CODECS) {
+				if (effect.abort.aborted) return undefined;
 				if (!codec.startsWith(required)) continue;
 
 				const hardwareAcceleration: HardwareAcceleration = "prefer-hardware";
@@ -675,6 +681,7 @@ export class Encoder {
 
 		// Try software encoding.
 		for (const codec of SOFTWARE_CODECS) {
+			if (effect.abort.aborted) return undefined;
 			if (!codec.startsWith(required)) continue;
 
 			const hardwareAcceleration: HardwareAcceleration = "prefer-software";
@@ -694,6 +701,7 @@ export class Encoder {
 			if (supported) return { codec, hardwareAcceleration };
 		}
 
+		if (effect.abort.aborted) return undefined;
 		throw new Error("no supported codec");
 	}
 
