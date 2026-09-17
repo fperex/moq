@@ -31,7 +31,7 @@ export type ReloadDelay = {
 
 	/**
 	 * Maximum total time to spend retrying the current URL before giving up
-	 * (default: 10000ms). Resets after each successful connection, a URL change, or a
+	 * (default: 60000ms). Resets after each successful connection, a URL change, or a
 	 * disable/re-enable. Set to 0 for unlimited retries.
 	 */
 	timeout?: Time.Milli;
@@ -66,17 +66,18 @@ export type ReloadProps = Omit<ConnectProps, "signal" | "transport"> & {
 /**
  * The backoff applied to whichever {@link ReloadDelay} fields a caller leaves out.
  *
- * The timeout is short on purpose: a failure that clears within it was transient, and one that
- * doesn't should surface on {@link Reload.error} rather than leave the page silently
- * reconnecting for minutes. A loop nobody watches wants `timeout: 0` instead, since there is
- * no one to react. Giving up does not dispose the loop: a new URL or a disable/re-enable
- * starts another sequence.
+ * The timeout has to outlast a relay restart, which is the common reason a live page is
+ * disconnected: a graceful relay drains for its own window (10s by default) before the process
+ * even exits. Past that it is deliberately short, so a failure that has not cleared surfaces on
+ * {@link Reload.error} rather than leaving the page silently reconnecting for the rest of the
+ * afternoon. A loop nobody watches wants `timeout: 0` instead, since there is no one to react.
+ * Giving up does not dispose the loop: a new URL or a disable/re-enable starts another sequence.
  */
 const DEFAULT_DELAY: Required<ReloadDelay> = {
 	initial: Time.Milli(1000),
 	multiplier: 2,
 	max: Time.Milli(5000),
-	timeout: Time.Milli(10000),
+	timeout: Time.Milli(60000),
 };
 
 /** How often the send-rate estimate is sampled from the live transport. */
