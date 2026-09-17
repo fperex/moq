@@ -250,15 +250,36 @@ export interface AudioBufferProps {
  * Picks `SharedAudioBuffer` when possible, falling back to `PostAudioBuffer`.
  */
 export function createAudioBuffer(worklet: AudioWorkletNode, props: AudioBufferProps): AudioBuffer {
-	if (supportsSharedArrayBuffer()) {
-		console.log("[audio] using SharedArrayBuffer audio buffer");
-		return new SharedAudioBuffer(worklet, props);
+	const shared = supportsSharedArrayBuffer();
+	reportTransport(shared);
+	return shared ? new SharedAudioBuffer(worklet, props) : new PostAudioBuffer(worklet, props);
+}
+
+// Whether the transport has been named already, since it is the same answer for the rest of the
+// document's life.
+let reported = false;
+
+/**
+ * Say which transport this document got, once.
+ *
+ * Cross-origin isolation is a property of the page, so every player on it lands on the same
+ * transport and each one saying so is the same line repeated. Neither answer is a fault: a page
+ * that is not isolated cannot have shared memory and the postMessage ring is what it runs on, so
+ * this is a note about the page rather than a warning about the player.
+ */
+function reportTransport(shared: boolean): void {
+	if (reported) return;
+	reported = true;
+
+	if (shared) {
+		console.info("[audio] using the SharedArrayBuffer audio buffer");
+		return;
 	}
-	console.warn(
-		"[audio] SharedArrayBuffer unavailable, falling back to the higher latency postMessage audio buffer. " +
-			"Serve the page cross-origin isolated (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp) to avoid this.",
+
+	console.info(
+		"[audio] using the postMessage audio buffer, which holds a little more latency. " +
+			"Serve the page cross-origin isolated (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp) for the SharedArrayBuffer one.",
 	);
-	return new PostAudioBuffer(worklet, props);
 }
 
 /** SharedArrayBuffer-backed implementation. Writes go directly into shared memory. */
