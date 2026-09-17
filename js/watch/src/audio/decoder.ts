@@ -22,6 +22,7 @@ import { Anchor } from "./anchor";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
 import { audioMaxAge, type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
 import { Handover } from "./handover";
+import { Interruption } from "./interruption";
 import { ringSamples } from "./latency";
 import type * as Playout from "./playout";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
@@ -79,6 +80,9 @@ type DecoderOutput = {
 	// Whether the audio buffer is stalled (waiting to fill)
 	stalled: Signal<boolean>;
 
+	// Whether playback stopped rather than started: the ring is stalled after it had been playing.
+	interrupted: Signal<boolean>;
+
 	// How many times the ring ran dry mid-playback, so the UI can show that the target is too low.
 	underruns: Signal<number>;
 
@@ -125,6 +129,7 @@ export class Decoder {
 		stats: new Signal<Stats | undefined>(undefined),
 		timestamp: new Signal<Time.Milli | undefined>(undefined),
 		stalled: new Signal<boolean>(true),
+		interrupted: new Signal<boolean>(false),
 		underruns: new Signal<number>(0),
 		skipped: new Signal<number>(0),
 		buffered: new Signal<Container.BufferedRanges>([]),
@@ -154,6 +159,9 @@ export class Decoder {
 
 	// Which subscription the ring's buffered samples came from. See #runDecoder.
 	#handover = new Handover();
+
+	// Whether a stalled ring is refilling after playback stopped, or filling for the first time.
+	#interruption = new Interruption();
 
 	#signals = new Effect();
 
@@ -324,8 +332,22 @@ export class Decoder {
 				this.#out.timestamp.set(ts);
 				if (ts !== undefined) this.#trimDecodeBuffered(ts);
 			});
+			// A stall means one of two things and the ring reports one flag for both, so the
+			// distinction is drawn here: a ring nobody is draining is filling, whatever it holds,
+			// and only a ring that stops after it has played has interrupted anything.
 			effect.run((inner) => {
-				this.#out.stalled.set(inner.get(ring.stalled));
+				const stalled = inner.get(ring.stalled);
+				this.#out.stalled.set(stalled);
+
+				if (!inner.get(this.in.enabled)) {
+					// The download is off and the emitter is disconnected, so nothing is draining
+					// the ring: whatever plays next is a fresh fill rather than playback resuming.
+					this.#interruption.restarted();
+					this.#out.interrupted.set(false);
+					return;
+				}
+
+				this.#out.interrupted.set(this.#interruption.update(stalled));
 			});
 			effect.run((inner) => {
 				this.#out.underruns.set(inner.get(ring.underruns));
