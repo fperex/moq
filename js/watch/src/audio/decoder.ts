@@ -517,6 +517,10 @@ export class Decoder {
 			track,
 			priority: Catalog.PRIORITY.audio,
 			maxAge: this.#maxAge,
+			// Buffered playback is media written ahead of the playhead, so what the track already
+			// holds is the point rather than a backlog to skip. Read at open, which is the only
+			// moment it decides anything; a later change re-derives the age budget instead.
+			start: this.sync.in.buffer.peek() > 0 ? "oldest" : "latest",
 		});
 		if (!sub) return;
 
