@@ -127,6 +127,10 @@ export class Decoder {
 	#pendingJitter = new Signal<Time.Milli | undefined>(undefined);
 	readonly #identity: Computed<PlaybackIdentity | undefined>;
 
+	// How late this rendition's frames arrive, measured for as long as the rendition lasts rather
+	// than for as long as one subscription does. See `#runSpread`.
+	#spread = new Signal<Container.Jitter | undefined>(undefined);
+
 	// Bumped to rebuild the track without anything else about the rendition changing: a codec that
 	// errored, or a picture that stayed frozen past RECOVER. `#runPending` reads it, so a bump tears
 	// the old subscription down and opens a new one at the live edge.
@@ -161,6 +165,7 @@ export class Decoder {
 		});
 
 		this.#signals.run(this.#runJitter.bind(this));
+		this.#signals.run(this.#runSpread.bind(this));
 		this.#signals.run(this.#runPending.bind(this));
 		this.#signals.run(this.#runActive.bind(this));
 		this.#signals.run(this.#runDisplay.bind(this));
@@ -184,6 +189,27 @@ export class Decoder {
 		const active = effect.get(this.#active)?.jitter;
 		const pending = effect.get(this.#pendingJitter);
 		effect.set(this.#out.jitter, switchJitter({ active, pending }));
+	}
+
+	/**
+	 * Measure how late frames arrive, for as long as the rendition lasts.
+	 *
+	 * One estimator per rendition rather than per subscription, the same rule the audio decoder
+	 * keeps (`Audio.Decoder`'s `#runSpread`). A rebuild replaces the subscription, and every
+	 * reason to rebuild is a path that just proved it delivers late; starting the measurement
+	 * over at the publisher's declaration hands Sync a delay sized for a path nobody is on, so
+	 * the shared delay collapses to whatever audio measured and the replacement subscription is
+	 * convicted by a budget the picture could never meet. Cleared when the rendition goes, so a
+	 * departed track stops holding the buffer open.
+	 */
+	#runSpread(effect: Effect): void {
+		const identity = effect.get(this.#identity);
+		if (!identity) return;
+
+		const spread = new Container.Jitter({ start: renditionJitter(identity.decoder) });
+		effect.set(this.#spread, spread);
+		effect.run((inner) => this.#out.spread.set(inner.get(spread.value)));
+		effect.cleanup(() => this.#out.spread.set(undefined));
 	}
 
 	#runPending(effect: Effect): void {
@@ -215,6 +241,9 @@ export class Decoder {
 			return;
 		}
 
+		const spread = effect.get(this.#spread);
+		if (!spread) return;
+
 		// Start a new pending effect.
 		let pending: DecoderTrack | undefined = new DecoderTrack({
 			sync: this.sync,
@@ -222,6 +251,7 @@ export class Decoder {
 			track,
 			config: identity.decoder,
 			stats: this.#out.stats,
+			spread,
 		});
 		effect.set(this.#pendingJitter, pending.jitter);
 
@@ -271,7 +301,6 @@ export class Decoder {
 		if (!active) {
 			// Clear stale data when disabled (e.g. paused or not visible).
 			this.#out.buffered.set([]);
-			this.#out.spread.set(undefined);
 			return;
 		}
 
@@ -288,7 +317,6 @@ export class Decoder {
 		});
 		effect.proxy(this.#out.timestamp, active.timestamp);
 		effect.proxy(this.#out.buffered, active.buffered);
-		effect.proxy(this.#out.spread, active.spread);
 		accumulate(effect, this.#out.skipped, active.skipped);
 	}
 
@@ -364,6 +392,9 @@ interface DecoderTrackProps {
 	config: DecoderConfig;
 
 	stats: Signal<Stats | undefined>;
+
+	/** The rendition's arrival estimator, which outlives this subscription. */
+	spread: Container.Jitter;
 }
 
 class DecoderTrack {
@@ -372,6 +403,7 @@ class DecoderTrack {
 	track: string;
 	config: DecoderConfig;
 	stats: Signal<Stats | undefined>;
+	spread: Container.Jitter;
 	jitter: Time.Milli | undefined;
 
 	timestamp = new Signal<Time.Milli | undefined>(undefined);
@@ -379,9 +411,6 @@ class DecoderTrack {
 
 	// Network jitter + decode buffer.
 	buffered = new Signal<Container.BufferedRanges>([]);
-
-	// How late frames arrive relative to the earliest one, from the container consumer.
-	spread = new Signal<Time.Milli | undefined>(undefined);
 
 	// Groups this track lost to the age budget or a transport that gave up.
 	skipped = new Signal<number>(0);
@@ -409,6 +438,7 @@ class DecoderTrack {
 		this.track = props.track;
 		this.config = props.config;
 		this.stats = props.stats;
+		this.spread = props.spread;
 		this.jitter = renditionJitter(props.config);
 
 		this.#signals.run(this.#run.bind(this));
@@ -500,8 +530,8 @@ class DecoderTrack {
 		const consumer = new Container.Consumer(sub, {
 			format,
 			maxAge: this.sync.out.maxAge,
-			// The publisher's declared flush span, which is where the arrival estimate starts.
-			jitter: this.jitter,
+			// The estimator for this rendition, which outlives any one subscription. See #runSpread.
+			jitter: this.spread,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -511,9 +541,6 @@ class DecoderTrack {
 			const decode = inner.get(this.#buffered);
 			this.buffered.update(() => Container.mergeBufferedRanges(network, decode));
 		});
-
-		// Publish the measured arrival spread for Sync.
-		effect.run((inner) => this.spread.set(inner.get(consumer.spread)));
 
 		accumulate(effect, this.skipped, consumer.skipped);
 
@@ -602,8 +629,8 @@ class DecoderTrack {
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
 			maxAge: this.sync.out.maxAge,
-			// The publisher's declared flush span, which is where the arrival estimate starts.
-			jitter: this.jitter,
+			// The estimator for this rendition, which outlives any one subscription. See #runSpread.
+			jitter: this.spread,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -613,9 +640,6 @@ class DecoderTrack {
 			const decode = inner.get(this.#buffered);
 			this.buffered.update(() => Container.mergeBufferedRanges(network, decode));
 		});
-
-		// Publish the measured arrival spread for Sync.
-		effect.run((inner) => this.spread.set(inner.get(consumer.spread)));
 
 		accumulate(effect, this.skipped, consumer.skipped);
 

@@ -257,3 +257,32 @@ test("a picture frozen past the recovery window rebuilds the track", async () =>
 		console.warn = warn;
 	}
 });
+
+test("the arrival estimator survives a rebuild", async () => {
+	const warn = console.warn;
+	console.warn = () => {};
+	const fx = fixture();
+	const seen: (number | undefined)[] = [];
+	const dispose = fx.decoder.out.spread.subscribe((value) => seen.push(value));
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		expect(fx.decoder.out.spread.peek()).toBeDefined();
+
+		fx.served[0].encode(payload(16), Time.Micro(0), true);
+		await settle();
+		built[0].emit(0);
+		await settle();
+
+		// The stall watchdog replaces the track. The measurement belongs to the rendition, not to
+		// the subscription: dropping it here handed Sync a delay sized for a path nobody is on, so
+		// the shared delay collapsed to whatever audio had measured and the replacement was
+		// convicted by a budget the picture could never meet.
+		expect(await fx.decoders(2)).toBeGreaterThanOrEqual(2);
+		expect(seen).not.toContain(undefined);
+		expect(fx.decoder.out.spread.peek()).toBeDefined();
+	} finally {
+		dispose();
+		fx.close();
+		console.warn = warn;
+	}
+});

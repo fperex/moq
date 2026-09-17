@@ -14,9 +14,11 @@ export interface ConsumerProps {
 	/**
 	 * How stale a group may get before it is skipped, in milliseconds (default: 0).
 	 *
-	 * Measured as the span from the oldest buffered frame to the newest, so it bounds how long a
-	 * late or missing group is waited for. The local half of the subscription's
-	 * `maxAge`; both measure the same budget, one on the wire and one as frames are read.
+	 * A group is measured by how far it could still present, which its successor's first
+	 * timestamp bounds, against the newest frame the track has reached. So it bounds how long a
+	 * late or missing group is waited for without reading a long group as a late one. The local
+	 * half of the subscription's `maxAge`; both measure the same budget, one on the wire and one
+	 * as frames are read.
 	 */
 	// Read-only: a Getter (e.g. another component's output) is accepted directly.
 	maxAge?: GetterInit<Time.Milli>;
@@ -378,28 +380,36 @@ export class Consumer {
 		let skipped = false;
 		let hole = false;
 
-		// Keep skipping the oldest group while the buffered span exceeds the max age.
-		// This also handles gaps in group sequence numbers: if #active points to a missing
-		// group, the span proves the missing content is too old to wait for.
+		// Keep skipping the oldest group while what it could still present has aged past the
+		// budget. This also handles gaps in group sequence numbers: if #active points to a
+		// missing group, the successor's start proves the missing content is too old to wait for.
 		while (this.#groups.length >= 2) {
 			const threshold = Moq.Time.Micro.fromMilli(this.#maxAge.peek());
 			const first = this.#groups[0];
 
-			// Check the difference between the earliest and latest known frames.
-			let min: number | undefined;
-			let max: number | undefined;
+			// A group is measured by how far it could still reach, not by how far behind it
+			// started: it cannot present past where its successor begins, so that bound is the
+			// freshest thing still worth waiting for, and the newest frame the track has reached
+			// is what it has aged against. This is the wire budget's rule verbatim
+			// (`Subscription::max_age`, `is_stale` in `rs/moq-net/src/model/track.rs`), which is
+			// the point: the two halves of one budget cannot be allowed to disagree.
+			//
+			// Measuring the head's own oldest undelivered frame instead made the verdict a
+			// function of the group's length. Audio groups hold one frame, so it read as
+			// lateness; a 2s video GOP whose tail was merely late was convicted the moment its
+			// successor opened, throwing away the rest of the GOP and leaving the picture frozen
+			// until the next keyframe, once per GOP for as long as the path stayed slow.
+			const reach = this.#groups[1].start;
+			if (reach === undefined) break;
 
+			let live: number | undefined;
 			for (const group of this.#groups) {
 				if (group.latest === undefined) continue;
-
-				const frame = group.frames.at(0)?.timestamp ?? group.latest;
-				if (min === undefined || frame < min) min = frame;
-				if (max === undefined || group.latest > max) max = group.latest;
+				if (live === undefined || group.latest > live) live = group.latest;
 			}
+			if (live === undefined) break;
 
-			if (min === undefined || max === undefined) break;
-
-			const age = max - min;
+			const age = live - reach;
 			if (age <= threshold) break;
 
 			this.#groups.shift();

@@ -562,12 +562,15 @@ test("Consumer counts a group the budget abandoned instead of failing its task",
 
 test("Consumer counts every group the max age skips", async () => {
 	const track = new Track.Producer("test");
-	// Zero max age: any span at all convicts the oldest group, so groups 0 and 1 are both shifted.
+	// Zero max age: a group whose successor already starts behind the newest frame has nothing
+	// left worth waiting for, so groups 0 and 1 are both shifted and group 2 (which reaches the
+	// newest frame) is kept.
 	const consumer = new Consumer(replay(track), { format: new LegacyFormat("data"), maxAge: 0 as Time.Milli });
 
 	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro]);
 	writeGroupWithLegacyFrames(track, 1, [100_000 as Time.Micro]);
 	writeGroupWithLegacyFrames(track, 2, [200_000 as Time.Micro]);
+	writeGroupWithLegacyFrames(track, 3, [300_000 as Time.Micro]);
 	track.close();
 
 	await drainFrames(consumer, 300);
@@ -1685,6 +1688,70 @@ test("Consumer jumps the playhead after a shed marker with a timestamp hole", as
 	const resumed = await nextFrame(consumer);
 	expect(resumed?.frame?.timestamp).toBe(1_000_000 as Time.Micro);
 	expect(resumed?.discontinuity).toBe(1);
+
+	consumer.close();
+});
+
+test("Consumer keeps a long group whose tail is merely late", async () => {
+	// A 2s video GOP at 30fps on a path that delivers the head of each group and then starves
+	// its tail until the next one opens: newest-first priority under congestion does exactly
+	// this. The budget is the auto delay a shaped path produces, well below a GOP.
+	const FRAME = 33_333;
+	const GOP = 60;
+	const HEAD = 4;
+
+	const track = new Track.Producer("video");
+	const consumer = new Consumer(track.subscribe({ maxAge: 30_000 }), {
+		format: new LegacyFormat("video"),
+		maxAge: 140 as Time.Milli,
+	});
+
+	// A player reads as it goes, so the head group is drained the moment its frames land.
+	const frames: Time.Micro[] = [];
+	const reader = (async () => {
+		for (;;) {
+			const next = await consumer.next();
+			if (!next) break;
+			if (next.frame) frames.push(next.frame.timestamp);
+		}
+	})();
+
+	const groups: { group: Group.Producer; base: number }[] = [];
+	for (let n = 0; n < 4; n++) {
+		const base = n * GOP * FRAME;
+		const group = new Group.Producer(n);
+		track.writeGroup(group);
+		groups.push({ group, base });
+
+		for (let i = 0; i < HEAD; i++) {
+			group.writeFrame({
+				payload: encodeLegacy((base + i * FRAME) as Time.Micro),
+				timestamp: Time.Timestamp.now(),
+			});
+		}
+		await settle();
+
+		// The previous group's tail lands now, a whole GOP late.
+		const previous = groups[n - 1];
+		if (!previous) continue;
+		for (let i = HEAD; i < GOP; i++) {
+			previous.group.writeFrame({
+				payload: encodeLegacy((previous.base + i * FRAME) as Time.Micro),
+				timestamp: Time.Timestamp.now(),
+			});
+		}
+		previous.group.close();
+		await settle();
+	}
+	groups[groups.length - 1].group.close();
+	track.close();
+	await reader;
+
+	// Every frame of the first three GOPs, in order, with nothing convicted. Measuring the head
+	// group by its own oldest undelivered frame instead convicted it the moment its successor
+	// opened, leaving HEAD frames per GOP and the picture frozen in between.
+	expect(consumer.skipped.peek()).toBe(0);
+	expect(frames).toEqual(Array.from({ length: 3 * GOP + HEAD }, (_, i) => (i * FRAME) as Time.Micro));
 
 	consumer.close();
 });
