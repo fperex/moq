@@ -157,6 +157,10 @@ export default class MoqWatch extends HTMLElement {
 	// The canvas element to render into.
 	#canvas = new Signal<HTMLCanvasElement | undefined>(undefined);
 
+	// Re-resolve the canvas child and republish it. Held so `connectedCallback` can re-arm the
+	// renderer's download gate; the constructor owns the closure.
+	#setCanvas?: (force?: boolean) => void;
+
 	// The overlay element captions are drawn into, created lazily on connect (custom elements may not
 	// touch children in their constructor). Positioned to fill the element, above the canvas.
 	#captionsOverlay = new Signal<HTMLElement | undefined>(undefined);
@@ -313,7 +317,14 @@ export default class MoqWatch extends HTMLElement {
 		});
 
 		// Watch to see if the canvas element is added or removed.
-		const setCanvas = () => {
+		//
+		// `force` republishes an unchanged canvas. The renderer's download gate is an
+		// IntersectionObserver armed on this node, and an observer armed on a node that is not in a
+		// document reports it as not intersecting with nothing to re-check when it lands in one.
+		// A page that re-appends its tiles to reorder them moves the node, which is the same story
+		// with the same answer. So `connectedCallback` republishes: the canvas object has not
+		// changed, but where it sits has, and where it sits is the whole of what the gate reads.
+		const setCanvas = (force = false) => {
 			const canvas = this.querySelector("canvas") ?? undefined;
 
 			// A <video> child used to render via MSE. Nothing renders it now, and audio still plays,
@@ -322,13 +333,17 @@ export default class MoqWatch extends HTMLElement {
 				console.warn("moq-watch: rendering requires a <canvas> child; a <video> child does nothing.");
 			}
 
-			this.#canvas.set(canvas);
+			this.#canvas.set(canvas, force || undefined);
 		};
+		this.#setCanvas = setCanvas;
 
-		const observer = new MutationObserver(setCanvas);
+		const observer = new MutationObserver(() => setCanvas());
 		observer.observe(this, { childList: true, subtree: true });
 		this.signals.cleanup(() => observer.disconnect());
 		setCanvas();
+		// A custom element may not touch its children in the constructor, so a page that appends
+		// the canvas after `createElement` arms the gate on a detached node. `connectedCallback`
+		// is what fixes that up.
 
 		// Optionally update attributes to match the library state.
 		// This is kind of dangerous because it can create loops.
@@ -420,6 +435,11 @@ export default class MoqWatch extends HTMLElement {
 		this.style.display = "block";
 		this.style.position = "relative";
 
+		// Re-arm the renderer's download gate on this node's new place in the document. See
+		// `setCanvas`: without it a tile built before it was inserted, or moved by a page
+		// reordering its tiles, downloads audio and never asks for video again.
+		this.#setCanvas?.(true);
+
 		// Create the caption overlay once, on first connect (the constructor may not add children).
 		if (!this.#captionsOverlayEl) {
 			const overlay = document.createElement("div");
@@ -437,6 +457,10 @@ export default class MoqWatch extends HTMLElement {
 	disconnectedCallback() {
 		// Stop everything but don't actually cleanup just in case we get added back to the DOM.
 		this.#enabled.set(false);
+
+		// A canvas out of the document is not on screen, so the download gate closes with it. The
+		// element keeps the child; `connectedCallback` republishes it.
+		this.#canvas.set(undefined);
 	}
 
 	attributeChangedCallback(name: Observed, oldValue: string | null, newValue: string | null) {
