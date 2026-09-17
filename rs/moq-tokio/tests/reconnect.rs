@@ -257,17 +257,37 @@ async fn a_peer_away_longer_than_a_relay_restart_is_reconnected_to() {
 	let port = probe.local_addr().expect("local addr").port();
 	drop(probe);
 
+	// The give-up window is the shipped default, which is the whole subject here.
+	// The delays are shortened only so the dial the peer's return has to wait for is
+	// a fifth of a second rather than five.
+	let mut backoff = moq_tokio::Backoff::default();
+	backoff.initial = Duration::from_millis(50).into();
+	backoff.max = Duration::from_millis(200).into();
+
 	let url: url::Url = format!("tcp://127.0.0.1:{port}/").parse().expect("parse url");
-	let _connection = client(Default::default()).connect(url);
+	let connection = client(backoff).connect(url);
 
-	// Twice the window this default used to carry, and past a relay's drain plus
-	// the time a process takes to come back.
+	// Twice the window this default used to carry, and past a relay's drain plus the
+	// time a process takes to come back. On the paused clock it costs nothing.
 	tokio::time::sleep(Duration::from_secs(20)).await;
-	let (_task, mut sessions) = listen_on(port).await.expect("bind the port the client is dialing");
 
-	tokio::time::timeout(Duration::from_secs(30), sessions.recv())
+	// Still retrying. The budget is measured on this same clock, so an outage the
+	// window covers cannot have ended the loop, however far any one dial got; the
+	// window this default used to carry would have ended it 10s ago.
+	assert!(
+		tokio::time::timeout(Duration::ZERO, connection.closed()).await.is_err(),
+		"the client gave up on a peer that was away for 20s"
+	);
+
+	// Back on the real clock before the peer returns, because the reconnect is real
+	// socket work: a paused clock jumps to the next deadline whenever the runtime
+	// waits on that socket, so a deadline across it would measure the jumps instead.
+	tokio::time::resume();
+
+	let (_task, mut sessions) = listen_on(port).await.expect("bind the port the client is dialing");
+	tokio::time::timeout(Duration::from_secs(10), sessions.recv())
 		.await
-		.expect("the client gave up on a peer that was away for 20s")
+		.expect("the client never came back to a peer that returned")
 		.expect("server stopped accepting");
 }
 
