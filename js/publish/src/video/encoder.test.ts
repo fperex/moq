@@ -11,12 +11,17 @@ class FakeVideoEncoder {
 	// Every accepted probe, so a test can assert a published config was actually validated.
 	static accepted: string[] = [];
 
+	// Parks every probe while set, the way a GPU process with no spare capacity does.
+	static hold: Promise<void> | undefined;
+
 	state: CodecState = "unconfigured";
 
 	static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
 		FakeVideoEncoder.probes++;
 		// Pretend the GPU takes a while, like a real probe under load.
 		await new Promise((resolve) => setTimeout(resolve, 5));
+		const hold = FakeVideoEncoder.hold;
+		if (hold !== undefined) await hold;
 
 		const supported = config.codec.startsWith("avc1");
 		if (supported) FakeVideoEncoder.accepted.push(probeKey(config));
@@ -710,5 +715,71 @@ test("paces capture, bounds delayed raw frames, and resets cadence at timing bou
 		sub.close();
 		if (original) Object.defineProperty(globalThis, "VideoEncoder", original);
 		else Reflect.deleteProperty(globalThis, "VideoEncoder");
+	}
+});
+
+// Hiding video and showing it again reruns the codec probe, and a rerun waits for the task the
+// previous run spawned. A probe that has not answered yet therefore held the encoder at the old
+// state for its whole duration: no resolved config, no rendition in the catalog, and nothing the
+// second toggle could do about it. The probe has to be cancelled with the run that wanted it.
+test("a probe that has not answered does not hold the encoder through a toggle", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const stuck = Promise.withResolvers<void>();
+	FakeVideoEncoder.hold = stuck.promise;
+
+	const track = new Moq.Track.Producer("video").accept({ priority: 60 });
+	const sub = track.subscribe();
+	const rendition = {
+		config: new Signal(undefined),
+		track: new Signal<Moq.Track.Producer | undefined>(track),
+		close: () => track.close(),
+	};
+	const capture = {
+		in: {
+			source: new Signal({
+				getSettings: () => ({ frameRate: 30 }),
+				getConstraints: () => ({}),
+			} as never),
+		},
+		out: {
+			display: new Signal({ width: 1280, height: 720 }),
+			frames: new Signal(undefined),
+		},
+	};
+
+	const enabled = new Signal(true);
+	const encoder = new Encoder("video", {
+		enabled,
+		broadcast: { video: () => rendition } as never,
+		capture: capture as never,
+	});
+
+	try {
+		await settle();
+		expect(FakeVideoEncoder.probes).toBeGreaterThan(0);
+		expect(encoder.out.resolved.peek()).toBeUndefined();
+
+		// The user hides video and shows it again while that probe is still out.
+		enabled.set(false);
+		await settle();
+
+		// The GPU frees up, so the probe this run starts answers straight away.
+		FakeVideoEncoder.hold = undefined;
+		enabled.set(true);
+		await settle();
+
+		expect(encoder.out.resolved.peek()).toBeDefined();
+		expect(encoder.out.catalog.peek()).toBeDefined();
+
+		// The abandoned probe finally answers. It speaks for a run that is gone, so it changes nothing.
+		const codec = encoder.out.resolved.peek()?.codec;
+		stuck.resolve();
+		await settle();
+		expect(encoder.out.resolved.peek()?.codec).toBe(codec);
+	} finally {
+		FakeVideoEncoder.hold = undefined;
+		stuck.resolve();
+		encoder.close();
+		sub.close();
 	}
 });
