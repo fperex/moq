@@ -3,7 +3,7 @@ import { Container } from "@moq/hang";
 import * as Catalog from "@moq/hang/catalog";
 import * as Moq from "@moq/net";
 import { Time } from "@moq/net";
-import { Signal } from "@moq/signals";
+import { type Effect, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
 import { Sync } from "../sync";
 import { Decoder } from "./decoder";
@@ -284,5 +284,64 @@ test("the arrival estimator survives a rebuild", async () => {
 		dispose();
 		fx.close();
 		console.warn = warn;
+	}
+});
+
+test("a replaced session re-subscribes to video", async () => {
+	// A reconnect swaps the broadcast consumer under the decoder. Audio re-subscribes because its
+	// whole subscription lives in one effect that reads the handle; video has to do the same or
+	// the tile stays frozen while the sound comes back, which is what the relay log of a restart
+	// showed: catalog, meta and audio re-subscribed, video never asked again.
+	const first = new Moq.Broadcast.Producer();
+	const handle = new Signal<Moq.Broadcast.Consumer>(first.consume());
+
+	const source = {
+		in: {
+			broadcast: new Signal({
+				relativeBroadcast: (effect: Effect) => effect.get(handle),
+			} as unknown as Broadcast),
+		},
+		out: {
+			track: new Signal<string | undefined>(TRACK),
+			config: new Signal<Catalog.VideoConfig | undefined>(
+				Catalog.VideoConfigSchema.parse({ codec: "avc1.640028", container: { kind: "legacy" } }),
+			),
+			catalog: new Signal<Catalog.VideoConfig | undefined>(undefined),
+		},
+	} as unknown as Source;
+
+	const sync = new Sync({ delay: Time.Milli(100) });
+	const decoder = new Decoder(source, sync);
+
+	const requests: string[] = [];
+	const serve = (producer: Moq.Broadcast.Producer, label: string) =>
+		void (async () => {
+			for (;;) {
+				const request = await producer.requested();
+				if (!request) return;
+				requests.push(`${label}:${request.name}`);
+				request.accept({});
+			}
+		})();
+
+	const second = new Moq.Broadcast.Producer();
+	serve(first, "first");
+	serve(second, "second");
+
+	try {
+		for (let i = 0; i < 400 && requests.length < 1; i++) await flush();
+		expect(requests).toEqual([`first:${TRACK}`]);
+
+		// The session is replaced, exactly as a reconnect replaces it.
+		first.close();
+		handle.set(second.consume());
+
+		for (let i = 0; i < 400 && requests.length < 2; i++) await flush();
+		expect(requests).toEqual([`first:${TRACK}`, `second:${TRACK}`]);
+	} finally {
+		decoder.close();
+		sync.close();
+		first.close();
+		second.close();
 	}
 });
