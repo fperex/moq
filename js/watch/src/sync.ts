@@ -19,6 +19,16 @@ export type Delay = "instant" | "auto" | Time.Milli;
 // The widest measured jitter "auto" sizes a buffer from, which is the estimator's own ceiling.
 const JITTER_CEILING = Time.Milli(Container.Jitter.CEILING);
 
+// The most latency lip sync is worth.
+//
+// The term exists to bring the picture back inside the window a viewer notices (ITU-R BT.1359 puts
+// that at 45ms of picture-ahead and 125ms of picture-behind), and past this a hold cannot buy that
+// back: a picture seconds late is out of sync whatever the sound does, and holding the sound with
+// it just makes everything late. Measured on an impaired path, an uncapped term reached 2s during
+// tune-in, where the video track is still replaying the backlog between the last keyframe and the
+// live edge and every arrival honestly looks that late.
+const OFFSET_MAX = Time.Milli(200);
+
 // How long one track's arrival floor stands before it stops counting.
 //
 // Two of these are kept and rotated, so a track that stops delivering (a muted tile, a hidden
@@ -408,7 +418,7 @@ export class Sync {
 		const behind = Math.max(0, video - audio);
 		const bucket = Container.Jitter.BUCKET;
 		const quantised = behind < bucket ? 0 : Math.ceil(behind / bucket) * bucket;
-		this.#out.offset.set(Time.Milli(Math.min(JITTER_CEILING, quantised)));
+		this.#out.offset.set(Time.Milli(Math.min(OFFSET_MAX, quantised)));
 	}
 
 	// Fold a newly received frame into the reference. The reference anchors playback to the
