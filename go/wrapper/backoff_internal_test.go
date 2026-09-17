@@ -12,7 +12,7 @@ import (
 // to the reconnect loop. Passing it through unresolved turns the most natural
 // literal a caller writes, Backoff{}, into an unthrottled dial loop.
 func TestBackoffFfiResolvesUnsetFields(t *testing.T) {
-	defaults := ffi.MoqBackoff{InitialUs: 1_000_000, Multiplier: 2, MaxUs: 5_000_000, TimeoutUs: 10_000_000}
+	defaults := ffi.MoqBackoff{InitialUs: 1_000_000, Multiplier: 2, MaxUs: 5_000_000, TimeoutUs: 60_000_000}
 
 	cases := []struct {
 		name string
@@ -27,7 +27,7 @@ func TestBackoffFfiResolvesUnsetFields(t *testing.T) {
 		{
 			name: "a partial override keeps the defaults for everything else",
 			in:   Backoff{Max: time.Second},
-			want: ffi.MoqBackoff{InitialUs: 1_000_000, Multiplier: 2, MaxUs: 1_000_000, TimeoutUs: 10_000_000},
+			want: ffi.MoqBackoff{InitialUs: 1_000_000, Multiplier: 2, MaxUs: 1_000_000, TimeoutUs: 60_000_000},
 		},
 		{
 			name: "RetryForever is the only way to reach the native zero timeout",
@@ -42,7 +42,7 @@ func TestBackoffFfiResolvesUnsetFields(t *testing.T) {
 		{
 			name: "a sub-microsecond delay floors at 1us instead of truncating to zero",
 			in:   Backoff{Initial: time.Nanosecond},
-			want: ffi.MoqBackoff{InitialUs: 1, Multiplier: 2, MaxUs: 5_000_000, TimeoutUs: 10_000_000},
+			want: ffi.MoqBackoff{InitialUs: 1, Multiplier: 2, MaxUs: 5_000_000, TimeoutUs: 60_000_000},
 		},
 		{
 			name: "explicit values pass through",
