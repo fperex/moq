@@ -180,6 +180,53 @@ function record(buffer: AudioBuffer, effect: Effect): Array<Time.Micro | undefin
 	return seen;
 }
 
+describe("AudioBuffer, transport", () => {
+	/** Everything the console was told while `run` ran. */
+	function captured(run: () => void): { info: unknown[][]; log: unknown[][]; warn: unknown[][] } {
+		const seen = { info: [] as unknown[][], log: [] as unknown[][], warn: [] as unknown[][] };
+		const real = { info: console.info, log: console.log, warn: console.warn };
+		console.info = (...args: unknown[]) => seen.info.push(args);
+		console.log = (...args: unknown[]) => seen.log.push(args);
+		console.warn = (...args: unknown[]) => seen.warn.push(args);
+		try {
+			run();
+		} finally {
+			console.info = real.info;
+			console.log = real.log;
+			console.warn = real.warn;
+		}
+		return seen;
+	}
+
+	it("names the transport once per document, not once per player", () => {
+		// Cross-origin isolation is a property of the page, so every player on it lands on the same
+		// transport. A page of tiles used to say so once per tile, at warning level, about the path
+		// a page that is not isolated is supposed to run on.
+		const build = () =>
+			createAudioBuffer(new FakeWorklet() as unknown as AudioWorkletNode, {
+				channels: 1,
+				rate: 48000,
+				latency: 4800,
+				buffered: false,
+				conceal: true,
+			});
+
+		const first = captured(build);
+		const second = captured(build);
+
+		// The second player is silent whatever ran before this test, which is the whole claim.
+		expect(second.info).toHaveLength(0);
+		expect(second.log).toHaveLength(0);
+		expect(second.warn).toHaveLength(0);
+
+		// The first is at most one line, and never a warning: this is the page, not a fault. It is
+		// silent when an earlier test in the same process already built a ring.
+		expect(first.log).toHaveLength(0);
+		expect(first.warn).toHaveLength(0);
+		expect(first.info.length).toBeLessThanOrEqual(1);
+	});
+});
+
 describe("AudioBuffer, flushed", () => {
 	it("never reports the old playhead once the postMessage ring is flushed", async () => {
 		const worklet = new FakeWorklet();

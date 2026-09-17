@@ -27,12 +27,10 @@ class Render extends AudioWorkletProcessor {
 		this.port.onmessage = (event: MessageEvent<Message>) => {
 			const msg = event.data;
 			if (msg.type === "init-shared") {
-				console.log("[audio-worklet] init-shared: using SharedArrayBuffer path");
 				const previous = this.#backend instanceof SharedRingBuffer ? this.#backend : undefined;
 				this.#backend = new SharedRingBuffer(msg, previous);
 				this.#reset(msg.rate, msg.channels, msg.conceal);
 			} else if (msg.type === "init-post") {
-				console.log("[audio-worklet] init-post: using postMessage path");
 				this.#backend = new AudioRingBuffer(msg);
 				this.#reset(msg.rate, msg.channels, msg.conceal);
 			} else if (msg.type === "data") {
