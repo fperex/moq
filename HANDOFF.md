@@ -1,8 +1,9 @@
 # Real-time audio playout: what was wrong, what this branch does about it
 
 Branch: `fperex/moq` `debug-findings-solution`, rebased onto `upstream/dev` (`877a561d8`, was
-`8f41d4d82`). This document sits at the branch tip: 88 commits, 163 files. The last change to the
-player itself is `de641c6b5`; everything above it is delivery and the work in progress noted below.
+`8f41d4d82`). This document sits at the branch tip: 96 commits and 185 files at the time of writing,
+one docs commit above. The last change to the player itself is `35459ad52`; everything above it is
+delivery.
 
 This is a **draft pull request on a fork, opened so the work can be read, and not a submission**. No
 pull request on `moq-dev/moq` is intended and nothing here asks to be merged as a unit. It exists so
@@ -25,11 +26,13 @@ maintainer" is the part that is worth reading even if none of the code is adopte
 total under 150 ms on the LAN and under 200 ms through the public relay, audio and video within one
 frame, and zero underruns after convergence. Firefox and Safari are graded like Chromium.
 
-**Work in progress at this tip.** Findings past the seventeen below are being fixed as this is
-written and will be appended here, each with the commit that fixes it: what a capture stop does to a
-publisher's catalog, the fill and the spinner after an unmute, hiding and showing video, and the
-console noise a watcher produces. Anyone reading an intermediate push should expect that list to
-grow rather than read the seventeen as the end of it.
+**Work in progress at this tip.** The four topics an earlier revision listed as in progress are
+done, and they are findings 18 to 25 below, each with the commit that fixes it: what a stopped video
+track does to a watcher and what a capture stop does to a publisher's catalog, the fill and the
+spinner after an unmute, hiding and showing video, and the console noise a watcher produces. What is
+still running is the cross-browser resilience matrix: each engine publishing and watching, hide and
+show, mute and unmute, an impaired path, a relay restart and a long run. Its results will be
+appended here, so anyone reading an intermediate push should expect this document to grow again.
 
 **Contents**
 
@@ -184,7 +187,16 @@ with their author intact.
 | 84 | `de641c6b5` | finding 15 | The audio context is keyed on its rate alone, so a later catalog frame cannot spend the gesture that started it |
 | 85 | `180975961` | delivery | The quiet re-measure, the audio-context fix, and the gates at the tip |
 | 86 | `f2bd8ad45` | delivery | The tip filled into the short form, and the handoff pointer |
-| 87 | this one | delivery | This document: the report, the short form and the handoff folded into one file at the repository root |
+| 87 | `ba7a68789` | delivery | This document: the report, the short form and the handoff folded into one file at the repository root |
+| 88 | `b63519ba8` | finding 20 | The arrival estimate lives as long as the rendition, so an unmute continues it instead of starting over at the declaration |
+| 89 | `9b2f794c9` | finding 20 | The spinner shows an interruption, not the fill a cold start or an unmute costs |
+| 90 | `48c9d5302` | finding 24 | The audio transport is named once per page, at info level, rather than once per player at warning level |
+| 91 | `20c6756eb` | finding 18 | A video track that stopped producing is rebuilt at the live edge, and a capture that stopped says why |
+| 92 | `5a4ed9e21` | finding 21 | A media subscription reads from the live edge rather than replaying the window its predecessor filled |
+| 93 | `ff4da0042` | finding 22 | A camera that is only busy is asked again instead of spending the retry budget, and the reason reaches the buttons |
+| 94 | `aba98fd21` | finding 19 | A video rendition's track stays open while it is not encoding, so a re-subscription is not answered from a finished track |
+| 95 | `35459ad52` | finding 23 | The audio context is built on the first gesture, or when the app turns audio on, and never at load for a muted tile |
+| 96 | this one | delivery | Findings 18 to 25, the measurements behind them, the API impact and the gates |
 
 Row 49 carries two commits, so the numbered rows cover one hash more than there are rows. Every hash
 `git log --oneline upstream/dev..HEAD` prints is in the table, in that order, and the last row is
@@ -219,7 +231,8 @@ The same commits, grouped by the quest they come from:
 | the browser publisher's catalog and its clock | `cb10a2a66` (a served catalog track is released when its last subscriber leaves), `eb4331877` (captured audio is stamped on the context clock) |
 | CodeRabbit fixes over the whole branch | `a8cbc93bb`, `97c7afb76`, `b85e57431`, `02f3f143a`, `f5087814b` |
 | CI, and the rebase onto the lease model | `2b9d492f0`, `5484970e1` (the nightly job), `8cabb3507` (the harness relay under `moq-auth`) |
-| review, flake and delivery | `fcce8af55`, `1af4609eb`, `928ec4abf`, `3f0e3221d`, `ec6d9761a`, `85583de68`, `3c9388e56`, `3dcea2ab4`, `0b2e4cad7`, `180975961`, `f2bd8ad45`, plus this one |
+| the listening round of 2026-09-17, findings 18 to 25 | `b63519ba8`, `9b2f794c9` (the unmute fill and the spinner), `48c9d5302` (the ring fallback line), `20c6756eb` (the video track that stopped), `5a4ed9e21` (the live edge), `ff4da0042` (a busy camera), `aba98fd21` (the rendition's track stays open), `35459ad52` (the context on the gesture) |
+| review, flake and delivery | `fcce8af55`, `1af4609eb`, `928ec4abf`, `3f0e3221d`, `ec6d9761a`, `85583de68`, `3c9388e56`, `3dcea2ab4`, `0b2e4cad7`, `180975961`, `f2bd8ad45`, `ba7a68789`, plus this one |
 
 ## Root causes
 
@@ -1313,6 +1326,124 @@ of 2 against 2 of 2 for arming alone). The same statement now reads: a gesture i
 on the context that exists when it lands, so the graph must keep that context rather than rebuild
 around it.
 
+### After the user's listening round, 2026-09-17
+
+The user listened on a build of `de641c6b5`, the last code commit below the eight above, and reported
+nine things. The rows below are what each fix measured on the same quiet bench, one row at a time,
+with the publisher restarted before every row. Every row is read out of its JSON on the same
+250 + U(0, 50) ms grid as the tables above, except the unmute rows, which sample every 50 ms because
+what they measure is shorter than a frame. Skew is the painted video timestamp minus the audio
+playhead, and the statistics to grade are the signed lead and lag, for the reason under
+"Conferencing targets": the p95 of the absolute value has a floor of one frame plus one display
+refresh whatever the player does.
+
+**The unmute.** A tile playing at auto, muted for three seconds, then unmuted, sampled every 50 ms
+around the unmute. The declared span is what a fresh consumer used to seed itself from, and the
+target is what the estimator says; before these two commits the first was also the second.
+
+| Source and page | Declared span | Target before the mute | Target at the unmute | Ring fill | Spinner | Playhead back | Underruns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `bbb.hang`, plain page | 320 ms | 60 ms | 60 ms | 200 ms | 0 ms | 282 ms | 0 |
+| `bbb.hang`, site page | 320 ms | 60 ms | 60 ms | 200 ms | 0 ms | 265 ms | 0 |
+| `mic.hang`, plain page | 80 ms | 40 ms | 40 ms | 150 ms | 0 ms | 231 ms | 0 |
+| `mic.hang`, plain page, re-run after the live edge | 80 ms | 40 ms | 40 ms | 150 ms | 0 ms | 231 ms | 0 |
+
+The spinner column is how long the buffering indicator was visible after the unmute, and it is zero
+on every row: no sample after an unmute reports `interrupted`. The target is the same either side of
+the mute on every row, which is the estimator being continued rather than reseeded. The ring fill is
+the ring's own stalled interval, and it is now the measured target plus a chunk rather than the
+declaration.
+
+**The mute and preset sequence, after each fix.** The user's sequence again, on the local relay.
+
+| Source | Engine | Tip | Worst skew | Where | Skew p50 | Underruns | Video stalls |
+| --- | --- | --- | ---: | --- | ---: | ---: | ---: |
+| `bbb.hang` | Chromium | the unmute fixes and the video rebuild | -48.0 ms | 0.4 s after `delay 100ms` | -20.4 ms | 0 | not measured |
+| `bbb.hang` | Firefox | the unmute fixes and the video rebuild | -51.3 ms | 2.8 s after the fifth unmute | -26.8 ms | 0 | not measured |
+| `bbb.hang` | Chromium | plus the live edge and the camera fix | -51.1 ms | 2.2 s after `delay auto` | -22.1 ms | 0 | 1, 1.5 s, at the `2000ms` preset |
+| `mic.hang` | Chromium | the final tip | 51.9 ms | 0.2 s after unmute 2 of 5 | -17.0 ms | 0 | 1, 1.5 s, at the `2000ms` preset |
+| `mic.hang` | Firefox | the final tip | -49.5 ms | 1.0 s before `delay auto` | -16.7 ms | 0 | 1, 1.5 s, at the `2000ms` preset |
+
+No row peaks on an unmute any more, and every worst reading is one held interval wide, which is the
+envelope the earlier toggle table reports: 41 to 74 ms there, 48 to 52 ms here, against the 200 ms
+toggle rule. The one video stall a row records starts 0.6 s after the `2000ms` preset and is the
+renderer holding the two seconds it was asked for; no row records a decoder rebuild.
+
+**The re-subscribe, read off the relay.** Before, every re-subscription to a rendition that had
+stopped encoding was completed at once; the excerpt is in finding 19. After, on the same sequence of
+hides and shows, each subscription lives until the watcher itself cancels it:
+
+```text
+11:51:41.020  subscribed started   id=6 broadcast=toggle.hang track=video
+11:51:50.193  subscribed cancelled id=6      9.2 s later, by the watcher
+11:51:50.620  subscribed started   id=7
+11:51:55.510  subscribed cancelled id=7      4.9 s
+11:51:55.949  subscribed started   id=8
+11:52:10.847  subscribed cancelled id=8     14.9 s
+```
+
+No `subscribed complete` anywhere in between. Through the whole mute and preset sequence one video
+subscription lived 54.6 s (`11:56:44.428` to `11:57:39.045`), and the `complete` that ends it is the
+publisher being stopped at the end of the row.
+
+**Hide and show video.** The publisher page with the USB camera, the camera button toggled twice
+300 ms apart and again 5 s later. "Busy window" is an injected device release: this camera frees in
+under 100 ms, which is not long enough to spend the retry budget, so the defect only appears when the
+release is made to take longer than the budget.
+
+| Engine | Tip | Busy window | getUserMedia calls, refused | Camera back after the show | Preview painted | End state |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| Chromium | before | none | 6, 0 | 110 and 124 ms | 139 and 174 ms | live, rendition in the catalog |
+| Chromium | after | none | 6, 0 | 104 and 112 ms | 155 and 139 ms | live, rendition in the catalog |
+| Brave | before | none | 7, 0 | 106 to 128 ms | 132 to 167 ms | live, rendition in the catalog |
+| Brave | before | 8 s | 12, 8 | never | never | no source, no video section in the catalog |
+| Brave | after | 8 s | 41, 35 | 8.5 s and 8.1 s | within one sample of the first frame | live, rendition in the catalog |
+| WebKit | after | none | 4, 0 | 47 and 54 ms | 75 and 78 ms | live, rendition in the catalog |
+| WebKit | after | 8 s | 28, 24 | 8.2 s | within one sample | live, rendition in the catalog |
+| Firefox | after | none | 4, 0 | 102 ms | never, see finding 25 | live, rendition in the catalog |
+
+The two `after` rows with the busy window are the proof: 35 and 24 refusals absorbed without ending
+the capture, and the camera back within half a second of the device becoming free, against a `before`
+row that gave up after 8 refusals and never asked again.
+
+**Real Safari, one Element Click per run.** The microphone broadcast, 20 s of settled window per run,
+the WebSocket transport, Safari frontmost. Every run built exactly one `AudioContext`, at the click.
+
+| Run | Context at the first sample after the click | Contexts | Target | Held | Level p50 | Underruns | Skew p50 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `running` at 5 ms | 1 | 40 ms | 60 ms | 70.1 ms | 0 | -14.2 ms |
+| 2 | `running` at 6 ms | 1 | 40 ms | 60 ms | 50.1 ms | 0 | -18.3 ms |
+| 3 | `running` at 5 ms | 1 | 40 ms | 60 ms | 50.1 ms | 0 | -25.8 ms |
+| 4 | `running` at 6 ms | 1 | 40 ms | 60 ms | 70.1 ms | 0 | -14.3 ms |
+| 5 | `running` at 4 ms | 1 | 40 ms | 60 ms | 60.1 ms | 0 | -21.1 ms |
+| 6 | `running` at 12 ms | 1 | 40 ms | 60 ms | 50.1 ms | 0 | -17.2 ms |
+| 7 | `running` at 8 ms | 1 | 40 ms | 60 ms | 50.1 ms | 0 | -16.0 ms |
+| 8 | `running` at 5 ms | 1 | 40 ms | 60 ms | 60.1 ms | 0 | -17.2 ms |
+
+Eight of eight, every row painting at 30 fps with zero video stalls and zero decoder rebuilds. The
+autoplay warnings the same change removes, counted on a page load with the browser's own policy and
+no gesture at all:
+
+| Page | Engine | Warnings at load | Contexts at load | Muted tiles holding a context |
+| --- | --- | ---: | ---: | ---: |
+| demo watch, two tiles, one muted | Chromium | 2 to 1 | 2 to 1 | 0 |
+| demo watch, two tiles, one muted | Firefox | 4 to 2 | not recorded separately | 0 |
+| the site page, player starts muted | both | 0 | 0 | 0 |
+
+The one warning Chromium keeps is the tile the demo page itself unmutes, which is an app enabling
+audio before any gesture, and that is the policy doing its job rather than something to hide.
+
+**U5, the "Buffering (audio clock)" report, did not reproduce on a quiet bench.** The same self-
+publish and watch in one Chromium, 40 s of settled window:
+
+| Target p50/p95 | Held | Level p50/p95/min | Underruns | Skips | Groups skipped | Concealed | Skew p50/worst | videoLead p50 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 40/40 ms | 60 ms | 60.2/70.1/40.2 ms | 0 | 0 | 0 | 0 | -14.6/-41.0 ms | 68.6 ms |
+
+The user's own observation was taken while agents were running headed encoder sessions on the same
+machine, which is recorded rather than explained away: a loaded machine is the case the report came
+from, and the matrix's long run is what will say whether it returns under load.
+
 ## Findings for the maintainer
 
 Things found while working that are separate from the fix.
@@ -1581,13 +1712,22 @@ Things found while working that are separate from the fix.
     with zero viewers. Making it real is larger than it looks, because it immediately exposes two
     more, an audio encoder that does not re-anchor after a gated interval (40.7 s of A/V skew on the
     first viewer after one) and a `Container.Legacy.Producer.close()` that throws `group is closed`
-    once its track has gone. Those three belong together in one quest rather than in this branch.
+    once its track has gone. Those two are fixed here after all, in `20c6756eb`; the gate itself
+    belongs in its own quest rather than in this branch.
 
     The other shape this fix could take is in `js/net`: hold the publishing side's dedup weakly, the
     way `rs/moq-net/src/model/broadcast.rs` holds its tracks in a `WeakCache`, so an unused track
     leaves the cache on its own. It was not taken because the subscribing side leans on the strong
     entry: it re-checks demand level-triggered, so a tile unmuted a moment later resumes the same
     subscription instead of opening another. Which layer should own it is the maintainer's call.
+
+    One half of that is now answered, in finding 19. The same release was tried for the media tracks
+    and it is wrong there: the publishing wire subscribes through a broadcast `Consumer`, which sets
+    `register = true`, so a repeat subscription already fans out from the live producer, and
+    releasing the scope ends the track on the wire, which is the defect finding 19 is about. The
+    catalog track keeps this fix, because its producer writes only when the catalog changes and a
+    subscriber arriving in between has to be seeded by a fresh request; a media track is being
+    written continuously and needs nothing.
 
 14. **A browser publish put its two tracks on two different epochs, and sound led picture by a third
     of a second.** `js/publish/src/audio/capture.ts` handed the worklet `zero: performance.now() *
@@ -1684,6 +1824,11 @@ Things found while working that are separate from the fix.
     viewer who hears nothing and does not know why, and the two alternatives both buy the saving with
     a coupling the current design does not have.
 
+    **Answered in finding 23**, and not by the recommendation above. The second shape turned out to
+    cost nothing: a tile builds its context inside the gesture that lands on it, so a muted tile
+    holds none at all, and real Safari still plays 8 of 8 on one click. The judgement item is
+    retired.
+
 16. **CodeRabbit over the whole branch: 22 findings, 18 fixed, 4 rejected.** The review exceeded the
     free plan's 150-file cap, so it ran per top-level directory instead. The eighteen real ones
     became `a8cbc93bb`, `97c7afb76`, `b85e57431`, `02f3f143a`, `f5087814b` and this docs commit. The
@@ -1699,6 +1844,239 @@ Things found while working that are separate from the fix.
     session. `8cabb3507` gives it the `"**"` upstream gave the demo and smoke configs. Worth knowing
     for any other config in the wild that still carries the empty string.
 
+18. **A video track that stopped once stopped for good, and the player called it "recovering".** A
+    user published from their own browser and watched their own tile: audio played for the whole
+    session, the picture froze, the stats panel read one burst of video and then 0 kbps and 0 fps,
+    and the badge said `stalled: recovering` while nothing was recovering. The relay log of that
+    session names it. The watcher subscribed to `track=video`, cancelled it, and did that six times
+    before stopping for good, then never asked for video again for the rest of the session, while it
+    re-subscribed to `audio` after every publisher reconnect.
+
+    Nothing in the player could bring video back. The `VideoDecoder` error callback called
+    `effect.close()`, which closed the `DecoderTrack`'s whole effect and its subscription with it,
+    while `#active` kept pointing at the dead track, so `#runPending` never built a replacement: the
+    relay saw the subscription cancelled and never saw another. The 500 ms `stalled` flag only ever
+    labelled the result, and `demo/web`'s "recovering" was a string beside it. A hole in delivery fed
+    a delta to a codec with no reference for it, which is what raises the error for a container that
+    carries keyframes inside a group, so the two are one chain.
+
+    Fixed in `20c6756eb`. The decoder records why a track died, and the parent rebuilds it at the
+    live edge: a 1 s retry, a stall of 5 s doubling to a 60 s ceiling so a hopeless rendition costs
+    one subscription a minute rather than one every five seconds, and the ceiling reset on the first
+    painted picture. After a hole, deltas are withheld until the next keyframe.
+
+    The publisher had the same shape one layer down. `Fanout` closed on a source that ended or failed
+    and told nobody, so a capture pipeline that stopped while the camera track was still live left
+    the preview holding its last frame, the capture rate at zero and the encoders quiet, with the
+    element still announcing a live broadcast. `Fanout.ended` and `Capture.out.stopped` now say why,
+    `Capture` rebuilds on a track that can still deliver, and the resolved dimensions stay with the
+    source across the gap instead of blanking and dropping the rendition out of the catalog, which
+    would take every viewer's subscription with it. That is option A of the three the catalog had.
+
+    Two more landed alongside, both found by trying the demand gate finding 13 describes: the audio
+    encoder declares a break after a gated interval, so the first frame after it is not read as
+    continuing the last one, and `Container.Legacy.Producer` no longer flushes an endpoint into a
+    group its closed track has already torn down. And a subscriber leaving resets the stream with
+    `Cancel`, which is the normal end of a subscription, so all three sites log it at debug rather
+    than as a publish error.
+
+    **The lip-sync hypothesis is false.** Late video is painted late, not discarded: the run that
+    forced skipping at 1080p60 skipped 7 video groups with zero stalled samples, zero underruns and a
+    painted-minus-audio median of -7.7 ms over 302 samples. **And the capture stop never reproduced
+    on the bench**: this USB camera sustains 1080p60 with its track live throughout, 60 fps end to
+    end, painted skew p50 8 ms and p95 32 ms after warmup, zero stalls, zero skipped groups and zero
+    underruns over 60 s of self-publish. What the user's relay log named instead is the defect above,
+    and the one below.
+
+19. **A video rendition's track was finished on the wire whenever it stopped encoding, and the relay
+    answered every later subscription from the finished track.** After the rebuild above, or a hide
+    and show, the watcher still never got its picture back. The relay logged `subscribed complete`
+    2 to 20 ms after `subscribed started` for a watcher re-subscribing every five seconds, with no
+    upstream subscription raised in between, while the publisher kept capturing and kept the
+    rendition in its catalog:
+
+    ```text
+    10:31:08.929  subscribed started  id=7 broadcast=toggle.hang track=video
+    10:31:08.932  subscribed complete id=7 broadcast=toggle.hang track=video
+    10:31:14.251  subscribed started  id=8
+    10:31:14.256  subscribed complete id=8
+    10:31:19.783  subscribed started  id=9
+    10:31:19.803  subscribed complete id=9
+    ```
+
+    The container producer is built per encode run, and `Container.Legacy.Producer.close()` closes
+    the track under it, so hiding video, a capture that went away or a reconfigure ended the *track*
+    rather than the group. A clean close FINs the subscribe stream in `js/net`,
+    `rs/moq-net/src/lite/subscriber.rs` reads that FIN as `ServeEnd::Finished`, and a finished track
+    is finished for good: every later subscription is served from it and completed at once.
+
+    Fixed in `aba98fd21`: the encoder stops at the group with `producer.cut()`, the way the audio
+    encoder already declares its stop, and the track producer belongs to the Broadcast, which closes
+    it when the rendition is superseded or unregistered. An encoder error still closes the track with
+    the error, which resets the stream rather than finishing it, so the peer can come back.
+
+    This also answers the dedup question finding 13 left open, and closes it the other way. The
+    publishing wire subscribes through a broadcast `Consumer`, which sets `register = true`, so a
+    repeat subscription fans out from the live producer and needs no fresh request. The `unused()`
+    release for media tracks is therefore dropped for good: it ends the track on the wire, which is
+    this same defect, and it measured 5421 ms of worst skew on the mute sequence when it was tried.
+
+    Three test files across two packages: `js/net` that a repeat peer subscription fans out from the
+    live track rather than raising a fresh request, the video encoder that a rendition hidden and
+    shown keeps one live subscription and resumes on a keyframe and that a subscription opened after
+    the stop is served, and the audio encoder that a subscription dropped and reopened three seconds
+    later lands on the same live track at the live timestamp. On the bench, three re-subscriptions to
+    one video rendition lived 9.2 s, 4.9 s and 14.9 s, each ended by the watcher's own cancel and
+    none by a `complete`, and one video subscription lived 54.6 s through the whole mute sequence and
+    was completed only when the publisher stopped.
+
+    **Worth the maintainer's eye.** A relay latching a finished track is protocol-correct: a FIN says
+    the track is over. It is also unforgiving for any publisher that finishes a track it means to
+    resume, and the failure is silent on both sides: the subscriber gets an accepted subscription
+    that completes immediately, and the publisher keeps capturing and advertising. Whether `js/net`
+    should make that distinction harder to get wrong, or whether "stop the group, never the track" is
+    simply the rule a publisher has to know, is a call worth making once rather than per publisher.
+
+20. **An unmute started the arrival estimate over, and the spinner could not tell a fill from an
+    underrun.** A muted tile downloads no audio, so unmuting subscribes again and built a second
+    `Container.Consumer` seeded from the rendition's declared flush span: 320 ms on the file
+    publisher and the 80 ms floor on a browser microphone. The ring then parks the playhead until it
+    holds that plus a chunk, and the buffering indicator keyed on the ring's raw `stalled` flag,
+    which is one flag for three different states: never played, deliberately parked, and ran dry
+    mid-playback. The viewer saw a spinner over video that never stopped, on every unmute.
+
+    Two fixes. `b63519ba8` makes the estimator live as long as the rendition rather than as long as a
+    subscription: `ConsumerProps.jitter` widens to `Time.Milli | Jitter`, so the replacement consumer
+    is handed the estimator that was already measuring and continues it through its existing
+    `reanchor()`, which drops the arrival reference and keeps the distribution, exactly as a
+    discontinuity does. NetEq keeps its delay manager across a pause for the same reason
+    (`modules/audio_coding/neteq/delay_manager.cc`). The measured spread is published for the
+    rendition's lifetime too, because clearing it with the subscription made `Sync` read the delay as
+    collapsing and then deepening across the mute, which is the decoder's own cue to park a second
+    time. `9b2f794c9` adds `Audio.Decoder.out.interrupted` beside `out.stalled`, a stall entered
+    after the ring had played, and the indicator keys its audio arm on that and its video arm on
+    video stalling while the player is not paused.
+
+    Measured on both pages and on the microphone: the spinner is visible for 0 ms on an unmute, the
+    ring fills against the measured 60 ms or 40 ms rather than the declared 320 ms or 80 ms, the
+    target is the same either side of the mute, the playhead is back 231 to 282 ms after the unmute,
+    and no toggle row peaks on an unmute any more. The tables are under "After the user's listening
+    round" below.
+
+    `rs/moq-audio` has the same estimator and the same seeding rule and needs no change: its engine
+    is built once per `decode::Consumer` and it has no notion of a resubscribe, so there is nothing
+    to mirror and the conformance corpus is untouched.
+
+21. **A replacement subscription replayed the window its predecessor had filled.** Repeat
+    subscriptions to one track share a single upstream, so an unmute, a rendition swap or a
+    reconnect landed on that cache and walked the whole retained window at decode speed before it
+    reached live media. On the bench an unmute convicted a group on the way back in
+    (`skipping slow group: track=audio`) and discarded the rest a frame at a time, three seconds
+    being the mute.
+
+    `5a4ed9e21` moves a media subscription's local read cursor to the live edge, which is what
+    `rs/moq-audio/src/decode/consumer.rs` does for `Start::Latest` and what the JS side never had.
+    Deliberately the local cursor and not the subscription's own group start: that field is a request
+    to the publisher, aggregated across every live subscriber, so naming a stale cached sequence
+    there asks the publisher to rewind the track for everyone reading it. Buffered playback keeps
+    `oldest`, since media written ahead of the playhead is the point there.
+
+    Tune-in no longer convicts a group. What is left is one conviction per unmute, and it is a
+    question for `moq-net` rather than a patch here: a group from before the mute is still delivered
+    alongside the live edge and convicted by the 40 ms budget
+    (`sync[audio]: 9 late frame(s), max 3.1s behind`), although `Subscription::max_age` should have
+    skipped it (`rs/moq-net/src/model/track.rs:1494-1496`). Either freshness is judged by a group's
+    newest frame rather than its oldest, or a new subscription on an already-served track does not
+    re-apply the budget. One line of instrumentation settles which: the convicted group's first and
+    last timestamps, and whether it was open or closed when it was judged. The cost today is one warn
+    line per unmute and zero underruns.
+
+22. **Hiding video and showing it again left the preview black, because a busy device spent the
+    retry budget.** Hiding stops the camera, which starts handing the device back to the OS, and a
+    browser finishes that some time after `stop()` returns, so the capture the re-show starts can be
+    refused with `NotReadableError`. Every refusal spent retry budget, and `Retry`'s `LIMIT = 3` with
+    a 250 ms to 1 s backoff is 0.9 to 1.8 s of budget: four refusals inside that window ended the
+    capture for good, `out.source` stayed undefined, the preview painted black, the video rendition
+    dropped out of the catalog, and nothing ever asked for the camera again.
+
+    `ff4da0042` makes a busy device a wait rather than a verdict. `NotReadableError` and `AbortError`
+    back off without spending budget, so the capture keeps asking for as long as it is wanted, and
+    every other reason spends it exactly as before. The next attempt awaits the previous capture's
+    release, which nothing ordered before. The reason is kept rather than swallowed, so `Camera`,
+    `Microphone` and the element can say why there is no picture: `MoqPublish.errors` and red camera
+    and microphone buttons with the reason in the tooltip, instead of a black canvas speaking for it.
+    Two more alongside: the codec probe races `effect.cancel`, so showing video again while a probe
+    was still out no longer holds the encoder at its old answer with no rendition in the catalog
+    meanwhile, and the mirrors wiring a selected source into the capture inputs bind to the run that
+    made them rather than to the element, so switching source no longer leaves one behind per switch.
+
+    **It is not reproducible unaided on this bench**: this camera frees in under 100 ms, so the first
+    frame after a show arrives 47 to 128 ms later and the preview paints within another 30 ms, in
+    Chromium, Brave, WebKit and on the `preview="encoded"` path, before the fix and after it.
+    Firefox delivers the frame in the same time and paints nothing, which is finding 25 and predates
+    this branch. It was proven with an injected 8 s busy
+    window in Brave and in WebKit, which is longer than the whole retry budget: before, the camera
+    was never asked for again, the preview stayed black and the catalog had no video section 15 s
+    later; after, the camera comes back within half a second of the device being free. The table is
+    below.
+
+    **A judgement item.** A busy device is now retried for as long as video is switched on, at most
+    once a second. That is deliberate, since the alternative is the black preview above, and it is
+    the one place on this branch where a failure is retried without a bound. The bound that exists is
+    the user's own switch: turning video off stops it.
+
+23. **The audio context was built at load for every tile, and building it on the gesture instead is
+    both quieter and more reliable.** This retires the judgement item finding 15 left open, with a
+    measurement rather than an argument. Every tile used to build an `AudioContext` as soon as the
+    catalog named a rate, so the demo page's muted tiles each cost a "The AudioContext was not
+    allowed to start" warning and a suspended context with its own render thread, for audio nobody
+    had asked to hear.
+
+    `35459ad52` builds a tile's context when it has a reason to: inside the gesture handler for a
+    tile that has none, and when the app turns audio on for a tile that is not muted. The gesture
+    path builds and resumes synchronously, because an effect the gesture schedules runs a microtask
+    later and WebKit only starts a context resumed outside a handler while the page's activation
+    lasts. The rate the decoder turns out to emit still replaces the context, since a context's rate
+    is fixed for its lifetime, and the replacement is armed again rather than assumed started.
+
+    Measured, in browsers with their default autoplay policy. Real Safari 26 through `safaridriver`
+    with exactly one Element Click on a muted tile: 8 of 8 runs build one context at the click, read
+    `running` at the first sample after it, 4 to 12 ms later, and hold a playhead with zero
+    underruns. The demo watch page with two tiles, one muted: Chromium falls from 2 warnings and 2
+    contexts to 1 and 1, the one that is left being the tile the page itself unmutes; Firefox falls
+    from 4 warnings to 2. Muted tiles hold no context at all, and the site page, whose player starts
+    muted, logs nothing and holds nothing. The nightly
+    Chromium lane still produces a playhead and its counters (`fixed-250 opus plain`, not voided),
+    which is the lane that drives a browser with no gesture at all.
+
+    Gesture first, with the broadcast arriving long after the click, fails inside and outside this
+    change alike, so it is not a regression. With the catalog 7.1 s after the click, the context is
+    built at the click and runs, the catalog's rate replaces it, and the replacement stays suspended
+    with no playhead; the shape this replaces has no context for the first five seconds, builds one
+    at 7.9 s and ends in WebKit's `interrupted` state without ever running. Inside the activation
+    (catalog 2.6 s after the click) it plays either way.
+
+    The recorded costs: an app that enables audio before any gesture still warns, because that is
+    what the policy is for, and a video-only tile holds an idle context once the first gesture has
+    landed.
+
+24. **The ring fallback was a wall of warnings.** A page that is not cross-origin isolated cannot
+    have a `SharedArrayBuffer`, so the postMessage ring is the path it is meant to run on. Every
+    player on the page said so at warning level, and the worklet added a second line from inside each
+    one. Cross-origin isolation is a property of the document, so `48c9d5302` answers once per page,
+    at info level, with the isolation hint kept for a page that wants the shared-memory path, and
+    drops the worklet's two lines, which said the same thing from the other side of the port.
+
+25. **The canvas preview never paints in Playwright Firefox, and it predates this branch.** In the
+    hide and show rows, Firefox delivers a camera frame 102 ms after the show, 819 frames reach the
+    main thread over the run, the camera source is live at the end and the catalog carries the
+    rendition (`avc1.640028 1280x720`), and both readbacks of the preview canvas read 0 at every
+    sample. Firefox has no `MediaStreamTrackProcessor` and takes the polyfill path in
+    `js/publish/src/video/processor.ts`, which is the difference between it and the three engines
+    that paint. Nothing on this branch touches it, and it is recorded here so the matrix's Firefox
+    self-publish rows are not read as a regression. Whether a watcher of that publisher sees the
+    picture is what those rows will say.
+
 ## Public API and wire impact
 
 No wire format change anywhere. One wire *semantics* addition: an audio endpoint bounds the source
@@ -1706,6 +2084,10 @@ media rather than the track, so a publisher that pauses declares one and declare
 before the frame that resumes. `drafts/draft-lcurley-moq-hang.md` and `doc/concept/hang.md` say so;
 the bytes are the empty frame and the empty group that both already define. All of the below is
 `dev` material.
+
+The eight commits of 2026-09-17 change no wire format and no message. The one thing they change on
+the wire at all is that a video rendition's track is no longer finished when it stops encoding
+(`aba98fd21`), which is a lifetime rather than a byte.
 
 **`@moq/net`**
 
@@ -1727,6 +2109,10 @@ the bytes are the empty frame and the empty group that both already define. All 
   document, that tells a consumer whether this receiver was blocked. It is **not** exported from
   `@moq/hang/container`; `Container.Consumer` owns the only instance.
 - New `ConsumerProps.jitter`, which passes that declaration through from the rendition config.
+- `b63519ba8` widens `ConsumerProps.jitter` to `Time.Milli | Jitter`: a duration is still the
+  publisher's declaration, and a `Jitter` is an estimate already measuring that the consumer
+  continues through `reanchor()`. Additive, one prop with one meaning; every existing caller compiles
+  untouched.
 - New `Container.Consumer.spread` and `Container.Consumer.skipped`.
 
 **`@moq/watch`**
@@ -1750,9 +2136,22 @@ the bytes are the empty frame and the empty group that both already define. All 
 - `de641c6b5` changes nothing on the surface. The `AudioContext` moves into a private effect keyed on
   a new private `#rate` computed, so the worklet and ring rebuild under it instead of replacing it,
   and `unlockOnGesture` is armed for the decoder's lifetime and returns without arming anything where
-  there is no `document`. Behaviour does change on a page with several tiles: a gesture anywhere now
-  starts the context of every tile that has one, not only of an unmuted tile. See finding 15, which
-  states the cost and the alternatives.
+  there is no `document`. Behaviour did change on a page with several tiles: a gesture anywhere
+  started the context of every tile that had one, not only of an unmuted tile. `35459ad52` below
+  settles that: a muted tile has no context to start.
+- `9b2f794c9` adds `Audio.Decoder.out.interrupted`, a stall entered after the ring had played.
+  `out.stalled` keeps its meaning and its reader in the stats panel; the buffering indicator is what
+  moves onto the new one.
+- `5a4ed9e21` gives `subscribeMedia` an optional `start` and exports `MediaStart` beside it. Both are
+  `@internal` to `@moq/watch`. Nothing about the request changes, only which groups this reader
+  delivers.
+- `20c6756eb` adds no surface. The video decoder's rebuild, its backoff and the keyframe it waits for
+  after a hole are private, and its only public trace is the warning it prints, which is the
+  follow-up below about a rebuild counter.
+- `35459ad52` adds no surface either. A tile's `AudioContext` is built inside the first gesture, or
+  when the app turns audio on for an unmuted tile, rather than as soon as the catalog names a rate.
+  That is visible to a page only as the warnings it no longer prints and the contexts it no longer
+  holds; see finding 23.
 - `Video.Decoder.out` gains `skipped`.
 - `DecoderInput.conceal` is new, with the element attribute `<moq-watch conceal>`.
 - `audioMaxAge` and `maxAgeHeadroom` are new in the audio config module.
@@ -1770,6 +2169,16 @@ the bytes are the empty frame and the empty group that both already define. All 
   rather than an `AudioFrame`, both internal to `js/publish/src/audio` and neither exported. The
   audio timestamps a publisher sends change value, by the epoch error they carried, and the framing
   does not.
+- `20c6756eb` adds `Fanout.ended`, why a source stopped (`null` for a clean end, an `Error` for a
+  failure, `undefined` while it is delivering), and `Video.Capture.out.stopped`, the same answer for
+  a capture pipeline. Both additive.
+- `ff4da0042` adds `Camera.out.error` and `Microphone.out.error`, the reason a source has no track,
+  `MoqPublish.errors` for the element that holds them, and the `.control--error` class the camera and
+  microphone buttons take when there is one. All additive.
+- `aba98fd21` adds and removes nothing. A video rendition's track is cut at the group rather than
+  closed when it stops encoding, so the same groups and frames go out with the subscription left open
+  instead of finished. That is behaviour, not format; it is the difference between a peer that can
+  come back and one that cannot.
 
 **`rs/moq-audio`**
 
@@ -1872,10 +2281,20 @@ than discarded, so the band is not evaluated on the instantaneous level the ques
   same sequence with each half of the fix removed.
 - Each of the five re-landed fixes has a test that fails without it and passes with it.
 - One pre-existing flaky `console.error` spy test was fixed on the way past, in `fcce8af55`.
+- A listening round by the user on a build of `de641c6b5`, which produced the nine reports the eight
+  commits of 2026-09-17 answer.
+- The rows behind findings 18 to 25, all on the quiet bench with the publisher restarted before each
+  one: the unmute on both pages and on the microphone, the mute and preset sequence per engine after
+  each fix, hide and show in Chromium, Brave, Firefox and WebKit with and without an injected 8 s
+  busy device, eight real-Safari runs with one Element Click each, a page load per engine counting
+  the autoplay warnings with the browser's own policy, and the relay's own log read either side of
+  the re-subscribe fix.
+- Tests with each of those fixes, in `js/hang`, `js/net`, `js/publish` and `js/watch`; the counts are
+  in the two gate passes below.
 
 ### Gates on the final tree
 
-Three passes, each stated with the tip it ran on, one command at a time.
+Five passes, each stated with the tip it ran on, one command at a time.
 
 At `3dcea2ab4`, 72 commits above `upstream/dev`:
 
@@ -1921,11 +2340,39 @@ The Chromium matrix at `5484970e1` breached 17 recorded ceilings and voided one 
 `opus-near-zero-isolated`, on `AudioContext.currentTime` drifting 4.92 percent from wall clock over
 10 s. Both are in the enforced-budgets section above, with every measured value against its ceiling.
 
-**`check-all`, `test all` and `smoke-full` were last run thirteen commits below the tip.** Those
+**`check-all`, `test all` and `smoke-full` were last run thirteen commits below that tip.** Those
 thirteen commits touch `js/watch`, `js/hang`, `js/publish`, `rs/moq-shaper`, `rs/moq-audio`, the
 harness, the nightly workflow and the delivery documents. Every one of those is inside the scope the
 `check` and `test` at the tip cover, so nothing in them is unchecked; what is not re-run is the rest
 of the workspace, which they do not touch, and the cross-language interop lane.
+
+At `48c9d5302`, with the video recovery work that became `20c6756eb` already in the tree:
+
+| Gate | Exit | What it covered |
+| --- | ---: | --- |
+| `just fix upstream/dev` | 0 | No tracked change |
+| `just check-all` | 0 | Every package, every language, including the bindings and the docs site. The round before it failed on two TypeScript errors in the new `js/watch/src/video/decoder.test.ts`, which were fixed before the commit |
+| `just js test` | 0 | 804 `@moq/net`, 230 `@moq/hang`, 373 `@moq/watch`, 145 `@moq/publish`, every package exiting 0 |
+| `demo/web` and the copied site rebuilt | 0 | So the listening rows that follow run the tip rather than an older build |
+
+At the code tip `35459ad52`, 96 commits above `upstream/dev`, covering `5a4ed9e21`, `ff4da0042`,
+`aba98fd21` and `35459ad52`:
+
+| Gate | Exit | What it covered |
+| --- | ---: | --- |
+| `just fix upstream/dev` | 0 | No tracked change |
+| `just check upstream/dev` | 0 | Every package the branch touches, scoped as CI scopes it |
+| `just js test` | 0 | 805 `@moq/net`, 230 `@moq/hang`, 383 `@moq/watch`, 153 `@moq/publish` |
+| `just test audio-quality`, one row | 0 | `chromium-opus-48000-fixed-250-plain`: zero underruns, target p95 250 ms, not void. Its 16 skip-aheads a minute are over a recorded ceiling of zero, reported rather than enforced, which is the `recorded` marker doing its job |
+| `demo/web` and the copied site rebuilt | 0 | Both served pages come from the final tip |
+
+**What was not re-run above `ba7a68789`**: the deterministic replay lane, the 24-row Chromium matrix,
+`just test default`, `check-all` at the final tip, and `smoke-full`. The eight commits touch
+`js/hang`, `js/net`, `js/publish`, `js/watch` and one paragraph of `doc/concept/playout.md`, and no
+Rust, no wire and nothing `moq play` reaches, so the cross-language lane has nothing new to cover.
+The replay lane and the Chromium matrix do cover the player, and they are the gap: what stands in
+their place is `just js test` at both passes and the bench rows above, which are instrument readings
+on one machine rather than a graded run.
 
 One caveat on the CPU bench in `stretch.bench.test.ts`: its ratio assertion
 (`max(stretch) / max(normal) < 30`) fails about one run in fifteen on this machine and passes the
@@ -1977,10 +2424,12 @@ ceiling, and every residual is in "The enforced budgets" above.
   outright, so an `auto` row is on its measured target within a second. `budgets.json` was
   re-recorded against that in `ce2e13112`, and the rows still disagree with themselves: three clear
   the test now where ten did before, which is the honest answer rather than a better one.
-- **No listening round has happened on this tip, `de641c6b5`.** The user last listened several
-  commits ago. The flushed-ring fix, the receiver-stall input, the five CodeRabbit commits and all
-  three of the fixes behind findings 13, 14 and 15 have landed since, and none of them has been
-  heard. Every number above is an instrument reading.
+- **No listening round has happened on this tip, `35459ad52`.** The user listened on a build of
+  `de641c6b5` and reported the nine things findings 18 to 25 answer. Every one of the eight commits
+  since is measured and none is heard, so every number above is an instrument reading.
+- **The cross-browser resilience matrix is still running** as this is written: each engine
+  publishing and watching, hide and show, mute and unmute, a device change, an impaired path through
+  `moq-shaper`, a relay restart and a 30 minute run. Nothing here claims its rows.
 - **The two cdn rows from the demo pages could not be run as written.** `https://cdn.moq.pro` with no
   path is what `demo/web` points at, and the public relay closes a session opened at its root, so
   both rows failed to start twice and are recorded that way. `cdn.moq.pro/demo` stands in on both
@@ -2142,8 +2591,8 @@ listed below, and it is the same follow-up as giving that package a `bun test` t
 ### The state of the branch
 
 `debug-findings-solution` on the fork `fperex/moq`, base `dev`, opened as draft pull request #3 there
-and nowhere else. The last change to the player itself is `de641c6b5`; the commits above it are this
-document, and the fixes named under "Work in progress at this tip" as they land. An earlier state of
+and nowhere else. The last change to the player itself is `35459ad52`; the commit above it is this
+document, and the cross-browser matrix that is still running will be another. An earlier state of
 the work is archived on `debug-findings-solution-wip-20260912`.
 
 Two things that produced numbers above are deliberately not on the branch: the full run matrix the
@@ -2154,20 +2603,37 @@ listening bench" and have a home proposed below.
 ### Quests worth opening
 
 - **The publisher demand gate.** `Rendition.track` documents a gate, "producers should encode only
-  while this is set", that no longer exists: a browser publisher encodes with zero viewers. Making it
-  real is larger than it looks, because it immediately exposes two more defects, an audio encoder
-  that does not re-anchor after a gated interval (40.7 s of A/V skew on the first viewer after one)
-  and a `Container.Legacy.Producer.close()` that throws `group is closed` once its track has gone.
-  Those three belong together in one quest rather than in this branch. Finding 13 has the detail.
+  while this is set", that no longer exists: a browser publisher encodes with zero viewers. Two of
+  the three defects that surfaced when the gate was tried are fixed here, in `20c6756eb`: the audio
+  encoder now declares a break after a gated interval, and `Container.Legacy.Producer` no longer
+  flushes into a group its closed track has torn down. What is left is the gate itself, and it is
+  still larger than it looks, because a rendition that stops encoding must stop at the group and not
+  at the track, which is finding 19. Findings 13, 18 and 19 have the detail.
 - **The camera's own pipeline latency.** Finding 14 fixed the publisher's two epochs, and what is
   left sits inside the video arrival anchor and cannot be measured from inside the page. An external
   reference is what would resolve it: a clap, or a flashing screen, recorded off both ends at once.
-- **The multi-tile audio context decision.** Finding 15's fix arms the unlock for the decoder's
-  lifetime, so a gesture anywhere on the page now starts the context of every tile that has one,
-  which on the five-tile demo page is five idle contexts on the first click. The three shapes and the
-  recommendation (keep it, and say so in the element's docs) are in finding 15. It is the
-  maintainer's call and it is the only behaviour change on this branch that a page can see without
-  listening to it.
+- **The multi-tile audio context decision is answered, not open.** Finding 15 left three shapes and a
+  recommendation. `35459ad52` takes the second one: a tile builds its context inside the gesture, or
+  when the app turns audio on, so a muted tile holds none at all. Real Safari is 8 of 8 on one click
+  and the warnings at load fall from 2 to 1 in Chromium and 4 to 2 in Firefox. Finding 23 has the
+  measurement and the two costs that remain.
+- **Which layer should stop a publisher finishing a track it means to resume.** Finding 19 fixes it
+  in `js/publish` by cutting the group rather than closing the track. The relay is right to latch a
+  finished track, and the failure it produces is silent on both sides, so the question is whether
+  `js/net` should make the distinction harder to get wrong or whether "stop the group, never the
+  track" is simply a rule a publisher has to know.
+- **The unmute conviction, in `moq-net`.** One group from before a mute is delivered alongside the
+  live edge and convicted by the 40 ms budget, although `Subscription::max_age` should have skipped
+  it. Finding 21 names the two candidate explanations and the one line of instrumentation that picks
+  between them. It costs one warn line per unmute today and no underruns.
+- **A public rebuild counter on `video.out`.** The decoder now rebuilds a track that stopped
+  producing, and the only trace of it outside the module is the warning it prints, which is what the
+  bench drivers count. `Video.Decoder`'s generation and the `DecoderTrack.failed` signal behind it
+  are both private; a counter beside `video.out.skipped` would let a harness grade recovery rather
+  than parse a log line.
+- **The publisher preview on the `MediaStreamTrackProcessor` polyfill path.** Finding 25: in
+  Playwright Firefox the frames arrive and the canvas never paints. Pre-existing, and worth pinning
+  down before anyone reads a Firefox self-publish row as a regression.
 - **A `bun test` target for `test/audio-quality/clients/js`**, and the bench drivers folded in beside
   `driver.ts`, `safari.ts` and `webdriver.ts` while it happens. The grader, the beacon, the probe and
   the Safari lane are exercised only by running the harness end to end, which is why the six
@@ -2194,6 +2660,10 @@ listening bench" and have a home proposed below.
 
 ### Open measurements
 
+- **The cross-browser resilience matrix is running as this is written.** Each engine as publisher and
+  as watcher, foreground and backgrounded, 720p30 through 1080p60, hide and show, mute and unmute, a
+  device change, an impaired path through `moq-shaper`, a relay restart mid-session and a 30 minute
+  run. Its rows are appended to this document when it finishes, and nothing above claims them.
 - **The twenty-one `recorded` harness rows.** They print a breach and do not fail a run. What would
   move them is the nightly runner recording its own budgets on its own hardware; every ceiling in
   `budgets.json` today was measured on one desktop.
@@ -2229,13 +2699,16 @@ listening bench" and have a home proposed below.
 
 ### The listening state, plainly
 
-**Nothing on this tip has been heard.** The last listening round was several commits below it. The
-flushed-ring fix (`8700f1fcc`), the Safari unlock (`b86b03c94`), the receiver-stall input
-(`d5886766f`), the five CodeRabbit commits, and all three of the fixes behind findings 13, 14 and 15
-(`cb10a2a66`, `eb4331877`, `de641c6b5`) have landed since, and none of them has been listened to.
-Every number in this document is an instrument reading. The bench above is what a listening round
-would be run on: the relay, the plain page, the copied site page, and one smooth `bbb.hang` publisher
-on the fixed recipe.
+**Nothing on this tip has been heard.** The last listening round was on a build of `de641c6b5`, and
+it is the round that produced the nine reports findings 18 to 25 answer. Since then the eight commits
+of 2026-09-17 have landed: the arrival estimate kept across a mute (`b63519ba8`), the spinner
+(`9b2f794c9`), the ring fallback line (`48c9d5302`), the video track that stopped (`20c6756eb`), the
+live edge (`5a4ed9e21`), the busy camera (`ff4da0042`), the rendition's track staying open
+(`aba98fd21`) and the audio context on the gesture (`35459ad52`). None of them has been listened to,
+and the cross-browser matrix is still running, so every number in this document is an instrument
+reading. The bench above is what a listening round is run on: the relay, the plain page, the copied
+site page, one smooth `bbb.hang` publisher on the fixed recipe, and a browser publisher of the USB
+camera and microphone for the self-publish half.
 
 ## Attribution and licensing
 
