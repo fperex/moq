@@ -1,3 +1,4 @@
+import { Time } from "@moq/net";
 import type { Effect } from "@moq/signals";
 import type MoqWatch from "../../element";
 import { formatMillis } from "../format";
@@ -53,8 +54,9 @@ export function liveBadge(parent: Effect, watch: MoqWatch, state: UiState): HTML
 
 	parent.run((effect) => {
 		// Show the total added latency (jitter buffer + codec frame overhead),
-		// which is what the viewer actually experiences.
-		const total = effect.get(watch.sync.out.delay);
+		// which is what the viewer actually experiences, including the hold a publisher whose
+		// picture arrives later than its sound costs.
+		const total = Time.Milli.add(effect.get(watch.sync.out.delay), effect.get(watch.sync.out.offset));
 		latency.textContent = `+${formatMillis(total)} latency`;
 	});
 
