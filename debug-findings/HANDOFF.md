@@ -1,14 +1,16 @@
 # Handoff: moq realtime audio stutter (NetEq-shaped playout), 2026-09-17
 
 Handoff for whoever continues this branch. A private, fuller copy with machine-local paths stays on
-the author's machine. Plan of record: the private session plan (stages, decisions, reuse inventory).
+the author's machine; for this session it is `HANDOFF-2026-09-17.md` in the root checkout.
+Plan of record: the private session plan (stages, decisions, reuse inventory).
 Memory: the private session memory (user decisions, acceptance targets, browser coverage, delivery
 shape).
 
 ## Where the work is
 
-- Branch `debug-findings-solution`, tip `de641c6b5`, 85 commits on `upstream/dev` `877a561d8`
-  (rebased off `8f41d4d82`). Pushed to the fork `fperex/moq`; draft PR
+- Branch `debug-findings-solution`, code tip `de641c6b5`, 85 commits on `upstream/dev` `877a561d8`
+  (rebased off `8f41d4d82`). The docs commit on top of it is the branch tip, and it is the last
+  commit in the table in `REPORT.md`. Pushed to the fork `fperex/moq`; draft PR
   https://github.com/fperex/moq/pull/3 (base `dev`, draft, fork only). NEVER open a PR on
   moq-dev/moq; the maintainer gets an issue comment on #2812 only after the user listens and says go.
 - Report for the maintainer: `debug-findings/REPORT.md` and `debug-findings/issue-comment.md` on the
@@ -81,24 +83,28 @@ cross-browser results and the Safari catalog retraction.
   after 20 s, 1240 ms concealed, A/V skew p50/p95 20.1/39.4 ms, worst reading gap 499 ms; round 1
   Chromium 40/40, 68/81.3/41.3, 0, 0, 21.7/41.6, 46 ms; round 2 Firefox 40/40, 67.8/81.2/47.3, 0, 0,
   18.4/38, 32 ms; round 2 Chromium 40/40, 71/84.8/44.1, 0, 0, 20/40, 14 ms.
-- The Chromium matrix at the tip: 24 rows, 36 enforced checks, 0 enforced breaches, 17 breaches on
-  `recorded` rows, 1 void on a recorded row (`opus-near-zero-isolated`, `AudioContext.currentTime`
-  drifting 4.92 percent from wall clock over 10 s).
+- The Chromium matrix at `5484970e1`, not re-run above it because the three fixes since touch one
+  `js/watch` effect and the browser publisher, which no matrix row uses: 24 rows, 36 enforced checks,
+  0 enforced breaches, 17 breaches on `recorded` rows, 1 void on a recorded row
+  (`opus-near-zero-isolated`, `AudioContext.currentTime` drifting 4.92 percent from wall clock over
+  10 s).
 - The replay lane at the tip: 12 rows, 148 enforced checks, 0 void.
 - Public relay `cdn.moq.pro` `bbb.hang` on the production path: 36 underruns per 120 s before,
   1 after; target 200 ms, held 223 ms, the 23 ms being the AAC chunk.
 
 ## What is left, in order
 
-1. **The listening round.** The bench is up and left up: relay on 4443 with
-   `demo/relay/localhost.toml`, four file publishers, and pages on 4400 (plain, the production
+1. **The listening round.** `debug-findings/bench/README.md` is the full recipe: relay on 4443 with
+   `demo/relay/localhost.toml`, the file publishers, and pages on 4400 (plain, the production
    postMessage path), 4401 (cross-origin isolated, the shared ring) and 4402 (the copied moq.dev
-   site, rebuilt against this tip). `debug-findings/bench/README.md` is the recipe. The quiet
-   re-measure is done and folded into the report; what is left is a human listening to it.
+   site, rebuilt against this tip). What is left up for the listening round is the narrow version of
+   it: the relay, the plain page on 4400, the site page on 4402, and one `bbb.hang` plus one
+   `demo/bbb.hang` publisher, both on the smooth `-pes_payload_size 0` recipe. The quiet re-measure
+   is done and folded into the report; what is left is a human listening to it.
 2. **The listening verdict from the user.** Nothing has been heard on this tip, `de641c6b5`, and
    findings 13, 14 and 15 have not been heard at all.
-3. **Fill the final tip into `debug-findings/issue-comment.md` and post it on #2812**, on the user's
-   go and not before.
+3. **Fill any newer tip into `debug-findings/issue-comment.md` and post it on #2812**, on the user's
+   go and not before. The tip in it today is `de641c6b5` with the docs commit on top.
 4. **Open judgement items**, none of which block the above: `aac-high-rtt-isolated` converging in
    42.7 s against an 11.6 s ceiling, which is outside ordinary run-to-run spread and is unexplained;
    the cluster of hard-zero recorded ceilings breached by a single episode, which is a recording
