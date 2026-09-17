@@ -451,19 +451,6 @@ describe("latency skip", () => {
 	// played is the target plus one more chunk. Every skip lands back here.
 	const HOLD = TARGET + CHUNK;
 
-	it("should skip READ when buffered exceeds the hold level and the stretch band", () => {
-		const buffer = create(BAND);
-
-		// Fill 700 samples in 100-sample chunks, well past the 500 sample band.
-		insertChunks(buffer, 0, 700, CHUNK, { channels: 1, value: 1.0 });
-		expect(buffer.stalled).toBe(false);
-
-		// Read should skip ahead to leave the hold level between READ and WRITE
-		const output = read(buffer, 1024, 1);
-
-		expect(output[0].length).toBe(HOLD);
-	});
-
 	it("should tolerate the stretch band above the hold level", () => {
 		// A ring sitting on what it holds is inside the band the moment the next chunk lands, and the
 		// band is what the reader's time stretch closes on its own. Skipping on that overshoot

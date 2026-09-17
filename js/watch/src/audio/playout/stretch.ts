@@ -24,7 +24,7 @@ import type { Noise } from "./noise";
 export const OVERLAP = 5;
 
 /** Shortest pitch period searched, in milliseconds, so 400Hz and up. */
-export const MIN_LAG = 2.5;
+const MIN_LAG = 2.5;
 
 /** Longest pitch period searched, in milliseconds, so 66Hz and up, and where a splice sits. */
 export const MAX_LAG = 15;
@@ -48,11 +48,9 @@ export const CORRELATION_FAST = 0.5;
 /**
  * How far above the background a block must sit to count as speech.
  *
- * Below it the correlation is meaningless and a splice is inaudible, so it is always allowed. This
- * is the gate the earlier prototype got wrong: it accepted `score >= 0.5 || passive` on the normal
- * path, which splices active speech on half the correlation NetEq requires.
+ * Below it the correlation is meaningless and a splice is inaudible, so it is always allowed.
  */
-export const PASSIVE_GATE = 8;
+const PASSIVE_GATE = 8;
 
 /** How well a sub-multiple of the winning lag must correlate before it is preferred to the lag itself. */
 const SUBMULTIPLE = 0.9;
