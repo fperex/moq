@@ -1,4 +1,4 @@
-# Handoff: moq realtime audio stutter (NetEq-shaped playout), 2026-09-16
+# Handoff: moq realtime audio stutter (NetEq-shaped playout), 2026-09-17
 
 Handoff for whoever continues this branch. A private, fuller copy with machine-local paths stays on
 the author's machine. Plan of record: the private session plan (stages, decisions, reuse inventory).
@@ -7,7 +7,7 @@ shape).
 
 ## Where the work is
 
-- Branch `debug-findings-solution`, tip `5484970e1`, 81 commits on `upstream/dev` `877a561d8`
+- Branch `debug-findings-solution`, tip `de641c6b5`, 85 commits on `upstream/dev` `877a561d8`
   (rebased off `8f41d4d82`). Pushed to the fork `fperex/moq`; draft PR
   https://github.com/fperex/moq/pull/3 (base `dev`, draft, fork only). NEVER open a PR on
   moq-dev/moq; the maintainer gets an issue comment on #2812 only after the user listens and says go.
@@ -44,15 +44,38 @@ cross-browser results and the Safari catalog retraction.
   after convergence are its own content process stalling, not the path.
 - `ce2e13112` the budgets re-recorded; `5484970e1` the nightly job also runs the replay lane;
   `3dcea2ab4` remark's formatting; `ec6d9761a`, `85583de68`, `3c9388e56` the delivery docs.
+- `cb10a2a66` a served catalog track is released when its last subscriber leaves. That is finding 13:
+  a browser publisher stopped seeding catalogs after its first viewer left, so every later viewer got
+  `subscribe ok` and no catalog.
+- `eb4331877` captured audio is stamped on the context clock. That is finding 14: the publisher's two
+  tracks sat on two epochs, sound led picture by 235 to 272 ms across the probe runs, and that offset
+  was the whole unmute transient.
+- `de641c6b5` the audio context is keyed on the rate it runs at and nothing else, and the unlock is
+  armed for the decoder's lifetime. That is finding 15: on the demo page a later catalog frame, the
+  one that adds the Opus `description`, closed the context the click had just started and built a
+  suspended replacement, so real Safari played 1 run in 8 with video and no sound. It carries a
+  behaviour change for the maintainer to rule on: a gesture anywhere now starts the context of every
+  tile, five on the demo page.
 
 ## Measured state
 
-- Safari one-click unlock: 6 of 6 gesture-first runs and 4 of 4 muted-tile runs reach `running` with
-  rendered output growing, across real Safari 26, Chromium and Firefox, on a headset at 44100 Hz that
-  matches neither broadcast rate. Building the context inside the gesture handler was measured and
-  rejected: 0 of 2 at 16 kHz.
+- **The full matrix is `debug-findings/bench/MATRIX-2026-09-17.md`**, which is private and stays on
+  this machine; every number it carries that matters is folded into `REPORT.md`, so the report is the
+  thing to read. The row JSONs it cites live in a session scratchpad and will not survive a Claude
+  Code reinstall.
+- Safari one-click unlock: 8 of 8 real-Safari runs reach `running` 4 to 12 ms after one Element
+  Click on `de641c6b5`, one context per run, against 7 of 8 before it. The earlier reading that a
+  page's activation carries to a context created later is wrong and is corrected in the report: it
+  holds only inside WebKit's few-second activation grace. Building the context inside the gesture
+  handler is still measured and rejected: 0 of 2 at 16 kHz.
 - The unmute transient: `sync.replay.test.ts` takes the reported sequence over the fallback transport
-  from 2992 ms of A/V skew to 37 ms. Firefox and WebKit have not been re-measured on a served build.
+  from 2992 ms of A/V skew to 37 ms. Re-measured at the tip, the worst skew over the sequence is
+  -41.1 ms in real Safari (the first time that cell has been measured), 64.3 ms in WebKit, 73.7 ms in
+  Chromium on the shared ring and -46.8 ms in Firefox, with zero underruns on all four.
+- The microphone rows on the fixed publisher: target 40 ms, held 60 ms, zero underruns and zero skips
+  on every engine and both rings. The skew metric's own resolution is one frame plus one refresh at
+  the floor and one playhead reporting interval at the ceiling, so the signed pair is what to grade;
+  the report's "Conferencing targets" section says it in full.
 - Firefox side by side with Chromium on the same broadcast, same relay, same moment, two rounds of
   120 s: round 1 Firefox target p50/max 40/780 ms, level p50/p95/min 70.9/751.7/0 ms, 1 underrun
   after 20 s, 1240 ms concealed, A/V skew p50/p95 20.1/39.4 ms, worst reading gap 499 ms; round 1
@@ -67,14 +90,13 @@ cross-browser results and the Safari catalog retraction.
 
 ## What is left, in order
 
-1. **Bench and listening round.** Relay on 4443 with `demo/relay/localhost.toml`. Two publishers:
-   `bbb-smooth.hang` through the `ffmpeg-ts` recipe with `-pes_payload_size 0`, and a bursty
-   `bbb.hang` through the same recipe without it. Pages on 4400 (plain, the production postMessage
-   path), 4401 (cross-origin isolated, the shared ring) and 4402 (the copied moq.dev site). Then a
-   quiet re-measure, with nothing else loading the machine, of the nine page rows and the microphone
-   pair in Chromium, Firefox and real Safari, plus the mute-sequence after numbers that the report
-   still has to name as unmeasured.
-2. **The listening verdict from the user.** Nothing has been heard on this tip.
+1. **The listening round.** The bench is up and left up: relay on 4443 with
+   `demo/relay/localhost.toml`, four file publishers, and pages on 4400 (plain, the production
+   postMessage path), 4401 (cross-origin isolated, the shared ring) and 4402 (the copied moq.dev
+   site, rebuilt against this tip). `debug-findings/bench/README.md` is the recipe. The quiet
+   re-measure is done and folded into the report; what is left is a human listening to it.
+2. **The listening verdict from the user.** Nothing has been heard on this tip, `de641c6b5`, and
+   findings 13, 14 and 15 have not been heard at all.
 3. **Fill the final tip into `debug-findings/issue-comment.md` and post it on #2812**, on the user's
    go and not before.
 4. **Open judgement items**, none of which block the above: `aac-high-rtt-isolated` converging in
@@ -93,8 +115,12 @@ WebTransport and hides an impaired UDP path (and `localhost` resolves IPv6-first
 IPv4); `rs/moq-relay/tests/drills.rs` does not compile and CI runs zero drill tests; a dead publisher
 stays announced for the 30 s idle timeout; the public `bbb` publisher should use `-pes_payload_size
 0`; the shaper reordered under jitter, and seeded both directions alike (both fixed); the estimator
-believed a blocked receiver (fixed); upstream's lease model changed what an empty `auth.public`
-means.
+believed a blocked receiver (fixed); a browser publisher stopped seeding catalogs after its first
+viewer left (fixed, finding 13, with the dead `Rendition.track` demand gate and the two defects
+behind it recorded for a quest); a browser publish stamped its two tracks on two epochs (fixed,
+finding 14); a catalog frame spent the gesture that started the audio context, so real Safari played
+in silence 1 run in 8 (fixed, finding 15, with a behaviour change to rule on); upstream's lease model
+changed what an empty `auth.public` means.
 
 ## Rules that held all session
 
