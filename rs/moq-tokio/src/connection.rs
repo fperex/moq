@@ -132,11 +132,16 @@ pub struct Backoff {
 	#[serde(default, rename = "__cli_max", skip_serializing_if = "Option::is_none")]
 	max_arg: Option<CliDuration>,
 
-	/// Maximum time to spend retrying before giving up. Defaults to 10s.
+	/// Maximum time to spend retrying before giving up. Defaults to 60s.
 	///
 	/// Resets after a stable connection (one that outlives the initial backoff), so a flapping
 	/// session that reconnects then immediately drops still counts toward the timeout. Set to 0 for
 	/// unlimited retries.
+	///
+	/// Long enough to outlive a relay being restarted, which is the common reason a
+	/// live publisher is disconnected: a graceful relay drains for its own window
+	/// (10s by default) before the process even exits, so a shorter one here means
+	/// giving up on a peer that announced it is coming back.
 	#[usage(skip)]
 	#[serde(with = "crate::cli::duration::serde_duration")]
 	pub timeout: Duration,
@@ -146,7 +151,7 @@ pub struct Backoff {
 		long,
 		env = "MOQ_BACKOFF_TIMEOUT",
 		default_value_t = CliDuration::fallback(DEFAULT_TIMEOUT),
-		default = "10s",
+		default = "60s",
 		setting = "connect.backoff.timeout"
 	)]
 	#[serde(default, rename = "__cli_timeout", skip_serializing_if = "Option::is_none")]
@@ -372,7 +377,7 @@ impl Default for Goaway {
 const DEFAULT_INITIAL: Duration = Duration::from_secs(1);
 const DEFAULT_MULTIPLIER: u32 = 2;
 const DEFAULT_MAX: Duration = Duration::from_secs(5);
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Floor for the retry delay, which also sets the bar for calling a session
 /// healthy. Small enough to stay out of the way of a fast config, large enough
@@ -501,6 +506,20 @@ impl Shared {
 	fn migrating(&self) {
 		if let Ok(mut state) = self.state.write() {
 			state.status = Some(Status::Migrating);
+		}
+	}
+
+	/// A replacement was waved away before it served, so `predecessor` is still the
+	/// live session and goes back into [`State`] in its place.
+	///
+	/// Counts the replacement's close, since it did connect, but leaves the epoch
+	/// alone: it never became the session a consumer was handed.
+	fn kept(&self, predecessor: &moq_net::Session) {
+		if let Ok(mut state) = self.state.write() {
+			state.presence.sessions_ended += 1;
+			state.status = Some(Status::Migrating);
+			state.version = Some(predecessor.version());
+			state.session = Some(predecessor.clone());
 		}
 	}
 
@@ -791,19 +810,42 @@ impl Connection {
 							url
 						};
 
-						// Hand over gracefully however the backoff bookkeeping scores this
-						// session. The old one keeps serving until it closes or overstays,
-						// so its routes stay attached and live tracks splice onto the
-						// replacement at a group boundary. Tearing it down here instead
-						// would drop every group published until the replacement caught up.
-						tracing::info!(peer = %Endpoint(&url), "upstream GOAWAY; migrating");
-						shared.migrating();
-						// Retire any predecessor first: overwriting would drop its deadline
-						// on the floor and leave it holding the connection open.
-						if let Some(mut old) = draining.take() {
-							old.retire();
+						// A GOAWAY naming no URI is a drain, not a redirect: the peer is
+						// restarting and telling us to come back to it, so nothing moved.
+						let drained = msg.uri.is_empty();
+
+						// A session waved away before it ever served is no replacement.
+						// Parking it here would retire the predecessor still carrying our
+						// groups in favor of one the peer has already finished with, throwing
+						// away the handover window rather than using it. Keep the
+						// predecessor: it enforces its own deadline.
+						let predecessor = match healthy {
+							true => None,
+							false => draining.as_ref().map(|old| old.session.clone()),
+						};
+
+						if let Some(predecessor) = predecessor {
+							tracing::info!(peer = %Endpoint(&url), "replacement was drained on arrival; keeping the session still serving");
+							// Leave as asked, at once: there is nothing to hand over from a
+							// session that never served, so this is a clean close, not a
+							// handover that overstayed.
+							session.abort(moq_net::Error::Cancel);
+							shared.kept(&predecessor);
+						} else {
+							// Hand over gracefully however the backoff bookkeeping scores this
+							// session. The old one keeps serving until it closes or overstays,
+							// so its routes stay attached and live tracks splice onto the
+							// replacement at a group boundary. Tearing it down here instead
+							// would drop every group published until the replacement caught up.
+							tracing::info!(peer = %Endpoint(&url), "upstream GOAWAY; migrating");
+							shared.migrating();
+							// Retire any predecessor first: overwriting would drop its deadline
+							// on the floor and leave it holding the connection open.
+							if let Some(mut old) = draining.take() {
+								old.retire();
+							}
+							draining = Some(Draining::new(session, goaway.handover(msg.timeout)));
 						}
-						draining = Some(Draining::new(session, goaway.handover(msg.timeout)));
 
 						if healthy {
 							delay = initial;
@@ -813,15 +855,27 @@ impl Connection {
 							continue;
 						}
 
-						// Redirected almost immediately. Still follow it, but score it as a
-						// failed attempt so two peers bouncing us between them escalate
-						// through backoff and eventually give up. The old session serves
-						// across the sleep, so the redirect loop costs time, not data.
-						last_error = Some(Error::Reconnect("peer redirected immediately".to_string()));
+						// Ended before it could serve. Still come back to it, but score it as
+						// a failed attempt so a peer that waves every session away escalates
+						// through backoff and eventually gives up: the same bound that stops
+						// two peers bouncing us between them forever. Whichever session is
+						// still draining serves across the sleep, so this costs time, not data.
+						let reason = match drained {
+							true => "peer is draining",
+							false => "peer redirected immediately",
+						};
+						last_error = Some(Error::Reconnect(reason.to_string()));
 						let Some(wait) = retry_wait(delay, retry_start, timeout) else {
 							return Err(timeout_error(timeout, last_error.as_ref()));
 						};
-						tracing::warn!(peer = %Endpoint(&url), ?wait, "peer redirected immediately; retrying after backoff");
+						match drained {
+							true => {
+								tracing::warn!(peer = %Endpoint(&url), ?wait, "peer is draining; retrying after backoff")
+							}
+							false => {
+								tracing::warn!(peer = %Endpoint(&url), ?wait, "peer redirected immediately; retrying after backoff")
+							}
+						}
 						// Keep the handover bounded across the sleep: nothing else polls the
 						// predecessor while the loop is between connections.
 						sleep_draining(wait, &mut draining, shared).await;
@@ -1682,7 +1736,9 @@ mod tests {
 		assert_eq!(backoff.initial, Duration::from_secs(1));
 		assert_eq!(backoff.multiplier, 2);
 		assert_eq!(backoff.max, Duration::from_secs(5));
-		assert_eq!(backoff.timeout, Duration::from_secs(10));
+		// Longer than a relay's drain window plus a process restart, so a client
+		// survives its peer being restarted rather than giving up mid-outage.
+		assert_eq!(backoff.timeout, Duration::from_secs(60));
 	}
 
 	#[test]

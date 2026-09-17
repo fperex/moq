@@ -35,6 +35,13 @@ pub(crate) async fn serve_ws(
 		return Ok(landing_response());
 	};
 
+	// A draining relay refuses a new session on every transport, for the reason
+	// given in `Connection::run`: accepting one only to wave it away is worse for
+	// the client than the refusal it will get a moment later anyway.
+	if state.shutdown.draining() {
+		return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+	}
+
 	let alpns = versions.alpns();
 	let ws = negotiate_subprotocol(ws, &alpns)?;
 

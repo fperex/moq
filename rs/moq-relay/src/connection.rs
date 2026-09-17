@@ -79,6 +79,17 @@ impl Connection {
 	/// Admits and serves this connection until it closes.
 	#[tracing::instrument("conn", skip_all, fields(id = self.id, remote = self.request.remote_addr().map(tracing::field::display), session = tracing::field::Empty))]
 	pub async fn run(self) -> anyhow::Result<()> {
+		// A relay that is going away has nothing to offer a new session: it would be
+		// drained on arrival, which costs a reconnecting client the session it was
+		// still being served on and spends its give-up budget on an endpoint that is
+		// leaving. Refuse it with the status a client retries, so the dial fails the
+		// way it will once the process is actually gone.
+		if self.shutdown.draining() {
+			tracing::info!("relay shutting down; refusing a new session");
+			let _ = self.request.close(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()).await;
+			return Ok(());
+		}
+
 		let peer_hop = self.request.peer_hop();
 		let (lease, registration) = match self.admit().await {
 			Ok(admitted) => admitted,

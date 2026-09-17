@@ -52,6 +52,16 @@ impl Observer {
 		}
 	}
 
+	/// Whether the drain has already begun.
+	///
+	/// A session accepted after this is true would be drained the moment it is
+	/// handed over, so the listeners refuse one instead: a peer that accepts and
+	/// waves a client straight back out costs it the session it still had and
+	/// spends its reconnect budget on an endpoint that will not serve it.
+	pub fn draining(&self) -> bool {
+		*self.rx.borrow()
+	}
+
 	/// Resolve once the shutdown broadcast fires. Never resolves for
 	/// [`disabled`](Self::disabled) handles.
 	pub async fn started(&mut self) {
