@@ -614,6 +614,37 @@ test("Consumer starts its measurement at what the rendition advertises", async (
 	consumer.close();
 });
 
+test("Consumer continues an estimator it is handed rather than starting over", async () => {
+	// Muting a player stops the download, so unmuting subscribes again and builds a second
+	// consumer. The path has not changed while nobody was reading it, so the estimate it comes
+	// back with is the one that was measured; reseeding from the declaration would park the
+	// playhead for the declared span on every unmute.
+	const measured = new Jitter({ start: 302 as Time.Milli });
+	measured.observe(0 as Time.Micro, 0 as Time.Milli);
+	measured.observe(20_000 as Time.Micro, 20 as Time.Milli);
+	// Closes the first resample interval, so the measurement replaces the declaration.
+	measured.observe(40_000 as Time.Micro, 600 as Time.Milli);
+
+	const target = measured.value.peek();
+	expect(target).toBeLessThan(320 as Time.Milli);
+
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe(), {
+		format: new LegacyFormat("audio"),
+		maxAge: 500 as Time.Milli,
+		jitter: measured,
+	});
+
+	expect(consumer.spread.peek()).toBe(target);
+	// The estimator is the one handed in, so what it measures next moves the consumer's own
+	// reading: a copy of the number would be stuck at the value it was cloned from.
+	measured.observe(60_000 as Time.Micro, 3000 as Time.Milli);
+	expect(consumer.spread.peek()).toBe(measured.value.peek());
+
+	track.close();
+	consumer.close();
+});
+
 // The arrival observation point is load-bearing enough to guard directly: a spy on the estimator
 // says exactly which frames were measured, at which arrival time, and what the consumer knew about
 // each of them.
