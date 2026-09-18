@@ -3,9 +3,16 @@
 Branch: `fperex/moq` `debug-findings-solution`, based on `upstream/dev` `61da0d247`. It was rebased
 there on 2026-09-17 from `877a561d8`, forty-five upstream commits below, and every conflict and
 adaptation that took is recorded under "The rebase onto upstream dev, 2026-09-17". This document
-sits at the branch tip: 118 commits and 204 files at the time of writing, one docs commit above. The
-last change to the player is `d87b15ce0`. The six commits above the previous docs pass touch
-`js/watch`, `js/publish`, `rs/moq-audio` and `doc/concept/playout.md`.
+sits at the branch tip: 123 commits at the time of writing, one docs commit above. The last change
+to the player is `a52f8e241`. The five commits above the previous docs pass are the first ten seconds
+after an event: a declared pause that reopens, a spent head that is no longer convicted, a rebuilt
+tile that keeps what the viewer chose, a hidden camera that is not a stall, a shaper that can drop,
+and the unit this repository packages the relay with. They touch `js/hang`, `js/watch`,
+`js/publish`, `demo/web`, `rs/moq-shaper`, `packaging/`, the hang draft and `doc/concept/`, and they
+are findings 36 to 44 below. The six commits above `0617b441e`, the five code ones and this document,
+carry no `Claude-Session` trailer yet because the session URL was not at hand when they were
+written; a tree-preserving rebase adds it and rewrites all six hashes, and the commit table below
+is refreshed then.
 
 This is a **draft pull request on a fork, opened so the work can be read, and not a submission**. No
 pull request on `moq-dev/moq` is intended and nothing here asks to be merged as a unit. It exists so
@@ -49,8 +56,9 @@ together, and hide and show and self-publish working, on both served pages with 
 and camera. They then reported two transients that round had not covered, the first seconds of their
 own self-publish and the stutter after an unmute, and both are fixed and measured here as findings
 32 and 33. Two more came out of the multi-watcher round the user asked for, findings 34 and 35.
-**The rebased tip has not been heard by the user**: it is gated and measured, and the ear is still
-owed. That is one listener, one machine and one session either way, so the measured rows below are
+**Neither the rebased tip nor this one has been heard by the user**: both are gated and measured,
+and the ear is still owed. The four transients the user reported after the last round they did hear
+are findings 36 and 38 to 40, and each is fixed and measured below. That is one listener, one machine and one session either way, so the measured rows below are
 the evidence and the ear is the confirmation.
 
 **Contents**
@@ -238,14 +246,22 @@ with their author intact.
 | 115 | `91c5878bd` | finding 33 | The same trim in the native engine |
 | 116 | `088752023` | finding 35 | A rendition's arrival estimate outlives a gap in the rendition, so a camera hide does not reseed it |
 | 117 | `d87b15ce0` | finding 35 | A departed track's last reading stays in the shared delay for a window |
-| 118 | this one | delivery | The rebase onto upstream dev, and findings 32 to 35 |
+| 118 | `0617b441e` | delivery | The rebase onto upstream dev, and findings 32 to 35 |
+| 119 | `8af1dc54d` | findings 36, 37 | The endpoint alone in its group is the discontinuity, raised when the group closes, so a declared pause plays out and the run after it reopens |
+| 120 | `a52f8e241` | findings 38, 39, 40, 44 | A finished head the cursor has reached is never convicted and one above it is walked onto; a broadcast that changes under a pinned tile is a tune-in; a rebuilt tile keeps the viewer's preset and the viewer's choice; a rendition that left the catalog is not a stall |
+| 121 | `44cffdbe3` | congestion campaign | The shaper takes a list of steps and its rate bucket can drop, so a capped link can be a tail-drop link |
+| 122 | `eaf12fbb8` | findings 41, 43 | The packaged relay unit passes its config file positionally, which is the only way the relay has ever read it |
+| 123 | `bc0e4a31c` | delivery | The replay budgets for the two rows the declared pause added |
+| 124 | this one | delivery | Findings 36 to 44, the before, after, after2, after3, after4 and regression rows behind them, and the gates at this tip |
 
 Row 49 carries two commits, so the numbered rows cover one hash more than there are rows. Every hash
 `git log --oneline upstream/dev..HEAD` prints is in the table, in that order, and the last row is
 this commit. Every hash above is the rebased one: the rebase of 2026-09-17 rewrote all of them, and
 the section below records what it resolved.
 
-Suggested reading order for review: 3, 4, 9 to 11, 21, 22, 31, 78. Those eight are the fix. The
+Suggested reading order for review: 3, 4, 9 to 11, 21, 22, 31, 78, and 119 and 120. The first eight
+are the fix; the last two change how a marker group and a spent head are read, which is the part
+worth reviewing even if nothing else is adopted. The
 native half (7, 16 to 20) is the same algorithm again and can be read second or skipped entirely.
 The harness (6, 23 to 30, 37 to 39, 44, 47, 48, 65, 69, 75, 79, 80) stands alone and can be adopted
 without any of the player changes.
@@ -1870,6 +1886,144 @@ is the preset's own cost, which every toggle row on this branch records. The one
 is unchanged by the rebase and still shows: one `skipping slow group: track=audio` warn per unmute,
 which is finding 21's `moq-net` question, with zero underruns behind it.
 
+### The first ten seconds after an event, before and after
+
+One publisher event per row, on the real microphone, each row graded against its own last twenty
+seconds, so every threshold is a multiple of something that row measured rather than a constant tied
+to a 20 ms frame or a 48 kHz device. The Chromium watcher runs on the pinned USB microphone at
+48 kHz, with the output context also at 48 kHz on every row. The ten rules the verdicts are read
+under are finding 42 and are reproduced under "The listening bench". The rows are in
+`bench/out15-before/`, `out15-after/`, `out15-after2/`, `out15-after3/` and `out15-after4/`, each
+with its own generated `MUTE-2026-09-18.md`, and the tables below are those files' own verdict rows.
+
+**Before**, on `0617b441e`, the tip these fixes start from:
+
+| Row | Preset | Browser | Verdict | Target | Chunk | Fill | Opening stretches |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| mute-basic-auto | auto | chromium | NOT GRADED | 20ms | 0ms | 20ms | - |
+| mute-basic-100ms | 100ms | chromium | NOT GRADED | 100ms | 0ms | 100ms | - |
+| pub-reload-auto | auto | chromium | PASS (3 not measured) | 20ms | 20ms | 40ms | - |
+| pub-reload-100ms | 100ms | chromium | PASS (3 not measured) | 100ms | 20ms | 120ms | - |
+| watch-reload-auto | auto | chromium | FAIL (1 checks) | 20ms | 20ms | 40ms | - |
+
+`3 rows graded, 2 passed, 1 failed, 2 not graded.` The two mute rows are not graded because 0 of 72
+and 0 of 73 tail samples carry an audio playhead at all: the row never recovered, which is finding
+36\. The `watch-reload` failure is the conviction of finding 39.
+
+**After Fix 1** (finding 36), the same schedules plus the watcher reload inside a declared silence:
+
+| Row | Preset | Browser | Verdict | Target | Chunk | Fill | Opening stretches |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| mute-basic-auto | auto | chromium | PASS (2 not measured) | 20ms | 20ms | 40ms | 8 |
+| mute-basic-100ms | 100ms | chromium | PASS (2 not measured) | 100ms | 20ms | 120ms | 1 |
+| pub-reload-auto | auto | chromium | PASS (1 not measured) | 20ms | 20ms | 40ms | 11 |
+| pub-reload-100ms | 100ms | chromium | PASS (1 not measured) | 100ms | 20ms | 120ms | 2 |
+| watch-reload-auto | auto | chromium | FAIL (1 checks) | 20ms | 20ms | 40ms | 3 |
+| watch-reload-silence-auto | auto | chromium | PASS (6 not measured) | 20ms | 20ms | 40ms | 5 |
+
+`6 rows graded, 5 passed, 1 failed, 0 not graded.` The mute rows are gradable for the first time and
+they pass. The one failure is still the watcher-reload conviction.
+
+**After Fix 2** (findings 38 and 40), with the page's own selection and preset added as a row:
+
+| Row | Preset | Browser | Verdict | Target | Chunk | Fill | Opening stretches |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| mute-basic-auto | auto | chromium | PASS (2 not measured) | 20ms | 20ms | 40ms | 7 |
+| mute-basic-100ms | 100ms | chromium | PASS (2 not measured) | 100ms | 20ms | 120ms | 2 |
+| pub-reload-auto | auto | chromium | PASS (1 not measured) | 20ms | 20ms | 40ms | 12 |
+| pub-reload-100ms | 100ms | chromium | PASS (1 not measured) | 100ms | 20ms | 120ms | 1 |
+| watch-reload-auto | auto | chromium | FAIL (1 checks) | 20ms | 20ms | 40ms | 10 |
+| watch-reload-silence-auto | auto | chromium | PASS (6 not measured) | 20ms | 20ms | 40ms | 8 |
+| page-keeps-choice-100ms | 100ms | chromium | PASS (1 not measured) | 100ms | 20ms | 120ms | 1 |
+
+`7 rows graded, 6 passed, 1 failed, 0 not graded.` The conviction survives, and the narrowed guard
+that was meant to stop it is proved unreachable on a cold tune-in: finding 39 has the timestamps.
+
+**After Fix 3** (finding 39), the final build of the player, `out15-after3/`:
+
+| Row | Preset | Browser | Verdict | Target | Chunk | Fill | Opening stretches |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| mute-basic-auto | auto | chromium | FAIL (1 checks) | 20ms | 20ms | 40ms | 1 |
+| mute-basic-100ms | 100ms | chromium | PASS (2 not measured) | 100ms | 20ms | 120ms | 2 |
+| pub-reload-auto | auto | chromium | PASS (1 not measured) | 20ms | 20ms | 40ms | 10 |
+| pub-reload-100ms | 100ms | chromium | PASS (1 not measured) | 100ms | 20ms | 120ms | 5 |
+| watch-reload-auto | auto | chromium | PASS (1 not measured) | 20ms | 20ms | 40ms | 6 |
+| watch-reload-silence-auto | auto | chromium | PASS (6 not measured) | 20ms | 20ms | 40ms | 12 |
+| page-keeps-choice-100ms | 100ms | chromium | PASS (1 not measured) | 100ms | 20ms | 120ms | 2 |
+
+`7 rows graded, 6 passed, 1 failed, 0 not graded.` The conviction is gone, with no warn line at all
+where every build below printed one, and the failure has moved: `mute-basic-auto`'s unmute stretches
+five times against a ceiling of three. That count was there before and the ring's own reset was
+hiding it. It is reported, and it is in the open measurements.
+
+**After Fix 4** (finding 44), the three rows the 27-row regression set had failed on the overlay,
+`out15-after4/`:
+
+| Row | Preset | Browser | Verdict | Target | Chunk | Fill | Opening stretches |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| hide-mute-auto | auto | chromium | FAIL (3 checks) | 20ms | 20ms | 40ms | 16 |
+| hide-mute-100ms | 100ms | chromium | FAIL (4 checks) | 100ms | 20ms | 120ms | 2 |
+| mute-basic-2000ms | 2000ms | chromium | FAIL (2 checks) | 2000ms | 20ms | 2020ms | 2 |
+
+`3 rows graded, 0 passed, 3 failed, 0 not graded.` The verdicts are worse-looking than the fix is,
+and the reason is worth stating rather than smoothing: the check the fix targets, "the spinner is
+hidden through the pause", **passes on both `hide-mute` rows for the first time**, 4578 ms and
+4493 ms of overlay going to 0 ms. What still fails on them is the playhead rate and the missing
+playhead through a hidden camera, which are the same ~110 ms resume gap the regression set found
+everywhere, and on `mute-basic-2000ms` the 1420 ms of `Buffering (audio clock)` that a parked fresh
+fill at a two second target produces by construction. Both are open measurements, neither is a
+conviction and neither loses audio.
+
+### The regression set, 27 rows
+
+`mutematrix.py --set regression`, run for the first time at this tip, in `bench/out15-regression/`:
+the eight schedules at `auto` and `100ms` in chromium, a burst of twenty mute and unmute pairs half
+a second apart, `mute-basic` at `2000ms`, `mute-basic` and `pub-reload` at `auto` in brave, firefox
+and webkit, and four error cases. The publisher is chromium on every row, because Playwright's
+WebKit refuses a getUserMedia permission and cannot publish at all.
+
+`24 rows graded, 6 passed, 18 failed, 3 not graded.`
+
+What holds:
+
+- **Zero convictions and zero slow-group lines on every one of the 27 rows**, in all four engines.
+  That is finding 39 across the whole family rather than on one schedule.
+- **`interrupted` is true on zero samples of zero rows.** Finding 36 holds everywhere the set
+  reaches, and it is what lets finding 44 attribute every remaining overlay to video.
+- **The twenty rapid mute and unmute pairs work**, half a second apart, with the playhead back
+  inside half a second on each of them.
+- The mute and reload family passes or fails only on the residuals below in brave, firefox and
+  webkit as well as chromium.
+
+What the 38 remaining failing checks are, and none of them is lost audio:
+
+- **A playhead gap of about 110 ms on every resume**, in the engine rows and the restart rows alike:
+  19128 to 19230 ms on firefox, 21161 to 21268 ms and 21194 to 21314 ms on the two `hide-mute` rows,
+  and the same shape elsewhere. It is the fresh fill arriving at a deeper target, it is inside the
+  acceptance bar, and it is reported rather than fixed.
+- **Stretch counts on resumes**, which rule 9 gives the tune-in allowance and which still exceed it
+  on a few rows.
+- **58 of about 96 failing checks in the first pass were windows a second long**, from the burst of
+  twenty pairs. Rule 10 makes those NOT MEASURED, which is what took the count to 38.
+
+Three rows are **not graded**, and each says why: `device-bt-auto` and `device-bt-100ms` because
+the driver reporting that no device matched the
+Bluetooth headset's label, the headset simply not being connected, and `relay-during-mute-auto` because a blocking relay
+restart moved the unmute marker inside the reference's own clear run. A fourth schedule, `instant`,
+has no audio row at all by design: the preset disables audio download, so an `instant` audio row
+measures only its own impossibility.
+
+**One thing the set found that is not a defect and is not explained.** Every tune-in in this run
+took about 1.1 s where `out15-after3/` measured about 0.5 s, uniformly across rows: `pub-reload-auto`
+reads `playerMs` 1112.9 ms here against 544.4 ms there. A fresh relay, fresh publishers and a fresh
+browser reproduce the slower number rather than the faster one, `out15-drift/` reading `playerMs`
+1142.6 ms on `pub-reload-auto` and 961 ms on the firefox unmute, so it is not accumulated bench
+state. What differs between the two is run ordering: `out15-after3/` ran after about twenty-five
+minutes of an idle machine. An idle-then-one-row test is what would settle it and it is scheduled
+after the gates. Until then the honest statement is that the tune-in figure in this document is
+0.44 s to 0.55 s on a rested bench and about 1.1 s on a busy one, and neither is a conviction, a
+trim or an underrun.
+
 ## Findings for the maintainer
 
 Things found while working that are separate from the fix.
@@ -3018,13 +3172,484 @@ Things found while working that are separate from the fix.
     the row's own three-broadcast load, which is the load reading rather than a hide. Both are in
     "Open measurements".
 
+36. **A publisher's mute declared an endpoint the watcher never reopened, so the tile sat on
+    Buffering until the page was reloaded.** This is the defect the user reported as symptom 2, and
+    it is the rebase's doing rather than the fix's: the writer survived the rebase and the reader
+    that answered it did not.
+
+    The branch's `3f6bc1cdd` makes a browser publisher write an endpoint frame alone in its group
+    when the microphone mutes (`js/publish/src/audio/encoder.ts:436-462`), an empty group when it
+    resumes (`:411-417`), and the same pair when the demand gate closes and opens (`:476-484`). The
+    hang draft says a media-less group is the discontinuity and that an empty group means nothing
+    (`drafts/draft-lcurley-moq-hang.md:549-551`), which is what upstream `9931cfa8b` settled. Before
+    the rebase the empty group was what raised the discontinuity in the JS consumer, and that is the
+    line the rebase dropped, leaving a publisher writing a marker that no longer reopened anything.
+
+    Underneath it the two languages disagreed about **when** a marker group raises the playhead.
+    Rust delivers `FrameEnd(T)` and bumps the playhead when the group closes
+    (`rs/moq-mux/src/container/consumer.rs:415-418`), so the result that carries `end` is one result
+    and the result that reopens the timeline is the next one. JS bumped on the marker frame itself
+    (`js/hang/src/container/consumer.ts:581`) and returned `end` in that same result, so
+    `Terminal.update` (`js/watch/src/audio/terminal.ts:55-67`) reset the endpoint and immediately
+    re-applied it to the run that followed, `span` (`:121-129`) trimmed every resumed sample to a
+    zero-length span, and `#emit` closed them silently
+    (`js/watch/src/audio/decoder.ts:858-861`). `#onNext` (`:984-989`) then reset the ring on the
+    marker's own playhead event before `#declareEnd` could play the tail out, and `ring.end()`
+    could not release a stall on a ring with nothing in it
+    (`js/watch/src/audio/ring-buffer.ts:437-442`). `interrupted` stayed true, the spinner stayed up,
+    and every later conviction that might have reopened the timeline was itself a playhead event
+    that reset the ring again.
+
+    The fix is the Rust order, in five places. The group-close result carries the playhead event, so
+    a marker group's `discontinuity + 1` and `continuous: false` arrive after the endpoint rather
+    than with it, and a marker whose group is still receiving media raises nothing
+    (`js/hang/src/container/consumer.ts`, the group-done branch). The publisher stops writing the
+    break group entirely: the endpoint alone in its group is the discontinuity, so `#paused` and its
+    writes are deleted from `js/publish/src/audio/encoder.ts`. The sentence the draft gained in
+    `3f6bc1cdd`, "a publisher resuming after one MUST declare a discontinuity before its first
+    frame", is deleted from `drafts/draft-lcurley-moq-hang.md:574` and `doc/concept/hang.md:133-137`
+    and replaced by what the marker already means. Both rings release the stall on `end()`
+    unconditionally (`ring-buffer.ts:437-442`, `shared-ring-buffer.ts:741-749`) and re-anchor on the
+    first write after a played-out endpoint (`ring-buffer.ts:240-244`,
+    `shared-ring-buffer.ts:324-327`), which is a fresh fill rather than a continuation. And
+    `Interruption` is gone: the ring itself reports `fresh` on `Playout.Snapshot`, and
+    `interrupted = enabled && stalled && !fresh` at `js/watch/src/audio/decoder.ts:404-417`, so a
+    ring that is filling for the first time is never reported as an interruption.
+    `js/watch/src/audio/playout/interruption.ts` and its test are deleted.
+
+    Measured on the bench, `mute-basic` on the real microphone at both presets, mute at about 15.3 s
+    and unmute three seconds later, `out15-before/` against `out15-after/`:
+
+    | Row | before | after |
+    | --- | ---: | ---: |
+    | `mute-basic-auto` `interrupted` over the mute window | 6686 ms | **0 ms** |
+    | `mute-basic-auto` `interrupted` over the unmute window | 9770 ms | **0 ms** |
+    | `mute-basic-100ms` `interrupted`, mute then unmute | 6724 / 9724 ms | **0 / 0 ms** |
+    | spinner, every one of those four windows | the same numbers again | **0 ms** |
+    | playhead after the unmute | never returns | **+462 ms** (auto), **+441 ms** (100ms) |
+    | trailing silence at the row's end | 38.7 s | **none** |
+    | `concealed` delta at `100ms` | -960 | **0** |
+
+    The two before rows are **not graded at all**, because 0 of 72 and 0 of 73 tail samples carry an
+    audio playhead: a row that never recovers has no steady state to grade against, and that is the
+    finding. The after rows do: reference target 20 ms, chunk 20 ms, level p50 30.1 ms, and the
+    final sample of the auto row reads `interrupted false`, `stalled false`, `spinner false`,
+    `dbg.buffered 1445`, `ctxState "running"`. `out15-after2/` reproduces it on the next build,
+    playhead back 450.6 ms and 449.3 ms after the unmute with every counter flat.
+
+    On the final tip, `out15-after3/`, the same pair reads the playhead back **453.6 ms** after the
+    unmute at `auto` and **454.7 ms** at `100ms`, with `interrupted` and the spinner still 0 ms on
+    every window, zero convictions, zero underruns, zero trims and zero concealment. That row's one
+    remaining failing check is the unmute's own stretch count, `accelerates + expands = 5` against a
+    ceiling of 3. It is the real cost of refilling from empty, and it shows up only now because the
+    ring no longer resets across that window and hides it; it is reported rather than argued away,
+    and it is in the open measurements.
+
+    Two details are worth keeping because they are the fix working rather than residue. Through the
+    declared pause the playhead is **present and frozen**, 3234 ms held against 113 ms of nothing at
+    all in `out15-after` and 3219 ms in `out15-after2`, which is the endpoint being played out and
+    then held rather than the timeline disappearing. And the `countersReset` flag on the auto mute
+    window, `accelerates` delta -2, is the fresh-fill re-anchor on the first write after that
+    played-out endpoint: the counters live on the ring, so the reset reads here as a delta that went
+    backwards, and the flag exists to say the arithmetic across that window is not a difference.
+
+    A watcher that reloads **inside** the declared silence recovers too, which is the other half of
+    symptom 3. `watch-reload-silence-auto` builds no ring at all while the publisher is muted,
+    `dbg` null on every sample from 17460 to 21526 ms, and then the playhead returns **441 ms after
+    the unmute** with `interrupted` 0 ms, spinner 0 ms, zero convictions and zero underruns.
+
+    Tests, each failing without the change: in `js/hang`, `consumer.test.ts` "Consumer reports a
+    marker group as a playhead event" moved to the Rust order, "delivers an endpoint, a break and
+    the resumed media without a conviction" and "does not raise the playhead for a marker whose
+    group still receives media"; in `js/watch`, `terminal.test.ts` "an endpoint delivered before its
+    playhead event trims the flush and not the resumed run", `decoder.test.ts` "a publisher's mute
+    and unmute play the resumed audio", and in both rings "a declared endpoint releases a stall on
+    an empty ring" and "media after a played-out endpoint is a fresh fill"; in `js/publish`,
+    `encoder.test.ts` "writes only media when it resumes" in place of the two break assertions; in
+    Rust, `a_marker_group_closes_the_run_before_it` in `rs/moq-mux`. The replay lane gains an
+    `endpoint` arrival (`js/watch/src/audio/replay.ts:30`, skipped natively at
+    `rs/moq-audio/src/playout/replay.rs:20-36`), a derived fixture `fixtures/mic-local-mute.json`
+    with a three second cut, two `budgets.json` rows, and "plays through a declared pause without an
+    underrun or a skip".
+
+    **What the native side does through a declared pause is different, and it is not fixed here.**
+    `rs/moq-audio`'s playout engine conceals through the pause and counts every block it conceals as
+    an underrun: **49 underruns in 500 ms at 10 ms blocks**, because the marker never reaches the
+    decode consumer at all. The resumed run then plays correctly, so nothing is lost; the number is
+    wrong rather than the audio. `a_declared_endpoint_then_resumed_media_decodes` in
+    `rs/moq-audio/src/decode/consumer.rs` keeps asserting zero and is marked `#[ignore]` with that
+    measurement in the reason, so the day the marker reaches the consumer the test fails loudly
+    instead of quietly passing. Surfacing the marker there, and an `Engine::end()` to go with it, is
+    a follow-up quest and is in the open items.
+
+    The wire impact is one group less per resume: a publisher no longer writes an empty group when
+    it comes back. The public API impact is none, and `Interruption` was internal.
+
+    `8af1dc54d` is the whole of it.
+
+37. **The old ring counted a declared pause as media somebody lost.** Found while the tests for
+    finding 36 were being written, and it explains two numbers that had been read as properties of
+    the harness.
+
+    A ring that was told the stream had ended, and then given media again, treated the gap between
+    them as samples it had skipped, so `skipped` grew by the length of the pause. That is the
+    invariant `READ == output - concealed + stretched + queued + skipped + trimmed` being balanced
+    with the wrong term: nothing was lost, the publisher said it was stopping. Two places had been
+    absorbing it. The replay lane carried a **144000** sample skip through the recorded pause, which
+    is three seconds at 48 kHz and had been budgeted as though it were real, and the render
+    worklet's own test balanced its arithmetic against the same miscount. With the fresh-fill
+    re-anchor of finding 36 in place the pause is a re-anchor rather than a loss, both numbers go to
+    zero, and the two tests that had been pinning the old behaviour were rewritten to the new one.
+
+    It matters beyond the tests because `skipped` is the counter a listener's complaint is graded
+    against. A declared pause that counts as lost media makes every mute look like a defect, and
+    makes a real defect during a mute invisible inside it.
+
+    `8af1dc54d`, with finding 36.
+
+38. **A publisher reload is two seconds of a page with no tile and half a second of a player.** The
+    user reported the reload as a cut, and it is, but four fifths of it happens before any audio
+    code runs.
+
+    On the demo page a re-announced broadcast does not reuse the element it had. The old
+    `<moq-watch>` is removed when the broadcast unannounces and a brand new one is built when it
+    comes back (`demo/web/src/index.ts:95-171, 226-246`), so a publisher reload, a watcher reload
+    and a fresh publish are the same event seen three ways: a cold tune-in on an element that has
+    never seen this broadcast. The bench now reports the two halves separately, `noTileMs` for the
+    stretch where the page has no element to sample and `playerMs` from the element existing to the
+    first advancing playhead, and only `playerMs` is graded.
+
+    Measured on the bench, `pub-reload` at both presets, `out15-after2/`:
+
+    | | `pub-reload-auto` | `pub-reload-100ms` |
+    | --- | ---: | ---: |
+    | `noTileMs`, the page waiting for the re-announce | **1902 ms** | **1877 ms** |
+    | `playerMs`, the tune-in itself | **572.3 ms** | **557.4 ms** |
+    | `groupsSkipped` / slow-group notes | 0 / none | 0 / none |
+    | `trimmed` / `discarded` / `skipped` / `concealed` | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+    | `underruns` | 0 | 0 |
+    | context after the swap | running, no second click | running, no second click |
+
+    The before rows are the same shape. Two quantities, and they are not the same one: `startupMs`,
+    the whole stretch with no advancing playhead, is **2565 ms** at `auto` and **2480 ms** at
+    `100ms`, while the **spinner** is up for **2027 ms** and **2033 ms**, shorter because for the
+    first part of it there is no tile to put a spinner on. Both were taken before the
+    `noTileMs` / `playerMs` split existed. Fix 1 does not move them, which is right: this was never
+    the endpoint path. On the final tip, `out15-after3/`, the split reads `noTileMs` 1875 ms and
+    1919 ms against `playerMs` 544.4 ms and 438.6 ms, the same shape again.
+
+    **The tune-in itself is clean, and that refutes two of the ranked sites.** The first ring depth
+    on these rows is 80 ms, which is the seed rather than a race with the worklet load, so \[D] does
+    not fire; no group is convicted inside the first three seconds with the budget above the walked
+    target, so \[E] does not fire; and the latency re-anchor never parks, so \[G] and \[H] do not fire
+    on this path either. Those four stay unmeasured rather than fixed, and they are in the open
+    items.
+
+    One real page defect came out of the rows. The rebuilt tile was created with `delay="auto"`
+    whatever the viewer had chosen, so a publisher reload silently put a listener at a fixed 100 ms
+    back on the auto preset, and the page also re-picked `list[0]` instead of the broadcast the
+    viewer was watching (`demo/web/src/index.ts:273-278`). The page now carries its own `delay` onto
+    a new tile and remembers the active broadcast across an unannounce.
+
+    Measured on the bench, `page-keeps-choice-100ms`, all three broadcasts listed so that the
+    self-publish is not `list[0]`, the bench's own tile pin off, and the preset set through the
+    page's control rather than an attribute. The driver set the element's `delay` **property** and
+    left the attribute at `auto`:
+
+    ```text
+    delay via the page's own control: {"delay":"100ms","delayAttr":"auto"}
+    ```
+
+    After the reload and the tile swap at 17604 ms the rebuilt tile carries `delayAttr: "100ms"` on
+    all **197** post-swap samples, which only the page can have put there. Over that window:
+    `delayAtMark` and `delayAtEnd` both 100 ms, the reference target 100 ms, `mutedProp` false on
+    every post-swap sample, the playhead advancing from 2283 ms to 41717 ms, **one click** for the
+    whole row, `groupsSkipped` 0, `underruns` 0, `trimmed` 0 ms, `lost` 0 ms, `interrupted` 0 ms,
+    `noTileMs` 1962 and `playerMs` 541.5. The row passes again on the final tip, `noTileMs` 1902 and
+    `playerMs` 552.5.
+
+    Keeping the element across an unannounce, rather than rebuilding it, is the larger change and is
+    a follow-up rather than this branch's; it is what would take the two seconds out.
+
+    `a52f8e241`.
+
+39. **The age budget convicted a group the reader had already played, and on legacy audio the
+    conviction fabricated a hole that reset the ring.** This is the last of the four symptoms, and
+    the one that was misread twice before the warn line was widened enough to read it.
+
+    `#checkMaxAge` in `js/hang/src/container/consumer.ts` judges the head of the queue by how far it
+    could still reach, and dropped it when that reach fell behind the live edge. It did that without
+    asking whether the reader had already had it. Measured on the real recording, **all 172
+    convictions are `queued=0 cursor=<the group's own sequence> closed`**: a finished group the
+    consumer had already delivered and popped from, still sitting at the head until `next()` takes
+    it away. Convicting one counts a skip that lost nothing, and on legacy audio, where frames carry
+    no duration, its contiguous successor then reads as a hole, and a hole is a playhead event, and
+    a playhead event resets the ring and the sync. Rust never sees it: the mux consumer pops a spent
+    group before the age check runs (`rs/moq-mux/src/container/consumer.rs:327-348`).
+
+    The rule is now one rule, and it is Rust's. A finished head the cursor has **reached** is never
+    convicted, with `<=` rather than `<` because the cursor is advanced past a completed group
+    before `next()` pops it. A finished head **above** the cursor is walked onto rather than dropped,
+    with a playhead event only where it is not contiguous with what came before. Only a group that
+    is still arriving, or an empty one above the cursor, can be convicted. The warn line
+    (`js/hang/src/container/consumer.ts:417-419`, twin at
+    `rs/moq-mux/src/container/consumer.rs:381`) now prints the convicted group's first and last
+    timestamps, whether it is open or closed, its reach, the live edge, the budget, and now `queued=`
+    and `cursor=`, which is what made the diagnosis readable at all.
+
+    The narrowed guard that preceded it is worth recording because it could not work. It exempted a
+    finished head with frames queued only while the cursor sat on it, and on a cold tune-in the
+    cursor does not exist yet: on `watch-reload-auto` the conviction is logged at **15597.2 ms** and
+    that tile's first playhead arrives at **15677.1 ms**, so `#active` was still undefined when the
+    decision was taken. An exemption that keys on the cursor is unreachable by construction on
+    exactly the event that needs it.
+
+    Measured on the replay lane, the profile that exists for this. Four numbers, and each counts a
+    different thing, so each is named:
+
+    - **91**, what the profile counted when it was called `budget-censors-the-tail` and the head was
+      judged by its timestamps alone. That is the number the previous revision of this document
+      carried.
+    - **115**, the same recording re-counted on `relay-bbb-7frame` at the 46 ms round-trip budget
+      once the JS-against-Rust cursor-walk divergence had been named. Every one of those 115 is JS
+      dropping a head Rust would have walked onto.
+    - **122**, the convictions that survived the cursor walk, once the widened warn line showed what
+      was actually being convicted: a spent head the reader had already played.
+    - **0**, at every budget under the rule above. The profile is renamed
+      `budget-spares-an-arrived-flush`, because a profile named for censoring a tail that is no
+      longer censored is a lie in the filename.
+
+    Measured on the bench, `watch-reload-auto` at `auto`, the build before this rule
+    (`out15-after2/`): **1** group convicted, **80 ms** trimmed and **80 ms** discarded against a
+    ceiling of 60 ms, the row's only failing verdict in the set. The warn line for it reads
+
+    ```text
+    skipping slow group: track=audio 758 -> 759
+      first=18060666 last=18060666 closed reach=18080666 live=18300666 budget=215000
+    ```
+
+    a closed group holding one frame, convicted by 5 ms. On the final tip, `out15-after3/`, the same
+    row records **0** convictions and **no slow-group warn line at all**, where each of the three
+    builds below it printed exactly one. Nothing a listener could hear is lost: `trimmed` 100 ms and
+    `discarded` 80 ms are both media **before the start point**, which rule 8 reports beside the
+    grade rather than charging to the tune-in, `lost` is 0 ms, and `playerMs` is **328.8 ms** flat.
+    The 27-row regression set says the same thing across the family: **zero convictions and zero
+    slow-group lines on every row of it**, in chromium, brave, firefox and webkit alike, with
+    `watch-reload` passing at both presets.
+
+    Tests: `consumer.test.ts` at `:503` and `:566` move to the Rust semantics, and the Rust twin is
+    not needed because the mux consumer already pops the spent group. The Rust rule is the
+    specification and the JS is now written against it.
+
+    **One behaviour change to confirm, and it is why this is a maintainer item.** `skipped` at the
+    `instant` preset now counts only media that was actually lost. It used to count a group the
+    reader had already played, so any harness, budget or dashboard that treated the old number as a
+    ceiling will see it fall. Nothing is being hidden: the drop is the count that was wrong going
+    away. "The budget" under "What changed, per stage" states it beside the replay numbers.
+
+    `a52f8e241`.
+
+40. **A republished broadcast on an element that keeps its tile is a tune-in, and nothing treated it
+    as one.** Not the demo page, which rebuilds the element and so cannot see this, but any page that
+    pins a `<moq-watch>` and lets the broadcast change underneath it, which is the shape an
+    application actually wants.
+
+    The arrival estimator is keyed by content identity, so when a publisher dies and a new one
+    publishes the same broadcast the estimator carries the dead publisher's reading into the live
+    one. The new publisher's timestamps start near zero, the sync still holds the old reference, and
+    every frame is discarded as being far in the past until something raises a discontinuity and
+    resets it. From outside it looks like a tile that is connected and silent: `discarded` climbing
+    while `audioTs` sits frozen.
+
+    `#runDecoder` in `js/watch` now resets the ring and the sync when the **broadcast consumer**
+    identity changes, and the video decoder does the same. A rendition swap deliberately does not:
+    that is the case finding 35 exists for, where the estimator must survive the swap, and the two
+    rules pull in opposite directions on purpose. A new negative-control test guards the second
+    half, because the finding 35 tests did not: they prove the estimator survives a rendition
+    change, and passed happily while a broadcast change was being treated the same way.
+
+    This is the one fix in this pass with no bench row of its own. The demo page cannot produce the
+    event, and the 27-row regression set has no pinned-element schedule either, so it adds nothing
+    here: the evidence is the two tests and the reading above. The schedule that would measure it,
+    one pinned `<moq-watch>` with the publisher killed and the same broadcast republished under it,
+    is in the open items.
+
+    `a52f8e241`.
+
+41. **The relay unit this repository packages has never been able to start the relay.**
+    `packaging/moq-relay/moq-relay.service` passes the configuration file as `--file`, and the relay
+    takes it positionally (`rs/moq-relay/src/config.rs:106-109`). The binary refuses the flag
+    outright, `unexpected argument '--file' found`, so the packaged unit fails at startup on any
+    build that has this argument parser. It was found by deploying the unit unmodified onto a clean
+    Debian 13 x64 host and watching it fail; it is a one-line fix, and the documentation already
+    describes the positional form, so nothing else moves.
+
+    **`upstream/dev` carries the same line**, so this applies upstream unchanged and does not depend
+    on anything else on this branch.
+
+    Worth a decision rather than just a fix: `moq-relay` takes its config positionally and
+    `moq-bench` takes the same thing as `--file`. One of the two spellings should win. This branch
+    only makes the unit match the binary it starts.
+
+    `eaf12fbb8`.
+
+42. **A grader that applies one rule to every window grades the wrong thing four times out of
+    seven.** This is a bench finding rather than a product one, and it is recorded because the rows
+    in this section are only worth reading if the rules behind them are stated.
+
+    Ten rules decide what each event window is answerable for, and every one of them exists because
+    the rule it replaced was charging a window for something it did not own. They are reproduced in
+    full at the head of every generated table and under "The listening bench":
+
+    1. `noTile`, the stretch where the page has no element to sample, is reported and never graded.
+       It is the demo waiting for a re-announce, not the player.
+    2. `player`, the element existing to the first advancing playhead, is what a tune-in is held to,
+       with a ceiling of one second.
+    3. The `player` clock stops through a declared pause. A watcher that reloads into a muted
+       publisher is waiting for the publisher, and wall time says otherwise.
+    4. Between a `mute` and its `unmute` the playhead-rate and missing-playhead checks do not apply.
+       A publisher that has said it is stopping sends nothing to advance a playhead with, so the
+       playhead stopping is the declared behaviour, and the unmute's own window grades what follows.
+    5. On a tune-in the missing-playhead check opens at that tune-in's first playhead. The stretch
+       before it is the tune-in, which rule 2 already grades.
+    6. A counter delta taken where the row had no ring at the mark, and any field a row was measured
+       before the bench recorded, are **NOT MEASURED**. Neither a pass nor a failure, and neither
+       ever counts against a verdict.
+    7. A window grades only the region no later event owns. A ten second window can contain whole
+       other events, and what those cost belongs to their own windows, which hold them to the right
+       budget. The tables still report the whole ten seconds, because that is what happened; the
+       grade uses the part before the next marker and says so when the two differ.
+    8. On a tune-in, what counts as lost is what a listener could hear missing, which is `skipped`
+       plus `concealed`. Playout starts on the level the ring holds, so media older than that start
+       point was never going to be played and dropping it is not a cut, which is finding 33.
+       `trimmed` and `discarded` are reported beside the grade as loss before the start point.
+    9. A resume after a declared pause, an `unmute`, a `watch-unmute` or a `show`, refills from
+       empty exactly as a tune-in does and gets the tune-in stretch allowance rather than the
+       steady-state one, which would leave converging no room at all.
+    10. A check whose window is too short to hold it is **NOT MEASURED**. The playhead rate needs a
+        whole second after the fill to average over, and "target back at the reference" asks where
+        the target ended up, which means the end of a full window. A burst of mute pairs half a
+        second apart cuts every window to a second, and asking either question there measures the
+        burst's spacing rather than the player.
+
+    Rules 1 to 6 were applied with `--report-only` to the same JSON, so no row was re-run for them.
+    Rule 7 was found on `watch-reload-silence-auto`, whose `mute` window failed
+    `stretching at the row's own rate` at `accelerates+expands=4` against a ceiling of 2: that
+    window is ten seconds long, it swallows the watcher reload and the unmute that follow it, and it
+    was being charged for a tune-in while held to a steady-state budget. The `watch-reload` window
+    covers the same region, gets the tune-in allowance, and passed with the same 4. Applying rule 7
+    moved two verdict lines, both on that row, `PASS (4 not measured)` to `PASS (6 not measured)` in
+    `out15-after` and `FAIL (1 check)` to `PASS (6 not measured)` in `out15-after2`, and nothing
+    else. `watch-reload-auto` has a single marker, so its window is never narrowed and its
+    conviction is graded exactly as before.
+
+    Rules 8, 9 and 10 came out of the 27-row regression set, and 10 is the largest of them: **58 of
+    about 96 failing checks in that set were windows a second long**, which is what a burst of
+    twenty mute pairs half a second apart produces, and asking a per-second question inside one
+    measures the schedule rather than the player. With all ten applied the same set reads 6 passed,
+    18 failed and 3 not graded over 27 rows, with 38 failing checks left, and those are mostly the
+    resume playhead gap and the stretch counts rather than anything convicted or lost.
+
+    The honest limit of the whole instrument is unchanged and belongs beside the rules: **the
+    sampler cannot hear**. Every number above is a counter, and the user's ear is the confirmation.
+
+    This one, with the docs.
+
+43. **A temporary Debian 13 x64 VPS was stood up as a second test host, and the deployment found
+    three defects the Mac bench never could.** It runs the full gate chain on x64, serves the demo
+    pages, the site copy and two file publishers over a real certificate, and is the remote relay a
+    local browser dials over a real wide-area path. It is temporary and it is torn down when this
+    work is finished; the concrete addresses, keys and dates are in the private bench archive rather
+    than here.
+
+    What it carries: the relay and the CLI built from this branch; a second relay built with the
+    `quinn`, `quiche` and `qlog` features, which the default feature set does not include, so the
+    congestion campaign can select a backend and write packet-level traces; the demo pages and the
+    site copy built against this branch's `js/`; the two `bbb.hang` publishers; and a gate runner
+    that drives `just check`, `just test default`, nextest over the touched crates, `just js test`,
+    the replay lane, `just drafts check` and `just test smoke-full` inside the repository's own nix
+    shell, serially, overnight. Seven systemd units, enabled and proven across two reboots. QUIC is
+    confirmed from a public address on the real certificate, and the WebSocket fallback is
+    distinguishable in the relay log, which is what makes a Safari row readable.
+
+    Three things it found, none of which a local bench can:
+
+    - **The packaged relay unit's `--file`**, which is finding 41. It is only visible to somebody
+      who installs the unit the repository ships.
+    - **`LogsDirectory` does not exist yet when `append:` wants it.** A unit that sends its output to
+      a file under a directory systemd is creating for it fails at start, because the redirection is
+      resolved before the directory is made. The ordering is the bug, the workaround is to create
+      the directory, and it is worth knowing before anybody copies the unit.
+    - **The nix build wants more memory than a small host has.** A single `rustc` inside the dev
+      shell can exceed a 4 GB box and lives on swap while it does, so every service in the demo
+      stack carries an `OOMScoreAdjust` drop-in and the kernel kills a build rather than the relay a
+      listener is on. A nix build also belongs to the client that asked for it: killing the
+      `nix develop` that started one cancels it, and two clients on one derivation doubled the
+      resident set and turned a five minute build into forty-five.
+
+    One smaller fact for anybody scripting against the CLI: `moq-cli` has no flag to override the
+    TLS server name, so a publisher on the same host dials the public name rather than loopback.
+
+    The gate chain was still running at the time of writing and its results are not in this
+    document. What the box has already proven is the deployment: the units, the certificate, the
+    reboots, the transport and the pages.
+
+    `eaf12fbb8`, for the packaging one-liner; the rest is infrastructure in the bench archive and not on
+    the branch.
+
+44. **The video watchdog called a rendition that had left the catalog a stall, so hiding the camera
+    put a Buffering overlay over the tile for the whole length of a mute.** Found by the 27-row
+    regression set rather than reported, and it is the one defect in this pass that audio never
+    touched.
+
+    `#runBuffering` in `js/watch/src/video/decoder.ts` reports a stall when it has no rendition to
+    decode. A publisher that hides its camera takes the rendition out of the catalog and leaves it
+    out, which is not a stall: it is a publisher that has stopped sending pictures on purpose, and
+    the tile has nothing to wait for. The overlay went up anyway and stayed up for as long as the
+    camera was hidden, over audio that was playing perfectly. It is the same event finding 35 is
+    about, read by a different consumer.
+
+    The attribution is what makes it clean. Across all 27 regression rows `interrupted` is true on
+    **zero samples**, and `spinner === videoStalled && !paused` on **every** sample of every row, so
+    the overlay in these rows is video's alone and audio never contributed to it.
+
+    Measured on the bench, `hide-mute` at both presets, the camera hidden and then the microphone
+    muted for three seconds, the spinner counted over the `mute` window after the fill:
+
+    | Row | regression set, before | `out15-after4/`, after |
+    | --- | ---: | ---: |
+    | `hide-mute-auto`, spinner over the mute | **4578 ms** | **0 ms** |
+    | `hide-mute-100ms`, spinner over the mute | **4493 ms** | **0 ms** |
+    | titles seen on it | `Buffering (audio clock)`, `Buffering` | none |
+    | spinner anywhere else in the row | the hide and the unmute windows too | the cold tune-in only, 258 ms and 291 ms |
+
+    A three second mute was showing four and a half seconds of overlay, which is the hide's stretch
+    and the mute's run together. After the fix each row has exactly one spinner span left and it is
+    the row's own opening tune-in.
+
+    `mute-basic-2000ms` is unchanged by construction and is reported rather than fixed: 1420 ms of
+    `Buffering (audio clock)` through a mute at the 2000 ms preset, which is the parked fresh fill
+    holding video while it fills a two second target. That is a deeper question than a watchdog
+    predicate, whether the audio clock should be nominated at all while a ring is parked for a fresh
+    fill, and it is in the open items rather than in this commit.
+
+    The test is "a rendition that left the catalog is not a stall" in
+    `js/watch/src/video/decoder.test.ts`, and it fails without the change. `js/watch` is 420 tests.
+
+    `a52f8e241`, with the reload work, because it is the same function's neighbourhood and the two are
+    not separately measurable on the same rows.
+
 ## Public API and wire impact
 
 No wire format change anywhere. One wire *semantics* addition: an audio endpoint bounds the source
-media rather than the track, so a publisher that pauses declares one and declares a discontinuity
-before the frame that resumes. `drafts/draft-lcurley-moq-hang.md` and `doc/concept/hang.md` say so;
-the bytes are the empty frame and the empty group that both already define. All of the below is
-`dev` material.
+media rather than the track, so a publisher that pauses declares one, alone in its group, and that
+marker group is itself the discontinuity: the run before it closes when the group closes, and the
+next group opens a run the endpoint does not trim.
+`drafts/draft-lcurley-moq-hang.md` and `doc/concept/hang.md` say so, and finding 36 deletes the
+sentence that used to ask a resuming publisher to declare a second discontinuity of its own. The
+bytes are the empty frame the draft already defines. The one wire *impact* of the final pass is one
+group fewer per resume, because a publisher coming back from a mute no longer writes an empty group
+after its marker. All of the below is `dev` material.
 
 The eight commits of 2026-09-17 change no wire format and no message. The one thing they change on
 the wire at all is that a video rendition's track is no longer finished when it stops encoding
@@ -3037,6 +3662,13 @@ at once. No draft is touched, and no `moq-net` or `hang` byte moves.
 The six commits of findings 32 to 35 change no wire format, no message and no track lifetime. What
 they add is one counter in each language and nothing else; the rest is behaviour inside the ring, the
 estimator's lifetime and one internal constant.
+
+The four commits of findings 36 to 44 change no wire format and no message either. Their wire impact
+is one group fewer per resume, above; their public API impact is none. `Interruption` was removed
+from `js/watch`, and it was internal, though anything reading `out.debug` saw it: the ring reports
+`fresh` on `Playout.Snapshot` and `interrupted` is `stalled && !fresh`. The behaviour change worth
+confirming is `skipped` at the `instant` preset, which is finding 39 and is stated under "The
+budget".
 
 **Carried by the rebase, not introduced here.** The rebase onto `61da0d247` adopted three upstream
 renames that touch surface this branch also touches, and they belong to upstream rather than to this
@@ -3623,6 +4255,20 @@ One caveat on the CPU bench in `stretch.bench.test.ts`: its ratio assertion
 rest, with the absolute budget (0.67 ms) never close. It is a wall-clock ratio on a shared machine
 rather than a regression, and it is the one flake left in the suite.
 
+**The gates at this tip are not in this table.** The five code commits above `0617b441e` were gated
+together, in the same order and with the same commands, and the run is recorded in
+`bench/gates-2026-09-18/` rather than here: every gate at this tip exited 0, which is `just fix` with
+no tracked change, `just check` including the flake step, `just test default` at 4685 Rust tests
+passed and 9 skipped, 2088 Bun and 64 Python, `cargo nextest` over the seven touched crates at 1779
+passed and 4 skipped, `just test audio-quality --runtime replay --enforce` at 172 enforced checks
+across 14 rows with the two new rows at their measured ceilings, `just drafts check`,
+`just test smoke-full` at 32 of 32, the privacy and em-dash greps at 0 hits, and both pages rebuilt
+at 06:48. Beside them stand the per-package
+`bun test` counts quoted in findings 36, 39 and 44, the Rust runs quoted in finding 36, and the bench
+rows in "The first ten seconds after an event", which are instrument readings on one machine rather
+than a graded run. A second chain over the same commands is running on a temporary Debian 13 x64
+host, which is finding 43, and it is confirmation rather than the gate this document reports.
+
 ### The budgets, and what the harness will and will not enforce
 
 `test/audio-quality` re-records its budgets from two 60 second runs of the whole matrix: the worst of
@@ -3858,13 +4504,54 @@ and `replay.ts`, which do most of this against the harness page, so folding the 
 per-engine matrix and the toggle sequence in beside them is the right shape. That is a follow-up,
 listed below, and it is the same follow-up as giving that package a `bun test` target.
 
+**The rules the event rows are graded under.** The tables in "The first ten seconds after an event"
+grade a window rather than a row, and ten rules decide what each window is answerable for. They are
+finding 42, they are reproduced at the head of every generated `MUTE-2026-09-18.md`, and they are
+here because a verdict is worth nothing without them.
+
+1. `noTile`, the stretch where the page has no `<moq-watch>` to sample, is reported and never
+   graded. That is the demo waiting for a broadcast to be re-announced, not the player.
+2. `player`, the tile being there to the first advancing playhead, is what a tune-in is held to,
+   with a ceiling of one second.
+3. The `player` clock stops through a declared pause. A watcher that reloads into a muted publisher
+   is waiting for the publisher rather than filling, and wall time says otherwise.
+4. Between a `mute` and its `unmute` the playhead-rate and missing-playhead checks do not apply. A
+   publisher that has said it is stopping sends nothing to advance a playhead with, so the playhead
+   stopping is the declared behaviour, and the unmute's own window grades everything after it.
+5. On a tune-in the missing-playhead check opens at that tune-in's first playhead. The stretch
+   before it is the tune-in itself, which rule 2 already grades.
+6. A counter delta taken where the row had no ring at the mark, and any field a row was measured
+   before the bench recorded, are NOT MEASURED. Neither is a pass nor a failure, and neither ever
+   counts against a verdict.
+7. A window grades only the region no later event owns. A ten second window can contain whole other
+   events, and what those cost belongs to their own windows, which hold them to the right budget.
+   The tables still report the whole ten seconds, because that is what happened; the grade uses the
+   part before the next marker, and says so when the two differ.
+8. On a tune-in, what counts as lost is what a listener could hear missing, which is `skipped` plus
+   `concealed`. Playout starts on the level the ring holds, so media older than that start point was
+   never going to be played and dropping it is not a cut, which is finding 33. `trimmed` and
+   `discarded` are reported beside the grade as loss before the start point, and on a tune-in
+   `trimmed` is reported rather than graded for the same reason.
+9. A resume after a declared pause, an `unmute`, a `watch-unmute` or a `show`, refills from empty
+   exactly as a tune-in does and gets the tune-in stretch allowance rather than the steady-state one,
+   which would leave converging no room at all.
+10. A check whose window is too short to hold it is NOT MEASURED. The playhead rate needs a whole
+    second after the fill to average over, and "target back at the reference" asks where the target
+    ended up, which means the end of a full window. A burst of mute pairs half a second apart cuts
+    every one of its windows to a second, and asking either question there measures the burst's
+    spacing rather than the player.
+
+The stretch budget is the steady-state rate over ten seconds, except on a tune-in, where it is the
+larger of that and what this row's own opening tune-in cost, because a converged reference stretches
+nothing and would leave converging no allowance at all.
+
 ## Open items and follow-ups
 
 ### The state of the branch
 
 `debug-findings-solution` on the fork `fperex/moq`, base `dev` at `61da0d247`, opened as draft pull
-request #3 there and nowhere else. The last change to the player is `d87b15ce0`, and the commit above
-it is this document. The branch was rebased from `877a561d8` on 2026-09-17, so every hash below
+request #3 there and nowhere else. The last change to the player is `a52f8e241`, and the commit above the
+five code commits of findings 36 to 44 is this document. The branch was rebased from `877a561d8` on 2026-09-17, so every hash below
 `91c5878bd` is a new one and the pull request needed a force push; the pre-rebase tip is kept locally
 on `debug-findings-solution-pre-rebase-20260917`, and an earlier state of the work is archived on
 `debug-findings-solution-wip-20260912`.
@@ -4014,11 +4701,88 @@ other way:
   come down for it. And a five-watcher row is not a single-watcher row with more browsers in it: it
   wants its own envelope, the way a shaped row and an interruption row already do. Both are bench
   tooling and neither is on this branch.
+- **What `skipped` means at the `instant` preset.** Finding 39. It used to include a finished group
+  the reader had already played and popped from, which is a count of nothing, and on legacy audio
+  the conviction that produced it also fabricated a hole that reset the ring. It now counts only
+  media actually lost, so the number falls on any path that was carrying spent heads. That is a
+  behaviour change on a counter other people grade against, and it is stated here rather than buried
+  in a commit: if a harness, a budget or a dashboard treats the old value as its ceiling, the
+  ceiling was measuring the wrong thing and wants re-recording. Recommended: keep the new meaning,
+  because a counter that says media was lost when none was makes a real loss during a mute
+  invisible.
+- **The JS and Rust container consumers agreed on the budget and now agree on the marker; one gap is
+  left.** Finding 36 and finding 39 closed two divergences: a marker group now raises the playhead
+  when the group closes in both languages, as Rust always did
+  (`rs/moq-mux/src/container/consumer.rs:415-418`), and neither language convicts a finished head
+  the cursor has reached, which Rust got for free by popping the spent group first
+  (`rs/moq-mux/src/container/consumer.rs:327-348`). What is still open is on the native side: the
+  declared endpoint never reaches `rs/moq-audio`'s decode consumer at all, so the engine conceals
+  through the pause and counts every concealed block as an underrun, 49 of them in 500 ms at 10 ms
+  blocks. The resumed audio is correct; the counter is not.
+  `a_declared_endpoint_then_resumed_media_decodes` in `rs/moq-audio/src/decode/consumer.rs` is
+  `#[ignore]` with that number in its reason, so it fails loudly the day the marker arrives. Two
+  pieces of work: surface the marker to the decode consumer, and give the engine an `Engine::end()`
+  so a caller can declare the same pause the browser can. Recommended as one quest, because the
+  second is what makes the first testable.
+- **Whether the audio clock should be nominated while a ring is parked for a fresh fill.** Finding
+  44's residue. The watchdog no longer calls a hidden camera a stall, but at a deep preset the
+  parked fresh fill still holds video for the length of the fill: 1420 ms of
+  `Buffering (audio clock)` through a three second mute at the `2000ms` preset, where `auto` and
+  `100ms` are now zero. The overlay is telling the truth about the clock and the wrong thing to the
+  viewer. The option is to stop nominating the audio clock while the ring is parked for a first
+  fill, which is a rule about what the A/V clock means rather than a predicate in a watchdog, and it
+  is the maintainer's to settle.
+- **`moq-relay` takes its config positionally and `moq-bench` takes it as `--file`.** Finding 41.
+  The packaged unit said `--file` and could never have started the relay; that is fixed to match the
+  binary. Which spelling should win across the workspace is the maintainer's, and it is a small
+  breaking change either way: teaching `moq-relay` to accept `--file` as well is additive and leaves
+  two spellings, and moving `moq-bench` to positional is a break on a test tool. Recommended:
+  positional everywhere, since that is what the relay's documentation already says.
+- **`skipping covered group` is still a warning on the happy path.** Carried from the previous pass
+  and now measured rather than argued: `#tryDurationSkip` in `js/hang/src/container/consumer.ts`
+  prints it at `console.warn` every time a group is dropped because its successor has already
+  started, and the `watch-reload-auto` row alone prints it twice in forty seconds on an unimpaired
+  LAN. After finding 26 that is an ordinary event on any jittery path. It belongs at debug, the way
+  the relay's `Cancel` was moved in `b366db8bb`. It was left alone again here to keep the budget
+  commits about the budget.
+- **The demo page should keep its element across an unannounce.** Finding 38. The page now carries
+  its `delay` onto a rebuilt tile and remembers which broadcast the viewer was watching, which fixes
+  the two things a reload silently changed. What it does not fix is the rebuild itself: 1902 ms of
+  the 2474 ms a listener hears as a cut is the page having no `<moq-watch>` at all between the
+  unannounce and the re-announce, against 572 ms for the tune-in that follows. Keeping the element
+  and letting it wait for the broadcast to come back is what would take that two seconds out. It is
+  a `demo/web` change with a real question underneath it, which is how long a tile should hold a
+  broadcast that has gone away before it admits it is gone, and it is deliberately not in this pass.
+- **A browser publisher other than Chromium stops delivering pictures across an unmute.** Found by
+  the regression set and not chased: brave, firefox and webkit publishers each stop for about 700 ms
+  across an unmute where chromium does not. It is publisher-side, it is not the watchdog of finding
+  44, and it wants its own row before anything is claimed about it.
+- **The congestion-control campaign's follow-ups.** The campaign is planned test work and is
+  described in the bench archive; five things it wants are not measurable with what the tree exposes
+  today, and each is a small, separable addition:
+  - **Which track the relay shed.** `moq_relay_stale_{groups,frames,bytes}_total` is per tier, so a
+    row can prove something was shed and not that audio was spared. Proposal: a `track` label behind
+    a flag, or one debug line per expiry carrying track, sequence and code.
+  - **Retransmitted video against fresh audio.** qlog carries stream ids, not tracks, so the
+    ordering the design promises can be graded at the transport level and not per track. Proposal: a
+    trace line when a group's stream opens, naming the track.
+  - **Downstream loss and congestion window on a grid.** The relay's `/metrics` has no RTT, cwnd or
+    loss at all, so qlog is the only packet-level source and it is per connection and offline.
+    Proposal: `moq_relay_quic_*` gauges under `[internal]`.
+  - **Browser transport RTT.** Absent everywhere; the PROBE stream's own `rtt` and Chromium's
+    `getStats()` are the only readings, and a WebSocket row has neither.
+  - **A link with tail drop.** `rs/moq-shaper`'s rate bucket delays an over-budget datagram and
+    never drops it, so every cap profile is a bufferbloat link and CUBIC never sees loss on one. The
+    shaper's queue with a `dropped` count, added as test tooling in this pass, is what closes it;
+    the profiles that use it are not written yet.
+    Also unverified rather than open: whether the browser publisher's priority reaches QUIC
+    `sendOrder`, and what rate the audio encoder is actually granted.
 
 ### Open measurements
 
-- **A listening round on `d87b15ce0`.** The six commits of findings 32 to 35 and the rebase under
-  them have not been heard. Everything else in this list is a number; this one is the ear.
+- **A listening round on the fixed tip.** Neither `d87b15ce0` and the six commits of findings 32 to
+  35 under it, nor the four code commits of findings 36 to 44 above it, have been heard. Everything
+  else in this list is a number; this one is the ear, and it is the thing the branch is waiting for.
 - **The residual underrun after a camera hide, 0.90 to 1.45 s later.** Finding 35. Seven of thirty
   hide windows after the fix still take one, on the target the row was already holding rather than on
   a step to the 80 ms guess, which is what the two commits removed. Whatever it is, it is not the
@@ -4068,39 +4832,80 @@ other way:
   earlier pass, neither reproducing on this tip; the arming residual measured fine.
 - **One flake is left in the suite**, the CPU bench's wall-clock ratio assertion in
   `stretch.bench.test.ts`, about one run in fifteen, with the absolute budget never close.
+- **The unmute's own stretch count, five against a ceiling of three.** Finding 36. On the final tip
+  `mute-basic-auto`'s unmute window stretches five times where the rule allows three. It is the real
+  cost of refilling a ring from empty and it became visible only when the ring stopped resetting
+  across that window, so it is a number that was always being paid and never counted. It is the one
+  failing check left in the seven-row set.
+- **A playhead gap of about 110 ms on every resume.** Finding 44's table and the regression set:
+  19128 to 19230 ms on the firefox row, 21161 to 21268 ms and 21194 to 21314 ms on the two
+  `hide-mute` rows, the same shape in the restart rows. It is the fresh fill landing at a deeper
+  target, it is inside the acceptance bar, and nothing here explains why it is so consistent.
+- **The tune-in figure differs by a factor of two between two runs and the cause is run ordering.**
+  `playerMs` reads 0.44 to 0.55 s in `out15-after3/` and about 1.1 s in `out15-regression/`,
+  uniformly across rows. A fresh relay, fresh publishers and a fresh browser reproduce the slower
+  number (`out15-drift/`: 1142.6 ms on `pub-reload-auto`, 961 ms on the firefox unmute), so it is not
+  accumulated bench state; what `out15-after3/` had that the others did not is about twenty-five
+  minutes of an idle machine before it. An idle-then-one-row test is what would settle it.
+- **A publisher other than Chromium stops delivering pictures for about 700 ms across an unmute.**
+  Brave, firefox and webkit publishers, chromium not. Publisher-side, unmeasured beyond the
+  observation, and it has no row of its own.
+- **The pinned-element broadcast change has no bench row.** Finding 40 is guarded by two tests and
+  nothing else, because the demo page rebuilds its element and so cannot produce the event, and the
+  regression set has no pinned-element schedule. A schedule that pins one `<moq-watch>`, kills the
+  publisher and republishes the same broadcast under it is what would measure it.
+- **Every row so far is one microphone and one output device.** The USB microphone at 48 kHz, with
+  the output context also at 48 kHz on every row. The 44.1 kHz output case is untested, and the
+  16 kHz Bluetooth headset microphone is untested because the headset was not connected for the
+  regression run, which is why `device-bt-auto` and `device-bt-100ms` are its two not-graded rows.
+  The sample-rate rebuild a 16 kHz microphone forces is therefore also unmeasured, and the rule each
+  fix is written to is stated in buckets, frame durations and the stretch bound rather than in
+  milliseconds so that it can be.
+- **`--same-browser` and `--via button` have never been exercised.** The first is the user's own
+  single-context shape, the second drives the publisher's mute through the page's own control rather
+  than the element property.
+- **The x64 gate chain was still running when this was written.** `just check`, `just test default`,
+  nextest over the touched crates, `just js test`, the replay lane, the drafts and `smoke-full`, in
+  order, on a temporary Debian 13 x64 host, in the repository's own nix shell. The Mac's gates are
+  the ones this document reports; the x64 pass is confirmation and is not folded in here.
+- **The four ranked tune-in sites that never fired.** \[D] a first ring depth racing the worklet
+  load, \[E] the budget dropping to the measured target while the ring walks down, \[G] and \[H] a
+  target rise past two buckets parking the ring. None of them appears on any row measured here: the
+  first depth is the 80 ms seed, no group is convicted inside the first three seconds with the
+  budget above the target, and the latency re-anchor never parks. They are unmeasured rather than
+  absent, and the changes proposed for them are deliberately not applied.
 
 ### The listening state, plainly
 
-**One tip below the rebase has been heard, and this one has not.** On 2026-09-17 the user listened
+**Two tips below this one have been heard, and this one has not.** On 2026-09-17 the user listened
 and watched on the bench built from the code tip that `e6be6a775` records, in their own browser with
 a headset, a real microphone and a real camera, on the plain page on 4400 and on the copied site page
 on 4402, and reported everything fine: no stutter, no spinner on an unmute, video and audio together,
-and hide and show and self-publish working.
+and hide and show and self-publish working. **The same listener then reported four transients that
+round had not covered**, and every one of them is what this pass is about: the first seconds of a
+fresh publish, a publisher page reload, a watcher page reload, and a publisher-side mute and unmute
+that left the tile on Buffering and stayed there.
 
-That round is the first to reach the sixteen commits above the previous one. Eight in the morning,
-answering the nine reports findings 18 to 25 come from: the arrival estimate kept across a mute
-(`c90eec220`), the spinner (`86baf84e7`), the ring fallback line (`6e04673c9`), the video track that
-stopped (`b366db8bb`), the live edge (`97f32ea66`), the busy camera (`3539e4ef2`), the rendition's
-track staying open (`002ae00e1`) and the audio context on the gesture (`16e6242aa`). Eight more
-after the matrix, answering what it found: the age budget (`d2443eba9`), the re-subscribe test
-(`208755120`), the download gate (`804c13a20`), the announce latch (`dc6f8d38c`), the cross-track
-hold and its cap (`69a89f17c`, `8b64a6aa6`), and the native reconnect in both the client and the
-bindings (`5be36750f`, `eec9016d9`); the commit above them, `b80a2084a`, is a test fix that changes
-nothing audible.
+Findings 32 and 33 answered the first two of the earlier reports and were never heard either.
+Findings 34 and 35 came out of the multi-watcher round the user asked for next. **Nobody has listened
+to `a52f8e241`**, and nobody listened to the rebase below it. The mute defect, which is the loudest of
+the four and the one that never recovered on its own, is fixed and measured here as finding 36, and
+the three others are findings 38, 39 and 40. Finding 44, the Buffering overlay a hidden camera left
+over the tile, was found by the bench rather than reported and nobody has heard that either.
 
-**The same listener then reported two transients that round had not covered**, and they are the
-honest limit of a clean verdict: the first seconds of their own self-publish, and the stutter after
-an unmute. Both are fixed and measured, as findings 32 and 33, and the multi-watcher round they asked
-for next produced findings 34 and 35. **None of those six commits has been heard**, and neither has
-the rebase under them. What stands in for an ear at this tip is the gate table above, the three bench
-rows on the rebased build, and the multi-watcher and trim rows in the Evidence section. A listening
-round on `d87b15ce0` is the thing this branch is waiting for.
+What stands in for an ear at this tip is the bench: the before rows on the tip these fixes start
+from, the after rows on each fix, the 27-row regression set across four engines, and the graded
+tables behind findings 36 to 44, in which every number is read out of a row's JSON rather than off a
+printed line. That is a real instrument and it is not a listener: **the sampler cannot hear**. It
+counts underruns, convictions, trims, concealment and the playhead, and a defect that is audible
+without moving one of those counters would pass every row in this document.
 
-It is one listener, one machine and one session in any case, and nothing was recorded from the round,
-so every number in this document is still an instrument reading: the measured rows are the evidence
-and the ear is the confirmation. The bench above is what the round was run on: the relay, the plain
-page, the copied site page, one smooth `bbb.hang` publisher on the fixed recipe, and a browser
-publisher of the USB camera and microphone for the self-publish half.
+It is one listener, one machine and one session in any case, and nothing is recorded from a listening
+round, so the measured rows are the evidence and the ear is the confirmation. The bench the round
+runs on is the relay, the plain page, the copied site page, one smooth `bbb.hang` publisher on the
+fixed recipe, and a browser publisher of the USB camera and microphone for the self-publish half. The
+same pages are also served from a temporary Debian 13 x64 host over a real certificate, so the round
+can be taken over a wide-area path as well as on the LAN.
 
 ## Attribution and licensing
 
