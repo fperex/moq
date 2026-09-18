@@ -449,3 +449,40 @@ test("unmuting continues the arrival estimate rather than starting over at the d
 	close();
 	producer.close();
 });
+
+test("a rendition that leaves the catalog and comes back keeps its arrival estimate", async () => {
+	// A publisher hiding a source takes the rendition out of the catalog for a few hundred
+	// milliseconds and then puts the same one back. That is a gap in one rendition, not a new one:
+	// the path and the publisher's claim about it are unchanged, so what was measured on it still
+	// holds. Building a fresh estimator there republishes the declaration as though something had
+	// measured it, and Sync holds every track to the widest reading, so one track's guess deepens
+	// the buffer every other track has already measured and the audio ring is resized mid-playback.
+	const producer = new MoqBroadcast.Producer();
+	const track = producer.createTrack("audio");
+	const rendition = catalog({ jitter: 302 });
+	const { decoder: built, catalog: root, close } = decoder(true, { catalog: rendition, active: producer.consume() });
+	await flush();
+
+	writeGroup(track, 0, 0);
+	writeGroup(track, 1, 20_000);
+	await sleep(600);
+	writeGroup(track, 2, 40_000);
+	await flush();
+
+	const measured = built.out.spread.peek();
+	expect(measured).toBeDefined();
+	expect(measured).toBeLessThan(320 as Time.Milli);
+
+	// The source goes. A departed track must stop holding the buffer open.
+	root.set({ audio: { renditions: {} } } as unknown as Catalog.Root);
+	await flush();
+	expect(built.out.spread.peek()).toBeUndefined();
+
+	// And comes back as the same rendition, with the measurement it left behind.
+	root.set(rendition);
+	await flush();
+	expect(built.out.spread.peek()).toBe(measured);
+
+	close();
+	producer.close();
+});

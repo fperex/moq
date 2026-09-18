@@ -177,6 +177,8 @@ function fixture() {
 	return {
 		served,
 		decoder,
+		/** The rendition the catalog is offering, which a publisher hiding its camera takes away. */
+		config: source.out.config as Signal<Catalog.VideoConfig | undefined>,
 		/** Wait until `count` subscriptions have been raised, or give up. */
 		async subscriptions(count: number): Promise<number> {
 			for (let i = 0; i < 400 && served.length < count; i++) await flush();
@@ -282,6 +284,52 @@ test("the arrival estimator survives a rebuild", async () => {
 		expect(fx.decoder.out.spread.peek()).toBeDefined();
 	} finally {
 		dispose();
+		fx.close();
+		console.warn = warn;
+	}
+});
+
+test("the arrival estimator survives the rendition leaving the catalog and coming back", async () => {
+	// A publisher hiding its camera takes the rendition out of the catalog for a few hundred
+	// milliseconds and then puts the same one back. That is a gap in one rendition, not a new one:
+	// the path and the publisher's claim about it are unchanged, so what was measured on it still
+	// holds. Building a fresh estimator there republishes the 80ms guess as though something had
+	// measured it, and Sync holds every track to the widest reading, so the audio ring is resized
+	// mid-playback and runs dry. Three of five watchers on the bench took an underrun from it.
+	const warn = console.warn;
+	console.warn = () => {};
+	const fx = fixture();
+	const rendition = fx.config.peek();
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+
+		// A prompt pair sets the arrival baseline, then one 600ms later closes the estimator's
+		// first resample interval, which is what replaces the declaration with a measurement.
+		const beating = heartbeat();
+		try {
+			fx.served[0].encode(payload(16), Time.Micro(0), true);
+			fx.served[0].encode(payload(16), Time.Micro(20_000), false);
+			await new Promise((resolve) => real.setTimeout(resolve, 600));
+			fx.served[0].encode(payload(16), Time.Micro(40_000), false);
+			await settle();
+
+			const measured = fx.decoder.out.spread.peek();
+			expect(measured).toBeDefined();
+			expect(measured).toBeLessThan(80 as Time.Milli);
+
+			// The camera goes. A departed track must stop holding the buffer open.
+			fx.config.set(undefined);
+			await settle();
+			expect(fx.decoder.out.spread.peek()).toBeUndefined();
+
+			// And comes back as the same rendition, with the measurement it left behind.
+			fx.config.set(rendition);
+			await settle();
+			expect(fx.decoder.out.spread.peek()).toBe(measured);
+		} finally {
+			beating();
+		}
+	} finally {
 		fx.close();
 		console.warn = warn;
 	}

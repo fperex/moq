@@ -14,7 +14,7 @@ import {
 	Signal,
 } from "@moq/signals";
 import { base64ToBytes } from "../base64";
-import { accumulate, nextMedia, subscribeMedia } from "../media";
+import { accumulate, Estimator, nextMedia, subscribeMedia } from "../media";
 
 import type { Sync } from "../sync";
 import {
@@ -131,6 +131,10 @@ export class Decoder {
 	// than for as long as one subscription does. See `#runSpread`.
 	#spread = new Signal<Container.Jitter | undefined>(undefined);
 
+	// What makes "as long as the rendition lasts" outlive the effect below, which ends the moment
+	// the rendition leaves the catalog. See `Estimator`.
+	#estimator = new Estimator();
+
 	// Bumped to rebuild the track without anything else about the rendition changing: a codec that
 	// errored, or a picture that stayed frozen past RECOVER. `#runPending` reads it, so a bump tears
 	// the old subscription down and opens a new one at the live edge.
@@ -200,13 +204,14 @@ export class Decoder {
 	 * over at the publisher's declaration hands Sync a delay sized for a path nobody is on, so
 	 * the shared delay collapses to whatever audio measured and the replacement subscription is
 	 * convicted by a budget the picture could never meet. Cleared when the rendition goes, so a
-	 * departed track stops holding the buffer open.
+	 * departed track stops holding the buffer open, and picked up again where it left off when the
+	 * same rendition comes back: a camera hidden and shown is a gap in one rendition, not a new one.
 	 */
 	#runSpread(effect: Effect): void {
 		const identity = effect.get(this.#identity);
 		if (!identity) return;
 
-		const spread = new Container.Jitter({ start: renditionJitter(identity.decoder) });
+		const spread = this.#estimator.spread(identity, renditionJitter(identity.decoder));
 		effect.set(this.#spread, spread);
 		effect.run((inner) => this.#out.spread.set(inner.get(spread.value)));
 		effect.cleanup(() => this.#out.spread.set(undefined));
