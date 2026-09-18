@@ -100,6 +100,11 @@ impl Decision {
 		self.chunk = count.clamp(block, frames(self.rate, super::delay::CEILING));
 	}
 
+	/// The most recent arrival, in frames. See [`Self::arrived`].
+	pub(crate) fn chunk(&self) -> usize {
+		self.chunk
+	}
+
 	/// The audio playout holds ahead of the playhead, in frames.
 	///
 	/// The target counts the frame being played, the way NetEq's does (its buffer

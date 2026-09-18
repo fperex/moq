@@ -71,6 +71,9 @@ pub(crate) struct Stats {
 	pub(crate) skips: u64,
 	/// Frames dropped by those skips.
 	pub(crate) skipped: u64,
+	/// Frames dropped off the front before playout had played anything, which no time
+	/// stretch had to close. See [`Engine::trim`].
+	pub(crate) trimmed: u64,
 	/// The target the estimator currently asks for.
 	pub(crate) target: Duration,
 	/// Contiguous audio held, ahead of the playhead.
@@ -203,6 +206,16 @@ impl Engine {
 		let count = pcm.len() / self.channels;
 		self.decision.arrived(count);
 		self.buffer.insert(timestamp, pcm);
+
+		// Nothing has been played from this timeline yet, so where playout starts is still
+		// ours to choose.
+		let trimmed = self.trim();
+		if trimmed > 0 {
+			self.stats.trimmed += trimmed as u64;
+			// Playout has not begun, so the playhead is simply where it is going to begin.
+			self.playhead = self.buffer.front();
+		}
+
 		self.playhead
 			.get_or_insert_with(|| self.buffer.front().unwrap_or(timestamp));
 
@@ -302,6 +315,33 @@ impl Engine {
 	fn flush(&mut self) -> usize {
 		let ceiling = self.buffer.duration(self.decision.ceiling());
 		self.buffer.flush(self.hold(), ceiling)
+	}
+
+	// Where playout starts on a timeline nothing has been played from: the newest audio
+	// less the level playout holds, rather than the oldest frame held.
+	//
+	// A fresh subscription is served the live edge and then whatever the relay still had
+	// cached inside the age budget, so a tune-in, an unmute or a re-anchor onto a hole
+	// arrives holding far more than playout wants. Nothing has been heard, so dropping the
+	// excess is silent, where stretching it away is seconds of compressed speech. NetEq
+	// reaches its target the same way at the start of a stream, by the position playout
+	// starts at rather than by accelerating into it (`decision_logic.cc`,
+	// `delay_manager.cc`).
+	//
+	// The first fill only. Once playout has taken audio, a surplus is on its way to being
+	// heard and the decision loop's own stretch is what closes it; a publisher's flush
+	// burst in particular drains again before the next one. A whole chunk of slack, because a
+	// fill lands a chunk at a time and a level over the hold by part of one is the buffer
+	// sitting where it is meant to sit; past that it lands back on the hold exactly, which is
+	// the level the decision loop is built around rather than the threshold it speeds up at.
+	fn trim(&mut self) -> usize {
+		if self.played.is_some() {
+			return 0;
+		}
+
+		let hold = self.hold();
+		let slack = self.buffer.duration(self.decision.chunk());
+		self.buffer.trim(hold, slack)
 	}
 
 	// Follow the estimator, which moves on every arrival.
@@ -749,6 +789,44 @@ mod tests {
 		);
 		let dominant = fixture::dominant(played, RATE, 900.0, 1100.0);
 		assert!((dominant - 997.0).abs() < 10.0, "{dominant}");
+	}
+
+	/// A tune-in, an unmute or a re-anchor: the subscription is served the live edge and
+	/// the relay follows it with everything it still had cached inside the age budget, so
+	/// playout is handed far more than it holds before it has played anything.
+	#[test]
+	fn a_first_fill_starts_on_the_level_it_holds() {
+		let mut player = Player::new(config(1, true), 10.0);
+
+		// 300ms of backlog, all of it delivered before the first pull.
+		player.now = 300.0;
+		player.deliver(Duration::ZERO);
+
+		// The 80ms cold-start target with the 20ms packet being played on top of it. Nothing
+		// had been heard, so the rest is simply where the playhead begins.
+		let hold = Duration::from_millis(100);
+		let stats = player.engine.stats();
+		assert_eq!(stats.buffered, hold, "{stats:?}");
+		assert_eq!(
+			stats.trimmed,
+			frames(RATE, Duration::from_millis(200)) as u64,
+			"{stats:?}"
+		);
+		assert_eq!(
+			player.engine.playhead(),
+			Some(Duration::from_millis(200)),
+			"playout starts on the newest audio less what it holds"
+		);
+
+		// And nothing was bent to get there. The window ends before the estimator's first
+		// measurement replaces the cold-start guess, because the accelerates a falling target
+		// asks for are its own business; what this covers is the backlog, which without the
+		// trim is compressed away right here.
+		player.play(25);
+		let stats = player.engine.stats();
+		assert_eq!(stats.accelerates, 0, "{stats:?}");
+		assert_eq!(stats.skips, 0, "{stats:?}");
+		assert_eq!(stats.underruns, 0, "{stats:?}");
 	}
 
 	/// A buffer running ahead of the device drains by playing slightly faster, not

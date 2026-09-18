@@ -73,7 +73,7 @@ impl Buffer {
 		// A packet straddling the playhead still has a usable tail, so trim rather
 		// than drop.
 		if let Some(floor) = self.floor
-			&& !self.trim(&mut start, &mut pcm, floor)
+			&& !self.drop_before(&mut start, &mut pcm, floor)
 		{
 			return;
 		}
@@ -87,7 +87,7 @@ impl Buffer {
 		if at > 0 {
 			let previous = &self.packets[at - 1];
 			let end = previous.timestamp + self.duration(previous.pcm.len() / self.channels);
-			if !self.trim(&mut start, &mut pcm, end) {
+			if !self.drop_before(&mut start, &mut pcm, end) {
 				return;
 			}
 		}
@@ -111,8 +111,9 @@ impl Buffer {
 		);
 	}
 
-	/// Drop everything before `floor`, reporting whether anything is left.
-	fn trim(&self, start: &mut Duration, pcm: &mut &[f32], floor: Duration) -> bool {
+	/// Drop everything in an arriving packet before `floor`, reporting whether anything is
+	/// left. Pairs with [`Self::drop_to`], which does the same to what is already held.
+	fn drop_before(&self, start: &mut Duration, pcm: &mut &[f32], floor: Duration) -> bool {
 		if *start + TOLERANCE >= floor {
 			return !pcm.is_empty();
 		}
@@ -203,6 +204,21 @@ impl Buffer {
 	pub(crate) fn flush(&mut self, target: Duration, threshold: Duration) -> usize {
 		let target = target.max(self.duration(1));
 		match self.buffered() > threshold.max(target * OVERFULL) {
+			true => self.drop_to(target),
+			false => 0,
+		}
+	}
+
+	/// Drop the oldest audio back to `target` once at least `target + slack` is held,
+	/// reporting the frames thrown away.
+	///
+	/// Where [`Self::flush`] bounds a buffer that is already playing, this is where playout
+	/// starts on a timeline nothing has been played from: the newest audio less the level
+	/// playout holds is simply the position the playhead begins at, so there is no cushion
+	/// to protect and no multiple of the target under it.
+	pub(crate) fn trim(&mut self, target: Duration, slack: Duration) -> usize {
+		let target = target.max(self.duration(1));
+		match self.buffered() >= target + slack {
 			true => self.drop_to(target),
 			false => 0,
 		}

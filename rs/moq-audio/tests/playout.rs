@@ -103,9 +103,11 @@ const BLOCK: usize = (RATE as usize / 100) * CHANNELS as usize * size_of::<f32>(
 #[tokio::test]
 async fn playout_hands_back_one_block_at_a_time() {
 	const PACKETS: usize = 25;
-	/// Enough ahead of the speaker to fill the cold-start target before the first
-	/// block is pulled, and well under what the engine would flush back to it.
-	const LEAD: usize = 5;
+	/// Enough ahead of the speaker that the loop's own first write fills the level
+	/// playout holds (the 80 ms cold-start target plus the packet being played) before
+	/// the first block is pulled, and no more: a lead past it is where the playhead
+	/// starts rather than audio anyone waits for, so playout would drop it.
+	const LEAD: usize = 4;
 
 	let mut fixture = broadcast(LEAD).await;
 
