@@ -19,15 +19,36 @@ export type Delay = "instant" | "auto" | Time.Milli;
 // The widest measured jitter "auto" sizes a buffer from, which is the estimator's own ceiling.
 const JITTER_CEILING = Time.Milli(Container.Jitter.CEILING);
 
+// The lead a viewer does not notice, so the part of it the hold does not have to buy back.
+//
+// ITU-R BT.1359 puts the detectability window at about 45ms of sound-ahead and 125ms of
+// sound-behind. The hold only has to bring the lead inside that window, not to zero: every
+// millisecond past it is latency a conferencing player pays for nothing, and when low audio
+// latency and perfect sync disagree a call wants the latency.
+const OFFSET_TOLERANCE = Time.Milli(45);
+
 // The most latency lip sync is worth.
 //
-// The term exists to bring the picture back inside the window a viewer notices (ITU-R BT.1359 puts
-// that at 45ms of picture-ahead and 125ms of picture-behind), and past this a hold cannot buy that
-// back: a picture seconds late is out of sync whatever the sound does, and holding the sound with
-// it just makes everything late. Measured on an impaired path, an uncapped term reached 2s during
-// tune-in, where the video track is still replaying the backlog between the last keyframe and the
-// live edge and every arrival honestly looks that late.
-const OFFSET_MAX = Time.Milli(200);
+// The term exists to bring the picture back inside the window a viewer notices (see
+// OFFSET_TOLERANCE), and past this a hold cannot buy that back: a picture that far behind is out
+// of sync whatever the sound does, and holding the sound with it just makes everything late. A
+// video call is the case this player is for, so the ceiling is what a call tolerates rather than
+// what a broadcast would: a self-publish measures its own camera pipeline, and the measured
+// browser publishers needed 55 to 70ms of it. Measured on an impaired path, an uncapped term
+// reached 2s during tune-in, where the video track is still replaying the backlog between the
+// last keyframe and the live edge and every arrival honestly looks that late.
+const OFFSET_MAX = Time.Milli(100);
+
+// How long the hold holds a value before it may move another bucket.
+//
+// The hold is spent by the audio ring, which reaches a deeper one by parking and a shallower one
+// by time-compressing what it already holds; either is audible if it happens in a burst. It is
+// also at its least trustworthy exactly when it moves most: at tune-in the video floor is set by
+// the camera's warm-up frames, the slowest the track will ever be, and a hold derived from them
+// would sit at the cap until both windows have rotated past them. A bucket per second is one
+// stretch period per second, which speech carries, and it is slow enough that a transient rotates
+// out of the windows before the hold has grown into it.
+const OFFSET_STEP = Time.Milli(1_000);
 
 // How long one track's arrival floor stands before it stops counting.
 //
@@ -152,8 +173,10 @@ type SyncOutput = {
 	// When the delay is a number, jitter equals that number.
 	jitter: Signal<Time.Milli>;
 
-	// How much later the picture arrives than the sound, for the same media timestamp. Zero when
-	// they arrive together, which is the ordinary case. See `#observeArrival`.
+	// How long the sound is held so a later picture lands with it: how much later the picture
+	// arrives, less the lead a viewer would not notice, capped at what a call tolerates and moved
+	// one bucket at a time. Zero when they arrive together, which is the ordinary case, and zero
+	// until something has been measured. See `#observeArrival`.
 	offset: Signal<Time.Milli>;
 
 	// The media timestamp of the most recently received frame.
@@ -205,6 +228,9 @@ export class Sync {
 	// Per-track arrival floors, for the cross-track offset. Only the tracks that render on the
 	// shared clock: captions render on `now()`, so holding sound for a late one would be wrong.
 	#arrivals = new Map<"audio" | "video", Arrival>();
+
+	// When the hold last moved, so it moves by one bucket at a time rather than in a burst.
+	#stepped: Time.Milli | undefined;
 
 	#signals = new Effect();
 
@@ -379,10 +405,16 @@ export class Sync {
 		if (!entry) {
 			this.#arrivals.set(name, { current: floor, previous: Number.POSITIVE_INFINITY, opened: now });
 		} else if (Time.Milli.sub(now, entry.opened) >= 2 * OFFSET_WINDOW) {
-			// Gone for longer than the pair of windows: nothing it measured before describes the
-			// path it is on now, so start over rather than walking empty windows.
+			// Gone for longer than the pair of windows: a mute, or a subscription rebuilt under it.
+			// What it measured carries across as the previous window rather than being thrown away,
+			// because a pause stops the download and not the path: the floor is the same one a
+			// moment later. Re-deriving the hold from a cold window instead is what moves it at the
+			// unmute, which the ring spends as a stall or a stretch just as the sound comes back.
+			// The estimator carries its own measurement across the same pause, for the same reason
+			// (`Decoder.#runSpread`). The window is re-opened at `now` rather than walked forward,
+			// so one arrival costs one rotation however long the pause was.
+			entry.previous = entry.current;
 			entry.current = floor;
-			entry.previous = Number.POSITIVE_INFINITY;
 			entry.opened = now;
 		} else if (Time.Milli.sub(now, entry.opened) >= OFFSET_WINDOW) {
 			entry.previous = entry.current;
@@ -394,9 +426,11 @@ export class Sync {
 
 		const floors = new Map<"audio" | "video", number>();
 		for (const [track, arrival] of this.#arrivals) {
-			// A track that stopped delivering stops counting, so muting a tile or scrolling its
-			// canvas away does not hold the other deep for the rest of the session.
-			if (Time.Milli.sub(now, arrival.opened) >= 2 * OFFSET_WINDOW) {
+			// A picture that stopped arriving stops counting, so muting a tile or scrolling its
+			// canvas away does not hold the sound deep for the rest of the session: there is
+			// nothing left to be in sync with. Audio is carried instead, because the term is not
+			// about the sound arriving, it is about the picture being later than it.
+			if (track === "video" && Time.Milli.sub(now, arrival.opened) >= 2 * OFFSET_WINDOW) {
 				this.#arrivals.delete(track);
 				continue;
 			}
@@ -404,21 +438,40 @@ export class Sync {
 			if (Number.isFinite(reading)) floors.set(track, reading);
 		}
 
-		// Only video's excess over audio, never the other way round. Audio is the clock and video
-		// is painted when the playhead reaches its timestamp, so a picture that arrives early is
-		// already held for free and one that arrives late is the only thing needing a term. Sound
-		// cannot be pulled forward either; the earlier track is the one that waits.
 		const audio = floors.get("audio");
 		const video = floors.get("video");
 		if (audio === undefined || video === undefined) {
-			this.#out.offset.set(Time.Milli.zero);
+			this.#stepOffset(Time.Milli.zero, now);
 			return;
 		}
 
-		const behind = Math.max(0, video - audio);
+		// Only the part of video's excess over audio that a viewer would notice, and only that
+		// excess, never the other way round. Audio is the clock and video is painted when the
+		// playhead reaches its timestamp, so a picture that arrives early is already held for free
+		// and one that arrives late is the only thing needing a term. Sound cannot be pulled
+		// forward either; the earlier track is the one that waits.
+		const behind = Math.max(0, video - audio - OFFSET_TOLERANCE);
 		const bucket = Container.Jitter.BUCKET;
 		const quantised = behind < bucket ? 0 : Math.ceil(behind / bucket) * bucket;
-		this.#out.offset.set(Time.Milli(Math.min(OFFSET_MAX, quantised)));
+		this.#stepOffset(Time.Milli(Math.min(OFFSET_MAX, quantised)), now);
+	}
+
+	/**
+	 * Move the hold one bucket towards what the floors ask for, at most once per {@link OFFSET_STEP}.
+	 *
+	 * Both directions, because the ring pays for both: it parks to reach a deeper hold and
+	 * time-compresses to reach a shallower one. The measured value is followed rather than
+	 * smoothed, so a hold that is wrong is still on its way to being right within a few seconds.
+	 */
+	#stepOffset(wanted: Time.Milli, now: Time.Milli): void {
+		const current = this.#out.offset.peek();
+		if (wanted === current) return;
+		if (this.#stepped !== undefined && Time.Milli.sub(now, this.#stepped) < OFFSET_STEP) return;
+
+		const bucket = Container.Jitter.BUCKET;
+		const next = wanted > current ? Math.min(wanted, current + bucket) : Math.max(wanted, current - bucket);
+		this.#stepped = now;
+		this.#out.offset.set(Time.Milli(next));
 	}
 
 	// Fold a newly received frame into the reference. The reference anchors playback to the
@@ -502,6 +555,7 @@ export class Sync {
 		// A rewind moves the media axis, so every arrival floor describes a timeline that no longer
 		// exists. The estimator drops its own reference on a discontinuity for the same reason.
 		this.#arrivals.clear();
+		this.#stepped = undefined;
 		this.#out.offset.set(Time.Milli.zero);
 		this.#wake();
 	}
