@@ -378,14 +378,19 @@ export class Consumer {
 		if (this.#active === undefined) return;
 
 		let skipped = false;
+		let walked = false;
 		let hole = false;
 
-		// Keep skipping the oldest group while what it could still present has aged past the
-		// budget. This also handles gaps in group sequence numbers: if #active points to a
-		// missing group, the successor's start proves the missing content is too old to wait for.
+		// Walk the delivery cursor forward while what the oldest group could still present has aged
+		// past the budget. This is also what ends the wait on a gap in group sequence numbers: if
+		// #active points to a missing group, the successor's start proves the missing content is
+		// too old to wait for. What happens to the oldest group when the budget runs out depends on
+		// what it holds; see the verdict below.
 		while (this.#groups.length >= 2) {
 			const threshold = Moq.Time.Micro.fromMilli(this.#maxAge.peek());
 			const first = this.#groups[0];
+			// Where delivery stands, which decides what a verdict against the head means.
+			const cursor = this.#active;
 
 			// A group is measured by how far it could still reach, not by how far behind it
 			// started: it cannot present past where its successor begins, so that bound is the
@@ -412,15 +417,45 @@ export class Consumer {
 			const age = live - reach;
 			if (age <= threshold) break;
 
+			// The budget has run out, and what that costs depends on where the head sits.
+			//
+			// A finished group the cursor has reached belongs to next(), not to the budget: next()
+			// hands over whatever is still queued there and pops the group once it is spent, both
+			// within a microtask of being asked. Convicting one either throws away media sitting in
+			// memory ready to play, which is what a tune-in burst is, or reports a group the
+			// listener has already heard as lost. On legacy audio the second is not even quiet: a
+			// frame carries no duration, so a spent group's end reads as its last timestamp and the
+			// contiguous successor one frame later is judged a hole, which re-anchors the reader.
+			// `rs/moq-mux`'s consumer cannot reach either verdict: its read arm returns a buffered
+			// frame, and closes out a spent group as `GroupEnd`, before the budget is consulted.
+			if (first.done && cursor !== undefined && first.consumer.sequence <= cursor) break;
+
+			// Above the cursor the group it sits on never arrived, and now it never will. Give up
+			// on those sequences rather than on the media that did arrive: walk the cursor onto the
+			// head, the way the same consumer walks onto the first arrived group instead of
+			// dropping it. A head that finished holding nothing cannot be walked onto, so it is
+			// convicted below along with a head that is still downloading.
+			if (first.done && first.frames.length > 0) {
+				// Whether that cost anything is the one thing the reader has to be told: a head
+				// that continues the timeline we left off at means the sequence numbers merely
+				// jumped, and a head that does not means a span of media is missing.
+				if (!ptsContiguous(this.#presentedEnd, first.frames.at(0)?.timestamp)) hole = true;
+				this.#active = first.consumer.sequence;
+				walked = true;
+				break;
+			}
+
 			this.#groups.shift();
 			this.#active = this.#groups[0]?.consumer.sequence;
 			// Everything the verdict was reached on, since the same line has to answer whether the
-			// group was actually late or merely long: what it still held, whether more was coming,
-			// and the three numbers the budget was compared against. Timestamps in microseconds.
+			// group was actually late or merely long: what it still held, how much of that nobody
+			// had read, where delivery stood, whether more was coming, and the three numbers the
+			// budget was compared against. Timestamps in microseconds.
 			console.warn(
 				`skipping slow group: track=${this.#track.name} ${first.consumer.sequence} -> ${this.#active} ` +
 					`first=${first.frames.at(0)?.timestamp ?? first.start} last=${first.latest} ` +
-					`${first.done ? "closed" : "open"} reach=${reach} live=${live} budget=${threshold}`,
+					`queued=${first.frames.length} cursor=${cursor} ${first.done ? "closed" : "open"} ` +
+					`reach=${reach} live=${live} budget=${threshold}`,
 			);
 
 			const nextStart = this.#groups[0]?.frames.at(0)?.timestamp ?? this.#groups[0]?.end;
@@ -440,7 +475,9 @@ export class Consumer {
 
 		if (hole) this.#markPlayhead();
 
-		if (skipped) {
+		// A walk moved delivery onto a group already buffered, so the reader has something to read
+		// even though nothing was dropped.
+		if (skipped || walked) {
 			this.#updateBuffered();
 
 			// Wake up any consumers waiting for a new frame.

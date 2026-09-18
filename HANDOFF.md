@@ -905,12 +905,29 @@ to 64 to 91 ms after it.
 
 ### The budget
 
-`budget-censors-the-tail` in `replay.test.ts` replays `relay-bbb-7frame` through a real subscription
-and a real `Container.Consumer`. In steady state: 0 of 443 groups convicted at the measured target,
-0 with the headroom, and 91 at the 46 ms round-trip budget the estimator replaced. The measured
-target already clears this publisher's 139 ms flush span by a wide margin, so on this recording the
-headroom buys nothing. It is insurance against a path whose target lands close to the flush, not a
-fix for what was recorded. The 91 is the control that shows the censoring mechanism is real.
+`budget-spares-an-arrived-flush` in `replay.test.ts` replays `relay-bbb-7frame` through a real
+subscription and a real `Container.Consumer`. In steady state it now convicts nothing at any budget:
+0 of 443 groups at the measured target, 0 with the headroom, and 0 at the 46 ms round-trip budget the
+estimator replaced, which is a third of this publisher's 139 ms flush span. The measured target
+clears the flush span by a wide margin either way, so the headroom is insurance against a path whose
+target lands close to the flush rather than anything this recording needed.
+
+The same replay censored 91 of those groups when the head was judged by its timestamps alone. What
+changed is what the budget rules on above the decoder: a group that has arrived is never convicted.
+A finished head the delivery cursor has reached belongs to `next()`, which hands over whatever is
+still queued and pops the group once it is spent; a finished head above the cursor is walked onto,
+since what never arrived is the sequences below it; and what is left to convict is a group still
+arriving with nothing to hand over. Every one of the 122 convictions that survived the walk read
+`queued=0 cursor=<its own sequence> closed`: a head the listener had already heard, still in the list
+because `next()` had not popped it yet. Convicting one lost no audio, but it counted a skip, reported
+the next delivery as discontinuous, and, because a Legacy frame carries no duration, judged the
+contiguous successor a hole and re-anchored the reader. That was the watch-reload conviction.
+
+**A behaviour change for the maintainer to confirm**: `skipped` now counts only media nobody could
+take. At `instant` (a zero budget) a reader that keeps up reports nothing at all, where it used to
+count every group it had played. The two zero-budget cases in `consumer.test.ts` were updated to the
+new semantics: one asserts that a reader keeping up plays the whole track and counts nothing, the
+other that a group still arriving is counted, once each time it happens.
 
 ### CPU
 

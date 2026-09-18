@@ -416,6 +416,13 @@ The reasoning is that the histogram holds delays, and a jump in the timeline
 does not move a delay. The reference deque holds absolute pairs from a timeline
 that no longer exists, and the open interval spans the jump, so both go.
 
+A publisher that restarts moves the axis just as far with nothing on the wire to
+say so: the same broadcast name comes back as a different broadcast, and its new
+encoder starts its timeline where it likes. A receiver that followed the
+republish in place, rather than being rebuilt around it, treats the replacement
+broadcast as a tune-in and resets the ring and the clock there. A rendition swap
+is not one: it reopens a subscription on the timeline already playing.
+
 ## The "plus one frame" question
 
 The first attempt added a learned frame duration on top of the quantile. It
@@ -573,7 +580,15 @@ The case this is for is a fresh subscription. A viewer tuning in or unmuting is
 served the live edge and the relay then follows it with every group it still has
 inside the age budget, whose headroom is a stretch bound wide on purpose, so a
 backlog well past the hold is admitted and decodes before the first render
-quantum. Measured on a self-publish through the local relay, Chromium watcher,
+quantum. That burst is landed on the hold by the trim below, never by the age
+budget: a group that arrived is never convicted. One the reader has reached
+belongs to the reader, which hands over what is still queued there and closes the
+group out once it is spent. One it has not reached is walked onto, since what the
+budget gave up on is the sequences below that never arrived, and that walk asks
+the reader to re-anchor only when the head does not continue the timeline. What
+is convicted is what is late in the sense the budget means: a group still
+arriving with nothing to hand over. So the skip counter reports media nobody
+could take, and at a zero budget a reader that keeps up reports nothing at all. Measured on a self-publish through the local relay, Chromium watcher,
 one unmute after a three second mute: the ring started playing 65 ms deep
 against a 40 ms hold, and the reader spent 8 accelerates and 50 ms of compressed
 speech closing that over the following seconds; five rapid mute and unmute pairs

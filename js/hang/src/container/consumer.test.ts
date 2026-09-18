@@ -500,24 +500,25 @@ test("Consumer throws on concurrent next() calls", async () => {
 	consumer.close();
 });
 
-test("Consumer skips a group via PTS-span when over the max age", async () => {
+test("Consumer plays every group under a zero budget when the reader keeps up", async () => {
 	const track = new Track.Producer("test");
 	// A zero max age lets a group stand only until its successor overtakes it.
 	const consumer = new Consumer(replay(track), { format: new LegacyFormat("data"), maxAge: 0 as Time.Milli });
 
-	// Write groups with increasing timestamps. A group whose successor has already started is over
-	// any budget of zero, so the consumer advances instead of waiting for the rest of it.
+	// Write groups with increasing timestamps. Every one of them is complete on arrival, so however
+	// far behind the live edge the oldest looks, the reader is not waiting for any of it: the budget
+	// has nothing to give up on and delivery walks the whole track.
 	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro]);
 	writeGroupWithLegacyFrames(track, 1, [100_000 as Time.Micro]);
 	writeGroupWithLegacyFrames(track, 2, [200_000 as Time.Micro]);
 	track.close();
 
 	const frames = await drainFrames(consumer, 300);
-	// Delivery reaches the newest group. Each group here holds one frame, already readable when the
-	// budget convicts it, so nothing is lost; the frames a skipped group had not delivered are what
-	// the counter in the next test measures.
+	// Delivery reaches the newest group, and counts nothing on the way: a group the reader played is
+	// not a group the budget skipped. What a zero budget does convict is the next test.
 	const groups = [...new Set(frames.map((f) => f.group))];
 	expect(groups.at(-1)).toBe(2);
+	expect(consumer.skipped.peek()).toBe(0);
 	consumer.close();
 });
 
@@ -565,19 +566,123 @@ test("Consumer counts a group the budget abandoned instead of failing its task",
 
 test("Consumer counts every group the max age skips", async () => {
 	const track = new Track.Producer("test");
-	// Zero max age: a group whose successor already starts behind the newest frame has nothing
-	// left worth waiting for, so groups 0 and 1 are both shifted and group 2 (which reaches the
-	// newest frame) is kept.
+	// Zero max age: a group holding nothing the reader can take stands only until its successor
+	// starts behind the newest frame, and each one it gives up on is counted once. That is a group
+	// still arriving, twice over here. A group that finished holding nothing is the other shape the
+	// budget would convict, but it rarely gets that far: next() walks an empty completed group on
+	// its own, because empty groups mean nothing.
 	const consumer = new Consumer(replay(track), { format: new LegacyFormat("data"), maxAge: 0 as Time.Milli });
 
-	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro]);
+	// Still arriving: the group is open and has published nothing, so waiting for it is the only
+	// thing holding delivery up.
+	const arriving = new Group.Producer(0);
+	track.writeGroup(arriving);
 	writeGroupWithLegacyFrames(track, 1, [100_000 as Time.Micro]);
 	writeGroupWithLegacyFrames(track, 2, [200_000 as Time.Micro]);
-	writeGroupWithLegacyFrames(track, 3, [300_000 as Time.Micro]);
+	await settle();
+
+	expect(consumer.skipped.peek()).toBe(1);
+	expect((await nextFrame(consumer))?.frame?.timestamp).toBe(100_000 as Time.Micro);
+	expect((await nextFrame(consumer))?.frame?.timestamp).toBe(200_000 as Time.Micro);
+
+	// The cursor moves off the group it just played, onto another that is still arriving.
+	expect((await consumer.next())?.frame).toBeUndefined(); // group 2 done
+	const stalling = new Group.Producer(3);
+	track.writeGroup(stalling);
+	writeGroupWithLegacyFrames(track, 4, [300_000 as Time.Micro]);
+	writeGroupWithLegacyFrames(track, 5, [400_000 as Time.Micro]);
+	await settle();
 	track.close();
 
-	await drainFrames(consumer, 300);
 	expect(consumer.skipped.peek()).toBe(2);
+	expect((await drainFrames(consumer, 300)).map((f) => f.timestamp as number)).toEqual([300_000, 400_000]);
+
+	arriving.close();
+	stalling.close();
+	consumer.close();
+});
+
+// A group the reader has played to the end sits in the list until the next next() pops it, which is
+// a microtask the caller spends decoding. An arrival landing in that window used to convict it: no
+// audio was lost, but the listener was told a group had been skipped, and because a Legacy frame
+// carries no duration the spent group's end read as its last timestamp, so the contiguous successor
+// one frame later was judged a hole and the reader re-anchored on it.
+test("a head the reader has played out is not convicted while next() has yet to pop it", async () => {
+	const track = new Track.Producer("test");
+	// Tight enough that one frame of successor puts the spent head over it.
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 10 as Time.Milli });
+
+	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro]);
+	await settle();
+	expect((await consumer.next())?.frame?.timestamp).toBe(0 as Time.Micro);
+
+	// Group 0 is spent and still at the cursor. Its successors arrive before anyone asks for them.
+	writeGroupWithLegacyFrames(track, 1, [20_000 as Time.Micro]);
+	writeGroupWithLegacyFrames(track, 2, [40_000 as Time.Micro]);
+	await settle();
+	track.close();
+
+	const frames = await drainFrames(consumer, 300);
+	expect(frames.map((f) => f.timestamp as number)).toEqual([20_000, 40_000]);
+	expect(consumer.skipped.peek()).toBe(0);
+	// The timeline never broke, so nothing asks the reader to re-anchor.
+	expect(consumer.discontinuity).toBe(0);
+
+	consumer.close();
+});
+
+// A reader tuning in is handed the backlog in one burst: ten complete groups parsed before its
+// first next(). Spread over the timeline they span more than the budget, but none of them is late,
+// because none of them is being waited for. Convicting the head here threw away the first audio a
+// reloaded page would have played.
+test("a complete head delivered in a burst is played, not skipped", async () => {
+	const track = new Track.Producer("test");
+	// 135ms of budget against 200ms of backlog: read as lateness, all but the youngest two groups
+	// are over it.
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 135 as Time.Milli });
+
+	const timestamps = Array.from({ length: 10 }, (_, i) => (i * 20_000) as Time.Micro);
+	for (const [sequence, timestamp] of timestamps.entries()) {
+		writeGroupWithLegacyFrames(track, sequence, [timestamp]);
+	}
+	track.close();
+	await settle();
+
+	const frames = await drainFrames(consumer, 300);
+	expect(frames.map((f) => f.timestamp as number)).toEqual(timestamps as number[]);
+	expect(consumer.skipped.peek()).toBe(0);
+	expect(consumer.discontinuity).toBe(0);
+	consumer.close();
+});
+
+// The cold tune-in the bench measured: the delivery cursor sits on a sequence the relay expired and
+// never sent, while the burst behind it is already complete in memory. What the budget gives up on
+// there is the missing group, not the media that did arrive.
+test("a cold tune-in walks onto its first buffered group instead of skipping it", async () => {
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 135 as Time.Milli });
+
+	// One group plays out, which leaves the cursor on the next sequence. That one never arrives.
+	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro]);
+	await settle();
+	expect((await consumer.next())?.frame?.timestamp).toBe(0 as Time.Micro);
+	expect((await consumer.next())?.frame).toBeUndefined(); // group 0 done
+
+	// The backlog lands in one burst, spanning 200ms against a 135ms budget.
+	const timestamps = Array.from({ length: 10 }, (_, i) => (200_000 + i * 20_000) as Time.Micro);
+	for (const [offset, timestamp] of timestamps.entries()) {
+		writeGroupWithLegacyFrames(track, 2 + offset, [timestamp]);
+	}
+	await settle();
+
+	const frames = await drainFrames(consumer, 300);
+	// Delivery resumes at the oldest group that did arrive, and every group of the burst plays.
+	expect(frames.map((f) => f.timestamp as number)).toEqual(timestamps as number[]);
+	expect(consumer.skipped.peek()).toBe(0);
+	// The span group 1 would have carried is missing, so the burst does not continue what played
+	// before it: that is a playhead event, and the only cost of the walk.
+	expect(consumer.discontinuity).toBe(1);
+
 	consumer.close();
 });
 

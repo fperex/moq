@@ -393,3 +393,103 @@ test("a replaced session re-subscribes to video", async () => {
 		second.close();
 	}
 });
+
+test("a republished broadcast re-anchors the clock", async () => {
+	// A pinned element follows a publisher restart in place: the broadcast consumer underneath it
+	// is replaced and the new encoder's timeline starts where it likes, which is near zero. A clock
+	// still anchored to the dead publisher holds every one of those pictures behind a reference
+	// they can never reach, and a republish declares no discontinuity, so nothing else lets go of
+	// it. A rendition swap is the opposite case and keeps the reference: see the audio decoder's
+	// "a replacement subscription on the same broadcast keeps the timeline it is playing".
+	const warn = console.warn;
+	console.warn = () => {};
+	const first = new Moq.Broadcast.Producer();
+	const second = new Moq.Broadcast.Producer();
+	const handle = new Signal<Moq.Broadcast.Consumer>(first.consume());
+
+	const source = {
+		in: {
+			broadcast: new Signal({
+				relativeBroadcast: (effect: Effect) => effect.get(handle),
+			} as unknown as Broadcast),
+		},
+		out: {
+			track: new Signal<string | undefined>(TRACK),
+			config: new Signal<Catalog.VideoConfig | undefined>(
+				Catalog.VideoConfigSchema.parse({ codec: "avc1.640028", container: { kind: "legacy" } }),
+			),
+			catalog: new Signal<Catalog.VideoConfig | undefined>(undefined),
+		},
+	} as unknown as Source;
+
+	const sync = new Sync({ delay: Time.Milli(100) });
+	const decoder = new Decoder(source, sync);
+
+	const served: Container.Legacy.Producer[] = [];
+	const serve = (producer: Moq.Broadcast.Producer) =>
+		void (async () => {
+			for (;;) {
+				const request = await producer.requested();
+				if (!request) return;
+				served.push(new Container.Legacy.Producer(request.accept({}), new Container.Legacy.Format("video")));
+			}
+		})();
+	serve(first);
+	serve(second);
+
+	try {
+		for (let i = 0; i < 400 && served.length < 1; i++) await flush();
+		expect(served).toHaveLength(1);
+
+		// A publisher that has been up for a while, so the clock anchors well past zero.
+		served[0].encode(payload(16), Time.Micro(10_000_000), true);
+		await settle();
+		expect(sync.out.reference.peek()).toBeDefined();
+
+		// It restarts: same name, a different broadcast.
+		first.close();
+		handle.set(second.consume());
+		for (let i = 0; i < 400 && served.length < 2; i++) await flush();
+		expect(served).toHaveLength(2);
+
+		expect(sync.out.reference.peek()).toBeUndefined();
+	} finally {
+		decoder.close();
+		sync.close();
+		first.close();
+		second.close();
+		console.warn = warn;
+	}
+});
+
+test("a rendition that left the catalog is not a stall", async () => {
+	// A publisher hiding its camera takes the rendition out of the catalog and the tile keeps the
+	// picture it already has. The buffering overlay reads `stalled`, so the watchdog labelling that
+	// gap put a spinner over a still frame for as long as the camera was away: 4.6s of it on the
+	// bench's `hide-mute` row, with the ring full and audio never interrupted.
+	const fx = fixture();
+	const rendition = fx.config.peek();
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+
+		fx.served[0].encode(payload(16), Time.Micro(0), true);
+		await settle();
+		built[0].emit(0);
+		await settle();
+		expect(fx.decoder.out.stalled.peek()).toBe(false);
+
+		// The camera goes, and nothing arrives for several watchdog windows.
+		fx.config.set(undefined);
+		await new Promise((resolve) => real.setTimeout(resolve, 100));
+		await settle();
+		expect(fx.decoder.out.stalled.peek()).toBe(false);
+
+		// It comes back, so a picture is due again and the watchdog arms with it.
+		fx.config.set(rendition);
+		await new Promise((resolve) => real.setTimeout(resolve, 60));
+		await settle();
+		expect(fx.decoder.out.stalled.peek()).toBe(true);
+	} finally {
+		fx.close();
+	}
+});
