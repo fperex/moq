@@ -63,7 +63,14 @@ const MERGES = 17;
  * renders silence rather than concealing a gap nobody left.
  */
 const ENDED = 18;
-const CONTROL_SLOTS = 19;
+/**
+ * Samples the writer dropped off the front of the first fill on a timeline. Writer only.
+ *
+ * Separate from DISCARDED because it is the one drop no listener can hear and no time stretch had
+ * to close: nothing had been played, so the playhead simply started further in. See `#trim`.
+ */
+const TRIMMED = 19;
+const CONTROL_SLOTS = 20;
 
 /**
  * The playhead and its mutation epoch, packed into one 64-bit word: epoch in the high
@@ -182,6 +189,11 @@ export class SharedRingBuffer implements RingReader {
 
 	// Whether READ/WRITE have been anchored to the first inserted sample.
 	#anchored = false;
+
+	// Where the writer left READ on this timeline, or undefined once the reader has taken a sample
+	// from it. While it stands, nothing on this timeline has been heard. Writer only: the reader's own
+	// advances are visible as READ moving past it. See {@link #trim}.
+	#resumed: number | undefined;
 
 	// What the last `view` sampled: the packed word its exchange has to match, and the cursor the
 	// skip-ahead left it on. Reader thread only, since only the worklet reads.
@@ -330,6 +342,8 @@ export class SharedRingBuffer implements RingReader {
 			Atomics.store(this.#state, 0, pack((epoch + 2) | 0, 0));
 			Atomics.store(this.#control, WRITE, 0);
 			this.#anchored = true;
+			// Nothing on this timeline has been played, so the fill is still free to trim.
+			this.#resumed = 0;
 			this.#position = 0;
 			this.#lastRead = 0;
 			this.#lastMedia = Number.NEGATIVE_INFINITY;
@@ -426,7 +440,6 @@ export class SharedRingBuffer implements RingReader {
 		// counts the frame in play, the way NetEq's does (the `packet_buffer` span plus the sync
 		// buffer), so a ring holding the target alone holds nothing unplayed and runs dry on the first
 		// arrival that is a millisecond late. See CHUNK.
-		const currentRead = readOf(Atomics.load(this.#state, 0));
 		const currentWrite = Atomics.load(this.#control, WRITE);
 		const latency = Atomics.load(this.#control, LATENCY);
 		const chunk = Atomics.load(this.#control, CHUNK);
@@ -435,9 +448,52 @@ export class SharedRingBuffer implements RingReader {
 		// the stream would stay parked for good. `setLatency` refuses a target past capacity outright;
 		// the chunk is the stream's to choose, so it is the term that gives way.
 		const hold = Math.min((latency + chunk) | 0, this.capacity);
-		if (((currentWrite - currentRead) | 0) >= hold && latency > 0) {
+		// Before the un-stall, so the level playback starts from is the one the trim left behind.
+		this.#trim(hold, chunk);
+		if (((currentWrite - readOf(Atomics.load(this.#state, 0))) | 0) >= hold && latency > 0) {
 			Atomics.store(this.#control, STALLED, 0);
 		}
+	}
+
+	/**
+	 * Start the playhead at the newest sample less `hold`, rather than at the oldest one.
+	 * Main thread only.
+	 *
+	 * Until the reader has taken a sample nothing on this timeline has been heard, so audio above the
+	 * level the ring holds is audio nobody is waiting on and dropping it is silent. Only once playback
+	 * has started does a surplus have to be closed by the reader's time stretch, which is seconds of
+	 * bent speech for the tens of milliseconds a resubscription admits past the hold: a fresh
+	 * subscription is served the live edge and then whatever the relay still had inside the age
+	 * budget, and all of it decodes before the first render quantum. NetEq reaches its target the same
+	 * way, by where playout starts rather than by accelerating into it, and does not adjust the buffer
+	 * at the start of a stream (`decision_logic.cc`, `delay_manager.cc`).
+	 *
+	 * The first fill only. A refill after an underrun resumes a timeline the listener is already
+	 * following, and there a publisher's flush burst is audio that will have drained again by the next
+	 * one, which is why the reader waits it out rather than dropping it.
+	 *
+	 * A whole chunk or more, because a fill lands a chunk at a time: a level that crossed the hold by
+	 * part of one is the ring sitting where it is meant to sit, and a trim that landed it anywhere but
+	 * on the hold would leave it on the very threshold the reader accelerates at. Buffered playback is
+	 * asked to hold a lookahead, so it keeps everything.
+	 */
+	#trim(hold: number, chunk: number): void {
+		if (this.#resumed === undefined || this.buffered) return;
+
+		const read = readOf(Atomics.load(this.#state, 0));
+		if (((read - this.#resumed) | 0) !== 0) {
+			// The reader has taken a sample, so the rest stops being free to drop.
+			this.#resumed = undefined;
+			return;
+		}
+
+		const excess = (((Atomics.load(this.#control, WRITE) - read) | 0) - hold) | 0;
+		if (excess < chunk) return;
+
+		const to = (read + excess) | 0;
+		this.#advance(to);
+		this.#resumed = to;
+		Atomics.add(this.#control, TRIMMED, excess);
 	}
 
 	/**
@@ -694,6 +750,7 @@ export class SharedRingBuffer implements RingReader {
 
 	reset(): void {
 		this.#anchored = false;
+		this.#resumed = undefined;
 		Atomics.store(this.#control, ENDED, 0);
 		Atomics.store(this.#control, STALLED, 1);
 		const write = Atomics.load(this.#control, WRITE);
@@ -758,6 +815,7 @@ export class SharedRingBuffer implements RingReader {
 			SKIPS,
 			SKIPPED,
 			DISCARDED,
+			TRIMMED,
 			ENDED,
 		]) {
 			Atomics.store(dst.#control, control, Atomics.load(this.#control, control));
@@ -872,6 +930,7 @@ export class SharedRingBuffer implements RingReader {
 			skips: load(SKIPS),
 			skipped: load(SKIPPED),
 			discarded: load(DISCARDED),
+			trimmed: load(TRIMMED),
 		};
 	}
 

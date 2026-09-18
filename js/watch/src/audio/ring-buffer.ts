@@ -55,6 +55,11 @@ export class AudioRingBuffer implements RingReader {
 	#skips = 0;
 	#skipped = 0;
 	#discarded = 0;
+	// Samples dropped off the front of the first fill on a timeline, which no listener waited on.
+	#trimmed = 0;
+	// Whether nothing on this timeline has been played yet, so what is buffered is still free to
+	// drop. Set by {@link reset} and cleared by the reader's first {@link commit}. See {@link #trim}.
+	#fresh = true;
 	// Samples the writer dropped out from under the reader since its last view, which the playout
 	// engine has to treat as a step rather than as the buffer draining.
 	#jumped = 0;
@@ -174,6 +179,7 @@ export class AudioRingBuffer implements RingReader {
 			skips: this.#skips,
 			skipped: this.#skipped,
 			discarded: this.#discarded,
+			trimmed: this.#trimmed,
 		};
 	}
 
@@ -358,9 +364,43 @@ export class AudioRingBuffer implements RingReader {
 		// first arrival that is a millisecond late. This is the only way out of a stall, so an
 		// underrun mid-playback refills to the same level before resuming. Bounded by what the ring
 		// physically holds, or a chunk wider than the ring would name a level no refill could reach.
-		if (this.length >= Math.min(hold, this.capacity)) {
+		const keep = Math.min(hold, this.capacity);
+		this.#trim(keep);
+		if (this.length >= keep) {
 			this.#stalled = false;
 		}
+	}
+
+	/**
+	 * Start the playhead at the newest sample less `keep`, rather than at the oldest one.
+	 *
+	 * Until the reader has taken a sample nothing on this timeline has been heard, so audio above the
+	 * level the ring holds is audio nobody is waiting on and dropping it is silent. Only once playback
+	 * has started does a surplus have to be closed by the reader's time stretch, which is seconds of
+	 * bent speech for the tens of milliseconds a resubscription admits past the hold: a fresh
+	 * subscription is served the live edge and then whatever the relay still had inside the age
+	 * budget, and all of it decodes before the first render quantum. NetEq reaches its target the same
+	 * way, by where playout starts rather than by accelerating into it, and does not adjust the buffer
+	 * at the start of a stream (`decision_logic.cc`, `delay_manager.cc`).
+	 *
+	 * The first fill only. A refill after an underrun resumes a timeline the listener is already
+	 * following, and there a publisher's flush burst is audio that will have drained again by the next
+	 * one, which is why the reader waits it out rather than dropping it.
+	 *
+	 * A whole chunk or more, because a fill lands a chunk at a time: a level that crossed the hold by
+	 * part of one is the ring sitting where it is meant to sit, and a trim that landed it anywhere but
+	 * on the hold would leave it on the very threshold the reader accelerates at. Buffered playback is
+	 * asked to hold a lookahead, so it keeps everything.
+	 */
+	#trim(keep: number): void {
+		if (!this.#fresh || this.#buffered) return;
+
+		const excess = this.length - keep;
+		if (excess < this.#chunk) return;
+
+		this.#readIndex += excess;
+		this.#trimmed += excess;
+		this.#jumped += excess;
 	}
 
 	/**
@@ -408,6 +448,7 @@ export class AudioRingBuffer implements RingReader {
 		this.#stalled = true;
 		this.#ended = false;
 		this.#anchored = false;
+		this.#fresh = true;
 		this.#generation++;
 	}
 
@@ -457,6 +498,8 @@ export class AudioRingBuffer implements RingReader {
 	commit(count: number): boolean {
 		this.#readIndex += count;
 		this.#jumped = 0;
+		// Something of this timeline has now been heard, so the rest stops being free to drop.
+		if (count > 0) this.#fresh = false;
 		return true;
 	}
 

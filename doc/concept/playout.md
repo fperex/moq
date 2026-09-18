@@ -450,6 +450,8 @@ sits at the bottom of its own band:
 - The audio age budget's headroom is `BUCKET + frame + STRETCH_BOUND`, which is
   the same three terms: the bucket the estimator rounded up by, the chunk on top
   of the target, and the stretch band.
+- Playout starts at `WRITE - hold` on a timeline nothing has been played from,
+  which is the next section.
 
 The hold is bounded by what the ring can physically hold. A chunk wider than the
 ring would otherwise name a level no refill could reach; `setLatency` refuses a
@@ -548,6 +550,59 @@ to move together:
 describes and what both languages are held to, and this is not an estimator
 quantity: it is a property of a pair of tracks, and `moq-audio` has only one.
 
+## Where playout starts
+
+Until the reader has taken a sample, nothing on the timeline has been heard, so
+where the playhead starts is still ours to choose. It starts at the newest audio
+less the level the ring holds, not at the oldest sample buffered.
+
+The case this is for is a fresh subscription. A viewer tuning in or unmuting is
+served the live edge and the relay then follows it with every group it still has
+inside the age budget, whose headroom is a stretch bound wide on purpose, so a
+backlog well past the hold is admitted and decodes before the first render
+quantum. Measured on a self-publish through the local relay, Chromium watcher,
+one unmute after a three second mute: the ring started playing 65 ms deep
+against a 40 ms hold, and the reader spent 8 accelerates and 50 ms of compressed
+speech closing that over the following seconds; five rapid mute and unmute pairs
+cost 15 and 144 ms. Starting the playhead 80 ms further in instead, the same two
+phases cost 0 accelerates and no compression at all. That is the fast-forward a
+listener hears after every unmute, and none of it was audio anyone was waiting
+for.
+
+```
+while nothing has been played on this timeline:
+    excess = buffered - hold
+    if (excess >= chunk) {
+        READ += excess       // counted as `trimmed`
+    }
+```
+
+**A whole chunk of slack**, because a fill lands a chunk at a time: a level that
+crossed the hold by part of one is the ring sitting where it is meant to sit.
+Past that it lands back on the hold exactly, rather than a chunk above it, which
+is the threshold the reader accelerates at.
+
+**The first fill only.** Once playout has taken audio, a surplus is on its way to
+being heard and the reader's time stretch is what closes it. A publisher's flush
+burst in particular inflates the ring and drains again before the next one, which
+is the case the level filter's own floor is there to wait out; trimming it would
+throw away audio a listener was about to hear. So the trim is armed by a
+re-anchor and disarmed by the first sample read.
+
+NetEq reaches its target the same way at the start of a stream, by the position
+playout begins at rather than by accelerating into it: `decision_logic.cc` does
+not ask for a time stretch before the first packet is played, and
+`delay_manager.cc` carries the target rather than a correction.
+
+`trimmed` is its own counter on both transports and in the stats panel, separate
+from the reader's `skipped` and the writer's `discarded`: it is the one drop no
+listener can hear. The playhead ledger counts it, so every quantum still holds
+`READ == output - concealed + stretched + queued + skipped + trimmed`.
+
+The corpus does not cover this. It holds arrival timing and the target series
+that follows from it; the ring's level at the start of playback is downstream of
+both.
+
 ## How fast the ring follows the target
 
 The two directions cost different things, so the ring takes them at different
@@ -602,6 +657,10 @@ The same list, from the Rust side. Each of these reads correct and is not.
 - The fall's share is `floor(distance / 6.0 / 20.0) * 20.0`: a division, floored
   to a whole bucket before the maximum with one bucket. Multiplying by an `f64`
   sixth instead can land the floor a bucket lower.
+- `Buffer::trim` has no floor under the level it drops to, where `Buffer::flush`
+  refuses a threshold below `OVERFULL` times the target. The flush is protecting
+  a cushion the reader is already playing out of; the trim is choosing where the
+  playhead starts, and there is no cushion yet.
 
 ## The corpus
 

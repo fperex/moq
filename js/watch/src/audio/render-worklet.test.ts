@@ -33,6 +33,10 @@ interface Harness {
 	insert(start: number, count: number): void;
 	setLatency(samples: number): void;
 	end(): void;
+	/** Flush the ring and re-stall it, which is what a mute does to the decoder's. */
+	reset(): void;
+	/** Where the reader is on the media timeline, in microseconds. */
+	timestamp(): number;
 	debug(): Snapshot;
 }
 
@@ -44,6 +48,8 @@ function shared(targetMs: number, buffered = false): Harness {
 		insert: (start, count) => ring.insert(micro(start), [media(start, count)]),
 		setLatency: (samples) => ring.setLatency(samples),
 		end: () => ring.end(),
+		reset: () => ring.reset(),
+		timestamp: () => ring.timestamp,
 		debug: () => ring.debug(),
 	};
 }
@@ -55,6 +61,8 @@ function post(targetMs: number, buffered = false): Harness {
 		insert: (start, count) => ring.write(micro(start), [media(start, count)]),
 		setLatency: (samples) => ring.resize(((samples / RATE) * 1000) as Time.Milli),
 		end: () => ring.end(),
+		reset: () => ring.reset(),
+		timestamp: () => ring.timestamp,
 		debug: () => ring.debug(),
 	};
 }
@@ -96,6 +104,16 @@ interface Script {
 	hole?: { at: number; ms: number; declared?: boolean };
 	/** Media inserted before the first quantum is pulled, in milliseconds. */
 	prefill: number;
+	/**
+	 * Media handed over in one go once playback has started, in milliseconds.
+	 *
+	 * A ring only lets a surplus accumulate once the reader has taken a sample from it: until then the
+	 * writer starts the playhead at the newest audio less the level it holds, so a deep prefill is
+	 * trimmed rather than played. A test that wants the reader looking at a deep ring hands the depth
+	 * over here, which is also how a real one arrives: a publisher's flush, or a path that stalled.
+	 * The sender keeps its own schedule afterwards, so the ring stays that much deeper.
+	 */
+	burst?: number;
 	/** How long to run, in seconds of output. */
 	seconds: number;
 	/**
@@ -157,6 +175,15 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 	let playhead = Number.NEGATIVE_INFINITY;
 
 	for (let q = 0; q < quanta; q++) {
+		// The surplus lands once the reader has taken a block, which is what makes it a surplus.
+		if (q === 1 && script.burst) {
+			for (let sent = 0; sent < ms(script.burst); sent += CHUNK) {
+				harness.insert(written, CHUNK);
+				written += CHUNK;
+				inserted = written;
+			}
+		}
+
 		while (outputFrame >= nextArrival) {
 			// A hole is media that never arrives: the timeline keeps its place, so what lands after
 			// it is the audio that follows the hole rather than the audio inside it.
@@ -186,10 +213,10 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 		const debug = harness.debug();
 		// What the ring handed over is what was played, less the frames that were made up rather
 		// than read, plus what a stretch moved, plus what is still in flight, plus what a jump
-		// passed over. `inserted - buffered` is READ.
+		// passed over or the writer dropped. `inserted - buffered` is READ.
 		const read = inserted - debug.buffered;
 		const heard = debug.output - debug.concealed;
-		if (read !== heard + debug.stretched + debug.queued + debug.skipped + debug.discarded) {
+		if (read !== heard + debug.stretched + debug.queued + debug.skipped + debug.discarded + debug.trimmed) {
 			balanced = false;
 		}
 		const media = read - debug.queued;
@@ -213,9 +240,11 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 	it("converges from the top of the band without skipping or running dry", () => {
 		// 180ms is inside the 195ms band (target, a chunk, and the stretch bound) and well above the
 		// 140ms upper limit an accelerate works down to. Past the band the reader jumps rather than
-		// stretching, which is the next test. Every prefill here is a whole number of chunks,
-		// because a ring is only ever a chunk at a time full.
-		const report = run(build, { target: 100, prefill: 180, seconds: 6 });
+		// stretching, which is the next test. The ring is filled to what it holds and the rest lands
+		// once playback has started, because a fill deeper than that is trimmed rather than played.
+		// Everything here is a whole number of chunks, because a ring is only ever a chunk at a time
+		// full.
+		const report = run(build, { target: 100, prefill: 120, burst: 60, seconds: 6 });
 
 		console.log(
 			`${name}: converged to ${(report.buffered / RATE) * 1000}ms with ${report.accelerates} accelerates, ${report.expands} expands, ${report.skips} skips, ${report.underruns} underruns`,
@@ -258,15 +287,38 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 	});
 
 	it("skips only past the band", () => {
-		const inside = run(build, { target: 100, prefill: 180, seconds: 2 });
+		const inside = run(build, { target: 100, prefill: 120, burst: 60, seconds: 2 });
 		expect(inside.skips).toBe(0);
 		expect(inside.skipped + inside.discarded).toBe(0);
 
 		// 300ms is well past the 195ms band, and past what an accelerate closes before the ring is
 		// next looked at. The shared ring jumps its reader; the post ring's writer bounds it on the
-		// way in, so the same audio is dropped a step earlier.
-		const outside = run(build, { target: 100, prefill: 300, seconds: 2 });
+		// way in, so the same audio is dropped a step earlier. Neither is a trim: the reader has been
+		// playing since the first quantum.
+		const outside = run(build, { target: 100, prefill: 120, burst: 180, seconds: 2 });
 		expect(outside.skipped + outside.discarded).toBeGreaterThan(0);
+		expect(outside.trimmed).toBe(0);
+	});
+
+	it("trims a fill deeper than the level it holds instead of stretching it away", () => {
+		// The unmute: the subscription restarts at the live edge and the relay follows it with every
+		// cached group inside the age budget, so the whole backlog decodes before the reader has taken
+		// a single block. Nothing has been heard, so the playhead starts at the newest audio less the
+		// 120ms the ring holds and the excess is dropped in silence, where stretching it away would be
+		// seconds of bent speech.
+		const report = run(build, { target: 100, prefill: 300, seconds: 2 });
+
+		// Playback starts on the 120ms the ring holds rather than on the 300ms that arrived.
+		expect(report.trimmed).toBe(ms(300) - ms(120));
+		expect(report.accelerates).toBe(0);
+		expect(report.skips).toBe(0);
+		expect(report.skipped + report.discarded).toBe(0);
+		expect(report.underruns).toBe(0);
+		expect(report.balanced).toBe(true);
+		expect(report.monotone).toBe(true);
+
+		// The first block read is the newest audio less what the ring holds, not the oldest.
+		expect(report.played.subarray(0, CHUNK)).toEqual(media(report.trimmed, CHUNK));
 	});
 
 	it("parks and resumes without losing the balance", () => {
@@ -470,5 +522,94 @@ describe("a ring that moves under the reader", () => {
 		expect(last.queued).toBe(0);
 		expect(last.output).toBe(0);
 		expect(last.stretched).toBe(0);
+	});
+});
+
+describe.each(RINGS)("%s ring unmute", (name, build) => {
+	it("resumes on the level it holds rather than stretching the backlog away", () => {
+		// A viewer muting for three seconds and unmuting. The mute flushes the decoder's ring; the
+		// resubscription is served the live edge and the relay follows it with the groups it still had
+		// cached inside the age budget, so a backlog well past the 120ms the ring holds is decoded
+		// before the reader takes its next block. Stretching that away is the few seconds of
+		// fast-forwarded speech a listener hears after every unmute.
+		const harness = build(100);
+		const engine = new Stretcher(RATE, 1, true);
+		const out = [new Float32Array(QUANTUM)];
+		const HOLD = ms(120);
+		const BACKLOG = ms(180);
+
+		let written = 0;
+		let outputFrame = 0;
+		let nextArrival = 0;
+
+		// Fill to what the ring holds, then play for a second with the sender in step.
+		const play = (quanta: number, arriving: boolean) => {
+			for (let q = 0; q < quanta; q++) {
+				while (arriving && outputFrame >= nextArrival) {
+					harness.insert(written, CHUNK);
+					written += CHUNK;
+					nextArrival += CHUNK;
+				}
+				engine.render(harness.reader, out, outputFrame);
+				outputFrame += QUANTUM;
+			}
+		};
+
+		while (written < HOLD) {
+			harness.insert(written, CHUNK);
+			written += CHUNK;
+			nextArrival = written;
+		}
+		play(Math.floor(RATE / QUANTUM), true);
+
+		const before = harness.debug();
+		expect(before.underruns).toBe(0);
+
+		// The mute: the ring is flushed and nothing is downloaded for three seconds, but the publisher
+		// keeps producing, so the timeline moves on without us.
+		harness.reset();
+		play(Math.floor((3 * RATE) / QUANTUM), false);
+		written += 3 * RATE;
+		nextArrival = outputFrame;
+
+		// The unmute: the backlog lands in one go, before the next block is pulled.
+		for (let sent = BACKLOG; sent > 0; sent -= CHUNK) {
+			harness.insert(written - sent, CHUNK);
+		}
+		nextArrival += CHUNK;
+
+		const resumed = harness.debug();
+		expect(resumed.buffered).toBe(HOLD);
+		expect(resumed.trimmed - before.trimmed).toBe(BACKLOG - HOLD);
+
+		// Three seconds of playback after it, which is the window a listener hears the catch-up in.
+		let playhead = Number.NEGATIVE_INFINITY;
+		let monotone = true;
+		for (let q = 0; q < Math.floor((3 * RATE) / QUANTUM); q++) {
+			while (outputFrame >= nextArrival) {
+				harness.insert(written, CHUNK);
+				written += CHUNK;
+				nextArrival += CHUNK;
+			}
+			engine.render(harness.reader, out, outputFrame);
+			outputFrame += QUANTUM;
+
+			const position = harness.timestamp();
+			if (position < playhead) monotone = false;
+			playhead = position;
+		}
+
+		const after = harness.debug();
+		console.log(
+			`${name}: the unmute trimmed ${(1000 * (after.trimmed - before.trimmed)) / RATE}ms and stretched ${(1000 * (after.stretched - before.stretched)) / RATE}ms over ${after.accelerates - before.accelerates} accelerates`,
+		);
+
+		// Nothing was compressed to get back on the level: the playhead simply started further in.
+		// The splice at the unmute still expands, which moves the same counter the other way.
+		expect(after.accelerates - before.accelerates).toBe(0);
+		expect(after.stretched - before.stretched).toBeLessThanOrEqual(0);
+		expect(after.underruns - before.underruns).toBe(0);
+		expect(after.skipped - before.skipped).toBe(0);
+		expect(monotone).toBe(true);
 	});
 });
