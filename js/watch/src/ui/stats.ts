@@ -90,6 +90,7 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	const aStretch = line(audioCard.grid, "Stretch");
 	const aConcealed = line(audioCard.grid, "Concealed");
 	const aSkipped = line(audioCard.grid, "Skipped");
+	const aTrimmed = line(audioCard.grid, "Trimmed");
 	const aClock = line(audioCard.grid, "Clock");
 	track(parent, audioCard, {
 		catalog: watch.audio.source.out.catalog,
@@ -163,6 +164,12 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 
 		const jumped = playout ? playout.skips : 0;
 		aSkipped.textContent = `${watch.audio.out.skipped.peek() + jumped}`;
+
+		// Audio the ring dropped off its front as it started playing, before anything had been
+		// heard. A tune-in or an unmute admits whatever the relay had cached, and starting the
+		// playhead past it is silent where stretching it away is seconds of bent speech.
+		const trimmed = playout ? playout.trimmed / (watch.audio.out.sampleRate.peek() ?? 48000) : undefined;
+		aTrimmed.textContent = trimmed !== undefined ? `${(1000 * trimmed).toFixed(0)}ms` : "—";
 
 		// Which playhead paces everything else. "wall" means nothing is rendering on a clock of its
 		// own (video only, muted, or audio that stopped), so playback runs on wall time instead.

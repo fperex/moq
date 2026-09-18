@@ -86,7 +86,7 @@ describe("initialization", () => {
 		expect(init.capacity).toBe(128);
 		expect(init.rate).toBe(1000);
 		expect(init.samples.byteLength).toBe(2 * 128 * 4); // 2 channels * 128 samples * Float32
-		expect(init.control.byteLength).toBe(19 * 4); // 19 control slots * Int32
+		expect(init.control.byteLength).toBe(20 * 4); // 20 control slots * Int32
 		expect(init.state.byteLength).toBe(8); // packed epoch + read cursor
 	});
 
@@ -477,8 +477,11 @@ describe("latency skip", () => {
 	it("should not skip when buffered is on the hold level", () => {
 		const buffer = create(BAND);
 
-		// Fill exactly what the ring holds
-		insertChunks(buffer, 0, HOLD, CHUNK, { channels: 1, value: 1.0 });
+		// Fill exactly what the ring holds, ending on a whole chunk: the level the ring holds is built
+		// from the most recent insert, so a ragged tail would leave it describing a shallower ring
+		// than the one the decoder is actually feeding.
+		insertChunks(buffer, 0, HOLD - CHUNK, CHUNK, { channels: 1, value: 1.0 });
+		insert(buffer, HOLD - CHUNK, CHUNK, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read should get all of them: no skip needed
@@ -802,8 +805,10 @@ describe("i32 wrapping", () => {
 		insert(buffer, startMs + 200, 4410, { channels: 1, value: 0.5 });
 
 		expect(buffer.stalled).toBe(false);
-		// The anchor is preserved, so media time survives the wrap rather than reading negative.
-		expect(buffer.timestamp).toBe(Time.Micro.fromMilli(startMs as Time.Milli));
+		// The anchor is preserved, so media time survives the wrap rather than reading negative. Three
+		// chunks land before the reader takes anything, so the writer starts the playhead at the newest
+		// audio less the two chunks the ring holds: the second chunk's media time.
+		expect(buffer.timestamp).toBe(Time.Micro.fromMilli((startMs + 100) as Time.Milli));
 		const output = read(buffer, 128, 1);
 		expect(output[0].length).toBe(128);
 		expect(output[0][0]).toBeCloseTo(0.5, 5);
@@ -1261,5 +1266,70 @@ describe("re-anchor store ordering", () => {
 			played += worklet.read(out);
 		}
 		expect(played).toBe(320);
+	});
+});
+
+describe("trimming the first fill", () => {
+	// A 30ms target with 10ms chunks: the ring holds 40ms, the target plus the chunk being played.
+	const TARGET = 30;
+	const CHUNK = 10;
+	const HOLD = TARGET + CHUNK;
+	const FILL = 90;
+
+	function filled(): SharedRingBuffer {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: TARGET });
+		// Each chunk carries its own index, so where the playhead starts is readable off the samples.
+		for (let i = 0; i < FILL / CHUNK; i++) {
+			insert(buffer, i * CHUNK, CHUNK, { channels: 1, value: i });
+		}
+		return buffer;
+	}
+
+	it("starts the playhead at the newest audio less the level it holds", () => {
+		const buffer = filled();
+
+		// Nothing had been played, so the excess was dropped in silence rather than left for the
+		// reader's time stretch to close over the seconds after a tune-in or an unmute.
+		expect(buffer.debug().trimmed).toBe(FILL - HOLD);
+		expect(buffer.length).toBe(HOLD);
+		expect(buffer.stalled).toBe(false);
+
+		// Nothing else counted it: a trim is neither a reader skipping ahead nor a writer overflowing.
+		expect(buffer.debug().skips).toBe(0);
+		expect(buffer.debug().skipped).toBe(0);
+		expect(buffer.debug().discarded).toBe(0);
+		expect(buffer.underruns).toBe(0);
+
+		// And the first read is the newest 40ms, which is chunk 5 onwards rather than chunk 0.
+		const output = read(buffer, HOLD, 1);
+		expect(output[0].length).toBe(HOLD);
+		expect(output[0][0]).toBe((FILL - HOLD) / CHUNK);
+	});
+
+	it("leaves a fill that is already on the level it holds alone", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: TARGET });
+		for (let i = 0; i < HOLD / CHUNK; i++) {
+			insert(buffer, i * CHUNK, CHUNK, { channels: 1, value: i });
+		}
+
+		expect(buffer.stalled).toBe(false);
+		expect(buffer.debug().trimmed).toBe(0);
+		expect(read(buffer, HOLD, 1)[0][0]).toBe(0);
+	});
+
+	it("keeps a surplus once something has been played", () => {
+		const buffer = filled();
+
+		// One block read is what makes the rest of the timeline the listener's: from here a surplus is
+		// audio on its way to being heard, and the reader's time stretch is what closes it.
+		expect(read(buffer, CHUNK, 1)[0].length).toBe(CHUNK);
+		const trimmed = buffer.debug().trimmed;
+
+		for (let i = 0; i < 5; i++) {
+			insert(buffer, FILL + i * CHUNK, CHUNK, { channels: 1, value: 9 + i });
+		}
+
+		expect(buffer.debug().trimmed).toBe(trimmed);
+		expect(buffer.length).toBeGreaterThan(HOLD);
 	});
 });

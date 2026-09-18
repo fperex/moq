@@ -136,6 +136,13 @@ export interface Snapshot extends Counters {
 	skipped: number;
 	/** Samples the writer dropped: too old for the playhead, or past the ring's capacity. */
 	discarded: number;
+	/**
+	 * Samples the writer dropped off the first fill on a timeline, before anything had been played.
+	 *
+	 * Separate from {@link skipped} and {@link discarded} because it is the one drop no listener
+	 * can hear and no time stretch had to close: the playhead simply started further in.
+	 */
+	trimmed: number;
 }
 
 /**
@@ -146,9 +153,10 @@ export interface Snapshot extends Counters {
  * ring through {@link RingReader}, so the isolated and postMessage transports run the same code.
  *
  * The media playhead is `READ - queued`, and every quantum holds
- * `READ == output - concealed + stretched + queued + skipped`: what the ring handed over is what was
- * played, less the frames that were made up rather than read, plus what a stretch moved, plus what
- * is still in flight, plus what a skip threw away.
+ * `READ == output - concealed + stretched + queued + skipped + trimmed`: what the ring handed over
+ * is what was played, less the frames that were made up rather than read, plus what a stretch
+ * moved, plus what is still in flight, plus what a skip threw away, plus what the writer trimmed
+ * off the front before playback started.
  */
 export class Stretcher {
 	readonly rate: number;

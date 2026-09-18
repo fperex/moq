@@ -159,6 +159,7 @@ function state(worklet: FakeWorklet, reader: Playhead | undefined, stalled: bool
 			skips: 0,
 			skipped: 0,
 			discarded: 0,
+			trimmed: 0,
 			queued: 0,
 			stretched: 0,
 			output: 0,

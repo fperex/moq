@@ -170,7 +170,7 @@ export function rings(rate: number): Array<[string, Build]> {
 export interface Result {
 	/** Times the reader ran dry mid-playback. */
 	underruns: number;
-	/** Samples thrown away: the reader skipped them or the writer dropped them. */
+	/** Samples thrown away: the reader skipped them, or the writer dropped or trimmed them. */
 	skipped: number;
 	/** Quanta rendered, so `underruns` can be read as a rate. */
 	quanta: number;
@@ -331,7 +331,11 @@ export function replay(build: Build, t: Arrival[], options: Options): Result {
 	const from = mark ?? { quanta, short, debug };
 	return {
 		underruns: debug.underruns - from.debug.underruns,
-		skipped: debug.skipped - from.debug.skipped + (debug.discarded - from.debug.discarded),
+		skipped:
+			debug.skipped -
+			from.debug.skipped +
+			(debug.discarded - from.debug.discarded) +
+			(debug.trimmed - from.debug.trimmed),
 		quanta: quanta - from.quanta,
 		short: short - from.short,
 		accelerates: debug.accelerates - from.debug.accelerates,

@@ -459,9 +459,13 @@ describe("resize", () => {
 		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 		expect(buffer.capacity).toBe(200 + SKIP);
 
-		// Write 200 samples in 50 sample chunks: first 100 with value 1.0, next 100 with value 2.0
-		writeChunks(buffer, 0, 100, 50, { channels: 1, value: 1.0 });
-		writeChunks(buffer, 100, 100, 50, { channels: 1, value: 2.0 });
+		// Write 250 samples in 50 sample chunks: 150 with value 1.0, the rest with 2.0. The reader
+		// takes a block once the ring holds its level, because until it has the writer starts the
+		// playhead at the newest audio less that level rather than letting a fill run deep: a ring only
+		// sits above what it holds once playback is under way.
+		writeChunks(buffer, 0, 150, 50, { channels: 1, value: 1.0 });
+		expect(read(buffer, 50, 1)[0].length).toBe(50);
+		writeChunks(buffer, 150, 100, 50, { channels: 1, value: 2.0 });
 		expect(buffer.length).toBe(200);
 
 		// Resize to a 30 sample target. Capacity is the level the ring holds, the 30 sample target
@@ -472,7 +476,7 @@ describe("resize", () => {
 		const capacity = 30 + 50 + SKIP;
 		expect(buffer.capacity).toBe(capacity);
 		expect(buffer.length).toBe(capacity); // Truncated to new capacity
-		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe((200 - capacity) as Time.Milli);
+		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe((250 - capacity) as Time.Milli);
 	});
 
 	it("should be a no-op when capacity is unchanged", () => {
@@ -1016,5 +1020,70 @@ describe("latency increase re-anchor", () => {
 		expect(buffer.stalled).toBe(true);
 		write(buffer, 200 as Time.Milli, 50, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
+	});
+});
+
+describe("trimming the first fill", () => {
+	// A 30ms target with 10ms chunks: the ring holds 40ms, the target plus the chunk being played.
+	const TARGET = 30;
+	const CHUNK = 10;
+	const HOLD = TARGET + CHUNK;
+	const FILL = 90;
+
+	function filled(): AudioRingBuffer {
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: TARGET as Time.Milli });
+		// Each chunk carries its own index, so where the playhead starts is readable off the samples.
+		for (let i = 0; i < FILL / CHUNK; i++) {
+			write(buffer, (i * CHUNK) as Time.Milli, CHUNK, { channels: 1, value: i });
+		}
+		return buffer;
+	}
+
+	it("starts the playhead at the newest audio less the level it holds", () => {
+		const buffer = filled();
+
+		// Nothing had been played, so the excess was dropped in silence rather than left for the
+		// reader's time stretch to close over the seconds after a tune-in or an unmute.
+		expect(buffer.debug().trimmed).toBe(FILL - HOLD);
+		expect(buffer.length).toBe(HOLD);
+		expect(buffer.stalled).toBe(false);
+
+		// Nothing else counted it: a trim is neither a reader skipping ahead nor a writer overflowing.
+		expect(buffer.debug().skips).toBe(0);
+		expect(buffer.debug().skipped).toBe(0);
+		expect(buffer.debug().discarded).toBe(0);
+		expect(buffer.underruns).toBe(0);
+
+		// And the first read is the newest 40ms, which is chunk 5 onwards rather than chunk 0.
+		const output = read(buffer, HOLD, 1);
+		expect(output[0].length).toBe(HOLD);
+		expect(output[0][0]).toBe((FILL - HOLD) / CHUNK);
+	});
+
+	it("leaves a fill that is already on the level it holds alone", () => {
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: TARGET as Time.Milli });
+		for (let i = 0; i < HOLD / CHUNK; i++) {
+			write(buffer, (i * CHUNK) as Time.Milli, CHUNK, { channels: 1, value: i });
+		}
+
+		expect(buffer.stalled).toBe(false);
+		expect(buffer.debug().trimmed).toBe(0);
+		expect(read(buffer, HOLD, 1)[0][0]).toBe(0);
+	});
+
+	it("keeps a surplus once something has been played", () => {
+		const buffer = filled();
+
+		// One block read is what makes the rest of the timeline the listener's: from here a surplus is
+		// audio on its way to being heard, and the reader's time stretch is what closes it.
+		expect(read(buffer, CHUNK, 1)[0].length).toBe(CHUNK);
+		const trimmed = buffer.debug().trimmed;
+
+		for (let i = 0; i < 5; i++) {
+			write(buffer, (FILL + i * CHUNK) as Time.Milli, CHUNK, { channels: 1, value: 9 + i });
+		}
+
+		expect(buffer.debug().trimmed).toBe(trimmed);
+		expect(buffer.length).toBeGreaterThan(HOLD);
 	});
 });
