@@ -139,6 +139,44 @@ describe("auto delay", () => {
 		sync.close();
 	});
 
+	it("keeps a departed track's reading for a window, so a rendition that blinks moves nothing", async () => {
+		// A publisher hiding its camera takes the rendition out of the catalog for a few hundred
+		// milliseconds. Dropping its reading the instant it goes takes the delay down to whatever
+		// the remaining tracks measured and its return puts it straight back, and the audio ring
+		// pays for both: resized down, then parked to refill, which is an underrun the listener
+		// hears. Three of five watchers on the bench took one from a 300ms camera hide.
+		clock = fakeClock();
+		const sync = new Sync();
+		sync.track("audio").spread.set(40 as Time.Milli);
+		sync.track("video").spread.set(120 as Time.Milli);
+		await flush();
+		expect(sync.out.jitter.peek()).toBe(120 as Time.Milli);
+
+		// The window starts where the track goes, not where its reading last moved: a steady path
+		// republishes the same number, which notifies nothing, so a deadline taken on the last
+		// change would have run out long before the camera was ever hidden.
+		clock.advance(30_000);
+		sync.track("video").spread.set(undefined);
+		await flush();
+		expect(sync.out.jitter.peek()).toBe(120 as Time.Milli);
+
+		// And it comes back, having measured the same path it was measuring before.
+		sync.track("video").spread.set(120 as Time.Milli);
+		await flush();
+		expect(sync.out.jitter.peek()).toBe(120 as Time.Milli);
+
+		// A track that really has gone stops holding the buffer open. Any reading re-taken past the
+		// window drops it; here the audio track publishing again is what re-takes it.
+		sync.track("video").spread.set(undefined);
+		await flush();
+		clock.advance(2_001);
+		sync.track("audio").spread.set(40 as Time.Milli, true);
+		await flush();
+		expect(sync.out.jitter.peek()).toBe(40 as Time.Milli);
+
+		sync.close();
+	});
+
 	it("is exactly the number asked for when the delay is fixed", async () => {
 		// A viewer picking 500ms gets 500ms. Adding the publisher's declared flush span on top made
 		// the 100ms preset read 400ms on a source declaring 300, which is not what the label says.

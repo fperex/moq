@@ -57,6 +57,17 @@ const OFFSET_STEP = Time.Milli(1_000);
 // the rest of the session. Wide enough that an ordinary group cadence refreshes it many times over.
 const OFFSET_WINDOW = Time.Milli(2_000);
 
+// How long a track's reading stays in the comparison after the track stops publishing one.
+//
+// A rendition that leaves the catalog and comes back, which is what hiding a camera or a
+// microphone does, is away for a few hundred milliseconds. Dropping its reading the instant it
+// goes takes the shared delay down to whatever the remaining tracks measured and its return puts
+// it straight back, and the audio ring pays for both: it is resized down, then parked to refill it,
+// which is an underrun the listener hears. The same window the arrival floor above uses, for the
+// same reason: wide enough that an ordinary cadence refreshes it many times over, and narrow enough
+// that a track that has really gone stops holding the buffer open.
+const SPREAD_WINDOW = Time.Milli(2_000);
+
 /**
  * One track's arrival floor, as two rotating windows.
  *
@@ -232,6 +243,13 @@ export class Sync {
 	// When the hold last moved, so it moves by one bucket at a time rather than in a burst.
 	#stepped: Time.Milli | undefined;
 
+	// The last reading each track published, and when it stops counting once the track has stopped
+	// publishing it. See SPREAD_WINDOW.
+	#spreads = new Map<"audio" | "video" | "text", { spread: Time.Milli; until?: Time.Milli }>();
+
+	// Bumped when a departed track's reading runs out, so the widest is taken again without it.
+	#expired = new Signal(0);
+
 	#signals = new Effect();
 
 	constructor(props?: Inputs<SyncInput>) {
@@ -304,9 +322,40 @@ export class Sync {
 			return;
 		}
 
+		// A track that stopped publishing a reading keeps the last one for SPREAD_WINDOW, so a
+		// rendition that blinks does not take the shared delay down and put it straight back.
+		effect.get(this.#expired);
+		const now = Time.Milli.now();
+
 		let spread = Time.Milli.zero;
+		let expires: Time.Milli | undefined;
 		for (const track of Object.values(this.#tracks)) {
-			spread = Time.Milli.max(spread, effect.get(track.spread) ?? Time.Milli.zero);
+			const reading = effect.get(track.spread);
+			if (reading !== undefined) {
+				// A reading that stands still never reruns this, so the window cannot be a deadline
+				// refreshed here: it would measure how long ago the reading last moved.
+				this.#spreads.set(track.name, { spread: reading });
+				spread = Time.Milli.max(spread, reading);
+				continue;
+			}
+
+			const held = this.#spreads.get(track.name);
+			if (!held) continue;
+
+			// The window starts where the track stopped publishing, which is this run.
+			held.until ??= Time.Milli.add(now, SPREAD_WINDOW);
+			if (held.until <= now) {
+				this.#spreads.delete(track.name);
+				continue;
+			}
+
+			spread = Time.Milli.max(spread, held.spread);
+			expires = Time.Milli.min(expires ?? held.until, held.until);
+		}
+
+		// Nothing else wakes this effect when the last reading of a departed track runs out.
+		if (expires !== undefined) {
+			effect.timer(() => this.#expired.update((count) => count + 1), Time.Milli.sub(expires, now));
 		}
 
 		// The estimator drops anything past its histogram's range rather than clamping it, so a
