@@ -310,7 +310,20 @@ drops it. What the path does while nobody is listening is not a reason to
 believe the publisher's guess again, and reseeding costs the viewer the
 difference as a cold fill on every unmute. NetEq keeps its delay manager across
 a pause for the same reason. A rendition whose catalog entry changes is a
-different path with a different declaration, and starts over.
+different path with a different declaration, and starts over; one that leaves
+the catalog and comes back unchanged, which is what hiding a camera or a
+microphone does, has not changed and keeps what it measured.
+
+A player that holds several tracks to one delay pays for a reseed twice over,
+because it has to hold the widest of them: a track that starts over is a track
+whose guess outranks every measurement beside it, so the audio ring is resized in
+the middle of playback and runs dry. Measured on the bench, a camera hidden and
+shown for 300 ms took the shared delay from 20 ms to the 80 ms guess and cost
+three of five watchers an underrun. For the same reason such a player holds a
+departed track's last reading for a couple of seconds rather than dropping it
+where the track went: a rendition that blinks would otherwise take the delay down
+to what the tracks beside it measured and put it straight back, and the ring pays
+for the fall and the rise both.
 
 **The first observation replaces it outright**, however far below it that
 lands. A seed is a prior, not an observation, and the fall bound below exists
