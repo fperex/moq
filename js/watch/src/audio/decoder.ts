@@ -15,7 +15,7 @@ import {
 	Signal,
 } from "@moq/signals";
 import { base64ToBytes } from "../base64";
-import { accumulate, nextMedia, subscribeMedia } from "../media";
+import { accumulate, Estimator, nextMedia, subscribeMedia } from "../media";
 
 import type { Delay, Sync } from "../sync";
 import { Anchor } from "./anchor";
@@ -171,6 +171,10 @@ export class Decoder {
 
 	// The catalog fields that require a replacement subscription or decoder.
 	readonly #identity: Computed<PlaybackIdentity | undefined>;
+
+	// What makes "as long as the rendition lasts" outlive the effect below, which ends the moment
+	// the rendition leaves the catalog. See `Estimator`.
+	#estimator = new Estimator();
 
 	// The decoder fields that require a new worklet and ring. Routing and metadata changes leave
 	// them alone.
@@ -539,13 +543,14 @@ export class Decoder {
 	 * for the same reason (`modules/audio_coding/neteq/delay_manager.cc`).
 	 *
 	 * The declaration seeds it again when the rendition itself changes, since that is a different
-	 * path with a different publisher's claim about it.
+	 * path with a different publisher's claim about it. A rendition that leaves the catalog and
+	 * comes back unchanged, which is what hiding a microphone does, is the same one.
 	 */
 	#runSpread(effect: Effect): void {
 		const identity = effect.get(this.#identity);
 		if (!identity) return;
 
-		const spread = new Container.Jitter({ start: effect.get(this.source.out.jitter) });
+		const spread = this.#estimator.spread(identity, effect.get(this.source.out.jitter));
 
 		// Published for as long as the estimator lives, not for as long as a subscription does. A
 		// mute would otherwise drop what Sync knows about this track and hand it back a moment
