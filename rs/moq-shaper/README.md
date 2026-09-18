@@ -111,15 +111,30 @@ window = "160ms"
 [up.rate]                # a token bucket
 bytes_per_second = 750000
 burst_bytes = 30000
+queue_bytes = 60000      # optional: the backlog it will hold before tail-dropping
 
-[up.step]                # replace delay and jitter part-way through the run
+[[up.steps]]             # revise the treatment part-way through the run
 at = "30s"
 delay = "60ms"
-jitter = "0ms"
+
+[[up.steps]]             # and put it back, so a run measures the recovery too
+at = "60s"
+delay = "5ms"
 
 [down]
 delay = "5ms"
 ```
+
+A step names `at` plus whatever it changes: `delay`, `jitter`, `loss`, or a whole `rate`
+table. Anything it leaves out keeps the value it had, so a later step puts one knob back
+without restating the profile. Steps run in the order they are written and `at` must
+increase; a step that names nothing but `at` is refused. A step can add or change a rate
+cap, never remove one.
+
+Without `queue_bytes` the token bucket only ever delays, so a capped path is pure
+bufferbloat: the queue grows without limit and a loss-based controller never sees a loss.
+With it the bucket is a link with a finite buffer, and a datagram that would push the
+backlog past the cap is dropped and counted as `queue_dropped`.
 
 The built-ins live in `profiles/` and are embedded in the binary, so `--profile mild`
 works with no data files:
@@ -129,7 +144,7 @@ works with no data files:
 | `near-zero` | The control. The shaper is in the path but treats nothing. |
 | `mild` | A healthy wired LAN: 5ms delay, 5ms sigma. |
 | `bursty` | A paced hop: seven datagrams per 160ms window, released together. |
-| `step` | 5ms for thirty seconds, then 60ms. |
+| `step` | 5ms for thirty seconds, then 60ms, with no recovery. |
 | `high-rtt` | An intercontinental path: 75ms one way, 30ms sigma. |
 | `lossy` | The drill profile: 2% loss with 1% reorder. |
 
@@ -145,6 +160,7 @@ and one set of counters per direction.
 | `delayed` | Datagrams released later than they arrived. |
 | `reordered` | Datagrams pushed back by the extra reorder delay. |
 | `rate_limited` | Datagrams the token bucket pushed back. |
+| `queue_dropped` | Datagrams the token bucket's `queue_bytes` cap tail-dropped. |
 | `queue_max` | The most datagrams waiting for release at once. |
 
 ## Assert the impairment applied
@@ -152,7 +168,9 @@ and one set of counters per direction.
 A profile that silently did nothing turns an impaired run into an unimpaired pass, which
 is worse than no impaired lane at all. So a harness grades the shaper's counters before
 it grades the run: a row on an active profile whose `delayed` is zero did not apply its
-impairment and is void, and so is a lossy row whose `dropped` is zero. `near-zero` is the
+impairment and is void, and so is a lossy row whose `dropped` is zero. `dropped` is the
+loss draw and a failed send, never the queue cap, so a capped row and a lossy row cannot be
+confused for each other: a tail drop counts in `queue_dropped` alone. `near-zero` is the
 only profile for which zero is the right answer, which is what makes it the control.
 
 Record the profile name, the seed, and the counters with the run's artifacts. The seed is

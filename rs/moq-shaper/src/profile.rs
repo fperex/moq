@@ -71,7 +71,7 @@ impl Profile {
 }
 
 /// One direction's treatment: what is dropped, how late it arrives, and how fast it may flow.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Direction {
 	/// Added to every datagram's delivery time.
@@ -98,8 +98,8 @@ pub struct Direction {
 	/// A token bucket applied to this direction.
 	pub rate: Option<ByteRate>,
 
-	/// Switch to a different delay part-way through the run.
-	pub step: Option<Step>,
+	/// Changes to this direction's treatment part-way through the run, earliest first.
+	pub steps: Vec<Step>,
 }
 
 impl Direction {
@@ -125,11 +125,22 @@ impl Direction {
 		}
 
 		if let Some(rate) = self.rate {
-			anyhow::ensure!(
-				rate.bytes_per_second > 0,
-				"{which}.rate.bytes_per_second must be at least 1"
-			);
-			anyhow::ensure!(rate.burst_bytes > 0, "{which}.rate.burst_bytes must be at least 1");
+			rate.validate(&format!("{which}.rate"))?;
+		}
+
+		// Out of order is a typo the run would silently skip past, because the lane only
+		// ever looks at the next one due.
+		let mut previous: Option<Duration> = None;
+		for (index, step) in self.steps.iter().enumerate() {
+			if let Some(last) = previous {
+				anyhow::ensure!(
+					step.at > last,
+					"{which}.steps must be in increasing order of `at`, got {:?} after {last:?}",
+					step.at
+				);
+			}
+			step.validate(&format!("{which}.steps[{index}]"))?;
+			previous = Some(step.at);
 		}
 
 		Ok(())
@@ -148,7 +159,8 @@ pub struct Burst {
 	pub window: Duration,
 }
 
-/// A token bucket: a sustained byte rate plus how far a sender may run ahead of it.
+/// A token bucket: a sustained byte rate, how far a sender may run ahead of it, and how much
+/// backlog may wait behind it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ByteRate {
@@ -157,23 +169,74 @@ pub struct ByteRate {
 
 	/// The bucket's capacity, so a burst up to this size passes untouched.
 	pub burst_bytes: u64,
+
+	/// The backlog the bucket will hold, in bytes owed. A datagram that would push the
+	/// backlog past this is dropped, the way a link with a finite queue tail-drops. Without
+	/// it the queue is unbounded, so the cap only ever bufferbloats and never loses.
+	#[serde(default)]
+	pub queue_bytes: Option<u64>,
 }
 
-/// Replace the direction's delay and jitter once the run reaches `at`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+impl ByteRate {
+	fn validate(&self, which: &str) -> anyhow::Result<()> {
+		anyhow::ensure!(self.bytes_per_second > 0, "{which}.bytes_per_second must be at least 1");
+		anyhow::ensure!(self.burst_bytes > 0, "{which}.burst_bytes must be at least 1");
+
+		if let Some(queue_bytes) = self.queue_bytes {
+			anyhow::ensure!(queue_bytes > 0, "{which}.queue_bytes must be at least 1");
+		}
+
+		Ok(())
+	}
+}
+
+/// A change to one direction's treatment once the run reaches `at`.
+///
+/// A step replaces only the knobs it names, so a later one puts a knob back without
+/// restating the rest of the profile. A step can add or change a rate cap, never remove one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Step {
-	/// How far into the run the switch happens.
+	/// How far into the run the change happens.
 	#[serde(with = "humantime_serde")]
 	pub at: Duration,
 
 	/// The delay from then on.
 	#[serde(with = "humantime_serde")]
-	pub delay: Duration,
+	pub delay: Option<Duration>,
 
-	/// The jitter sigma from then on. A step that omits it switches jitter off.
+	/// The jitter sigma from then on.
 	#[serde(with = "humantime_serde")]
-	pub jitter: Duration,
+	pub jitter: Option<Duration>,
+
+	/// The fraction of datagrams discarded from then on.
+	pub loss: Option<f64>,
+
+	/// The token bucket from then on.
+	pub rate: Option<ByteRate>,
+}
+
+impl Step {
+	fn validate(&self, which: &str) -> anyhow::Result<()> {
+		if let Some(loss) = self.loss {
+			anyhow::ensure!(
+				(0.0..=1.0).contains(&loss),
+				"{which}.loss must be between 0 and 1, got {loss}"
+			);
+		}
+
+		if let Some(rate) = self.rate {
+			rate.validate(&format!("{which}.rate"))?;
+		}
+
+		// A step naming nothing is a profile that thinks it recovers and does not.
+		anyhow::ensure!(
+			self.delay.is_some() || self.jitter.is_some() || self.loss.is_some() || self.rate.is_some(),
+			"{which} changes nothing"
+		);
+
+		Ok(())
+	}
 }
 
 #[cfg(test)]
@@ -227,6 +290,71 @@ mod tests {
 			..Default::default()
 		};
 		assert!(dir.validate("up").is_ok());
+	}
+
+	#[test]
+	fn the_step_builtin_is_one_step_on_each_direction() {
+		let profile = Profile::parse("step").unwrap();
+		for (which, dir) in [("up", &profile.up), ("down", &profile.down)] {
+			assert_eq!(dir.delay, Duration::from_millis(5), "{which}");
+			assert_eq!(dir.steps.len(), 1, "{which}");
+			assert_eq!(dir.steps[0].at, Duration::from_secs(30), "{which}");
+			assert_eq!(dir.steps[0].delay, Some(Duration::from_millis(60)), "{which}");
+		}
+	}
+
+	#[test]
+	fn steps_out_of_order_are_refused() {
+		let dir = Direction {
+			steps: vec![
+				Step {
+					at: Duration::from_secs(60),
+					delay: Some(Duration::from_millis(10)),
+					..Default::default()
+				},
+				Step {
+					at: Duration::from_secs(30),
+					delay: Some(Duration::from_millis(20)),
+					..Default::default()
+				},
+			],
+			..Default::default()
+		};
+		let err = dir.validate("down").unwrap_err().to_string();
+		assert!(err.contains("increasing order"), "{err}");
+	}
+
+	#[test]
+	fn a_step_that_changes_nothing_is_refused() {
+		let dir = Direction {
+			steps: vec![Step {
+				at: Duration::from_secs(30),
+				..Default::default()
+			}],
+			..Default::default()
+		};
+		let err = dir.validate("down").unwrap_err().to_string();
+		assert!(err.contains("changes nothing"), "{err}");
+	}
+
+	#[test]
+	fn an_empty_queue_cap_is_refused() {
+		let dir = Direction {
+			rate: Some(ByteRate {
+				bytes_per_second: 1000,
+				burst_bytes: 100,
+				queue_bytes: Some(0),
+			}),
+			..Default::default()
+		};
+		let err = dir.validate("down").unwrap_err().to_string();
+		assert!(err.contains("queue_bytes"), "{err}");
+	}
+
+	#[test]
+	fn a_rate_without_a_queue_cap_is_unbounded() {
+		let rate: ByteRate = toml::from_str("bytes_per_second = 1000\nburst_bytes = 100\n").unwrap();
+		assert_eq!(rate.queue_bytes, None);
 	}
 
 	#[test]
