@@ -1,10 +1,11 @@
 # Real-time audio playout: what was wrong, what this branch does about it
 
 Branch: `fperex/moq` `debug-findings-solution`, rebased onto `upstream/dev` (`877a561d8`, was
-`8f41d4d82`). This document sits at the branch tip: 107 commits and 201 files at the time of
-writing, one docs commit above. The last change to the player is `17ff71750`; the commit above it,
-`27d68bb14`, is a test-only fix to one of the reconnect cases. The eight commits above
-the previous docs pass touch `js/watch`, `js/hang`, `js/publish`, `js/net`, `rs/moq-tokio`,
+`8f41d4d82`). This document sits at the branch tip: 111 commits and 203 files at the time of
+writing, one docs commit above. The last change to the player is `17ff71750`; above it are
+`27d68bb14`, a test-only fix to one of the reconnect cases, and the two commits of the cleanup
+sweep, which remove dead exports and correct comments and change no behaviour. The eight commits
+above the previous docs pass touch `js/watch`, `js/hang`, `js/publish`, `js/net`, `rs/moq-tokio`,
 `rs/moq-relay`, `rs/moq-ffi`, `go/wrapper`, `dart/moq_ffi`, and `doc/concept/playout.md` and
 `doc/bin/relay/` beside them.
 
@@ -218,7 +219,11 @@ with their author intact.
 | 104 | `17ff71750` | finding 31 | The FFI and the Go wrapper follow the native give-up default |
 | 105 | `1426a16dd` | delivery | The resilience matrix, findings 26 to 31, the API impact and the gates |
 | 106 | `27d68bb14` | finding 31 | The reconnect test measures the outage rather than the paused clock's jumps |
-| 107 | this one | delivery | The quiet confirmation rows and the gates at the tip |
+| 107 | `3d5bd1c1b` | delivery | The quiet confirmation rows and the gates at the tip |
+| 108 | `be1fc2c2a` | delivery | The listening round at this tip |
+| 109 | `f27d965ae` | cleanup | Exports nothing consumes, and one ring test the surviving case already brackets |
+| 110 | `49707cb23` | cleanup | The comments a later commit on this branch had made false |
+| 111 | this one | delivery | The cleanup sweep and the final counts |
 
 Row 49 carries two commits, so the numbered rows cover one hash more than there are rows. Every hash
 `git log --oneline upstream/dev..HEAD` prints is in the table, in that order, and the last row is
@@ -254,7 +259,7 @@ The same commits, grouped by the quest they come from:
 | CodeRabbit fixes over the whole branch | `a8cbc93bb`, `97c7afb76`, `b85e57431`, `02f3f143a`, `f5087814b` |
 | CI, and the rebase onto the lease model | `2b9d492f0`, `5484970e1` (the nightly job), `8cabb3507` (the harness relay under `moq-auth`) |
 | the listening round of 2026-09-17, findings 18 to 25 | `b63519ba8`, `9b2f794c9` (the unmute fill and the spinner), `48c9d5302` (the ring fallback line), `20c6756eb` (the video track that stopped), `5a4ed9e21` (the live edge), `ff4da0042` (a busy camera), `aba98fd21` (the rendition's track stays open), `35459ad52` (the context on the gesture) |
-| review, flake and delivery | `fcce8af55`, `1af4609eb`, `928ec4abf`, `3f0e3221d`, `ec6d9761a`, `85583de68`, `3c9388e56`, `3dcea2ab4`, `0b2e4cad7`, `180975961`, `f2bd8ad45`, `ba7a68789`, `1426a16dd`, plus this one |
+| review, flake and delivery | `fcce8af55`, `1af4609eb`, `928ec4abf`, `3f0e3221d`, `ec6d9761a`, `85583de68`, `3c9388e56`, `3dcea2ab4`, `0b2e4cad7`, `180975961`, `f2bd8ad45`, `ba7a68789`, `1426a16dd`, `f27d965ae` and `49707cb23` (the cleanup sweep), plus this one |
 
 ## Root causes
 
@@ -2974,6 +2979,10 @@ than discarded, so the band is not evaluated on the instantaneous level the ques
 - **A listening round by the user at this tip**, on 2026-09-17, on the bench's own pages with a real
   microphone and camera and a headset, which reported it clean. Nothing was recorded from it, so it
   confirms the rows above rather than adding a number to them.
+- **A dead-code and stale-comment sweep over the whole diff at the end**, which dropped five exports
+  nothing imports and one ring test the surviving case already brackets, and corrected every comment
+  a later commit on this branch had made false, for a net 9 lines and no behaviour change, with
+  `just fix`, `just check` and `just test default` re-run green on that tree.
 
 ### Gates on the final tree
 
@@ -3329,8 +3338,9 @@ listed below, and it is the same follow-up as giving that package a `bun test` t
 
 `debug-findings-solution` on the fork `fperex/moq`, base `dev`, opened as draft pull request #3 there
 and nowhere else. The last change to the player is `17ff71750`, the test fix above it is
-`27d68bb14`, and the commit above that is this document.
-An earlier state of the work is archived on `debug-findings-solution-wip-20260912`.
+`27d68bb14`, the two commits of the cleanup sweep above that change no behaviour, and the commit
+above them is this document. An earlier state of the work is archived on
+`debug-findings-solution-wip-20260912`.
 
 Two things that produced numbers above are deliberately not on the branch: the full run matrix the
 quiet re-measure wrote, and the bench driver scripts. Every number from the matrix that matters is
@@ -3339,13 +3349,14 @@ listening bench" and have a home proposed below.
 
 ### Quests worth opening
 
-- **The publisher demand gate.** `Rendition.track` documents a gate, "producers should encode only
-  while this is set", that no longer exists: a browser publisher encodes with zero viewers. Two of
-  the three defects that surfaced when the gate was tried are fixed here, in `20c6756eb`: the audio
-  encoder now declares a break after a gated interval, and `Container.Legacy.Producer` no longer
-  flushes into a group its closed track has torn down. What is left is the gate itself, and it is
-  still larger than it looks, because a rendition that stops encoding must stop at the group and not
-  at the track, which is finding 19. Findings 13, 18 and 19 have the detail.
+- **The publisher demand gate.** `Rendition.track` documented a gate, "producers should encode only
+  while this is set", that no longer exists: a browser publisher encodes with zero viewers. The
+  comment is corrected in `49707cb23` rather than the code. Two of the three defects that surfaced
+  when the gate was tried are fixed here, in `20c6756eb`: the audio encoder now declares a break
+  after a gated interval, and `Container.Legacy.Producer` no longer flushes into a group its closed
+  track has torn down. What is left is the gate itself, and it is still larger than it looks,
+  because a rendition that stops encoding must stop at the group and not at the track, which is
+  finding 19. Findings 13, 18 and 19 have the detail.
 - **The camera's own pipeline latency.** Finding 14 fixed the publisher's two epochs, and what is
   left sits inside the video arrival anchor and cannot be measured from inside the page. An external
   reference is what would resolve it: a clap, or a flashing screen, recorded off both ends at once.
@@ -3376,6 +3387,11 @@ listening bench" and have a home proposed below.
   `driver.ts`, `safari.ts` and `webdriver.ts` while it happens. The grader, the beacon, the probe and
   the Safari lane are exercised only by running the harness end to end, which is why the six
   fail-quietly defects in `b85e57431` were found by a reviewer rather than by a test.
+- **The replay harness's `floorMs`.** `js/watch/src/audio/replay.ts` holds its measured target above
+  a floor the player itself does not have: `Sync` held the advertised jitter as a floor before the
+  cold-start fix and does not now, and the harness kept the term, so the replay budgets are recorded
+  against a rule the player no longer follows. Either drop it and re-record those budgets, or keep
+  it and say plainly that it is the harness's own term, which is what its comment now does.
 - **Whether one track's spread should size another track's buffer.** `Sync` in auto takes the `max()`
   across tracks, which #3517 had and this branch kept. The shaper defect (finding 8) is what made it
   visible: the reordering hurt the video stream, the video spread ran at 1.6 to 2.0 s while audio
