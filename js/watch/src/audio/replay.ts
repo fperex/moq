@@ -34,6 +34,13 @@ export interface Arrival {
 	arrival: number;
 	/** The recorder's own event loop was blocked before this frame was read. */
 	stalled?: boolean;
+	/**
+	 * The publisher declared its timeline finished here rather than sending a frame.
+	 *
+	 * Carries no media, so it is neither inserted nor observed: a declared pause says nothing about
+	 * how late the path is running. The ring is told, and what it holds plays out into silence.
+	 */
+	endpoint?: boolean;
 }
 
 /** A recorded trace, as trimmed into `./fixtures`. */
@@ -49,15 +56,16 @@ export interface Fixture {
 	 * receiver was blocked before it read this frame, which the estimator discounts rather than
 	 * measuring. A recording that never watched its loop simply omits it.
 	 */
-	arrivals: { timestamp_us: number; arrival_ms: number; stalled?: boolean }[];
+	arrivals: { timestamp_us: number; arrival_ms: number; stalled?: boolean; endpoint?: boolean }[];
 }
 
 /** A fixture's arrivals in the units this module works in. */
 export function recorded(fixture: Fixture): Arrival[] {
-	return fixture.arrivals.map(({ timestamp_us, arrival_ms, stalled }) => ({
+	return fixture.arrivals.map(({ timestamp_us, arrival_ms, stalled, endpoint }) => ({
 		media: timestamp_us / 1000,
 		arrival: arrival_ms,
 		stalled,
+		endpoint,
 	}));
 }
 
@@ -113,6 +121,8 @@ export function target(t: Arrival[], floorMs: number): number {
 export interface Ring {
 	readonly reader: RingReader;
 	insert(timestamp: Time.Micro, data: Float32Array[]): void;
+	/** The publisher declared the timeline finished: play out what is held, then silence. */
+	end(): void;
 	setLatency(ms: number): void;
 	debug(): Snapshot;
 	readonly length: number;
@@ -133,6 +143,7 @@ export function shared(rate: number): Build {
 		return {
 			reader: ring,
 			insert: (timestamp, data) => ring.insert(timestamp, data),
+			end: () => ring.end(),
 			setLatency: (ms) => ring.setLatency(Math.ceil((rate * ms) / 1000)),
 			debug: () => ring.debug(),
 			get length() {
@@ -149,6 +160,7 @@ export function post(rate: number): Build {
 		return {
 			reader: ring,
 			insert: (timestamp, data) => ring.write(timestamp, data),
+			end: () => ring.end(),
 			setLatency: (ms) => ring.resize(ms as Time.Milli),
 			debug: () => ring.debug(),
 			get length() {
@@ -298,6 +310,14 @@ export function replay(build: Build, t: Arrival[], options: Options): Result {
 
 	for (let now = 0; now < end; now += step) {
 		while (next < t.length && t[next].arrival <= now) {
+			if (t[next].endpoint) {
+				// A declared pause carries no media: nothing to insert, and nothing to measure a
+				// path against. The ring plays out what it holds and renders silence after it.
+				ring.end();
+				next++;
+				continue;
+			}
+
 			const count = samples[next];
 			jitter.observe(Time.Micro.fromMilli(t[next].media as Time.Milli), now as Time.Milli, {
 				stalled: t[next].stalled,

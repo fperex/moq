@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
-import type { Time } from "@moq/net";
-import { Terminal } from "./terminal";
+import * as Container from "@moq/hang/container";
+import { Group, Time, Track, Varint } from "@moq/net";
+import { type DecodedSpan, Terminal } from "./terminal";
 
 test("Terminal trims a partial packet to the source endpoint", () => {
 	const terminal = new Terminal();
@@ -112,4 +113,54 @@ test("a discontinuity reapplies Opus pre-skip in the resumed epoch", () => {
 	terminal.update({ discontinuity: 1, frame: { timestamp: 1_000_000 as Time.Micro } });
 	const resumed = terminal.span({ timestamp: 1_000_000, sampleRate: 48_000, numberOfFrames: 960 });
 	expect(resumed).toEqual({ timestamp: 1_000_000 as Time.Micro, frameOffset: 312, frames: 648 });
+});
+
+test("an endpoint delivered before its playhead event trims the flush and not the resumed run", async () => {
+	// Ordered by the real consumer, because the order is the whole point: the endpoint belongs to
+	// the run it ends and the playhead event to the result that closes the marker group. Delivered
+	// as one result instead, the event resets the endpoint and the same result re-applies it, so
+	// every sample of the resumed run is trimmed to nothing and the talker is never heard again.
+	const track = new Track.Producer("audio");
+	const consumer = new Container.Consumer(track.subscribe({ maxAge: 30_000 }), {
+		// Wide enough that the ten second pause is not a conviction: the publisher declared it.
+		format: new Container.Legacy.Format("audio"),
+		maxAge: 30_000 as Time.Milli,
+	});
+
+	const media = (sequence: number, timestamp: Time.Micro, payload: Uint8Array) => {
+		const group = new Group.Producer(sequence);
+		const ts = Varint.encode(timestamp);
+		const frame = new Uint8Array(ts.byteLength + payload.byteLength);
+		frame.set(ts, 0);
+		frame.set(payload, ts.byteLength);
+		group.writeFrame({ payload: frame, timestamp: Time.Timestamp.fromMicros(timestamp) });
+		group.close();
+		track.writeGroup(group);
+	};
+
+	const terminal = new Terminal();
+	terminal.clear(312);
+
+	media(0, 0 as Time.Micro, new Uint8Array([0xde, 0xad]));
+	media(1, 20_000 as Time.Micro, new Uint8Array()); // the endpoint, alone in its group
+	media(2, 10_020_000 as Time.Micro, new Uint8Array([0xde, 0xad]));
+	track.close();
+
+	const spans: DecodedSpan[] = [];
+	for (;;) {
+		const next = await consumer.next();
+		if (!next) break;
+		terminal.update(next);
+		if (!next.frame) continue;
+		// One decoded packet per container frame, which is what an Opus decoder hands back.
+		spans.push(terminal.span({ timestamp: next.frame.timestamp, sampleRate: 48_000, numberOfFrames: 960 }));
+	}
+
+	// The first run, less the pre-skip, then its drain trimmed to the endpoint, then the resumed
+	// run whole: the endpoint the publisher declared bounds its own run and nothing after it.
+	expect(spans.map((span) => span.frames)).toEqual([648, 648]);
+	expect(terminal.end).toBeUndefined();
+	expect(consumer.skipped.peek()).toBe(0);
+
+	consumer.close();
 });

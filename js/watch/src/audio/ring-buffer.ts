@@ -27,8 +27,10 @@ export class AudioRingBuffer implements RingReader {
 	readonly #buffered: boolean;
 	// Un-stall threshold in samples (how much to buffer before playback starts).
 	#latencySamples: number;
-	// Whether the read/write indices have been anchored to the first inserted sample.
+	// Whether the read/write indices have been anchored to the first inserted sample, and the sample
+	// index that anchored them, which is where this timeline's playhead started.
 	#anchored = false;
+	#anchor = 0;
 
 	// Bumped whenever the media timeline is replaced, so a reader holding a block from the previous
 	// one knows to drop it. The shared transport reads its mutation epoch for the same purpose.
@@ -180,6 +182,10 @@ export class AudioRingBuffer implements RingReader {
 			skipped: this.#skipped,
 			discarded: this.#discarded,
 			trimmed: this.#trimmed,
+			// `#fresh` stands until the reader commits a sample from this timeline, which is exactly
+			// what "nothing has been played yet" means; an unanchored ring has no timeline at all.
+			fresh: !this.#anchored || this.#fresh,
+			anchor: this.#anchor,
 		};
 	}
 
@@ -236,12 +242,13 @@ export class AudioRingBuffer implements RingReader {
 	write(timestamp: Time.Micro, data: Float32Array[]): void {
 		if (data.length !== this.channels) throw new Error("wrong number of channels");
 
-		// Media is back, so the declared pause is over. If the reader played the pause out, refill to
-		// the target before resuming, exactly as after an underrun: starting on the first chunk to
-		// arrive would run dry on the next quantum, and this time the gap really would be concealed.
+		// Media is back, so the declared pause is over. A pause the reader played out leaves nothing
+		// to resume: this is a fresh fill, so start it over rather than writing onto a timeline
+		// whose playhead sits at the endpoint. The insert below then re-anchors, arms the trim and
+		// refills to the target, exactly as at a cold start.
 		if (this.#ended) {
+			if (this.length <= 0) this.reset();
 			this.#ended = false;
-			if (this.#writeIndex - this.#readIndex <= 0) this.#stalled = true;
 		}
 
 		// A chunk wider than the target needs a wider ring, or the level this one holds plus the
@@ -262,6 +269,7 @@ export class AudioRingBuffer implements RingReader {
 		if (!this.#anchored) {
 			this.#readIndex = start;
 			this.#writeIndex = start;
+			this.#anchor = start;
 			this.#anchored = true;
 			this.#generation++;
 		}
@@ -437,8 +445,10 @@ export class AudioRingBuffer implements RingReader {
 	end(): void {
 		this.#ended = true;
 		// A stall waits for a refill, and there is no refill coming: releasing it is what lets the
-		// tail play out instead of being held against a target nothing will ever reach.
-		if (this.#writeIndex - this.#readIndex > 0) this.#stalled = false;
+		// tail play out instead of being held against a target nothing will ever reach. An empty
+		// ring is released too, since `view` parks the reader on the endpoint itself and a stall
+		// nothing can clear would outlive the pause.
+		this.#stalled = false;
 	}
 
 	// Flush all buffered samples and re-stall, ready to anchor the next utterance.

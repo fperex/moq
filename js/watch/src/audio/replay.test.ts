@@ -8,6 +8,7 @@ import { maxAgeHeadroom } from "./config";
 import fourKWebm from "./fixtures/4k-webm.json" with { type: "json" };
 import lanBbb from "./fixtures/lan-bbb.json" with { type: "json" };
 import micLocal from "./fixtures/mic-local.json" with { type: "json" };
+import micLocalMute from "./fixtures/mic-local-mute.json" with { type: "json" };
 import micRemote from "./fixtures/mic-remote.json" with { type: "json" };
 import relayBbb7Frame from "./fixtures/relay-bbb-7frame.json" with { type: "json" };
 import { zeroRun } from "./playout/fixture";
@@ -278,6 +279,26 @@ function holed(t: Arrival[], holes: number[]): Arrival[] {
 		}),
 	);
 }
+
+describe.each(RINGS)("%s ring, a declared pause", (ring, build) => {
+	it("plays through a declared pause without an underrun or a skip", () => {
+		// The same microphone arrivals, cut by a publisher muting for three seconds. Nothing in the
+		// trace is late and nothing is missing, so the pause costs the listener nothing: the ring
+		// plays out what it holds, renders the pause as the silence it is, and refills on the far
+		// side the way a cold start does.
+		const t = recorded(micLocalMute as Fixture);
+		const measured = replay(build, t, 4000);
+
+		console.log(
+			`${ring}/mic-local-mute: ${measured.underruns} underruns and ${measured.skipped} skipped samples over ${measured.quanta} quanta, with ${measured.concealed} concealed samples and ${measured.merges} merges`,
+		);
+
+		expect(measured.underruns).toBe(0);
+		expect(measured.skipped).toBe(0);
+		// A declared pause is not a gap, so there is nothing to invent audio over.
+		expect(measured.concealed).toBe(0);
+	});
+});
 
 describe.each(RINGS)("%s ring, the rare tail", (ring, build) => {
 	it("conceals a 165, 220 and 111ms outage rather than playing them as silence", () => {

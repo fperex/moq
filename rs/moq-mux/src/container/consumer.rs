@@ -372,13 +372,34 @@ impl<F: Container> Consumer<F> {
 			{
 				let hole = !pts_contiguous(current_end.or(self.presented_end), next_start);
 				let had_marker = self.pending.iter().take(new_idx).any(GroupBuffer::marker);
+				// What the verdict was reached on, since the same line has to answer whether the
+				// oldest group was actually late or merely long: what it held, and whether more of
+				// it was still coming.
+				let (first, last, open) = match self.pending.front_mut() {
+					Some(front) => (
+						front.min_timestamp,
+						front.max_timestamp,
+						front.group.poll_finished(waiter).is_pending(),
+					),
+					None => (None, None, false),
+				};
 				self.pending.drain(0..new_idx);
 				if hole || had_marker {
 					self.bump_playhead();
 				}
 				let new_current = self.pending.front().map(|g| g.sequence).unwrap();
 
-				tracing::debug!(old = self.current, new = new_current, "skipping slow groups");
+				tracing::debug!(
+					old = self.current,
+					new = new_current,
+					?first,
+					?last,
+					open,
+					reach = ?next_start,
+					live = ?max_timestamp,
+					budget = ?self.max_age,
+					"skipping slow groups"
+				);
 
 				self.current = new_current;
 				self.note_group_edge();
@@ -1141,6 +1162,66 @@ mod tests {
 		assert_eq!(consumer.read().await.unwrap().unwrap().timestamp, ts(0));
 		assert_eq!(consumer.discontinuity(), 0);
 		assert_eq!(consumer.read().await.unwrap().unwrap().timestamp, ts(1_000_000));
+		assert_eq!(consumer.discontinuity(), 1);
+	}
+
+	/// Drive `poll_event` and keep the endpoint the way [`Consumer::poll_read`] does, so a test can
+	/// see both the order the events arrive in and what each one leaves behind.
+	async fn poll_one<F: ContainerTrait>(consumer: &mut Consumer<F>) -> Option<Event> {
+		let event = kio::wait(|waiter| consumer.poll_event(waiter)).await.unwrap();
+		if let Some(Event::FrameEnd(end)) = &event
+			&& consumer.format.kind() == crate::container::Kind::Audio
+		{
+			consumer.end = Some(*end);
+		}
+		event
+	}
+
+	#[tokio::test]
+	async fn a_marker_group_closes_the_run_before_it() {
+		// What a publisher's mute writes: media, an endpoint alone in its group, an empty group, and
+		// media again ten seconds later. The endpoint belongs to the run it ends, so the playhead
+		// event is the marker group closing behind it, and none of this is a skip: the publisher
+		// said where its timeline stopped rather than falling behind.
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.audio));
+		let mut consumer = Consumer::new(
+			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(135))),
+			Container::Legacy(crate::container::Kind::Audio),
+		);
+
+		// Written as the publisher writes it, a group at a time: dumping ten seconds of timeline in
+		// at once would age the first run past the budget and convict it, which is a different test.
+		write_group(&mut track, 0, &[ts(0)]);
+		assert!(matches!(poll_one(&mut consumer).await, Some(Event::Frame(frame)) if frame.timestamp == ts(0)));
+		assert!(matches!(poll_one(&mut consumer).await, Some(Event::GroupEnd)));
+		assert_eq!(consumer.discontinuity(), 0);
+
+		// The endpoint, delivered on the run it ends.
+		write_marker_group(&mut track, 1, ts(20_000));
+		assert!(matches!(poll_one(&mut consumer).await, Some(Event::FrameEnd(end)) if end == ts(20_000)));
+		assert_eq!(consumer.end(), Some(ts(20_000)));
+		assert_eq!(consumer.discontinuity(), 0);
+
+		// Closing the marker group is the event, and it takes the endpoint with it, so the run that
+		// resumes is not trimmed by the one that ended.
+		assert!(matches!(poll_one(&mut consumer).await, Some(Event::GroupEnd)));
+		assert_eq!(consumer.discontinuity(), 1);
+		assert_eq!(consumer.end(), None);
+
+		// The empty group means nothing.
+		track
+			.create_group(moq_net::group::Info { sequence: 2 })
+			.unwrap()
+			.finish()
+			.unwrap();
+		assert!(matches!(poll_one(&mut consumer).await, Some(Event::GroupEnd)));
+		assert_eq!(consumer.discontinuity(), 1);
+
+		write_group(&mut track, 3, &[ts(10_020_000)]);
+		track.finish().unwrap();
+		assert!(
+			matches!(poll_one(&mut consumer).await, Some(Event::Frame(frame)) if frame.timestamp == ts(10_020_000))
+		);
 		assert_eq!(consumer.discontinuity(), 1);
 	}
 

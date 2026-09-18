@@ -318,12 +318,13 @@ export class SharedRingBuffer implements RingReader {
 	insert(timestamp: Time.Micro, data: Float32Array[]): void {
 		if (data.length !== this.channels) throw new Error("wrong number of channels");
 
-		// Media is back, so the declared pause is over. If the reader played the pause out, refill to
-		// the target before resuming, exactly as after an underrun: starting on the first chunk to
-		// arrive would run dry on the next quantum, and this time the gap really would be concealed.
+		// Media is back, so the declared pause is over. A pause the reader played out leaves nothing
+		// to resume: this is a fresh fill, so start it over rather than writing onto a timeline
+		// whose playhead sits at the endpoint. The insert below then re-anchors, arms the trim and
+		// refills to the target, exactly as at a cold start.
 		if (Atomics.exchange(this.#control, ENDED, 0) === 1) {
 			const read = readOf(Atomics.load(this.#state, 0));
-			if (((Atomics.load(this.#control, WRITE) - read) | 0) <= 0) Atomics.store(this.#control, STALLED, 1);
+			if (((Atomics.load(this.#control, WRITE) - read) | 0) <= 0) this.reset();
 		}
 
 		let start = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
@@ -743,9 +744,10 @@ export class SharedRingBuffer implements RingReader {
 
 		// A stall waits for a refill, and there is no refill coming: releasing it is what lets the
 		// tail play out instead of being held against a target nothing will ever reach. Safe against
-		// the reader's own raise, which only happens on an empty ring, where there is no tail.
-		const read = readOf(Atomics.load(this.#state, 0));
-		if (((Atomics.load(this.#control, WRITE) - read) | 0) > 0) Atomics.store(this.#control, STALLED, 0);
+		// the reader's own raise, which only happens on an empty ring, where there is no tail. An
+		// empty ring is released too, since `view` parks the reader on the endpoint itself and a
+		// stall nothing can clear would outlive the pause.
+		Atomics.store(this.#control, STALLED, 0);
 	}
 
 	reset(): void {
@@ -931,6 +933,14 @@ export class SharedRingBuffer implements RingReader {
 			skipped: load(SKIPPED),
 			discarded: load(DISCARDED),
 			trimmed: load(TRIMMED),
+			// Where the writer left READ, against where READ is now: the same question `#trim` asks,
+			// and asked here rather than read off `#resumed` because only an insert clears that, so
+			// a reader that has played and then run dry would still look untouched. An unanchored
+			// ring has no timeline to have played at all.
+			fresh:
+				!this.#anchored ||
+				(this.#resumed !== undefined && ((readOf(Atomics.load(this.#state, 0)) - this.#resumed) | 0) === 0),
+			anchor: this.#anchor,
 		};
 	}
 

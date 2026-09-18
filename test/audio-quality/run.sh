@@ -45,7 +45,7 @@ ALL_PROFILES=(near-zero mild bursty step high-rtt fixed-250)
 SAFARI_PROFILES=(near-zero fixed-250)
 # The replay runtime's "profile" is which recording was replayed: the path is what it did on the day
 # it was captured, not something a shaper applied. `replay.ts` owns what each one was recorded off.
-REPLAY_PROFILES=(lan-bbb relay-bbb-7frame 4k-webm mic-local mic-remote mic-firefox)
+REPLAY_PROFILES=(lan-bbb relay-bbb-7frame 4k-webm mic-local mic-local-mute mic-remote mic-firefox)
 ALL_RINGS=(isolated plain)
 ALL_CODECS=(opus aac)
 ALL_RUNTIMES=(chromium safari replay)
