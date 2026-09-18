@@ -304,11 +304,11 @@ async fn a_step_profile_gets_worse_part_way_through() {
 	let upstream = Upstream::start().await;
 	let shape = Direction {
 		delay: Duration::from_millis(5),
-		step: Some(Step {
+		steps: vec![Step {
 			at: Duration::from_millis(150),
-			delay: Duration::from_millis(60),
-			jitter: Duration::ZERO,
-		}),
+			delay: Some(Duration::from_millis(60)),
+			..Default::default()
+		}],
 		..Default::default()
 	};
 	let shaper = start(upward("step-fast", 11, shape), upstream.addr, false).await;

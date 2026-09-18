@@ -75,6 +75,9 @@ pub struct Counters {
 	/// Datagrams the token bucket pushed back.
 	pub rate_limited: u64,
 
+	/// Datagrams discarded because the token bucket's queue was already full.
+	pub queue_dropped: u64,
+
 	/// The most datagrams waiting for release at once.
 	pub queue_max: usize,
 }
@@ -410,8 +413,8 @@ impl State {
 			// through SplitMix64, so adjacent values start it well apart and the run still
 			// replays from the profile's one seed.
 			lanes: [
-				Lane::new(profile.up, profile.seed, start),
-				Lane::new(profile.down, profile.seed.wrapping_add(1), start),
+				Lane::new(profile.up.clone(), profile.seed, start),
+				Lane::new(profile.down.clone(), profile.seed.wrapping_add(1), start),
 			],
 		}
 	}
@@ -422,7 +425,18 @@ impl State {
 		let lane = &mut self.lanes[dir.index()];
 		lane.step(start, now);
 
-		let shape = lane.shape;
+		// The treatment in force, copied out field by field so the lane stays free to count
+		// while it is read. Every one of these is `Copy`; the schedule behind them is not.
+		let Direction {
+			delay,
+			jitter,
+			burst,
+			loss: loss_rate,
+			reorder: reorder_rate,
+			reorder_delay,
+			rate,
+			..
+		} = lane.shape;
 
 		// Fixed draw order, every datagram, whether or not the knob is on: that is what
 		// makes a seed replay the same decisions.
@@ -430,24 +444,34 @@ impl State {
 		let spread = gaussian(&mut lane.rng);
 		let reorder: f64 = lane.rng.random();
 
-		if loss < shape.loss {
+		if loss < loss_rate {
 			lane.counters.dropped += 1;
 			return;
 		}
 
-		let wait = shape.delay.as_secs_f64() + shape.jitter.as_secs_f64() * spread;
+		let wait = delay.as_secs_f64() + jitter.as_secs_f64() * spread;
 		let mut release = now + Duration::from_secs_f64(wait.max(0.0));
 
-		if let Some(rate) = shape.rate {
-			let refill = now.duration_since(lane.refilled).as_secs_f64() * rate.bytes_per_second as f64;
-			lane.tokens = (lane.tokens + refill).min(rate.burst_bytes as f64);
-			lane.refilled = now;
+		if let Some(rate) = rate {
+			lane.refill(now);
+			let owed = payload.len() as f64 - lane.tokens;
+
+			// Debt is the backlog: bytes already promised that the rate has yet to earn. A
+			// link with a finite queue tail-drops rather than growing that backlog forever,
+			// so a datagram that would not fit is discarded here and counted apart from the
+			// loss draw.
+			if let Some(queue_bytes) = rate.queue_bytes
+				&& owed > queue_bytes as f64
+			{
+				lane.counters.queue_dropped += 1;
+				return;
+			}
+
 			lane.tokens -= payload.len() as f64;
 
-			// Debt is how long the bucket has to refill before this datagram may leave.
+			// Debt is also how long the bucket has to refill before this datagram may leave.
 			if lane.tokens < 0.0 {
-				let owed = -lane.tokens / rate.bytes_per_second as f64;
-				release = release.max(now + Duration::from_secs_f64(owed));
+				release = release.max(now + Duration::from_secs_f64(owed / rate.bytes_per_second as f64));
 				lane.counters.rate_limited += 1;
 			}
 		}
@@ -459,8 +483,8 @@ impl State {
 		release = release.max(lane.last_release);
 		lane.last_release = release;
 
-		if reorder < shape.reorder {
-			release += shape.reorder_delay;
+		if reorder < reorder_rate {
+			release += reorder_delay;
 			lane.counters.reordered += 1;
 		}
 
@@ -478,7 +502,7 @@ impl State {
 		lane.queued += 1;
 		lane.counters.queue_max = lane.counters.queue_max.max(lane.queued);
 
-		match shape.burst {
+		match burst {
 			Some(burst) => {
 				if lane.held.is_empty() {
 					lane.deadline = Some(now + burst.window);
@@ -524,11 +548,11 @@ impl State {
 
 /// One direction's generator, token bucket, held batch, and counters.
 struct Lane {
-	/// The treatment in force, which a step replaces part-way through the run.
+	/// The treatment in force, which each step revises part-way through the run.
 	shape: Direction,
 
-	/// The step still pending, taken once the run reaches it.
-	step: Option<Step>,
+	/// The steps still pending, latest first, so the next one due is the last element.
+	steps: Vec<Step>,
 
 	rng: SmallRng,
 
@@ -551,8 +575,11 @@ struct Lane {
 
 impl Lane {
 	fn new(shape: Direction, seed: u64, start: Instant) -> Self {
+		let mut steps = shape.steps.clone();
+		steps.reverse();
+
 		Self {
-			step: shape.step,
+			steps,
 			tokens: shape.rate.map_or(0.0, |rate| rate.burst_bytes as f64),
 			shape,
 			rng: SmallRng::seed_from_u64(seed),
@@ -565,16 +592,46 @@ impl Lane {
 		}
 	}
 
-	/// Apply the profile's step once the run has reached it.
+	/// Apply every step the run has reached, in order, each revising what it names.
 	fn step(&mut self, start: Instant, now: Instant) {
-		let Some(step) = self.step else { return };
-		if now.duration_since(start) < step.at {
-			return;
+		let elapsed = now.duration_since(start);
+
+		while self.steps.last().is_some_and(|step| step.at <= elapsed) {
+			let step = self.steps.pop().expect("peeked");
+
+			// Settle the bucket at the old rate before the new one takes over, or the time
+			// either side of the step refills at whichever rate happened to arrive last.
+			self.refill(now);
+
+			if let Some(delay) = step.delay {
+				self.shape.delay = delay;
+			}
+			if let Some(jitter) = step.jitter {
+				self.shape.jitter = jitter;
+			}
+			if let Some(loss) = step.loss {
+				self.shape.loss = loss;
+			}
+			if let Some(rate) = step.rate {
+				// A cap that was not there starts full, the way the run started. One that
+				// was keeps its credit, clipped to the new bucket.
+				self.tokens = match self.shape.rate {
+					Some(_) => self.tokens.min(rate.burst_bytes as f64),
+					None => rate.burst_bytes as f64,
+				};
+				self.shape.rate = Some(rate);
+			}
+		}
+	}
+
+	/// Credit the bucket for the time since it was last touched.
+	fn refill(&mut self, now: Instant) {
+		if let Some(rate) = self.shape.rate {
+			let refill = now.duration_since(self.refilled).as_secs_f64() * rate.bytes_per_second as f64;
+			self.tokens = (self.tokens + refill).min(rate.burst_bytes as f64);
 		}
 
-		self.shape.delay = step.delay;
-		self.shape.jitter = step.jitter;
-		self.step = None;
+		self.refilled = now;
 	}
 
 	/// Release the held batch, every datagram at the same instant.
@@ -807,27 +864,206 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_step_replaces_the_delay_once_the_run_reaches_it() {
+	async fn each_delay_step_applies_at_its_own_time() {
 		let socket = socket().await;
 		let now = Instant::now();
 		let shape = Direction {
 			delay: Duration::from_millis(5),
-			step: Some(Step {
-				at: Duration::from_millis(100),
-				delay: Duration::from_millis(60),
-				jitter: Duration::ZERO,
+			steps: vec![
+				Step {
+					at: Duration::from_millis(100),
+					delay: Some(Duration::from_millis(60)),
+					..Default::default()
+				},
+				Step {
+					at: Duration::from_millis(200),
+					delay: Some(Duration::from_millis(5)),
+					..Default::default()
+				},
+			],
+			..Default::default()
+		};
+		let mut state = State::new(&profile(shape), now);
+
+		// One datagram per stretch, each drained before the next, so the release time read
+		// off the queue is that datagram's own and not the one in front of it.
+		let release = |state: &mut State, at: Instant| {
+			state.accept(Dir::Up, vec![0; 16], socket.clone(), None, at);
+			let leaves = state.queue.peek().expect("queued").at;
+			state.due(leaves);
+			leaves
+		};
+
+		assert_eq!(release(&mut state, now), now + Duration::from_millis(5));
+
+		let during = now + Duration::from_millis(100);
+		assert_eq!(release(&mut state, during), during + Duration::from_millis(60));
+
+		// The step back restores the treatment the run opened with.
+		let after = now + Duration::from_millis(200);
+		assert_eq!(release(&mut state, after), after + Duration::from_millis(5));
+	}
+
+	#[tokio::test]
+	async fn a_loss_step_turns_the_loss_draw_on_and_off_again() {
+		let socket = socket().await;
+		let now = Instant::now();
+		let shape = Direction {
+			steps: vec![
+				Step {
+					at: Duration::from_secs(30),
+					loss: Some(1.0),
+					..Default::default()
+				},
+				Step {
+					at: Duration::from_secs(60),
+					loss: Some(0.0),
+					..Default::default()
+				},
+			],
+			..Default::default()
+		};
+		let mut state = State::new(&profile(shape), now);
+
+		let stretch = |state: &mut State, at: Instant| {
+			let before = state.lanes[0].counters.dropped;
+			for _ in 0..100 {
+				state.accept(Dir::Up, vec![0; 16], socket.clone(), None, at);
+			}
+			state.due(at);
+			state.lanes[0].counters.dropped - before
+		};
+
+		assert_eq!(stretch(&mut state, now), 0, "the profile opens clean");
+		assert_eq!(
+			stretch(&mut state, now + Duration::from_secs(30)),
+			100,
+			"the step lost nothing"
+		);
+		assert_eq!(
+			stretch(&mut state, now + Duration::from_secs(60)),
+			0,
+			"the step back never cleared"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_rate_step_narrows_the_bucket_and_widens_it_again() {
+		let socket = socket().await;
+		let now = Instant::now();
+		let wide = ByteRate {
+			bytes_per_second: 4000,
+			burst_bytes: 100,
+			queue_bytes: None,
+		};
+		let narrow = ByteRate {
+			bytes_per_second: 1000,
+			burst_bytes: 100,
+			queue_bytes: None,
+		};
+		let shape = Direction {
+			rate: Some(wide),
+			steps: vec![
+				Step {
+					at: Duration::from_secs(30),
+					rate: Some(narrow),
+					..Default::default()
+				},
+				Step {
+					at: Duration::from_secs(60),
+					rate: Some(wide),
+					..Default::default()
+				},
+			],
+			..Default::default()
+		};
+		let mut state = State::new(&profile(shape), now);
+
+		// The bucket is full at each stretch, so the first 100 bytes are free and the next
+		// 100 owe exactly one bucket's worth of refill at whichever rate is in force.
+		let owed = |state: &mut State, at: Instant| {
+			state.accept(Dir::Up, vec![0; 100], socket.clone(), None, at);
+			state.accept(Dir::Up, vec![0; 100], socket.clone(), None, at);
+			let release = state.queue.iter().map(|entry| entry.at).max().expect("queued");
+			state.due(release);
+			release.duration_since(at)
+		};
+
+		assert_eq!(owed(&mut state, now), Duration::from_millis(25));
+		assert_eq!(
+			owed(&mut state, now + Duration::from_secs(30)),
+			Duration::from_millis(100)
+		);
+		assert_eq!(
+			owed(&mut state, now + Duration::from_secs(60)),
+			Duration::from_millis(25)
+		);
+	}
+
+	#[tokio::test]
+	async fn the_queue_cap_drops_what_will_not_fit_and_counts_it() {
+		let socket = socket().await;
+		let now = Instant::now();
+		let shape = Direction {
+			rate: Some(ByteRate {
+				bytes_per_second: 1000,
+				burst_bytes: 100,
+				queue_bytes: Some(200),
 			}),
 			..Default::default()
 		};
 		let mut state = State::new(&profile(shape), now);
 
-		state.accept(Dir::Up, vec![0; 16], socket.clone(), None, now);
-		assert_eq!(state.queue.peek().unwrap().at, now + Duration::from_millis(5));
-		state.due(now + Duration::from_millis(5));
+		// The first 100 bytes are free, the next 200 fill the queue, and everything after
+		// that is tail-dropped until the bucket refills.
+		for _ in 0..8 {
+			state.accept(Dir::Up, vec![0; 100], socket.clone(), None, now);
+		}
 
-		let later = now + Duration::from_millis(100);
-		state.accept(Dir::Up, vec![0; 16], socket, None, later);
-		assert_eq!(state.queue.peek().unwrap().at, later + Duration::from_millis(60));
+		let counters = state.lanes[0].counters;
+		assert_eq!(counters.queue_dropped, 5, "the queue cap held the wrong backlog");
+		assert_eq!(counters.rate_limited, 2, "only the queued datagrams owe the bucket");
+		assert_eq!(counters.dropped, 0, "a tail drop is not a loss draw");
+		assert_eq!(state.due(now + Duration::from_secs(1)).len(), 3);
+
+		// A queue that has drained takes datagrams again, so the cap sheds a burst rather
+		// than blackholing the lane.
+		let later = now + Duration::from_secs(1);
+		state.accept(Dir::Up, vec![0; 100], socket, None, later);
+		assert_eq!(state.lanes[0].counters.queue_dropped, 5);
+		assert_eq!(state.due(later).len(), 1);
+	}
+
+	#[tokio::test]
+	async fn a_rate_without_a_queue_cap_never_drops() {
+		let socket = socket().await;
+		let now = Instant::now();
+		let shape = Direction {
+			rate: Some(ByteRate {
+				bytes_per_second: 1000,
+				burst_bytes: 100,
+				queue_bytes: None,
+			}),
+			..Default::default()
+		};
+		let mut state = State::new(&profile(shape), now);
+
+		for _ in 0..8 {
+			state.accept(Dir::Up, vec![0; 100], socket.clone(), None, now);
+		}
+
+		let counters = state.lanes[0].counters;
+		assert_eq!(counters.queue_dropped, 0, "an uncapped queue tail-dropped");
+		assert_eq!(counters.dropped, 0);
+		assert_eq!(
+			counters.rate_limited, 7,
+			"every datagram past the burst owes the bucket"
+		);
+		assert_eq!(
+			state.due(now + Duration::from_secs(1)).len(),
+			8,
+			"the lane held nothing back"
+		);
 	}
 
 	#[tokio::test]
@@ -865,6 +1101,7 @@ mod tests {
 			rate: Some(ByteRate {
 				bytes_per_second: 1000,
 				burst_bytes: 100,
+				queue_bytes: None,
 			}),
 			..Default::default()
 		};
@@ -893,7 +1130,7 @@ mod tests {
 		};
 
 		let decisions = |now| {
-			let mut state = State::new(&profile(shape), now);
+			let mut state = State::new(&profile(shape.clone()), now);
 			for i in 0..1000u32 {
 				state.accept(Dir::Up, i.to_be_bytes().to_vec(), socket.clone(), None, now);
 			}
@@ -921,7 +1158,7 @@ mod tests {
 		let profile = Profile {
 			name: "test".to_string(),
 			seed: 7,
-			up: shape,
+			up: shape.clone(),
 			down: shape,
 		};
 		let mut state = State::new(&profile, now);
