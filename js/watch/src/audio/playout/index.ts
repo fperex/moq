@@ -1,3 +1,4 @@
+import type { Time } from "@moq/net";
 import { BLOCK, Decision } from "./decision";
 import { Expand } from "./expand";
 import { Merge } from "./merge";
@@ -143,6 +144,29 @@ export interface Snapshot extends Counters {
 	 * can hear and no time stretch had to close: the playhead simply started further in.
 	 */
 	trimmed: number;
+	/**
+	 * Whether nothing on the ring's current timeline has been played yet.
+	 *
+	 * A ring reports one stalled flag for filling and for stopping, and this is what tells them
+	 * apart: a fresh ring is filling, whatever it holds, and only a ring that stops after it has
+	 * played has interrupted anything.
+	 */
+	fresh: boolean;
+	/** The sample index the ring's timeline is anchored at, i.e. where its playhead started. */
+	anchor: number;
+}
+
+/**
+ * A ring {@link Snapshot} plus what the decoder feeding it is doing.
+ *
+ * What `Decoder.out.debug` carries: the ring cannot see the budget its own supply is skipped
+ * against, and reading the two apart would leave them describing different instants.
+ *
+ * @internal
+ */
+export interface Debug extends Snapshot {
+	/** How stale a group may get before the container consumer skips it, in milliseconds. */
+	budget: Time.Milli;
 }
 
 /**

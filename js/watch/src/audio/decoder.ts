@@ -22,7 +22,6 @@ import { Anchor } from "./anchor";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
 import { audioMaxAge, type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
 import { Handover } from "./handover";
-import { Interruption } from "./interruption";
 import { LOWER_INTERVAL, nextLatency, ringSamples } from "./latency";
 import type * as Playout from "./playout";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
@@ -98,12 +97,13 @@ type DecoderOutput = {
 	spread: Signal<Time.Milli | undefined>;
 
 	/**
-	 * Every audio ring counter at once: what it holds, what the playout engine did with it, and what
-	 * either end threw away. Undefined until the graph is built and the first sample lands.
+	 * Every audio ring counter at once: what it holds, what the playout engine did with it, what
+	 * either end threw away, and the budget its supply is skipped against. Undefined until the graph
+	 * is built and the first sample lands.
 	 *
 	 * @internal
 	 */
-	debug: Signal<Playout.Snapshot | undefined>;
+	debug: Signal<Playout.Debug | undefined>;
 };
 
 /** Cumulative audio statistics since the decoder started. */
@@ -134,7 +134,7 @@ export class Decoder {
 		skipped: new Signal<number>(0),
 		buffered: new Signal<Container.BufferedRanges>([]),
 		spread: new Signal<Time.Milli | undefined>(undefined),
-		debug: new Signal<Playout.Snapshot | undefined>(undefined),
+		debug: new Signal<Playout.Debug | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -172,8 +172,9 @@ export class Decoder {
 	// Which subscription the ring's buffered samples came from. See #runDecoder.
 	#handover = new Handover();
 
-	// Whether a stalled ring is refilling after playback stopped, or filling for the first time.
-	#interruption = new Interruption();
+	// Whether the ring is playing out a declared endpoint, so the playhead event that closes the
+	// marker group is that endpoint's own and must not throw the tail away. See #onNext.
+	#ended = false;
 
 	#signals = new Effect();
 
@@ -407,27 +408,24 @@ export class Decoder {
 				if (ts !== undefined) this.#trimDecodeBuffered(ts);
 			});
 			// A stall means one of two things and the ring reports one flag for both, so the
-			// distinction is drawn here: a ring nobody is draining is filling, whatever it holds,
-			// and only a ring that stops after it has played has interrupted anything.
+			// distinction is drawn here: a ring nobody has played from is filling, whatever it
+			// holds, and only a ring that stops after it has played has interrupted anything.
 			effect.run((inner) => {
 				const stalled = inner.get(ring.stalled);
 				this.#out.stalled.set(stalled);
 
-				if (!inner.get(this.in.enabled)) {
-					// The download is off and the emitter is disconnected, so nothing is draining
-					// the ring: whatever plays next is a fresh fill rather than playback resuming.
-					this.#interruption.restarted();
-					this.#out.interrupted.set(false);
-					return;
-				}
-
-				this.#out.interrupted.set(this.#interruption.update(stalled));
+				// The download being off disconnects the emitter, so nothing is draining the ring
+				// and whatever plays next is a fresh fill rather than playback resuming.
+				const enabled = inner.get(this.in.enabled);
+				const fresh = inner.get(ring.debug)?.fresh ?? true;
+				this.#out.interrupted.set(enabled && stalled && !fresh);
 			});
 			effect.run((inner) => {
 				this.#out.underruns.set(inner.get(ring.underruns));
 			});
 			effect.run((inner) => {
-				this.#out.debug.set(inner.get(ring.debug));
+				const debug = inner.get(ring.debug);
+				this.#out.debug.set(debug && { ...debug, budget: inner.get(this.#maxAge) });
 			});
 
 			effect.set(this.#out.root, worklet);
@@ -606,6 +604,9 @@ export class Decoder {
 		// overwrites the slots it lands on, but a publisher writing ahead of real-time leaves seconds
 		// of tail beyond them. Drop that once the replacement's first frame says where it starts.
 		this.#handover.opened();
+		// A tune-in, not a resume: whatever the previous subscription declared is not this one's to
+		// play out, so its first playhead event flushes the ring like any other.
+		this.#ended = false;
 
 		const sub = subscribeMedia(effect, {
 			broadcast: active,
@@ -702,6 +703,8 @@ export class Decoder {
 					decoder.configure(decoderConfig);
 					anchor.restarted();
 				}
+				// The endpoint arrives before the playhead event that closes its marker group, so
+				// the flush runs with the tail still queued. See #onNext.
 				if (next.end !== undefined) {
 					await this.#declareEnd(decoder, anchor);
 					continue;
@@ -808,6 +811,8 @@ export class Decoder {
 					anchor.restarted();
 				}
 
+				// The endpoint arrives before the playhead event that closes its marker group, so
+				// the flush runs with the tail still queued. See #onNext.
 				if (next.end !== undefined) {
 					await this.#declareEnd(decoder, anchor);
 					continue;
@@ -926,6 +931,9 @@ export class Decoder {
 		// Hand off to the ring. Shared transport writes directly; post transport
 		// transfers the ArrayBuffers.
 		ring.insert(timestamp, channelData);
+		// Media is back, so the declared pause is over and the next playhead event is somebody
+		// else's. The ring takes its own endpoint back on the same write.
+		this.#ended = false;
 
 		sample.close();
 	}
@@ -995,13 +1003,19 @@ export class Decoder {
 			if (!flushed) return;
 		}
 		this.#ring?.end();
+		this.#ended = true;
 	}
 
-	// Apply ordered container metadata before handling the result. An endpoint that also
-	// starts a new epoch must survive the reset so its following drain is trimmed.
+	// Apply ordered container metadata before handling the result.
+	//
+	// The consumer raises the playhead on the result that closes a marker group, which arrives after
+	// the endpoint that group carried, so the flush above has already queued the tail. Throwing it
+	// away here would spend the declared pause as a flush instead of playing it out, and leave the
+	// ring parked with nothing to un-park it. A hole or a conviction has no tail to protect and
+	// still resets.
 	#onNext(next: { discontinuity: number; end?: Time.Micro; frame?: { timestamp: Time.Micro } }): boolean {
 		if (!this.#terminal.update(next)) return false;
-		this.#ring?.reset();
+		if (!this.#ended) this.#ring?.reset();
 		this.sync.reset();
 		return true;
 	}

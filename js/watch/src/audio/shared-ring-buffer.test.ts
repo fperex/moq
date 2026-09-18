@@ -1333,3 +1333,61 @@ describe("trimming the first fill", () => {
 		expect(buffer.length).toBeGreaterThan(HOLD);
 	});
 });
+
+describe("a declared endpoint", () => {
+	// A 30ms target with 10ms chunks: the ring holds 40ms, the target plus the chunk being played.
+	const TARGET = 30;
+	const CHUNK = 10;
+	const HOLD = TARGET + CHUNK;
+	const FILL = 90;
+
+	/** A ring the reader has played out and run dry on, which is where a declared pause finds it. */
+	function drained(): SharedRingBuffer {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: TARGET });
+		for (let i = 0; i < HOLD / CHUNK; i++) {
+			insert(buffer, i * CHUNK, CHUNK, { channels: 1, value: i });
+		}
+		expect(buffer.stalled).toBe(false);
+		expect(read(buffer, HOLD, 1)[0].length).toBe(HOLD);
+		read(buffer, CHUNK, 1); // nothing left: the reader parks
+		expect(buffer.stalled).toBe(true);
+		return buffer;
+	}
+
+	it("releases a stall on an empty ring", () => {
+		const buffer = drained();
+
+		buffer.end();
+
+		// A stall waits for a refill and there is no refill coming, so it is a wait nothing can end.
+		// The reader parks on the endpoint itself, which is the pause the publisher declared rather
+		// than a gap to conceal.
+		expect(buffer.stalled).toBe(false);
+		expect(buffer.view().ended).toBe(true);
+		expect(read(buffer, CHUNK, 1)[0].length).toBe(0);
+	});
+
+	it("takes the endpoint back on an insert, and media after a played-out one is a fresh fill", () => {
+		const buffer = drained();
+		buffer.end();
+		expect(buffer.debug().fresh).toBe(false); // this timeline has been played
+
+		const timeline = buffer.view().generation;
+
+		// The publisher unmutes ten seconds later, and the relay serves more than the ring holds.
+		for (let i = 0; i < FILL / CHUNK; i++) {
+			insert(buffer, 10_000 + i * CHUNK, CHUNK, { channels: 1, value: i });
+		}
+
+		expect(buffer.view().ended).toBe(false);
+		// Nothing of the resumed run has been heard, so the playhead starts on the newest audio and
+		// the rest is dropped in silence rather than left for the reader to stretch across.
+		expect(buffer.debug().anchor).toBe(10_000);
+		expect(buffer.debug().fresh).toBe(true);
+		expect(buffer.view().generation).not.toBe(timeline);
+		expect(buffer.debug().trimmed).toBe(FILL - HOLD);
+		expect(buffer.length).toBe(HOLD);
+		expect(buffer.stalled).toBe(false);
+		expect(read(buffer, HOLD, 1)[0][0]).toBe((FILL - HOLD) / CHUNK);
+	});
+});

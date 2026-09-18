@@ -190,6 +190,7 @@ than ignored: the recording decides all three.
 | `relay-bbb-7frame` | The public relay serving `bbb.hang`, in ~160 ms flushes of seven AAC frames. |
 | `4k-webm` | A 4K WebM whose audio shares a connection with a video track big enough to queue, holes included. |
 | `mic-local` | A browser microphone over a local relay: the shallowest spread a real path produces. |
+| `mic-local-mute` | The same microphone, cut by a publisher muting: a declared endpoint and three seconds of silence, derived from `mic-local`. |
 | `mic-remote` | The same microphone through the public relay: more delay, the same spread. |
 | `mic-firefox` | A Firefox watcher whose own content process froze in bursts while the path stayed clean. |
 
@@ -201,6 +202,12 @@ rather than sizing a buffer for a path that did nothing. The marks come from the
 sampler, a 250 ms timer on the same main thread, so they cover the blocks that delayed one of its
 firings by more than 100 ms and not the shorter ones it could sit between: the row is a lower bound
 on what the runtime monitor sees. Without them the same arrivals take the target to 1600 ms.
+
+`mic-local-mute` is the one recording that is derived rather than captured: `mic-local` cut at six
+seconds, with an endpoint one frame past the last and the rest re-based three seconds later. An
+arrival marked `endpoint` carries no media, so it is neither inserted nor measured; the ring is told
+the timeline finished there and plays out what it holds. Nothing in the trace is late, so a reader
+that hears the pause as a gap grades it as thrown-away audio.
 
 What it cannot say is anything about the transport, the container consumer, the device, or the wall
 clock, because there is no session and no audio hardware. Those metrics report null. What it can say

@@ -507,6 +507,11 @@ impl Consumer {
 
 	/// A playhead event re-applies startup delay and skip. The decoder is not reset:
 	/// the next group already starts on a keyframe, and pre-skip is a play-path concern.
+	///
+	/// A declared pause is heard differently here than in the browser. The marker never reaches
+	/// this consumer, so the engine keeps concealing until the resumed frame arrives and this
+	/// re-anchors on it, where the browser's ring is told the timeline ended and renders the pause
+	/// as the silence it is. Surfacing the marker and giving the engine an `end` is a follow-up.
 	fn apply_discontinuity(&mut self) -> Result<(), Error> {
 		let discontinuity = self.track.discontinuity();
 		if discontinuity == self.discontinuity {
@@ -1335,6 +1340,135 @@ mod tests {
 		let first_frames = first.data.len() / size_of::<f32>();
 		let expected = advance(first.timestamp, first_frames, 48_000).unwrap();
 		assert_eq!(second.timestamp, expected);
+	}
+
+	/// A muted publisher writes an endpoint alone in its group and resumes seconds later with
+	/// media and nothing else. The endpoint bounds the run it ended, so what resumes has to play:
+	/// the marker group closing is the playhead event, and it clears the endpoint with it.
+	///
+	/// The resumed run does play. What fails is the pause itself: see the `ignore` reason and the
+	/// note on [`Consumer::apply_discontinuity`].
+	#[tokio::test]
+	#[ignore = "the engine conceals a declared pause rather than parking on it: the marker never \
+	            reaches this consumer, so 50 pulls across the pause are 49 underruns (measured \
+	            2026-09-18). Surfacing the marker and an Engine::end() is the follow-up."]
+	async fn a_declared_endpoint_then_resumed_media_decodes() {
+		let input = Input {
+			format: Format::F32,
+			sample_rate: 48_000,
+			channels: 1,
+		};
+		let mut encoder = Encoder::new(&crate::encode::Config::new(input)).unwrap();
+		let catalog = encoder.catalog();
+		let frame_size = encoder.frame_size();
+
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let subscriber = broadcast.consume();
+		let mut producer = moq_mux::container::Producer::new(
+			track,
+			moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Audio),
+		);
+		let mut consumer = Consumer::new(
+			&subscriber,
+			&catalog,
+			"audio",
+			Config {
+				max_age: std::time::Duration::from_secs(30),
+				delay: Some(std::time::Duration::from_millis(120)),
+				..Config::new()
+			},
+		)
+		.await
+		.unwrap();
+
+		let pcm = vec![0.25f32; frame_size];
+		// Borrowed per call so the endpoint below can write through the same producer.
+		let write = |producer: &mut moq_mux::container::Producer<moq_mux::catalog::hang::Container>,
+		             packet: u64,
+		             payload: bytes::Bytes| {
+			producer
+				.write(moq_mux::container::Frame {
+					timestamp: Timestamp::from_scale(packet * frame_size as u64, 48_000).unwrap(),
+					duration: None,
+					payload,
+					keyframe: true,
+				})
+				.unwrap();
+			producer.cut(None).unwrap();
+		};
+		// Half a second of media, so the first run is long enough to play out through a target
+		// the buffer has to fill first.
+		for packet in 0..25 {
+			let payload = encoder.encode(&pcm).unwrap().payload;
+			write(&mut producer, packet, payload);
+		}
+
+		let first = consumer.read().await.unwrap().expect("first block");
+		assert!(
+			first.timestamp.as_micros() < 1_000_000,
+			"playout starts on the first run"
+		);
+
+		// A speaker's clock keeps pulling: the run plays out, and then the pause is pulled through
+		// too, which is where the engine has to know the timeline ended rather than stalled.
+		let per_second = 48_000 / consumer.playout.as_ref().unwrap().engine.block();
+		while consumer.playout.as_ref().unwrap().engine.stats().buffered >= std::time::Duration::from_millis(20) {
+			consumer.read().await.unwrap().expect("a block of the first run");
+		}
+		assert_eq!(
+			consumer.playout.as_ref().unwrap().engine.stats().underruns,
+			0,
+			"the run before the mute plays out of the buffer it filled"
+		);
+
+		// The mute: an empty payload at the endpoint, alone in its group, the way `publish_terminal`
+		// writes one.
+		let end = Timestamp::from_scale(25 * frame_size as u64, 48_000).unwrap();
+		producer
+			.write(moq_mux::container::Frame {
+				timestamp: end,
+				duration: None,
+				payload: bytes::Bytes::new(),
+				keyframe: true,
+			})
+			.unwrap();
+		producer.cut(Some(end)).unwrap();
+
+		// Half a second of the declared pause, pulled at the speaker's rate.
+		for _ in 0..per_second / 2 {
+			consumer.read().await.unwrap().expect("a block of the declared pause");
+		}
+
+		// Ten seconds later it unmutes. 48_000 samples per second, so 480_000 samples in.
+		let resumed = 480_000 / frame_size as u64;
+		for packet in resumed..resumed + 25 {
+			let payload = encoder.encode(&pcm).unwrap().payload;
+			write(&mut producer, packet, payload);
+		}
+		producer.finish().unwrap();
+
+		let mut last = first.timestamp;
+		for _ in 0..4_000 {
+			let Some(frame) = consumer.read().await.unwrap() else {
+				break;
+			};
+			last = frame.timestamp;
+			if last.as_micros() >= 10_000_000 {
+				break;
+			}
+		}
+		assert!(
+			last.as_micros() >= 10_000_000,
+			"the resumed run plays: the endpoint bounds the run before it, not this one"
+		);
+		assert_eq!(
+			consumer.playout.as_ref().unwrap().engine.stats().underruns,
+			0,
+			"a declared pause is not an underrun"
+		);
 	}
 
 	#[tokio::test]

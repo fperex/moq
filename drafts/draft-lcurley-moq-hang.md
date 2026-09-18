@@ -565,10 +565,10 @@ A consumer MUST skip it and MUST NOT submit it to a decoder.
 It does not mean the track ended.
 
 For audio, an empty codec payload retains its terminal-trimming meaning: its timestamp is the exclusive endpoint of the source media.
-When a codec must receive additional packets to emit buffered source samples, the marker MUST precede those terminal packets.
+When a codec must receive additional packets to emit buffered source samples, the marker MUST precede those terminal packets in the same group.
 A consumer MUST NOT submit the marker to the codec decoder, MUST decode the terminal packets, and MUST discard decoded samples at or after the endpoint.
 The endpoint bounds the source media, not the track: a publisher that stops capturing, such as one whose microphone is muted, SHOULD declare one so consumers render silence rather than concealing a gap that will never be filled.
-Because the endpoint discards every later decoded sample, a publisher resuming after one MUST declare a discontinuity before its first frame; a consumer clears the endpoint when it does.
+An endpoint that is the only frame in its group is the discontinuity marker above: it closes the run before it, and the next group opens a run the endpoint does not trim.
 Audio publishers do not append per-group duration markers because the codec defines each packet's duration.
 Data tracks retain empty payloads as data, without endpoint semantics.
 

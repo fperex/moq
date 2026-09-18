@@ -31,6 +31,11 @@ fn replay(name: &str) -> Duration {
 
 	let mut jitter = Jitter::new();
 	for arrival in arrivals {
+		// A declared endpoint carries no media, so it is not an arrival to measure a path against:
+		// the publisher said where its timeline stopped rather than running late.
+		if arrival["endpoint"].as_bool().unwrap_or(false) {
+			continue;
+		}
 		let timestamp = arrival["timestamp_us"].as_f64().expect("a timestamp");
 		let now = arrival["arrival_ms"].as_f64().expect("an arrival");
 		// A recording that watched its own event loop says which frames came out of a

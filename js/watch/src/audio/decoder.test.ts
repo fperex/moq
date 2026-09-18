@@ -78,14 +78,53 @@ function click(): void {
 	MockContext.activation = false;
 }
 
+/** Enough of an EncodedAudioChunk to carry a frame's timestamp to the decoder below. */
+class MockEncodedChunk {
+	readonly timestamp: number;
+	constructor(init: { timestamp: number }) {
+		this.timestamp = init.timestamp;
+	}
+}
+
 /**
- * Enough of WebCodecs for the decode loop to run. It decodes nothing: these cases are about what
- * the decoder subscribes to and what it measures, both of which sit above the codec.
+ * Enough of an AudioData for the emit path: one 20ms stereo packet of a constant, copied planar.
+ *
+ * Stamped from the chunk that produced it, which is what a decoder anchored on that chunk emits.
+ */
+class MockAudioData {
+	readonly format = "f32-planar";
+	readonly sampleRate = DEVICE_RATE;
+	readonly numberOfFrames = 960;
+	readonly numberOfChannels = 2;
+	readonly timestamp: number;
+
+	constructor(timestamp: number) {
+		this.timestamp = timestamp;
+	}
+
+	copyTo(dst: Float32Array): void {
+		dst.fill(0.5);
+	}
+
+	close(): void {}
+}
+
+/**
+ * Enough of WebCodecs for the decode loop to run: one decoded packet per chunk, so what the
+ * container consumer orders reaches the ring. The codec itself is not what these cases are about.
  */
 class MockAudioDecoder {
 	state = "configured";
+	readonly #output: (data: MockAudioData) => void;
+
+	constructor(init: { output: (data: MockAudioData) => void }) {
+		this.#output = init.output;
+	}
+
 	configure(): void {}
-	decode(): void {}
+	decode(chunk: MockEncodedChunk): void {
+		this.#output(new MockAudioData(chunk.timestamp));
+	}
 	reset(): void {}
 	close(): void {
 		this.state = "closed";
@@ -147,7 +186,7 @@ beforeEach(() => {
 	// Present, so the libav polyfill resolves without loading anything.
 	(globalThis as Record<string, unknown>).AudioDecoder = MockAudioDecoder;
 	(globalThis as Record<string, unknown>).AudioEncoder = class {};
-	(globalThis as Record<string, unknown>).EncodedAudioChunk = class {};
+	(globalThis as Record<string, unknown>).EncodedAudioChunk = MockEncodedChunk;
 	MockContext.built = [];
 	MockContext.activation = false;
 	MockContext.grace = false;
@@ -482,6 +521,60 @@ test("a rendition that leaves the catalog and comes back keeps its arrival estim
 	root.set(rendition);
 	await flush();
 	expect(built.out.spread.peek()).toBe(measured);
+
+	close();
+	producer.close();
+});
+
+/** The endpoint a muting publisher writes: an empty codec payload, alone in its group. */
+function writeMarker(track: { writeGroup: (group: Group.Producer) => void }, sequence: number, timestamp: number) {
+	const group = new Group.Producer(sequence);
+	group.writeFrame({
+		payload: Varint.encode(timestamp),
+		timestamp: Time.Timestamp.fromMicros(timestamp as Time.Micro),
+	});
+	group.close();
+	track.writeGroup(group);
+}
+
+test("a publisher's mute and unmute play the resumed audio", async () => {
+	const producer = new MoqBroadcast.Producer();
+	const track = producer.createTrack("audio");
+	const { decoder: built, close } = decoder(true, { catalog: catalog(), active: producer.consume() });
+	await flush();
+
+	// Six 20ms frames, since the legacy warmup drops the first three decoder callbacks.
+	for (let i = 0; i < 6; i++) writeGroup(track, i, i * 20_000);
+	await sleep(60);
+	await flush();
+
+	const before = built.out.debug.peek();
+	expect(before?.buffered).toBeGreaterThan(0);
+	const playhead = built.out.timestamp.peek();
+	expect(playhead).toBeDefined();
+
+	// The microphone is muted: the endpoint says where the source stopped, alone in its group.
+	writeMarker(track, 6, 120_000);
+	await sleep(40);
+	await flush();
+
+	// Ten seconds later it is unmuted again. Nothing here is late and nothing is missing, so the
+	// resumed run has to play: the endpoint bounds the run it ended, not this one.
+	for (let i = 0; i < 6; i++) writeGroup(track, 7 + i, 10_000_000 + i * 20_000);
+	await sleep(120);
+	await flush();
+
+	expect(built.out.skipped.peek()).toBe(0);
+	const after = built.out.debug.peek();
+	expect(after?.buffered).toBeGreaterThan(0);
+
+	// The resumed run reached the ring. Applied to it instead, the endpoint trims every sample of
+	// it to nothing and the ring holds only what was there before the mute.
+	expect(built.out.buffered.peek().at(-1)?.start).toBeGreaterThanOrEqual(10_000 as Time.Milli);
+	// And the playhead followed it. Nothing drains the ring here, so it lands where the ring's
+	// capacity bounds it rather than on the resumed media itself.
+	expect(built.out.timestamp.peek()).toBeGreaterThan(playhead as Time.Milli);
+	expect(built.out.interrupted.peek()).toBe(false);
 
 	close();
 	producer.close();

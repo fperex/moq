@@ -414,8 +414,13 @@ export class Consumer {
 
 			this.#groups.shift();
 			this.#active = this.#groups[0]?.consumer.sequence;
+			// Everything the verdict was reached on, since the same line has to answer whether the
+			// group was actually late or merely long: what it still held, whether more was coming,
+			// and the three numbers the budget was compared against. Timestamps in microseconds.
 			console.warn(
-				`skipping slow group: track=${this.#track.name} ${first.consumer.sequence} -> ${this.#active}`,
+				`skipping slow group: track=${this.#track.name} ${first.consumer.sequence} -> ${this.#active} ` +
+					`first=${first.frames.at(0)?.timestamp ?? first.start} last=${first.latest} ` +
+					`${first.done ? "closed" : "open"} reach=${reach} live=${live} budget=${threshold}`,
 			);
 
 			const nextStart = this.#groups[0]?.frames.at(0)?.timestamp ?? this.#groups[0]?.end;
@@ -510,6 +515,10 @@ export class Consumer {
 	 * jumps relative to the previous call, re-apply startup delay and skip: it is a playhead
 	 * event, not a decoder flush.
 	 *
+	 * A media-less marker group raises that event on the result that closes it, after its
+	 * endpoint and any terminal packets behind it, so the endpoint ends the run it belongs to
+	 * rather than trimming the one that resumes.
+	 *
 	 * `continuous` is true when this result picks up exactly where the previous frame left off, so
 	 * the span between them can be treated as delivered. It is false on the first frame, after a
 	 * playhead event, and whenever the consumer threw content away to keep up: a slow group skipped
@@ -578,7 +587,6 @@ export class Consumer {
 					const seq = this.#groups[0].consumer.sequence;
 					const end = this.#format.end?.(frame);
 					if (end !== undefined) {
-						if (!this.#groups[0].media) this.#markPlayhead();
 						if (this.#liveEdge === undefined || end > this.#liveEdge.timestamp) {
 							this.#liveEdge = { group: seq, timestamp: end };
 						}
@@ -624,6 +632,11 @@ export class Consumer {
 					if (group) {
 						const seq = group.consumer.sequence;
 						if (group.truncated) this.#gap = true;
+						// A group that carried wire frames but no media is the publisher's declared
+						// break. Raised as the group closes rather than on the marker frame, so the
+						// endpoint still belongs to the run it ends and the reader only re-anchors
+						// once every terminal packet behind the marker has been delivered.
+						if (!group.empty && !group.media) this.#markPlayhead();
 						this.#updateBuffered();
 						return {
 							frame: undefined,

@@ -166,6 +166,12 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 	};
 
 	let declared = false;
+	// Media a declared pause means the publisher never sent, so it is neither audio the reader threw
+	// away nor audio it is still holding: it does not exist. The ring re-anchors on the far side of
+	// one, where an undeclared hole is stepped over and counted, so what the resume leaves behind
+	// (`unsent`) comes off the accounting below from then on.
+	let paused = 0;
+	let unsent = 0;
 	let outputFrame = 0;
 	let nextArrival = CHUNK / pace;
 	let shortQuanta = 0;
@@ -190,11 +196,16 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 			const missing = hole && written >= hole.from && written < hole.from + hole.frames;
 			if (missing) {
 				// A declared pause says so once, as the publisher's encoder stops.
-				if (script.hole?.declared && !declared) {
-					harness.end();
-					declared = true;
+				if (script.hole?.declared) {
+					if (!declared) {
+						harness.end();
+						declared = true;
+					}
+					paused += CHUNK;
 				}
 			} else {
+				// The first media past a declared pause re-anchors the ring, leaving the pause behind.
+				if (declared) unsent = paused;
 				harness.insert(written, CHUNK);
 				inserted = written + CHUNK;
 			}
@@ -214,7 +225,7 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 		// What the ring handed over is what was played, less the frames that were made up rather
 		// than read, plus what a stretch moved, plus what is still in flight, plus what a jump
 		// passed over or the writer dropped. `inserted - buffered` is READ.
-		const read = inserted - debug.buffered;
+		const read = inserted - debug.buffered - unsent;
 		const heard = debug.output - debug.concealed;
 		if (read !== heard + debug.stretched + debug.queued + debug.skipped + debug.discarded + debug.trimmed) {
 			balanced = false;

@@ -159,10 +159,6 @@ export class Encoder {
 	// reconfiguring it would be a retry, so the rendition stays down for the life of this encoder.
 	#fatal = new Signal<Error | undefined>(undefined);
 
-	// Whether the last run declared where its timeline stopped, so the next frame has to declare
-	// the break that reopens it. See the endpoint written when encoding stops.
-	#paused = false;
-
 	#signals = new Effect();
 
 	constructor(name: string, props?: EncoderProps) {
@@ -398,18 +394,8 @@ export class Encoder {
 						if (!producer) {
 							// Demand went away between framing and encoding, so this chunk is
 							// dropped like the ones the gate below never framed. Either way the
-							// timeline now has a hole in it. See that gate for why it has to be
-							// declared.
-							this.#paused = true;
+							// timeline now has a hole in it, which the subscriber detects itself.
 							return;
-						}
-
-						if (this.#paused) {
-							// The last run declared where the timeline stopped, which trims
-							// everything past it. Declare the break so a subscriber that heard the
-							// endpoint flushes what it holds and re-anchors on this frame.
-							producer.appendGroup().close();
-							this.#paused = false;
 						}
 
 						// Each audio frame is its own group so the relay can forward it without
@@ -435,9 +421,12 @@ export class Encoder {
 					// Muting stops the encoder without closing the track, and a subscriber has no
 					// way to tell audio that stopped from audio that is late: it conceals the gap,
 					// and keeps concealing. Say where the timeline stops instead, with the empty
-					// frame hang already defines as an endpoint. Closing discards whatever the
-					// codec still held, so the last chunk that reached the output callback is
-					// where it really stops. A reconfigure keeps encoding, so it declares nothing.
+					// frame hang already defines as an endpoint. Alone in its group it is also the
+					// discontinuity: it ends the run before it, and the next group opens a run it
+					// does not trim, so resuming writes media and nothing else. Closing discards
+					// whatever the codec still held, so the last chunk that reached the output
+					// callback is where it really stops. A reconfigure keeps encoding, so it
+					// declares nothing.
 					//
 					// Capture or its format going away stops the pipeline just as surely as muting
 					// does, and can happen while `enabled` stays true, so what decides this is
@@ -452,9 +441,6 @@ export class Encoder {
 						payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
 						timestamp: Time.Timestamp.fromMicros(end),
 					});
-					// An endpoint trims everything past it, so the run that resumes has to declare
-					// a break before its first frame.
-					this.#paused = true;
 				});
 
 				console.debug("encoding audio", encoderConfig);
@@ -469,16 +455,11 @@ export class Encoder {
 						for (const data of framer.push(input)) {
 							// The demand gate. The framer still consumes every sample so its timestamps stay
 							// on the capture clock, but there is nowhere to send a chunk with no subscriber.
-							if (!track.peek()) {
-								// The gap this leaves is a real break in the timeline, not a pause in
-								// delivery. Without declaring it, the first frame after the gate
-								// reopens reads as continuing the last one, and a subscriber holds it
-								// at the old anchor: its playhead ends up the whole gated interval
-								// behind. It is the same break a mute already declares below, and the
-								// pipeline outlives any one subscription, so nothing else notices.
-								this.#paused = true;
-								continue;
-							}
+							// The gap this leaves is a hole in the timeline rather than a declared
+							// pause, and a hole is the subscriber's to find: the first frame after
+							// the gate reopens sits a whole gated interval past the last one, which
+							// is what its decoder measures a break against.
+							if (!track.peek()) continue;
 
 							const joinedLength = data.channels.reduce((total, channel) => total + channel.length, 0);
 							const joined = new Float32Array(joinedLength);

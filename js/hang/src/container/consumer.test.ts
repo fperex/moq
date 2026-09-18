@@ -1630,11 +1630,82 @@ test("Consumer reports a marker group as a playhead event", async () => {
 
 	expect((await consumer.next())?.discontinuity).toBe(0);
 	expect((await consumer.next())?.discontinuity).toBe(0); // group 0 done
+
+	// The endpoint belongs to the run it ends, so it is delivered on that run's playhead.
+	const endpoint = await consumer.next();
+	expect(endpoint?.end).toBe(0 as Time.Micro);
+	expect(endpoint?.discontinuity).toBe(0);
+
+	// Closing the marker group is the event, once every terminal packet behind the marker is out.
 	const reset = await consumer.next();
 	expect(reset?.frame).toBeUndefined();
+	expect(reset?.end).toBeUndefined();
 	expect(reset?.discontinuity).toBe(1);
 	expect(reset?.continuous).toBe(false);
 	expect((await nextFrame(consumer))?.discontinuity).toBe(1);
+
+	consumer.close();
+});
+
+// A publisher muting and unmuting: an endpoint alone in its group, the empty group a resume used
+// to write, and then media seconds later. Every one of those is the publisher saying so, and none
+// of it is the consumer falling behind, so nothing may be convicted on the way through.
+test("Consumer delivers an endpoint, a break and the resumed media without a conviction", async () => {
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 135 as Time.Milli });
+
+	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro]);
+	await settle();
+	expect((await consumer.next())?.frame?.timestamp).toBe(0 as Time.Micro);
+	expect((await consumer.next())?.frame).toBeUndefined(); // group 0 done
+
+	writeMarkerGroup(track, 1, 20_000 as Time.Micro);
+	await settle();
+	const endpoint = await consumer.next();
+	expect(endpoint?.end).toBe(20_000 as Time.Micro);
+	expect(endpoint?.discontinuity).toBe(0);
+	expect((await consumer.next())?.discontinuity).toBe(1); // group 1 done: the playhead event
+
+	const empty = new Group.Producer(2);
+	track.writeGroup(empty);
+	empty.close();
+	writeGroupWithLegacyFrames(track, 3, [10_020_000 as Time.Micro]);
+	await settle();
+
+	const resumed = await nextFrame(consumer);
+	expect(resumed?.frame?.timestamp).toBe(10_020_000 as Time.Micro);
+	expect(resumed?.discontinuity).toBe(1);
+	expect(consumer.skipped.peek()).toBe(0);
+
+	consumer.close();
+});
+
+// The race the old order lost: `media` was read as the marker was delivered, so a codec's terminal
+// packets still in flight behind it made the group look media-less and raised the playhead on a run
+// that had not ended.
+test("Consumer does not raise the playhead for a marker whose group still receives media", async () => {
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 2_000 as Time.Milli });
+
+	const group = new Group.Producer(0);
+	track.writeGroup(group);
+	group.writeFrame({
+		payload: encodeLegacyFrame(20_000 as Time.Micro, new Uint8Array()),
+		timestamp: Time.Timestamp.fromMicros(20_000 as Time.Micro),
+	});
+	await settle();
+
+	const endpoint = await consumer.next();
+	expect(endpoint?.end).toBe(20_000 as Time.Micro);
+	expect(endpoint?.discontinuity).toBe(0);
+
+	group.writeFrame({ payload: encodeLegacy(20_000 as Time.Micro), timestamp: Time.Timestamp.now() });
+	group.close();
+	await settle();
+
+	expect((await consumer.next())?.frame?.timestamp).toBe(20_000 as Time.Micro);
+	expect((await consumer.next())?.frame).toBeUndefined(); // group 0 done
+	expect(consumer.discontinuity).toBe(0);
 
 	consumer.close();
 });
