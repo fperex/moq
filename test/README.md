@@ -8,8 +8,9 @@ tests live in each language's own justfile.
 | [smoke](smoke/README.md) | `just test smoke` | every client built from this checkout interoperates |
 | [wasm](wasm/README.md) | `just test wasm` | the `@moq/wasm` bindings work in a real browser |
 | [ts](ts/README.md) | `just test ts` | the subscriber's `export ts` output is IRD-compliant |
+| [audio-quality](audio-quality/README.md) | `just test audio-quality` | audio playout survives an impaired path |
 
-All three stand up a `moq-relay` and clients, so two of them running at once, or
+All of them stand up a `moq-relay` and clients, so two of them running at once, or
 the same one running from two worktrees, would otherwise collide. `lib/harness.sh`
 is what keeps them apart.
 
@@ -69,14 +70,18 @@ a running build fails it.
 
 ### Keeping a failure
 
+A failing run keeps its directory on its own, with its logs, configs, and
+`endpoints.txt`, and prints the path along with the command that reproduces the
+run. Nobody has to have predicted the failure to get the evidence for it.
+
 ```bash
 MOQ_TEST_KEEP=1 just test smoke
 ```
 
-The run directory survives with its logs, configs, and `endpoints.txt`, and the
-path is printed along with the command that reproduces the run. The children are
-still reaped and the ports still released: what is kept is evidence, not a live
-session. Remove it with the `rm -rf` the run prints; nothing expires it for you.
+The flag adds the passing case, for reading a run that worked. Either way the
+children are still reaped and the ports still released: what is kept is
+evidence, not a live session. Remove it with the `rm -rf` the run prints;
+nothing expires it for you.
 
 ## Worktrees
 

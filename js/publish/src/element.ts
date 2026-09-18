@@ -6,7 +6,7 @@
  * @module
  */
 import * as Moq from "@moq/net";
-import { Effect, Signal } from "@moq/signals";
+import { Effect, readonlys, Signal } from "@moq/signals";
 import * as Audio from "./audio";
 import { Broadcast } from "./broadcast";
 import * as Preview from "./preview";
@@ -23,8 +23,9 @@ export type SourceType = "camera" | "screen" | "file";
  * When to announce the broadcast.
  *
  * `always` announces immediately, `never` never announces, and `source` waits until media is
- * actually being captured (a live audio/video track, i.e. permission granted). Defaults to
- * `source` so we don't announce an empty broadcast with no audio/video.
+ * actually being captured (a live audio/video track, i.e. permission granted) and then holds until
+ * the selected source changes. Defaults to `source` so we don't announce an empty broadcast with no
+ * audio/video, while a device being switched or re-acquired keeps its subscribers.
  */
 export type AnnounceMode = "always" | "source" | "never";
 
@@ -132,6 +133,19 @@ export default class MoqPublish extends HTMLElement {
 	// Whether to advertise the broadcast, driven by the `announce` mode.
 	#announcing = new Signal(false);
 
+	#errors = {
+		video: new Signal<Error | undefined>(undefined),
+		audio: new Signal<Error | undefined>(undefined),
+	};
+
+	/**
+	 * Why capture is not running while it is switched on, or undefined while it is.
+	 *
+	 * The device could not be opened, or the pipeline reading it stopped. Something has to say so:
+	 * a black preview and a silent broadcast are what the user sees otherwise.
+	 */
+	readonly errors = readonlys(this.#errors);
+
 	/**
 	 * Effects scoped to this element's lifetime, closed on disconnect.
 	 *
@@ -166,12 +180,27 @@ export default class MoqPublish extends HTMLElement {
 
 		this.signals.run((effect) => {
 			const announce = effect.get(this.controls.announce);
-			// "source" waits until media is actually being captured -- a live audio or
-			// video track exists -- not merely a source *type* selected. Otherwise we'd
-			// announce an empty broadcast while the getUserMedia/getDisplayMedia
-			// permission prompt is still pending (or after the user denies it).
-			const hasMedia = effect.get(this.#videoSource) !== undefined || effect.get(this.#audioSource) !== undefined;
-			this.#announcing.set(announce === "always" || (announce === "source" && hasMedia));
+
+			// A fresh selection has captured nothing yet, so the latch below starts closed.
+			effect.get(this.controls.source);
+			let captured = false;
+
+			effect.run((effect) => {
+				// "source" waits until media is actually being captured -- a live audio or
+				// video track exists -- not merely a source *type* selected. Otherwise we'd
+				// announce an empty broadcast while the getUserMedia/getDisplayMedia
+				// permission prompt is still pending (or after the user denies it).
+				//
+				// It latches: once this selection has produced a track the broadcast stays
+				// announced until the selection changes. A track that stops is one source
+				// being switched or re-acquired, not the end of the broadcast, and an
+				// unannounce drops every subscription (catalog included) for the tenth of a
+				// second it takes to open the next device.
+				const hasMedia =
+					effect.get(this.#videoSource) !== undefined || effect.get(this.#audioSource) !== undefined;
+				captured ||= hasMedia;
+				this.#announcing.set(announce === "always" || (announce === "source" && captured));
+			});
 		});
 
 		this.capture = new Video.Capture({ source: this.#videoSource });
@@ -274,6 +303,29 @@ export default class MoqPublish extends HTMLElement {
 			console.warn('moq-publish: preview="encoded" requires a <canvas> element; showing the raw source.');
 		});
 
+		this.signals.run((effect) => {
+			const source = effect.get(this.sources.video);
+			const failed =
+				effect.get(this.#videoEnabled) && source instanceof Source.Camera
+					? effect.get(source.out.error)
+					: undefined;
+			if (failed) console.error(`moq-publish: camera unavailable: ${failed.message}`);
+
+			// The capture reports its own stall, loudly, so only the source is logged here.
+			effect.set(this.#errors.video, failed ?? effect.get(this.capture.out.stopped));
+		});
+
+		this.signals.run((effect) => {
+			const source = effect.get(this.sources.audio);
+			const failed =
+				effect.get(this.#audioEnabled) && source instanceof Source.Microphone
+					? effect.get(source.out.error)
+					: undefined;
+			if (failed) console.error(`moq-publish: microphone unavailable: ${failed.message}`);
+
+			effect.set(this.#errors.audio, failed);
+		});
+
 		this.signals.run(this.#runSource.bind(this));
 	}
 
@@ -308,19 +360,22 @@ export default class MoqPublish extends HTMLElement {
 		}
 	}
 
+	// Mirror the selected source into the capture inputs. Each mirror belongs to this run: on
+	// `this.signals` it would outlive the source it reads, so every switch would leave another one
+	// behind, holding a closed source alive and writing what it sees into the live capture.
 	#runSource(effect: Effect) {
 		const source = effect.get(this.controls.source);
 		if (!source) return;
 
 		if (source === "camera") {
 			const video = new Source.Camera({ enabled: this.#videoEnabled });
-			this.signals.run((effect) => {
+			effect.run((effect) => {
 				const source = effect.get(video.out.source);
 				this.#videoSource.set(source);
 			});
 
 			const audio = new Source.Microphone({ enabled: this.#audioEnabled });
-			this.signals.run((effect) => {
+			effect.run((effect) => {
 				const source = effect.get(audio.out.source);
 				this.#audioSource.set(source);
 			});
@@ -341,7 +396,7 @@ export default class MoqPublish extends HTMLElement {
 				enabled: this.#eitherEnabled,
 			});
 
-			this.signals.run((effect) => {
+			effect.run((effect) => {
 				const source = effect.get(screen.out.source);
 				if (!source) return;
 
@@ -374,7 +429,7 @@ export default class MoqPublish extends HTMLElement {
 
 			effect.set(this.sources.file, fileSource);
 
-			this.signals.run((effect) => {
+			effect.run((effect) => {
 				const source = effect.get(fileSource.out.source);
 				this.#videoSource.set(source.video);
 				this.#audioSource.set(source.audio);

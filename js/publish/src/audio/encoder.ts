@@ -373,6 +373,14 @@ export class Encoder {
 
 				const framer = createFramer(resolved, config.sampleRate);
 
+				// Where the audio written so far stops, so muting can say so on the wire. WebCodecs
+				// stamps a duration on the chunk it hands back; the configured frame is the
+				// fallback, which for a fixed-frame codec is its sample count.
+				const frameDuration =
+					resolved.frameDuration ??
+					Time.Micro.fromSecond((AAC_FRAME_SAMPLES / config.sampleRate) as Time.Second);
+				let end: Time.Micro | undefined;
+
 				const encoder = new AudioEncoder({
 					output: (frame, metadata) => {
 						if (frame.type !== "key") {
@@ -386,12 +394,22 @@ export class Encoder {
 							bytes: stats.bytes + frame.byteLength,
 						}));
 
+						const producer = track.peek();
+						if (!producer) {
+							// Demand went away between framing and encoding, so this chunk is
+							// dropped like the ones the gate below never framed. Either way the
+							// timeline now has a hole in it, which the subscriber detects itself.
+							return;
+						}
+
 						// Each audio frame is its own group so the relay can forward it without
 						// waiting for a group boundary. Loss is handled by the codec's PLC.
-						track.peek()?.writeFrame({
+						producer.writeFrame({
 							payload: Container.Legacy.encodeFrame(frame, frame.timestamp as Time.Micro),
 							timestamp: Time.Timestamp.fromMicros(frame.timestamp as Time.Micro),
 						});
+
+						end = (frame.timestamp + (frame.duration ?? frameDuration)) as Time.Micro;
 					},
 					error: (err) => {
 						console.error("encoder error", err);
@@ -403,6 +421,30 @@ export class Encoder {
 				// A fatal error already closed the codec, and closing it twice throws.
 				effect.cleanup(() => {
 					if (encoder.state !== "closed") encoder.close();
+
+					// Muting stops the encoder without closing the track, and a subscriber has no
+					// way to tell audio that stopped from audio that is late: it conceals the gap,
+					// and keeps concealing. Say where the timeline stops instead, with the empty
+					// frame hang already defines as an endpoint. Alone in its group it is also the
+					// discontinuity: it ends the run before it, and the next group opens a run it
+					// does not trim, so resuming writes media and nothing else. Closing discards
+					// whatever the codec still held, so the last chunk that reached the output
+					// callback is where it really stops. A reconfigure keeps encoding, so it
+					// declares nothing.
+					//
+					// Capture or its format going away stops the pipeline just as surely as muting
+					// does, and can happen while `enabled` stays true, so what decides this is
+					// whether anything is still feeding the encoder rather than the mute alone.
+					const capture = this.in.capture.peek();
+					const stopped = !this.in.enabled.peek() || !capture || !capture.out.format.peek();
+					if (end === undefined || !stopped) return;
+					const producer = track.peek();
+					if (!producer) return;
+
+					producer.writeFrame({
+						payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
+						timestamp: Time.Timestamp.fromMicros(end),
+					});
 				});
 
 				console.debug("encoding audio", encoderConfig);
@@ -417,6 +459,10 @@ export class Encoder {
 						for (const data of framer.push(input)) {
 							// The demand gate. The framer still consumes every sample so its timestamps stay
 							// on the capture clock, but there is nowhere to send a chunk with no subscriber.
+							// The gap this leaves is a hole in the timeline rather than a declared
+							// pause, and a hole is the subscriber's to find: the first frame after
+							// the gate reopens sits a whole gated interval past the last one, which
+							// is what its decoder measures a break against.
 							if (!track.peek()) continue;
 
 							const joinedLength = data.channels.reduce((total, channel) => total + channel.length, 0);
@@ -546,8 +592,9 @@ export function resolve(captured: Format, selected: Codec): Resolved {
 function createFramer(resolved: Resolved, sampleRate: number): Framer {
 	const config = resolved.catalog;
 
-	// WebCodecs copies input AudioData timestamps to encoded chunks. Align those inputs to codec frames
-	// because the worklet's 128-sample quanta usually do not align with Opus frame boundaries.
+	// Align the inputs to codec frames because the worklet's 128-sample quanta usually do not align
+	// with Opus frame boundaries. An encoded chunk's timestamp is the encoder's own continuous output
+	// clock, not a copy of one input's: several inputs can land in one packet.
 	if (config.codec.startsWith("mp4a")) {
 		return new Framer({
 			sampleRate,

@@ -1,8 +1,17 @@
 import type * as Catalog from "@moq/hang/catalog";
+import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
+import { STRETCH_BOUND } from "./playout";
 
-// AudioWorklet always renders in 128-sample quanta.
-const WORKLET_QUANTUM = 128;
+/**
+ * The AudioWorklet's render block, in samples. Fixed by the spec.
+ *
+ * The floor under any ring depth, since a ring shallower than one block can never be read from. It
+ * is this reader's own granularity rather than anything about the stream, so it stays out of the
+ * arrival estimate: native has no worklet, and a target series carrying the browser's render block
+ * could not be held to the same conformance corpus.
+ */
+export const WORKLET_QUANTUM = 128;
 const OPUS_FRAME_DURATION_MS = 20;
 const AAC_LC_FRAME_SAMPLES = 1024;
 const MP3_MPEG1_FRAME_SAMPLES = 1152;
@@ -40,15 +49,49 @@ export function playbackIdentity(config: Catalog.AudioConfig): PlaybackIdentity 
 	};
 }
 
-/** The jitter to add to the sync buffer for a rendition, in milliseconds. */
+/**
+ * The delay a rendition advertises, in milliseconds: the publisher's declared flush span.
+ *
+ * A declaration, not a measurement. It is where the playout estimator starts, and the first arrival
+ * it resamples replaces it outright, so it neither floors the target nor adds to it. The render
+ * quantum is the ring's granularity rather than the publisher's, and lives in the ring's slack.
+ */
 export function playbackJitter(config: Catalog.AudioConfig): Time.Milli {
 	// A publisher advertising 0 is claiming frames are never delayed, which no encoder can do, so
 	// fall back to the codec's frame duration the same way an absent field does.
-	const codecJitter = (config.jitter || defaultJitter(config)) ?? 0;
+	return Time.Milli((config.jitter || defaultJitter(config)) ?? 0);
+}
 
-	// Add the worklet render quantum so the ring buffer has margin between frame arrivals.
-	const overhead = Math.ceil((WORKLET_QUANTUM / config.sampleRate) * 1000);
-	return Time.Milli(codecJitter + overhead);
+/**
+ * The age budget for audio: the shared max age plus what the ring can absorb past it.
+ *
+ * The budget and the playout target measure the same path, so setting the budget to the target
+ * alone throws away the arrivals the target was sized to cover, and the estimator underneath it
+ * then only ever confirms the budget it was cut to.
+ *
+ * `instant` holds nothing, so there is nothing to absorb the difference with.
+ */
+export function audioMaxAge(maxAge: Time.Milli, config: Catalog.AudioConfig | undefined, instant: boolean): Time.Milli {
+	if (instant || !config) return maxAge;
+	return Time.Milli.add(maxAge, maxAgeHeadroom(config));
+}
+
+/**
+ * How much further than the playout target audio may arrive and still be played, in milliseconds.
+ *
+ * The age budget and the estimator measure the same path but round it differently, so a budget set
+ * to the target alone convicts the arrivals the target was sized to cover. Three terms separate
+ * them, and each is something the ring absorbs without dropping a sample: the estimator reports a
+ * bucket's upper edge, so the real delay sits up to one bucket below it; the ring holds one chunk on
+ * top of the target, because the target counts the frame being played; and the reader's time stretch
+ * plays the ring back onto that level across the stretch band rather than dropping what sits inside
+ * it.
+ */
+export function maxAgeHeadroom(config: Catalog.AudioConfig): Time.Milli {
+	// The codec's own frame duration, not the advertised flush span: a publisher batching ten
+	// frames per flush still delivers them one frame at a time to the ring.
+	const frame = defaultJitter(config) ?? config.jitter ?? 0;
+	return Time.Milli(Math.ceil(Container.Jitter.BUCKET + frame + STRETCH_BOUND));
 }
 
 // Estimate the minimum jitter (frame duration) based on the audio codec.

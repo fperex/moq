@@ -86,6 +86,12 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	const aRate2 = line(audioCard.grid, "Sample rate");
 	const aChannels = line(audioCard.grid, "Channels");
 	const aBitrate = line(audioCard.grid, "Bitrate");
+	const aUnderruns = line(audioCard.grid, "Underruns");
+	const aStretch = line(audioCard.grid, "Stretch");
+	const aConcealed = line(audioCard.grid, "Concealed");
+	const aSkipped = line(audioCard.grid, "Skipped");
+	const aTrimmed = line(audioCard.grid, "Trimmed");
+	const aClock = line(audioCard.grid, "Clock");
 	track(parent, audioCard, {
 		catalog: watch.audio.source.out.catalog,
 		flag: watch.controls.muted,
@@ -136,6 +142,38 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 		const aBitrate2 = aStats ? rate(aPrev, aStats.bytesReceived, now) : undefined;
 		aBitrate.textContent = aBitrate2 !== undefined ? formatBitrate(aBitrate2) : "—";
 		if (aStats) aPrev = { bytes: aStats.bytesReceived, when: now };
+
+		// A non-zero count means the target is below what arrivals actually need.
+		const aUnder = watch.audio.out.underruns.peek();
+		aUnderruns.textContent = watch.audio.out.stalled.peek() ? `${aUnder} (buffering)` : `${aUnder}`;
+
+		// How often the ring played the media slightly fast or slow to converge on the delay. A
+		// stream that shows these and no skips is converging the way it should.
+		const playout = watch.audio.out.debug.peek();
+		aStretch.textContent = playout ? `${playout.accelerates} / ${playout.expands}` : "—";
+
+		// Content lost above the decoder, which an underrun count alone cannot show: the ring
+		// never ran dry, the frames simply never got there. The ring's own jumps join it, since a
+		// listener cannot tell the two apart.
+		// Audio the reader made up because the ring had none, which is what an underrun sounds like
+		// now: the pitch of what was playing rather than a hole. The count of splices beside it says
+		// how many separate outages that covered.
+		const concealed = playout ? playout.concealed / (watch.audio.out.sampleRate.peek() ?? 48000) : undefined;
+		aConcealed.textContent =
+			concealed !== undefined ? `${(1000 * concealed).toFixed(0)}ms / ${playout?.merges}` : "—";
+
+		const jumped = playout ? playout.skips : 0;
+		aSkipped.textContent = `${watch.audio.out.skipped.peek() + jumped}`;
+
+		// Audio the ring dropped off its front as it started playing, before anything had been
+		// heard. A tune-in or an unmute admits whatever the relay had cached, and starting the
+		// playhead past it is silent where stretching it away is seconds of bent speech.
+		const trimmed = playout ? playout.trimmed / (watch.audio.out.sampleRate.peek() ?? 48000) : undefined;
+		aTrimmed.textContent = trimmed !== undefined ? `${(1000 * trimmed).toFixed(0)}ms` : "—";
+
+		// Which playhead paces everything else. "wall" means nothing is rendering on a clock of its
+		// own (video only, muted, or audio that stopped), so playback runs on wall time instead.
+		aClock.textContent = watch.sync.out.clock.peek() ?? "wall";
 
 		// Network. "Estimated max" is the congestion controller / PROBE estimate;
 		// "Actual" is the goodput we measure from the video + audio byte counters.

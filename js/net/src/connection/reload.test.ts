@@ -583,3 +583,56 @@ test("announced refuses a non-prefix scope before any session exists", () => {
 		reload.close();
 	}
 });
+
+test("a peer away longer than a relay restart is reconnected to", async () => {
+	const original = globalThis.WebTransport;
+	const url = new URL("https://example.com/");
+
+	// A clock the dials drive, so the peer can be away for 22s of simulated time
+	// while the test itself runs in milliseconds. The retry window is read off
+	// `performance.now()`, which is what makes this the window under test rather
+	// than a count of attempts.
+	let clock = 0;
+	const now = spyOn(performance, "now").mockImplementation(() => clock);
+
+	// Longer than a relay's own drain window plus the time its process takes to
+	// come back, which is the outage a live page has to ride out.
+	const AWAY = 11;
+	let dials = 0;
+	const stub = function StubWebTransport() {
+		dials += 1;
+		if (dials <= AWAY) {
+			clock += 2000;
+			return {
+				// `ready` rejecting is a refused dial; `closed` never settles, since the
+				// caller only reaches it once the transport is up.
+				ready: Promise.reject(new Error("connection refused")),
+				closed: new Promise<void>(() => {}),
+				close() {},
+			};
+		}
+		const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+		void accept(pair.server, url);
+		return pair.client;
+	};
+	globalThis.WebTransport = stub as unknown as typeof WebTransport;
+
+	// The default retry window, which is the one a page runs on. Only the delays are
+	// shortened: the test must not sleep out the backoff it is not measuring.
+	const reload = new Reload({
+		enabled: true,
+		url,
+		websocket: { enabled: false },
+		delay: { initial: Time.Milli(1), multiplier: 1, max: Time.Milli(1) },
+	});
+
+	try {
+		await waitUntil(() => reload.established.peek() !== undefined);
+		expect(reload.error.peek()).toBeUndefined();
+		expect(dials).toBeGreaterThan(AWAY);
+	} finally {
+		reload.close();
+		now.mockRestore();
+		globalThis.WebTransport = original;
+	}
+});

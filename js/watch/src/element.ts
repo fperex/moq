@@ -26,6 +26,7 @@ const OBSERVED = [
 	"reload",
 	"delay",
 	"buffer",
+	"conceal",
 	// Released spellings, kept parsing but off the documented surface. `latency-max` is absent
 	// deliberately: its old ceiling included the floor, so translating it faithfully would mean
 	// tracking the resolved delay reactively, which is the coupling `buffer` exists to remove.
@@ -85,12 +86,16 @@ function coerceLegacyDelay(value: unknown): Delay {
 
 // The released spellings of `delay`, in bare milliseconds. Kept unitless so pages still on them
 // behave exactly as they did; `delay` is the current surface and does require a unit.
-function parseLegacyDelay(value: string | null): Delay {
+function parseLegacyDelay(name: string, value: string | null): Delay {
 	const trimmed = value?.trim();
 	if (!trimmed || trimmed === "real-time") return "auto";
 	if (trimmed === "instant") return "instant";
 	const parsed = Number.parseFloat(trimmed);
-	return Moq.Time.Milli(Number.isFinite(parsed) ? parsed : 100);
+	if (Number.isFinite(parsed)) return Moq.Time.Milli(parsed);
+	// Falls back to the element's default, like every other attribute. It used to land on a silent
+	// 100ms, which is neither what the page asked for nor what the element does without it.
+	console.warn(`moq-watch: invalid ${name}="${value}", expected "auto", "instant", or milliseconds`);
+	return "auto";
 }
 
 /**
@@ -166,11 +171,16 @@ export default class MoqWatch extends HTMLElement {
 	// Broadcast configuration owned here and wired into `broadcast` as inputs.
 	#name = new Signal<Moq.Path.Valid>(Moq.Path.empty());
 	#reload = new Signal(true);
+	#conceal = new Signal(true);
 	#catalogFormat = new Signal<CatalogFormat | undefined>(undefined);
 	#catalog = new Signal<Catalog.Root | undefined>(undefined);
 
 	// The canvas element to render into.
 	#canvas = new Signal<HTMLCanvasElement | undefined>(undefined);
+
+	// Re-resolve the canvas child and republish it. Held so `connectedCallback` can re-arm the
+	// renderer's download gate; the constructor owns the closure.
+	#setCanvas?: (force?: boolean) => void;
 
 	// The overlay element captions are drawn into, created lazily on connect (custom elements may not
 	// touch children in their constructor). Positioned to fill the element, above the canvas.
@@ -238,22 +248,21 @@ export default class MoqWatch extends HTMLElement {
 		});
 		this.signals.cleanup(() => this.text.close());
 
-		// The video decoder owns rendition handoffs but also needs Sync. Bridge its output through a
-		// parent-owned signal so Sync can be constructed first without exposing mutable wiring.
-		const videoJitter = new Signal<Time.Milli | undefined>(undefined);
-
 		this.sync = new Sync({
 			delay: this.controls.delay,
 			buffer: this.controls.buffer,
-			probe: this.connection.probe,
-			video: videoJitter,
-			audio: audioSource.out.jitter,
 		});
 		this.signals.cleanup(() => this.sync.close());
 
+		// The decoders own rendition handoffs and measure how late frames arrive, but they need Sync
+		// to exist first, so its per-track handles are what they wire into.
 		this.video = new Video.Decoder(videoSource, this.sync, { enabled: this.#videoEnabled });
-		this.signals.proxy(videoJitter, this.video.out.jitter);
-		this.audio = new Audio.Decoder(audioSource, this.sync, { enabled: this.#audioEnabled });
+		this.signals.proxy(this.sync.track("video").spread, this.video.out.spread);
+		this.audio = new Audio.Decoder(audioSource, this.sync, {
+			enabled: this.#audioEnabled,
+			conceal: this.#conceal,
+		});
+		this.signals.proxy(this.sync.track("audio").spread, this.audio.out.spread);
 		this.signals.cleanup(() => {
 			this.video.close();
 			this.audio.close();
@@ -333,7 +342,14 @@ export default class MoqWatch extends HTMLElement {
 		});
 
 		// Watch to see if the canvas element is added or removed.
-		const setCanvas = () => {
+		//
+		// `force` republishes an unchanged canvas. The renderer's download gate is an
+		// IntersectionObserver armed on this node, and an observer armed on a node that is not in a
+		// document reports it as not intersecting with nothing to re-check when it lands in one.
+		// A page that re-appends its tiles to reorder them moves the node, which is the same story
+		// with the same answer. So `connectedCallback` republishes: the canvas object has not
+		// changed, but where it sits has, and where it sits is the whole of what the gate reads.
+		const setCanvas = (force = false) => {
 			const canvas = this.querySelector("canvas") ?? undefined;
 
 			// A <video> child used to render via MSE. Nothing renders it now, and audio still plays,
@@ -342,13 +358,17 @@ export default class MoqWatch extends HTMLElement {
 				console.warn("moq-watch: rendering requires a <canvas> child; a <video> child does nothing.");
 			}
 
-			this.#canvas.set(canvas);
+			this.#canvas.set(canvas, force || undefined);
 		};
+		this.#setCanvas = setCanvas;
 
-		const observer = new MutationObserver(setCanvas);
+		const observer = new MutationObserver(() => setCanvas());
 		observer.observe(this, { childList: true, subtree: true });
 		this.signals.cleanup(() => observer.disconnect());
 		setCanvas();
+		// A custom element may not touch its children in the constructor, so a page that appends
+		// the canvas after `createElement` arms the gate on a detached node. `connectedCallback`
+		// is what fixes that up.
 
 		// Optionally update attributes to match the library state.
 		// This is kind of dangerous because it can create loops.
@@ -440,6 +460,11 @@ export default class MoqWatch extends HTMLElement {
 		this.style.display = "block";
 		this.style.position = "relative";
 
+		// Re-arm the renderer's download gate on this node's new place in the document. See
+		// `setCanvas`: without it a tile built before it was inserted, or moved by a page
+		// reordering its tiles, downloads audio and never asks for video again.
+		this.#setCanvas?.(true);
+
 		// Create the caption overlay once, on first connect (the constructor may not add children).
 		if (!this.#captionsOverlayEl) {
 			const overlay = document.createElement("div");
@@ -457,6 +482,10 @@ export default class MoqWatch extends HTMLElement {
 	disconnectedCallback() {
 		// Stop everything but don't actually cleanup just in case we get added back to the DOM.
 		this.#enabled.set(false);
+
+		// A canvas out of the document is not on screen, so the download gate closes with it. The
+		// element keeps the child; `connectedCallback` republishes it.
+		this.#canvas.set(undefined);
 	}
 
 	attributeChangedCallback(name: Observed, oldValue: string | null, newValue: string | null) {
@@ -483,8 +512,10 @@ export default class MoqWatch extends HTMLElement {
 			this.controls.delay.set(parseDelay(newValue));
 		} else if (name === "buffer") {
 			this.controls.buffer.set(parseBuffer(newValue));
+		} else if (name === "conceal") {
+			this.#conceal.set(parseBoolean(newValue, true));
 		} else if (name === "latency" || name === "latency-min" || name === "jitter") {
-			this.controls.delay.set(parseLegacyDelay(newValue));
+			this.controls.delay.set(parseLegacyDelay(name, newValue));
 		} else if (name === "catalog-format") {
 			this.#catalogFormat.set(parseCatalogFormat(newValue));
 		} else if (name === "captions") {
@@ -552,10 +583,19 @@ export default class MoqWatch extends HTMLElement {
 		this.#reload.set(value);
 	}
 
+	/** Whether a gap in the audio is concealed rather than played as a gap. See {@link Audio.DecoderInput.conceal}. */
+	get conceal(): boolean {
+		return this.#conceal.peek();
+	}
+
+	set conceal(value: boolean) {
+		this.#conceal.set(value);
+	}
+
 	/**
 	 * How far playback trails the live edge, in milliseconds. See {@link Delay}.
 	 *
-	 * `"auto"` (the default) sizes the jitter buffer from the connection RTT. `"instant"` drops the
+	 * `"auto"` (the default) sizes the jitter buffer from how late frames arrive. `"instant"` drops the
 	 * clock instead: video paints the moment it decodes and audio is disabled.
 	 */
 	get delay(): Delay {

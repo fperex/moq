@@ -20,7 +20,12 @@ export interface CameraProps extends Inputs<CameraInput> {
 type CameraOutput = {
 	// The live camera track, or undefined while disabled or denied.
 	source: Signal<Video.Source | undefined>;
+	// Why there is no track while the camera is enabled, or undefined while it is capturing.
+	error: Signal<Error | undefined>;
 };
+
+// A capture attempt: the stream the browser handed over, or why it would not.
+type Attempt = { stream: MediaStream; error?: undefined } | { stream?: undefined; error: unknown };
 
 /** Captures video from a camera, tracking the available devices. */
 export class Camera {
@@ -46,11 +51,19 @@ export class Camera {
 
 	readonly #out: CameraOutput = {
 		source: new Signal<Video.Source | undefined>(undefined),
+		error: new Signal<Error | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
 	#signals = new Effect();
-	#retry = new Retry();
+	#retry = new Retry(this.#out.error);
+
+	// The release of the capture the previous run held, awaited before the next attempt.
+	//
+	// A browser only starts handing the device back at `stop()`, and this effect's cleanup is not
+	// ordered against the next run's `getUserMedia` at all: hiding video while an attempt is still
+	// in flight and showing it again asks for a device we have not released yet.
+	#released: Promise<void> = Promise.resolve();
 
 	constructor(props?: CameraProps) {
 		this.in = {
@@ -95,31 +108,42 @@ export class Camera {
 		};
 
 		effect.spawn(async () => {
-			const media = navigator.mediaDevices.getUserMedia({ video: finalConstraints }).catch(() => undefined);
-
-			// If the effect is cancelled for any reason (ex. cancel), stop any media that we got.
-			effect.cleanup(() =>
-				media.then((media) =>
-					media?.getTracks().forEach((track) => {
-						track.stop();
-					}),
-				),
-			);
-
-			const stream = await Promise.race([media, effect.cancel]);
-
-			// A torn-down run is not a failed attempt: whatever cancelled it reruns us.
+			// Let go of the last capture before asking for a device again: the browser is still
+			// holding it otherwise, and it answers that with a failure like any other.
+			await Promise.race([this.#released, effect.cancel]);
 			if (effect.abort.aborted) return;
 
-			if (!stream) return this.#retry.failed();
+			const media = navigator.mediaDevices
+				.getUserMedia({ video: finalConstraints })
+				.then((stream): Attempt => ({ stream }))
+				.catch((error: unknown): Attempt => ({ error }));
 
-			const source = stream.getVideoTracks()[0] as Video.StreamTrack | undefined;
+			// If the effect is cancelled for any reason (ex. cancel), stop any media that we got,
+			// and keep the release for the next attempt to wait on.
+			effect.cleanup(() => {
+				this.#released = media.then(({ stream }) => {
+					stream?.getTracks().forEach((track) => {
+						track.stop();
+					});
+				});
+			});
+
+			const attempt = await Promise.race([media, effect.cancel]);
+
+			// A torn-down run is not a failed attempt: whatever cancelled it reruns us.
+			if (effect.abort.aborted || !attempt) return;
+
+			if (!attempt.stream) return this.#retry.failed(attempt.error);
+
+			const source = attempt.stream.getVideoTracks()[0] as Video.StreamTrack | undefined;
 
 			// getUserMedia resolved, so we have permission even if no track came back.
 			effect.cleanup(this.device.capture(source?.getSettings().deviceId));
 
 			// A track that arrives dead already fired "ended", so nothing would ever rerun us.
-			if (!source || source.readyState === "ended") return this.#retry.failed();
+			if (!source || source.readyState === "ended") {
+				return this.#retry.failed(new Error("the camera produced no live track"));
+			}
 
 			this.#retry.succeeded(effect, source);
 			effect.set(this.#out.source, source);

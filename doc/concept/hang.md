@@ -130,7 +130,12 @@ as metadata and never pass it to a decoder. This lets a group close immediately
 without waiting for the next frame. Audio has codec-defined durations, and CMAF
 carries sample durations directly, so neither needs per-group duration markers.
 Audio retains its separate terminal marker before codec drain packets, allowing
-consumers to discard encoder padding beyond the source endpoint. LOC readers
+consumers to discard encoder padding beyond the source endpoint. It bounds the
+source, not the track: a publisher that stops capturing (a muted microphone)
+declares one so a consumer renders silence instead of concealing a gap nobody
+will fill. Alone in its group that endpoint is the discontinuity marker: it
+closes the run before it, and the next group opens a run it does not trim, with
+any terminal packets following it in the same group. LOC readers
 also skip empty payloads; LOC writers wait for the compatibility release before
 emitting markers. Empty payloads on data tracks remain data, including empty
 text cues.

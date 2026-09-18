@@ -1,0 +1,23 @@
+# Relay config for the audio quality harness.
+# Anonymous access, self-signed localhost cert, QUIC + HTTP on 127.0.0.1:4443.
+#
+# run.sh rewrites the port into a scratch copy. The browser reaches this relay through the shaper on
+# a different port and pins the certificate by its hash, fetched over the shaper's TCP passthrough
+# from /certificate.sha256, so the port change needs nothing here.
+
+[log]
+level = "info"
+
+[server]
+# QUIC on UDP. 127.0.0.1 avoids IPv6 flakiness on CI runners.
+listen = "127.0.0.1:4443"
+tls.generate = ["localhost", "127.0.0.1"]
+
+[web.http]
+# HTTP on TCP, serving /certificate.sha256 so the browser can pin the self-signed cert via
+# WebTransport's serverCertificateHashes.
+listen = "127.0.0.1:4443"
+
+[auth]
+# Allow anonymous access to everything.
+public = "**"

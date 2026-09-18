@@ -4,7 +4,7 @@
  * @module
  */
 import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
-import { FrameTooLarge, GroupTooLarge, Lagged } from "./error.ts";
+import { Expired, FrameTooLarge, GroupTooLarge, Lagged } from "./error.ts";
 import { hooks, type ReadGroupFrame } from "./internal.ts";
 import { Timestamp } from "./time.ts";
 
@@ -48,13 +48,14 @@ export interface Info {
 }
 
 /**
- * Thrown by a frame read when the reader asked for a frame the group never held, and by a
- * frame write when the frame or the group exceeds its cache budget.
+ * Thrown by a frame read when the reader asked for a frame the group never held or the
+ * subscription's max age budget gave up on it, and by a frame write when the frame or the
+ * group exceeds its cache budget.
  *
- * All three carry a moq-lite stream code, and a peer's reset with one decodes back into the
+ * All four carry a moq-lite stream code, and a peer's reset with one decodes back into the
  * same class.
  */
-export { FrameTooLarge, GroupTooLarge, Lagged } from "./error.ts";
+export { Expired, FrameTooLarge, GroupTooLarge, Lagged } from "./error.ts";
 
 /** Reactive backing state shared by the group producer and one consumer. */
 class GroupState {
@@ -419,7 +420,7 @@ export class Consumer {
 		if (!this.#expiry?.expired()) return false;
 
 		if (unread) {
-			this.#terminal = new Error("group exceeded the subscription max age budget");
+			this.#terminal = new Expired();
 		} else {
 			this.#ended = true;
 		}

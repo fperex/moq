@@ -30,10 +30,11 @@ in sync at the latency you ask for.
 | --- | --- |
 | `url`, `name` | Relay URL (with `?jwt=` if needed) and broadcast name. |
 | `paused`, `muted`, `volume` | The usual player controls, mirrored as reactive properties. |
-| `delay` | How far playback trails the live edge: `"auto"` (derived from RTT, the default), a duration like `"300ms"`, or `"instant"` to paint frames as they decode with no pacing at all. |
+| `delay` | How far playback trails the live edge: `"auto"` (the default, sized from how late frames actually arrive), a duration like `"300ms"` which is the whole delay, or `"instant"` to paint frames as they decode with no pacing at all. |
 | `buffer` | Future-dated media held beyond the live edge before playback skips ahead, e.g. `"30s"`. Defaults to none. |
+| `conceal` | Cover a gap in the audio with synthesized audio instead of playing it as a gap (default on). `conceal="false"` leaves the loss audible, for a listener who would rather hear it than hear invented audio. Read when the audio graph is built. |
 | `captions` | The caption track to show, or absent for off. `el.text.out.available` lists the renditions for a picker. |
-| `jitter` | The jitter buffer in ms. |
+| `jitter` | The jitter buffer in ms: in `"auto"` this is the measured arrival spread, read-only in practice. |
 | `visible` | Only subscribe to video while the element is on screen: a margin (`"20%"` default, `"200px"`), `"always"`, or `"never"`. |
 | `reload` | Wait for the broadcast to be announced before subscribing (default on), so a player can be mounted before the stream exists. |
 | `catalog-format` | `hang` (default, from the `.hang` suffix), `hangz` (compressed), `msf`, or `manual` to supply the catalog yourself. |
@@ -146,6 +147,75 @@ const broadcast = new Watch.Broadcast({ origin: connection.origin, name: Moq.Pat
 `Audio.Emitter` are the pieces the element assembles; every input and output
 is a signal from [`@moq/signals`](/lib/js/signals). Load from a CDN
 (`https://esm.sh/@moq/watch/element`) for a no-build embed.
+
+## Keeping tracks together
+
+`Watch.Sync` is the clock the tracks render against. It takes the playback
+settings, `delay` and `buffer`, and nothing else; each track is wired through a
+handle of its own:
+
+```ts
+const sync = new Watch.Sync({ delay: "auto" });
+
+const audio = sync.track("audio");
+audio.spread; // how late its frames actually arrived
+```
+
+`"auto"` is that measurement, the largest across every track;
+`sync.track("text")` joins on the same footing. What the selected rendition
+says it flushes at once is not a second term: it is the same quantity measured
+by the publisher, so it is where the measurement starts (the container
+consumer's `jitter`) and the arrivals take it from there, up or down. A fixed
+`delay` is exactly the number asked for, with nothing added to it.
+
+While audio plays, its ring publishes where it is (`audio.clock`) and
+everything else is paced against that: `sync.wait()` for video frames,
+`sync.now()` for captions. A ring that re-buffers parks its playhead, and
+video parks with it instead of running away from the audio you can hear. Mute
+the player or end the track and the clock is handed back to the wall clock
+where the playhead left it, so nothing jumps. `sync.out.clock` names whichever
+track is driving, or is empty while playback runs on wall time.
+
+## Converging on the delay
+
+The audio ring is almost never exactly on its target: a publisher that flushes
+several frames at once fills it in steps, the network moves the arrivals around,
+and the target itself follows what arrives. Rather than jump, the ring plays the
+media very slightly faster or slower until it is back where it belongs, the way
+WebRTC's NetEq does. Each correction drops or repeats one pitch period, at most
+15ms per 100ms of audio and only where the waveform repeats, so convergence is
+inaudible.
+
+Skipping ahead is left for what the stretch cannot close in half a second.
+`audio.out.underruns` counts the times the ring ran dry, and the stats panel
+shows the corrections beside it: `Stretch` counts the blocks played fast and then
+the blocks played slow, and `Skipped` what was thrown away. A healthy stream
+shows corrections and no skips; skips mean the delay is moving faster than the
+stretch can follow.
+
+## Covering what never arrived
+
+A stretch bends a few percent, so it cannot cover a packet that is a whole
+hundred milliseconds late or a group the network gave up on. Rather than play the
+hole as silence, the player carries the audio on: it takes the pitch period of
+the last real audio, repeats it, and fades it out if the outage runs on, the way
+WebRTC's NetEq conceals one. When the media comes back it is lined up against the
+concealment and crossfaded in, so neither end of the outage is a click. The fade
+ends in digital silence rather than in room tone, which is what the pinned
+Chromium tree does and what tells a paused talker apart from a dead stream; a
+publisher that means to pause says so on the wire instead, and the player renders
+that as silence with no concealment at all.
+
+The stats panel's `Concealed` row is how much audio was invented and how many
+separate outages that covered. Turn it off with `conceal` on the audio decoder
+and a gap is a gap again, audibly:
+
+```ts
+new Watch.Audio.Decoder(source, sync, { conceal: false });
+```
+
+It is read when the audio graph is built, since it belongs to the reader inside
+the worklet.
 
 ## Buffered playback
 

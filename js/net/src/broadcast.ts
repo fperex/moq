@@ -52,13 +52,16 @@ function closeState(state: BroadcastState, abort?: Error) {
 	});
 }
 
-// `register` is set on the subscribing (consumer) side: the fresh producer is cached in
-// `state.tracks` so repeat subscriptions to the same track fan out from one upstream subscription
-// instead of opening a new one, mirroring the Rust `broadcast::Consumer::track` weak-dedup. The
-// consumer wire watches the producer's demand ({@link track.Producer.used}) and tears the upstream
-// down once its last subscriber leaves, closing the producer, which evicts the cache entry below.
-// The publishing side leaves `register` false: `state.tracks` there holds only the tracks the app
-// inserted, and a dynamic serve stays one request per peer subscription.
+// `register` caches the fresh producer in `state.tracks`, so repeat subscriptions to the same track
+// fan out from one upstream subscription instead of opening a new one, mirroring the Rust
+// `broadcast::Consumer::track` weak-dedup. The wire watches the producer's demand ({@link
+// track.Producer.used}) and tears the upstream down once its last subscriber leaves, closing the
+// producer, which evicts the cache entry below.
+//
+// Only {@link Consumer.subscribe} sets it, and both wire layers reach a broadcast through a
+// `Consumer`: the subscribing side over the network, and the publishing side over
+// {@link Producer.consume}, which shares this same state. A second peer subscribing to a track
+// already being served therefore shares the one producer instead of raising another request.
 function subscribe(
 	state: BroadcastState,
 	name: string,
@@ -223,12 +226,12 @@ export class Producer implements track.Broadcast {
 		this.#state.tracks.delete(name);
 	}
 
-	/** Open a live subscription to a track. Used by the publishing wire layer. */
+	/** Open a live subscription to a track. Used by {@link Producer.track}, a local read handle. */
 	subscribe(name: string, options?: track.Subscription): track.Subscriber {
 		return subscribe(this.#state, name, options);
 	}
 
-	/** Resolve a track's immutable info. Used by the publishing wire layer. */
+	/** Resolve a track's immutable info. Used by a local reader of this broadcast. */
 	resolveTrackInfo(name: string): Promise<track.Info> {
 		return resolveTrackInfo(this.#state, name);
 	}
@@ -334,7 +337,7 @@ export class Consumer implements track.Broadcast {
 		return new track.Consumer(name, this);
 	}
 
-	/** Open a live subscription to a track. Used by the subscribing wire layer. Repeat subscriptions to the same track share one upstream subscription. */
+	/** Open a live subscription to a track. Used by both wire layers. Repeat subscriptions to the same track share one upstream subscription. */
 	subscribe(name: string, options?: track.Subscription): track.Subscriber {
 		return subscribe(this.#state, name, options, true);
 	}

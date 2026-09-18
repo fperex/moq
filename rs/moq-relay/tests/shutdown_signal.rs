@@ -17,6 +17,7 @@
 use std::{net::TcpListener, time::Duration};
 
 use moq_relay::{Config, Relay, auth};
+use moq_tokio::moq_net::Hop;
 
 /// Long enough that "exited immediately" and "waited out the window" cannot be
 /// confused, short enough to keep the test quick: `Relay::run` sleeps this plus
@@ -104,6 +105,141 @@ async fn sigint_drains_sessions_before_exiting_inner() {
 		"relay exited after {:?}, short of the {DRAIN_TIMEOUT:?} drain window",
 		signalled.elapsed()
 	);
+}
+
+/// A draining relay refuses a new session instead of accepting one and waving it
+/// straight back out.
+///
+/// The regression it guards: the accept loop ran for the whole drain window, so a
+/// client redialing during a restart was handed a session that was GOAWAYed a
+/// millisecond later. Its reconnect loop scored each one as a failed attempt,
+/// retired the predecessor that was still serving its media, and gave up inside
+/// the window, which is how a relay restart killed every native publisher on it.
+#[test]
+fn a_draining_relay_refuses_a_new_session() {
+	// Same reason as above: a `Connection` carrying every transport backend
+	// overflows libtest's per-test stack in an unoptimized build.
+	std::thread::Builder::new()
+		.stack_size(32 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("build test runtime")
+				.block_on(a_draining_relay_refuses_a_new_session_inner());
+		})
+		.expect("spawn test thread")
+		.join()
+		.expect("test thread panicked");
+}
+
+async fn a_draining_relay_refuses_a_new_session_inner() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+	let (port, config) = relay_config();
+	let relay = Relay::load(config).await.expect("load relay");
+	// The embedder's trigger rather than a signal: the drain is the same one, and
+	// this test is about what the listeners answer during it.
+	let origin = relay.cluster().origin.clone();
+	let trigger = relay.shutdown_trigger().clone();
+	let run = tokio::spawn(relay.run());
+	wait_listening(port).await;
+
+	// Something for a session to be served, so the drain below cannot land while
+	// the first handshake is still in flight: a session the listener has taken but
+	// not yet admitted is refused rather than drained, which is right but is not
+	// what this test is about.
+	let broadcast = origin.create_broadcast("test").expect("create broadcast");
+	broadcast.announce(Default::default()).expect("announce");
+
+	let mut client_config = moq_tokio::connect::Config::default();
+	client_config.tls.insecure = Some(true);
+	let client = client_config.init(Default::default()).expect("client init");
+	let url: url::Url = format!("tcp://127.0.0.1:{port}/").parse().expect("parse url");
+
+	// One-shot throughout: this is about how a dial is answered, not about what a
+	// reconnect loop makes of the answer.
+	let subscriber = moq_tokio::origin::spawn(Hop::random());
+	let consumer = subscriber.consume();
+	let mut announced = consumer.announced();
+	let connection = client
+		.clone()
+		.with_reconnect(false)
+		.with_subscriber(subscriber)
+		.connect(url.clone())
+		.established()
+		.await
+		.expect("connect");
+	let draining = connection.draining().expect("connected");
+
+	// The announcement crossing the session is the relay serving it, which is the
+	// state the drain has to find for a GOAWAY to be the answer.
+	let update = tokio::time::timeout(Duration::from_secs(5), announced.next())
+		.await
+		.expect("announcement timed out")
+		.expect("origin closed");
+	assert!(update.active, "expected an announce, got a retraction");
+
+	trigger.start();
+	let goaway = tokio::time::timeout(Duration::from_secs(5), draining.recv())
+		.await
+		.expect("no GOAWAY within 5s of the trigger")
+		.expect("session closed without a GOAWAY");
+	assert_eq!(goaway.uri, "", "expected a reconnect-to-me GOAWAY");
+
+	// Mid-window the listener is still up, so the refusal below is the relay's
+	// answer rather than the socket being gone.
+	tokio::net::TcpStream::connect(("127.0.0.1", port))
+		.await
+		.expect("the listener closed inside the drain window");
+
+	// So a dial is answered, and the answer must never be a session that serves.
+	let dialed = tokio::time::timeout(
+		Duration::from_secs(5),
+		client.with_reconnect(false).connect(url).established(),
+	)
+	.await
+	.expect("the second dial never settled");
+
+	// A transport carrying an HTTP response reports the refusal as the dial's
+	// answer. A plain stream transport takes the bytes first, so the same refusal
+	// lands as the session closing on arrival, which is what a reconnect loop
+	// scores as a severed connection. What must hold on both: nothing that serves,
+	// and no GOAWAY, which is the message that would cost the loop its predecessor.
+	match dialed {
+		Err(err) => {
+			if let Some(status) = err.status() {
+				assert_eq!(status, 503, "refused with status {status} rather than a retryable 503");
+			}
+		}
+		Ok(refused) => {
+			let drained = refused.draining();
+			assert!(
+				tokio::time::timeout(Duration::from_secs(2), refused.closed())
+					.await
+					.is_ok(),
+				"a draining relay left a new session open"
+			);
+			assert!(
+				drained.and_then(|goaway| goaway.peek()).is_none(),
+				"a draining relay sent a GOAWAY to a session it refused"
+			);
+		}
+	}
+
+	// Refusing new sessions must not cut the drain short for the one already being
+	// served: the window is what a live publisher rides out.
+	assert!(
+		!run.is_finished(),
+		"relay exited inside the {DRAIN_TIMEOUT:?} drain window"
+	);
+	drop(connection);
+
+	tokio::time::timeout(Duration::from_secs(15), run)
+		.await
+		.expect("relay never exited after the drain window")
+		.expect("relay task panicked")
+		.expect("relay exited with an error");
 }
 
 /// A stream-only relay on a free loopback TCP port, fully public, with a short

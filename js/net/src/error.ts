@@ -148,9 +148,9 @@ export interface StreamErrorOptions {
  *
  * This surfaces on every transport, so catch this type rather than feature-detecting
  * `WebTransportError`, which a non-browser runtime never defines and the WebSocket fallback
- * never throws. Local conditions with a code of their own subclass it ({@link Lagged},
- * {@link FrameTooLarge}, {@link GroupTooLarge}, {@link NotFound}), so the same `code` check catches a condition
- * whether it was raised here or reported by the peer.
+ * never throws. Local conditions with a code of their own subclass it ({@link Expired},
+ * {@link Lagged}, {@link FrameTooLarge}, {@link GroupTooLarge}, {@link NotFound}), so the same
+ * `code` check catches a condition whether it was raised here or reported by the peer.
  *
  * ```ts
  * try {
@@ -175,6 +175,25 @@ export class StreamError extends Error {
 		);
 		this.name = "StreamError";
 		this.code = code;
+	}
+}
+
+/**
+ * The content missed its delivery deadline, so what was still unread is gone.
+ *
+ * Raised locally when a subscription's max age budget gives up on a group that still held
+ * content, and decoded from a moq-lite peer's `DELIVERY_TIMEOUT` reset, since a deadline the
+ * sender gave up on truncates the reader the same way.
+ *
+ * @public
+ */
+export class Expired extends StreamError {
+	constructor(options?: { cause?: unknown }) {
+		super(StreamCode.DeliveryTimeout, {
+			...options,
+			message: "expired: group exceeded the subscription max age budget",
+		});
+		this.name = "Expired";
 	}
 }
 
@@ -337,6 +356,7 @@ export function fromTransport(err: unknown, options?: TransportErrorOptions): Er
 	if (options?.version !== undefined && !sharedStreamCode(code, options.version) && claimedLocally(code)) {
 		return new StreamError(StreamCode.Internal, { cause: err, message: `remote error: ${code}` });
 	}
+	if (code === StreamCode.DeliveryTimeout) return new Expired({ cause: err });
 	if (code === StreamCode.TooFarBehind) return new Lagged({ cause: err });
 	if (code === StreamCode.FrameTooLarge) return new FrameTooLarge({ cause: err });
 	if (code === StreamCode.GroupTooLarge) return new GroupTooLarge({ cause: err });

@@ -17,6 +17,9 @@ import { hardwareReliable } from "../support/video";
 import type { Capture } from "./capture";
 import { normalizeSource, type Source } from "./types";
 
+// How many frames may be waiting on the codec before capture starts dropping them.
+const MAX_ENCODE_QUEUE_SIZE = 8;
+
 /** Cumulative encoder output totals, measured from the chunks the encoder produces. */
 export interface Stats {
 	/** Total frames encoded while serving. Monotonic; diff over an interval for a frame rate. */
@@ -183,7 +186,7 @@ export class Encoder {
 		// Publish the resolved catalog config; undefined (while disabled) drops it from the catalog.
 		effect.proxy(rendition.config, this.out.catalog);
 
-		// Encode only while enabled and a subscriber is attached (the demand gate).
+		// Encode only while enabled and the rendition has a track to write into.
 		effect.run((effect) => {
 			const enabled = effect.get(this.in.enabled);
 			const track = effect.get(rendition.track);
@@ -235,16 +238,29 @@ export class Encoder {
 		this.#lastCaptureWall = performance.now();
 
 		const producer = new Container.Legacy.Producer(track, new Container.Legacy.Format("video"));
-		effect.cleanup(() => producer.close());
+		// Stopping (hidden, capture gone, reconfigured) ends the group, not the track: closing the
+		// track FINs the subscription, which a peer reads as the track being over for good, so
+		// every later subscription completes the moment it starts while the catalog still
+		// advertises the rendition. The Broadcast owns the producer and closes it when the
+		// rendition is superseded or unregistered; the audio encoder stops the same way.
+		effect.cleanup(() => producer.cut());
 
 		let lastKeyframe: Time.Micro | undefined;
-		let lastEncoded: Time.Micro | undefined;
+		let pacingRate: number | undefined;
+		let pacingDeadline: number | undefined;
+		let previousCapture: Time.Micro | undefined;
 
 		effect.spawn(async () => {
 			const encoder = new VideoEncoder({
 				output: (frame: EncodedVideoChunk) => {
 					const key = frame.type === "key";
-					if (key) {
+					// A codec that reorders can emit a keyframe long after it was submitted, and a
+					// timeline reset clears the anchor. Only move it forward, and never past capture.
+					if (
+						key &&
+						frame.timestamp <= (previousCapture ?? frame.timestamp) &&
+						(lastKeyframe === undefined || frame.timestamp > lastKeyframe)
+					) {
 						lastKeyframe = frame.timestamp as Time.Micro;
 					}
 
@@ -296,20 +312,45 @@ export class Encoder {
 							// This doesn't need to be reactive.
 							const config = this.config.peek();
 
-							// Pace to the target frame rate by dropping frames that arrive too soon.
-							// Allow half an interval of slack so jittery capture timestamps don't drop
-							// a frame we meant to keep.
-							const targetFrameRate = config?.frameRate;
-							if (targetFrameRate && lastEncoded !== undefined) {
-								const minGap = Time.Micro.fromSecond((1 / targetFrameRate) as Time.Second);
-								if (frame.timestamp - lastEncoded < minGap - minGap / 2) continue;
-							}
-							lastEncoded = frame.timestamp as Time.Micro;
 							const captured = frame.timestamp as Time.Micro;
+							const targetFrameRate = config?.frameRate;
+
+							// Pace to the target frame rate against a deadline that advances by whole
+							// intervals, so a 60 Hz capture at a 30 fps target drops every other frame
+							// instead of ratcheting the cadence forward on each admission. Half an
+							// interval of slack keeps jittery capture timestamps from dropping a frame
+							// we meant to keep.
+							if (targetFrameRate !== pacingRate) {
+								pacingRate = targetFrameRate;
+								pacingDeadline = undefined;
+							}
+
+							// Capture going backwards is a new timeline (a file looped, a source was
+							// swapped), so neither the cadence nor the keyframe anchor still applies.
+							if (previousCapture !== undefined && captured < previousCapture) {
+								pacingDeadline = undefined;
+								lastKeyframe = undefined;
+							}
+							previousCapture = captured;
+
+							const frameInterval = targetFrameRate ? 1_000_000 / targetFrameRate : undefined;
+							if (
+								frameInterval !== undefined &&
+								pacingDeadline !== undefined &&
+								captured <= Math.round(pacingDeadline - frameInterval / 2)
+							) {
+								continue;
+							}
+
 							this.#firstCaptured ??= captured;
 							this.#lastCaptured = captured;
 							this.#lastCaptureWall = performance.now();
 							this.#observe({ demand: true, idle: false });
+
+							// Stop feeding a codec that is not keeping up. Measured on the codec's own
+							// queue rather than on submitted minus output: a codec that retains frames
+							// for reordering never drains that difference and would deadlock.
+							if (encoder.encodeQueueSize >= MAX_ENCODE_QUEUE_SIZE) continue;
 
 							const interval = config?.keyframeInterval ?? Time.Milli.fromSecond(2 as Time.Second);
 
@@ -321,6 +362,15 @@ export class Encoder {
 							}
 
 							encoder.encode(frame, { keyFrame });
+
+							// A gap longer than an interval re-anchors rather than letting the deadline
+							// chase a capture that stalled.
+							if (frameInterval !== undefined) {
+								pacingDeadline =
+									pacingDeadline === undefined || captured - pacingDeadline > frameInterval
+										? captured + frameInterval
+										: pacingDeadline + frameInterval;
+							}
 						} finally {
 							frame.close();
 						}
@@ -402,7 +452,10 @@ export class Encoder {
 		const required = effect.get(this.#codecFilter) ?? "";
 
 		effect.spawn(async () => {
-			const detected = await this.#bestCodec(required, dimensions);
+			// A rerun waits for this task, so a probe that outlives its run holds the encoder at the
+			// old answer: showing video again while one is still running would wait out the whole
+			// probe before the rendition came back. The probe itself stops at its next step.
+			const detected = await Promise.race([this.#bestCodec(effect, required, dimensions), effect.cancel]);
 			if (!detected) return;
 
 			effect.set(this.#codec, { ...detected, required, ...dimensions });
@@ -538,8 +591,10 @@ export class Encoder {
 		effect.set(this.#dimensions, { width, height });
 	}
 
-	// Try to determine the best config for the given settings.
+	// Try to determine the best config for the given settings, stopping early once `effect` is torn
+	// down: every candidate costs a round trip to the GPU process, and the answer is already stale.
 	async #bestCodec(
+		effect: Effect,
 		required: string,
 		dimensions: { width: number; height: number },
 	): Promise<
@@ -608,6 +663,7 @@ export class Encoder {
 		// VideoToolbox anyway regardless of the hint.
 		if (hardwareReliable()) {
 			for (const codec of HARDWARE_CODECS) {
+				if (effect.abort.aborted) return undefined;
 				if (!codec.startsWith(required)) continue;
 
 				const hardwareAcceleration: HardwareAcceleration = "prefer-hardware";
@@ -630,6 +686,7 @@ export class Encoder {
 
 		// Try software encoding.
 		for (const codec of SOFTWARE_CODECS) {
+			if (effect.abort.aborted) return undefined;
 			if (!codec.startsWith(required)) continue;
 
 			const hardwareAcceleration: HardwareAcceleration = "prefer-software";
@@ -649,6 +706,7 @@ export class Encoder {
 			if (supported) return { codec, hardwareAcceleration };
 		}
 
+		if (effect.abort.aborted) return undefined;
 		throw new Error("no supported codec");
 	}
 

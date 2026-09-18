@@ -169,8 +169,10 @@ onto the host we already dialed, so a peer moves us between ports and schemes;
 into the local network, since a name it controls resolves wherever it likes;
 `ignore` keeps the current address list. Empty, malformed, or refused redirects
 also preserve caller-configured fallbacks; only an accepted redirect replaces
-the list with the peer's URI. `handover` is a cap: a shorter deadline on
-the received GOAWAY wins, a longer one does not extend it.
+the list with the peer's URI. An empty URI is not a redirect at all: the peer is
+restarting and asking us back, so the same address is redialed with backoff.
+`handover` is a cap: a shorter deadline on the received GOAWAY wins, a longer
+one does not extend it.
 
 ## \[cache]
 

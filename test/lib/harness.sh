@@ -381,7 +381,11 @@ harness_finish() {
 
     [[ -n "$HARNESS_RUN" ]] || return "$status"
 
-    if [[ "${MOQ_TEST_KEEP:-0}" == 0 ]]; then
+    # A failure is exactly when the logs are worth having, and whoever hit it
+    # cannot go back and re-ask for them: the run they wanted is already over and
+    # the next one may well pass. So a failing run keeps its directory without
+    # being asked, and MOQ_TEST_KEEP only adds the passing case.
+    if [[ "$status" -eq 0 && "${MOQ_TEST_KEEP:-0}" == 0 ]]; then
         rm -rf "$HARNESS_RUN"
     else
         # The ports are already released and the children are gone, so a retained
