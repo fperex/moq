@@ -23,7 +23,7 @@ import { type AudioBuffer, createAudioBuffer } from "./buffer";
 import { audioMaxAge, type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
 import { Handover } from "./handover";
 import { Interruption } from "./interruption";
-import { ringSamples } from "./latency";
+import { LOWER_INTERVAL, nextLatency, ringSamples } from "./latency";
 import type * as Playout from "./playout";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
@@ -152,6 +152,14 @@ export class Decoder {
 	// The derived target as of the last settled change, to detect a *deepening* (which needs the
 	// ring to refill) versus a decrease. See #runLatencyReanchor.
 	#prevTarget?: Time.Milli;
+
+	// The depth the ring was last told to hold, and when, so a fall walks down one bucket at a
+	// time. See #runLatency.
+	#latency?: Time.Milli;
+	#latencyAt?: Time.Milli;
+
+	// Bumped by the walk's own timer, so the effect reruns and sheds the next bucket.
+	readonly #latencyStep = new Signal<number>(0);
 
 	// Which subscription the ring's buffered samples came from. See #runDecoder.
 	#handover = new Handover();
@@ -461,8 +469,28 @@ export class Decoder {
 		const ring = this.#ring;
 		if (!ring) return;
 
-		const delay = effect.get(this.#target);
-		ring.setLatency(ringSamples(ring.rate, delay));
+		const target = effect.get(this.#target);
+		// The walk's own tick, so the timer below reruns this effect rather than reaching into the ring.
+		effect.get(this.#latencyStep);
+
+		const now = Time.Milli.now();
+		const current = this.#latency;
+		// The first depth the ring is given is whatever is asked for: there is nothing to shed yet.
+		const held = current === undefined ? LOWER_INTERVAL : Time.Milli.sub(now, this.#latencyAt ?? now);
+		const next = current === undefined ? target : nextLatency(current, target, held);
+
+		if (next !== current) {
+			this.#latency = next;
+			this.#latencyAt = now;
+			ring.setLatency(ringSamples(ring.rate, next));
+		}
+
+		// Still above what is asked for: come back for the next bucket. The timer is the effect's,
+		// so a target that moves again in the meantime tears it down and re-decides from there.
+		if (next > target) {
+			const wait = Time.Milli(Math.max(LOWER_INTERVAL - held, 0));
+			effect.timer(() => this.#latencyStep.update((step) => step + 1), next === current ? wait : LOWER_INTERVAL);
+		}
 	}
 
 	// Park playback when the target *deepens*, so the ring refills to it. Video rebuilds a deeper

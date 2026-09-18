@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
 import { Signal } from "@moq/signals";
 import { type Clock, Sync } from "./sync";
@@ -436,7 +437,13 @@ describe("clock", () => {
 describe("the cross-track arrival offset", () => {
 	// Feed both tracks the same media timeline in real time, with the picture landing `late`
 	// milliseconds after the sound for every timestamp. Returns the sync afterwards.
-	function deliver(sync: Sync, tick: ReturnType<typeof fakeClock>, late: number, seconds = 6) {
+	function deliver(
+		sync: Sync,
+		tick: ReturnType<typeof fakeClock>,
+		late: number | ((media: number) => number),
+		seconds = 8,
+	) {
+		const lateness = typeof late === "number" ? () => late : late;
 		for (let media = 0; media < seconds * 1000; media += 20) {
 			// The sound for this instant, on time.
 			tick.advance(20);
@@ -445,7 +452,7 @@ describe("the cross-track arrival offset", () => {
 			// The picture for the same instant, `late` milliseconds behind it. Sent on the sound's
 			// grid so the two are measured against the same wall clock rather than drifting apart.
 			if (media % 40 === 0) {
-				sync.received(Math.max(0, media - late) as Time.Milli, "video");
+				sync.received(Math.max(0, media - lateness(media)) as Time.Milli, "video");
 			}
 		}
 	}
@@ -457,9 +464,10 @@ describe("the cross-track arrival offset", () => {
 			deliver(sync, clock, 70);
 			await flush();
 
-			// A whole bucket at a time, so 70ms of lateness is covered by 80ms of hold rather than
+			// Only the part a viewer would notice: 45ms of it is inside the window ITU-R BT.1359
+			// says nobody sees, and the 25ms left is covered a whole bucket at a time rather than
 			// by a term that flickers by a millisecond and re-parks the ring.
-			expect(sync.out.offset.peek()).toBe(Time.Milli(80));
+			expect(sync.out.offset.peek()).toBe(Time.Milli(40));
 
 			// The estimator's answer is untouched: the jitter buffer row still reports what the
 			// viewer asked for, and the corpus still describes the whole of `out.delay`.
@@ -467,7 +475,7 @@ describe("the cross-track arrival offset", () => {
 
 			// What playback actually waits, and what the age budget has to reach back over, both
 			// grow by it. Otherwise the deeper hold waits for a group the budget already convicted.
-			expect(sync.out.maxAge.peek()).toBe(Time.Milli(120));
+			expect(sync.out.maxAge.peek()).toBe(Time.Milli(80));
 		} finally {
 			sync.close();
 		}
@@ -512,10 +520,86 @@ describe("the cross-track arrival offset", () => {
 			// last keyframe and the live edge, so every arrival honestly looks seconds late. A
 			// picture that far behind is out of sync whatever the sound does, and holding the sound
 			// with it just makes everything late.
-			deliver(sync, clock, 2_000);
+			deliver(sync, clock, 2_000, 14);
 			await flush();
 
-			expect(sync.out.offset.peek()).toBe(Time.Milli(200));
+			expect(sync.out.offset.peek()).toBe(Time.Milli(100));
+		} finally {
+			sync.close();
+		}
+	});
+
+	it("stops at the cap for a camera pipeline the hold cannot cover", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(40) });
+		try {
+			// A self-publish whose camera pipeline runs 300ms behind its microphone. The hold buys
+			// back what a call is willing to wait for and no more: past the cap the sound would be
+			// held for a picture the viewer has already given up on.
+			deliver(sync, clock, 300, 14);
+			await flush();
+
+			expect(sync.out.offset.peek()).toBe(Time.Milli(100));
+		} finally {
+			sync.close();
+		}
+	});
+
+	it("does not hold the sound for the camera's warm-up frames", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(40) });
+		const held: number[] = [];
+		try {
+			// Tune-in on a self-publish: the first frames out of a camera are its slowest, and the
+			// steady cadence behind them is inside the tolerance. A hold derived from the warm-up
+			// would sit at the cap until both windows had rotated past it, which is the few seconds
+			// of held sound a publisher hears at the start of their own broadcast.
+			const late = (media: number) => (media < 500 ? 400 : 60);
+			for (let media = 0; media < 10_000; media += 20) {
+				clock.advance(20);
+				sync.received(media as Time.Milli, "audio");
+				if (media % 40 === 0) sync.received(Math.max(0, media - late(media)) as Time.Milli, "video");
+				held.push(sync.out.offset.peek());
+			}
+			await flush();
+
+			// Never more than a step or two, where the uncapped term used to stand at the ceiling
+			// for as long as both windows remembered the warm-up.
+			expect(Math.max(...held)).toBeLessThanOrEqual(Time.Milli(40));
+			// The steady cadence is inside the tolerance, so nothing is held at all.
+			expect(sync.out.offset.peek()).toBe(Time.Milli.zero);
+		} finally {
+			sync.close();
+		}
+	});
+
+	it("keeps the hold across a mute, so the ring is not re-derived on the unmute", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(40) });
+		try {
+			deliver(sync, clock, 70);
+			await flush();
+			const before = sync.out.offset.peek();
+			expect(before).toBe(Time.Milli(40));
+
+			// The listener mutes for three seconds. The download stops; the path does not change.
+			for (let media = 8000; media < 11000; media += 20) {
+				clock.advance(20);
+				if (media % 40 === 0) sync.received((media - 70) as Time.Milli, "video");
+			}
+			await flush();
+			expect(sync.out.offset.peek()).toBe(before);
+
+			// Unmuted: the sound is back on the same path, so the hold it lands in is the one it
+			// left rather than one derived from a cold window.
+			for (let media = 11000; media < 13000; media += 20) {
+				clock.advance(20);
+				sync.received(media as Time.Milli, "audio");
+				if (media % 40 === 0) sync.received((media - 70) as Time.Milli, "video");
+			}
+			await flush();
+
+			expect(Math.abs(sync.out.offset.peek() - before)).toBeLessThanOrEqual(Container.Jitter.BUCKET);
 		} finally {
 			sync.close();
 		}
@@ -527,11 +611,11 @@ describe("the cross-track arrival offset", () => {
 		try {
 			deliver(sync, clock, 70);
 			await flush();
-			expect(sync.out.offset.peek()).toBe(Time.Milli(80));
+			expect(sync.out.offset.peek()).toBe(Time.Milli(40));
 
 			// The tile is muted, the canvas scrolls away, the picture stops. A term measured
 			// against a track nobody is downloading would hold the sound deep for the session.
-			for (let media = 6000; media < 12000; media += 20) {
+			for (let media = 8000; media < 16000; media += 20) {
 				clock.advance(20);
 				sync.received(media as Time.Milli, "audio");
 			}

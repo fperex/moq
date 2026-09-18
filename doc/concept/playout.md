@@ -492,21 +492,40 @@ offset        = max(0, floor(video) - floor(audio))
 
 A minimum, for the same reason each arrival is measured against the fastest
 recent one: the floor is the path, and everything above it is jitter the
-estimator already covers. Two rotating windows of 2 s, so a track that stops
-delivering drops out of the comparison within two windows instead of holding the
-sound deep for the rest of the session, and a rewind clears both the way
-`reanchor()` clears the estimator's reference. Quantised up to a whole bucket,
-with anything below one bucket reading zero: below the estimator's own
-resolution this is noise, and a term that flickered by a millisecond would
-re-park the ring for nothing.
+estimator already covers. Two rotating windows of 2 s. A picture that stops
+arriving drops out of the comparison within two windows instead of holding the
+sound deep for the rest of the session; the sound is carried across a pause
+instead, because a mute stops the download and not the path, and the floor it
+measured a moment ago is still the floor the resubscription lands on. The
+estimator carries its own measurement across the same pause for the same reason.
+A rewind clears both the way `reanchor()` clears the estimator's reference.
+Quantised up to a whole bucket, with anything below one bucket reading zero:
+below the estimator's own resolution this is noise, and a term that flickered by
+a millisecond would re-park the ring for nothing.
 
-It is capped at 200 ms. The term exists to bring the picture back inside the
-window a viewer notices (ITU-R BT.1359 puts that at 45 ms of picture-ahead and
-125 ms of picture-behind), and past that a hold cannot buy it back: a picture
-seconds late is out of sync whatever the sound does. Measured on an impaired
-path, an uncapped term reached 2 s during tune-in, where the video track is
-still replaying the span between the last keyframe and the live edge and every
-arrival honestly looks that late.
+The tolerance is why 45 ms is subtracted before any of that. ITU-R BT.1359 puts
+the detectability window at about 45 ms of sound-ahead and 125 ms of
+sound-behind, so the hold only has to bring the lead back inside that window,
+not to zero. Every millisecond past it is latency bought for something nobody
+can see, and a conferencing player prefers the low audio latency when the two
+disagree.
+
+It is then capped at 100 ms, which is what a video call tolerates: past that the
+hold is worse than the desync it is buying off, since a picture that far behind
+is out of sync whatever the sound does. The measured browser publishers needed
+55 to 70 ms of it. Measured on an impaired path, an uncapped term reached 2 s
+during tune-in, where the video track is still replaying the span between the
+last keyframe and the live edge and every arrival honestly looks that late.
+
+It moves one bucket per second, in both directions. The ring reaches a deeper
+hold by parking and a shallower one by time-compressing what it already holds,
+so a term that lands in one step is audible either way, and the term is at its
+least trustworthy exactly when it moves most: at tune-in the video floor is set
+by the camera's warm-up frames, the slowest that track will ever be, and a hold
+derived from them would stand at the ceiling until both windows had rotated past
+them. That is the few seconds of held sound a publisher used to hear at the
+start of their own broadcast. A bucket per second is slow enough that such a
+transient rotates out of the windows before the hold has grown into it.
 
 It is deliberately one-directional. Audio is the clock and video is painted when
 the playhead reaches its timestamp, so a picture that arrives *early* is already
@@ -528,6 +547,35 @@ to move together:
 `Sync.out.delay` is untouched by it. The estimator's answer is what the corpus
 describes and what both languages are held to, and this is not an estimator
 quantity: it is a property of a pair of tracks, and `moq-audio` has only one.
+
+## How fast the ring follows the target
+
+The two directions cost different things, so the ring takes them at different
+speeds.
+
+A rise is a cushion the ring has to refill into. `setLatency` alone only raises
+the bar a future refill has to clear, so a ring already playing never gets
+deeper; the browser player parks the playhead once, which spends the deficit as
+silence in one place instead of leaving it to the underrun a shallow buffer
+causes anyway. That lands at once: delaying it only lengthens the window the
+underrun is waiting in.
+
+A fall is the opposite. The ring cannot un-receive what it already holds, so a
+shallower target is reached by time-compressing audio that is on its way to
+being heard, one pitch period per 100 ms of output. The player sheds one bucket
+per second instead of the whole fall at once. The case this is for is the cold
+start of a self-publish: a browser publisher declares no flush span, so the
+estimator holds the 80 ms guess until its first measurement, which on a LAN
+replaces it with 20 ms. Spent in one step, the reader compressed six periods
+inside half a second, which is the fast-forward heard in the first seconds of
+one's own broadcast. NetEq lets the buffer drift towards a lower target rather
+than stretching straight after a start for the same reason
+(`delay_manager.cc`, and the accelerate decision in `decision_logic.cc`).
+
+A fall further than the reader's own stretch bound is not walked. Past that
+bound the reader skips ahead instead of stretching, which is one discontinuity
+rather than a run of them, and walking a viewer's 2 s delay down to 100 ms would
+turn that single jump into a minute of bent audio.
 
 ## Parity traps
 
