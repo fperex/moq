@@ -428,10 +428,15 @@ async function censored(fixture: Fixture, budgetFor: (target: number) => number,
 // The finding this guards, stated plainly: the age budget is the wire subscription's max age and
 // the container consumer's skip threshold at once, and both rule on media timestamps. A publisher
 // that flushes seven frames together puts the oldest of them a whole flush behind the live edge the
-// moment it lands, so a budget below the flush span convicts content that had already arrived, and
-// the estimator underneath it can then only ever confirm the budget it was cut to.
-describe("budget-censors-the-tail", () => {
-	it("reports what the age budget throws away above the decoder", async () => {
+// moment it lands, so a budget below the flush span reads a whole flush as lateness.
+//
+// Above the decoder that verdict is no longer reachable, however small the budget is. What it
+// convicts is a group still arriving with nothing to hand over, and every group in this recording
+// had arrived: one the reader has reached belongs to next(), and one above the cursor is walked onto
+// rather than dropped. Judged by their timestamps instead, 91 of these groups were censored at the
+// round-trip budget and 122 once the walk landed but a spent head could still be convicted.
+describe("budget-spares-an-arrived-flush", () => {
+	it("convicts nothing above the decoder at any budget", async () => {
 		const headroom = maxAgeHeadroom(
 			Catalog.AudioConfigSchema.parse({
 				codec: "mp4a.40.2",
@@ -443,22 +448,20 @@ describe("budget-censors-the-tail", () => {
 
 		const bare = await censored(relayBbb7Frame as Fixture, (target) => target, 4000);
 		const padded = await censored(relayBbb7Frame as Fixture, (target) => target + headroom, 4000);
-		// What the round-trip formula asked for before the target was measured. The control that
-		// makes the two numbers above mean something: the budget really does censor, it just has
-		// to fall below the publisher's flush span first.
+		// What the round-trip formula asked for before the target was measured: 46ms against this
+		// publisher's 139ms flush span, so a third of what the arrivals need.
 		const roundTrip = await censored(relayBbb7Frame as Fixture, () => 46, 4000);
 
 		console.log(
-			`budget-censors-the-tail: ${bare.skipped}/${bare.groups} groups convicted at the measured target, ${padded.skipped} with ${headroom}ms of headroom, ${roundTrip.skipped} at the 46ms round-trip budget`,
+			`budget-spares-an-arrived-flush: ${bare.skipped}/${bare.groups} groups convicted at the measured target, ${padded.skipped} with ${headroom}ms of headroom, ${roundTrip.skipped} at the 46ms round-trip budget`,
 		);
 
-		expect(roundTrip.skipped).toBeGreaterThan(0);
-
-		// The measured target already sits far above this publisher's 139ms flush span, so it
-		// censors nothing here with or without the headroom: the headroom is insurance against a
-		// path whose target lands close to the flush, not a fix for this recording. Pinned at zero
-		// so a change that starts convicting at the measured target fails here.
+		// The measured target already sits far above the flush span, so the headroom buys nothing
+		// here: it is insurance against a path whose target lands close to the flush.
 		expect(bare.skipped).toBe(0);
 		expect(padded.skipped).toBe(0);
+		// And a budget a third of what the arrivals need costs the listener nothing either, which is
+		// the point: lateness is what the head has to give, not how far back its timestamps sit.
+		expect(roundTrip.skipped).toBe(0);
 	}, 25_000);
 });

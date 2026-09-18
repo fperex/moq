@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Group, Broadcast as MoqBroadcast, Time, Varint } from "@moq/net";
-import { Signal } from "@moq/signals";
+import { type Effect, Signal } from "@moq/signals";
 import type { Decoder as DecoderType } from "./decoder";
 
 // The worklet is compiled to a blob URL by a vite plugin, which `bun test` has no loader for. The
@@ -210,11 +210,15 @@ function decoder(
 	decoder: DecoderType;
 	catalog: Signal<Catalog.Root | undefined>;
 	enabled: Signal<boolean>;
+	active: Signal<MoqBroadcast.Consumer | undefined>;
 	close: () => void;
 } {
 	const root = new Signal<Catalog.Root | undefined>(props?.catalog ?? catalog());
+	// Which broadcast is being consumed, as a signal: a publisher that restarts is announced again
+	// and the element is handed a different consumer for the same name.
+	const active = new Signal<MoqBroadcast.Consumer | undefined>(props?.active);
 	// Only the two members the audio source and decoder read off a Broadcast.
-	const broadcast = { out: { catalog: root }, relativeBroadcast: () => props?.active };
+	const broadcast = { out: { catalog: root }, relativeBroadcast: (effect: Effect) => effect.get(active) };
 	const source = new Source({
 		broadcast: new Signal(broadcast as never),
 		supported: async () => true,
@@ -226,6 +230,7 @@ function decoder(
 		decoder: built,
 		catalog: root,
 		enabled: downloading,
+		active,
 		close: () => {
 			built.close();
 			sync.close();
@@ -575,6 +580,80 @@ test("a publisher's mute and unmute play the resumed audio", async () => {
 	// capacity bounds it rather than on the resumed media itself.
 	expect(built.out.timestamp.peek()).toBeGreaterThan(playhead as Time.Milli);
 	expect(built.out.interrupted.peek()).toBe(false);
+
+	close();
+	producer.close();
+});
+
+test("a republished broadcast is a tune-in, not a late continuation", async () => {
+	// A pinned `<moq-watch reload>` survives a publisher restart: the element stays, and the
+	// broadcast underneath it is replaced by a new consumer for the same name. The new encoder
+	// starts its timeline where it likes, which is near zero, so everything anchored to the dead
+	// publisher has to go. Kept, the ring discards every sample of the new run as too old for a
+	// playhead ten seconds ahead of it, and nothing in the stream says so: a republish raises no
+	// discontinuity, because nobody declared anything.
+	const first = new MoqBroadcast.Producer();
+	const firstTrack = first.createTrack("audio");
+	const { decoder: built, active, close } = decoder(true, { catalog: catalog(), active: first.consume() });
+	await flush();
+
+	// A publisher that has been up for a while, so its timeline is well past zero.
+	for (let i = 0; i < 6; i++) writeGroup(firstTrack, i, 10_000_000 + i * 20_000);
+	await sleep(60);
+	await flush();
+	const before = built.out.debug.peek();
+	expect(before?.buffered).toBeGreaterThan(0);
+	expect(before?.anchor).toBeGreaterThan(10 * DEVICE_RATE);
+
+	// It restarts: same name, a different broadcast, and a timeline that starts over.
+	firstTrack.close();
+	first.close();
+	const second = new MoqBroadcast.Producer();
+	const secondTrack = second.createTrack("audio");
+	active.set(second.consume());
+	await flush();
+
+	for (let i = 0; i < 6; i++) writeGroup(secondTrack, i, i * 20_000);
+	await sleep(60);
+	await flush();
+
+	// The new publisher's audio is in the ring, on its own timeline.
+	const after = built.out.debug.peek();
+	expect(after?.anchor).toBeLessThan(DEVICE_RATE);
+	expect(after?.buffered).toBeGreaterThan(0);
+	expect(built.out.buffered.peek().at(-1)?.end).toBeLessThan(1_000 as Time.Milli);
+
+	close();
+	second.close();
+});
+
+test("a replacement subscription on the same broadcast keeps the timeline it is playing", async () => {
+	// The other half of the rule above. A rendition that redeclares its flush span reopens the
+	// subscription and builds a new container consumer, on the same broadcast and the same
+	// timeline, so the ring keeps playing what it holds. Re-anchoring there would park the playhead
+	// and refill for nothing, on a stream that never stopped.
+	const producer = new MoqBroadcast.Producer();
+	const track = producer.createTrack("audio");
+	const {
+		decoder: built,
+		catalog: root,
+		close,
+	} = decoder(true, { catalog: catalog({ jitter: 40 }), active: producer.consume() });
+	await flush();
+
+	for (let i = 0; i < 6; i++) writeGroup(track, i, 10_000_000 + i * 20_000);
+	await sleep(60);
+	await flush();
+	const anchor = built.out.debug.peek()?.anchor;
+	expect(anchor).toBeGreaterThan(10 * DEVICE_RATE);
+
+	root.set(catalog({ jitter: 80 }));
+	await flush();
+	for (let i = 0; i < 6; i++) writeGroup(track, 6 + i, 10_120_000 + i * 20_000);
+	await sleep(60);
+	await flush();
+
+	expect(built.out.debug.peek()?.anchor).toBe(anchor as number);
 
 	close();
 	producer.close();

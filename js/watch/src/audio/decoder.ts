@@ -172,6 +172,10 @@ export class Decoder {
 	// Which subscription the ring's buffered samples came from. See #runDecoder.
 	#handover = new Handover();
 
+	// The broadcast the ring is currently filled from, so a different one is recognised as a new
+	// publisher rather than a continuation. See #runDecoder.
+	#broadcast?: Moq.Broadcast.Consumer;
+
 	// Whether the ring is playing out a declared endpoint, so the playhead event that closes the
 	// marker group is that endpoint's own and must not throw the tail away. See #onNext.
 	#ended = false;
@@ -597,6 +601,18 @@ export class Decoder {
 		// broadcast instead of the catalog's own broadcast.
 		const active = broadcast.relativeBroadcast(effect, identity.broadcast);
 		if (!active) return;
+
+		// A different broadcast consumer is a different publisher: an element that followed a
+		// republish (`reload`) rather than being rebuilt around it. Its timeline starts wherever
+		// its encoder starts, which is near zero, so everything anchored to the old publisher has
+		// to go: the ring would discard every sample below its anchor and the clock would hold a
+		// reference no frame can ever reach, and nothing else raises a discontinuity to break it.
+		// A rendition swap reopens a subscription on the timeline already playing and keeps both.
+		if (this.#broadcast !== undefined && this.#broadcast !== active) {
+			this.#ring?.reset();
+			this.sync.reset();
+		}
+		this.#broadcast = active;
 
 		// The ring outlives this effect (it's keyed on the sample rate and channel count), so a
 		// replacement subscription (a rendition swap, a republished broadcast, a reconnect) inherits

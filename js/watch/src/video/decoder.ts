@@ -135,6 +135,10 @@ export class Decoder {
 	// the rendition leaves the catalog. See `Estimator`.
 	#estimator = new Estimator();
 
+	// The broadcast the current track is reading, so a different one is recognised as a new
+	// publisher rather than a continuation. See `#runPending`.
+	#broadcast?: Moq.Broadcast.Consumer;
+
 	// Bumped to rebuild the track without anything else about the rendition changing: a codec that
 	// errored, or a picture that stayed frozen past RECOVER. `#runPending` reads it, so a bump tears
 	// the old subscription down and opens a new one at the live edge.
@@ -246,6 +250,14 @@ export class Decoder {
 			return;
 		}
 
+		// A different broadcast consumer is a different publisher: an element that followed a
+		// republish (`reload`) rather than being rebuilt around it. The new encoder's timestamps
+		// start near zero, so a clock still anchored to the old publisher parks every picture
+		// behind a reference it can never reach. A rendition swap keeps the reference, since it
+		// reopens a subscription on the timeline already playing.
+		if (this.#broadcast !== undefined && this.#broadcast !== active) this.sync.reset();
+		this.#broadcast = active;
+
 		const spread = effect.get(this.#spread);
 		if (!spread) return;
 
@@ -347,6 +359,16 @@ export class Decoder {
 	#runBuffering(effect: Effect): void {
 		const enabled = effect.get(this.in.enabled);
 		if (!enabled) return;
+
+		// A rendition that is not in the catalog is not late: a publisher hiding its camera takes
+		// the picture away on purpose, and there is nothing on its way to wait for. The buffering
+		// overlay reads this flag, so labelling that gap a stall spun a spinner over the held
+		// picture for as long as the camera was away. The overlay gates its audio half the same
+		// way, on there being a ring to speak for.
+		if (!effect.get(this.source.out.config)) {
+			this.#out.stalled.set(false);
+			return;
+		}
 
 		const frame = effect.get(this.#out.frame);
 		if (!frame) {
