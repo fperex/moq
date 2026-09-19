@@ -48,20 +48,6 @@ const GRANULARITY = 20;
  */
 const FAST = 4;
 
-/**
- * Share of the hold level below which the engine stops holding audio back and lets the ring refill.
- *
- * NetEq's `kPostponeDecodingLevel`, which postpones *decoding* at half the target so playback does
- * not restart onto an empty buffer. We have no decode to postpone (the ring is fed from the main
- * thread), so the same hysteresis gates expansion instead: below half the level the ring is
- * refilling and stretching would only fight the refill.
- *
- * The other half of that rule, not resuming from a concealment until the ring holds a cushion again,
- * is the ring's: it parks on an underrun and only un-parks once it holds that level again, which is
- * stricter than NetEq's half and is one mechanism rather than two.
- */
-const POSTPONE = 0.5;
-
 /** What to do with the next block. */
 export type Operation = "normal" | "accelerate" | "fast-accelerate" | "expand" | "conceal" | "merge" | "silence";
 
@@ -165,8 +151,11 @@ export class Decision {
 
 		if (demand.outputFrame < this.#ready) return "normal";
 		if (level >= high) return "accelerate";
-		// Below half the hold level the ring is refilling and holding audio back would fight it.
-		if (level < low && level >= low * POSTPONE) return "expand";
+		// However far below the hold level it is: stretching is the only thing that takes a playing
+		// ring deeper, so a ring that plays on at its old depth instead just waits for the first late
+		// arrival to underrun it. A ring with nothing left to stretch never reaches here, since it
+		// parks on the way in and answers `starved`.
+		if (level < low) return "expand";
 
 		return "normal";
 	}

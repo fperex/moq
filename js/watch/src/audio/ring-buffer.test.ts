@@ -879,7 +879,7 @@ describe("re-buffer", () => {
 		writeChunks(buffer, 0, 60, 20, { channels: 1, value: 1.0 });
 		expect(read(buffer, 20, 1)[0].length).toBe(20);
 
-		// The target deepens, so playback parks until the ring holds the new depth.
+		// A viewer's deeper delay parks playback until the ring holds the new depth.
 		buffer.resize(60 as Time.Milli);
 		buffer.stall();
 		expect(buffer.stalled).toBe(true);
@@ -1004,12 +1004,13 @@ describe("latency increase re-anchor", () => {
 
 		// Raising the latency floor grows the target but must NOT re-stall a ring mid-playback:
 		// resize() only re-stalls an empty ring, so it keeps draining at the old depth. This is
-		// exactly why setLatency() alone doesn't re-buffer -- the desync the Decoder re-anchor fixes.
+		// exactly why setLatency() alone doesn't re-buffer -- the reader expands into the new depth.
 		buffer.resize(200 as Time.Milli);
 		expect(buffer.stalled).toBe(false);
 
-		// reset() re-stalls, so the ring refills to the (new) floor before playing again. The Decoder
-		// calls reset() on a latency-floor increase (#runLatencyReanchor) to re-anchor to the cushion.
+		// reset() re-stalls, so the ring refills to the (new) floor before playing again, and it also
+		// throws the buffer away and re-anchors. The Decoder parks with stall() instead (#runLatency),
+		// and only for a delay the viewer set past the stretch bound; reset() contrasts with resize().
 		buffer.reset();
 		expect(buffer.stalled).toBe(true);
 

@@ -34,12 +34,12 @@ export const LOWER_INTERVAL = Time.Milli(1_000);
  * The depth to hold now, given the one being held, the one asked for, and how long the current one
  * has stood.
  *
- * Rises land at once: the ring reaches a deeper target by parking once, which costs silence rather
- * than a bent waveform, and delaying one only lengthens the shallow window an underrun is waiting
- * in. So does a fall further than the reader's own stretch bound, because past that the reader
- * skips ahead instead of stretching ({@link STRETCH_BOUND}), which is one discontinuity rather than
- * a run of them: walking a viewer's 2s delay down to 100ms would turn that single jump into a
- * minute of bent audio. Everything in between is walked, one bucket per {@link LOWER_INTERVAL}.
+ * Rises land at once: the reader expands into a deeper target however far away it is, and holding
+ * the bar back only lengthens the shallow window an underrun is waiting in. So does a fall further
+ * than the reader's own stretch bound, because past that the reader skips ahead instead of
+ * stretching ({@link STRETCH_BOUND}), which is one discontinuity rather than a run of them: walking
+ * a viewer's 2s delay down to 100ms would turn that single jump into a minute of bent audio.
+ * Everything in between is walked, one bucket per {@link LOWER_INTERVAL}.
  */
 export function nextLatency(current: Time.Milli, target: Time.Milli, held: Time.Milli): Time.Milli {
 	if (target >= current || current - target > STRETCH_BOUND) return target;

@@ -352,11 +352,19 @@ describe("decision", () => {
 		expect(decide(seeded(4 * HIGH), 4 * HIGH)).toBe("fast-accelerate");
 	});
 
-	it("expands below the hold level but not below half of it", () => {
+	it("expands below the hold level, however far below it", () => {
 		expect(decide(seeded(LOW - 1), LOW - 1)).toBe("expand");
 		expect(decide(seeded(LOW / 2), LOW / 2)).toBe("expand");
-		// Below half of it the ring is refilling, and holding audio back would fight the refill.
-		expect(decide(seeded(LOW / 2 - 1), LOW / 2 - 1)).toBe("normal");
+	});
+
+	it("a deeper target is reached by expanding from below half the hold", () => {
+		// The hold moved out from under a ring that is playing perfectly well at the depth it has:
+		// stretching is the only thing that takes it deeper, so a ring left playing at the old depth
+		// would just wait for the first late arrival to underrun it. One frame is the least a ring
+		// can hold and still be playing rather than parked.
+		const shallow = seeded(CHUNK);
+		expect(decide(shallow, CHUNK)).toBe("expand");
+		expect(CHUNK).toBeLessThan(LOW / 2);
 	});
 
 	it("holds a cooldown of a hundred milliseconds of output", () => {

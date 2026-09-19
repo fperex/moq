@@ -2,7 +2,9 @@ import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Group, Broadcast as MoqBroadcast, Time, Varint } from "@moq/net";
 import { type Effect, Signal } from "@moq/signals";
+import type { Delay, Sync as SyncType } from "../sync";
 import type { Decoder as DecoderType } from "./decoder";
+import { STRETCH_BOUND } from "./playout";
 
 // The worklet is compiled to a blob URL by a vite plugin, which `bun test` has no loader for. The
 // modules under test are imported after the mock, since a static import would load it first.
@@ -205,12 +207,13 @@ afterEach(() => {
 /** A decoder fed by a catalog signal, the way `<moq-watch>` wires one up. */
 function decoder(
 	enabled: boolean,
-	props?: { catalog?: Catalog.Root; active?: MoqBroadcast.Consumer },
+	props?: { catalog?: Catalog.Root; active?: MoqBroadcast.Consumer; delay?: Signal<Delay> },
 ): {
 	decoder: DecoderType;
 	catalog: Signal<Catalog.Root | undefined>;
 	enabled: Signal<boolean>;
 	active: Signal<MoqBroadcast.Consumer | undefined>;
+	sync: SyncType;
 	close: () => void;
 } {
 	const root = new Signal<Catalog.Root | undefined>(props?.catalog ?? catalog());
@@ -223,7 +226,12 @@ function decoder(
 		broadcast: new Signal(broadcast as never),
 		supported: async () => true,
 	});
-	const sync = new Sync({ delay: new Signal("auto" as const), buffer: new Signal(Time.Milli.zero) });
+	// A numeric delay is the estimator's answer, verbatim and under the test's hand: `out.delay` is
+	// what the ring's target is derived from, whether a viewer fixed it or the estimator moved it.
+	const sync = new Sync({
+		delay: props?.delay ?? new Signal<Delay>("auto"),
+		buffer: new Signal(Time.Milli.zero),
+	});
 	const downloading = new Signal(enabled);
 	const built = new Decoder(source, sync, { enabled: downloading });
 	return {
@@ -231,6 +239,7 @@ function decoder(
 		catalog: root,
 		enabled: downloading,
 		active,
+		sync,
 		close: () => {
 			built.close();
 			sync.close();
@@ -657,4 +666,108 @@ test("a replacement subscription on the same broadcast keeps the timeline it is 
 
 	close();
 	producer.close();
+});
+
+/** A tile whose ring has filled and un-stalled, so what happens next happens mid-playback. */
+async function playing(delay: Signal<Delay>): Promise<{ built: DecoderType; sync: SyncType; close: () => void }> {
+	const producer = new MoqBroadcast.Producer();
+	const track = producer.createTrack("audio");
+	const tile = decoder(true, { catalog: catalog(), active: producer.consume(), delay });
+	await flush();
+
+	// Twelve 20ms frames, well past the depth below, since the legacy warmup drops the first three
+	// decoder callbacks.
+	for (let i = 0; i < 12; i++) writeGroup(track, i, i * 20_000);
+	await sleep(80);
+	await flush();
+	expect(tile.decoder.out.stalled.peek()).toBe(false);
+
+	return {
+		built: tile.decoder,
+		sync: tile.sync,
+		close: () => {
+			tile.close();
+			producer.close();
+		},
+	};
+}
+
+// Two frames of the rendition below, which is the shallowest depth the estimator settles on.
+const SHALLOW = Time.Milli(2 * 20);
+
+// Past the re-anchor's debounce and past one poll of the ring's state, so whatever the ring did has
+// reached the signals by the time it is read.
+const settle = () => sleep(400);
+
+test("a rise inside the stretch bound is expanded into rather than parked", async () => {
+	const delay = new Signal<Delay>(SHALLOW);
+	const { built, close } = await playing(delay);
+
+	// A viewer nudging their delay. A whole stretch bound is what the reader closes in half a second
+	// of slightly slurred speech, which is less than a cut costs, so even an explicit rise this small
+	// is stretched into rather than parked.
+	delay.set(Time.Milli.add(SHALLOW, Time.Milli(STRETCH_BOUND)));
+	await settle();
+
+	expect(built.out.stalled.peek()).toBe(false);
+	expect(built.out.interrupted.peek()).toBe(false);
+
+	close();
+});
+
+test("a rise past the stretch bound is walked into, not parked", async () => {
+	const { built, sync, close } = await playing(new Signal<Delay>("auto"));
+	const measured = sync.track("audio").spread;
+
+	measured.set(SHALLOW);
+	await settle();
+
+	// The estimator's own answer climbing, which is every tune-in and every return to a tab. Nobody
+	// asked for this depth, so nobody is expecting the cut: the reader expands into it a pitch period
+	// at a time, the way the native engine reaches every deeper hold. Parking instead spent the whole
+	// deficit as silence with the sound still arriving, and froze the picture with it, since video is
+	// painted when the audio playhead reaches its timestamp.
+	measured.set(Time.Milli.add(SHALLOW, Time.Milli(4 * STRETCH_BOUND)));
+	await settle();
+
+	expect(built.out.stalled.peek()).toBe(false);
+	expect(built.out.interrupted.peek()).toBe(false);
+
+	close();
+});
+
+test("a delay the viewer set deeper parks once rather than walking for seconds", async () => {
+	const delay = new Signal<Delay>(SHALLOW);
+	const { built, close } = await playing(delay);
+
+	// The one rise still worth a cut. A viewer dragging the slider asked for this jump and expects
+	// the silence; expanding into it instead would bend seconds of speech to spare them a break they
+	// already accepted. Past the bound only, so a nudge stays a stretch.
+	delay.set(Time.Milli.add(SHALLOW, Time.Milli(2 * STRETCH_BOUND)));
+	await settle();
+
+	expect(built.out.stalled.peek()).toBe(true);
+
+	close();
+});
+
+test("small rises inside the debounce do not add up to a park", async () => {
+	const delay = new Signal<Delay>(SHALLOW);
+	const { built, close } = await playing(delay);
+
+	// A slider drag arrives as a run of small steps even when it lands somewhere far away. Each one
+	// is a rise the reader expands into, and the debounce is there to drop a step that is taken back
+	// again, not to add the run up into a deficit none of its steps ever asked for.
+	let depth = SHALLOW;
+	for (let i = 0; i < 3; i++) {
+		depth = Time.Milli.add(depth, Time.Milli(STRETCH_BOUND / 2));
+		delay.set(depth);
+		await sleep(30);
+	}
+	await settle();
+
+	expect(built.out.stalled.peek()).toBe(false);
+	expect(built.out.interrupted.peek()).toBe(false);
+
+	close();
 });

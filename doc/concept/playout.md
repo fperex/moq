@@ -545,8 +545,9 @@ during tune-in, where the video track is still replaying the span between the
 last keyframe and the live edge and every arrival honestly looks that late.
 
 It moves one bucket per second, in both directions. The ring reaches a deeper
-hold by parking and a shallower one by time-compressing what it already holds,
-so a term that lands in one step is audible either way, and the term is at its
+hold by stretching what it already holds, or by parking when the step is past
+the stretch bound, and a shallower one by time-compressing it, so a term that
+lands in one step is audible either way, and the term is at its
 least trustworthy exactly when it moves most: at tune-in the video floor is set
 by the camera's warm-up frames, the slowest that track will ever be, and a hold
 derived from them would stand at the ceiling until both windows had rotated past
@@ -642,11 +643,16 @@ The two directions cost different things, so the ring takes them at different
 speeds.
 
 A rise is a cushion the ring has to refill into. `setLatency` alone only raises
-the bar a future refill has to clear, so a ring already playing never gets
-deeper; the browser player parks the playhead once, which spends the deficit as
-silence in one place instead of leaving it to the underrun a shallow buffer
-causes anyway. That lands at once: delaying it only lengthens the window the
-underrun is waiting in.
+the bar a future refill has to clear, so the reader is what takes a playing ring
+deeper: it expands, a pitch period per 100 ms of output, or about 150 ms of
+extra depth a second, however far away the new target is. That is how the native
+engine reaches every deeper hold, and sync survives the walk, since audio is the
+clock and the picture is painted when the playhead reaches its timestamp. The
+target itself lands at once: holding the bar back only lengthens the window an
+underrun is waiting in. The one exception is a delay the viewer set themselves.
+Past the reader's stretch bound that is a jump they asked for, so the browser
+player parks the playhead once and refills, debounced, rather than bending
+seconds of speech to spare them a cut they expect.
 
 A fall is the opposite. The ring cannot un-receive what it already holds, so a
 shallower target is reached by time-compressing audio that is on its way to

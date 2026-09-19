@@ -23,7 +23,7 @@ import { type AudioBuffer, createAudioBuffer } from "./buffer";
 import { audioMaxAge, type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
 import { Handover } from "./handover";
 import { LOWER_INTERVAL, nextLatency, ringSamples } from "./latency";
-import type * as Playout from "./playout";
+import * as Playout from "./playout";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -31,8 +31,8 @@ import { type DecodedSpan, Terminal } from "./terminal";
 import { unlockOnGesture } from "./unlock";
 import { Warmup } from "./warmup";
 
-// How long the latency target must hold steady before a floor increase re-anchors. Coalesces a
-// slider drag (many small steps) into a single re-anchor once the user settles on a value.
+// How long a viewer's deeper delay must stand before the ring parks to refill into it. A slider
+// drag passes through every value on its way, and one taken straight back again costs nothing.
 const LATENCY_REANCHOR_DEBOUNCE_MS = 150;
 
 const LEGACY_WARMUP_CALLBACKS = 3;
@@ -157,10 +157,6 @@ export class Decoder {
 	// Ordered discontinuity and endpoint state from the container consumer.
 	#terminal = new Terminal();
 
-	// The derived target as of the last settled change, to detect a *deepening* (which needs the
-	// ring to refill) versus a decrease. See #runLatencyReanchor.
-	#prevTarget?: Time.Milli;
-
 	// The depth the ring was last told to hold, and when, so a fall walks down one bucket at a
 	// time. See #runLatency.
 	#latency?: Time.Milli;
@@ -265,7 +261,6 @@ export class Decoder {
 		this.#signals.run(this.#runFlush.bind(this));
 		this.#signals.run(this.#runClock.bind(this));
 		this.#signals.run(this.#runLatency.bind(this));
-		this.#signals.run(this.#runLatencyReanchor.bind(this));
 		this.#signals.run(this.#runSpread.bind(this));
 	}
 
@@ -484,6 +479,24 @@ export class Decoder {
 		effect.cleanup(() => track.clock.set(undefined));
 	}
 
+	// Hold the ring at the depth the target asks for.
+	//
+	// A rise is reached by stretching, however big it is: `setLatency` moves the bar and the reader
+	// expands one pitch period per cooldown until the ring holds it, about 150ms of extra cushion a
+	// second. That is how the native engine reaches every deeper hold (`retarget` in
+	// `rs/moq-audio/src/playout/engine.rs` only moves the target), and sync survives the walk: audio
+	// is the clock and video is painted when the playhead reaches its timestamp, so sound playing
+	// slightly slow takes the picture with it and the pair gains the cushion together. Parking spends
+	// the whole deficit as silence instead, which is what a rising shared target cost the listener
+	// through tune-in and on every return to a tab.
+	//
+	// A delay the app set as a number is the exception: that is a jump a viewer asked for, and
+	// walking 100ms up to 2s would bend thirteen seconds of speech to spare them a cut they expect.
+	// Past the reader's own stretch bound it parks once, debounced, since a drag passes through every
+	// value on the way to the one meant.
+	//
+	// A fall is `nextLatency`'s. Either way the step is measured from the depth the ring was actually
+	// last set to, so a run of small steps is judged as the steps it was rather than as their sum.
 	#runLatency(effect: Effect): void {
 		// Gate on the worklet signal so this effect re-runs once the ring is created.
 		const worklet = effect.get(this.#out.root);
@@ -493,6 +506,10 @@ export class Decoder {
 		if (!ring) return;
 
 		const target = effect.get(this.#target);
+		// Whether the viewer named this delay, which is the only rise still worth a cut. Peeked: the
+		// mode decides nothing on its own, and a rerun on it would tear down a park still waiting out
+		// the debounce the same change scheduled.
+		const fixed = typeof this.sync.in.delay.peek() === "number";
 		// The walk's own tick, so the timer below reruns this effect rather than reaching into the ring.
 		effect.get(this.#latencyStep);
 
@@ -506,6 +523,11 @@ export class Decoder {
 			this.#latency = next;
 			this.#latencyAt = now;
 			ring.setLatency(ringSamples(ring.rate, next));
+
+			// The first depth is the fill's own, which builds the cushion without parking anything.
+			if (fixed && current !== undefined && next - current > Playout.STRETCH_BOUND) {
+				effect.timer(() => ring.stall(), LATENCY_REANCHOR_DEBOUNCE_MS);
+			}
 		}
 
 		// Still above what is asked for: come back for the next bucket. The timer is the effect's,
@@ -514,40 +536,6 @@ export class Decoder {
 			const wait = Time.Milli(Math.max(LOWER_INTERVAL - held, 0));
 			effect.timer(() => this.#latencyStep.update((step) => step + 1), next === current ? wait : LOWER_INTERVAL);
 		}
-	}
-
-	// Park playback when the target *deepens*, so the ring refills to it. Video rebuilds a deeper
-	// cushion implicitly (its per-frame sync.wait() reads the live buffer, so it just holds longer),
-	// but the audio ring keeps draining at its old depth: setLatency only raises the bar a future
-	// refill has to clear, so a ring already playing never gets deeper and audio runs ahead of video
-	// (the "raise latency, only video re-buffers" desync). Stalling spends the deficit as silence,
-	// once, instead of leaving it to the underrun that the shallow buffer eventually causes anyway.
-	//
-	// The derived delay, not the user's setting, since the arrival estimator moves it too. The
-	// threshold is the estimator's own resolution rather than the rendition's advertised jitter: the
-	// two are different quantities, and a codec with a long frame would otherwise let a real
-	// deepening through unparked while a short one parked on noise.
-	//
-	// Two buckets, not one. A stall is audible silence until the worklet can stretch instead, so it
-	// is worth paying only for a rise the estimator could not have produced by rounding, and a
-	// single-bucket rise is inside the buffer's own slack anyway.
-	// The debounce coalesces a slider drag or a converging estimate into a single stall. Decreases
-	// are left to natural catch-up.
-	#runLatencyReanchor(effect: Effect): void {
-		const target = effect.get(this.#target);
-		const step = Time.Milli(2 * Container.Jitter.BUCKET);
-		if (this.#prevTarget === undefined) {
-			// Startup: the initial fill already builds the cushion; just record the baseline.
-			this.#prevTarget = target;
-			return;
-		}
-		// When the timer fires, the target read above is still current: any change would have rerun
-		// this effect (tearing down the timer), so compare it against the pre-change baseline directly.
-		const baseline = this.#prevTarget;
-		effect.timer(() => {
-			if (target - baseline > step) this.#ring?.stall();
-			this.#prevTarget = target;
-		}, LATENCY_REANCHOR_DEBOUNCE_MS);
 	}
 
 	/**
