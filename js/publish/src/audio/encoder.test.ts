@@ -90,6 +90,14 @@ function chunk(timestamp: number, duration: number): EncodedAudioChunk {
 	} as unknown as EncodedAudioChunk;
 }
 
+/** The metadata WebCodecs attaches to an Opus chunk: the description a decoder has to init from. */
+const described = {
+	decoderConfig: { description: new Uint8Array([1, 2, 3]) },
+} as unknown as EncodedAudioChunkMetadata;
+
+/** The PCM format the microphone delivers, and delivers again once it has been re-acquired. */
+const mono: Format = { sampleRate: 48_000, channelCount: 1 };
+
 function installFakeAudioCodecs() {
 	const originals = (["AudioEncoder", "AudioDecoder"] as const).map(
 		(name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const,
@@ -131,12 +139,16 @@ describe("a rendition that stops encoding", () => {
 	async function encoding() {
 		const written: Array<{ payload: Uint8Array }> = [];
 		const track = trackOf(written);
-		const rendition = { config: new Signal(undefined), track: new Signal<unknown>(track), close: () => {} };
+		const rendition = {
+			config: new Signal<Catalog.AudioConfig | undefined>(undefined),
+			track: new Signal<unknown>(track),
+			close: () => {},
+		};
 		const capture = {
 			in: { source: new Signal(undefined) },
 			out: {
 				root: new Signal(undefined),
-				format: new Signal<Format | undefined>({ sampleRate: 48_000, channelCount: 1 }),
+				format: new Signal<Format | undefined>(mono),
 				frames: new Signal(undefined),
 			},
 		};
@@ -267,7 +279,7 @@ describe("a rendition that stops encoding", () => {
 			in: { source: new Signal(undefined) },
 			out: {
 				root: new Signal(undefined),
-				format: new Signal<Format | undefined>({ sampleRate: 48_000, channelCount: 1 }),
+				format: new Signal<Format | undefined>(mono),
 				frames: new Signal(undefined),
 			},
 		};
@@ -359,6 +371,172 @@ describe("a rendition that stops encoding", () => {
 			expect(payload.byteLength).toBe(0);
 		} finally {
 			encoder.close();
+		}
+	});
+
+	test("a muted rendition stays in the catalog", async () => {
+		using _codecs = installFakeAudioCodecs();
+		const { encoder, enabled, capture, rendition } = await encoding();
+
+		try {
+			const entry = rendition.config.peek();
+			expect(entry?.codec).toBe("opus");
+
+			// Muting releases the microphone, so the captured format goes with it. The rendition is
+			// paused rather than gone, and the endpoint marker on the wire already says so.
+			enabled.set(false);
+			capture.out.format.set(undefined);
+			await settle();
+
+			expect(rendition.config.peek()).toEqual(entry);
+		} finally {
+			encoder.close();
+		}
+	});
+
+	test("the resumed rendition carries the same catalog entry", async () => {
+		using _codecs = installFakeAudioCodecs();
+		const { encoder, enabled, capture, rendition } = await encoding();
+
+		try {
+			FakeAudioEncoder.last?.output(chunk(0, 20_000), described);
+			await settle();
+			const entry = rendition.config.peek();
+			expect(entry?.description).toBeDefined();
+
+			enabled.set(false);
+			capture.out.format.set(undefined);
+			await settle();
+			expect(rendition.config.peek()).toEqual(entry);
+
+			// The device comes back and the encoder is built again, against an equal config. A
+			// subscriber's rendition is unchanged throughout, description included: a catalog that
+			// dropped it would look like a different rendition to select, decode and measure.
+			enabled.set(true);
+			capture.out.format.set(mono);
+			await settle();
+			expect(rendition.config.peek()).toEqual(entry);
+
+			FakeAudioEncoder.last?.output(chunk(10_000_000, 20_000), described);
+			await settle();
+			expect(rendition.config.peek()).toEqual(entry);
+		} finally {
+			encoder.close();
+		}
+	});
+
+	test("a rendition whose source is removed leaves the catalog", async () => {
+		using _codecs = installFakeAudioCodecs();
+		const { encoder, capture, rendition } = await encoding();
+
+		try {
+			expect(rendition.config.peek()).toBeDefined();
+
+			// Capture ending while the rendition is enabled is the source going for good, not a
+			// pause, so nothing is held open for it.
+			capture.out.format.set(undefined);
+			await settle();
+			expect(rendition.config.peek()).toBeUndefined();
+		} finally {
+			encoder.close();
+		}
+	});
+
+	test("a rendition that comes back republishes its decoder description", async () => {
+		using _codecs = installFakeAudioCodecs();
+		const { encoder, capture, rendition } = await encoding();
+
+		try {
+			FakeAudioEncoder.last?.output(chunk(0, 20_000), described);
+			await settle();
+			const entry = rendition.config.peek();
+			expect(entry?.description).toBeDefined();
+
+			// A device unplugged and plugged back in: the rendition leaves and is resolved again into
+			// an equal config, which is a different object for the description to be keyed against.
+			capture.out.format.set(undefined);
+			await settle();
+			expect(rendition.config.peek()).toBeUndefined();
+
+			capture.out.format.set(mono);
+			await settle();
+
+			FakeAudioEncoder.last?.output(chunk(10_000_000, 20_000), described);
+			await settle();
+			expect(rendition.config.peek()).toEqual(entry);
+		} finally {
+			encoder.close();
+		}
+	});
+
+	// The unmute end to end, on the real broadcast and net path: a subscriber attached throughout
+	// has to receive the first resumed frame on the subscription it already has. A rendition that
+	// leaves the catalog while the device is released costs that subscriber a catalog round trip
+	// and a resubscribe before the publisher's demand gate reopens, and every frame captured in
+	// between is dropped at the gate rather than sent.
+	test("a mute and unmute resume on the same subscription", async () => {
+		using _codecs = installFakeAudioCodecs();
+
+		const { Broadcast } = await import("../broadcast");
+		const broadcast = new Broadcast({
+			enabled: true,
+			origin: new Moq.Origin.Producer(),
+			name: Moq.Path.from("unmute.hang"),
+		});
+		const format = new Signal<Format | undefined>(mono);
+		const capture = {
+			in: { source: new Signal(undefined) },
+			out: { root: new Signal(undefined), format, frames: new Signal(undefined) },
+		};
+		const enabled = new Signal(true);
+		const encoder = new Audio.Encoder("audio", { enabled, broadcast, capture: capture as never });
+
+		let front: Moq.Broadcast.Consumer | undefined;
+		let sub: Moq.Track.Subscriber | undefined;
+
+		try {
+			await settle();
+			const net = broadcast.net.peek();
+			if (!net) throw new Error("expected a network producer");
+			front = net.consume();
+
+			sub = front.subscribe("audio");
+			await settle();
+			FakeAudioEncoder.last?.output(chunk(0, 20_000));
+			const drain = draining(sub);
+			expect(await drain()).toBe(0);
+
+			// Everything the catalog does from here on, which is what decides whether that subscriber
+			// stays where it is.
+			const changes: Array<Catalog.AudioConfig | undefined> = [];
+			const dispose = encoder.out.catalog.subscribe((config) => changes.push(config));
+
+			enabled.set(false);
+			format.set(undefined);
+			await settle();
+
+			// The endpoint marker, and nothing else: the rendition is still advertised.
+			expect(await drain()).toBe(20_000);
+			expect(changes).toEqual([]);
+
+			enabled.set(true);
+			format.set(mono);
+			await settle();
+			expect(changes).toEqual([]);
+
+			// The first frame the re-acquired device produces goes straight out, on a subscription
+			// that was never dropped and a track that never closed.
+			FakeAudioEncoder.last?.output(chunk(3_000_000, 20_000));
+			await settle();
+			expect(await drain()).toBe(3_000_000);
+			expect(sub.closed.peek()).toBeUndefined();
+
+			dispose();
+		} finally {
+			sub?.close();
+			front?.close();
+			encoder.close();
+			broadcast.close();
 		}
 	});
 });

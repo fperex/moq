@@ -594,6 +594,82 @@ test("a publisher's mute and unmute play the resumed audio", async () => {
 	producer.close();
 });
 
+test("a mute and unmute on one subscription plays on without rebuilding the ring", async () => {
+	// A publisher that keeps the rendition in the catalog across a mute changes nothing a watcher
+	// selects on, so the subscription, the decoder and the ring under it all survive the pause. The
+	// resumed run lands in the ring that was already playing: no resubscribe to wait for, no second
+	// decoder to prime, and no refill of a cushion that was never spent.
+	const producer = new MoqBroadcast.Producer();
+	const track = producer.createTrack("audio");
+	const { decoder: built, close } = decoder(true, { catalog: catalog(), active: producer.consume() });
+	await flush();
+
+	for (let i = 0; i < 6; i++) writeGroup(track, i, i * 20_000);
+	await sleep(60);
+	await flush();
+
+	// A rebuilt ring is a new worklet node, and a rebuilt context is a spent gesture.
+	const worklet = built.out.root.peek();
+	expect(worklet).toBeDefined();
+	const spread = built.out.spread.peek();
+
+	writeMarker(track, 6, 120_000);
+	await sleep(40);
+	await flush();
+
+	for (let i = 0; i < 6; i++) writeGroup(track, 7 + i, 10_000_000 + i * 20_000);
+	await sleep(120);
+	await flush();
+
+	expect(built.out.root.peek()).toBe(worklet);
+	expect(MockContext.live().length).toBe(1);
+	expect(built.out.spread.peek()).toBe(spread);
+	expect(built.out.interrupted.peek()).toBe(false);
+	expect(built.out.skipped.peek()).toBe(0);
+
+	// The resumed run reached the ring from its first frame. A decoder primed a second time would
+	// have swallowed the three callbacks the legacy warmup drops, which is 60ms of speech.
+	expect(built.out.buffered.peek().at(-1)?.start).toBe(10_000 as Time.Milli);
+
+	close();
+	producer.close();
+});
+
+test("a watcher that joins while the publisher is muted waits rather than reporting a break", async () => {
+	// The rendition is advertised with nothing captured behind it yet, so there is no media until
+	// the first unmute. A ring nobody has played from is filling rather than stalling, and saying
+	// otherwise puts a buffering overlay over video that is playing fine.
+	const producer = new MoqBroadcast.Producer();
+	const track = producer.createTrack("audio");
+	const { decoder: built, close } = decoder(true, { catalog: catalog(), active: producer.consume() });
+	await flush();
+	await sleep(60);
+	await flush();
+
+	const worklet = built.out.root.peek();
+	expect(worklet).toBeDefined();
+	expect(built.out.interrupted.peek()).toBe(false);
+	expect(built.out.debug.peek()?.fresh ?? true).toBe(true);
+	expect(built.out.timestamp.peek()).toBeUndefined();
+
+	// The publisher unmutes: the first media it captures plays on the graph already standing.
+	for (let i = 0; i < 6; i++) writeGroup(track, i, 10_000_000 + i * 20_000);
+	await sleep(80);
+	await flush();
+
+	expect(built.out.root.peek()).toBe(worklet);
+	expect(built.out.debug.peek()?.buffered).toBeGreaterThan(0);
+	expect(built.out.timestamp.peek()).toBeDefined();
+	// This decoder is genuinely cold, so it still primes on the first real media. What a late
+	// joiner must not pay is a second one on the unmute after it.
+	expect(built.out.buffered.peek().at(-1)?.start).toBeGreaterThanOrEqual(10_000 as Time.Milli);
+	expect(built.out.interrupted.peek()).toBe(false);
+	expect(built.out.skipped.peek()).toBe(0);
+
+	close();
+	producer.close();
+});
+
 test("a republished broadcast is a tune-in, not a late continuation", async () => {
 	// A pinned `<moq-watch reload>` survives a publisher restart: the element stays, and the
 	// broadcast underneath it is replaced by a new consumer for the same name. The new encoder

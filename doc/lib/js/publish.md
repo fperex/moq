@@ -29,7 +29,7 @@ WebCodecs, writes the catalog, and publishes a hang broadcast.
 | --- | --- |
 | `url`, `name` | Relay URL (with `?jwt=` if needed) and broadcast name. |
 | `source` | `camera`, `screen`, or `file`. |
-| `muted`, `invisible` | Disable audio or video capture. |
+| `muted`, `invisible` | Disable audio or video capture. `muted` releases the microphone but leaves the audio rendition in the catalog, paused, so unmuting resumes on the subscriptions it already has; `invisible` takes the video rendition out. |
 | `preview` | What the nested element shows: the raw `source` (default), a decoded copy of the `encoded` stream to see what viewers get, or `none`. |
 | `announce` | When to advertise: once a `source` is live (default), `always`, or `never`. `source` latches: it waits for the first live track and then stays announced until the selected source changes, so replacing a device keeps every subscriber. The broadcast is created while connected either way; this only flips discoverability. |
 

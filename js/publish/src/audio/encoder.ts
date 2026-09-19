@@ -65,8 +65,10 @@ export interface Stats {
 
 // Signals the encoder reads.
 export type EncoderInput = {
-	// Whether to publish (and encode) this rendition. Defaults to true. When false the rendition drops out of the
-	// catalog and stops encoding, but stays registered so a subscriber still gets an idle track.
+	// Whether to encode this rendition. Defaults to true. When false it stops encoding and declares
+	// where the timeline stops, but stays registered and keeps the catalog entry it last resolved, so
+	// a subscriber holds the subscription it resumes on. The entry leaves only when the source goes
+	// for good, which is capture ending while this is true.
 	enabled: Getter<boolean>;
 
 	// The broadcast to register the rendition on. Undefined resolves the config but has nowhere to publish.
@@ -141,6 +143,11 @@ export class Encoder {
 	// first encoder output without feeding that catalog-only update back into the encoder.
 	#config = new Signal<Resolved | undefined>(undefined);
 	#decoderDescription = new Signal<{ config: Catalog.AudioConfig; description: Catalog.Hex } | undefined>(undefined);
+
+	// What the last captured format resolved to, republished while a pause holds the rendition in the
+	// catalog with nothing feeding it, and whether that is what the rendition is doing. See #runConfig.
+	#resolved: Resolved | undefined;
+	#paused = false;
 
 	readonly #out: EncoderOutput = {
 		catalog: new Signal<Catalog.AudioConfig | undefined>(undefined),
@@ -241,7 +248,7 @@ export class Encoder {
 		const rendition = broadcast.audio(this.name);
 		effect.cleanup(() => rendition.close());
 
-		// Publish the resolved config; undefined (no capture) drops it from the catalog.
+		// Publish the resolved config; undefined (no source left to capture) drops it from the catalog.
 		effect.proxy(rendition.config, this.out.catalog);
 
 		// The pipeline outlives any one subscription: it is built as soon as capture runs and
@@ -295,17 +302,28 @@ export class Encoder {
 	// Derive the encoder config from the captured format and the codec. Re-runs whenever either changes, so a
 	// codec update (bitrate, frame duration) reconfigures without waiting for a channel-count change.
 	//
-	// Gated on `enabled` the same way the video encoder is: a disabled rendition has to drop out of
-	// the catalog, and a sample source keeps its format while muted rather than tearing down.
+	// Capture ending is a pause rather than an end while the rendition is disabled, so the entry it
+	// resolved stays in the catalog and only the endpoint marker on the wire says the audio stopped.
+	// Muting a microphone releases the device and takes the captured format with it, and a subscriber
+	// that answers that by dropping the rendition spends a catalog round trip, a resubscribe and a
+	// cold decoder on the way back, which is most of the speech an unmute loses. The hold outlives
+	// the enable: re-acquiring a device is the slow part, and dropping the entry for that window
+	// would cost exactly what holding it saved. Capture ending while enabled is the source going for
+	// good, so that entry leaves, and one that never had a format was never there to hold.
 	#runConfig(effect: Effect): void {
 		const capture = effect.get(this.in.capture);
 		const captured = capture ? effect.get(capture.out.format) : undefined;
-		if (!effect.get(this.in.enabled) || !captured) {
-			effect.set(this.#config, undefined);
-			return;
+		const enabled = effect.get(this.in.enabled);
+
+		if (captured) {
+			this.#paused = false;
+			this.#resolved = resolve(captured, effect.get(this.codec));
+		} else {
+			this.#paused = !!capture && (this.#paused || !enabled);
+			if (!this.#paused) this.#resolved = undefined;
 		}
 
-		effect.set(this.#config, resolve(captured, effect.get(this.codec)));
+		effect.set(this.#config, this.#resolved);
 	}
 
 	// Publish the config immediately so a consumer can request the demand-gated track. Once encoding
@@ -504,7 +522,11 @@ export class Encoder {
 		const current = this.#decoderDescription.peek();
 		if (current?.config === config && current.description === description) return;
 
-		this.#decoderDescription.set({ config, description });
+		// The catalog merges this onto the exact config object it was reported for, so a rebuilt
+		// encoder reporting the same bytes against a fresh one is an equal value and no notification
+		// of its own. Force one, or the rendition keeps the entry that was published before this
+		// description found its config: the same rendition minus the description a decoder inits from.
+		this.#decoderDescription.set({ config, description }, true);
 	}
 
 	close() {

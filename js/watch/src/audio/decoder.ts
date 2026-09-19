@@ -551,7 +551,7 @@ export class Decoder {
 	 *
 	 * The declaration seeds it again when the rendition itself changes, since that is a different
 	 * path with a different publisher's claim about it. A rendition that leaves the catalog and
-	 * comes back unchanged, which is what hiding a microphone does, is the same one.
+	 * comes back unchanged is the same one.
 	 */
 	#runSpread(effect: Effect): void {
 		const identity = effect.get(this.#identity);
