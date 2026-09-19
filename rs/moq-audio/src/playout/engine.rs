@@ -629,12 +629,15 @@ mod tests {
 	/// One 20 ms packet, which is what an Opus publisher sends.
 	const PACKET: Duration = Duration::from_millis(20);
 
+	/// How stale media may be before it is skipped, for every config below.
+	const MAX_AGE: Duration = Duration::from_millis(500);
+
 	fn config(channels: u32, conceal: bool) -> Config {
 		Config {
 			sample_rate: RATE,
 			channels,
 			delay: Duration::ZERO,
-			max_age: Duration::from_millis(500),
+			max_age: MAX_AGE,
 			advertised: Duration::ZERO,
 			conceal,
 		}
@@ -717,6 +720,14 @@ mod tests {
 				self.out.extend_from_slice(&out);
 				self.now += BLOCK.as_secs_f64() * 1000.0;
 			}
+		}
+
+		/// Raise the caller's floor mid-stream, which is what a viewer asking for a
+		/// deeper buffer does: the estimator keeps measuring, and the target it
+		/// produces now lands no shallower than this.
+		fn deepen(&mut self, delay: Duration) {
+			self.engine.constraints = Constraints::new(delay, MAX_AGE, MAX_AGE).unwrap();
+			self.engine.retarget();
 		}
 
 		/// Hold every delivery until the buffer runs dry, returning where the
@@ -818,15 +829,60 @@ mod tests {
 			"playout starts on the newest audio less what it holds"
 		);
 
-		// And nothing was bent to get there. The window ends before the estimator's first
-		// measurement replaces the cold-start guess, because the accelerates a falling target
-		// asks for are its own business; what this covers is the backlog, which without the
-		// trim is compressed away right here.
+		// And nothing was compressed away to get there. The window ends before the estimator's
+		// first measurement replaces the cold-start guess, because the accelerates a falling
+		// target asks for are its own business; what this covers is the backlog, which without
+		// the trim is squeezed out right here. Output carrying no more media than its own
+		// length is what says so, and it is the direction that matters: an accelerate is the
+		// only thing that makes a block carry more, where the expansion a buffer a chunk under
+		// its hold asks for makes it carry less.
 		player.play(25);
 		let stats = player.engine.stats();
-		assert_eq!(stats.accelerates, 0, "{stats:?}");
+		let output = BLOCK * 25;
+		assert!(
+			player.engine.playhead().expect("audio has played") <= Duration::from_millis(200) + output,
+			"the backlog was compressed away: {stats:?}"
+		);
 		assert_eq!(stats.skips, 0, "{stats:?}");
 		assert_eq!(stats.underruns, 0, "{stats:?}");
+	}
+
+	/// The level playout holds moved out from under a stream that is playing perfectly
+	/// well at the depth it has. Arrivals stay real time, so a stretch is the only
+	/// thing that can take the buffer deeper; one left at its old depth would play on
+	/// until the first late arrival ran it dry.
+	#[test]
+	fn a_target_rise_is_reached_without_an_underrun() {
+		let mut player = Player::new(config(1, true), 30.0);
+		// A path with a little scheduling noise on it, which is what a real one has.
+		let jitter = |block: usize| Some(Duration::from_millis((block % 3) as u64));
+		player.play_with(300, jitter);
+
+		let before = player.engine.stats();
+
+		// The distance between a microphone on a local relay and a publisher that packs
+		// seven frames into one flush, which is a rendition switch or an estimate that
+		// has only now seen the wider path. The buffer is left below half the level it is
+		// asked to hold, which is the range the half gate used to leave alone.
+		let rise = Duration::from_millis(180);
+		assert!(
+			before.buffered * 2 < before.target + rise + PACKET,
+			"the buffer has to land below half the new hold: {before:?}"
+		);
+		player.deepen(before.target + rise);
+
+		player.play_with(800, jitter);
+
+		let stats = player.engine.stats();
+		assert!(
+			stats.buffered >= stats.target,
+			"the buffer never reached the deeper level it was asked for: {stats:?}"
+		);
+		// And it was stretched there rather than parked there: a buffer that waits for
+		// the refill spends the whole rise as concealment first.
+		assert_eq!(stats.expands, before.expands, "the rise was parked through: {stats:?}");
+		assert_eq!(stats.underruns, before.underruns, "reaching it cost a gap: {stats:?}");
+		assert_eq!(stats.skips, 0, "{stats:?}");
 	}
 
 	/// A buffer running ahead of the device drains by playing slightly faster, not

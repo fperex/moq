@@ -136,7 +136,6 @@ impl Decision {
 	pub(crate) fn decide(&mut self, ready: usize, queued: usize, contiguous: bool) -> Action {
 		let block = frames(self.rate, BLOCK);
 		self.level.update(ready + queued, 0);
-		let level = self.level.filtered();
 
 		// Too little to play is a stall whatever caused it, and audio that does not
 		// continue what was played is a splice rather than a stall: the merge is
@@ -154,12 +153,18 @@ impl Decision {
 			if ready < self.hold() {
 				return Action::Conceal;
 			}
+			// Playout resumes at whatever depth the refill reached. The level did not
+			// drift there, so adopt it rather than filtering toward it: a filter still
+			// walking up from the refill reads a healthy buffer as one that needs
+			// stretching.
+			self.level.set(ready + queued);
 			self.stalled = false;
 		}
 		if !contiguous || self.concealing {
 			return Action::Merge;
 		}
 
+		let level = self.level.filtered();
 		let high = self.high();
 		if level >= FAST * high && ready >= self.stretch_input() {
 			// No cooldown: a buffer this far above target is going to be late
@@ -175,11 +180,12 @@ impl Decision {
 			return Action::Accelerate { fast: false };
 		}
 
-		// Below half the level it holds the buffer is not being refilled by a slow
-		// path, it is empty, and stretching it thinner only delays the concealment
-		// that is coming. NetEq holds decoding back at the same threshold.
+		// However far below the level it holds: a stretch is the only thing that takes
+		// a playing buffer deeper, so one left at its old depth just waits for the
+		// first late arrival to run it dry. A buffer with nothing left to stretch never
+		// reaches here, because it stalls on the way in and conceals.
 		let hold = self.hold();
-		if level < hold && level >= hold / 2 && ready >= self.stretch_input() {
+		if level < hold && ready >= self.stretch_input() {
 			return Action::Expand;
 		}
 
@@ -295,19 +301,30 @@ mod tests {
 		settle(&mut decision, ready);
 		assert!(ready < hold(target));
 		assert_eq!(decision.decide(ready, 0, true), Action::Expand);
-	}
 
-	#[test]
-	fn a_nearly_empty_buffer_is_left_to_refill() {
-		let target = Duration::from_millis(200);
-		let mut decision = decision(target);
+		// However far below that level it is. A buffer this thin is one late arrival
+		// from running dry, and the stretch is what buys the refill its time.
 		let ready = frames(RATE, Duration::from_millis(50));
 		settle(&mut decision, ready);
-		assert_eq!(
-			decision.decide(ready, 0, true),
-			Action::Normal,
-			"stretching a buffer this thin only delays the concealment"
-		);
+		assert!(ready < hold(target) / 2);
+		assert_eq!(decision.decide(ready, 0, true), Action::Expand);
+	}
+
+	/// The level playout holds moved out from under a buffer that is playing
+	/// perfectly well at the depth it has. A stretch is the only thing that takes a
+	/// playing buffer deeper, so one left at its old depth would play on until the
+	/// first late arrival ran it dry.
+	#[test]
+	fn a_deeper_target_is_expanded_into_from_below_half_the_hold() {
+		let shallow = Duration::from_millis(60);
+		let mut decision = decision(shallow);
+		let ready = hold(shallow);
+		settle(&mut decision, ready);
+		assert_eq!(decision.decide(ready, 0, true), Action::Normal);
+
+		decision.target(Duration::from_millis(400));
+		assert!(ready < decision.hold() / 2);
+		assert_eq!(decision.decide(ready, 0, true), Action::Expand);
 	}
 
 	#[test]
@@ -320,6 +337,24 @@ mod tests {
 		decision.produced(BLOCK_FRAMES, 0, true);
 
 		assert_eq!(decision.decide(hold(target), 0, true), Action::Merge);
+	}
+
+	/// The refill put the buffer where it is meant to be, so the blocks after the
+	/// splice are owed nothing. A filter still walking up from empty reads the same
+	/// buffer as one that needs stretching.
+	#[test]
+	fn a_refilled_buffer_resumes_without_a_stretch() {
+		let target = Duration::from_millis(100);
+		let mut decision = decision(target);
+		decision.reset(0);
+
+		assert_eq!(decision.decide(0, 0, true), Action::Conceal);
+		decision.produced(BLOCK_FRAMES, 0, true);
+
+		assert_eq!(decision.decide(hold(target), 0, true), Action::Merge);
+		decision.produced(BLOCK_FRAMES, 0, false);
+
+		assert_eq!(decision.decide(hold(target), 0, true), Action::Normal);
 	}
 
 	/// Resuming on whatever arrived first plays on an empty cushion, so the next
