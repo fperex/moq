@@ -137,6 +137,27 @@ test("the conceal attribute reaches the audio decoder, defaulting to on", () => 
 	expect(el.audio.in.conceal.peek()).toBe(false);
 });
 
+test("the audio decoder is told when the element leaves the document", () => {
+	// The download gate alone cannot say it: a muted tile stops downloading too, and it keeps its
+	// audio context so the unmute costs no gesture. Only the element knows it is off the page,
+	// which is what lets the decoder release the context rather than leak one per detach.
+	const MoqWatch = require("./element").default as new () => {
+		connectedCallback(): void;
+		disconnectedCallback(): void;
+		audio: { in: { attached: { peek(): boolean } } };
+	};
+	const el = new MoqWatch();
+
+	// Built but not inserted: a page appends the canvas before the element lands in a document.
+	expect(el.audio.in.attached.peek()).toBe(false);
+
+	el.connectedCallback();
+	expect(el.audio.in.attached.peek()).toBe(true);
+
+	el.disconnectedCallback();
+	expect(el.audio.in.attached.peek()).toBe(false);
+});
+
 test("connecting re-arms the video download gate", async () => {
 	// A page may not touch a custom element's children in its constructor, so `createElement`,
 	// `appendChild(canvas)`, then insert is the ordinary order. That arms the download gate on a

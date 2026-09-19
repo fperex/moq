@@ -212,6 +212,7 @@ function decoder(
 	decoder: DecoderType;
 	catalog: Signal<Catalog.Root | undefined>;
 	enabled: Signal<boolean>;
+	attached: Signal<boolean>;
 	active: Signal<MoqBroadcast.Consumer | undefined>;
 	sync: SyncType;
 	close: () => void;
@@ -233,11 +234,14 @@ function decoder(
 		buffer: new Signal(Time.Milli.zero),
 	});
 	const downloading = new Signal(enabled);
-	const built = new Decoder(source, sync, { enabled: downloading });
+	// Whether the player is on the page, which is what `<moq-watch>` feeds from its connect callbacks.
+	const attached = new Signal(true);
+	const built = new Decoder(source, sync, { enabled: downloading, attached });
 	return {
 		decoder: built,
 		catalog: root,
 		enabled: downloading,
+		attached,
 		active,
 		sync,
 		close: () => {
@@ -427,6 +431,86 @@ test("a rate change after the gesture rebuilds inside the grace and re-arms outs
 
 	click();
 	expect(third.state).toBe("running");
+
+	close();
+});
+
+test("a player taken off the page releases its context", async () => {
+	// A context is a render thread and one of the handful a browser allows, and a player that is
+	// not in the document can never be heard out of. Held past the detach, a page that cycles its
+	// tiles runs out of contexts and the smoke lane's resource baseline never comes back to zero.
+	const { decoder: built, attached, close } = decoder(true);
+	await flush();
+
+	click();
+	const context = built.out.context.peek() as unknown as MockContext;
+	expect(context.state).toBe("running");
+
+	attached.set(false);
+	await flush();
+
+	expect(context.state).toBe("closed");
+	expect(built.out.context.peek()).toBeUndefined();
+	expect(built.out.root.peek()).toBeUndefined();
+	expect(MockContext.live()).toBeEmpty();
+
+	// The listeners stay armed for the player's lifetime, so a click anywhere on the page still
+	// reaches this one. It belongs to whatever the viewer clicked, not to a tile that is gone.
+	click();
+	expect(MockContext.live()).toBeEmpty();
+
+	close();
+});
+
+test("a player put back on the page builds a context again", async () => {
+	const { decoder: built, attached, close } = decoder(true);
+	await flush();
+
+	click();
+	const first = built.out.context.peek() as unknown as MockContext;
+
+	attached.set(false);
+	await flush();
+	expect(first.state).toBe("closed");
+
+	// The page keeps its activation across the detach (Chromium's is sticky for the document's
+	// lifetime), so the replacement starts without asking the viewer to click again. Where it does
+	// not, unlockOnGesture is still armed and spends the next gesture on it.
+	MockContext.grace = true;
+	attached.set(true);
+	await flush();
+
+	const second = built.out.context.peek() as unknown as MockContext;
+	expect(second).toBeDefined();
+	expect(second).not.toBe(first as unknown as MockContext);
+	expect(second.state).toBe("running");
+	expect(built.out.root.peek()).toBeDefined();
+	expect(MockContext.live().length).toBe(1);
+
+	close();
+});
+
+test("a viewer muting a tile keeps the context it is playing", async () => {
+	// Muting stops the download, and the graph stays up behind it: rebuilding would spend a gesture
+	// on the unmute, which is the one thing a viewer cannot be asked for twice.
+	const { decoder: built, enabled, close } = decoder(true);
+	await flush();
+
+	click();
+	const context = built.out.context.peek() as unknown as MockContext;
+	expect(context.state).toBe("running");
+
+	enabled.set(false);
+	await flush();
+
+	expect(built.out.context.peek()).toBe(context as unknown as AudioContext);
+	expect(context.state).toBe("running");
+
+	enabled.set(true);
+	await flush();
+
+	expect(built.out.context.peek()).toBe(context as unknown as AudioContext);
+	expect(MockContext.built.length).toBe(1);
 
 	close();
 });

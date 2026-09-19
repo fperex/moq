@@ -17,6 +17,9 @@ import { type Effect, type Getter, Signal } from "@moq/signals";
  * starts on its own only where the autoplay policy is permissive or the activation is still live;
  * the listeners stay armed regardless and spend the next gesture on it.
  *
+ * `build` returns nothing to decline the gesture, which a player off the page does: there is
+ * nothing to hear out of it, and the gesture belongs to whatever the viewer actually clicked.
+ *
  * This attempts `resume()` whenever the context is not running (for autoplay-permissive browsers
  * like Chrome with prior engagement, and for a page that has already had its gesture), and again on
  * every `pointerdown`/`keydown` until the context is actually running. A single unconditional attempt
@@ -32,7 +35,7 @@ import { type Effect, type Getter, Signal } from "@moq/signals";
 export function unlockOnGesture(
 	effect: Effect,
 	context: Getter<AudioContext | undefined>,
-	build: () => AudioContext,
+	build: () => AudioContext | undefined,
 ): void {
 	// Nothing to arm where there is no document (server rendering, a test runner): no gestures reach
 	// this build, and no audio plays out of it either.

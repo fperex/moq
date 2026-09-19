@@ -42,6 +42,15 @@ export type DecoderInput = {
 	enabled: Getter<boolean>;
 
 	/**
+	 * Whether the player is on the page at all. Defaults to true.
+	 *
+	 * A player that is not can never be heard, so it releases its audio context, the render thread
+	 * behind it and the ring, and builds them again if it comes back. Separate from `enabled`, which
+	 * a mute also clears: a muted tile keeps the context it has, so the unmute costs no gesture.
+	 */
+	attached: Getter<boolean>;
+
+	/**
 	 * Whether a gap in the audio is concealed with synthesized audio rather than played as a ramp
 	 * into silence. Defaults to true.
 	 *
@@ -145,7 +154,8 @@ export class Decoder {
 	#ring: AudioBuffer | undefined;
 
 	// The AudioContext the graph runs in, owned here rather than by an effect: it is built by the
-	// gesture that starts it (see #buildContext) and outlives every other change to the graph.
+	// gesture that starts it (see #buildContext) and outlives every other change to the graph short
+	// of the player leaving the page (see #runContext).
 	#context: AudioContext | undefined;
 
 	// The rate the decoder actually outputs, learned from the first decoded frame. This is the source
@@ -218,6 +228,7 @@ export class Decoder {
 	constructor(props: DecoderProps) {
 		this.in = {
 			enabled: getter(props?.enabled ?? true),
+			attached: getter(props?.attached ?? true),
 			conceal: getter(props?.conceal ?? true),
 		};
 
@@ -252,8 +263,11 @@ export class Decoder {
 		// There is no context until a user gesture builds one (see #buildContext). Armed for the
 		// decoder's lifetime rather than while audio is enabled: the click that unmutes a tile is the
 		// activation, and listeners armed as a consequence of it are armed one microtask too late to
-		// hear it. See unlockOnGesture.
-		unlockOnGesture(this.#signals, this.#out.context, () => this.#context ?? this.#buildContext(this.#rate.peek()));
+		// hear it. See unlockOnGesture. A player off the page builds nothing: the gesture belongs to
+		// whatever the viewer actually clicked.
+		unlockOnGesture(this.#signals, this.#out.context, () =>
+			this.in.attached.peek() ? (this.#context ?? this.#buildContext(this.#rate.peek())) : undefined,
+		);
 		this.#signals.cleanup(() => this.#closeContext());
 
 		this.#signals.run(this.#runContext.bind(this));
@@ -265,8 +279,8 @@ export class Decoder {
 	}
 
 	/**
-	 * Build the context for a tile whose audio is on, and replace it when the rate it must run at
-	 * changes.
+	 * Build the context for a tile whose audio is on, replace it when the rate it must run at
+	 * changes, and release it when the player leaves the page.
 	 *
 	 * A context's rate is fixed for its lifetime, so the rate the decoder turns out to emit (see
 	 * #emit) is the one change worth a new context. Everything else that rebuilds the graph (a later
@@ -275,8 +289,18 @@ export class Decoder {
 	 * that may never come again. The replacement here is built outside a handler, so it starts only
 	 * while the page's activation is still live; unlockOnGesture stays armed and spends the next
 	 * gesture on it otherwise.
+	 *
+	 * A player taken off the page releases its context and pays for a new one if it comes back:
+	 * nothing can be heard out of it, and what it holds is a render thread and one of the handful of
+	 * contexts a browser allows. Keyed on `attached` rather than on `enabled`, which a mute also
+	 * clears, so a muted tile keeps the context it has.
 	 */
 	#runContext(effect: Effect): void {
+		if (!effect.get(this.in.attached)) {
+			this.#closeContext();
+			return;
+		}
+
 		const rate = effect.get(this.#rate);
 		const enabled = effect.get(this.in.enabled);
 

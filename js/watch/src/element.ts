@@ -241,6 +241,7 @@ export default class MoqWatch extends HTMLElement {
 			source: audioSource,
 			sync: this.sync,
 			enabled: this.#audioEnabled,
+			attached: this.#enabled,
 			conceal: this.#conceal,
 		});
 		this.signals.proxy(this.sync.track("audio").spread, this.audio.out.spread);
