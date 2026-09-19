@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Time } from "@moq/net";
 import { Jitter, type JitterObservation } from "./jitter";
 import { load, replay } from "./jitter.vectors.ts";
+import { Stall, type StallTimer } from "./stall";
 
 const FRAME = 20;
 const START = 80;
@@ -33,6 +34,75 @@ function flush(
 	}
 
 	return start + frames * frame;
+}
+
+/**
+ * The event loop monitor's own timer and probe, on a clock the test moves by hand.
+ *
+ * `advance` runs whatever was queued up to `to`, which is a loop that keeps running. `throttle`
+ * holds every schedule to a minimum interval, which is what a hidden tab does to `setTimeout` while
+ * its loop and its socket carry on as before. `busy` runs nothing at all while the test keeps
+ * reading, which is a loop running flat out: the reads are served and everything queued behind them
+ * waits.
+ */
+function fakeTimer(): StallTimer & { advance(to: number): void; throttle(ms: number): void; busy(on: boolean): void } {
+	let now = 0;
+	let due: { at: number; fn: () => void } | undefined;
+	let floor = 0;
+	let stopped = false;
+	let handler: (() => void) | undefined;
+	let queued = 0;
+
+	return {
+		now: () => now,
+		schedule: (fn, ms) => {
+			due = { at: now + Math.max(ms, floor), fn };
+			return due;
+		},
+		clear: () => {
+			due = undefined;
+		},
+		probe: (fn) => {
+			handler = fn;
+			return {
+				post: () => {
+					queued++;
+				},
+				close: () => {},
+			};
+		},
+		advance(to: number) {
+			// One millisecond at a time, so a timer that reschedules itself fires as often as it would
+			// on a loop that was running.
+			while (now < to) {
+				now++;
+				if (stopped) continue;
+
+				for (;;) {
+					// A task the loop was handed goes before a timer: it is served as soon as whatever
+					// is in front of it is done.
+					if (queued > 0) {
+						queued--;
+						handler?.();
+						continue;
+					}
+					if (due !== undefined && due.at <= now) {
+						const fn = due.fn;
+						due = undefined;
+						fn();
+						continue;
+					}
+					break;
+				}
+			}
+		},
+		throttle(ms: number) {
+			floor = ms;
+		},
+		busy(on: boolean) {
+			stopped = on;
+		},
+	};
 }
 
 describe("tune-in", () => {
@@ -276,6 +346,92 @@ describe("the receiver's own reading gap", () => {
 		// And the same arrivals with nothing watching the loop, which is what the flag is worth: most
 		// of the block lands in the target, where the histogram then remembers it for half a minute.
 		expect(control).toBeGreaterThanOrEqual(300 as Time.Milli);
+	});
+
+	it("the target does not decay while the tab's timers are throttled", () => {
+		// The flag comes from watching the event loop, so what the monitor calls a block is what the
+		// estimator throws arrivals away for. A hidden tab is rationed to one timer a second while its
+		// loop keeps running and its socket keeps being read, so the arrivals here are the ones a
+		// visible tab sees and the path's jitter is the same 60ms throughout.
+		const LATE = 60;
+
+		const timer = fakeTimer();
+		const stall = new Stall(timer);
+		const jitter = new Jitter();
+
+		let frame = 0;
+		let cursor = 0;
+
+		// Every tenth frame is held 60ms and the frames queued behind it are read right after it.
+		const feed = (seconds: number) => {
+			for (let i = 0; i < (seconds * 1000) / FRAME; i++) {
+				const media = frame * FRAME;
+				cursor = Math.max(cursor, media + 50 + (frame % 10 === 9 ? LATE : 0));
+				frame++;
+
+				timer.advance(cursor);
+				observe(jitter, media, cursor, { stalled: stall.blocked(cursor as Time.Milli) });
+			}
+		};
+
+		feed(30);
+		const settled = jitter.value.peek();
+		expect(settled).toBe(80 as Time.Milli);
+
+		// The tab goes to the background. Two minutes of it, because the histogram's own memory holds
+		// the measured tail above the quantile for the first minute of discarded arrivals.
+		timer.throttle(1000);
+		feed(120);
+
+		expect(jitter.value.peek()).toBeGreaterThanOrEqual((settled - Jitter.BUCKET) as Time.Milli);
+
+		stall.close();
+	});
+
+	it("the target does not rise while the loop is busy but still answering", () => {
+		// The same monitor with two tracks on it. A page running flat out on a keyframe keeps reading
+		// the socket, so the audio track's arrivals keep the loop visibly alive at 20ms spacing while
+		// the video group queued behind the work is handed over all at once at the end of the burst.
+		// Those frames waited in this receiver; measured against the path they read as 300ms of it.
+		const VIDEO = 33;
+		const AUDIO = 20;
+		const PATH = 50;
+		const BURST = 300;
+		const PERIOD = 2000;
+		const SECONDS = 30;
+
+		const run = (bursts: boolean): number => {
+			const timer = fakeTimer();
+			const stall = new Stall(timer);
+			const jitter = new Jitter();
+
+			let held: number[] = [];
+
+			for (let ms = 1; ms <= SECONDS * 1000; ms++) {
+				const busy = bursts && ms % PERIOD < BURST;
+				timer.busy(busy);
+				timer.advance(ms);
+
+				// The audio track is read throughout, whatever the loop is doing.
+				if (ms % AUDIO === 0) stall.blocked(ms as Time.Milli);
+
+				if (ms >= PATH && (ms - PATH) % VIDEO === 0) held.push(ms - PATH);
+				if (busy || held.length === 0) continue;
+
+				for (const media of held) {
+					observe(jitter, media, ms, { stalled: stall.blocked(ms as Time.Milli) });
+				}
+				held = [];
+			}
+
+			stall.close();
+			return jitter.value.peek();
+		};
+
+		// The path is the same 50ms throughout both, so the only thing between them is the loop, and
+		// a target that can tell the difference is one sizing a viewer's buffer for this receiver.
+		const steady = run(false);
+		expect(Math.abs(run(true) - steady)).toBeLessThanOrEqual(Jitter.BUCKET);
 	});
 });
 

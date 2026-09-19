@@ -158,11 +158,16 @@ content process blocked for 400 ms and a publisher flushing every 400 ms produce
 the same arrivals, so a lower threshold buys the second one's damage to catch
 the first. What separates them is whether this receiver was running, which is
 not in the arrival timing at all but is directly observable where the receiver
-lives. In the browser `Container.Consumer` watches its own event loop with a
-50 ms timer, reads the lag each firing measures, and calls anything past 100 ms
-a block (`js/hang/src/container/stall.ts`); the estimator itself stays free of
-timers and of any clock but the one an arrival is stamped with, which is what
-lets one corpus hold every language. A receiver with nothing watching it is left
+lives. In the browser `Container.Consumer` watches its own event loop
+(`js/hang/src/container/stall.ts`): it hands the loop an ordinary task, a
+`MessageChannel` message rather than a timer, and reads back how long the loop
+took to get to it, and separately notices a stretch in which no turn of the loop
+happened at all. Either one past 100 ms is a block. How late a timer runs
+measures neither, because a hidden tab is rationed to one timer a second with
+its loop running and its socket read as before, and a loop running flat out
+delivers its timers late while answering every read on time. The estimator
+itself stays free of timers and of any clock but the one an arrival is stamped
+with, which is what lets one corpus hold every language. A receiver with nothing watching it is left
 with the spacing rule, which is why that rule stays. The `receiver-stall` and
 `receiver-stall-unflagged` corpus cases are the same arrivals with and without
 the input.
