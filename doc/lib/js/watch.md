@@ -40,6 +40,8 @@ in sync at the latency you ask for.
 
 The overlay adds play/pause, volume, fullscreen, a quality selector, a
 buffering indicator, an unsupported-codec warning, and a stats panel.
+The stats panel counts rendered frames, so its frame-rate graph shows zero
+when the displayed picture stops advancing.
 `<moq-watch-support>` shows what the browser can play.
 
 ## Binding from a framework
