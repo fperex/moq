@@ -2,43 +2,43 @@
 set -euo pipefail
 
 if [[ ${1:-} == --help ]]; then
-    echo 'Usage: bash .agents/commands/sync-upstream [remote [branch]]'
-    echo 'Defaults: upstream main. Fetch, back up HEAD, and prepare a merge for review.'
-    echo 'Requires a clean branch. Never stashes, commits, rebases, or pushes.'
-    exit 0
+	echo 'Usage: bash .agents/commands/sync-upstream [remote [branch]]'
+	echo 'Defaults: upstream main. Fetch, back up HEAD, and prepare a merge for review.'
+	echo 'Requires a clean branch. Never stashes, commits, rebases, or pushes.'
+	exit 0
 fi
-if (( $# > 2 )) || [[ ${1:-} == -* || ${2:-} == -* ]]; then
-    echo 'Expected a remote name and branch name. Use --help.' >&2
-    exit 2
+if (($# > 2)) || [[ ${1:-} == -* || ${2:-} == -* ]]; then
+	echo 'Expected a remote name and branch name. Use --help.' >&2
+	exit 2
 fi
 remote=${1:-upstream}
 branch=${2:-main}
 cd "$(git rev-parse --show-toplevel)"
 git symbolic-ref --quiet HEAD >/dev/null || {
-    echo 'Refusing to sync a detached HEAD. Select the intended working branch.' >&2
-    exit 1
+	echo 'Refusing to sync a detached HEAD. Select the intended working branch.' >&2
+	exit 1
 }
 for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
-    if [[ -e $(git rev-parse --git-path "$state") ]]; then
-        echo "Finish or abort the existing Git operation first: $state" >&2
-        exit 1
-    fi
+	if [[ -e $(git rev-parse --git-path "$state") ]]; then
+		echo "Finish or abort the existing Git operation first: $state" >&2
+		exit 1
+	fi
 done
 if [[ -n $(git status --porcelain --untracked-files=normal) ]]; then
-    echo 'Commit the intended work first. The sync command does not stash or discard changes.' >&2
-    exit 1
+	echo 'Commit the intended work first. The sync command does not stash or discard changes.' >&2
+	exit 1
 fi
 git remote get-url "$remote" >/dev/null
 git check-ref-format "refs/heads/$branch"
 git fetch --no-tags "$remote" "refs/heads/$branch"
 target=$(git rev-parse FETCH_HEAD)
 git merge-base HEAD "$target" >/dev/null || {
-    echo 'Refusing to merge unrelated histories.' >&2
-    exit 1
+	echo 'Refusing to merge unrelated histories.' >&2
+	exit 1
 }
 if git merge-base --is-ancestor "$target" HEAD; then
-    echo "Already contains $remote/$branch at $target."
-    exit 0
+	echo "Already contains $remote/$branch at $target."
+	exit 0
 fi
 backup="refs/backups/sync/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 git update-ref "$backup" HEAD ''
@@ -46,8 +46,8 @@ echo "Backup: $backup"
 echo "Incoming commits from $remote/$branch:"
 git log --oneline "HEAD..$target"
 if ! git -c merge.autoStash=false merge --no-commit --no-ff "$target"; then
-    echo 'Merge stopped. Resolve and commit, or run git merge --abort to return to the backup.' >&2
-    exit 1
+	echo 'Merge stopped. Resolve and commit, or run git merge --abort to return to the backup.' >&2
+	exit 1
 fi
 echo 'Review the staged merge, validate affected packages, and commit with your own attribution.'
 echo 'No remote branch has been changed.'
