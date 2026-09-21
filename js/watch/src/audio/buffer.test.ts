@@ -233,6 +233,49 @@ describe("AudioBuffer, transport", () => {
 });
 
 describe("AudioBuffer output clock", () => {
+	it("filters output timestamp noise without delaying a resumed output clock", () => {
+		clock = fakeClock(1000);
+		const worklet = new FakeWorklet();
+		let output = { contextTime: 1, performanceTime: 1000 };
+		const shared = globalThis.SharedArrayBuffer;
+		(globalThis as { SharedArrayBuffer?: SharedArrayBufferConstructor }).SharedArrayBuffer = undefined;
+		let buffer: AudioBuffer;
+		try {
+			buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+				context: { getOutputTimestamp: () => output },
+				channels: 1,
+				rate: 48000,
+				latency: 4800,
+				buffered: false,
+				conceal: true,
+			});
+		} finally {
+			globalThis.SharedArrayBuffer = shared;
+		}
+		try {
+			worklet.deliver({ ...state(worklet, playhead(500, 1), false), contextTime: Time.Second(1) });
+			for (let i = 1; i <= 100; i++) {
+				clock.advance(20);
+				output = { contextTime: 1 + i * 0.02, performanceTime: 1000 + i * 20 + (i % 2 ? 4 : -4) };
+				worklet.deliver({
+					...state(worklet, playhead(500 + i * 20, 1), false),
+					contextTime: Time.Second(1 + i * 0.02),
+				});
+				expect(Math.abs((buffer.clock.peek()?.reference ?? Number.NaN) - (1000 + i * 20))).toBeLessThan(1);
+			}
+			clock.advance(60_020);
+			output = { contextTime: 3.02, performanceTime: 63_020 };
+			worklet.deliver({ ...state(worklet, playhead(2520, 1), false), contextTime: Time.Second(3.02) });
+			expect(buffer.clock.peek()).toEqual({
+				timestamp: Time.Micro(2_520_000),
+				reference: Time.Milli(63_020),
+				rate: 1,
+			});
+		} finally {
+			buffer.close();
+		}
+	});
+
 	it("keeps the audio timeline stable when worklet messages arrive unevenly", () => {
 		clock = fakeClock(1010);
 		const worklet = new FakeWorklet();

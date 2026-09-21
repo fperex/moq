@@ -509,6 +509,8 @@ end of its render quantum. The main thread maps that audio context time through
 `AudioContext.getOutputTimestamp()` before using it to pace video. Message
 delivery time varies with main-thread load; using it as the playback timestamp
 would turn that scheduling jitter into uneven video frame releases.
+Small variations in the browser's output-time estimate are smoothed before they
+pace video. A larger clock jump re-anchors immediately, including after suspension.
 
 ## Holding the sound for a later picture
 

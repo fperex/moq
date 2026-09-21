@@ -468,6 +468,7 @@ class PostAudioBuffer implements AudioBuffer {
 		const msg: InitPost = { type: "init-post", channels, rate, latency, buffered, conceal };
 		worklet.port.postMessage(msg);
 
+		let output: { contextTime: number; offset: number } | undefined;
 		// Listen for state updates from the worklet.
 		this.#signals.event(worklet.port, "message", (ev: Event) => {
 			const data = (ev as MessageEvent<State>).data;
@@ -490,12 +491,17 @@ class PostAudioBuffer implements AudioBuffer {
 				}
 				// Message delivery varies with main-thread load. Anchor the playhead to when its
 				// samples reach the output device so that delivery jitter does not pace video.
-				const reference = Time.Milli(performanceTime + (data.contextTime - contextTime) * 1000);
-				this.#clock.set(
-					contextTime === 0 && performanceTime === 0
-						? undefined
-						: this.#clockSource.sample(data.playhead, reference),
-				);
+				let offset = performanceTime - contextTime * 1000;
+				if (output && contextTime >= output.contextTime && Math.abs(offset - output.offset) < 20) {
+					// Output timestamps are estimates: their quantum-scale noise must not move
+					// consecutive video frames across the same display refresh. Average over 250 ms,
+					// but adopt a discontinuity immediately when the output clock resumes or changes.
+					const elapsed = (contextTime - output.contextTime) * 1000;
+					offset = output.offset + (offset - output.offset) * -Math.expm1(-elapsed / 250);
+				}
+				output = contextTime === 0 && performanceTime === 0 ? undefined : { contextTime, offset };
+				const reference = Time.Milli(data.contextTime * 1000 + offset);
+				this.#clock.set(output ? this.#clockSource.sample(data.playhead, reference) : undefined);
 				// While stalled the playhead is parked, so release the decode loop to refill the floor;
 				// once playing, hold it to ~the floor ahead.
 				if (data.debug.stalled || timestamp === undefined) this.#backpressure.flush();
