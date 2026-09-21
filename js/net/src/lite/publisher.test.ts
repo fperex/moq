@@ -9,6 +9,7 @@ import * as Path from "../path.ts";
 import { Reader, Stream, Writer } from "../stream.ts";
 import { Milli, Timestamp } from "../time.ts";
 import { DEFAULT_MAX_AGE_MS } from "../track.ts";
+import { wireOf } from "../wire.ts";
 import { AnnounceRequest } from "./announce.ts";
 import { Fetch } from "./fetch.ts";
 import { Group as GroupMessage } from "./group.ts";
@@ -1398,7 +1399,7 @@ test("a repeat subscription fans out from the live track instead of raising a re
 		firstServer,
 	);
 
-	const request = await broadcast.requested();
+	const request = await wireOf(broadcast).requested();
 	if (!request) throw new Error("expected a track request");
 	expect(request.name).toBe("video");
 	const track = request.accept();
@@ -1417,7 +1418,7 @@ test("a repeat subscription fans out from the live track instead of raising a re
 
 		// No second request: the live producer answers it.
 		const none = Symbol("none");
-		expect(await Promise.race([broadcast.requested(), Promise.resolve(none)])).toBe(none);
+		expect(await Promise.race([wireOf(broadcast).requested(), Promise.resolve(none)])).toBe(none);
 
 		// And it is served: one group written now opens a stream for each subscription.
 		const group = new GroupProducer(0);

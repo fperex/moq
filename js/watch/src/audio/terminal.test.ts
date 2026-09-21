@@ -121,7 +121,7 @@ test("an endpoint delivered before its playhead event trims the flush and not th
 	// as one result instead, the event resets the endpoint and the same result re-applies it, so
 	// every sample of the resumed run is trimmed to nothing and the talker is never heard again.
 	const track = new Track.Producer("audio");
-	const consumer = new Container.Consumer(track.subscribe({ maxAge: 30_000 }), {
+	const consumer = new Container.Consumer(track.subscribe({ maxAge: Time.Milli(30_000) }), {
 		// Wide enough that the ten second pause is not a conviction: the publisher declared it.
 		format: new Container.Legacy.Format("audio"),
 		maxAge: 30_000 as Time.Milli,

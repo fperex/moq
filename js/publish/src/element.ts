@@ -313,7 +313,7 @@ export default class MoqPublish extends HTMLElement {
 			if (failed) console.error(`moq-publish: camera unavailable: ${failed.message}`);
 
 			// The capture reports its own stall, loudly, so only the source is logged here.
-			effect.set(this.#errors.video, failed ?? effect.get(this.capture.out.stopped));
+			effect.set(this.#errors.video, failed ?? effect.get(this.#capture.out.stopped));
 		});
 
 		this.signals.run((effect) => {

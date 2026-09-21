@@ -86,7 +86,12 @@ impl Connection {
 		// way it will once the process is actually gone.
 		if self.shutdown.draining() {
 			tracing::info!("relay shutting down; refusing a new session");
-			let _ = self.request.close(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()).await;
+			let _ = self
+				.request
+				.reject(moq_tokio::server::Reject::App(
+					http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+				))
+				.await;
 			return Ok(());
 		}
 

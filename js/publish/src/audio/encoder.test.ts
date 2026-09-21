@@ -295,7 +295,7 @@ describe("a rendition that stops encoding", () => {
 			if (!net) throw new Error("expected a network producer");
 			front = net.consume();
 
-			first = front.subscribe("audio");
+			first = front.track("audio").subscribe();
 			await settle();
 			FakeAudioEncoder.last?.output(chunk(0, 20_000));
 			expect(await readTimestamp(first)).toBe(0);
@@ -313,16 +313,19 @@ describe("a rendition that stops encoding", () => {
 			// Unmute. The subscription is served rather than answered from a finished track, and it
 			// reaches the live timestamp: the pipeline never re-anchored, so the audio is where the
 			// video is.
-			second = front.subscribe("audio");
+			second = front.track("audio").subscribe();
 			await settle();
 			expect(second.closed.peek()).toBeUndefined();
 
-			// The live edge is waiting for it: this is the track that kept running, so the unmute
-			// starts three seconds on rather than at the timestamp the mute stopped at.
+			// The track kept running, so the group it held before the mute is still there: the
+			// subscription is served from it rather than answered from a finished track. Nothing was
+			// added while nobody was listening, because the rendition handle is demand-gated and the
+			// mute stopped the encoder with it.
 			const drain = draining(second);
-			expect(await drain()).toBe(3_000_000);
+			expect(await drain()).toBe(0);
 
-			// And it stays on that timeline: the next frame follows it.
+			// And it stays on the timeline it kept: the unmute picks up three seconds on rather than
+			// re-anchoring at the timestamp the mute stopped at.
 			FakeAudioEncoder.last?.output(chunk(3_020_000, 20_000));
 			await settle();
 			expect(await drain()).toBe(3_020_000);
@@ -500,7 +503,7 @@ describe("a rendition that stops encoding", () => {
 			if (!net) throw new Error("expected a network producer");
 			front = net.consume();
 
-			sub = front.subscribe("audio");
+			sub = front.track("audio").subscribe();
 			await settle();
 			FakeAudioEncoder.last?.output(chunk(0, 20_000));
 			const drain = draining(sub);

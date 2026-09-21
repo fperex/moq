@@ -93,36 +93,6 @@ describe("delay and buffer", () => {
 		expect(sync.out.maxAge.peek()).toBe(0 as Time.Milli);
 		sync.close();
 	});
-
-	it("includes a track's advertised delay until the track clears it", async () => {
-		const sync = new Sync({ delay: 100 as Time.Milli });
-		sync.track("audio").advertised.set(20 as Time.Milli);
-		await flush();
-		expect(sync.out.delay.peek()).toBe(120 as Time.Milli);
-
-		sync.track("audio").advertised.set(80 as Time.Milli);
-		await flush();
-		expect(sync.out.delay.peek()).toBe(180 as Time.Milli);
-
-		sync.track("audio").advertised.set(undefined);
-		await flush();
-		expect(sync.out.delay.peek()).toBe(100 as Time.Milli);
-		sync.close();
-	});
-
-	it("takes the largest advertised delay across tracks", async () => {
-		const sync = new Sync({ delay: 100 as Time.Milli });
-		sync.track("audio").advertised.set(20 as Time.Milli);
-		sync.track("video").advertised.set(50 as Time.Milli);
-		await flush();
-		expect(sync.out.delay.peek()).toBe(150 as Time.Milli);
-
-		sync.track("video").advertised.set(undefined);
-		await flush();
-		expect(sync.out.delay.peek()).toBe(120 as Time.Milli);
-
-		sync.close();
-	});
 });
 
 describe("auto delay", () => {

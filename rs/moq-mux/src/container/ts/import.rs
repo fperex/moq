@@ -3716,7 +3716,7 @@ mod test {
 		const AAC_PID: u16 = 0x0060;
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
-		let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 		let mut import = super::Import::new(broadcast, catalog.reserve());
 		import
 			.decode(&bytes::BytesMut::from(
@@ -3762,7 +3762,7 @@ mod test {
 		const EAC3_PID: u16 = 0x0060;
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
-		let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 		let mut import = super::Import::new(broadcast, catalog.reserve());
 		let pmt = synth_pmt(
 			&[(StreamType::DolbyDigitalPlusUpTo16ChannelAudioForAtsc, EAC3_PID)],

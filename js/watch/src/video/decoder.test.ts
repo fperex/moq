@@ -145,6 +145,29 @@ function heartbeat(): () => void {
 	};
 }
 
+/**
+ * A track the test serves directly, recording every subscription the decoder opens on it.
+ *
+ * A broadcast answers a subscription from the tracks the application inserted, and a repeat
+ * subscription fans out from the same producer, so the count of `subscribe` calls is what a
+ * per-subscription request used to report.
+ */
+class ServedTrack extends Moq.Track.Producer {
+	#log: string[];
+	#label: string;
+
+	constructor(name: string, log: string[], label = "") {
+		super(name);
+		this.#log = log;
+		this.#label = label;
+	}
+
+	override subscribe(options?: Moq.Track.Subscription): Moq.Track.Subscriber {
+		this.#log.push(this.#label ? `${this.#label}:${this.name}` : this.name);
+		return super.subscribe(options);
+	}
+}
+
 /** A live broadcast, a `Decoder` reading it, and every subscription it has raised. */
 function fixture() {
 	const broadcast = new Moq.Broadcast.Producer();
@@ -161,28 +184,24 @@ function fixture() {
 	} as unknown as Source;
 
 	const sync = new Sync({ delay: Time.Milli(100) });
-	const decoder = new Decoder(source, sync);
+	const decoder = new Decoder({ source, sync });
 
-	// Accept every subscription as it arrives. One handle per subscription is the whole point: a
-	// rebuilt track raises a second request, and a stranded one never does.
-	const served: Container.Legacy.Producer[] = [];
-	void (async () => {
-		for (;;) {
-			const request = await broadcast.requested();
-			if (!request) return;
-			served.push(new Container.Legacy.Producer(request.accept({}), new Container.Legacy.Format("video")));
-		}
-	})();
+	// Serve the track directly. A rebuilt subscription opens a second one on the same producer, and
+	// a stranded one never opens anything, which is what `subscriptions` counts.
+	const opened: string[] = [];
+	const track = new ServedTrack(TRACK, opened).accept({});
+	broadcast.insertTrack(track);
+	const served = [new Container.Legacy.Producer(track, new Container.Legacy.Format("video"))];
 
 	return {
 		served,
 		decoder,
 		/** The rendition the catalog is offering, which a publisher hiding its camera takes away. */
 		config: source.out.config as Signal<Catalog.VideoConfig | undefined>,
-		/** Wait until `count` subscriptions have been raised, or give up. */
+		/** Wait until `count` subscriptions have been opened, or give up. */
 		async subscriptions(count: number): Promise<number> {
-			for (let i = 0; i < 400 && served.length < count; i++) await flush();
-			return served.length;
+			for (let i = 0; i < 400 && opened.length < count; i++) await flush();
+			return opened.length;
 		},
 		/** Wait until `count` codecs have been built, or give up. One per rebuilt track. */
 		async decoders(count: number): Promise<number> {
@@ -359,18 +378,11 @@ test("a replaced session re-subscribes to video", async () => {
 	} as unknown as Source;
 
 	const sync = new Sync({ delay: Time.Milli(100) });
-	const decoder = new Decoder(source, sync);
+	const decoder = new Decoder({ source, sync });
 
 	const requests: string[] = [];
 	const serve = (producer: Moq.Broadcast.Producer, label: string) =>
-		void (async () => {
-			for (;;) {
-				const request = await producer.requested();
-				if (!request) return;
-				requests.push(`${label}:${request.name}`);
-				request.accept({});
-			}
-		})();
+		producer.insertTrack(new ServedTrack(TRACK, requests, label).accept({}));
 
 	const second = new Moq.Broadcast.Producer();
 	serve(first, "first");
@@ -423,23 +435,19 @@ test("a republished broadcast re-anchors the clock", async () => {
 	} as unknown as Source;
 
 	const sync = new Sync({ delay: Time.Milli(100) });
-	const decoder = new Decoder(source, sync);
+	const decoder = new Decoder({ source, sync });
 
-	const served: Container.Legacy.Producer[] = [];
-	const serve = (producer: Moq.Broadcast.Producer) =>
-		void (async () => {
-			for (;;) {
-				const request = await producer.requested();
-				if (!request) return;
-				served.push(new Container.Legacy.Producer(request.accept({}), new Container.Legacy.Format("video")));
-			}
-		})();
-	serve(first);
-	serve(second);
+	const opened: string[] = [];
+	const serve = (producer: Moq.Broadcast.Producer) => {
+		const track = new ServedTrack(TRACK, opened).accept({});
+		producer.insertTrack(track);
+		return new Container.Legacy.Producer(track, new Container.Legacy.Format("video"));
+	};
+	const served = [serve(first), serve(second)];
 
 	try {
-		for (let i = 0; i < 400 && served.length < 1; i++) await flush();
-		expect(served).toHaveLength(1);
+		for (let i = 0; i < 400 && opened.length < 1; i++) await flush();
+		expect(opened).toHaveLength(1);
 
 		// A publisher that has been up for a while, so the clock anchors well past zero.
 		served[0].encode(payload(16), Time.Micro(10_000_000), true);
@@ -449,8 +457,8 @@ test("a republished broadcast re-anchors the clock", async () => {
 		// It restarts: same name, a different broadcast.
 		first.close();
 		handle.set(second.consume());
-		for (let i = 0; i < 400 && served.length < 2; i++) await flush();
-		expect(served).toHaveLength(2);
+		for (let i = 0; i < 400 && opened.length < 2; i++) await flush();
+		expect(opened).toHaveLength(2);
 
 		expect(sync.out.reference.peek()).toBeUndefined();
 	} finally {

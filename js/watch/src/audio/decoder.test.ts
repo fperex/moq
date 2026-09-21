@@ -236,7 +236,7 @@ function decoder(
 	const downloading = new Signal(enabled);
 	// Whether the player is on the page, which is what `<moq-watch>` feeds from its connect callbacks.
 	const attached = new Signal(true);
-	const built = new Decoder(source, sync, { enabled: downloading, attached });
+	const built = new Decoder({ source, sync, enabled: downloading, attached });
 	return {
 		decoder: built,
 		catalog: root,

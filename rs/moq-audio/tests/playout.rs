@@ -60,7 +60,7 @@ impl Fixture {
 /// A PCM broadcast, so the test exercises the playout path rather than a codec.
 async fn broadcast(packets: usize) -> Fixture {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 	let mut snapshots = catalog.consume().unwrap();
 	let consumer = broadcast.consume();
 

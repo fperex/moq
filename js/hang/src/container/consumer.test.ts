@@ -547,7 +547,7 @@ test("Consumer counts a group the budget abandoned instead of failing its task",
 
 		// The verdict a subscription that gave up on this group reaches, and the same one a peer's
 		// DELIVERY_TIMEOUT reset decodes back into.
-		abandoned.close(new Group.Expired());
+		abandoned.close(new NetError.Expired());
 
 		writeGroupWithLegacyFrames(track, 1, [40_000 as Time.Micro]);
 		track.close();
@@ -1880,7 +1880,7 @@ test("Consumer keeps a long group whose tail is merely late", async () => {
 	const HEAD = 4;
 
 	const track = new Track.Producer("video");
-	const consumer = new Consumer(track.subscribe({ maxAge: 30_000 }), {
+	const consumer = new Consumer(track.subscribe({ maxAge: Time.Milli(30_000) }), {
 		format: new LegacyFormat("video"),
 		maxAge: 140 as Time.Milli,
 	});

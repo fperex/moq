@@ -899,7 +899,7 @@ test("a rendition that stops encoding keeps its track open for the next subscrib
 		front = net.consume();
 
 		// The watcher subscribes, and the encoder starts feeding the accepted producer.
-		first = front.subscribe("video");
+		first = front.track("video").subscribe();
 		await settle();
 		controller.enqueue(new TestFrame(1_000_000) as never);
 		await settle();
@@ -923,7 +923,7 @@ test("a rendition that stops encoding keeps its track open for the next subscrib
 		expect(resumed?.sequence).toBeGreaterThan(0);
 
 		// And a subscription opened after the stop is served rather than completing at once.
-		second = front.subscribe("video");
+		second = front.track("video").subscribe();
 		await settle();
 		controller.enqueue(new TestFrame(7_000_000) as never);
 		await settle();

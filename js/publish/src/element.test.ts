@@ -111,7 +111,7 @@ test("switching the source leaves no mirror behind", async () => {
 
 		el.source = "camera";
 		await settle();
-		expect(el.capture.in.source.peek()).toBe(media.video[0] as never);
+		expect(el.video.in.capture.peek()?.in.source.peek()).toBe(media.video[0] as never);
 
 		el.source = "screen";
 		await settle();
@@ -123,7 +123,7 @@ test("switching the source leaves no mirror behind", async () => {
 
 		// And the surviving mirror is the live one.
 		expect(media.video).toHaveLength(2);
-		expect(el.capture.in.source.peek()).toBe(media.video[1] as never);
+		expect(el.video.in.capture.peek()?.in.source.peek()).toBe(media.video[1] as never);
 	} finally {
 		run.mockRestore();
 		el.signals.close();
@@ -165,7 +165,7 @@ test("switching the camera keeps the broadcast announced", async () => {
 
 		// The new device is serving, and nothing in between said the broadcast was gone.
 		expect(media.video).toHaveLength(2);
-		expect(el.capture.in.source.peek()).toBe(media.video[1] as never);
+		expect(el.video.in.capture.peek()?.in.source.peek()).toBe(media.video[1] as never);
 		expect((media.video[1] as FakeTrack).deviceId).toBe("cam2");
 		expect(announced).toEqual([]);
 		expect(el.broadcast.in.announce.peek()).toBe(true);
@@ -187,7 +187,7 @@ test("a camera that cannot be opened keeps the broadcast announced and names the
 		camera.device.preferred.set("cam2");
 		await settle();
 
-		expect(el.capture.in.source.peek()).toBeUndefined();
+		expect(el.video.in.capture.peek()?.in.source.peek()).toBeUndefined();
 		expect(el.errors.video.peek()?.message).toBe("the camera produced no live track");
 		expect(el.broadcast.in.announce.peek()).toBe(true);
 	} finally {

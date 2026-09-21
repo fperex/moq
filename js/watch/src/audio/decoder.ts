@@ -252,7 +252,7 @@ export class Decoder {
 		// the picture arrives than the sound for the same timestamp. `sync.out.delay` stays the
 		// estimator's answer alone, which is what the player's jitter buffer row reports; this is
 		// the quantity the listener actually waits, and the one that puts the picture back in sync.
-		this.#target = new Derived([sync.out.delay, sync.out.offset] as const, (delay, offset) =>
+		this.#target = new Derived([this.sync.out.delay, this.sync.out.offset] as const, (delay, offset) =>
 			Time.Milli.add(delay, offset),
 		);
 		this.#maxAge = new Derived(
@@ -273,6 +273,7 @@ export class Decoder {
 		this.#signals.run(this.#runContext.bind(this));
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runFlush.bind(this));
+		this.#signals.run(this.#runInstant.bind(this));
 		this.#signals.run(this.#runClock.bind(this));
 		this.#signals.run(this.#runLatency.bind(this));
 		this.#signals.run(this.#runSpread.bind(this));
@@ -465,16 +466,21 @@ export class Decoder {
 	 */
 	#runFlush(effect: Effect): void {
 		if (!effect.get(this.in.enabled)) return;
-
-		// "instant" holds nothing, so the decoder refuses it (see #runDecoder) and whatever the ring
-		// still holds stops being filled: drop it now rather than playing it against video that just
-		// jumped to the live edge.
-		if (effect.get(this.sync.in.delay) === "instant") {
-			this.reset();
-			return;
-		}
-
 		effect.cleanup(() => this.#ring?.reset());
+	}
+
+	/**
+	 * Drop what the ring holds when the delay turns instant.
+	 *
+	 * "instant" paces nothing, so the decoder refuses it (see `#runDecoder`) and the ring stops
+	 * being filled. Playing out what is left would run audio against video that just jumped to the
+	 * live edge. Its own effect rather than a branch of `#runFlush`, whose cleanup must not fire on
+	 * every delay change.
+	 */
+	#runInstant(effect: Effect): void {
+		if (!effect.get(this.in.enabled)) return;
+		if (effect.get(this.sync.in.delay) !== "instant") return;
+		this.reset();
 	}
 
 	/**

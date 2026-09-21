@@ -182,16 +182,16 @@ class Watcher {
 	}
 
 	joinCatalog(): void {
-		this.catalog = this.front.subscribe(Broadcast.CATALOG_TRACK);
+		this.catalog = this.front.track(Broadcast.CATALOG_TRACK).subscribe();
 	}
 
 	joinVideo(): void {
-		this.video = this.front.subscribe("video");
+		this.video = this.front.track("video").subscribe();
 		this.#video = draining(this.video);
 	}
 
 	joinAudio(): void {
-		this.audio = this.front.subscribe("audio");
+		this.audio = this.front.track("audio").subscribe();
 		this.#audio = draining(this.audio);
 	}
 
