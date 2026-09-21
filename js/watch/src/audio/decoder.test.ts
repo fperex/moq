@@ -593,6 +593,50 @@ function writeGroup(track: { writeGroup: (group: Group.Producer) => void }, sequ
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+test("a tune-in gap before the first decoded callback keeps audio on the source timeline", async () => {
+	class DeferredDecoder extends MockAudioDecoder {
+		readonly output: (data: MockAudioData) => void;
+		pending: MockAudioData[] = [];
+		next: number | undefined;
+
+		constructor(init: { output: (data: MockAudioData) => void }) {
+			super(init);
+			this.output = init.output;
+		}
+
+		override decode(chunk: MockEncodedChunk): void {
+			this.next ??= chunk.timestamp;
+			this.pending.push(new MockAudioData(this.next));
+			this.next += 20_000;
+			setTimeout(() => this.drain(), 0);
+		}
+		drain(): void {
+			for (const sample of this.pending.splice(0)) this.output(sample);
+		}
+		override async flush(): Promise<void> {
+			this.drain();
+		}
+		override reset(): void {
+			this.next = undefined;
+			this.pending = [];
+		}
+	}
+	Object.assign(globalThis, { AudioDecoder: DeferredDecoder });
+	const producer = new MoqBroadcast.Producer();
+	const track = producer.createTrack("audio");
+	const tile = decoder(true, { active: producer.consume() });
+	try {
+		await flush();
+		writeGroup(track, 0, 1_000_000);
+		for (let i = 0; i < 6; i++) writeGroup(track, i + 1, 2_140_000 + i * 20_000);
+		await flush();
+		expect(tile.decoder.out.buffered.peek().at(-1)?.end).toBe(Time.Milli(2_260));
+	} finally {
+		tile.close();
+		producer.close();
+	}
+});
+
 test("unmuting continues the arrival estimate rather than starting over at the declaration", async () => {
 	// Muting stops the download, so unmuting subscribes again and builds a second container
 	// consumer. The path is the one that was already measured: reseeding it from the publisher's

@@ -697,9 +697,11 @@ export class Decoder {
 
 			const warmup = new Warmup(LEGACY_WARMUP_CALLBACKS);
 			const anchor = new Anchor();
+			let primed = false;
 
 			const decoder = new AudioDecoder({
 				output: (data) => {
+					primed = true;
 					const decoded = this.#terminal.span(data);
 					if (warmup.drop()) {
 						// Drop initial callbacks to prime the decoder.
@@ -774,6 +776,13 @@ export class Decoder {
 				// of this loop. Stop instead: the error callback already reported the real failure.
 				if (decoder.state === "closed") break;
 				decoder.decode(chunk);
+				// Learn the packet duration before another input can hide a tune-in gap.
+				// Native decoders accumulate output timestamps across unreported gaps.
+				if (!primed) {
+					const flushed = await Promise.race([decoder.flush().then(() => true), effect.cancel]);
+					if (!flushed) break;
+					anchor.restarted();
+				}
 			}
 		});
 	}
@@ -816,8 +825,12 @@ export class Decoder {
 			const loaded = await Util.Libav.polyfill();
 			if (!loaded) return; // cancelled
 
+			let primed = false;
 			const decoder = new AudioDecoder({
-				output: (data) => this.#emit(data),
+				output: (data) => {
+					primed = true;
+					this.#emit(data);
+				},
 				error: (error) => console.error("audio decoder error", error),
 			});
 			effect.cleanup(() => {
@@ -879,6 +892,12 @@ export class Decoder {
 						timestamp: frame.timestamp,
 					}),
 				);
+				// Establish the decoded packet duration before checking the next input gap.
+				if (!primed) {
+					const flushed = await Promise.race([decoder.flush().then(() => true), effect.cancel]);
+					if (!flushed) break;
+					anchor.restarted();
+				}
 			}
 		});
 	}
