@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
+import { Time } from "@moq/net";
 import { Signal } from "@moq/signals";
 import type { Decoder } from "./decoder";
 import { Renderer } from "./renderer";
@@ -51,6 +52,54 @@ describe("Renderer", () => {
 		return pending.length;
 	}
 
+	it("paints the newest frame during an already scheduled display refresh", async () => {
+		const drawn: number[] = [];
+		const context = {
+			canvas: { width: 640, height: 360 },
+			save() {},
+			restore() {},
+			fillRect() {},
+			drawImage(frame: VideoFrame) {
+				drawn.push(frame.timestamp);
+			},
+		};
+		const canvas = { getContext: () => context } as unknown as HTMLCanvasElement;
+		const frame = (timestamp: number) =>
+			({
+				timestamp,
+				clone() {
+					return this;
+				},
+				close() {},
+			}) as unknown as VideoFrame;
+		const frames = new Signal<VideoFrame | undefined>(frame(1_000));
+		const decoder = {
+			in: { enabled: new Signal(true) },
+			out: { display: new Signal(undefined), frame: frames },
+			source: { out: { catalog: new Signal(undefined) } },
+		} as unknown as Decoder;
+		const renderer = new Renderer({ decoder, canvas, visible: "never" });
+		try {
+			await settle();
+			// Browsers snapshot callback IDs for a refresh. An earlier callback can deliver
+			// a new frame before this renderer's callback gets its turn.
+			for (const timestamp of [2_000, 3_000, 4_000]) {
+				const refresh = [...callbacks.keys()];
+				frames.set(frame(timestamp));
+				await settle();
+				for (const id of refresh) {
+					const callback = callbacks.get(id);
+					callbacks.delete(id);
+					callback?.(0);
+				}
+			}
+			expect(drawn).toEqual([2_000, 3_000, 4_000]);
+			expect(renderer.out.timestamp.peek()).toBe(Time.Milli(4));
+		} finally {
+			renderer.close();
+		}
+	});
+
 	it("repaints the current frame when presentation metadata changes", async () => {
 		const transforms: number[][] = [];
 		const draws: unknown[][] = [];
@@ -82,6 +131,7 @@ describe("Renderer", () => {
 		} as unknown as VideoFrame;
 		const catalog = new Signal<Catalog.Video | undefined>({ renditions: {}, rotation: 0 });
 		const decoder = {
+			in: { enabled: new Signal(true) },
 			out: {
 				display: new Signal({ width: 640, height: 360 }),
 				frame: new Signal<VideoFrame | undefined>(frame),

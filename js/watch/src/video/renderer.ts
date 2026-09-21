@@ -146,29 +146,33 @@ export class Renderer {
 		const ctx = effect.get(this.#ctx);
 		if (!ctx) return;
 
-		const frame = effect.get(this.decoder.out.frame);
-		const video = effect.get(this.decoder.source.out.catalog);
-
-		// Request a callback to render the frame based on the monitor's refresh rate.
-		// Always render, even when paused (to show last frame).
-		let animate: number | undefined = requestAnimationFrame(() => {
-			this.#render(ctx, frame, video);
-
-			if (frame) {
-				this.#out.frame.update((current) => {
-					current?.close();
-					return frame.clone();
-				});
-				this.#out.timestamp.set(Time.Milli.fromMicro(frame.timestamp as Time.Micro));
-			} else {
-				this.#out.frame.update((current) => {
-					current?.close();
-					return undefined;
-				});
-				this.#out.timestamp.set(undefined);
-			}
-
+		let animate: number | undefined;
+		let dirty = false;
+		const render = () => {
 			animate = undefined;
+			if (dirty) {
+				dirty = false;
+				const frame = this.decoder.out.frame.peek();
+				const video = this.decoder.source.out.catalog.peek();
+				this.#render(ctx, frame, video);
+
+				this.#out.frame.update((current) => {
+					current?.close();
+					return frame?.clone();
+				});
+				this.#out.timestamp.set(frame ? Time.Milli.fromMicro(frame.timestamp as Time.Micro) : undefined);
+			}
+			// Keep a place in every display refresh while playing. Rescheduling from a
+			// frame update during that refresh would miss its already-snapshotted callbacks.
+			if (this.decoder.in.enabled.peek()) animate = requestAnimationFrame(render);
+		};
+		effect.run((inner) => {
+			inner.get(this.decoder.out.frame);
+			inner.get(this.decoder.source.out.catalog);
+			inner.get(this.decoder.in.enabled);
+			dirty = true;
+			// A paused tile still paints changed metadata or its final frame once.
+			if (animate === undefined) animate = requestAnimationFrame(render);
 		});
 
 		// Clean up any pending animation request.
