@@ -220,6 +220,38 @@ async function settle(): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, 200));
 }
 
+test("frame-rate changes never lower the rendition's advertised jitter", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 60 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1280, height: 720 }), frames: new Signal(undefined) },
+	};
+	const enabled = new Signal(true);
+	const encoder = new Encoder("video", { capture: capture as never, enabled, config: { frameRate: 30 } });
+	try {
+		await settle();
+		expect(encoder.out.catalog.peek()?.jitter).toBe(34);
+		encoder.config.set({ frameRate: 60 });
+		await settle();
+		expect(encoder.out.catalog.peek()?.framerate).toBe(60);
+		expect(encoder.out.catalog.peek()?.jitter).toBe(34);
+
+		encoder.config.set({ frameRate: 15 });
+		await settle();
+		expect(encoder.out.catalog.peek()?.jitter).toBe(67);
+		enabled.set(false);
+		await settle();
+		expect(encoder.out.catalog.peek()).toBeUndefined();
+		encoder.config.set({ frameRate: 60 });
+		enabled.set(true);
+		await settle();
+		expect(encoder.out.catalog.peek()?.framerate).toBe(60);
+		expect(encoder.out.catalog.peek()?.jitter).toBe(67);
+	} finally {
+		encoder.close();
+	}
+});
+
 // The codec probe only speaks for the dimensions and codec filter it ran against. Those live in
 // separate effects, which observe a change in whatever order they happen to be subscribed in, so
 // the resolved config must never pair a fresh dimension with a stale probe.

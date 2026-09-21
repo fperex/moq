@@ -147,6 +147,8 @@ export class Encoder {
 	// What the last captured format resolved to, republished while a pause holds the rendition in the
 	// catalog with nothing feeding it, and whether that is what the rendition is doing. See #runConfig.
 	#resolved: Resolved | undefined;
+	// A reconfiguration can shorten frames, but the stream's advertised bound cannot shrink.
+	#jitter: Catalog.AudioConfig["jitter"];
 	#paused = false;
 
 	readonly #out: EncoderOutput = {
@@ -337,7 +339,10 @@ export class Encoder {
 
 		const decoder = effect.get(this.#decoderDescription);
 		const catalog = decoder?.config === config ? { ...config, description: decoder.description } : config;
-		effect.set(this.#out.catalog, catalog);
+		if (catalog.jitter !== undefined) {
+			this.#jitter = Catalog.u53(Math.max(this.#jitter ?? 0, catalog.jitter));
+		}
+		effect.set(this.#out.catalog, { ...catalog, jitter: this.#jitter });
 	}
 
 	// Collect the encode-only Opus knobs that are set, reading the codec through the effect so the

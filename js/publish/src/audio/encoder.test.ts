@@ -163,6 +163,29 @@ describe("a rendition that stops encoding", () => {
 		return { encoder, enabled, capture, rendition, written };
 	}
 
+	test("shorter audio frames never lower the rendition's advertised jitter", async () => {
+		using _codecs = installFakeAudioCodecs();
+		const { encoder, enabled } = await encoding();
+		try {
+			expect(encoder.out.catalog.peek()?.jitter).toBe(20);
+			encoder.codec.set({ mime: "opus", frameDuration: Time.Milli(5) });
+			await settle();
+			expect(encoder.out.catalog.peek()?.jitter).toBe(20);
+			encoder.codec.set({ mime: "opus", frameDuration: Time.Milli(40) });
+			await settle();
+			expect(encoder.out.catalog.peek()?.jitter).toBe(40);
+			enabled.set(false);
+			await settle();
+			expect(encoder.out.catalog.peek()?.jitter).toBe(40);
+			encoder.codec.set({ mime: "opus", frameDuration: Time.Milli(5) });
+			enabled.set(true);
+			await settle();
+			expect(encoder.out.catalog.peek()?.jitter).toBe(40);
+		} finally {
+			encoder.close();
+		}
+	});
+
 	test("declares where the timeline stops when it is muted", async () => {
 		using _codecs = installFakeAudioCodecs();
 		const { encoder, enabled, written } = await encoding();
