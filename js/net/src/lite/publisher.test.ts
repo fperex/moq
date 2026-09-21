@@ -1,5 +1,6 @@
 import { expect, mock, spyOn, test } from "bun:test";
 import { Signal } from "@moq/signals";
+import { Expired } from "../error.ts";
 import { Producer as GroupProducer } from "../group.ts";
 import { randomHop } from "../hop.ts";
 import { hooks } from "../internal.ts";
@@ -1298,6 +1299,64 @@ test("lite draft-05: a blocked group header is reset when the group expires", as
 		publisher.close();
 		client.close();
 		broadcast.close();
+	}
+});
+
+test("lite draft-05: expiry before a group opens leaves later groups publishable", async () => {
+	const pair = createMockTransportPair(ALPN_05);
+	const opening = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const open = pair.server.createUnidirectionalStream.bind(pair.server);
+	let first = true;
+	pair.server.createUnidirectionalStream = async (options) => {
+		const stream = await open(options);
+		if (first) {
+			first = false;
+			opening.resolve();
+			await release.promise;
+		}
+		return stream;
+	};
+
+	const origin = new OriginProducer();
+	const broadcast = publish(origin, Path.from("test"));
+	const track = broadcast.createTrack("video");
+	const publisher = new Publisher(pair.server, Version.DRAFT_05, randomHop(), origin.consume());
+	const client = await Stream.open(pair.client);
+	const server = await Stream.accept(pair.server);
+	if (!server) throw new Error("missing subscribe stream");
+	const serving = publisher.runSubscribe(
+		new Subscribe({ id: 0n, broadcast: Path.from("test"), track: "video", priority: 0 }),
+		server,
+	);
+	const incoming = pair.client.incomingUnidirectionalStreams.getReader();
+	try {
+		track.writeString("old");
+		await opening.promise;
+		const old = await incoming.read();
+		if (old.done) throw new Error("missing old group stream");
+
+		track.writeString("new");
+		release.resolve();
+		// The type byte may have reached the peer before reset; the rest must fail.
+		await expect(new Reader(old.value).readAll()).rejects.toBeInstanceOf(Expired);
+
+		const next = await incoming.read();
+		if (next.done) throw new Error("missing next group stream");
+		const reader = new Reader(next.value);
+		expect(await reader.u53()).toBe(0);
+		expect((await GroupMessage.decode(reader, Version.DRAFT_05)).sequence).toBe(1);
+		await reader.u62(); // Frame timestamp delta.
+		expect(await reader.string()).toBe("new");
+		expect(await reader.readAll()).toEqual(new Uint8Array());
+	} finally {
+		release.resolve();
+		client.close();
+		await serving;
+		incoming.releaseLock();
+		publisher.close();
+		broadcast.close();
+		origin.close();
 	}
 });
 
