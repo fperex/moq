@@ -336,7 +336,7 @@ pub(crate) fn launch(
 		socket,
 		endpoint,
 		key,
-		deadline: moq_net::runtime::Deadline::new(handle),
+		deadline: crate::Timer::new(handle),
 		scratch: Vec::with_capacity(TRAIN_SEGMENTS * SEGMENT),
 		blocked: false,
 	};
@@ -603,7 +603,7 @@ struct Driver {
 	/// frees the slot). Weak, because the endpoint owns us.
 	endpoint: Weak<endpoint::Inner>,
 	key: ConnectionHandle,
-	deadline: moq_net::runtime::Deadline<Handle>,
+	deadline: crate::Timer,
 	/// Egress staging: noq-proto writes into a `Vec`, so a train is built
 	/// here and copied into the socket's registered buffer.
 	scratch: Vec<u8>,
@@ -777,8 +777,13 @@ impl Driver {
 		tx[..transmit.size].copy_from_slice(&self.scratch[..transmit.size]);
 		// A lone datagram is its own segment size, and the socket's GSO
 		// stride has to match what noq actually packed.
-		let segment = transmit.segment_size.unwrap_or(transmit.size);
-		if let Err(err) = tx.send(transmit.size, transmit.destination, segment) {
+		let transmit = udp::Transmit {
+			to: transmit.destination,
+			len: transmit.size,
+			segment: transmit.segment_size.unwrap_or(transmit.size),
+			ecn: transmit.ecn.map(super::ecn_from_noq),
+		};
+		if let Err(err) = tx.send(transmit) {
 			return Poll::Ready(Err(Error::Io(err.to_string())));
 		}
 		// A flush frees datagram-send queue space.

@@ -28,6 +28,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 #[cfg(feature = "qlog")]
 use super::qlog;
 use super::{Congestion, Error, Identity, SEGMENT, Transport, client, endpoint::CID_LEN, server};
+use crate::udp;
 
 /// Per-stream flow control credit.
 const STREAM_WINDOW: u32 = 4 * 1024 * 1024;
@@ -35,6 +36,22 @@ const STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 const CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 /// How many datagrams to buffer in each direction.
 const DATAGRAM_WINDOW: usize = 64 * SEGMENT;
+
+fn ecn_to_noq(ecn: udp::Ecn) -> noq_proto::EcnCodepoint {
+	match ecn {
+		udp::Ecn::Ect0 => noq_proto::EcnCodepoint::Ect0,
+		udp::Ecn::Ect1 => noq_proto::EcnCodepoint::Ect1,
+		udp::Ecn::Ce => noq_proto::EcnCodepoint::Ce,
+	}
+}
+
+fn ecn_from_noq(ecn: noq_proto::EcnCodepoint) -> udp::Ecn {
+	match ecn {
+		noq_proto::EcnCodepoint::Ect0 => udp::Ecn::Ect0,
+		noq_proto::EcnCodepoint::Ect1 => udp::Ecn::Ect1,
+		noq_proto::EcnCodepoint::Ce => udp::Ecn::Ce,
+	}
+}
 
 impl From<noq_proto::ConnectionError> for Error {
 	fn from(err: noq_proto::ConnectionError) -> Self {

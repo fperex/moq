@@ -182,14 +182,16 @@ where
 	if let Some(publish) = publish {
 		server = server.with_subscriber(publish);
 	}
-	// Hold the session so it doesn't close early; the machine serves it in place
-	// (an Inline runtime hands it back instead of spawning), so its lifetime and
-	// teardown stay tied to this handler task.
-	let runtime = moq_tokio::runtime::Inline::new();
-	let session = server
-		.accept(runtime.clone(), moq_tokio::transport::Session::new(ws))
+	// Keep the driver in this task so cancellation tears down the transport.
+	let (session, driver) = server
+		.accept(
+			tokio::time::Instant::now().into_std(),
+			moq_tokio::transport::Session::new(ws),
+		)
 		.await?;
-	let mut driver = runtime.take().expect("accept hands the machine to its runtime");
+
+	let driver = moq_net::time::run(driver);
+	tokio::pin!(driver);
 
 	// The handshake is done, so this is a MoQ session now: only now can a push
 	// be serviced, and only now does the session appear in the live table.
@@ -203,21 +205,15 @@ where
 			}
 		};
 		tokio::select! {
-			res = &mut driver => {
-				lease.close(
-					match &res {
-						Ok(()) => "closed".to_string(),
-						Err(err) => err.to_string(),
-					},
-					crate::connection::session_bytes(&session),
-				);
-				return res.map_err(Into::into);
+			err = &mut driver => {
+				lease.close(err.to_string(), crate::connection::session_bytes(&session));
+				return ended(err);
 			}
 			why = lease.ended() => {
 				tracing::info!(%why, "lease ended, closing session");
 				session.abort(moq_net::Error::Unauthorized);
 				// Drive the teardown so the close reaches the peer.
-				let res = driver.await.map_err(Into::into);
+				let res = ended(driver.await);
 				lease.close(why, crate::connection::session_bytes(&session));
 				return res;
 			}
@@ -229,14 +225,22 @@ where
 				let drain = shutdown.drain_session(&session);
 				let mut drain = std::pin::pin!(drain);
 				let res = tokio::select! {
-					res = &mut driver => res.map_err(Into::into),
-					_ = &mut drain => driver.await.map_err(Into::into),
+					err = &mut driver => ended(err),
+					_ = &mut drain => ended(driver.await),
 				};
 				lease.close("shutdown", crate::connection::session_bytes(&session));
 				return res;
 			}
 			() = nudged => lease.revalidate(),
 		}
+	}
+}
+
+/// The driver's terminal error as a session outcome: a clean close is not a failure.
+fn ended(err: moq_net::Error) -> anyhow::Result<()> {
+	match err {
+		moq_net::Error::Closed => Ok(()),
+		err => Err(err.into()),
 	}
 }
 

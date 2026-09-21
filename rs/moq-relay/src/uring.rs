@@ -653,7 +653,7 @@ async fn serve_connection(
 
 	let request = moq_net::Server::new()
 		.with_versions(serve.versions.clone())
-		.accept_request_lite(handle.clone(), transport)
+		.accept_request_lite(std::time::Instant::now(), transport)
 		.await
 		.context("moq handshake failed")?;
 
@@ -755,7 +755,13 @@ async fn serve_connection(
 	if let Some(publish) = grants.publish {
 		request = request.with_subscriber(publish);
 	}
-	let session = request.ok().await?;
+	let (session, driver) = request.ok().await?;
+	let driver_handle = handle.clone();
+	handle.spawn(async move {
+		if let Err(err) = driver_handle.run(driver).await {
+			tracing::debug!(%err, "session driver ended");
+		}
+	});
 	let node_connection = peer_hop.map(|origin| serve.cluster.nodes.connect_inbound(id, origin));
 
 	tracing::info!(id, version = %session.version(), transport = %moq_tokio::server::Transport::Quic, "negotiated");

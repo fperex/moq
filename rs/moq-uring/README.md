@@ -17,7 +17,7 @@ the UDP sockets bound through it.
   (the shape a later `SENDMSG_ZC` needs).
 - **Timers**: a heap the worker sweeps; the earliest deadline rides
   `io_uring_enter` as an absolute timeout. Zero timeout SQEs. The worker's
-  `Handle` implements `moq_net::Timers`.
+  `Handle::run` drives MoQ with the worker clock and a single timer.
 - **Parking**: a futex word per worker. Remote wakes are an atomic store, plus
   one `futex(2)` wake only while the worker is actually parked (a `FUTEX_WAIT`
   SQE armed on the word).
@@ -29,10 +29,10 @@ the UDP sockets bound through it.
 - **WebTransport**: browsers negotiate `h3` and `quic::web::Request` runs the
   HTTP/3 CONNECT handshake (SETTINGS, subprotocol selection, capsule close)
   over the same adapter via `web-transport-proto`. `quic::web::Session` is
-  the one transport type the runtime drives, raw or web (`Session::raw`), so
-  `connect_lite`/`accept_lite` run moq-lite sessions on the worker either
-  way, with stream and close codes mapped through the HTTP/3 error space in
-  web mode.
+  a raw or web transport (`Session::raw`). `connect_lite`/`accept_lite` return
+  the session and its driver; poll the driver or await it inside a
+  `Handle::spawn` task to run it on the worker. Web mode maps stream and close codes through the
+  HTTP/3 error space.
 - **qlog**: `quic::qlog::Sink` points a group of workers at a directory and
   `quic::Transport::qlog` turns capture on. The pinned worker never writes to
   the file: the QUIC stacks want a `Send + Sync` writer, which cannot hold the

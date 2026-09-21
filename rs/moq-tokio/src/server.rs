@@ -587,7 +587,7 @@ impl Server {
 							// (like the stream bindings).
 							let Accepted { session, url, identity, authority, mut link } = super::noq::accept(_conn, alpns).await?;
 							link.local = local;
-							let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session)).await?;
+							let request = server.accept_request(tokio::time::Instant::now().into_std(), crate::transport::Session::new(session)).await?;
 							Ok(Request { transport: Transport::Quic, url, identity, authority, link, kind: RequestKind::Noq(Box::new(request)) })
 						}.boxed());
 					}
@@ -596,7 +596,7 @@ impl Server {
 					#[cfg(feature = "iroh")]
 					self.accept.push(async move {
 						let Accepted { session, url, identity, authority, link } = super::iroh::accept(_conn).await?;
-						let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session)).await?;
+						let request = server.accept_request(tokio::time::Instant::now().into_std(), crate::transport::Session::new(session)).await?;
 						Ok(Request { transport: Transport::Iroh, url, identity, authority, link, kind: RequestKind::Iroh(Box::new(request)) })
 					}.boxed());
 				}
@@ -608,7 +608,7 @@ impl Server {
 							// slow peer doesn't stall the accept loop (spawned like the others).
 							let local = self.websocket_local_addr();
 							self.accept.push(async move {
-								let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session)).await?;
+								let request = server.accept_request(tokio::time::Instant::now().into_std(), crate::transport::Session::new(session)).await?;
 								let authority = url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 								let link = Link { remote: Some(accepted.remote), local, alpn: accepted.protocol, ..Default::default() };
 								Ok(Request { transport: Transport::WebSocket, url: Some(url), authority, identity: None, link, kind: RequestKind::Qmux(Box::new(request)) })
@@ -1017,7 +1017,10 @@ fn spawn_stream_request(
 ) {
 	tokio::spawn(async move {
 		match server
-			.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session))
+			.accept_request(
+				tokio::time::Instant::now().into_std(),
+				crate::transport::Session::new(session),
+			)
 			.await
 		{
 			Ok(request) => {
@@ -1043,7 +1046,7 @@ fn spawn_stream_request(
 /// every transport before the caller authorizes. The variant only distinguishes the
 /// underlying session type; all of them delegate identically.
 /// A pending moq-net request over transport `S`, driven by our tokio runtime.
-type PendingRequest<S> = moq_net::server::Handshake<S, crate::runtime::Runtime<S>>;
+type PendingRequest<S> = moq_net::server::Handshake<S>;
 
 pub(crate) enum RequestKind {
 	#[cfg(feature = "noq")]
@@ -1297,7 +1300,12 @@ impl Request {
 
 	/// Accept the session, starting the MoQ session loops.
 	pub async fn ok(self) -> crate::Result<Session> {
-		Ok(request_into!(self.kind, request => request.ok().await?))
+		Ok(request_into!(self.kind, request => {
+			let (session, driver) = request.ok().await?;
+			use tracing::Instrument;
+			tokio::spawn(moq_net::time::run(driver).instrument(tracing::Span::current()));
+			session
+		}))
 	}
 
 	/// Returns the network transport carrying this session.
