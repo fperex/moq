@@ -14,11 +14,11 @@ export interface ConsumerProps {
 	/**
 	 * How stale a group may get before it is skipped, in milliseconds (default: 0).
 	 *
-	 * A group is measured by how far it could still present, which its successor's first
-	 * timestamp bounds, against the newest frame the track has reached. So it bounds how long a
-	 * late or missing group is waited for without reading a long group as a late one. The local
-	 * half of the subscription's `maxAge`; both measure the same budget, one on the wire and one
-	 * as frames are read.
+	 * A group is measured by how far it could still present, which the first timestamp of the next
+	 * group holding a frame bounds, against the newest frame the track has reached. So it bounds
+	 * how long a late or missing group is waited for without reading a long group as a late one.
+	 * The local half of the subscription's `maxAge`; both measure the same budget, one on the wire
+	 * and one as frames are read.
 	 */
 	// Read-only: a Getter (e.g. another component's output) is accepted directly.
 	maxAge?: GetterInit<Time.Milli>;
@@ -383,9 +383,9 @@ export class Consumer {
 
 		// Walk the delivery cursor forward while what the oldest group could still present has aged
 		// past the budget. This is also what ends the wait on a gap in group sequence numbers: if
-		// #active points to a missing group, the successor's start proves the missing content is
-		// too old to wait for. What happens to the oldest group when the budget runs out depends on
-		// what it holds; see the verdict below.
+		// #active points to a missing group, the start of the next group holding a frame proves the
+		// missing content is too old to wait for. What happens to the oldest group when the budget
+		// runs out depends on what it holds; see the verdict below.
 		while (this.#groups.length >= 2) {
 			const threshold = Moq.Time.Micro.fromMilli(this.#maxAge.peek());
 			const first = this.#groups[0];
@@ -393,18 +393,27 @@ export class Consumer {
 			const cursor = this.#active;
 
 			// A group is measured by how far it could still reach, not by how far behind it
-			// started: it cannot present past where its successor begins, so that bound is the
-			// freshest thing still worth waiting for, and the newest frame the track has reached
-			// is what it has aged against. This is the wire budget's rule verbatim
-			// (`Subscription::max_age`, `is_stale` in `rs/moq-net/src/model/track.rs`), which is
-			// the point: the two halves of one budget cannot be allowed to disagree.
+			// started: it cannot present past where the next group holding a frame begins, so
+			// that bound is the freshest thing still worth waiting for, and the newest frame the
+			// track has reached is what it has aged against. This is the wire budget's rule
+			// verbatim (`Subscription::max_age`, `is_stale` in `rs/moq-net/src/model/track.rs`),
+			// which is the point: the two halves of one budget cannot be allowed to disagree.
 			//
-			// Measuring the head's own oldest undelivered frame instead made the verdict a
-			// function of the group's length. Audio groups hold one frame, so it read as
-			// lateness; a 2s video GOP whose tail was merely late was convicted the moment its
-			// successor opened, throwing away the rest of the GOP and leaving the picture frozen
-			// until the next keyframe, once per GOP for as long as the path stayed slow.
-			const reach = this.#groups[1].start;
+			// Measuring the head's own oldest undelivered frame instead makes the verdict a
+			// function of the group's length. Audio groups hold one frame, so it reads as
+			// lateness; a 2s video GOP whose tail is merely late is convicted the moment its
+			// successor opens, throwing away the rest of the GOP and leaving the picture frozen
+			// until the next keyframe, once per GOP for as long as the path stays slow.
+			//
+			// Stopping at the immediate successor instead is no bound at all when that successor
+			// holds nothing: a starved path opens groups it never fills, so the head is waited on
+			// forever while the groups behind those hold seconds of playable media. Only a group
+			// with a frame says where the timeline resumes, which is what `rs/moq-mux` measures
+			// against too.
+			let reach: Time.Micro | undefined;
+			for (let i = 1; i < this.#groups.length && reach === undefined; i++) {
+				reach = this.#groups[i].start;
+			}
 			if (reach === undefined) break;
 
 			let live: number | undefined;
@@ -458,9 +467,13 @@ export class Consumer {
 					`reach=${reach} live=${live} budget=${threshold}`,
 			);
 
-			const nextStart = this.#groups[0]?.frames.at(0)?.timestamp ?? this.#groups[0]?.end;
+			// Where the timeline picks up is where the next group holding a frame starts, the same
+			// bound the verdict was reached on. Anything convicted in between held nothing, and a
+			// group that held nothing says nothing about the timeline, so reading the immediate
+			// successor here would call a starved group a hole and re-anchor the reader over media
+			// that turned out to be contiguous.
 			const marker = !first.empty && !first.media;
-			if (marker || !ptsContiguous(first.end ?? this.#presentedEnd, nextStart)) {
+			if (marker || !ptsContiguous(first.end ?? this.#presentedEnd, reach)) {
 				hole = true;
 			}
 			first.consumer.close();

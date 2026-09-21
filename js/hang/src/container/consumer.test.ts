@@ -1935,6 +1935,87 @@ test("Consumer keeps a long group whose tail is merely late", async () => {
 	consumer.close();
 });
 
+// The other half of the same measurement: a jittery path starves the older groups, so the cursor
+// sits on a group whose stream header arrived and whose first frame never did, with another one
+// exactly like it behind. Measuring the head against whatever sits immediately behind it reads an
+// empty successor as "nothing is known yet" and waits forever, while the seconds of media buffered
+// behind those two hold the picture frozen until a watchdog rebuilds the track.
+test("Consumer measures a slow group against the next group that has a frame", async () => {
+	const track = new Track.Producer("video");
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("video"), maxAge: 100 as Time.Milli });
+
+	// Group 0 plays out, which leaves the cursor on group 1 with a known presentation end.
+	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro, 33_000 as Time.Micro]);
+	await settle();
+	expect((await consumer.next())?.frame?.timestamp).toBe(0 as Time.Micro);
+	expect((await consumer.next())?.frame?.timestamp).toBe(33_000 as Time.Micro);
+	expect((await consumer.next())?.frame).toBeUndefined(); // group 0 done
+
+	// The cursor's group and the one behind it open and then starve: a header, no frame.
+	const starved = new Group.Producer(1);
+	track.writeGroup(starved);
+	const alsoStarved = new Group.Producer(2);
+	track.writeGroup(alsoStarved);
+
+	// The media that did arrive sits behind both of them, well past the budget, and keeps coming.
+	writeGroupWithLegacyFrames(track, 3, [
+		300_000 as Time.Micro,
+		333_000 as Time.Micro,
+		366_000 as Time.Micro,
+		400_000 as Time.Micro,
+	]);
+	writeGroupWithLegacyFrames(track, 4, [433_000 as Time.Micro, 466_000 as Time.Micro]);
+	await settle();
+
+	const frames = await drainFrames(consumer, 300);
+	expect(frames.map((f) => f.timestamp as number)).toEqual([300_000, 333_000, 366_000, 400_000, 433_000, 466_000]);
+	// Two groups were given up on, and the span they would have carried is really missing, so the
+	// reader re-anchors exactly once.
+	expect(consumer.skipped.peek()).toBe(2);
+	expect(consumer.discontinuity).toBe(1);
+
+	starved.close();
+	alsoStarved.close();
+	consumer.close();
+});
+
+// Same starvation, except the middle group closes with nothing in it. A group that held nothing
+// says nothing about the timeline, so closing it changes who reaches the verdict and nothing else.
+test("Consumer measures a slow group past a successor that closed empty", async () => {
+	const track = new Track.Producer("video");
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("video"), maxAge: 100 as Time.Milli });
+
+	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro, 33_000 as Time.Micro]);
+	await settle();
+	expect((await consumer.next())?.frame?.timestamp).toBe(0 as Time.Micro);
+	expect((await consumer.next())?.frame?.timestamp).toBe(33_000 as Time.Micro);
+	expect((await consumer.next())?.frame).toBeUndefined(); // group 0 done
+
+	const starved = new Group.Producer(1);
+	track.writeGroup(starved);
+	const empty = new Group.Producer(2);
+	track.writeGroup(empty);
+	empty.close();
+
+	writeGroupWithLegacyFrames(track, 3, [
+		300_000 as Time.Micro,
+		333_000 as Time.Micro,
+		366_000 as Time.Micro,
+		400_000 as Time.Micro,
+	]);
+	writeGroupWithLegacyFrames(track, 4, [433_000 as Time.Micro, 466_000 as Time.Micro]);
+	await settle();
+
+	const frames = await drainFrames(consumer, 300);
+	expect(frames.map((f) => f.timestamp as number)).toEqual([300_000, 333_000, 366_000, 400_000, 433_000, 466_000]);
+	// Only the open group is convicted; next() walks the completed empty one on its own.
+	expect(consumer.skipped.peek()).toBe(1);
+	expect(consumer.discontinuity).toBe(1);
+
+	starved.close();
+	consumer.close();
+});
+
 test("Consumer zero-budget skip keeps a contiguous marker", async () => {
 	const track = new Track.Producer("test");
 	const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 0 as Time.Milli });
