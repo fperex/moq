@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Group, Broadcast as MoqBroadcast, Time, Varint } from "@moq/net";
 import { type Effect, Signal } from "@moq/signals";
@@ -38,11 +38,19 @@ class MockContext extends EventTarget {
 	// Whether the browser's autoplay policy starts a context with no gesture at all, which is how
 	// the audio-quality lane launches Chromium.
 	static autoplay = false;
+	static deferModule = false;
+	module?: ReturnType<typeof Promise.withResolvers<void>>;
 
 	state = "suspended";
 	resumeCalls = 0;
 	readonly sampleRate: number;
-	readonly audioWorklet = { addModule: async () => {} };
+	readonly audioWorklet = {
+		addModule: () => {
+			if (!MockContext.deferModule) return Promise.resolve();
+			this.module ??= Promise.withResolvers<void>();
+			return this.module.promise;
+		},
+	};
 
 	constructor(options?: { sampleRate?: number }) {
 		super();
@@ -69,6 +77,7 @@ class MockContext extends EventTarget {
 
 	close(): Promise<void> {
 		this.state = "closed";
+		this.module?.reject(new DOMException("Unable to load a worklet module.", "AbortError"));
 		return Promise.resolve();
 	}
 }
@@ -136,6 +145,10 @@ class MockAudioDecoder {
 
 /** Enough of an AudioWorkletNode for the ring to be built against. */
 class MockWorkletNode {
+	static built: MockContext[] = [];
+	constructor(context: MockContext) {
+		MockWorkletNode.built.push(context);
+	}
 	readonly port = { postMessage: () => {}, onmessage: null, addEventListener: () => {}, start: () => {} };
 	connect(): void {}
 	disconnect(): void {}
@@ -190,9 +203,11 @@ beforeEach(() => {
 	(globalThis as Record<string, unknown>).AudioEncoder = class {};
 	(globalThis as Record<string, unknown>).EncodedAudioChunk = MockEncodedChunk;
 	MockContext.built = [];
+	MockWorkletNode.built = [];
 	MockContext.activation = false;
 	MockContext.grace = false;
 	MockContext.autoplay = false;
+	MockContext.deferModule = false;
 });
 
 afterEach(() => {
@@ -364,6 +379,51 @@ test("a catalog frame that only adds the codec description keeps the running con
 	expect(MockContext.built.length).toBe(1);
 
 	close();
+});
+
+test("a worklet load failure in the current context remains an error", async () => {
+	MockContext.deferModule = true;
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	const tile = decoder(true);
+	try {
+		await flush();
+		const failure = new Error("module failed");
+		const context = MockContext.built[0];
+		expect(context.module).toBeDefined();
+		context.module?.reject(failure);
+		await flush();
+		expect(errors).toHaveBeenCalledWith("spawn error", failure);
+		expect(MockWorkletNode.built).toEqual([]);
+	} finally {
+		tile.close();
+		errors.mockRestore();
+	}
+});
+
+test("a catalog rate replacing the gesture context cancels its pending worklet before closing it", async () => {
+	MockContext.deferModule = true;
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	const tile = decoder(true, { catalog: {} as Catalog.Root });
+	try {
+		await flush();
+		click();
+		MockContext.grace = true;
+		tile.catalog.set(catalog({ rate: 44100 }));
+		await flush();
+		const [first, second] = MockContext.built;
+		expect(first.module).toBeDefined();
+		expect(first.state).toBe("closed");
+		expect(second.sampleRate).toBe(44100);
+		expect(second.module).toBeDefined();
+		second.module?.resolve();
+		await flush();
+		expect(tile.decoder.out.context.peek()).toBe(second as unknown as AudioContext);
+		expect(MockWorkletNode.built).toEqual([second]);
+		expect(errors).not.toHaveBeenCalled();
+	} finally {
+		tile.close();
+		errors.mockRestore();
+	}
 });
 
 test("a gesture before the catalog builds at the device default, and the real rate replaces it", async () => {
