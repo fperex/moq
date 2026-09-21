@@ -100,6 +100,76 @@ describe("Renderer", () => {
 		}
 	});
 
+	it("presents adjacent frames across refreshes without retaining an old backlog", async () => {
+		const drawn: number[] = [];
+		let clones = 0;
+		const frame = (timestamp: number, owned = false): VideoFrame => {
+			let closed = false;
+			if (owned) clones++;
+			return {
+				timestamp,
+				clone() {
+					if (closed) throw new Error("cloning a closed frame");
+					return frame(timestamp, true);
+				},
+				close() {
+					if (closed) throw new Error("closing a frame twice");
+					closed = true;
+					if (owned) clones--;
+				},
+			} as unknown as VideoFrame;
+		};
+		const context = {
+			canvas: { width: 640, height: 360 },
+			save() {},
+			restore() {},
+			fillRect() {},
+			drawImage(value: VideoFrame) {
+				drawn.push(value.timestamp);
+			},
+		};
+		const frames = new Signal<VideoFrame | undefined>(frame(100_000));
+		const decoder = {
+			in: { enabled: new Signal(true) },
+			out: { display: new Signal(undefined), frame: frames },
+			source: { out: { catalog: new Signal(undefined) } },
+		} as unknown as Decoder;
+		const renderer = new Renderer({
+			decoder,
+			canvas: { getContext: () => context } as unknown as HTMLCanvasElement,
+			visible: "never",
+		});
+		try {
+			await settle();
+			paint();
+			for (const timestamp of [116_667, 133_333]) {
+				frames.set(frame(timestamp));
+				await settle();
+			}
+			paint();
+			paint();
+			expect(drawn).toEqual([100_000, 116_667, 133_333]);
+			for (const timestamp of [150_000, 166_667, 183_333]) {
+				frames.set(frame(timestamp));
+				await settle();
+			}
+			paint();
+			paint();
+			expect(drawn.slice(-2)).toEqual([166_667, 183_333]);
+			frames.set(frame(200_000));
+			await settle();
+			frames.set(frame(333_333));
+			await settle();
+			paint();
+			expect(drawn.at(-1)).toBe(333_333);
+			frames.set(frame(350_000));
+			await settle();
+		} finally {
+			renderer.close();
+		}
+		expect(clones).toBe(0);
+	});
+
 	it("repaints the current frame when presentation metadata changes", async () => {
 		const transforms: number[][] = [];
 		const draws: unknown[][] = [];
