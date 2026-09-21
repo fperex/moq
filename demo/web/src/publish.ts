@@ -19,7 +19,7 @@ import "./highlight";
 import * as Json from "@moq/json";
 import "@moq/publish/element"; // defines <moq-publish>
 import "@moq/publish/ui"; // defines <moq-publish-ui>
-import { type Audio, Net, Signals, Source, type Video } from "@moq/publish";
+import { type Audio, Net, Signals, Source, Video } from "@moq/publish";
 import type MoqPublish from "@moq/publish/element";
 import MoqPublishSupport from "@moq/publish/support/element";
 import { formatBitrate, formatFps, graph } from "./viz";
@@ -150,6 +150,31 @@ function encoderConfig(effect: Signals.Effect, target: VideoTarget): Video.Confi
 ui.run((effect) => {
 	publish.video.config.set(encoderConfig(effect, readVideoTarget(effect)));
 });
+
+// Give Auto quality a smaller rendition when the connection cannot carry the main one.
+// Both encoders share capture and only encode while their rendition has a subscriber.
+const fallbackEnabled = new Signals.Signal(false);
+const fallback = new Video.Encoder("video-low", {
+	broadcast: publish.video.in.broadcast,
+	capture: publish.video.in.capture,
+	bandwidth: publish.video.in.bandwidth,
+	enabled: fallbackEnabled,
+});
+ui.run((effect) => {
+	const enabled = effect.get(publish.video.in.enabled);
+	const main = effect.get(publish.video.out.resolved);
+	fallbackEnabled.set(enabled && !!main && main.width * main.height > 640 * 360);
+});
+ui.run((effect) => {
+	const main = effect.get(publish.video.config);
+	fallback.config.set({
+		...main,
+		maxPixels: 640 * 360,
+		maxBitrate: Math.min(main?.maxBitrate ?? 400_000, 400_000),
+		frameRate: Math.min(main?.frameRate ?? 30, 30),
+	});
+});
+ui.cleanup(() => fallback.close());
 
 // Request the selected resolution from the camera itself, not just cap the encoder.
 // publish.sources.video holds the active Camera source (undefined for screen/file); its constraints

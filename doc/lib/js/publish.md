@@ -43,8 +43,15 @@ The video encoder follows its share of the connection's send-rate estimate
 each target the whole uplink. Audio reserves its configured bitrate so
 video's share is honest, and keeps encoding at that rate. Codec, resolution,
 framerate, and bitrate are tunable through `el.video.config`; the audio
-encoder exposes its codec and volume. For simulcast or several renditions,
-drop the element and register your own encoders on a `Publish.Broadcast`.
+encoder exposes its codec and volume. Additional `Video.Encoder` instances can
+share the element's `video.in.broadcast`, `video.in.capture`, and
+`video.in.bandwidth` inputs. Each rendition encodes only while subscribed.
+
+The publish demo also offers a 360p fallback at up to 30 fps and 400 kbps when
+the main rendition is larger. Lower frame-rate and bitrate settings apply to
+the fallback too. A watcher with Quality set to Auto can select it when the
+connection estimate cannot support the main rendition. Selecting a specific
+rendition keeps that choice even if the connection cannot sustain it.
 
 ## Custom tracks
 
