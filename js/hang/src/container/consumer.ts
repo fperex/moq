@@ -160,6 +160,10 @@ export class Consumer {
 		}
 		this.spread = this.#spread.value;
 
+		this.#signals.run((effect) => {
+			effect.get(this.#maxAge);
+			this.#checkMaxAge();
+		});
 		this.#signals.spawn(this.#run.bind(this));
 		this.#signals.cleanup(() => {
 			this.#stall.close();
@@ -340,6 +344,7 @@ export class Consumer {
 				const next = this.#groups[this.#groups.indexOf(group) + 1];
 				this.#active = continues(group, next) ? next.consumer.sequence : group.consumer.sequence + 1;
 			}
+			this.#checkMaxAge();
 
 			// Recompute buffered ranges now that this group is done,
 			// so consecutive done groups can merge into a single range.
@@ -424,7 +429,10 @@ export class Consumer {
 			if (live === undefined) break;
 
 			const age = live - reach;
-			if (age <= threshold) break;
+			if (age < threshold) break;
+			// Closed wire groups have no delivery left to wait for. Let their reader
+			// finish parsing buffered frames before deciding whether anything is missing.
+			if (!first.done && first.consumer.isClosed) break;
 
 			// The budget has run out, and what that costs depends on where the head sits.
 			//

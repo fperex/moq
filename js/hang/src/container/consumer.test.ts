@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { Format as LocFormat, Producer as LocProducer } from "@moq/loc";
 import { Group, Error as NetError, SessionCode, StreamCode, Time, Track, Varint } from "@moq/net";
+import { Signal } from "@moq/signals";
 import { AudioConfigSchema } from "../catalog/audio.ts";
 import { decodeInitSegment, type InitSegment } from "./cmaf/decode.ts";
 import { createAudioInitSegment, encodeDataSegment } from "./cmaf/encode.ts";
@@ -13,6 +14,39 @@ import type { Frame } from "./types.ts";
 
 // What `Jitter` reads before any arrival has been folded in.
 const COLD_START = 80 as Time.Milli;
+
+test("Consumer applies a reduced age budget without another arrival", async () => {
+	const track = new Track.Producer("video");
+	const maxAge = new Signal(Time.Milli(1_000));
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("video"), maxAge });
+	try {
+		const first = track.appendGroup();
+		first.writeFrame({
+			payload: encodeLegacyFrame(Time.Micro(0), new Uint8Array([1])),
+			timestamp: Time.Timestamp.now(),
+		});
+		expect((await consumer.next())?.frame?.timestamp).toBe(Time.Micro.zero);
+		const next = track.appendGroup();
+		next.writeFrame({
+			payload: encodeLegacyFrame(Time.Micro(2_000_000), new Uint8Array([2])),
+			timestamp: Time.Timestamp.now(),
+		});
+		await settle();
+		let delivered: number | undefined;
+		const pending = consumer.next().then((next) => {
+			delivered = next?.frame?.timestamp;
+		});
+		await settle();
+		expect(delivered).toBeUndefined();
+		maxAge.set(Time.Milli.zero);
+		await settle();
+		expect(delivered).toBe(2_000_000);
+		await pending;
+	} finally {
+		consumer.close();
+		track.close();
+	}
+});
 
 const TIMESCALE = 90_000;
 const TEST_INIT: InitSegment = {

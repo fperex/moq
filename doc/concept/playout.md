@@ -583,6 +583,13 @@ to move together:
 describes and what both languages are held to, and this is not an estimator
 quantity: it is a property of a pair of tracks, and `moq-audio` has only one.
 
+The browser video reader also limits its local age budget to the distance from
+its buffered edge to the shared playhead. Once a buffered successor is due, an
+incomplete older group must not hold it back for another jitter-buffer interval.
+This local limit does not change the subscription's wire budget. Budget changes
+wake the container reader even when no more frames arrive, and a video-only gap
+does not reset a running audio clock.
+
 ## Where playout starts
 
 Until the reader has taken a sample, nothing on the timeline has been heard, so

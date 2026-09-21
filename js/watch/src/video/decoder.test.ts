@@ -196,6 +196,8 @@ function fixture() {
 	return {
 		served,
 		decoder,
+		sync,
+		track,
 		/** The rendition the catalog is offering, which a publisher hiding its camera takes away. */
 		config: source.out.config as Signal<Catalog.VideoConfig | undefined>,
 		/** Wait until `count` subscriptions have been opened, or give up. */
@@ -215,6 +217,38 @@ function fixture() {
 		},
 	};
 }
+
+test("video advances to a buffered keyframe when the audio playhead reaches it", async () => {
+	const fx = fixture();
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		const write = (group: Moq.Group.Producer, timestamp: number) => {
+			const header = Moq.Varint.encode(timestamp);
+			const payload = new Uint8Array(header.length + 1);
+			payload.set(header);
+			payload[header.length] = 1;
+			group.writeFrame({ payload, timestamp: Time.Timestamp.fromMicros(Time.Micro(timestamp)) });
+		};
+		const first = fx.track.appendGroup();
+		write(first, 0);
+		await settle();
+		expect(built[0].chunks).toEqual(["key"]);
+		fx.sync.track("audio").clock.set({ timestamp: Time.Micro(1_900_000), reference: Time.Milli.now(), rate: 0 });
+		const next = fx.track.appendGroup();
+		write(next, 2_000_000);
+		await settle();
+		expect(built[0].chunks).toEqual(["key"]);
+		fx.sync.track("audio").clock.set({ timestamp: Time.Micro(2_000_000), reference: Time.Milli.now(), rate: 0 });
+		await settle();
+		expect(built[0].chunks).toEqual(["key", "key"]);
+		expect(fx.sync.out.clock.peek()).toBe("audio");
+		built[0].emit(2_000_000);
+		await settle();
+		expect(fx.decoder.out.timestamp.peek()).toBe(Time.Milli(2_000));
+	} finally {
+		fx.close();
+	}
+});
 
 test("a codec error rebuilds the track instead of stranding the subscription", async () => {
 	const warn = console.warn;

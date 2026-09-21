@@ -548,19 +548,34 @@ class DecoderTrack {
 		}
 	}
 
+	#consume(effect: Effect, sub: Moq.Track.Subscriber, format: Container.Format): Container.Consumer {
+		const maxAge = new Signal(this.sync.out.maxAge.peek());
+		const consumer = new Container.Consumer(sub, { format, maxAge, jitter: this.spread });
+		effect.cleanup(() => consumer.close());
+		effect.run((inner) => {
+			const budget = inner.get(this.sync.out.maxAge);
+			const latest = inner.get(consumer.buffered).at(-1)?.end;
+			inner.get(this.sync.track("audio").clock);
+			inner.get(this.sync.track("video").clock);
+			inner.get(this.sync.out.reference);
+			const playhead = this.sync.now();
+			// The wire budget follows the live edge. Local delivery must also stop waiting
+			// once the next group's content is due on the shared playback clock.
+			maxAge.set(
+				latest === undefined || playhead === undefined
+					? budget
+					: Time.Milli.min(budget, Time.Milli.max(Time.Milli.zero, Time.Milli.sub(latest, playhead))),
+			);
+		});
+		return consumer;
+	}
+
 	#runLegacy(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
 		const format =
 			this.config.container.kind === "loc"
 				? new Container.Loc.Format("video")
 				: new Container.Legacy.Format(this.config);
-		// Create consumer that reorders groups/frames up to the provided latency.
-		const consumer = new Container.Consumer(sub, {
-			format,
-			maxAge: this.sync.out.maxAge,
-			// The estimator for this rendition, which outlives any one subscription. See #runSpread.
-			jitter: this.spread,
-		});
-		effect.cleanup(() => consumer.close());
+		const consumer = this.#consume(effect, sub, format);
 
 		// Combine network jitter buffer with decode buffer
 		effect.run((inner) => {
@@ -653,13 +668,7 @@ class DecoderTrack {
 		const init = Container.Cmaf.decodeInitSegment(initSegment);
 		const description = this.config.description ? Util.Hex.toBytes(this.config.description) : init.description;
 
-		const consumer = new Container.Consumer(sub, {
-			format: new Container.Cmaf.Format(init),
-			maxAge: this.sync.out.maxAge,
-			// The estimator for this rendition, which outlives any one subscription. See #runSpread.
-			jitter: this.spread,
-		});
-		effect.cleanup(() => consumer.close());
+		const consumer = this.#consume(effect, sub, new Container.Cmaf.Format(init));
 
 		// Combine network jitter buffer with decode buffer
 		effect.run((inner) => {
@@ -739,19 +748,16 @@ class DecoderTrack {
 		});
 	}
 
-	// React to the container consumer's discontinuity counter. On a change the publisher has
-	// rewound the timeline, so drop what's queued downstream and re-anchor the shared clock
-	// before the new utterance. Clearing `timestamp` is load-bearing: otherwise its stale high
-	// value would late-reject the rewound (lower-timestamp) frames at the output guard. Bumping
-	// the generation drops in-flight decodes on output. The held frame is left in place so the
-	// last picture shows until the new keyframe renders, instead of flashing empty. Returns true
-	// if a rewind was handled.
+	// Discard queued output across a container discontinuity, including a skipped group.
+	// Keep the last picture until the next keyframe renders. Audio retains ownership of
+	// the shared clock when only video lost content.
 	#onDiscontinuity(count: number): boolean {
 		if (count === this.#discontinuity) return false;
 		this.#discontinuity = count;
 		this.timestamp.set(undefined);
 		this.#buffered.set([]);
-		this.sync.reset();
+		// A video delivery gap must not reset the audio track's running clock.
+		if (this.sync.out.clock.peek() !== "audio") this.sync.reset();
 		return true;
 	}
 
