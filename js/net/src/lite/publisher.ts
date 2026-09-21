@@ -1071,6 +1071,9 @@ export class Publisher {
 				}
 
 				stream.close();
+				// FIN can still be queued behind congestion. Keep expiry and priority active
+				// until the transport finishes sending, so stale buffered groups can be reset.
+				await hooks.guardGroup(group, stream.closed);
 				group.close();
 			} catch (err: unknown) {
 				const e = error(err);

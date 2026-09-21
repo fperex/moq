@@ -2423,6 +2423,28 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 	/// every failure as Cancel.
 	fn poll_serve(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		loop {
+			if let GroupState::Serve { writer, .. } | GroupState::Closed { writer } = &mut self.state {
+				// Queue and SUBSCRIBE_UPDATE priority changes apply on every pass,
+				// whatever the write pipeline is blocked on. The rank is re-read as
+				// a send order when handled, since the two conventions are inverted.
+				while let Poll::Ready(rank) = self.priority.poll_next(waiter) {
+					writer.set_priority(PriorityHandle::send_order_of(rank));
+				}
+				let seen = self.ctx.track_priority_seen;
+				// A dropped producer just disables this arm, like the queue arm above.
+				if let Poll::Ready(Ok(value)) = self.ctx.track_priority.poll(waiter, |value| {
+					if **value != seen {
+						Poll::Ready(**value)
+					} else {
+						Poll::Pending
+					}
+				}) {
+					self.ctx.track_priority_seen = value;
+					let rank = self.priority.set_track(value);
+					writer.set_priority(PriorityHandle::send_order_of(rank));
+				}
+			}
+
 			match &mut self.state {
 				GroupState::Open => {
 					if self.group.poll_expired(waiter) {
@@ -2466,26 +2488,6 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 					batch_pos,
 				} => {
 					let mut cx = Context::from_waker(waiter.waker());
-
-					// Queue and SUBSCRIBE_UPDATE priority changes apply on every pass,
-					// whatever the write pipeline is blocked on. The rank is re-read as
-					// a send order when handled, since the two conventions are inverted.
-					while let Poll::Ready(rank) = self.priority.poll_next(waiter) {
-						writer.set_priority(PriorityHandle::send_order_of(rank));
-					}
-					let seen = self.ctx.track_priority_seen;
-					// A dropped producer just disables this arm, like the queue arm above.
-					if let Poll::Ready(Ok(value)) = self.ctx.track_priority.poll(waiter, |value| {
-						if **value != seen {
-							Poll::Ready(**value)
-						} else {
-							Poll::Pending
-						}
-					}) {
-						self.ctx.track_priority_seen = value;
-						let rank = self.priority.set_track(value);
-						writer.set_priority(PriorityHandle::send_order_of(rank));
-					}
 
 					let outcome = 'serve: {
 						// The peer closing first cancels the group.
@@ -2610,7 +2612,22 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 					// poll_close releases the stream on completion: the peer acknowledged
 					// everything, so the Drop fallback must not reset the stream and
 					// discard bytes still retransmitting.
-					let res = ready!(writer.poll_close(&mut cx));
+					let res = match writer.poll_close(&mut cx) {
+						Poll::Ready(res) => res,
+						Poll::Pending => {
+							// FIN does not release queued bytes until the peer acknowledges them.
+							if self.group.poll_expired_while_pending(waiter, true) {
+								let GroupState::Closed { writer } =
+									std::mem::replace(&mut self.state, GroupState::Done)
+								else {
+									unreachable!()
+								};
+								writer.abort(&Error::Old);
+								return Poll::Ready(Err(Error::Old));
+							}
+							return Poll::Pending;
+						}
+					};
 					self.state = GroupState::Done;
 					return Poll::Ready(res.map(|()| {
 						tracing::debug!(sequence = self.sequence, "finished group");
@@ -2830,6 +2847,49 @@ mod serve_group_test {
 		assert_eq!(log.resets(), vec![crate::StreamError::Old.to_code()]);
 	}
 
+	#[tokio::test]
+	async fn unacknowledged_fin_expires_with_the_group() {
+		tokio::time::pause();
+
+		let gate = kio::Producer::new(false);
+		let session = SinkSession::new(Log::default()).with_fin_gate(gate.consume());
+		let log = session.log.clone();
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			version: Version::Lite06Wip,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut subscriber = track.subscribe(None);
+		let mut old = track.append_group().unwrap();
+		old.write_frame(Timestamp::ZERO, b"old".as_slice()).unwrap();
+		old.finish().unwrap();
+		let group = subscriber.recv_group().await.unwrap().expect("old group");
+
+		let handle = subscription.priority.insert(Priority::new(0, 0, 0));
+		let mut serve = std::pin::pin!(subscription.serve_group(0, 0, handle, group));
+		assert!(
+			futures::poll!(serve.as_mut()).is_pending(),
+			"FIN acknowledgement is blocked"
+		);
+
+		tokio::time::advance(Duration::from_secs(1)).await;
+		let mut edge = track.append_group().unwrap();
+		edge.write_frame(Timestamp::from_millis(1000).unwrap(), b"edge".as_slice())
+			.unwrap();
+		edge.finish().unwrap();
+
+		assert!(matches!(futures::poll!(serve.as_mut()), Poll::Ready(Err(Error::Old))));
+		assert_eq!(log.resets(), vec![crate::StreamError::Old.to_code()]);
+	}
+
 	/// The final payload remains guarded after its frame has advanced the group cursor.
 	#[tokio::test]
 	async fn blocked_final_transport_chunk_expires_with_the_group() {
@@ -3002,6 +3062,43 @@ mod serve_group_test {
 			priorities.iter().all(|&p| p == 255),
 			"rank 0 must reach the transport as send order 255: {priorities:?}",
 		);
+	}
+	#[tokio::test]
+	async fn unacknowledged_fin_keeps_newest_first_priority() {
+		let log = Log::default();
+		let gate = kio::Producer::new(false);
+		let session = SinkSession::new(log.clone()).with_fin_gate(gate.consume());
+
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			version: Version::Lite06Wip,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut group = track.create_group(group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(Timestamp::from_millis(0).unwrap(), b"hello".as_slice())
+			.unwrap();
+		let consumer = group.consume();
+		group.finish().unwrap();
+
+		let handle = subscription.priority.insert(Priority::new(0, 0, 0));
+		let queue = subscription.priority.clone();
+		let mut serving = std::pin::pin!(subscription.serve_group(0, 0, handle, consumer));
+		assert!(futures::poll!(serving.as_mut()).is_pending());
+		assert_eq!(log.priorities().last(), Some(&255));
+
+		let _newer = queue.insert(Priority::new(0, 0, 1));
+		assert!(futures::poll!(serving.as_mut()).is_pending());
+		assert_eq!(log.priorities().last(), Some(&254));
+		assert!(log.resets().is_empty());
 	}
 }
 

@@ -93,6 +93,7 @@ pub struct SinkSend {
 	/// [`poll_closed`](poll::SendStream::poll_closed) waits on, mirroring a peer that
 	/// acknowledges the FIN; an unfinished one parks like a peer that never answers.
 	finished: bool,
+	fin_gate: Option<kio::Consumer<bool>>,
 }
 
 impl SinkSend {
@@ -102,6 +103,7 @@ impl SinkSend {
 			gate: None,
 			park: kio::Park::default(),
 			finished: false,
+			fin_gate: None,
 		}
 	}
 
@@ -112,6 +114,7 @@ impl SinkSend {
 			gate: Some(gate),
 			park: kio::Park::default(),
 			finished: false,
+			fin_gate: None,
 		}
 	}
 }
@@ -148,7 +151,16 @@ impl poll::SendStream for SinkSend {
 		self.log.resets.lock().unwrap().push(code);
 	}
 
-	fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		if self.finished
+			&& let Some(gate) = &self.fin_gate
+		{
+			let waiter = self.park.hold(cx);
+			match gate.poll(waiter, |open| (**open).then_some(()).map_or(Poll::Pending, Poll::Ready)) {
+				Poll::Ready(Ok(())) => {}
+				Poll::Ready(Err(_)) | Poll::Pending => return Poll::Pending,
+			}
+		}
 		match self.finished {
 			true => Poll::Ready(Ok(())),
 			// Nothing to acknowledge yet, so park like a peer that never answers.
@@ -330,6 +342,7 @@ pub struct SinkSession {
 	uni_gate: Option<kio::Consumer<bool>>,
 	/// Set by [`Self::gated_open_uni`] to withhold unidirectional stream credit.
 	uni_open_gate: Option<kio::Consumer<bool>>,
+	uni_fin_gate: Option<kio::Consumer<bool>>,
 	uni_open_park: kio::Park,
 	/// The ALPN to report, for a test that needs a specific negotiated version rather
 	/// than the SETUP-negotiated fallback an absent one selects.
@@ -349,9 +362,16 @@ impl SinkSession {
 			uni_gate: None,
 			uni_open_gate: None,
 			uni_open_park: kio::Park::default(),
+			uni_fin_gate: None,
 			protocol: None,
 			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
+	}
+
+	/// Hold unidirectional FIN acknowledgements until `gate` opens.
+	pub fn with_fin_gate(mut self, gate: kio::Consumer<bool>) -> Self {
+		self.uni_fin_gate = Some(gate);
+		self
 	}
 
 	/// Report these connection statistics, as a real transport would.
@@ -384,6 +404,7 @@ impl SinkSession {
 			uni_gate: None,
 			uni_open_gate: None,
 			uni_open_park: kio::Park::default(),
+			uni_fin_gate: None,
 			protocol: None,
 			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
@@ -402,6 +423,7 @@ impl SinkSession {
 			uni_gate: None,
 			uni_open_gate: None,
 			uni_open_park: kio::Park::default(),
+			uni_fin_gate: None,
 			protocol: None,
 			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
@@ -416,6 +438,7 @@ impl SinkSession {
 			uni_gate: Some(gate),
 			uni_open_gate: None,
 			uni_open_park: kio::Park::default(),
+			uni_fin_gate: None,
 			protocol: None,
 			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
@@ -430,6 +453,7 @@ impl SinkSession {
 			uni_gate: None,
 			uni_open_gate: Some(gate),
 			uni_open_park: kio::Park::default(),
+			uni_fin_gate: None,
 			protocol: None,
 			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
@@ -455,6 +479,7 @@ impl poll::Session for SinkSession {
 			gate: Some(gate),
 			park: kio::Park::default(),
 			finished: false,
+			fin_gate: None,
 		};
 		Poll::Ready(Ok((send, PendingRecv)))
 	}
@@ -470,6 +495,7 @@ impl poll::Session for SinkSession {
 			gate: Some(gate),
 			park: kio::Park::default(),
 			finished: false,
+			fin_gate: None,
 		};
 		Poll::Ready(Ok((send, PendingRecv)))
 	}
@@ -482,10 +508,12 @@ impl poll::Session for SinkSession {
 				Poll::Ready(Err(_)) | Poll::Pending => return Poll::Pending,
 			}
 		}
-		Poll::Ready(Ok(match &self.uni_gate {
+		let mut send = match &self.uni_gate {
 			Some(gate) => SinkSend::gated(self.log.clone(), gate.clone()),
 			None => SinkSend::new(self.log.clone()),
-		}))
+		};
+		send.fin_gate = self.uni_fin_gate.clone();
+		Poll::Ready(Ok(send))
 	}
 
 	fn poll_send_datagram(&mut self, _cx: &mut Context<'_>, _payload: &[u8]) -> Poll<Result<(), Self::Error>> {

@@ -518,6 +518,8 @@ export class Publisher {
 				}
 
 				stream.close();
+				// The transport may still hold data after FIN is queued.
+				await hooks.guardGroup(group, stream.closed);
 			} catch (err: unknown) {
 				stream.reset(error(err));
 			}

@@ -1232,11 +1232,11 @@ test("lite draft-05: group streams do not ask the transport to wait for a slot",
 
 // The header is part of the group's lifetime too. If it blocks on flow control, advancing
 // the live edge must reset the stream without waiting for that write to finish.
-test("lite draft-05: a blocked group header is reset when the group expires", async () => {
+test.each(["header", "FIN"] as const)("a blocked group %s is reset when the group expires", async (phase) => {
 	const pair = createMockTransportPair(ALPN_05);
 
 	let started!: () => void;
-	const headerStarted = new Promise<void>((resolve) => {
+	const operationStarted = new Promise<void>((resolve) => {
 		started = resolve;
 	});
 	let release!: () => void;
@@ -1247,15 +1247,20 @@ test("lite draft-05: a blocked group header is reset when the group expires", as
 	const streamReset = new Promise<void>((resolve) => {
 		reset = resolve;
 	});
-	const closed = new Promise<void>(() => {});
+	const closed = phase === "FIN" ? blocked : new Promise<void>(() => {});
 	const writable = {
 		getWriter: () => ({
 			closed,
 			write: async () => {
+				if (phase !== "header") return;
 				started();
 				await blocked;
 			},
-			close: async () => {},
+			close: async () => {
+				if (phase !== "FIN") return;
+				started();
+				await blocked;
+			},
 			abort: async () => {
 				reset();
 			},
@@ -1282,7 +1287,7 @@ test("lite draft-05: a blocked group header is reset when the group expires", as
 		old.writeFrame({ payload: new TextEncoder().encode("old"), timestamp: Timestamp.fromMillis(0) });
 		old.close();
 		track.writeGroup(old);
-		await headerStarted;
+		await operationStarted;
 
 		const edge = new GroupProducer(1);
 		edge.writeFrame({ payload: new TextEncoder().encode("edge"), timestamp: Timestamp.fromMillis(1000) });
