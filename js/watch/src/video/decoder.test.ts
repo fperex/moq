@@ -250,6 +250,25 @@ test("video advances to a buffered keyframe when the audio playhead reaches it",
 	}
 });
 
+test("late backlog cannot replace the picture shown before clock catch-up", async () => {
+	const fx = fixture();
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		fx.served[0].encode(payload(16), Time.Micro(2_000_000), true);
+		await settle();
+		fx.sync.track("audio").clock.set({ timestamp: Time.Micro(1_000_000), reference: Time.Milli.now(), rate: 0 });
+		await settle();
+		built[0].emit(2_000_000);
+		await settle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(2_000_000);
+		built[0].emit(1_000_000);
+		await settle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(2_000_000);
+	} finally {
+		fx.close();
+	}
+});
+
 test("a codec error rebuilds the track instead of stranding the subscription", async () => {
 	const warn = console.warn;
 	console.warn = () => {};

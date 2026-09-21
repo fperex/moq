@@ -500,7 +500,9 @@ class DecoderTrack {
 					if (this.sync.out.reference.peek() === undefined) return;
 
 					if (this.frame.peek() === undefined) {
-						// Render something while we wait for the sync to catch up.
+						// This preview is already visible. Older backlog must not replace it
+						// while its timestamp is still waiting for the shared clock.
+						this.timestamp.set(timestamp);
 						this.frame.set(frame.clone());
 					}
 
