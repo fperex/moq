@@ -410,6 +410,7 @@ export class Decoder {
 
 			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
 			const ring = createAudioBuffer(worklet, {
+				context,
 				channels: channelCount,
 				rate: sampleRate,
 				latency: latencySamples,

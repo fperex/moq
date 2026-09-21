@@ -208,11 +208,10 @@ describe("video follows the audio playhead", () => {
 		expect(wall.ahead).toBeGreaterThan(4 * driven.ahead);
 
 		// Every frame renders at the audio position it belongs to, never meaningfully before the ring
-		// got there. Two terms allow the slack: `wait()` returns without sleeping under 5ms, since a
-		// timer that coarse would overshoot anyway, and the clock is up to a poll stale.
+		// got there. The ring is sampled in render quanta, and the clock is up to a poll stale.
 		const early = Math.max(...driven.rendered.map(({ timestamp, playhead }) => timestamp - playhead));
 		console.log(`sync replay: earliest frame presented ${early.toFixed(1)}ms before the audio reached it`);
-		expect(early).toBeLessThan(5 + driven.ahead);
+		expect(early).toBeLessThanOrEqual(STEP + driven.ahead);
 	}, 60_000);
 });
 
@@ -325,6 +324,7 @@ class FakeWorklet extends EventTarget {
 	compose(): State {
 		return {
 			type: "state",
+			contextTime: Time.Second((performance.now() - 1) / 1000),
 			timeline: this.#timeline,
 			playhead: this.#ring.playhead,
 			debug: this.#ring.debug(),
@@ -343,6 +343,7 @@ function postAudioBuffer(worklet: FakeWorklet, latency: number): AudioBuffer {
 	(globalThis as { SharedArrayBuffer?: SharedArrayBufferConstructor }).SharedArrayBuffer = undefined;
 	try {
 		return createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+			context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
 			channels: 1,
 			rate: RATE,
 			latency,
@@ -502,7 +503,7 @@ async function session({
 		const present = () => {
 			const position = sync.now();
 			if (position === undefined) return;
-			while (frame < position + 5) {
+			while (frame <= position) {
 				const timestamp = frame as Time.Milli;
 				pending.push(
 					sync.wait(timestamp).then(() => {

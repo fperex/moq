@@ -497,9 +497,18 @@ corpus hold both languages: a step that carried the browser's render block would
 produce a different target series from the same trace on native.
 
 The reported numbers follow the same split. `Sync.out.delay` stays the
-estimator's answer, which is what the player's "jitter buffer" row shows. What a
-listener waits is `delay + offset + chunk`, which is what the "total buffer" row
+estimator's answer, which is what the player's "jitter buffer" row shows. The configured
+media hold is `delay + offset + chunk`, which is what the "total buffer" row
 shows; the middle term is the next section and is zero in the ordinary case.
+This is a buffering target, not capture-to-speaker or capture-to-display latency.
+Capture, encoding, transport and output-device delays also contribute to the
+end-to-end delay.
+
+The browser's message-based audio buffer timestamps each playhead sample at the
+end of its render quantum. The main thread maps that audio context time through
+`AudioContext.getOutputTimestamp()` before using it to pace video. Message
+delivery time varies with main-thread load; using it as the playback timestamp
+would turn that scheduling jitter into uneven video frame releases.
 
 ## Holding the sound for a later picture
 

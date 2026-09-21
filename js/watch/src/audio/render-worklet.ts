@@ -1,3 +1,4 @@
+import { Time } from "@moq/net";
 import { Stretcher } from "./playout";
 import type { Message, State } from "./render";
 import { AudioRingBuffer } from "./ring-buffer";
@@ -115,6 +116,7 @@ class Render extends AudioWorkletProcessor {
 				this.#stateCounter = 0;
 				const state: State = {
 					type: "state",
+					contextTime: Time.Second((currentFrame + output[0].length) / sampleRate),
 					timeline: this.#timeline,
 					playhead: backend.playhead,
 					debug: backend.debug(),

@@ -448,6 +448,33 @@ describe("clock", () => {
 		sync.close();
 	});
 
+	it("keeps a frame waiting until the running audio clock reaches its timestamp", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(100) });
+		await flush();
+		sync.track("audio").clock.set(sample(5000, clock.at));
+		await flush();
+		let rendered = false;
+		const frame = sync.wait(Time.Milli(5004)).then(() => {
+			rendered = true;
+		});
+		try {
+			await flush();
+			expect(rendered).toBe(false);
+			clock.advance(3);
+			sync.track("audio").clock.set(sample(5003, clock.at));
+			await flush();
+			expect(rendered).toBe(false);
+			clock.advance(1);
+			sync.track("audio").clock.set(sample(5004, clock.at));
+			await frame;
+			expect(rendered).toBe(true);
+		} finally {
+			sync.close();
+			await frame;
+		}
+	});
+
 	it.each([1, 20])("keeps a frame %d ms ahead waiting while the audio playhead is parked", async (ahead) => {
 		clock = fakeClock();
 		const sync = new Sync({ delay: Time.Milli(100) });

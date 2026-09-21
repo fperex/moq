@@ -644,9 +644,6 @@ export class Sync {
 			}
 			const sleep = remaining / rate;
 
-			// Skip setTimeout for small sleeps; the timer resolution (~4ms) would overshoot.
-			if (sleep < 5) return;
-
 			const wait = Promise.withResolvers<void>();
 			const timer = setTimeout(wait.resolve, sleep);
 			await Promise.race([this.#update.promise, wait.promise]);
