@@ -60,9 +60,21 @@ fn client() -> moq_tokio::Client {
 }
 
 async fn wait_for_http(port: u16) {
+	let client = reqwest::Client::builder()
+		.no_proxy()
+		.timeout(Duration::from_secs(1))
+		.build()
+		.expect("readiness client");
+	let url = format!("http://127.0.0.1:{port}/health");
 	let deadline = std::time::Instant::now() + Duration::from_secs(5);
 	loop {
-		if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+		// Linux can connect a TCP socket to itself without a listener.
+		if client
+			.get(&url)
+			.send()
+			.await
+			.is_ok_and(|response| response.status().is_success())
+		{
 			return;
 		}
 		if std::time::Instant::now() >= deadline {
@@ -70,6 +82,30 @@ async fn wait_for_http(port: u16) {
 		}
 		tokio::time::sleep(Duration::from_millis(25)).await;
 	}
+}
+
+#[tokio::test]
+async fn http_readiness_requires_a_response() {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+	let ready = tokio::spawn(wait_for_http(port));
+	let (mut stream, _) = tokio::time::timeout(TIMEOUT, listener.accept()).await.unwrap().unwrap();
+	let expected = b"GET /health HTTP/1.1\r\n";
+	let mut request = [0; 22];
+	tokio::time::timeout(TIMEOUT, stream.read_exact(&mut request))
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(&request, expected);
+	assert!(!ready.is_finished(), "TCP connection alone reported HTTP readiness");
+	stream
+		.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+		.await
+		.unwrap();
+	tokio::time::timeout(TIMEOUT, ready).await.unwrap().unwrap();
 }
 
 async fn assert_owner_stopped(quic: SocketAddr, http: SocketAddr) {
