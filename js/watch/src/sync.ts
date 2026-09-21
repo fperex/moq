@@ -634,16 +634,23 @@ export class Sync {
 			const playhead = this.#playhead(Time.Milli.now());
 			if (playhead === undefined) return;
 
-			const sleep = Time.Milli.sub(timestamp, playhead);
-			if (sleep <= 0) return;
+			const remaining = Time.Milli.sub(timestamp, playhead);
+			if (remaining <= 0) return;
+
+			const rate = this.#clock?.rate ?? 1;
+			if (rate <= 0) {
+				await this.#update.promise;
+				continue;
+			}
+			const sleep = remaining / rate;
 
 			// Skip setTimeout for small sleeps; the timer resolution (~4ms) would overshoot.
 			if (sleep < 5) return;
 
-			const wait = new Promise((resolve) => setTimeout(resolve, sleep)).then(() => true);
-
-			const ok = await Promise.race([this.#update.promise, wait]);
-			if (ok) return;
+			const wait = Promise.withResolvers<void>();
+			const timer = setTimeout(wait.resolve, sleep);
+			await Promise.race([this.#update.promise, wait.promise]);
+			clearTimeout(timer);
 		}
 	}
 
@@ -658,5 +665,6 @@ export class Sync {
 
 	close() {
 		this.#signals.close();
+		this.reset();
 	}
 }

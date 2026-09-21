@@ -448,6 +448,63 @@ describe("clock", () => {
 		sync.close();
 	});
 
+	it.each([1, 20])("keeps a frame %d ms ahead waiting while the audio playhead is parked", async (ahead) => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(100) });
+		await flush();
+		sync.track("audio").clock.set(sample(5000, clock.at, 0));
+		await flush();
+		let rendered = false;
+		const frame = sync.wait(Time.Milli(5000 + ahead)).then(() => {
+			rendered = true;
+		});
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 40));
+			expect(rendered).toBe(false);
+			sync.track("audio").clock.set(sample(5000 + ahead, clock.at, 0));
+			await frame;
+			expect(rendered).toBe(true);
+		} finally {
+			sync.reset();
+			sync.close();
+			await frame;
+		}
+	});
+
+	it("rechecks a slowed audio playhead when the frame timer expires", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(100) });
+		await flush();
+		sync.track("audio").clock.set(sample(5000, clock.at, 0.5));
+		await flush();
+		let rendered = false;
+		const frame = sync.wait(Time.Milli(5020)).then(() => {
+			rendered = true;
+		});
+		try {
+			clock.advance(20);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(rendered).toBe(false);
+			sync.track("audio").clock.set(sample(5020, clock.at, 0));
+			await frame;
+			expect(rendered).toBe(true);
+		} finally {
+			sync.close();
+			await frame;
+		}
+	});
+
+	it("releases a parked frame when closed", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(100) });
+		await flush();
+		sync.track("audio").clock.set(sample(5000, clock.at, 0));
+		await flush();
+		const frame = sync.wait(Time.Milli(5020));
+		sync.close();
+		await frame;
+	});
+
 	it("paces a frame against the playhead rather than the wall clock", async () => {
 		clock = fakeClock();
 		const sync = new Sync({ delay: 100 as Time.Milli });
