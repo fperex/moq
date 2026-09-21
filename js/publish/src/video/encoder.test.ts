@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
+import * as Catalog from "@moq/hang/catalog";
 import * as Container from "@moq/hang/container";
 import * as Moq from "@moq/net";
 import { Signal } from "@moq/signals";
@@ -230,15 +231,15 @@ test("frame-rate changes never lower the rendition's advertised jitter", async (
 	const encoder = new Encoder("video", { capture: capture as never, enabled, config: { frameRate: 30 } });
 	try {
 		await settle();
-		expect(encoder.out.catalog.peek()?.jitter).toBe(34);
+		expect(encoder.out.catalog.peek()?.jitter).toBe(Catalog.u53(34));
 		encoder.config.set({ frameRate: 60 });
 		await settle();
 		expect(encoder.out.catalog.peek()?.framerate).toBe(60);
-		expect(encoder.out.catalog.peek()?.jitter).toBe(34);
+		expect(encoder.out.catalog.peek()?.jitter).toBe(Catalog.u53(34));
 
 		encoder.config.set({ frameRate: 15 });
 		await settle();
-		expect(encoder.out.catalog.peek()?.jitter).toBe(67);
+		expect(encoder.out.catalog.peek()?.jitter).toBe(Catalog.u53(67));
 		enabled.set(false);
 		await settle();
 		expect(encoder.out.catalog.peek()).toBeUndefined();
@@ -246,7 +247,7 @@ test("frame-rate changes never lower the rendition's advertised jitter", async (
 		enabled.set(true);
 		await settle();
 		expect(encoder.out.catalog.peek()?.framerate).toBe(60);
-		expect(encoder.out.catalog.peek()?.jitter).toBe(67);
+		expect(encoder.out.catalog.peek()?.jitter).toBe(Catalog.u53(67));
 	} finally {
 		encoder.close();
 	}

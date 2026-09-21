@@ -167,20 +167,20 @@ describe("a rendition that stops encoding", () => {
 		using _codecs = installFakeAudioCodecs();
 		const { encoder, enabled } = await encoding();
 		try {
-			expect(encoder.out.catalog.peek()?.jitter).toBe(20);
+			expect(encoder.out.catalog.peek()?.jitter).toBe(Catalog.u53(20));
 			encoder.codec.set({ mime: "opus", frameDuration: Time.Milli(5) });
 			await settle();
-			expect(encoder.out.catalog.peek()?.jitter).toBe(20);
+			expect(encoder.out.catalog.peek()?.jitter).toBe(Catalog.u53(20));
 			encoder.codec.set({ mime: "opus", frameDuration: Time.Milli(40) });
 			await settle();
-			expect(encoder.out.catalog.peek()?.jitter).toBe(40);
+			expect(encoder.out.catalog.peek()?.jitter).toBe(Catalog.u53(40));
 			enabled.set(false);
 			await settle();
-			expect(encoder.out.catalog.peek()?.jitter).toBe(40);
+			expect(encoder.out.catalog.peek()?.jitter).toBe(Catalog.u53(40));
 			encoder.codec.set({ mime: "opus", frameDuration: Time.Milli(5) });
 			enabled.set(true);
 			await settle();
-			expect(encoder.out.catalog.peek()?.jitter).toBe(40);
+			expect(encoder.out.catalog.peek()?.jitter).toBe(Catalog.u53(40));
 		} finally {
 			encoder.close();
 		}
