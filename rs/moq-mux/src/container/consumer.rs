@@ -1785,6 +1785,41 @@ mod tests {
 		assert_eq!(micros, vec![0, 100_000], "the slow stream's frames are delivered");
 	}
 
+	/// A starved path opens groups it never fills: the cursor's group carries a stream header and
+	/// no frame, and so does the one behind it. What the cursor could still present is bounded by
+	/// where the next group holding a frame begins, since a group holding nothing bounds nothing,
+	/// so the budget still expires and the media buffered behind them is delivered.
+	#[tokio::test]
+	async fn frameless_successor_does_not_hide_a_stamped_group() {
+		tokio::time::pause();
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let consumer_track = track.subscribe(None);
+		let mut consumer = container_max_age_only(consumer_track, Duration::from_millis(100));
+
+		// The cursor's group opens and starves, and so does the one behind it.
+		let _starved = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		let _also_starved = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+
+		// The media that did arrive sits behind both of them, well past the 100ms budget.
+		write_group(&mut track, 2, &[ts(300_000), ts(333_000), ts(366_000), ts(400_000)]);
+		write_group(&mut track, 3, &[ts(433_000), ts(466_000)]);
+
+		let mut micros = Vec::new();
+		for _ in 0..6 {
+			let frame = tokio::time::timeout(Duration::from_millis(500), consumer.read())
+				.await
+				.expect("delivery must not park on a group holding nothing")
+				.unwrap()
+				.expect("a frame");
+			micros.push(frame.timestamp.as_micros());
+		}
+		assert_eq!(
+			micros,
+			vec![300_000, 333_000, 366_000, 400_000, 433_000, 466_000],
+			"the buffered groups are delivered in order"
+		);
+	}
+
 	// ---- Decode errors ----
 
 	/// A container that decodes each frame's payload as an 8-byte LE microsecond
