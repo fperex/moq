@@ -289,7 +289,7 @@ describe("a rendition that stops encoding", () => {
 	// release of the serving scope on `unused()` closes the producer here instead, which both ends
 	// the track for good on the wire and restarts the timeline, so the resumed audio plays out
 	// seconds behind the video.
-	test("keeps the track and the timeline across a dropped and resumed subscription", async () => {
+	test("keeps the track writable across a dropped and resumed subscription", async () => {
 		using _codecs = installFakeAudioCodecs();
 
 		const { Broadcast } = await import("../broadcast");
@@ -334,8 +334,8 @@ describe("a rendition that stops encoding", () => {
 			await settle();
 
 			// Unmute. The subscription is served rather than answered from a finished track, and it
-			// reaches the live timestamp: the pipeline never re-anchored, so the audio is where the
-			// video is.
+			// accepts a chunk at the live timestamp. The browser media lifecycle test checks that
+			// the codec itself preserves the input gap.
 			second = front.track("audio").subscribe();
 			await settle();
 			expect(second.closed.peek()).toBeUndefined();
@@ -347,8 +347,7 @@ describe("a rendition that stops encoding", () => {
 			const drain = draining(second);
 			expect(await drain()).toBe(0);
 
-			// And it stays on the timeline it kept: the unmute picks up three seconds on rather than
-			// re-anchoring at the timestamp the mute stopped at.
+			// A new chunk at the live timestamp is published on the same track.
 			FakeAudioEncoder.last?.output(chunk(3_020_000, 20_000));
 			await settle();
 			expect(await drain()).toBe(3_020_000);

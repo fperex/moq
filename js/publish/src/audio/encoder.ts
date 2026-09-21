@@ -255,8 +255,8 @@ export class Encoder {
 
 		// The pipeline outlives any one subscription: it is built as soon as capture runs and
 		// #encode reads the live producer per frame rather than subscribing to it. Rebuilding on a
-		// swap would close the AudioEncoder, which discards every chunk the codec still holds, and
-		// would restart the framer mid-frame, so the output fell permanently behind its input.
+		// swap would discard partial captured frames. Keep framing on the capture clock, and reset
+		// the codec only when the next encoded input proves that its timeline has a gap.
 		effect.run((effect) => {
 			const enabled = effect.get(this.in.enabled);
 			const capture = effect.get(this.in.capture);
@@ -468,6 +468,7 @@ export class Encoder {
 
 				console.debug("encoding audio", encoderConfig);
 				encoder.configure(encoderConfig);
+				let expected: Time.Micro | undefined;
 
 				const pipeline: Pipeline = {
 					channelCount: config.numberOfChannels,
@@ -483,6 +484,14 @@ export class Encoder {
 							// the gate reopens sits a whole gated interval past the last one, which
 							// is what its decoder measures a break against.
 							if (!track.peek()) continue;
+
+							// AudioEncoder can count output samples continuously across input timestamp
+							// gaps. Reset at a capture or demand gap so the resumed audio keeps its
+							// place beside video. Allow the same 1ms rounding tolerance as the framer.
+							if (expected !== undefined && Math.abs(data.timestamp - expected) > Time.Micro(1_000)) {
+								encoder.reset();
+								encoder.configure(encoderConfig);
+							}
 
 							const joinedLength = data.channels.reduce((total, channel) => total + channel.length, 0);
 							const joined = new Float32Array(joinedLength);
@@ -503,6 +512,10 @@ export class Encoder {
 							});
 
 							encoder.encode(frame);
+							expected = Time.Micro.add(
+								data.timestamp,
+								Time.Micro.fromSecond(Time.Second(data.channels[0].length / config.sampleRate)),
+							);
 							frame.close();
 						}
 					},
