@@ -275,7 +275,7 @@ test("several watchers joining and leaving audio and video keep both tracks live
 		for (;;) {
 			const event = await announced.next();
 			if (!event) return;
-			announcements.push({ path: event.path, kind: event.kind });
+			announcements.push({ path: event.prefix, kind: event.kind });
 		}
 	})();
 
