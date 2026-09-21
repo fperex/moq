@@ -226,7 +226,7 @@ if (index >= 100) return       // dropped, not clamped
 for each i: bucket[i] *= forget
 bucket[index] += 1 - forget
 adds += 1
-forget = clamp(1 - 2 / (adds + 1), 0, 0.983)
+forget = clamp(1 - 2 / (adds + 1), 0, 0.9)
 ```
 
 The sum stays 1, so there is no correction loop. WebRTC has one only because
@@ -239,12 +239,19 @@ arrival pin the target at 2000 ms for the length of the histogram's memory.
 
 **The start ramp.** `forget` is 0 on the first add, so the first observation
 replaces the seeded prior outright rather than nudging it. It reaches the
-steady-state 0.983 at `adds >= 117`. Without the ramp a cold start crawls for
-tens of seconds; `start_forget_weight = 2` is WebRTC's value.
+steady-state 0.9 at `adds >= 19`. The ramp lets a cold start replace its prior
+without waiting for the steady-state decay; `start_forget_weight = 2` is WebRTC's value.
 
-**Memory.** 0.983 per observation and one observation per 500 ms is about
-`500 / (1 - 0.983)`, roughly 29 seconds of wall clock. That claim only holds if
-an interval with no arrival also decays, which is the next section.
+**Memory.** Each observation retains 90% of the previous distribution. With
+one observation per 500 ms, even a distribution made entirely of old delays
+falls below the quantile's 5% tail after 29 new observations, about 15 seconds:
+`0.9^29 < 0.05`. Repeated high delays continue to contribute fresh mass, so
+sustained jitter keeps its buffer. A temporary queue can fade after the path
+recovers. The published target then falls at the bounded rate below.
+
+The mean age of the history is not a recovery deadline: a high quantile can
+remain elevated after most of its old mass has decayed. Empty intervals must
+also decay, as the next section specifies.
 
 **Quantile.** Walk from bucket 0 subtracting mass until the remaining tail
 drops to `1 - 0.95`:
@@ -269,7 +276,7 @@ sizes that tail wrong in both directions.
 
 An interval in which nothing arrived produces no observation, and therefore no
 decay step. Left alone, a pause preserves whatever the path looked like before
-it, and the 29 second memory above is not true.
+it, regardless of how much wall-clock time passed.
 
 So empty intervals decay, lazily, on the next arrival that closes an interval:
 
@@ -390,14 +397,14 @@ exactly where the target is furthest from what the histogram asks for, and the
 time it takes to undo an overshoot grows with the overshoot: 1600 ms at a bucket
 a second is eighty seconds.
 
-**Why a sixth.** The limiter must never outlast the observation that raised the
-target. The histogram forgets in about 29 seconds, and the widest gap it can
-open is its own range, 2000 ms down to one bucket, a factor of 100. Closing a
-factor of 100 inside 29 seconds needs `1 - 100^(-1/29)`, about 0.147 per second;
-a sixth is the next simple fraction above it. It is written as a division by 6,
-not a multiplication by an `f64` sixth, so the floor below it lands on the same
-bucket in every language. The bucket stays as the floor because it is the
-estimator's own resolution, and below it the target cannot move at all.
+**Why a sixth.** Retiring old observations and changing playback depth are
+separate steps. The histogram follows the recovered path; the limiter keeps
+that reduction gradual while the audio ring catches up. A sixth of the
+remaining distance per second drains a large excess faster than a fixed
+20 ms step, while a small excess still falls one bucket at a time. The divisor
+is exactly 6 so both languages round to the same bucket. The limiter can
+outlast the histogram's old tail; the recovery tests cover their combined
+effect rather than treating the histogram's mean age as a deadline.
 
 The quantile is a bucket index, so it comes down in handfuls of buckets at a
 time as mass leaves the tail, not smoothly. That is the case the fixed step

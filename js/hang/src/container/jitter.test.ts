@@ -471,8 +471,8 @@ describe("the histogram", () => {
 
 	it("ramps the forget factor so a cold start converges in seconds", () => {
 		// Four seconds of clean audio is 8 observations. Without the ramp the seeded 0.5^(i+1) prior
-		// still holds most of the mass after 8 decays of 0.983, and the quantile needs about 134 of
-		// them, more than a minute, before it reaches the first bucket.
+		// still retains prior mass after 8 decays of 0.9, so the startup ramp must replace it
+		// before the steady-state history has faded.
 		const jitter = new Jitter();
 		flush(jitter, { frames: 200 });
 		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
@@ -517,6 +517,16 @@ describe("pauses", () => {
 });
 
 describe("rise and fall", () => {
+	it("releases a temporary queue within twenty seconds of paced arrivals", () => {
+		const jitter = new Jitter();
+		const congested = flush(jitter, { frames: 6000 });
+		const recovered = flush(jitter, { frames: 300, burst: 25, start: congested });
+		expect(jitter.value.peek()).toBeGreaterThanOrEqual(Time.Milli(480));
+
+		flush(jitter, { frames: 1000, start: recovered });
+		expect(jitter.value.peek()).toBeLessThanOrEqual(Time.Milli(200));
+	});
+
 	it("rises as soon as an arrival proves the buffer is too shallow", () => {
 		const jitter = new Jitter();
 		flush(jitter, { frames: 500 });
@@ -585,7 +595,7 @@ describe("rise and fall", () => {
 		// The path degrades 30ms a frame for a second, which the estimator reads as the delay it is,
 		// and then flushes what it queued. The quantile comes down in whole handfuls of buckets as
 		// the histogram forgets, and a fixed step cannot follow it: 1480ms at a bucket a second is
-		// 74 seconds, well past the 29 seconds the histogram remembers why it went up.
+		// 74 seconds, long after the old observations have faded.
 		const jitter = new Jitter();
 		flush(jitter, { frames: 500 });
 

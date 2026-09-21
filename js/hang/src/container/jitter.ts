@@ -8,8 +8,9 @@ const BUCKETS = 100;
 const QUANTILE = 0.95;
 
 // Steady-state forget factor, applied once per resampled observation rather than per arrival.
-// 500ms / (1 - 0.983) is about 29s of wall-clock memory.
-const FORGET = 0.983;
+// At 500ms per observation, old mass falls below the 5% quantile tail in 15s.
+// A longer history keeps a recovered path buffered for a minute after a short queue.
+const FORGET = 0.9;
 
 // Cold-start ramp: the first observations replace the seeded prior instead of nudging it.
 const START_FORGET_WEIGHT = 2;
@@ -32,9 +33,8 @@ const MAX_CATCHUP = 60;
 const LOWER_INTERVAL = 1000;
 
 // The share of the distance to the quantile the target may close per LOWER_INTERVAL, when that is
-// more than one bucket: one part in this many. Enough to close the histogram's whole range inside
-// the histogram's own memory, so the limiter can never outlast the observation that raised the
-// target. A divisor rather than a fraction so the arithmetic is exact in every language.
+// more than one bucket: one part in this many. This smooths reductions after the histogram has
+// released an old delay. A divisor rather than a fraction keeps the arithmetic exact in every language.
 const LOWER_DIVISOR = 6;
 
 // One admitted arrival, on both axes in milliseconds.
@@ -83,8 +83,8 @@ export type JitterProps = {
  *
  * The estimate rises the moment a late frame proves the buffer is too shallow and falls once a
  * second by a share of the distance left, so a refinement shrinks a viewer's buffer in steps it can
- * absorb without taking longer to undo than the histogram remembers. That bound holds between two
- * measurements. It carries no floor: the rendition's advertised jitter is the prior it starts from
+ * absorb. The fall limiter can keep the published target above the measured quantile while the
+ * ring catches up. It carries no floor: the rendition's advertised jitter is the prior it starts from
  * ({@link JitterProps.start}), and the first measurement replaces it outright.
  *
  * Time the receiver spends not reading is not the path's fault, so a gap in the receiver's own

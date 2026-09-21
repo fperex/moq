@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::delay::{BUCKET, Jitter, LOWER_DIVISOR, Observation};
+use super::delay::{BUCKET, FORGET, Jitter, LOWER_DIVISOR, Observation};
 
 /// The corpus, checked in beside the tests that consume it.
 const CORPUS: &str = include_str!("../../tests/playout-01.json");
@@ -94,7 +94,7 @@ fn the_constants_match() {
 	assert_eq!(number(constants, "bucket_ms"), BUCKET);
 	assert_eq!(number(constants, "buckets"), 100.0);
 	assert_eq!(number(constants, "quantile"), 0.95);
-	assert_eq!(number(constants, "forget"), 0.983);
+	assert_eq!(number(constants, "forget"), FORGET);
 	assert_eq!(number(constants, "start_forget_weight"), 2.0);
 	assert_eq!(number(constants, "resample_ms"), 500.0);
 	assert_eq!(number(constants, "window_ms"), 2000.0);
