@@ -123,6 +123,11 @@ interface Script {
 	pace?: number;
 	/** Output frame at which to park the ring, as a fraction of the run. */
 	stallAt?: number;
+	/**
+	 * Target changes once playback is under way, as a fraction of the run and the new target in
+	 * milliseconds: what the estimator's walk does to a ring that is already playing.
+	 */
+	steps?: Array<{ at: number; target: number }>;
 }
 
 interface Report extends Snapshot {
@@ -136,12 +141,36 @@ interface Report extends Snapshot {
 	balanced: boolean;
 	/** Whether the media playhead ever stepped backwards. */
 	monotone: boolean;
+	/** The engine's smoothed buffer level after every quantum, which is what it has learned. */
+	levels: number[];
+	/** How many timelines the ring handed the engine, told apart by generation. */
+	timelines: number;
+	/** The ring as each of the script's steps left it. */
+	stepped: Snapshot[];
 }
 
 function run(build: (targetMs: number, buffered?: boolean) => Harness, script: Script): Report {
 	const harness = build(script.target);
 	const engine = new Stretcher(RATE, 1, script.conceal ?? true);
 	const out = [new Float32Array(QUANTUM)];
+
+	// Every timeline the engine was shown, noted on its own reads: the shared ring's `view` applies
+	// the skip-ahead, so reading it from here as well would change what the engine gets.
+	const generations = new Set<number>();
+	const ring = harness.reader;
+	const reader: RingReader = {
+		rate: ring.rate,
+		channels: ring.channels,
+		view: () => {
+			const view = ring.view();
+			generations.add(view.generation);
+			return view;
+		},
+		peek: (dst, count, offset) => ring.peek(dst, count, offset),
+		commit: (count) => ring.commit(count),
+		starve: () => ring.starve(),
+		report: (counters) => ring.report(counters),
+	};
 
 	const quanta = Math.floor((RATE * script.seconds) / QUANTUM);
 	const played = new Float32Array(quanta * QUANTUM);
@@ -179,6 +208,8 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 	let balanced = true;
 	let monotone = true;
 	let playhead = Number.NEGATIVE_INFINITY;
+	const levels: number[] = [];
+	const stepped: Snapshot[] = [];
 
 	for (let q = 0; q < quanta; q++) {
 		// The surplus lands once the reader has taken a block, which is what makes it a surplus.
@@ -213,13 +244,19 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 			nextArrival += CHUNK / pace;
 		}
 		if (q === stallAt) harness.reader.starve();
+		for (const step of script.steps ?? []) {
+			if (q !== Math.floor(quanta * step.at)) continue;
+			harness.setLatency(ms(step.target));
+			stepped.push(harness.debug());
+		}
 
 		out[0].fill(0);
-		const got = engine.render(harness.reader, out, outputFrame);
+		const got = engine.render(reader, out, outputFrame);
 		played.set(out[0].subarray(0, got), length);
 		rendered.set(out[0], q * QUANTUM);
 		length += got;
 		if (got < QUANTUM) shortQuanta++;
+		levels.push(engine.level);
 
 		const debug = harness.debug();
 		// What the ring handed over is what was played, less the frames that were made up rather
@@ -244,7 +281,18 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 		shortQuanta,
 		balanced,
 		monotone,
+		levels,
+		timelines: generations.size,
+		stepped,
 	};
+}
+
+/** The first index at which two runs differ, or -1 when they are the same. */
+function diverge(a: ArrayLike<number>, b: ArrayLike<number>): number {
+	for (let i = 0; i < Math.max(a.length, b.length); i++) {
+		if (a[i] !== b[i]) return i;
+	}
+	return -1;
 }
 
 describe.each(RINGS)("%s ring worklet", (name, build) => {
@@ -478,6 +526,66 @@ describe("both rings", () => {
 		});
 		expect(b.output).toBe(a.output);
 		expect(b.stretched).toBe(a.stretched);
+	});
+});
+
+describe("a target step", () => {
+	// The postMessage ring sizes its storage from the target, so every step the estimator takes moves
+	// its samples into an array of a new size. The shared ring's `setLatency` only stores the number,
+	// which makes it the reference for what a step sounds like when nothing else changes.
+
+	it("plays the same on both rings", () => {
+		// 40ms to 60ms and back, each landing mid-tone: the first block past the rise expands, which
+		// splices onto the audio just played.
+		const script: Script = {
+			target: 40,
+			prefill: 40 + CHUNK_MS,
+			seconds: 4,
+			steps: [
+				{ at: 0.375, target: 60 },
+				{ at: 0.625, target: 40 },
+			],
+		};
+		const a = run(shared, script);
+		const b = run(post, script);
+
+		expect(b.expands).toBeGreaterThan(0);
+		// Nothing the reader held was dropped and nothing it learned was forgotten: the same audio,
+		// under the same buffer level at every decision.
+		expect(diverge(b.rendered, a.rendered)).toBe(-1);
+		expect(diverge(b.levels, a.levels)).toBe(-1);
+		expect(b.timelines).toBe(1);
+		expect(b.balanced).toBe(true);
+		expect(b.monotone).toBe(true);
+		expect(zeroRun(b.played)).toBeLessThanOrEqual(2);
+		expect(maxStep(b.played)).toBeLessThan(1.5 * SLOPE);
+	});
+
+	// A late arrival runs the ring dry and raises the estimator's target, so the step lands while
+	// concealment is covering the gap: before the media is back, or once the refill has started.
+	it.each([
+		["on the empty ring", 0.42, 0],
+		["while the ring refills", 0.433, CHUNK],
+	])("keeps concealing through a step that lands %s", (_, at, buffered) => {
+		const script: Script = {
+			target: 40,
+			prefill: 40 + CHUNK_MS,
+			seconds: 4,
+			hole: { at: 0.4, ms: 100 },
+			steps: [{ at, target: 60 }],
+		};
+		const a = run(shared, script);
+		const b = run(post, script);
+
+		expect(b.stepped[0].stalled).toBe(true);
+		expect(b.stepped[0].underruns).toBe(1);
+		expect(b.stepped[0].buffered).toBe(buffered);
+		// The concealment runs until the media is back and is spliced onto it, rather than breaking
+		// off into silence at the step.
+		expect(b.shortQuanta).toBe(0);
+		expect(b.merges).toBe(1);
+		expect(diverge(b.rendered, a.rendered)).toBe(-1);
+		expect(b.timelines).toBe(1);
 	});
 });
 

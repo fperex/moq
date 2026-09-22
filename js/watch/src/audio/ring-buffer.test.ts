@@ -479,6 +479,46 @@ describe("resize", () => {
 		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe((250 - capacity) as Time.Milli);
 	});
 
+	it("keeps the timeline when every buffered sample fits", () => {
+		// Capacity follows the target, so every step of it moves the samples into an array of a new
+		// size. Nothing was skipped, so the reader must not be told to forget what it learned.
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 40 as Time.Milli });
+		writeChunks(buffer, 0, 60, 20, { channels: 1, value: 1.0 });
+		expect(read(buffer, 20, 1)[0].length).toBe(20);
+		write(buffer, 60 as Time.Milli, 20, { channels: 1, value: 2.0 });
+		const generation = buffer.view().generation;
+
+		buffer.resize(60 as Time.Milli);
+		expect(buffer.capacity).toBe(120 + SKIP);
+		expect(buffer.length).toBe(60);
+		expect(buffer.view().generation).toBe(generation);
+
+		buffer.resize(40 as Time.Milli);
+		expect(buffer.capacity).toBe(80 + SKIP);
+		expect(buffer.length).toBe(60);
+		expect(buffer.view().generation).toBe(generation);
+
+		const output = read(buffer, 60, 1);
+		expect(output[0].length).toBe(60);
+		expect(output[0].subarray(0, 40).every((sample) => sample === 1.0)).toBe(true);
+		expect(output[0].subarray(40).every((sample) => sample === 2.0)).toBe(true);
+	});
+
+	it("starts a new timeline when the new capacity drops samples", () => {
+		// The shrink above: 200 buffered against a capacity of 155, so the reader's next sample is not
+		// the one after its last.
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
+		writeChunks(buffer, 0, 150, 50, { channels: 1, value: 1.0 });
+		expect(read(buffer, 50, 1)[0].length).toBe(50);
+		writeChunks(buffer, 150, 100, 50, { channels: 1, value: 2.0 });
+		expect(buffer.length).toBe(200);
+		const generation = buffer.view().generation;
+
+		buffer.resize(30 as Time.Milli);
+		expect(buffer.length).toBe(30 + 50 + SKIP);
+		expect(buffer.view().generation).not.toBe(generation);
+	});
+
 	it("should be a no-op when capacity is unchanged", () => {
 		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 
@@ -781,6 +821,20 @@ describe("capacity", () => {
 		write(buffer, 60 as Time.Milli, 60, { channels: 1, value: 2.0 });
 		expect(buffer.length).toBe(120);
 		expect(buffer.debug().discarded).toBe(0);
+	});
+
+	it("keeps the timeline when a wider chunk grows it mid-stream", () => {
+		// A publisher moving from 20ms to 60ms frames. The wider ring holds everything the narrow one
+		// did, so the reader is still on the timeline it was playing.
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 20 as Time.Milli });
+		writeChunks(buffer, 0, 40, 20, { channels: 1, value: 1.0 });
+		expect(read(buffer, 20, 1)[0].length).toBe(20);
+		const generation = buffer.view().generation;
+
+		write(buffer, 40 as Time.Milli, 60, { channels: 1, value: 2.0 });
+		expect(buffer.capacity).toBe(20 + 60 + SKIP);
+		expect(buffer.length).toBe(80);
+		expect(buffer.view().generation).toBe(generation);
 	});
 });
 

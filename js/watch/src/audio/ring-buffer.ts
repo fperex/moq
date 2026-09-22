@@ -67,10 +67,10 @@ export class AudioRingBuffer implements RingReader {
 	#jumped = 0;
 
 	// The widest chunk written so far, which capacity has to hold on top of the target. A high-water
-	// mark rather than the current chunk, because growing the array replaces the timeline and the
-	// reader drops the block it was holding: a publisher alternating two frame durations would
-	// otherwise pay that on every other write. It only costs memory, since the band is measured
-	// against the current chunk either way.
+	// mark rather than the current chunk, because shrinking the array back can leave samples behind,
+	// which replaces the timeline: a publisher alternating two frame durations would otherwise risk
+	// that on every other write. It only costs memory, since the band is measured against the current
+	// chunk either way.
 	#largest = 0;
 
 	// The depth the ring keeps between flushes, which is the one that says a surplus is real.
@@ -233,10 +233,14 @@ export class AudioRingBuffer implements RingReader {
 		}
 
 		// Update state for the new buffer, only stall if empty.
+		const dropped = this.length - samplesToKeep;
 		this.#buffer = newBuffer;
 		this.#readIndex = this.#writeIndex - samplesToKeep;
 		if (samplesToKeep === 0) this.#stalled = true;
-		this.#generation++;
+		// Samples left behind are media the reader skips, which is a new timeline. A copy that kept
+		// them all, an empty ring included, is the one it was playing: a new generation there would
+		// make it forget what it learned about the stream on every step of the target.
+		if (dropped > 0) this.#generation++;
 	}
 
 	write(timestamp: Time.Micro, data: Float32Array[]): void {
