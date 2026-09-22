@@ -80,6 +80,9 @@ pub struct Import<E: catalog::Catalog = ()> {
 	/// discontinuity only here; on any other PID it says nothing but that the
 	/// continuity counter jumped ([`Continuity`]).
 	pcr_pid: Option<Pid>,
+	/// The multiplex rate measured off the PCR PID, recorded in the `mpegts` section
+	/// while the source holds one. Only fed with `mpegts` catalog support.
+	mux_rate: super::mux_rate::Meter,
 	/// Whether any media or section has been published since the last timebase break, so
 	/// consecutive markers (a repeated flag, a retransmitted clock packet) declare one
 	/// break rather than one each.
@@ -157,6 +160,7 @@ impl<E: catalog::Catalog> Import<E> {
 			pending: HashMap::new(),
 			continuity: HashMap::new(),
 			pcr_pid: None,
+			mux_rate: Default::default(),
 			published: false,
 			initialized: false,
 			scratch: Vec::new(),
@@ -247,6 +251,10 @@ impl<E: catalog::Catalog> Import<E> {
 			let pkt: [u8; TsPacket::SIZE] = self.scratch[off..off + TsPacket::SIZE].try_into().unwrap();
 			off += TsPacket::SIZE;
 			let pid = (((pkt[1] & 0x1f) as u16) << 8) | pkt[2] as u16;
+			// Every packet paces the multiplex, null stuffing and retransmissions included.
+			if self.supports_mpegts {
+				self.mux_rate.packet();
+			}
 			let continuation = Pid::new(pid)
 				.ok()
 				.filter(|pid| self.streams.contains_key(pid) || self.pcr_pid == Some(*pid))
@@ -261,8 +269,15 @@ impl<E: catalog::Catalog> Import<E> {
 			// A packet the demodulator flagged corrupt (`transport_error_indicator`) is not
 			// read: its adaptation field is as untrustworthy as its payload, and taking a bit
 			// out of it would break every track in the program on line noise.
-			if self.pcr_pid.is_some_and(|p| p.as_u16() == pid) && pkt[1] & 0x80 == 0 && discontinuity_indicator(&pkt) {
-				self.timebase_break()?;
+			if self.pcr_pid.is_some_and(|p| p.as_u16() == pid) && pkt[1] & 0x80 == 0 {
+				if discontinuity_indicator(&pkt) {
+					self.timebase_break()?;
+				} else if self.supports_mpegts
+					&& let Some(pcr) = pcr(&pkt)
+					&& self.mux_rate.pcr(pcr)
+				{
+					self.record_mux_rate()?;
+				}
 			}
 			let pts = self.last_pts.unwrap_or(Timestamp::ZERO);
 			if let Some(section) = self.sections.get_mut(&pid) {
@@ -351,7 +366,13 @@ impl<E: catalog::Catalog> Import<E> {
 			Some(TsPayload::Pmt(pmt)) => {
 				// Which PID speaks for the program clock, so a `discontinuity_indicator` there
 				// can be read as a timebase reset rather than a counter jump.
-				self.pcr_pid = pmt.pcr_pid;
+				if self.pcr_pid != pmt.pcr_pid {
+					self.pcr_pid = pmt.pcr_pid;
+					// A new clock: the intervals straddling the switch measure nothing.
+					if self.mux_rate.discontinuity() {
+						self.record_mux_rate()?;
+					}
+				}
 
 				// SCTE-35 is announced by a program-level registration descriptor with
 				// format_identifier 'CUEI' (ITU-T J.181). The stream itself uses
@@ -721,7 +742,21 @@ impl<E: catalog::Catalog> Import<E> {
 		self.media_unwrap.discontinuity();
 		self.last_pts = None;
 		self.published = false;
+		if self.mux_rate.discontinuity() {
+			self.record_mux_rate()?;
+		}
 		tracing::debug!("MPEG-TS system time-base discontinuity");
+		Ok(())
+	}
+
+	/// Copy the measured multiplex rate into the `mpegts` section, publishing the
+	/// catalog. Called only when the measurement changed, so a steady source never
+	/// republishes.
+	fn record_mux_rate(&mut self) -> anyhow::Result<()> {
+		let rate = self.mux_rate.published();
+		if let Some(mpegts) = self.catalog.modify()?.ext.mpegts_mut() {
+			mpegts.mux_rate = rate;
+		}
 		Ok(())
 	}
 
@@ -968,7 +1003,7 @@ fn register_verbatim<E: catalog::Catalog>(
 	// timeline track can collide), and the `VerbatimEntry` that removes this catalog
 	// entry on drop only exists once this function returns successfully, so an entry
 	// published first would be stranded.
-	let media = catalog.media_producer(
+	let media = catalog.media_raw(
 		track,
 		crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
 	)?;
@@ -1236,6 +1271,20 @@ fn discontinuity_indicator(pkt: &[u8; 188]) -> bool {
 	pkt[3] & 0x20 != 0 && pkt[4] > 0 && pkt[5] & 0x80 != 0
 }
 
+/// The PCR a packet's adaptation field carries, in 27 MHz ticks.
+fn pcr(pkt: &[u8; 188]) -> Option<u64> {
+	if pkt[3] & 0x20 == 0 || pkt[4] < 7 || pkt[5] & 0x10 == 0 {
+		return None;
+	}
+	let base = (u64::from(pkt[6]) << 25)
+		| (u64::from(pkt[7]) << 17)
+		| (u64::from(pkt[8]) << 9)
+		| (u64::from(pkt[9]) << 1)
+		| (u64::from(pkt[10]) >> 7);
+	let ext = (u64::from(pkt[10] & 0x01) << 8) | u64::from(pkt[11]);
+	Some(base * 300 + ext)
+}
+
 /// Whether two packets differ only in the clock fields a retransmission may refresh.
 fn is_duplicate(last: &[u8; 188], pkt: &[u8; 188]) -> bool {
 	if last == pkt {
@@ -1436,16 +1485,16 @@ impl SectionReassembler {
 enum Stream<E: catalog::Catalog = ()> {
 	H264 {
 		split: h264::Split,
-		import: Box<h264::Import<E>>,
+		import: Box<h264::Import>,
 		unwrap: PtsUnwrap,
 	},
 	H265 {
 		split: h265::Split,
-		import: Box<h265::Import<E>>,
+		import: Box<h265::Import>,
 		unwrap: PtsUnwrap,
 	},
 	Aac(Box<AacStream<E>>),
-	Opus(Box<OpusStream<E>>),
+	Opus(Box<OpusStream>),
 	Legacy(Box<LegacyStream<E>>),
 	/// A codec we don't decode, carried verbatim as PES (DTS audio, private PES, ...).
 	Verbatim(Box<VerbatimStream<E>>),
@@ -1868,7 +1917,7 @@ impl From<&legacy::Descriptor> for SyncWord {
 /// (the sample rate and channel layout aren't in the PMT), so creation is
 /// deferred until the first frame arrives.
 struct AacStream<E: CatalogExt = ()> {
-	import: Option<aac::Import<E>>,
+	import: Option<aac::Import>,
 	broadcast: moq_net::broadcast::Producer,
 	/// Reservation held from the PMT until the first frame builds the importer, so the catalog stays
 	/// withheld until this deferred rendition resolves (config comes from the first ADTS header).
@@ -2133,12 +2182,12 @@ impl<E: CatalogExt> AacStream<E> {
 /// One Opus elementary stream. The channels come from the PMT descriptors and the rate
 /// is always 48 kHz, so (unlike AAC) the importer is built up front. A PES carries one or
 /// more Opus packets, each prefixed by the Opus-in-TS control header.
-struct OpusStream<E: CatalogExt = ()> {
-	import: opus::Import<E>,
+struct OpusStream {
+	import: opus::Import,
 	unwrap: PtsUnwrap,
 }
 
-impl<E: CatalogExt> OpusStream<E> {
+impl OpusStream {
 	fn write(&mut self, pending: Pending) -> anyhow::Result<bool> {
 		let base = unwrap_pts(&mut self.unwrap, pending.pts)?;
 
@@ -2270,7 +2319,7 @@ fn parse_opus_control_header(data: &[u8]) -> anyhow::Result<(usize, usize)> {
 /// (the config isn't in the PMT).
 struct LegacyStream<E: CatalogExt = ()> {
 	descriptor: &'static legacy::Descriptor,
-	import: Option<legacy::Import<E>>,
+	import: Option<legacy::Import>,
 	broadcast: moq_net::broadcast::Producer,
 	/// Reservation held from the PMT until the first frame builds the importer, so the catalog stays
 	/// withheld until this deferred rendition resolves (config comes from the first frame header).
@@ -5254,6 +5303,78 @@ mod test {
 				"the restarted clock rewound instead of continuing forward: {stamps:?}"
 			);
 		}
+	}
+
+	/// An adaptation-only clock packet on `pid` carrying `ticks` of the 27 MHz PCR.
+	fn pcr_packet(pid: u16, ticks: u64) -> Vec<u8> {
+		let (base, ext) = (ticks / 300, ticks % 300);
+		let mut p = vec![
+			0x47,
+			(pid >> 8) as u8 & 0x1f,
+			(pid & 0xff) as u8,
+			0x20,
+			183,
+			0x10,
+			(base >> 25) as u8,
+			(base >> 17) as u8,
+			(base >> 9) as u8,
+			(base >> 1) as u8,
+			((base as u8 & 1) << 7) | 0x7e | (ext >> 8) as u8,
+			ext as u8,
+		];
+		p.resize(188, 0xff);
+		p
+	}
+
+	/// The catalog follows the clock: a stable multiplex rate is recorded, a source that
+	/// stops holding it clears the record, a fresh stable window records it again, and a
+	/// declared time-base break clears it at once.
+	#[test]
+	fn mux_rate_follows_the_clock() {
+		use crate::catalog::hang::Catalog;
+		use crate::container::ts::catalog::Ext;
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(
+			&mut broadcast,
+			crate::catalog::Config::default().with_catalog(Catalog::<Ext>::default()),
+		)
+		.unwrap();
+		let mut import = super::Import::new(broadcast, catalog.reserve());
+		import
+			.decode(&synth_pmt(&[(StreamType::Mpeg1Audio, PCR_PID)], false))
+			.unwrap();
+
+		// 40 ms PCR intervals; `stuffing(i)` packets of null padding after the i-th clock.
+		const INTERVAL: u64 = 27_000_000 / 25;
+		let mut ticks = 0;
+		let mut feed = |import: &mut super::Import<Ext>, seconds: u64, stuffing: &dyn Fn(u64) -> usize| {
+			for i in 0..seconds * 25 {
+				let mut bytes = pcr_packet(PCR_PID, ticks);
+				for _ in 0..stuffing(i) {
+					bytes.extend_from_slice(&super::super::export::NULL_PACKET);
+				}
+				import.decode(&bytes).unwrap();
+				ticks += INTERVAL;
+			}
+		};
+		let rate = || catalog.snapshot().ext.mpegts.mux_rate;
+
+		// 100 packets per 40 ms: 3.76 Mb/s, byte-locked.
+		feed(&mut import, 3, &|_| 99);
+		assert_eq!(rate(), Some(3_760_000), "a stable window records the rate");
+
+		// The stuffing comes and goes: nothing agrees with the record any more. Windows
+		// are 2 s and the feeds are not aligned to them, so allow one straddling window
+		// (which still holds intervals at the old rate) before the next full one clears.
+		feed(&mut import, 4, &|i| if (i / 5) % 2 == 0 { 10 } else { 90 });
+		assert_eq!(rate(), None, "an unstable window clears the record");
+
+		feed(&mut import, 4, &|_| 99);
+		assert_eq!(rate(), Some(3_760_000), "a fresh stable window records it again");
+
+		import.decode(&clock_break_packet(PCR_PID)).unwrap();
+		assert_eq!(rate(), None, "a time-base break clears the record at once");
 	}
 
 	/// The same flag on an elementary PID declares only that the continuity counter jumped.

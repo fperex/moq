@@ -1,11 +1,11 @@
-//! The jitter buffer as a caller sees it: [`decode::Config::delay`] turns it on,
+//! The jitter buffer as a caller sees it: [`decode::Options::delay`] turns it on,
 //! and [`decode::Consumer::read`] then hands back playout blocks instead of the
 //! packets it decoded.
 
 use std::time::Duration;
 
 use bytes::Bytes;
-use moq_audio::{Format, Frame, decode, encode};
+use moq_audio::{Format, Frame, Layout, decode, encode};
 use moq_net::Timestamp;
 
 const RATE: u32 = 48_000;
@@ -64,14 +64,11 @@ async fn broadcast(packets: usize) -> Fixture {
 	let mut snapshots = catalog.consume().unwrap();
 	let consumer = broadcast.consume();
 
-	let input = encode::Input {
-		format: Format::F32,
-		sample_rate: RATE,
-		channels: CHANNELS,
-	};
+	let mut input = encode::Input::new(RATE, Layout::Stereo);
+	input.format = Format::F32;
 	let mut options = encode::Options::default();
 	options.track = Some("pcm".to_string());
-	options.codec = encode::Codec::Pcm;
+	options.settings.codec = encode::Codec::Pcm;
 
 	let producer = encode::Producer::new(&mut broadcast, catalog.clone(), input, &options).unwrap();
 
@@ -111,8 +108,8 @@ async fn playout_hands_back_one_block_at_a_time() {
 
 	let mut fixture = broadcast(LEAD).await;
 
-	let mut config = decode::Config::new();
-	config.format = Format::F32;
+	let mut config = decode::Options::new();
+	config.output.format = Format::F32;
 	config.delay = Some(Duration::from_millis(60));
 	config.max_age = Duration::from_millis(500);
 
@@ -169,8 +166,8 @@ async fn playout_hands_back_one_block_at_a_time() {
 async fn without_a_delay_the_packets_come_back_as_they_are() {
 	let fixture = broadcast(5).await;
 
-	let mut config = decode::Config::new();
-	config.format = Format::F32;
+	let mut config = decode::Options::new();
+	config.output.format = Format::F32;
 
 	let mut consumer = decode::Consumer::new(&fixture.consumer, &fixture.catalog, "pcm", config)
 		.await
@@ -188,7 +185,7 @@ async fn without_a_delay_the_packets_come_back_as_they_are() {
 async fn a_delay_the_budget_cannot_hold_is_refused() {
 	let fixture = broadcast(2).await;
 
-	let mut config = decode::Config::new();
+	let mut config = decode::Options::new();
 	config.delay = Some(Duration::from_millis(500));
 	config.max_age = Duration::from_millis(200);
 
@@ -206,7 +203,7 @@ async fn a_delay_the_budget_cannot_hold_is_refused() {
 async fn a_delay_inside_the_budget_is_accepted() {
 	let accepted = async |delay: u64, max_age: u64| {
 		let fixture = broadcast(2).await;
-		let mut config = decode::Config::new();
+		let mut config = decode::Options::new();
 		config.delay = Some(Duration::from_millis(delay));
 		config.max_age = Duration::from_millis(max_age);
 		decode::Consumer::new(&fixture.consumer, &fixture.catalog, "pcm", config)

@@ -205,9 +205,7 @@ impl VideoProducer {
 		// A buffer that isn't one picture at the configured size is rejected here,
 		// by the surface constructors, rather than reinterpreted.
 		let surface = match self.format {
-			MoqVideoPixelFormat::I420 => {
-				moq_video::Surface::I420(moq_video::I420::new(self.size.width, self.size.height, frame.data)?)
-			}
+			MoqVideoPixelFormat::I420 => moq_video::Surface::I420(moq_video::I420::new(self.size, frame.data)?),
 			MoqVideoPixelFormat::Rgba => moq_video::Surface::rgba(&frame.data, self.size)?,
 		};
 
@@ -302,12 +300,16 @@ impl MoqVideoProducer {
 	/// The next frame is encoded as a keyframe, which closes the open group and
 	/// starts a new one at it. Calling this repeatedly before that frame arrives
 	/// cuts once, not several times.
+	///
+	/// Fails when the selected encoder cannot force a keyframe (a V4L2 driver
+	/// without the control): nothing is queued, and groups keep falling at the
+	/// configured interval.
 	pub fn cut(&self) -> Result<(), MoqError> {
 		let mut guard = self.inner.lock().unwrap();
 		let producer = guard.as_mut().ok_or(MoqError::Closed)?;
 		// A keyframe is what a cut is on the wire: the importer closes the open
 		// group and starts a new one at it.
-		producer.encoder.keyframe();
+		block_on(producer.encoder.cut())?;
 		Ok(())
 	}
 
@@ -393,12 +395,14 @@ impl MoqBroadcastProducer {
 	) -> Result<Arc<MoqVideoProducer>, MoqError> {
 		let _guard = crate::ffi::runtime().enter();
 
-		let mut config = moq_video::encode::Config::new(input.width, input.height, input.framerate);
+		let framerate = moq_video::Rate::new(input.framerate, 1)
+			.map_err(|_| MoqError::from(moq_video::Error::InvalidFramerate(input.framerate)))?;
+		let mut config = moq_video::encode::Config::new(input.width, input.height, framerate);
 		config.codec = output.codec.into();
 		config.kind = output.kind.into();
 		config.bitrate = output.bitrate.map(moq_net::bandwidth::Rate::from_bps);
-		if let Some(gop) = output.gop {
-			config.gop = gop;
+		if let Some(interval) = output.gop {
+			config.gop = moq_video::encode::Gop::Keyframe { interval };
 		}
 
 		// Both before the track exists: a config this machine can't encode should fail
@@ -468,7 +472,7 @@ fn video_ceiling(
 		.unwrap_or_else(|| {
 			// Same 0.07 bits/pixel/s default moq-video uses when neither is set.
 			moq_net::bandwidth::Rate::from_bps(
-				((config.size().pixels() * config.framerate as u64) as f64 * 0.07) as u64,
+				(config.size().pixels() as f64 * config.framerate.as_f64() * 0.07) as u64,
 			)
 		})
 }
@@ -515,7 +519,7 @@ async fn follow_reservation(
 	ceiling: Arc<AtomicU64>,
 	applied: Arc<AtomicU64>,
 ) {
-	use moq_video::encode::rate::{Control, Policy};
+	use moq_mux::rate::{Control, Policy};
 
 	let mut max = moq_net::bandwidth::Rate::from_bps(ceiling.load(Ordering::SeqCst));
 	let mut control = Control::new(Policy::new(max));
@@ -608,13 +612,14 @@ impl VideoConsumerInner {
 		let data = frame
 			.surface
 			.into_i420()
-			.map_err(|err| MoqError::Codec(err.to_string()))?;
+			.map_err(|err| MoqError::Codec(err.to_string()))?
+			.into_data();
 
 		Ok(Some(MoqVideoDecodedFrame {
 			timestamp_us: frame.timestamp.as_micros() as u64,
 			width: size.width,
 			height: size.height,
-			data: data.to_vec(),
+			data,
 		}))
 	}
 }

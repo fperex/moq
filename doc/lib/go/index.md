@@ -5,7 +5,7 @@ description: Idiomatic Go over cgo via moq.dev/moq
 
 # Go
 
-[![Go Reference](https://pkg.go.dev/badge/moq.dev/moq.svg)](https://pkg.go.dev/moq.dev/moq)
+[![Go Reference](https://pkg.go.dev/badge/github.com/moq-dev/moq-go.svg)](https://pkg.go.dev/github.com/moq-dev/moq-go)
 
 `moq.dev/moq`: `context.Context` cancellation, `error`
 returns, and Go 1.23 range-over-func iterators for live streams. The native
@@ -18,7 +18,7 @@ go get moq.dev/moq@latest
 ```
 
 ```go
-import "moq.dev/moq"
+import "github.com/moq-dev/moq-go"
 
 // Subscribe. The iterator is live, so run it in its own goroutine.
 client, err := moq.Dial(ctx, "https://relay.example.com", moq.WithTLSRoots("ca.pem"))
@@ -27,7 +27,8 @@ if err != nil {
 }
 defer client.Close()
 
-announced, err := client.Announced("live/")
+filter := "*/camera"
+announced, err := client.Announced(moq.AnnounceOptions{Prefix: "live/", Filter: &filter})
 if err != nil {
     log.Fatal(err)
 }
@@ -36,8 +37,9 @@ for ann, err := range announced.All(ctx) {
         if moq.IsShutdown(err) { break }
         log.Fatal(err)
     }
-    // The requested prefix scopes discovery; each update's prefix is relative to it.
-    broadcast, err := client.RequestBroadcast(ctx, "live/" + ann.Prefix())
+    // Updates stay origin-relative; Captures reports what each wildcard matched.
+    fmt.Printf("captures: %v\n", ann.Captures())
+    broadcast, err := client.RequestBroadcast(ctx, ann.Prefix())
     if err != nil {
         log.Fatal(err)
     }
@@ -73,9 +75,9 @@ The three advertising operations: `client.CreateBroadcast(path)` (or
 advertisement; `origin.Dynamic(prefix, route)` claims `prefix` and every
 path beneath it (`""` for everything). Hold the returned `OriginDynamic`
 while the claim should stay advertised, and reject the requests you will not
-serve. A route is a capability, not an inventory. `Announced(prefix)` is the
-requested discovery scope; `ann.Prefix()` is the concrete covered prefix
-relative to it.
+serve. A route is a capability, not an inventory. `Announced(options)` combines
+a literal prefix with an optional relative pattern; `ann.Prefix()` stays
+relative to the origin and `ann.Captures()` reports the wildcard matches.
 
 Every call that can block takes a `context.Context` first. Cancelling it
 returns `ctx.Err()` promptly and tears the in-flight native work down, so a
@@ -105,6 +107,6 @@ one: `FetchGroup`/`FetchMediaGroup`, `Dynamic()` with `Requests(ctx)`,
 `AppendDatagram`/`Datagrams(ctx)`, `SetCatalogSection`, `Used`/`Unused`,
 `Session().Stats()`. `moq.IsAuthError` and `moq.IsShutdown` classify errors. `moq.ProtocolError(err)` is the structured protocol failure (scope, verbatim code, kind) when the peer sent one.
 
-- API reference: [pkg.go.dev/moq.dev/moq](https://pkg.go.dev/moq.dev/moq)
+- API reference: [pkg.go.dev/github.com/moq-dev/moq-go](https://pkg.go.dev/github.com/moq-dev/moq-go)
 - Source: [`go/`](https://github.com/moq-dev/moq/tree/main/go); `just go check` builds and tests locally
 - Mirrors the vanity path resolves to: [moq-dev/moq-go](https://github.com/moq-dev/moq-go) (wrapper), [moq-dev/moq-go-ffi](https://github.com/moq-dev/moq-go-ffi) (raw bindings and static libraries)

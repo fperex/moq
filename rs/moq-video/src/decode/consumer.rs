@@ -92,6 +92,12 @@ impl Consumer {
 
 	/// Read the next decoded I420 frame, or `None` after the track ends and the
 	/// decoder's buffered tail has been drained.
+	///
+	/// This inherits [`Sink`]'s cancellation contract. If a queued codec
+	/// operation is cancelled, the next read returns a codec error: a cancelled
+	/// mid-stream decode poisons the sink so every later read keeps returning
+	/// that error, while a cancelled tail flush reports the error once and then
+	/// `None`. Drop the consumer instead of continuing to read it.
 	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
 		loop {
 			if let Some(frame) = self.pending.pop_front() {
@@ -138,6 +144,8 @@ impl Consumer {
 
 #[cfg(test)]
 mod tests {
+	#![cfg_attr(not(feature = "openh264"), allow(dead_code, unused_imports))]
+
 	use bytes::Bytes;
 	use moq_net::Timestamp;
 
@@ -159,6 +167,7 @@ mod tests {
 	use crate::encode::{Config as EncodeConfig, Encoder, Kind as EncodeKind, Producer as EncodeProducer};
 
 	#[tokio::test]
+	#[cfg(feature = "openh264")]
 	async fn reads_cmaf_container_declared_by_catalog() {
 		let mut source_broadcast = moq_net::broadcast::Info::new().produce();
 		let source_subscriber = source_broadcast.consume();
@@ -166,14 +175,14 @@ mod tests {
 			moq_mux::catalog::Producer::new(&mut source_broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let config = EncodeConfig {
 			kind: EncodeKind::Software,
-			..EncodeConfig::new(320, 240, 30)
+			..EncodeConfig::new(320, 240, crate::Rate::new(30, 1).unwrap())
 		};
 		let rendition = config.probe().await.unwrap();
 		let mut producer = EncodeProducer::new(source_broadcast, source_catalog, rendition).unwrap();
 		let mut encoder = Encoder::new(&config).unwrap();
 		let rgba = vec![0x80u8; 320 * 240 * 4];
 		for index in 0..2 {
-			encoder.keyframe();
+			encoder.cut().unwrap();
 			let surface = crate::Surface::rgba(&rgba, crate::Size::new(320, 240)).unwrap();
 			let frame = crate::Frame::new(surface, moq_net::Timestamp::from_micros(index * 33_333).unwrap());
 			producer.publish(&encoder.encode(&frame).unwrap()).unwrap();
@@ -558,7 +567,7 @@ mod tests {
 		const FRAMES: u64 = 5;
 		let config = EncodeConfig {
 			kind: EncodeKind::Software,
-			..EncodeConfig::new(320, 240, 30)
+			..EncodeConfig::new(320, 240, crate::Rate::new(30, 1).unwrap())
 		};
 		let catalog = config.probe().await.expect("probe the software encoder");
 
@@ -576,7 +585,7 @@ mod tests {
 		let rgba = vec![0x80u8; 320 * 240 * 4];
 		for index in 0..FRAMES {
 			if index == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
 			let surface = crate::Surface::rgba(&rgba, crate::Size::new(320, 240)).unwrap();
 			let frame = crate::Frame::new(surface, moq_net::Timestamp::from_micros(index * 33_333).unwrap());

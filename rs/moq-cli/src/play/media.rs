@@ -48,7 +48,7 @@ const AUDIO_DEVICE_CUSHION: Duration = Duration::from_millis(30);
 /// deepest audio is still playing.
 /// Rounded up, so the three quarters taken back off it still cover the range.
 const AUDIO_MAX_AGE: Duration =
-	Duration::from_nanos((moq_audio::decode::Config::DELAY_MAX.as_nanos() as u64 * 4).div_ceil(3));
+	Duration::from_nanos((moq_audio::decode::Options::DELAY_MAX.as_nanos() as u64 * 4).div_ceil(3));
 
 /// How much audio is handed to the speaker per write.
 ///
@@ -210,13 +210,13 @@ impl Media {
 					// itself: the consumer measures what arrives and holds at least
 					// this much, and the budget it keeps on the wire follows that
 					// measurement rather than the ceiling below.
-					let mut decode = moq_audio::decode::Config::new();
+					let mut decode = moq_audio::decode::Options::new();
 					decode.start = moq_audio::decode::Start::Latest;
 					decode.delay = Some(self.args.delay.into_std());
 					decode.max_age = AUDIO_MAX_AGE;
 					// The sink and the frame-duration math below both assume f32,
 					// so ask for it rather than inheriting the decoder default.
-					decode.format = moq_audio::Format::F32;
+					decode.output.format = moq_audio::Format::F32;
 					match moq_audio::decode::Consumer::new(&rendition, &config, &name, decode).await {
 						Ok(consumer) => {
 							tracing::info!(track = name, "playing audio rendition");
@@ -294,12 +294,13 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 	// the blocks come out on the device's clock, and the window schedules video
 	// against where the speaker has actually reached.
 	let sample_rate = consumer.sample_rate();
-	let channels = consumer.channels();
+	let layout = consumer.layout();
+	let channels = layout.channels();
 	let engine = moq_audio::playback::Engine::open(Default::default()).await?;
 	let mut input = moq_audio::playback::Input::default();
 	input.format = moq_audio::Format::F32;
 	input.sample_rate = sample_rate;
-	input.channels = channels;
+	input.layout = layout;
 	input.latency = AUDIO_DEVICE_CUSHION;
 	let mut sink = engine.sink(input.clone())?;
 
@@ -355,7 +356,7 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 		if let Some(excess) = sink.buffered().checked_sub(AUDIO_DEVICE_CUSHION) {
 			tokio::time::sleep(excess).await;
 		}
-		sink.write(&frame.data)?;
+		let _ = sink.write(&frame.data)?;
 
 		// Anchor the playout clock on where the speaker has actually reached, which
 		// is the only half of the pipeline that cannot skip ahead. A move has to
@@ -400,9 +401,9 @@ mod tests {
 	#[test]
 	fn the_budget_leaves_the_estimator_room_to_rise() {
 		assert!(
-			AUDIO_MAX_AGE * 3 / 4 >= moq_audio::decode::Config::DELAY_MAX,
+			AUDIO_MAX_AGE * 3 / 4 >= moq_audio::decode::Options::DELAY_MAX,
 			"{AUDIO_MAX_AGE:?} caps the target below {:?}",
-			moq_audio::decode::Config::DELAY_MAX
+			moq_audio::decode::Options::DELAY_MAX
 		);
 	}
 

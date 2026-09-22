@@ -105,14 +105,14 @@ impl Rung {
 	/// worker's initialization and uninitialize COM on one that never initialized
 	/// it. The sink owns a thread and stays on it.
 	async fn encode(&self, color: Option<moq_video::Color>) -> Result<moq_video::encode::Sink, Error> {
-		let mut config =
-			moq_video::encode::Config::new(self.info.size.width, self.info.size.height, self.info.framerate);
+		let framerate = self.info.framerate.unwrap_or(moq_video::Rate::new(30, 1).unwrap());
+		let mut config = moq_video::encode::Config::new(self.info.size.width, self.info.size.height, framerate);
 		config.bitrate = Some(self.info.bitrate);
 		config.kind = self.encoder.clone();
 		config.color = color;
-		// Keyframes are forced at every group boundary; the GOP is only a
+		// Every source group boundary is a cut; the keyframe interval is only a
 		// backstop against pathologically long source groups.
-		config.gop = self.info.framerate.saturating_mul(8).max(1);
+		config.gop = moq_video::encode::Gop::keyframe_every(std::time::Duration::from_secs(8), framerate);
 		Ok(moq_video::encode::Sink::open(&config).await?)
 	}
 }
@@ -207,10 +207,10 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 		// encoder session until someone subscribes again.
 		let mut listener = rung.feed.listen();
 		// Built from the first frame: the encoder writes that frame's color space
-		// into the bitstream, so it cannot open before one has arrived. A keyframe
+		// into the bitstream, so it cannot open before one has arrived. A cut
 		// asked for at a group boundary waits here until it exists.
 		let mut encoder: Option<moq_video::encode::Sink> = None;
-		let mut pending_keyframe = false;
+		let mut pending_cut = false;
 
 		// The output group currently being written, if the feed is mid-group.
 		let mut current: Option<moq_net::group::Producer> = None;
@@ -259,10 +259,12 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 					}
 					// A subscriber has to be able to start at this group, so its first
 					// frame must be an IDR. The request waits for the next frame, so a
-					// rung that skips this group simply carries it forward.
+					// rung that skips this group simply carries it forward. A backend
+					// that cannot cut fails the rung here: its groups could never
+					// mirror the source's, which is what this rung promises.
 					match &mut encoder {
-						Some(encoder) => encoder.keyframe(),
-						None => pending_keyframe = true,
+						Some(encoder) => encoder.cut().await?,
+						None => pending_cut = true,
 					}
 					// Mirror the source sequence so fetches and rendition
 					// switches map 1:1.
@@ -294,14 +296,14 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 					// this rung's size.
 					let frame: Arc<moq_video::Frame> = match frame.size() == rung.info.size {
 						true => frame,
-						false => Arc::new(frame.resize_with(rung.info.size, &rung.resize)?),
+						false => Arc::new(frame.resize(rung.info.size, &rung.resize)?),
 					};
 					let encoder = match &mut encoder {
 						Some(encoder) => encoder,
 						None => {
 							let mut opened = rung.encode(frame.surface.color()).await?;
-							if std::mem::take(&mut pending_keyframe) {
-								opened.keyframe();
+							if std::mem::take(&mut pending_cut) {
+								opened.cut().await?;
 							}
 							encoder.insert(opened)
 						}
@@ -607,14 +609,14 @@ fn write(
 /// rung's resolution (`decode::Config::resize`). A decoder with a hardware
 /// scaler (NVDEC) does, and its GPU frames feed the encoder in place: the NVDEC
 /// -> NVENC path never touches the CPU. Frames that come back at any other size
-/// get `Frame::resize_with` instead.
+/// get `Frame::resize` instead.
 struct Pipeline {
 	decoder: moq_video::decode::Sink,
 	/// Opened from the first decoded frame, whose color space it has to declare.
-	/// `None` until one arrives; a keyframe requested before then waits in
-	/// `pending_keyframe`.
+	/// `None` until one arrives; a cut requested before then waits in
+	/// `pending_cut`.
 	encoder: Option<moq_video::encode::Sink>,
-	pending_keyframe: bool,
+	pending_cut: bool,
 	rung: Rung,
 	size: moq_video::Size,
 }
@@ -631,7 +633,7 @@ impl Pipeline {
 		Ok(Self {
 			decoder,
 			encoder: None,
-			pending_keyframe: false,
+			pending_cut: false,
 			rung: rung.clone(),
 			size: rung.info.size,
 		})
@@ -650,8 +652,8 @@ impl Pipeline {
 		// nothing for the access unit that asked for one.
 		if keyframe {
 			match &mut self.encoder {
-				Some(encoder) => encoder.keyframe(),
-				None => self.pending_keyframe = true,
+				Some(encoder) => encoder.cut().await?,
+				None => self.pending_cut = true,
 			}
 		}
 
@@ -668,12 +670,12 @@ impl Pipeline {
 		// as-is, keeping a GPU frame on the GPU.
 		let raw = match raw.size() == self.size {
 			true => raw,
-			false => raw.resize_with(self.size, &self.rung.resize)?,
+			false => raw.resize(self.size, &self.rung.resize)?,
 		};
 		if self.encoder.is_none() {
 			let mut opened = self.rung.encode(raw.surface.color()).await?;
-			if std::mem::take(&mut self.pending_keyframe) {
-				opened.keyframe();
+			if std::mem::take(&mut self.pending_cut) {
+				opened.cut().await?;
 			}
 			self.encoder = Some(opened);
 		}
@@ -708,7 +710,7 @@ mod tests {
 	use super::*;
 	use moq_video::resize::Acceleration;
 
-	/// A fetched NVDEC group reaches `Frame::resize_with` at native size when
+	/// A fetched NVDEC group reaches `Frame::resize` at native size when
 	/// CPU scaling is forced, rather than being resized in the decoder first.
 	#[test]
 	fn forced_cpu_skips_the_decoder_scaler() {
@@ -729,7 +731,7 @@ mod tests {
 			height: 120,
 			size: moq_video::Size::new(160, 120),
 			bitrate: moq_net::bandwidth::Rate::from_bps(100_000),
-			framerate: 30,
+			framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
 		};
 
 		let active = crate::active::Producer::default();

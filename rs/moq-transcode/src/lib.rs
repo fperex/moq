@@ -16,8 +16,8 @@
 //!   1:1, so group N of every rung is the same content as source group N.
 //!
 //! The codec work is `moq-video`: hardware where available (NVDEC + NVENC on
-//! Linux, VideoToolbox on macOS, Media Foundation on Windows) with openh264 as
-//! the H.264 software fallback. On an NVIDIA GPU the whole pipeline is
+//! Linux, VideoToolbox on macOS, Media Foundation on Windows), with the default
+//! `openh264` feature providing H.264 software fallback. On an NVIDIA GPU the whole pipeline is
 //! GPU-resident: NVDEC decodes and scales in hardware and NVENC encodes the
 //! CUDA frame in place, with no CPU copies. Other decoders scale on the CPU.
 
@@ -309,12 +309,12 @@ mod tests {
 	/// to decode while the group is still open.
 	fn write_keyframe(group: &mut moq_net::group::Producer) {
 		let mut encoder = moq_video::encode::Encoder::new(&{
-			let mut config = moq_video::encode::Config::new(320, 240, 30);
+			let mut config = moq_video::encode::Config::new(320, 240, moq_video::Rate::new(30, 1).unwrap());
 			config.kind = moq_video::encode::Kind::Software;
 			config
 		})
 		.unwrap();
-		encoder.keyframe();
+		encoder.cut().unwrap();
 		let gray = vec![0x80u8; 320 * 240 * 4];
 		for encoded in encoder.encode(&gray_frame(&gray, 0)).unwrap() {
 			hang::container::Frame {
@@ -354,7 +354,7 @@ mod tests {
 		let track = broadcast.create_track("video", info).unwrap();
 
 		let mut encoder = moq_video::encode::Encoder::new(&{
-			let mut config = moq_video::encode::Config::new(320, 240, 30);
+			let mut config = moq_video::encode::Config::new(320, 240, moq_video::Rate::new(30, 1).unwrap());
 			config.kind = moq_video::encode::Kind::Software;
 			config
 		})
@@ -366,7 +366,7 @@ mod tests {
 			for index in 0..frames {
 				let timestamp = (sequence * frames + index) * 33_333;
 				if index == 0 {
-					encoder.keyframe();
+					encoder.cut().unwrap();
 				}
 				for encoded in encoder.encode(&gray_frame(&gray, timestamp)).unwrap() {
 					let frame = hang::container::Frame {
@@ -420,11 +420,12 @@ mod tests {
 		};
 
 		let task = tokio::spawn(async move {
-			let mut encoder = moq_video::encode::Encoder::new(&{
-				let mut config = moq_video::encode::Config::new(320, 240, 30);
+			let mut encoder = moq_video::encode::Sink::open(&{
+				let mut config = moq_video::encode::Config::new(320, 240, moq_video::Rate::new(30, 1).unwrap());
 				config.kind = moq_video::encode::Kind::Software;
 				config
 			})
+			.await
 			.unwrap();
 			let gray = vec![0x80u8; 320 * 240 * 4];
 
@@ -437,9 +438,9 @@ mod tests {
 				for index in 0..frames {
 					let timestamp = (sequence * frames + index) * 33_333;
 					if index == 0 {
-						encoder.keyframe();
+						encoder.cut().await.unwrap();
 					}
-					for encoded in encoder.encode(&gray_frame(&gray, timestamp)).unwrap() {
+					for encoded in encoder.encode(gray_frame(&gray, timestamp)).await.unwrap() {
 						let frame = hang::container::Frame {
 							timestamp: encoded.timestamp,
 							payload: encoded.payload,
@@ -586,7 +587,7 @@ mod tests {
 	/// with the NVIDIA driver). Probed through the public API so the hardware
 	/// test skips cleanly on GPU-less CI.
 	fn hardware_available() -> bool {
-		let mut encode = moq_video::encode::Config::new(160, 120, 30);
+		let mut encode = moq_video::encode::Config::new(160, 120, moq_video::Rate::new(30, 1).unwrap());
 		encode.kind = moq_video::encode::Kind::Hardware;
 		if moq_video::encode::Encoder::new(&encode).is_err() {
 			return false;

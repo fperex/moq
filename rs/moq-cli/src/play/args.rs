@@ -145,7 +145,7 @@ mod tests {
 		// The bound has to be playout's own, which only a build carrying playout
 		// can say.
 		#[cfg(feature = "play")]
-		assert_eq!(DELAY_MAX, moq_audio::decode::Config::DELAY_MAX);
+		assert_eq!(DELAY_MAX, moq_audio::decode::Options::DELAY_MAX);
 	}
 
 	/// The suffix picks the format, and the flag overrides it.
