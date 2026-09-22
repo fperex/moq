@@ -1468,9 +1468,9 @@ mod tests {
 		let input = Input {
 			format: Format::F32,
 			sample_rate: 48_000,
-			channels: 1,
+			layout: Layout::Mono,
 		};
-		let mut encoder = Encoder::new(&crate::encode::Config::new(input)).unwrap();
+		let mut encoder = Encoder::new(&Settings::new(input.sample_rate, input.layout)).unwrap();
 		let catalog = encoder.catalog();
 		let frame_size = encoder.frame_size();
 
@@ -1487,10 +1487,10 @@ mod tests {
 			&subscriber,
 			&catalog,
 			"audio",
-			Config {
+			Options {
 				max_age: std::time::Duration::from_secs(30),
 				delay: Some(std::time::Duration::from_millis(120)),
-				..Config::new()
+				..Options::new()
 			},
 		)
 		.await
