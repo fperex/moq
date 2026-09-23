@@ -969,8 +969,13 @@ mod tests {
 		player.play(60);
 
 		let played = player.opening(from);
-		let sum: f32 = played.chunks_exact(2).map(|frame| (frame[0] + frame[1]).abs()).sum();
-		let energy: f32 = played.chunks_exact(2).map(|frame| frame[0].abs()).sum();
+		let sum: f32 = played
+			.as_chunks::<2>()
+			.0
+			.iter()
+			.map(|frame| (frame[0] + frame[1]).abs())
+			.sum();
+		let energy: f32 = played.as_chunks::<2>().0.iter().map(|frame| frame[0].abs()).sum();
 		assert!(sum < energy * 0.1, "the image collapsed: {sum} against {energy}");
 	}
 
