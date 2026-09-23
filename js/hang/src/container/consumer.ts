@@ -386,12 +386,30 @@ export class Consumer {
 		let walked = false;
 		let hole = false;
 
+		// A cursor below every buffered group sits on sequences that never arrived, and none of them
+		// can present past where the head begins. Give them up once the head's own first frame has
+		// aged past the budget, even while the head is the only group buffered or is still
+		// downloading: waiting for a second group to measure against held the picture on the last
+		// group played for a whole GOP. `rs/moq-mux` walks its cursor on the same rule.
+		const head = this.#groups[0];
+		if (head?.start !== undefined && head.consumer.sequence > this.#active) {
+			let live: number = head.start;
+			for (const group of this.#groups) {
+				if (group.latest !== undefined && group.latest > live) live = group.latest;
+			}
+			if (live - head.start >= Moq.Time.Micro.fromMilli(this.#maxAge.peek())) {
+				// As for the walk below: a head that does not continue the timeline we left off at
+				// means a span of media is missing, which the reader has to be told.
+				if (!ptsContiguous(this.#presentedEnd, head.frames.at(0)?.timestamp)) hole = true;
+				this.#active = head.consumer.sequence;
+				walked = true;
+			}
+		}
+
 		// Walk the delivery cursor forward while what the oldest group could still present has aged
-		// past the budget. This is also what ends the wait on a gap in group sequence numbers: if
-		// #active points to a missing group, the start of the next group holding a frame proves the
-		// missing content is too old to wait for. What happens to the oldest group when the budget
-		// runs out depends on what it holds; see the verdict below.
-		while (this.#groups.length >= 2) {
+		// past the budget. What happens to the oldest group when the budget runs out depends on what
+		// it holds; see the verdict below.
+		while (!walked && this.#groups.length >= 2) {
 			const threshold = Moq.Time.Micro.fromMilli(this.#maxAge.peek());
 			const first = this.#groups[0];
 			// Where delivery stands, which decides what a verdict against the head means.
@@ -447,11 +465,12 @@ export class Consumer {
 			// frame, and closes out a spent group as `GroupEnd`, before the budget is consulted.
 			if (first.done && cursor !== undefined && first.consumer.sequence <= cursor) break;
 
-			// Above the cursor the group it sits on never arrived, and now it never will. Give up
-			// on those sequences rather than on the media that did arrive: walk the cursor onto the
-			// head, the way the same consumer walks onto the first arrived group instead of
-			// dropping it. A head that finished holding nothing cannot be walked onto, so it is
-			// convicted below along with a head that is still downloading.
+			// Above the cursor the group it sits on never arrived, and now it never will. The walk
+			// before this loop gives it up first on an ordinary timeline; this one covers a head
+			// whose successor starts before it. Give up on those sequences rather than on the media
+			// that did arrive: walk the cursor onto the head, the way the same consumer walks onto
+			// the first arrived group instead of dropping it. A head that finished holding nothing
+			// cannot be walked onto, so it is convicted below along with a head still downloading.
 			if (first.done && first.frames.length > 0) {
 				// Whether that cost anything is the one thing the reader has to be told: a head
 				// that continues the timeline we left off at means the sequence numbers merely
