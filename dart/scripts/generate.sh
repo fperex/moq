@@ -23,10 +23,15 @@ cargo build --locked --release --package moq-ffi --no-default-features \
     --target "$host" \
     --manifest-path "$WORKSPACE_DIR/Cargo.toml"
 
+# Ask cargo where it built rather than assuming target/: CARGO_TARGET_DIR moves
+# it, and a library left under target/ by an earlier build would be stale.
+target_base=$(cargo metadata --format-version 1 --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-deps |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+
 case "$host" in
-    *-apple-*) library="$WORKSPACE_DIR/target/$host/release/libmoq_ffi.dylib" ;;
-    *-windows-*) library="$WORKSPACE_DIR/target/$host/release/moq_ffi.dll" ;;
-    *) library="$WORKSPACE_DIR/target/$host/release/libmoq_ffi.so" ;;
+    *-apple-*) library="$target_base/$host/release/libmoq_ffi.dylib" ;;
+    *-windows-*) library="$target_base/$host/release/moq_ffi.dll" ;;
+    *) library="$target_base/$host/release/libmoq_ffi.so" ;;
 esac
 
 mkdir -p "$OUTPUT_DIR"
