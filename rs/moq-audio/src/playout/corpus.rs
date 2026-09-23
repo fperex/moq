@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::delay::{BUCKET, FORGET, HOLD, Jitter, LOWER_DIVISOR, Observation};
+use super::delay::{BUCKET, FORGET, HOLD, Jitter, LOWER_DIVISOR, Observation, STALL_WINDOW};
 
 /// The corpus, checked in beside the tests that consume it.
 const CORPUS: &str = include_str!("../../tests/playout-01.json");
@@ -110,6 +110,7 @@ fn the_constants_match() {
 	assert_eq!(number(constants, "lower_interval_ms"), 1000.0);
 	assert_eq!(number(constants, "lower_divisor"), LOWER_DIVISOR);
 	assert_eq!(number(constants, "hold_ms"), HOLD);
+	assert_eq!(number(constants, "stall_window_ms"), STALL_WINDOW);
 }
 
 /// Every case the page names, so one silently dropped from the generator shows up
@@ -146,6 +147,8 @@ fn every_case_is_present() {
 		"run-dry-repeated",
 		"run-dry-below-histogram",
 		"run-dry-before-measurement",
+		"run-dry-unstalled",
+		"run-dry-outside-window",
 	] {
 		assert!(names.contains(&expected), "the corpus lost `{expected}`");
 	}

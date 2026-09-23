@@ -432,14 +432,19 @@ absorb.
 
 Nothing in the arrivals can say the ring is too shallow here. The player can: it
 ran dry, and it knows for how long. So the estimator takes one more input,
-`starved(gap, now)`, on the arrival clock:
+`starved(gap, now)`, on the arrival clock, and acts on it only when the page
+itself caused the run-dry:
 
 ```
+if (no stalled arrival yet || |now - lastStalled| > 200) return
 level   = min(2000, ceil((target + gap) / 20) * 20)
 held    = now < holdEnd ? max(held, level) : level
 holdEnd = now + HOLD
 publish(now)
 ```
+
+`lastStalled` is when the last arrival flagged `stalled` landed, recorded for
+every observation that carries the flag, reordered or not.
 
 `target` is the one published now: the player ran dry holding what it asked for,
 so covering the gap takes the two together. A report while a hold runs can only
@@ -467,6 +472,24 @@ the freezes that cause a run-dry, or the fall walks the target back into the
 next one, and every second past that is latency paid by a receiver that froze
 once. A player that keeps running dry keeps restarting it.
 
+**Only the page's own run-dries count.** A run-dry says the player ran out of
+audio, not why. Media that is late runs a ring dry too, and the arrivals already
+measure it when it lands. Media that is lost runs it dry, and no buffer brings it
+back. Raising the target for either buys latency and nothing else, and it
+costs more than that: measured on a 20 ms path, learning from every run-dry took
+a 200 ms loss to 400 ms of concealment and a 220 ms target held for the whole
+hold, a 3 s loss or late delivery to the 2 s ceiling, and on three lost outages
+the later ones reached a ring deep enough that the browser's writer zero-filled
+them instead of the reader concealing them. What separates the page's own
+run-dry is the same signal the stall rule uses: the arrivals read right after a
+block are flagged `stalled`, and a report within 200 ms of the last of them is
+the page's. The report that counts is the one made once media is back, which
+lands one ring read (50 ms at most) after the decoder inserts the backlog those
+arrivals opened; the window is four of those, for a page still catching up after
+a freeze. A report made before the backlog was read finds no block yet and
+changes nothing, which costs nothing, since the one after it counts. Anything
+further from a block, a network event or a tune-in, changes nothing at all.
+
 **A caller reports what the target does not already cover.** The level is
 measured from the target the estimator finds, so one run-dry reported twice,
 once as soon as it is seen and again once its whole length is known, would count
@@ -480,8 +503,9 @@ everything else, so the first read after one is the first moment the player can
 know. An underrun the reader counted starts a run-dry. Its length is the audio
 concealment made up plus the render quanta that went out short where it could
 not, which is all of them with concealment off. It is reported at every read
-while the ring is still dry, so the refill aims at the raised target, and once
-more at the read that finds media back. Not after: what follows is the refill,
+while the ring is still dry, so a read that comes after the backlog was flagged
+aims the refill at the raised target, and once more at the read that finds media
+back. Not after: what follows is the refill,
 whose length the raised target itself sets, so counting it would feed the report
 back into itself. The reads a postMessage ring gets queue up behind a freeze and
 are handled in order afterwards, and the earliest describe its first
@@ -490,18 +514,11 @@ fresh timeline (a tune-in, a flush, a mute) and a declared endpoint are not
 running dry, and the reader counts no underrun for them; a timeline replaced
 under a run-dry ends it without another report.
 
-The native engine counts the blocks it has nothing to play for once playout has
-begun, and reports once, as media comes back and before it decides the refill,
-so the refill aims at the raised target the same way. The marker a publisher
-pauses with never reaches it, so it conceals through a declared pause, and the
-re-anchor on the far side drops the count rather than reporting the pause.
-
-**What it cannot tell apart.** The report says the player ran dry, not why.
-Media that never arrives, a lost group, runs the ring dry the same way a freeze
-does, and a target raised for it buys nothing: the refill after it waits for the
-raised level, and a later hole inside the hold reaches a ring deep enough that
-the browser's writer zero-fills it in place instead of the reader concealing it.
-The rare-tail case in `replay.test.ts` is three such holes.
+Nothing native reports a run-dry. A native receiver never flags an arrival: the
+task that froze is the one that stamps the packets, so its arrivals carry the
+freeze to the histogram themselves, and the target rises through them. The
+native estimator still implements `starved`, so the corpus holds both languages
+to one algorithm.
 
 ## Re-anchoring
 
@@ -821,6 +838,10 @@ The same list, from the Rust side. Each of these reads correct and is not.
   there: a later report starts from the target, not from the expired level.
 - Before the first measurement a held level raises the prior, and the first
   measurement is `max(optimal, held)`, not `optimal`.
+- The last stalled arrival is recorded before the reordered check, so a
+  reordered frame read out of a block counts, and the window is inclusive: a
+  report exactly 200 ms from it counts. A report outside the window returns
+  before anything moves, the hold included.
 
 ## The corpus
 
@@ -865,7 +886,9 @@ An arrival may carry `reordered: true` to force the reordered path,
 that long, with `arrival_ms` the moment the report reached the estimator, which
 is replayed as `starved()` rather than `observe()`. A case may carry `start_ms`,
 the publisher's declared flush span the estimator starts from. `target_ms[i]` is
-the target after entry `i`, and `constants.hold_ms` is `HOLD`. The declaration
+the target after entry `i`, `constants.hold_ms` is `HOLD`, and
+`constants.stall_window_ms` is the 200 ms window around the last stalled arrival.
+The declaration
 and the run-dry reports aside, there is no input: the estimator sees arrival
 timing and nothing else.
 
@@ -890,7 +913,9 @@ The cases, and what each one holds:
 | `receiver-stall` | A 400 ms block the receiver reports, which the spacing rule is too coarse to see. |
 | `receiver-stall-unflagged` | The same arrivals unreported, which is what a receiver with no monitor measures. |
 | `seeded` | A declared 310 ms flush span starts the target at 320 ms and the first observation replaces it with 20 ms. |
-| `run-dry` | One 82 ms run-dry on a 20 ms path takes the target to 120 ms at once, holds it for `HOLD`, then it falls a bucket a second. |
-| `run-dry-repeated` | Twenty reports 1.5 s apart keep restarting the hold: the fall starts `HOLD` after the last. |
+| `run-dry` | A 120 ms page block and an 82 ms run-dry on a 20 ms path take the target to 120 ms at once, hold it for `HOLD`, then it falls a bucket a second. |
+| `run-dry-repeated` | Twenty blocks and reports 1.5 s apart keep restarting the hold: the fall starts `HOLD` after the last. |
 | `run-dry-below-histogram` | Arrivals asking for more than the held level decide the target on their own. |
-| `run-dry-before-measurement` | A report before the first measurement raises the prior, and the first measurement does not land below it. |
+| `run-dry-before-measurement` | A block and a report before the first measurement raise the prior, and the first measurement does not land below it. |
+| `run-dry-unstalled` | A report with no page block anywhere changes nothing. |
+| `run-dry-outside-window` | A report 200 ms after a block counts; one a quarter of a millisecond later changes nothing. |

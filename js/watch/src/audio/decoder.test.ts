@@ -1185,38 +1185,61 @@ async function started(isolated: boolean) {
 }
 
 describe.each(TRANSPORTS)("a %s ring", (_, isolated) => {
-	test("that runs dry raises the arrival estimate by what the player ran out of", async () => {
+	test("that runs dry while the page is blocked raises the arrival estimate by what it ran out of", async () => {
 		const tile = await started(isolated);
 
-		// The main thread freezes and nothing reaches the ring, while the audio thread plays on
-		// through the 80ms it still held and then 100ms of nothing.
+		// The page freezes for 150ms. The audio thread plays on through the 80ms the ring still held
+		// and then 100ms of nothing, while the path keeps delivering: the frames it sends queue
+		// behind the freeze and are read the moment it ends, which `Stall` flags as the page's own
+		// wait, so none of them says the ring was too shallow.
+		const until = performance.now() + 150;
 		tile.audio.render(180);
+		for (let i = 12; i < 24; i++) writeGroup(tile.track, i, i * 20_000);
+		while (performance.now() < until) {}
+
+		// The backlog is read, decoded and in the ring before the next read of it, and the audio
+		// thread splices it back on.
+		await flush();
+		tile.audio.render(40);
 		await sleep(120);
 
 		const debug = tile.decoder.out.debug.peek();
 		expect(debug?.underruns).toBe(1);
+		expect(tile.decoder.out.stalled.peek()).toBe(false);
 		// Concealment covered the whole of it, so no quantum reached the device short.
 		expect(debug?.short).toBe(0);
 		const concealed = ((debug?.concealed ?? 0) / DEVICE_RATE) * 1000;
 		expect(concealed).toBeGreaterThan(80);
 
-		// The frames that did not come were this receiver's own wait, so the arrivals could never have
-		// said the ring was too shallow. What the player ran out of does, and the target rises by it
-		// on the spot, rounded up to a whole bucket.
+		// What the player ran out of says it, and the target rises by that, rounded up to a whole
+		// bucket, give or take the bucket the splice back adds.
 		const raised = tile.decoder.out.spread.peek() ?? 0;
-		expect(raised).toBe(Math.ceil((80 + concealed) / 20) * 20);
+		expect(raised).toBeGreaterThanOrEqual(Math.ceil((80 + concealed) / 20) * 20 - 20);
+		expect(raised).toBeLessThanOrEqual(Math.ceil((80 + concealed) / 20) * 20);
 
-		// The main thread comes back and the path with it. Reporting the run-dry again once media is
-		// back asks for no more than it did: at most the bucket the splice back adds.
+		tile.close();
+	});
+
+	test("that runs dry while the page keeps running does not raise the arrival estimate", async () => {
+		const tile = await started(isolated);
+		// A second of the page running normally, far past anything the tune-in may have flagged.
+		await sleep(1000);
+
+		// The path stops: nothing reaches the ring, and the page is running the whole time. That is
+		// media that is late, which the arrivals measure when it lands, or lost, which no buffer can
+		// bring back, so the ring running dry teaches the estimate nothing.
+		tile.audio.render(180);
+		await sleep(120);
+		expect(tile.decoder.out.debug.peek()?.underruns).toBe(1);
+
 		for (let i = 12; i < 24; i++) writeGroup(tile.track, i, i * 20_000);
-		await sleep(80);
 		await flush();
 		tile.audio.render(40);
 		await sleep(120);
-		expect(tile.decoder.out.stalled.peek()).toBe(false);
-		expect(tile.decoder.out.spread.peek()).toBeGreaterThanOrEqual(raised as Time.Milli);
-		expect(tile.decoder.out.spread.peek()).toBeLessThanOrEqual((raised + 20) as Time.Milli);
 
+		// Whatever the arrivals say, which for this clean path is less than the prior, and nothing on top.
+		expect(tile.decoder.out.stalled.peek()).toBe(false);
+		expect(tile.decoder.out.spread.peek()).toBeLessThanOrEqual(80 as Time.Milli);
 		tile.close();
 	});
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Time } from "@moq/net";
-import { HOLD, Jitter, type JitterObservation } from "./jitter";
+import { HOLD, Jitter, type JitterObservation, STALL_WINDOW } from "./jitter";
 import { load, replay } from "./jitter.vectors.ts";
 import { Stall, type StallTimer } from "./stall";
 
@@ -629,21 +629,71 @@ describe("a run-dry the arrivals cannot show", () => {
 	// Where `flush` leaves the arrival clock: the last frame it fed landed `base` after its timestamp.
 	const clock = (media: number) => (media - FRAME + 50) as Time.Milli;
 
+	// The page itself was blocked: the frame it held is read out of the block flagged `stalled`, the
+	// way `Stall` marks it. Returns the media past it, so `clock` of that is when it landed.
+	const blocked = (jitter: Jitter, media: number): number => {
+		observe(jitter, media, media + 50, { stalled: true });
+		return media + FRAME;
+	};
+
 	it("rises at once to cover what the player ran out of", () => {
 		// A clean path, so the arrivals ask for one bucket. The receiver froze for 120ms with 40ms
 		// held, and the frames it was not reading are discounted as its own, so nothing about them
 		// raises the target: the 82ms the player ran dry is the only thing that says it was too low.
 		const jitter = new Jitter();
-		const media = flush(jitter, { frames: 500 });
+		const media = blocked(jitter, flush(jitter, { frames: 500 }));
 		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
 
 		jitter.starved(82 as Time.Milli, clock(media));
 		expect(jitter.value.peek()).toBe(120 as Time.Milli);
 	});
 
+	it("changes nothing when the page was not blocked", () => {
+		// The same report with no stalled arrival anywhere near it: lost media, a path that stopped,
+		// or a tune-in, all of which the arrivals measure or no buffer can fix.
+		const reported = new Jitter();
+		const control = new Jitter();
+		let media = 0;
+		for (const jitter of [reported, control]) media = flush(jitter, { frames: 500 });
+		reported.starved(82 as Time.Milli, clock(media));
+		expect(reported.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
+
+		// Nor later: the report did not start a hold either.
+		for (const jitter of [reported, control]) flush(jitter, { frames: 500, start: media });
+		expect(reported.value.peek()).toBe(control.value.peek());
+	});
+
+	it("changes nothing when the last block is further away than STALL_WINDOW", () => {
+		const jitter = new Jitter();
+		const media = blocked(jitter, flush(jitter, { frames: 500 }));
+		const stalled = clock(media);
+
+		// The run-dry is reported once the page has been running normally for a while.
+		const later = flush(jitter, { frames: 2 + Math.ceil(STALL_WINDOW / FRAME), start: media });
+		expect(clock(later) - stalled).toBeGreaterThan(STALL_WINDOW);
+		jitter.starved(82 as Time.Milli, clock(later));
+		expect(jitter.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
+	});
+
+	it("still counts a report STALL_WINDOW after the block", () => {
+		const jitter = new Jitter();
+		const media = blocked(jitter, flush(jitter, { frames: 500 }));
+		jitter.starved(82 as Time.Milli, Time.Milli(clock(media) + STALL_WINDOW));
+		expect(jitter.value.peek()).toBe(120 as Time.Milli);
+	});
+
+	it("counts a block on a frame that came out of order", () => {
+		// The flag says the page was blocked before this frame was read, whatever order it came in.
+		const jitter = new Jitter();
+		const media = flush(jitter, { frames: 500 });
+		observe(jitter, media - 2 * FRAME, media + 50, { stalled: true });
+		jitter.starved(82 as Time.Milli, Time.Milli(media + 50));
+		expect(jitter.value.peek()).toBe(120 as Time.Milli);
+	});
+
 	it("holds the raised target until HOLD after the report, then falls as a fall does", () => {
 		const jitter = new Jitter();
-		const start = flush(jitter, { frames: 500 });
+		const start = blocked(jitter, flush(jitter, { frames: 500 }));
 		const at = clock(start);
 		jitter.starved(82 as Time.Milli, at);
 
@@ -668,13 +718,13 @@ describe("a run-dry the arrivals cannot show", () => {
 
 	it("restarts the hold on every report, and only ever raises the level", () => {
 		const jitter = new Jitter();
-		let media = flush(jitter, { frames: 500 });
+		let media = blocked(jitter, flush(jitter, { frames: 500 }));
 		jitter.starved(82 as Time.Milli, clock(media));
 		expect(jitter.value.peek()).toBe(120 as Time.Milli);
 
-		// Ten seconds on, the same run-dry reported again with nothing more to add. The level stays
-		// where the first report put it, and the hold is measured from here now.
-		media = flush(jitter, { frames: 500, start: media });
+		// Ten seconds on, the page blocks again and the run-dry is reported with nothing more to add.
+		// The level stays where the first report put it, and the hold is measured from here now.
+		media = blocked(jitter, flush(jitter, { frames: 500, start: media }));
 		const last = clock(media);
 		jitter.starved(Time.Milli.zero, last);
 		expect(jitter.value.peek()).toBe(120 as Time.Milli);
@@ -691,9 +741,9 @@ describe("a run-dry the arrivals cannot show", () => {
 		// The first report covered the freeze but for 5ms: the player still ran dry at the raised
 		// target, so the next report is measured from there, and the level climbs a bucket.
 		const jitter = new Jitter();
-		let media = flush(jitter, { frames: 500 });
+		let media = blocked(jitter, flush(jitter, { frames: 500 }));
 		jitter.starved(82 as Time.Milli, clock(media));
-		media = flush(jitter, { frames: 75, start: media });
+		media = blocked(jitter, flush(jitter, { frames: 75, start: media }));
 		jitter.starved(5 as Time.Milli, clock(media));
 		expect(jitter.value.peek()).toBe(140 as Time.Milli);
 	});
@@ -706,7 +756,7 @@ describe("a run-dry the arrivals cannot show", () => {
 		const reported = new Jitter();
 		const control = new Jitter();
 		let media = 0;
-		for (const jitter of [reported, control]) media = flush(jitter, { frames: 100 });
+		for (const jitter of [reported, control]) media = blocked(jitter, flush(jitter, { frames: 100 }));
 		reported.starved(40 as Time.Milli, clock(media));
 		expect(reported.value.peek()).toBe(60 as Time.Milli);
 
@@ -731,17 +781,18 @@ describe("a run-dry the arrivals cannot show", () => {
 		const jitter = new Jitter();
 		observe(jitter, 0, 50);
 		observe(jitter, FRAME, FRAME + 50);
+		observe(jitter, 2 * FRAME, 2 * FRAME + 50, { stalled: true });
 		expect(jitter.value.peek()).toBe(START as Time.Milli);
 
-		jitter.starved(60 as Time.Milli, (FRAME + 60) as Time.Milli);
+		jitter.starved(60 as Time.Milli, (2 * FRAME + 50) as Time.Milli);
 		expect(jitter.value.peek()).toBe(140 as Time.Milli);
 
 		// One second of a clean path: without the report its first measurement lands on one bucket.
-		flush(jitter, { frames: 50, start: 2 * FRAME });
+		flush(jitter, { frames: 50, start: 3 * FRAME });
 		expect(jitter.value.peek()).toBe(140 as Time.Milli);
 
 		const control = new Jitter();
-		flush(control, { frames: 52 });
+		flush(control, { frames: 53 });
 		expect(control.value.peek()).toBe(Jitter.BUCKET as Time.Milli);
 	});
 
@@ -749,18 +800,19 @@ describe("a run-dry the arrivals cannot show", () => {
 		// The level an expired hold asked for is gone: a new report is measured from where the
 		// target has fallen to, not from what the old one held.
 		const jitter = new Jitter();
-		let media = flush(jitter, { frames: 500 });
+		let media = blocked(jitter, flush(jitter, { frames: 500 }));
 		jitter.starved(82 as Time.Milli, clock(media));
 		media = flush(jitter, { frames: (HOLD + 2500) / FRAME, start: media });
 		expect(jitter.value.peek()).toBe(80 as Time.Milli);
 
+		media = blocked(jitter, media);
 		jitter.starved(10 as Time.Milli, clock(media));
 		expect(jitter.value.peek()).toBe(100 as Time.Milli);
 	});
 
 	it("never raises the target past the histogram's range", () => {
 		const jitter = new Jitter();
-		const media = flush(jitter, { frames: 500 });
+		const media = blocked(jitter, flush(jitter, { frames: 500 }));
 		jitter.starved(5000 as Time.Milli, clock(media));
 		expect(jitter.value.peek()).toBe(Jitter.CEILING as Time.Milli);
 	});
@@ -768,7 +820,7 @@ describe("a run-dry the arrivals cannot show", () => {
 	it("keeps a running hold across a re-anchor", () => {
 		// A discontinuity moves the timeline, not the player: what it ran dry at still stands.
 		const jitter = new Jitter();
-		const media = flush(jitter, { frames: 500 });
+		const media = blocked(jitter, flush(jitter, { frames: 500 }));
 		jitter.starved(82 as Time.Milli, clock(media));
 
 		// The media timeline jumps a hundred seconds ahead; the wall clock the arrivals land on does not.

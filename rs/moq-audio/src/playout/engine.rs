@@ -87,13 +87,6 @@ struct Segment {
 	media: Duration,
 }
 
-/// Playout running dry: the target it ran dry at, and the blocks it has had nothing
-/// to play for since.
-struct Starving {
-	base: Duration,
-	blocks: u32,
-}
-
 /// A jitter buffer for one audio stream.
 pub(crate) struct Engine {
 	rate: u32,
@@ -127,9 +120,6 @@ pub(crate) struct Engine {
 	/// Concealed blocks produced back to back, for the ramp a caller who turned
 	/// concealment off hears instead.
 	silence: u32,
-
-	/// The run-dry in progress, until media is back and it is reported.
-	starving: Option<Starving>,
 
 	/// Reused between blocks so a pull allocates nothing once it is warm.
 	scratch: Vec<f32>,
@@ -175,7 +165,6 @@ impl Engine {
 			segments: VecDeque::new(),
 			playhead: None,
 			silence: 0,
-			starving: None,
 			scratch: Vec::new(),
 			produced: Vec::new(),
 			concealed: Vec::new(),
@@ -249,20 +238,17 @@ impl Engine {
 		self.played = None;
 		self.observed = None;
 		self.playhead = None;
-		// What playout waits for from here is the new timeline's fill, not a run-dry.
-		self.starving = None;
 	}
 
 	/// Fill `out` with exactly one block of playout, whatever the network is doing.
 	///
 	/// `out` must hold one block of interleaved frames, which is what
-	/// [`block`](Self::block) reports. `now` is on the clock arrivals are stamped
-	/// with, which is what a run-dry is reported to the estimator on.
-	pub(crate) fn pull(&mut self, out: &mut [f32], now: f64) {
+	/// [`block`](Self::block) reports.
+	pub(crate) fn pull(&mut self, out: &mut [f32]) {
 		debug_assert_eq!(out.len(), self.block * self.channels);
 
 		while self.sync.queued() < self.block {
-			self.produce(now);
+			self.produce();
 		}
 
 		if !self.sync.pull(out) {
@@ -365,7 +351,7 @@ impl Engine {
 	}
 
 	// One turn of the decision loop, committing at least one block to the output.
-	fn produce(&mut self, now: f64) {
+	fn produce(&mut self) {
 		let front = self.buffer.front();
 		let contiguous = match (self.played, front) {
 			(Some(played), Some(front)) => front <= played + self.buffer.duration(1),
@@ -384,47 +370,13 @@ impl Engine {
 		}
 
 		let ready = self.buffer.ready();
-
-		// Media is back after playout ran dry. Reported before the decision below reads
-		// the target, so the refill it starts aims at the raised one.
-		if ready >= self.block
-			&& let Some(starving) = self.starving.take()
-		{
-			self.starved(starving, now);
-		}
-
 		match self.decision.decide(ready, self.sync.queued(), contiguous) {
 			Action::Normal => self.play(self.block),
 			Action::Accelerate { fast } => self.accelerate(fast),
 			Action::Expand => self.preemptive_expand(),
-			Action::Conceal => {
-				self.conceal(ready == 0);
-
-				// Not a block to play once playout had begun: it ran dry. A fill before the
-				// first block is not that, and neither is the wait for a refill once media is
-				// back, whose length the raised target itself sets.
-				if ready < self.block && self.played.is_some() {
-					let base = self.jitter.target();
-					self.starving.get_or_insert(Starving { base, blocks: 0 }).blocks += 1;
-				}
-			}
+			Action::Conceal => self.conceal(ready == 0),
 			Action::Merge => self.splice(),
 		}
-	}
-
-	// Tell the estimator how long playout had nothing to play, which is the one thing
-	// about this receiver its arrivals cannot show.
-	//
-	// Once, when media is back, rather than per concealed block: the marker a publisher
-	// pauses with never reaches the engine, so a declared pause reads as running dry
-	// until the consumer re-anchors on the far side of it, which drops the count here
-	// instead of reporting a pause as a run-dry.
-	fn starved(&mut self, starving: Starving, now: f64) {
-		let gap = BLOCK * starving.blocks;
-		// Measured from the target it ran dry at, less whatever has raised it since.
-		let gap = (starving.base + gap).saturating_sub(self.jitter.target());
-		self.jitter.starved(gap, now);
-		self.retarget();
 	}
 
 	// Play what is held, as it stands.
@@ -764,7 +716,7 @@ mod tests {
 				if let Some(late) = arrival(block) {
 					self.deliver(late);
 				}
-				self.engine.pull(&mut out, self.now);
+				self.engine.pull(&mut out);
 				self.out.extend_from_slice(&out);
 				self.now += BLOCK.as_secs_f64() * 1000.0;
 			}
@@ -1078,63 +1030,39 @@ mod tests {
 		);
 	}
 
-	/// A receiver whose reading freezes for 120ms every 1.5s for 30s. The packets keep
-	/// arriving on time and the estimator measures them as they land, so nothing it
-	/// sees says the buffer is too shallow; what the freeze holds up is their way into
-	/// playout. Only the buffer running dry can say so, and once it has, the target
-	/// covers every freeze after it.
+	/// A receiver whose task freezes for 120ms every 1.5s for 30s. Natively the task
+	/// that reads the packets is the one that froze, so they are stamped when it comes
+	/// back and the estimator reads the freeze as the delay it was: nothing tells it
+	/// otherwise, which is why nothing here reports playout running dry to it. The
+	/// first freeze finds the buffer at one bucket and runs it dry; the target covers
+	/// every one after.
 	#[test]
-	fn a_receiver_that_freezes_runs_dry_once_rather_than_every_time() {
-		const FROM: f64 = 5000.0;
-		const EVERY: f64 = 1500.0;
-		const FREEZE: f64 = 120.0;
+	fn a_receiver_that_freezes_raises_the_target_through_its_arrivals() {
+		const FROM: usize = 500;
+		const EVERY: usize = 150;
+		const FREEZE: usize = 12;
 		const COUNT: usize = 20;
 
 		let mut player = Player::new(config(1, true), 40.0);
-		let mut out = vec![0.0; player.engine.block()];
-		let mut observed = 0;
 		let mut episodes = 0;
 		let mut dry = false;
 
-		while player.now < FROM + EVERY * COUNT as f64 + 2000.0 {
-			let now = player.now;
-
-			// Every packet the publisher has produced by now reached the receiver on time.
-			let produced = Duration::from_secs_f64(now / 1000.0);
-			loop {
-				let (timestamp, pcm) = player.packet(observed);
-				if pcm.is_empty() || produced < timestamp + PACKET {
-					break;
-				}
-				player.engine.observe(timestamp, now);
-				observed += 1;
-			}
-
-			// A frozen receiver hands none of it to playout until the freeze ends.
-			let since = now - FROM;
-			let frozen = since >= 0.0 && ((since / EVERY) as usize) < COUNT && since % EVERY < FREEZE;
-			if !frozen {
-				while player.next < observed {
-					let (timestamp, pcm) = player.packet(player.next);
-					let pcm = pcm.to_vec();
-					player.engine.insert(timestamp, now, &pcm);
-					player.next += 1;
-				}
-			}
+		for block in 0..FROM + EVERY * COUNT + 200 {
+			let since = block.checked_sub(FROM);
+			let frozen = since.is_some_and(|since| since / EVERY < COUNT && since % EVERY < FREEZE);
 
 			let before = player.engine.stats().underruns;
-			player.engine.pull(&mut out, now);
+			player.play_with(1, |_| (!frozen).then_some(Duration::ZERO));
 			let running_dry = player.engine.stats().underruns > before;
-			if running_dry && !dry && now >= FROM {
+			if running_dry && !dry && block >= FROM {
 				episodes += 1;
 			}
 			dry = running_dry;
-			player.now += BLOCK.as_secs_f64() * 1000.0;
 		}
 
 		let stats = player.engine.stats();
 		assert!(episodes <= 2, "ran dry on {episodes} of {COUNT} freezes: {stats:?}");
-		assert!(stats.target >= Duration::from_millis(100), "{stats:?}");
+		assert!(stats.target >= Duration::from_millis(120), "{stats:?}");
 	}
 
 	/// A floor the age budget cannot hold is a contradiction the caller has to

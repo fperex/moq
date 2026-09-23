@@ -39,16 +39,20 @@ function snapshot(fields: Partial<Snapshot> = {}): Snapshot {
 	};
 }
 
-/** An estimate settled on one bucket, which is what a clean path leaves it at. */
+// Reads a second or so after the estimate settled, so every report lands on the same clock.
+const NOW = Time.Milli(11_000);
+
+/**
+ * An estimate settled on one bucket, which is what a clean path leaves it at, that has just read a
+ * frame out of a page block: the only kind of run-dry it takes a report of.
+ */
 function settled(): Container.Jitter {
 	const jitter = new Container.Jitter();
 	for (let i = 0; i < 500; i++) jitter.observe(Time.Micro.fromMilli(Time.Milli(i * 20)), Time.Milli(i * 20 + 50));
+	jitter.observe(Time.Micro.fromMilli(Time.Milli(10_000)), Time.Milli(NOW - 10), { stalled: true });
 	expect(jitter.value.peek()).toBe(Container.Jitter.BUCKET as Time.Milli);
 	return jitter;
 }
-
-// Reads a second or so after the estimate settled, so every report lands on the same clock.
-const NOW = Time.Milli(11_000);
 
 describe("a ring that runs dry", () => {
 	it("is reported as soon as a read shows it", () => {
