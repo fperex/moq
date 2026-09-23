@@ -91,12 +91,13 @@ class Channel {
 	maxEnergy = 0;
 	threshold = THRESHOLD;
 
-	/** Fold in one window, returning whether it replaced the estimate. */
-	update(window: Float32Array): boolean {
+	/** Fold in the first `length` frames of `window`, returning whether they replaced the estimate. */
+	update(window: Float32Array, length: number): boolean {
 		let energy = 0;
-		for (const sample of window) energy += sample * sample;
+		// Indexed rather than for-of: V8 boxes every element a for-of over a typed array yields.
+		for (let i = 0; i < length; i++) energy += window[i] * window[i];
 		const r0 = energy;
-		energy /= window.length;
+		energy /= length;
 
 		if (energy >= this.threshold) {
 			// Loud window. Open the search up a little and remember the peak, so the threshold
@@ -114,11 +115,11 @@ class Channel {
 		if (r0 <= 0) return false;
 
 		let r1 = 0;
-		for (let i = 1; i < window.length; i++) r1 += window[i - 1] * window[i];
+		for (let i = 1; i < length; i++) r1 += window[i - 1] * window[i];
 		const reflection = Math.max(-0.99, Math.min(0.99, r1 / r0));
 
 		let residual = 0;
-		for (let i = window.length - RESIDUAL; i < window.length; i++) {
+		for (let i = length - RESIDUAL; i < length; i++) {
 			const error = window[i] - reflection * window[i - 1];
 			residual += error * error;
 		}
@@ -150,10 +151,13 @@ export class Noise {
 		const take = Math.min(length, WINDOW);
 		if (take < RESIDUAL + 1) return;
 
-		const window = this.#window.subarray(0, take);
+		// Copied into the window a sample at a time, because a `subarray` view is an allocation and
+		// this runs on the audio thread.
+		const window = this.#window;
 		for (let index = 0; index < this.#channels.length; index++) {
-			window.set(pcm[Math.min(index, pcm.length - 1)].subarray(length - take, length));
-			if (this.#channels[index].update(window)) this.#initialised = true;
+			const src = pcm[Math.min(index, pcm.length - 1)];
+			for (let i = 0; i < take; i++) window[i] = src[length - take + i];
+			if (this.#channels[index].update(window, take)) this.#initialised = true;
 		}
 	}
 

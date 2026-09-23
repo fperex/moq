@@ -63,7 +63,9 @@ function post(targetMs: number, buffered = false): Harness {
 		end: () => ring.end(),
 		reset: () => ring.reset(),
 		timestamp: () => ring.timestamp,
-		debug: () => ring.debug(),
+		// A copy, as the state message makes: the ring refills one object, and the cases keep reads
+		// to compare with later ones.
+		debug: () => ({ ...ring.debug() }),
 	};
 }
 
@@ -624,7 +626,8 @@ describe("a ring that moves under the reader", () => {
 		starve(): void {}
 
 		report(counters: Counters): void {
-			this.reports.push(counters);
+			// Copied, because the engine refills the one object it reports.
+			this.reports.push({ ...counters });
 		}
 	}
 

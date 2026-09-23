@@ -1,5 +1,5 @@
 import type { Time } from "@moq/net";
-import { BLOCK, Decision } from "./decision";
+import { BLOCK, Decision, type Demand } from "./decision";
 import { Expand } from "./expand";
 import { Merge } from "./merge";
 import { Noise } from "./noise";
@@ -76,7 +76,12 @@ export interface RingReader {
 	readonly rate: number;
 	readonly channels: number;
 
-	/** Sample the ring. Must be called before {@link peek} or {@link commit}. */
+	/**
+	 * Sample the ring. Must be called before {@link peek} or {@link commit}.
+	 *
+	 * The view is only good until the next call, which may overwrite it: the reader runs on the
+	 * audio thread, so a ring can hand back the same object every time.
+	 */
 	view(): RingView;
 
 	/** Copy `count` buffered samples into `dst` at `offset`, without advancing the playhead. */
@@ -204,6 +209,29 @@ export class Stretcher {
 	readonly #concealment: Float32Array[] = [];
 	readonly #block: number;
 
+	// What the decision is asked and what the ring is told, filled in place: an object built per
+	// block or per quantum is garbage the audio thread's collector has to clear.
+	readonly #demand: Demand = {
+		buffered: 0,
+		queued: 0,
+		target: 0,
+		chunk: 0,
+		outputFrame: 0,
+		starved: false,
+		conceal: false,
+		converge: true,
+	};
+	readonly #counters: Counters = {
+		queued: 0,
+		stretched: 0,
+		output: 0,
+		concealed: 0,
+		accelerates: 0,
+		expands: 0,
+		merges: 0,
+		short: 0,
+	};
+
 	// Media samples committed to the output block, cumulative, and the value it held when the
 	// block in flight was committed. What has actually been heard is prorated between them.
 	#committed = 0;
@@ -267,21 +295,21 @@ export class Stretcher {
 		return this.#decision.level;
 	}
 
-	/** What the engine has done, for the ring to publish. */
+	/** What the engine has done, for the ring to publish. The same object every call, so copy it to keep it. */
 	counters(): Counters {
 		const emitted = this.#emitted();
-		return {
-			queued: this.#committed - emitted,
-			// Concealed frames carried no media, so they are taken off the output before the two are
-			// compared: what is left is the media a time stretch moved.
-			stretched: emitted - (this.#output - this.#concealed),
-			output: this.#output,
-			concealed: this.#concealed,
-			accelerates: this.#accelerates,
-			expands: this.#expands,
-			merges: this.#merges,
-			short: this.#short,
-		};
+		const counters = this.#counters;
+		counters.queued = this.#committed - emitted;
+		// Concealed frames carried no media, so they are taken off the output before the two are
+		// compared: what is left is the media a time stretch moved.
+		counters.stretched = emitted - (this.#output - this.#concealed);
+		counters.output = this.#output;
+		counters.concealed = this.#concealed;
+		counters.accelerates = this.#accelerates;
+		counters.expands = this.#expands;
+		counters.merges = this.#merges;
+		counters.short = this.#short;
+		return counters;
 	}
 
 	/**
@@ -406,18 +434,18 @@ export class Stretcher {
 		// started yet has nothing to repeat and renders the ramp instead, however the option is set.
 		if (this.#stalled) this.#prepare();
 
-		const operation = this.#decision.decide({
-			buffered: this.#stalled ? 0 : view.buffered,
-			// Always zero here: a block is drained before the next is produced. Passed anyway
-			// because the level is defined on what the engine holds, not on the ring alone.
-			queued: this.#committed - this.#emitted(),
-			target: view.target,
-			chunk: view.chunk,
-			outputFrame,
-			starved: this.#stalled,
-			conceal: this.conceal && this.#expand.ready,
-			converge: view.converge,
-		});
+		const demand = this.#demand;
+		demand.buffered = this.#stalled ? 0 : view.buffered;
+		// Always zero here: a block is drained before the next is produced. Passed anyway because
+		// the level is defined on what the engine holds, not on the ring alone.
+		demand.queued = this.#committed - this.#emitted();
+		demand.target = view.target;
+		demand.chunk = view.chunk;
+		demand.outputFrame = outputFrame;
+		demand.starved = this.#stalled;
+		demand.conceal = this.conceal && this.#expand.ready;
+		demand.converge = view.converge;
+		const operation = this.#decision.decide(demand);
 
 		// Nothing to play and concealment is off, so the caller ramps into silence.
 		if (operation === "silence") return false;

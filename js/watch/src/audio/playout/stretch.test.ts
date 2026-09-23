@@ -111,17 +111,18 @@ describe("accelerate", () => {
 		const stretch = new Stretch(rate, 1);
 		const quiet = new Noise(1);
 
-		const found = stretch.analyse(input, length, quiet);
-		expect(found.active).toBe(true);
-		expect(found.correlation).toBeGreaterThan(CORRELATION_FAST);
-		expect(found.correlation).toBeLessThanOrEqual(CORRELATION);
+		// Taken apart here, because `accelerate` runs its own `analyse`, which refills the same object.
+		const { active, correlation, lag } = stretch.analyse(input, length, quiet);
+		expect(active).toBe(true);
+		expect(correlation).toBeGreaterThan(CORRELATION_FAST);
+		expect(correlation).toBeLessThanOrEqual(CORRELATION);
 
 		expect(stretch.accelerate(input, length, quiet, false, planes(1, length))).toBe(0);
 
 		const removed = stretch.accelerate(input, length, quiet, true, planes(1, length));
-		const folded = Math.floor(stretch.maxLag / found.lag) * found.lag;
+		const folded = Math.floor(stretch.maxLag / lag) * lag;
 		expect(removed).toBe(folded);
-		expect(removed).toBeGreaterThanOrEqual(2 * found.lag);
+		expect(removed).toBeGreaterThanOrEqual(2 * lag);
 	});
 });
 

@@ -1083,8 +1083,10 @@ class ProcessorPort {
 	onmessage: ((event: { data: unknown }) => void) | null = null;
 	reply?: (message: unknown) => void;
 
+	// Copied as it is posted, as a real port does: the processor refills one state message, and
+	// replies are delivered a task later, after it may have refilled it again.
 	postMessage(message: unknown): void {
-		this.reply?.(message);
+		this.reply?.(structuredClone(message));
 	}
 }
 

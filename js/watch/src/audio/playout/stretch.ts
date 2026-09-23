@@ -102,6 +102,13 @@ export interface Match {
 }
 
 /**
+ * The correlation at each lag a search tries, shared by every search so none allocates on the audio
+ * thread. No search tries more than the lags between 2.5 and 15ms at the decimated rate, whatever
+ * the input rate or window, and each reads only the entries it has just written.
+ */
+const LAGS = new Float64Array(frames(DECIMATED, MAX_LAG) - frames(DECIMATED, MIN_LAG));
+
+/**
  * The lag, in frames, whose autocorrelation against the last `window` milliseconds of `signal` is
  * strongest.
  *
@@ -109,8 +116,8 @@ export interface Match {
  * plus `DspHelper::PeakDetection`: the search itself runs on a 4kHz decimation, and a parabola
  * through the winning bin and its neighbours recovers most of what the decimation threw away.
  *
- * Pass `scratch` (sized `frames(DECIMATED, window + MAX_LAG)`) to keep the search allocation-free
- * on the audio thread.
+ * Pass `scratch` (sized `frames(DECIMATED, window + MAX_LAG)`) so the audio thread does not
+ * allocate the decimation on every search.
  */
 export function peak(signal: Float32Array, rate: number, window: number, scratch?: Float32Array): number {
 	const minLag = frames(rate, MIN_LAG);
@@ -128,7 +135,9 @@ export function peak(signal: Float32Array, rate: number, window: number, scratch
 	const head = decimated.length - width;
 	const longest = Math.min(frames(DECIMATED, MAX_LAG), head);
 
-	const correlation = new Float64Array(Math.max(0, longest - min));
+	// Only the first `count` entries are this search's.
+	const count = Math.max(0, longest - min);
+	const correlation = LAGS;
 	for (let lag = min; lag < longest; lag++) {
 		let sum = 0;
 		for (let i = 0; i < width; i++) sum += decimated[head + i] * decimated[head - lag + i];
@@ -136,7 +145,7 @@ export function peak(signal: Float32Array, rate: number, window: number, scratch
 	}
 
 	let best = 0;
-	for (let i = 1; i < correlation.length; i++) {
+	for (let i = 1; i < count; i++) {
 		if (correlation[i] > correlation[best]) best = i;
 	}
 
@@ -146,7 +155,7 @@ export function peak(signal: Float32Array, rate: number, window: number, scratch
 	// 15ms, so starting from a multiple costs both of them. Walk down the sub-multiples and take
 	// the shortest one that still correlates nearly as well.
 	const strongest = min + best;
-	if (correlation.length > 0 && correlation[best] > 0) {
+	if (count > 0 && correlation[best] > 0) {
 		const floor = SUBMULTIPLE * correlation[best];
 		for (let divisor = 2; divisor <= Math.max(1, Math.floor(strongest / min)); divisor++) {
 			const candidate = Math.floor(strongest / divisor);
@@ -157,7 +166,7 @@ export function peak(signal: Float32Array, rate: number, window: number, scratch
 	// Parabolic fit through the peak and its neighbours, for the sub-sample part of the lag that
 	// the decimation cannot see.
 	let refined = min + best;
-	if (best > 0 && best + 1 < correlation.length) {
+	if (best > 0 && best + 1 < count) {
 		const left = correlation[best - 1];
 		const centre = correlation[best];
 		const right = correlation[best + 1];
@@ -182,6 +191,8 @@ export class Stretch {
 	readonly window: number;
 
 	#scratch: Float32Array;
+	// What `analyse` hands back, filled in place because it runs on the audio thread.
+	readonly #match: Match = { lag: 0, correlation: 0, active: false };
 
 	/** A stretcher for planar `channels` channel PCM at `rate`. */
 	constructor(rate: number, channels: number) {
@@ -206,7 +217,8 @@ export class Stretch {
 	 * The pitch period of the first `length` frames of `input` and how much the waveform repeats at it.
 	 *
 	 * Reads the reference channel only, as NetEq does, and applies the result to every channel: a
-	 * splice at different points per channel would smear the stereo image.
+	 * splice at different points per channel would smear the stereo image. The same object every
+	 * call, so copy it to keep it.
 	 */
 	analyse(input: Float32Array[], length: number, noise: Noise): Match {
 		const reference = input[0];
@@ -232,10 +244,12 @@ export class Stretch {
 		const mean = (oldEnergy + newEnergy) / (2 * lag);
 		const active = mean > PASSIVE_GATE * noise.energy(0);
 
-		const correlation =
+		const match = this.#match;
+		match.lag = lag;
+		match.correlation =
 			oldEnergy > 0 && newEnergy > 0 ? Math.max(0, Math.min(1, cross / Math.sqrt(oldEnergy * newEnergy))) : 0;
-
-		return { lag, correlation, active };
+		match.active = active;
+		return match;
 	}
 
 	/**
