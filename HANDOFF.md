@@ -4999,7 +4999,7 @@ other way:
   started, and the `watch-reload-auto` row alone prints it twice in forty seconds on an unimpaired
   LAN. After finding 26 that is an ordinary event on any jittery path. It belongs at debug, the way
   the relay's `Cancel` was moved in `b366db8bb`. It was left alone again here to keep the budget
-  commits about the budget.
+  commits about the budget. Fixed in `b92e6e1ab`: it prints at `console.debug` now.
 - **The demo page should keep its element across an unannounce.** Finding 38. The page now carries
   its `delay` onto a rebuilt tile and remembers which broadcast the viewer was watching, which fixes
   the two things a reload silently changed. What it does not fix is the rebuild itself: 1902 ms of
