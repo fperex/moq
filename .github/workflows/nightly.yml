@@ -149,6 +149,8 @@ jobs:
   # `ubuntu-latest` rather than the arm runner the jobs above use: this is the
   # third lane in the repository to launch Playwright's Chromium, and smoke.yml
   # and wasm.yml both run theirs on x86 for that reason.
+  #
+  # audio-quality.yml runs this same job on demand. Keep the two in step.
   audio-quality:
     name: Audio quality
     runs-on: ubuntu-latest
