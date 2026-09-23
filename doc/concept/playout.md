@@ -416,7 +416,92 @@ nowhere else, so in `@moq/watch` an auto delay is the target and a fixed delay
 is the number the viewer asked for. Carrying the declaration a second time, as a floor
 under auto or a term added to a fixed delay, double-counted it: a viewer asking
 for 100 ms on a source declaring 300 waited 400, and a LAN viewer measuring
-20 ms was pinned at 300 for the length of the session.
+20 ms was pinned at 300 for the length of the session. The one thing that holds
+the target up for a while is the player running dry, which is the next section.
+
+## Learning from running dry
+
+The stall rule above has a cost. A receiver whose page freezes for 120 ms every
+second and a half reads each freeze's backlog at once, and every frame of it is
+flagged `stalled`, so none of them reaches the histogram: the path never delayed
+them, and the rule is right to say so. But the ring the target sizes still has
+to last through the freeze, and a target of one bucket holds 40 ms. Measured on
+the bench, such a page ran dry on every freeze for as long as it ran, and Auto
+never left 20 ms. Freezes of 30 and 60 ms were short enough for the ring to
+absorb.
+
+Nothing in the arrivals can say the ring is too shallow here. The player can: it
+ran dry, and it knows for how long. So the estimator takes one more input,
+`starved(gap, now)`, on the arrival clock:
+
+```
+level   = min(2000, ceil((target + gap) / 20) * 20)
+held    = now < holdEnd ? max(held, level) : level
+holdEnd = now + HOLD
+publish(now)
+```
+
+`target` is the one published now: the player ran dry holding what it asked for,
+so covering the gap takes the two together. A report while a hold runs can only
+raise its level, and every report restarts it, so the hold is measured from the
+last time the player ran dry rather than the first.
+
+Publishing treats the held level as one more thing the target has to cover, for
+as long as the hold lasts:
+
+```
+if (now >= holdEnd) drop held
+optimal = max(optimal, held)      // the histogram's, when nothing is held
+```
+
+and the rest of the target rules run unchanged on that: it rises to the level at
+once, and once the hold lets it go it comes down through the same fall limiter,
+a bucket a second from where a 20 ms path left it. Before the first measurement
+a report still raises the prior, since a run-dry is not a guess, and the first
+measurement lands at the held level rather than below it. Nothing else changes:
+the stall rule, the reading gap, reordering, re-anchoring (which keeps a running
+hold), resampling and the histogram are all as described above.
+
+`HOLD` is 30 s, one constant in each language. It has to outlast the gap between
+the freezes that cause a run-dry, or the fall walks the target back into the
+next one, and every second past that is latency paid by a receiver that froze
+once. A player that keeps running dry keeps restarting it.
+
+**A caller reports what the target does not already cover.** The level is
+measured from the target the estimator finds, so one run-dry reported twice,
+once as soon as it is seen and again once its whole length is known, would count
+twice. The caller remembers the target it ran dry at and passes
+`max(0, ranDryAt + length - target)`. It can then report as often as it likes:
+however many reports there are, they add up to one.
+
+**What counts as running dry.** In the browser the ring's counters are read on
+the main thread (`js/watch/src/audio/starvation.ts`), which a freeze holds up with
+everything else, so the first read after one is the first moment the player can
+know. An underrun the reader counted starts a run-dry. Its length is the audio
+concealment made up plus the render quanta that went out short where it could
+not, which is all of them with concealment off. It is reported at every read
+while the ring is still dry, so the refill aims at the raised target, and once
+more at the read that finds media back. Not after: what follows is the refill,
+whose length the raised target itself sets, so counting it would feed the report
+back into itself. The reads a postMessage ring gets queue up behind a freeze and
+are handled in order afterwards, and the earliest describe its first
+milliseconds, which is why every read reports rather than only the first. A
+fresh timeline (a tune-in, a flush, a mute) and a declared endpoint are not
+running dry, and the reader counts no underrun for them; a timeline replaced
+under a run-dry ends it without another report.
+
+The native engine counts the blocks it has nothing to play for once playout has
+begun, and reports once, as media comes back and before it decides the refill,
+so the refill aims at the raised target the same way. The marker a publisher
+pauses with never reaches it, so it conceals through a declared pause, and the
+re-anchor on the far side drops the count rather than reporting the pause.
+
+**What it cannot tell apart.** The report says the player ran dry, not why.
+Media that never arrives, a lost group, runs the ring dry the same way a freeze
+does, and a target raised for it buys nothing: the refill after it waits for the
+raised level, and a later hole inside the hold reaches a ring deep enough that
+the browser's writer zero-fills it in place instead of the reader concealing it.
+The rare-tail case in `replay.test.ts` is three such holes.
 
 ## Re-anchoring
 
@@ -728,6 +813,14 @@ The same list, from the Rust side. Each of these reads correct and is not.
   refuses a threshold below `OVERFULL` times the target. The flush is protecting
   a cushion the reader is already playing out of; the trim is choosing where the
   playhead starts, and there is no cushion yet.
+- A run-dry's level is measured from the target as published, and rounded up with
+  `ceil`. Rust converts the `Duration` gap to milliseconds as nanoseconds over
+  `1e6`, which is exact; `as_secs_f64() * 1000.0` rounds twice and can land a
+  hair above a bucket edge the `ceil` then counts as a whole bucket.
+- The hold is over at `now >= holdEnd`, not after it, and it is dropped for good
+  there: a later report starts from the target, not from the expired level.
+- Before the first measurement a held level raises the prior, and the first
+  measurement is `max(optimal, held)`, not `optimal`.
 
 ## The corpus
 
@@ -767,10 +860,14 @@ The schema:
 
 An arrival may carry `reordered: true` to force the reordered path,
 `stalled: true` to declare that the receiver itself was blocked before it, or
-`reanchor_before: true` to call `reanchor()` first. A case may carry
-`start_ms`, the publisher's declared flush span the estimator starts from.
-`target_ms[i]` is the target after arrival `i`. The declaration aside, there is
-no catalog input: the estimator sees arrival timing and nothing else.
+`reanchor_before: true` to call `reanchor()` first. An entry may instead carry
+`starved_ms` in place of `timestamp_us`: the player reporting that it ran dry for
+that long, with `arrival_ms` the moment the report reached the estimator, which
+is replayed as `starved()` rather than `observe()`. A case may carry `start_ms`,
+the publisher's declared flush span the estimator starts from. `target_ms[i]` is
+the target after entry `i`, and `constants.hold_ms` is `HOLD`. The declaration
+and the run-dry reports aside, there is no input: the estimator sees arrival
+timing and nothing else.
 
 The cases, and what each one holds:
 
@@ -793,3 +890,7 @@ The cases, and what each one holds:
 | `receiver-stall` | A 400 ms block the receiver reports, which the spacing rule is too coarse to see. |
 | `receiver-stall-unflagged` | The same arrivals unreported, which is what a receiver with no monitor measures. |
 | `seeded` | A declared 310 ms flush span starts the target at 320 ms and the first observation replaces it with 20 ms. |
+| `run-dry` | One 82 ms run-dry on a 20 ms path takes the target to 120 ms at once, holds it for `HOLD`, then it falls a bucket a second. |
+| `run-dry-repeated` | Twenty reports 1.5 s apart keep restarting the hold: the fall starts `HOLD` after the last. |
+| `run-dry-below-histogram` | Arrivals asking for more than the held level decide the target on their own. |
+| `run-dry-before-measurement` | A report before the first measurement raises the prior, and the first measurement does not land below it. |

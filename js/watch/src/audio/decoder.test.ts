@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Group, Broadcast as MoqBroadcast, Time, Varint } from "@moq/net";
-import { type Effect, Signal } from "@moq/signals";
+import { Effect, Signal } from "@moq/signals";
 import type { Delay, Sync as SyncType } from "../sync";
 import type { Decoder as DecoderType } from "./decoder";
 import { STRETCH_BOUND } from "./playout";
@@ -80,6 +80,12 @@ class MockContext extends EventTarget {
 		this.module?.reject(new DOMException("Unable to load a worklet module.", "AbortError"));
 		return Promise.resolve();
 	}
+
+	// No output device, so no timestamp to map the playhead through: the postMessage ring then
+	// publishes no clock, which nothing in these cases reads.
+	getOutputTimestamp(): AudioTimestamp {
+		return { contextTime: 0, performanceTime: 0 };
+	}
 }
 
 /** One click on the page: a gesture, and the activation that goes with it. */
@@ -143,13 +149,38 @@ class MockAudioDecoder {
 	async flush(): Promise<void> {}
 }
 
+/**
+ * The main thread's end of a worklet node's port: every message the ring posted, and the listeners
+ * its replies are dispatched to. Nothing reads the messages unless a case hands them to a processor.
+ */
+class MockPort extends EventTarget {
+	readonly posted: unknown[] = [];
+	onmessage = null;
+	#peer?: (message: unknown) => void;
+
+	postMessage(message: unknown): void {
+		this.posted.push(message);
+		this.#peer?.(message);
+	}
+
+	start(): void {}
+
+	/** Hand `peer` every message posted so far and every one after, in order. */
+	connect(peer: (message: unknown) => void): void {
+		this.#peer = peer;
+		for (const message of this.posted) peer(message);
+	}
+}
+
 /** Enough of an AudioWorkletNode for the ring to be built against. */
 class MockWorkletNode {
 	static built: MockContext[] = [];
+	static nodes: MockWorkletNode[] = [];
 	constructor(context: MockContext) {
 		MockWorkletNode.built.push(context);
+		MockWorkletNode.nodes.push(this);
 	}
-	readonly port = { postMessage: () => {}, onmessage: null, addEventListener: () => {}, start: () => {} };
+	readonly port = new MockPort();
 	connect(): void {}
 	disconnect(): void {}
 }
@@ -204,6 +235,7 @@ beforeEach(() => {
 	(globalThis as Record<string, unknown>).EncodedAudioChunk = MockEncodedChunk;
 	MockContext.built = [];
 	MockWorkletNode.built = [];
+	MockWorkletNode.nodes = [];
 	MockContext.activation = false;
 	MockContext.grace = false;
 	MockContext.autoplay = false;
@@ -933,7 +965,13 @@ test("a replacement subscription on the same broadcast keeps the timeline it is 
 });
 
 /** A tile whose ring has filled and un-stalled, so what happens next happens mid-playback. */
-async function playing(delay: Signal<Delay>): Promise<{ built: DecoderType; sync: SyncType; close: () => void }> {
+async function playing(delay: Signal<Delay>): Promise<{
+	built: DecoderType;
+	sync: SyncType;
+	enabled: Signal<boolean>;
+	track: ReturnType<MoqBroadcast.Producer["createTrack"]>;
+	close: () => void;
+}> {
 	const producer = new MoqBroadcast.Producer();
 	const track = producer.createTrack("audio");
 	const tile = decoder(true, { catalog: catalog(), active: producer.consume(), delay });
@@ -949,6 +987,8 @@ async function playing(delay: Signal<Delay>): Promise<{ built: DecoderType; sync
 	return {
 		built: tile.decoder,
 		sync: tile.sync,
+		enabled: tile.enabled,
+		track,
 		close: () => {
 			tile.close();
 			producer.close();
@@ -1035,3 +1075,224 @@ test("small rises inside the debounce do not add up to a park", async () => {
 
 	close();
 });
+
+// --- A ring that runs dry teaches the arrival estimate ---
+
+/** The render worklet's end of a port: the processor sets `onmessage`, and its replies go to `reply`. */
+class ProcessorPort {
+	onmessage: ((event: { data: unknown }) => void) | null = null;
+	reply?: (message: unknown) => void;
+
+	postMessage(message: unknown): void {
+		this.reply?.(message);
+	}
+}
+
+interface Processor {
+	readonly port: ProcessorPort;
+	process(inputs: Float32Array[][], outputs: Float32Array[][], parameters: Record<string, Float32Array>): boolean;
+}
+
+// The real render worklet, registered into stand-ins for the scope it runs in, so what counts as the
+// ring running dry is decided by the same playout engine a page runs.
+let Render: (new () => Processor) | undefined;
+Object.assign(globalThis, {
+	AudioWorkletProcessor: class {
+		readonly port = new ProcessorPort();
+	},
+	registerProcessor: (_name: string, processor: new () => Processor) => {
+		Render = processor;
+	},
+});
+await import("./render-worklet.ts");
+
+const QUANTUM = 128;
+
+/**
+ * The audio thread behind the tile's newest worklet node: the real processor, handed every message
+ * the ring has posted, pulled a quantum at a time for as long as a case says.
+ *
+ * Rendering is synchronous, so the main thread does nothing while it runs: a case that renders a
+ * stretch in one call is a main thread frozen for that stretch. Replies cross the port as tasks of
+ * their own, which is how a state message reaches a main thread that was busy.
+ */
+function audioThread(): { render(ms: number): void } {
+	const node = MockWorkletNode.nodes.at(-1);
+	if (!node || !Render) throw new Error("no worklet node to run");
+	const processor = new Render();
+	processor.port.reply = (message) =>
+		setTimeout(() => node.port.dispatchEvent(new MessageEvent("message", { data: message })), 0);
+	node.port.connect((message) => processor.port.onmessage?.({ data: message }));
+
+	let frame = 0;
+	const output = [new Float32Array(QUANTUM), new Float32Array(QUANTUM)];
+	return {
+		render(ms: number) {
+			for (let q = 0; q < Math.round((ms * DEVICE_RATE) / 1000 / QUANTUM); q++) {
+				Object.assign(globalThis, { currentFrame: frame, sampleRate: DEVICE_RATE });
+				processor.process([], [output], {});
+				frame += QUANTUM;
+			}
+		},
+	};
+}
+
+// Both transports, told apart by whether the page is cross-origin isolated.
+const TRANSPORTS: Array<[string, boolean]> = [
+	["shared", true],
+	["postMessage", false],
+];
+
+/**
+ * A tile on `transport` whose ring has played a little and holds the rest of twelve frames, with the
+ * arrival estimate still on the 80ms prior: every frame landed at once, so nothing has been measured.
+ */
+async function started(isolated: boolean) {
+	if (!isolated) Object.assign(globalThis, { crossOriginIsolated: false });
+
+	const producer = new MoqBroadcast.Producer();
+	const track = producer.createTrack("audio");
+	const tile = decoder(true, { catalog: catalog(), active: producer.consume() });
+	// What the player does with the decoder's estimate: "auto" sizes the shared delay from it.
+	const wiring = new Effect();
+	wiring.proxy(tile.sync.track("audio").spread, tile.decoder.out.spread);
+	await flush();
+	const audio = audioThread();
+
+	// Twelve 20ms frames, since the legacy warmup drops the first three decoder callbacks: 180ms,
+	// of which the ring starts on the 100ms it holds.
+	for (let i = 0; i < 12; i++) writeGroup(track, i, i * 20_000);
+	await sleep(80);
+	await flush();
+
+	audio.render(20);
+	await sleep(120);
+	expect(tile.decoder.out.stalled.peek()).toBe(false);
+	expect(tile.decoder.out.debug.peek()?.fresh).toBe(false);
+	expect(tile.decoder.out.spread.peek()).toBe(80 as Time.Milli);
+
+	return {
+		...tile,
+		track,
+		audio,
+		close: () => {
+			wiring.close();
+			tile.close();
+			producer.close();
+			delete (globalThis as Record<string, unknown>).crossOriginIsolated;
+		},
+	};
+}
+
+describe.each(TRANSPORTS)("a %s ring", (_, isolated) => {
+	test("that runs dry raises the arrival estimate by what the player ran out of", async () => {
+		const tile = await started(isolated);
+
+		// The main thread freezes and nothing reaches the ring, while the audio thread plays on
+		// through the 80ms it still held and then 100ms of nothing.
+		tile.audio.render(180);
+		await sleep(120);
+
+		const debug = tile.decoder.out.debug.peek();
+		expect(debug?.underruns).toBe(1);
+		// Concealment covered the whole of it, so no quantum reached the device short.
+		expect(debug?.short).toBe(0);
+		const concealed = ((debug?.concealed ?? 0) / DEVICE_RATE) * 1000;
+		expect(concealed).toBeGreaterThan(80);
+
+		// The frames that did not come were this receiver's own wait, so the arrivals could never have
+		// said the ring was too shallow. What the player ran out of does, and the target rises by it
+		// on the spot, rounded up to a whole bucket.
+		const raised = tile.decoder.out.spread.peek() ?? 0;
+		expect(raised).toBe(Math.ceil((80 + concealed) / 20) * 20);
+
+		// The main thread comes back and the path with it. Reporting the run-dry again once media is
+		// back asks for no more than it did: at most the bucket the splice back adds.
+		for (let i = 12; i < 24; i++) writeGroup(tile.track, i, i * 20_000);
+		await sleep(80);
+		await flush();
+		tile.audio.render(40);
+		await sleep(120);
+		expect(tile.decoder.out.stalled.peek()).toBe(false);
+		expect(tile.decoder.out.spread.peek()).toBeGreaterThanOrEqual(raised as Time.Milli);
+		expect(tile.decoder.out.spread.peek()).toBeLessThanOrEqual((raised + 20) as Time.Milli);
+
+		tile.close();
+	});
+
+	test("that is flushed does not raise the arrival estimate", async () => {
+		const tile = await started(isolated);
+
+		// A flush throws the ring's timeline away: the reader parks on it and waits for the next
+		// fill, which is not running dry.
+		tile.decoder.reset();
+		tile.audio.render(300);
+		await sleep(120);
+
+		expect(tile.decoder.out.debug.peek()?.underruns).toBe(0);
+		expect(tile.decoder.out.spread.peek()).toBe(80 as Time.Milli);
+		tile.close();
+	});
+
+	test("that is muted does not raise the arrival estimate", async () => {
+		const tile = await started(isolated);
+
+		// A viewer muting stops the download and flushes what the ring held.
+		tile.enabled.set(false);
+		await flush();
+		tile.audio.render(300);
+		await sleep(120);
+
+		expect(tile.decoder.out.debug.peek()?.underruns).toBe(0);
+		expect(tile.decoder.out.spread.peek()).toBe(80 as Time.Milli);
+		tile.close();
+	});
+
+	test("that plays out a declared endpoint does not raise the arrival estimate", async () => {
+		const tile = await started(isolated);
+
+		// The publisher mutes: the endpoint says where its timeline stopped, the ring plays out what
+		// it holds and then renders the pause as the silence it is.
+		writeMarker(tile.track, 12, 240_000);
+		await sleep(40);
+		await flush();
+		tile.audio.render(300);
+		await sleep(120);
+
+		expect(tile.decoder.out.debug.peek()?.underruns).toBe(0);
+		expect(tile.decoder.out.spread.peek()).toBe(80 as Time.Milli);
+		tile.close();
+	});
+});
+
+test.each(TRANSPORTS)(
+	"a fresh %s ring filling from nothing does not raise the arrival estimate",
+	async (_, isolated) => {
+		if (!isolated) Object.assign(globalThis, { crossOriginIsolated: false });
+		const producer = new MoqBroadcast.Producer();
+		const track = producer.createTrack("audio");
+		const tile = decoder(true, { catalog: catalog(), active: producer.consume() });
+		try {
+			await flush();
+			const audio = audioThread();
+
+			// The graph is up before any media is: the reader renders the fill, with nothing to play.
+			audio.render(300);
+			await sleep(120);
+
+			for (let i = 0; i < 12; i++) writeGroup(track, i, i * 20_000);
+			await sleep(80);
+			await flush();
+			audio.render(20);
+			await sleep(120);
+
+			expect(tile.decoder.out.stalled.peek()).toBe(false);
+			expect(tile.decoder.out.debug.peek()?.underruns).toBe(0);
+			expect(tile.decoder.out.spread.peek()).toBe(80 as Time.Milli);
+		} finally {
+			tile.close();
+			producer.close();
+			delete (globalThis as Record<string, unknown>).crossOriginIsolated;
+		}
+	},
+);

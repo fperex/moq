@@ -1,7 +1,8 @@
 //! The cross-language conformance corpus for [`Jitter`](super::delay::Jitter).
 //!
-//! `tests/playout-01.json` holds arrival traces and the target series each one must
-//! produce. `js/hang/src/container/jitter.vectors.ts` generates it from the browser
+//! `tests/playout-01.json` holds arrival traces, with the player's run-dry reports
+//! among them, and the target series each one must produce.
+//! `js/hang/src/container/jitter.vectors.ts` generates it from the browser
 //! estimator, and this replays it through the native one: both languages are held to
 //! `doc/concept/playout.md` rather than to each other, and a divergence is a bug in
 //! whichever one departed from the page.
@@ -14,7 +15,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::delay::{BUCKET, FORGET, Jitter, LOWER_DIVISOR, Observation};
+use super::delay::{BUCKET, FORGET, HOLD, Jitter, LOWER_DIVISOR, Observation};
 
 /// The corpus, checked in beside the tests that consume it.
 const CORPUS: &str = include_str!("../../tests/playout-01.json");
@@ -31,7 +32,7 @@ fn number(value: &Value, key: &str) -> f64 {
 	value[key].as_f64().unwrap_or_else(|| panic!("`{key}` is a number"))
 }
 
-/// Every case, replayed arrival by arrival, compared as whole milliseconds.
+/// Every case, replayed entry by entry, compared as whole milliseconds.
 ///
 /// Exact equality: every target in the corpus is a whole multiple of one bucket, so
 /// an `f64` difference between V8 and rustc cannot reach this comparison.
@@ -50,7 +51,7 @@ fn the_corpus_passes() {
 		assert_eq!(
 			arrivals.len(),
 			targets.len(),
-			"{name}: one target per arrival, got {} and {}",
+			"{name}: one target per entry, got {} and {}",
 			arrivals.len(),
 			targets.len()
 		);
@@ -63,16 +64,22 @@ fn the_corpus_passes() {
 		};
 
 		for (index, (arrival, expected)) in arrivals.iter().zip(targets).enumerate() {
-			if arrival["reanchor_before"].as_bool().unwrap_or(false) {
-				jitter.reanchor();
-			}
+			// An entry is a frame arriving, or the player reporting that it ran dry.
+			if let Some(gap) = arrival["starved_ms"].as_f64() {
+				let gap = Duration::from_nanos((gap * 1_000_000.0).round() as u64);
+				jitter.starved(gap, number(arrival, "arrival_ms"));
+			} else {
+				if arrival["reanchor_before"].as_bool().unwrap_or(false) {
+					jitter.reanchor();
+				}
 
-			let timestamp = Duration::from_nanos((number(arrival, "timestamp_us") * 1000.0).round() as u64);
-			let observation = Observation {
-				reordered: arrival["reordered"].as_bool().unwrap_or(false),
-				stalled: arrival["stalled"].as_bool().unwrap_or(false),
-			};
-			jitter.observe(timestamp, number(arrival, "arrival_ms"), observation);
+				let timestamp = Duration::from_nanos((number(arrival, "timestamp_us") * 1000.0).round() as u64);
+				let observation = Observation {
+					reordered: arrival["reordered"].as_bool().unwrap_or(false),
+					stalled: arrival["stalled"].as_bool().unwrap_or(false),
+				};
+				jitter.observe(timestamp, number(arrival, "arrival_ms"), observation);
+			}
 
 			let expected = expected.as_f64().expect("a target is a number");
 			let actual = jitter.target().as_secs_f64() * 1000.0;
@@ -102,6 +109,7 @@ fn the_constants_match() {
 	assert_eq!(number(constants, "max_catchup"), 60.0);
 	assert_eq!(number(constants, "lower_interval_ms"), 1000.0);
 	assert_eq!(number(constants, "lower_divisor"), LOWER_DIVISOR);
+	assert_eq!(number(constants, "hold_ms"), HOLD);
 }
 
 /// Every case the page names, so one silently dropped from the generator shows up
@@ -134,6 +142,10 @@ fn every_case_is_present() {
 		"receiver-stall",
 		"receiver-stall-unflagged",
 		"seeded",
+		"run-dry",
+		"run-dry-repeated",
+		"run-dry-below-histogram",
+		"run-dry-before-measurement",
 	] {
 		assert!(names.contains(&expected), "the corpus lost `{expected}`");
 	}

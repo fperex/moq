@@ -62,6 +62,15 @@ const LOWER_INTERVAL: f64 = 1000.0;
 /// histogram has released an old delay, while the playout buffer catches up.
 pub(crate) const LOWER_DIVISOR: f64 = 6.0;
 
+/// How long the target stays up after playout last ran dry, in milliseconds.
+///
+/// A run-dry says what the arrivals cannot: that this receiver stops, and nothing
+/// says when it will stop again. The hold is how long that is believed. It has to
+/// outlast the gap between the freezes that cause it, or the fall walks the target
+/// back into the next one, and every second past that is latency paid by a receiver
+/// that froze once.
+pub(crate) const HOLD: f64 = 30_000.0;
+
 /// Width of one histogram bucket in milliseconds, and the resolution of the target.
 ///
 /// The target is always a whole number of buckets, so a consumer asking whether the
@@ -79,6 +88,15 @@ pub(crate) const CEILING: Duration = Duration::from_millis((BUCKETS * BUCKET as 
 struct Arrival {
 	timestamp: f64,
 	arrival: f64,
+}
+
+/// What playout's run-dries asked for, in milliseconds on the arrival clock.
+#[derive(Clone, Copy)]
+struct Held {
+	/// The target they asked for.
+	level: f64,
+	/// When that ask runs out.
+	until: f64,
 }
 
 /// What the caller already knows about one arrival, beyond the two clocks it carries.
@@ -135,6 +153,9 @@ pub(crate) struct Jitter {
 	/// The published target, and when it last moved.
 	target: f64,
 	lowered: Option<f64>,
+
+	/// The level playout's run-dries asked for, while their hold lasts.
+	held: Option<Held>,
 }
 
 impl Jitter {
@@ -177,6 +198,7 @@ impl Jitter {
 			measured: false,
 			target: start,
 			lowered: None,
+			held: None,
 		}
 	}
 
@@ -255,6 +277,39 @@ impl Jitter {
 		let delay = (now - reference.arrival - (ts - reference.timestamp)).max(0.0);
 
 		self.resample(now, delay);
+		self.publish(now);
+	}
+
+	/// Raise the target to cover the `gap` of audio playout just ran out of, and keep
+	/// it up for a while.
+	///
+	/// A receiver that keeps freezing is a receiver the arrivals never convict: the
+	/// wait in them is its own, and whoever watched it discounts it, so nothing about
+	/// them says the buffer is too shallow. Running dry does. `now` is on the arrival
+	/// clock.
+	pub(crate) fn starved(&mut self, gap: Duration, now: f64) {
+		// Exact for a whole number of nanoseconds, where `as_secs_f64() * 1000.0` rounds
+		// twice and can land a hair above a bucket edge the ceiling below then counts.
+		let gap = gap.as_nanos() as f64 / 1_000_000.0;
+
+		// Playout ran dry holding what this target asked for, so covering the gap takes
+		// the two together. A caller reporting the same run-dry twice passes only what
+		// the target does not already cover, which is what lets each report be measured
+		// from the target it finds.
+		let level = ((self.target + gap) / BUCKET).ceil() * BUCKET;
+		let level = level.min(BUCKETS as f64 * BUCKET);
+
+		// A report inside a running hold can only raise its level, and every report
+		// restarts it: the hold is measured from the last run-dry, not the first.
+		let level = match self.held {
+			Some(held) if now < held.until => held.level.max(level),
+			_ => level,
+		};
+		self.held = Some(Held {
+			level,
+			until: now + HOLD,
+		});
+
 		self.publish(now);
 	}
 
@@ -350,16 +405,34 @@ impl Jitter {
 	}
 
 	fn publish(&mut self, now: f64) {
+		// A run-dry's level stands until its hold runs out, and is gone for good after
+		// that: from then on the fall below walks the target back toward what the
+		// histogram asks for.
+		if self.held.is_some_and(|held| now >= held.until) {
+			self.held = None;
+		}
+		let held = self.held.map(|held| held.level);
+
 		// A seed is a prior, not an observation. It holds the target until the
 		// histogram has measured something, and the first measurement then replaces
 		// it outright however far below it that lands: there is no earlier
 		// measurement for the fall bound to protect, and walking down from a guess
 		// keeps a viewer above their real buffer for tens of seconds. NetEq does the
 		// same, replacing `kStartDelayMs` with the first optimal delay it gets rather
-		// than approaching it (`delay_manager.cc`).
+		// than approaching it (`delay_manager.cc`). A run-dry is not a guess, so it
+		// can raise the prior before then, and the first measurement does not land
+		// below it.
 		let Some(optimal) = self.optimal else {
+			if let Some(held) = held {
+				self.target = self.target.max(held);
+			}
 			return;
 		};
+
+		// The held level is one more thing the target has to cover, exactly as though
+		// the histogram had asked for it: the target rises to it at once, and comes
+		// down through the same limiter once the hold lets it go.
+		let optimal = held.map_or(optimal, |held| optimal.max(held));
 		if !self.measured {
 			self.measured = true;
 			self.lowered = Some(now);
@@ -808,6 +881,186 @@ mod tests {
 			"{fell:?}"
 		);
 		assert_eq!(fell.last(), Some(&Duration::from_millis(20)), "{fell:?}");
+	}
+
+	/// Where [`steady`] leaves the media timeline after `count` frames from `from`.
+	fn after(count: usize, spacing: f64, from: f64) -> f64 {
+		from + count as f64 * spacing
+	}
+
+	fn ms(value: u64) -> Duration {
+		Duration::from_millis(value)
+	}
+
+	/// A clean path asks for one bucket. The receiver froze for 120ms with 40ms held, and the
+	/// frames it was not reading are discounted as its own wait, so the 82ms the player ran dry is
+	/// the only thing that says the target was too low.
+	#[test]
+	fn a_run_dry_raises_the_target_at_once() {
+		let mut jitter = Jitter::new();
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
+		assert_eq!(jitter.target(), ms(20));
+
+		jitter.starved(ms(82), now);
+		assert_eq!(jitter.target(), ms(120));
+	}
+
+	#[test]
+	fn a_run_dry_holds_the_target_until_hold_after_the_report_then_falls() {
+		let mut jitter = Jitter::new();
+		let at = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
+		jitter.starved(ms(82), at);
+
+		let start = after(500, 20.0, 0.0);
+		let mut previous = jitter.target();
+		let mut bottom = None;
+		for i in 0..((HOLD + 10_000.0) / 20.0) as u64 {
+			let media = start + (i * 20) as f64;
+			jitter.observe(
+				Duration::from_secs_f64(media / 1000.0),
+				media + 50.0,
+				Observation::default(),
+			);
+			let target = jitter.target();
+
+			if media + 50.0 < at + HOLD {
+				assert_eq!(target, ms(120), "moved {}ms after the report", media + 50.0 - at);
+			}
+			assert!(
+				previous.saturating_sub(target) <= ms(20),
+				"fell {:?} at once",
+				previous - target
+			);
+			previous = target;
+			if bottom.is_none() && target == ms(20) {
+				bottom = Some(media + 50.0);
+			}
+		}
+
+		// Five buckets at a bucket a second, the first a second after the hold ends.
+		let bottom = bottom.expect("the target never came back down");
+		assert!(bottom >= at + HOLD + 5000.0 - 20.0, "{}", bottom - at);
+		assert!(bottom <= at + HOLD + 5000.0 + 20.0, "{}", bottom - at);
+	}
+
+	/// The same run-dry reported again with nothing to add keeps the level and restarts the hold.
+	#[test]
+	fn a_report_restarts_the_hold_and_only_raises_the_level() {
+		let mut jitter = Jitter::new();
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
+		jitter.starved(ms(82), now);
+		assert_eq!(jitter.target(), ms(120));
+
+		let now = steady(&mut jitter, 500, 20.0, 50.0, after(500, 20.0, 0.0));
+		jitter.starved(Duration::ZERO, now);
+		assert_eq!(jitter.target(), ms(120));
+
+		let frames = ((HOLD - 1000.0) / 20.0) as usize;
+		steady(&mut jitter, frames, 20.0, 50.0, after(1000, 20.0, 0.0));
+		assert_eq!(jitter.target(), ms(120));
+
+		steady(&mut jitter, 250, 20.0, 50.0, after(1000 + frames, 20.0, 0.0));
+		assert!(jitter.target() < ms(120), "{:?}", jitter.target());
+	}
+
+	/// The first report covered the freeze but for 5ms, so the player still ran dry at the raised
+	/// target: the next report is measured from there.
+	#[test]
+	fn a_later_run_dry_adds_to_the_target_it_raised() {
+		let mut jitter = Jitter::new();
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
+		jitter.starved(ms(82), now);
+		let now = steady(&mut jitter, 75, 20.0, 50.0, after(500, 20.0, 0.0));
+		jitter.starved(ms(5), now);
+		assert_eq!(jitter.target(), ms(140));
+	}
+
+	/// Once the arrivals ask for more than the held level on their own, the level decides nothing:
+	/// the series is the one the same arrivals produce with no run-dry at all.
+	#[test]
+	fn the_histogram_above_the_held_level_decides() {
+		let mut reported = Jitter::new();
+		let mut control = Jitter::new();
+		let now = steady(&mut reported, 100, 20.0, 50.0, 0.0);
+		steady(&mut control, 100, 20.0, 50.0, 0.0);
+		reported.starved(ms(40), now);
+		assert_eq!(reported.target(), ms(60));
+
+		let mut joined = false;
+		for i in 0..((HOLD + 10_000.0) / 20.0) as u64 {
+			let frame = 100 + i;
+			// Seven frames flushed at once, the packing the public relay serves.
+			let flushed = ((frame / 7) * 7 + 6) * 20 + 50;
+			for jitter in [&mut reported, &mut control] {
+				jitter.observe(ms(frame * 20), flushed as f64, Observation::default());
+			}
+
+			joined |= control.target() > ms(60);
+			if joined {
+				assert_eq!(reported.target(), control.target(), "frame {frame}");
+			}
+		}
+		assert!(joined);
+		assert_eq!(control.target(), ms(140));
+	}
+
+	/// A report before the first resample interval closes raises the prior, and the first
+	/// measurement, which replaces a prior outright, does not replace a run-dry.
+	#[test]
+	fn the_first_measurement_does_not_land_below_a_running_hold() {
+		let mut jitter = Jitter::new();
+		jitter.observe(ms(0), 50.0, Observation::default());
+		jitter.observe(ms(20), 70.0, Observation::default());
+		assert_eq!(jitter.target(), ms(80));
+
+		jitter.starved(ms(60), 80.0);
+		assert_eq!(jitter.target(), ms(140));
+
+		steady(&mut jitter, 50, 20.0, 50.0, 40.0);
+		assert_eq!(jitter.target(), ms(140));
+
+		let mut control = Jitter::new();
+		steady(&mut control, 52, 20.0, 50.0, 0.0);
+		assert_eq!(control.target(), ms(20));
+	}
+
+	/// The level an expired hold asked for is gone: a new report is measured from where the target
+	/// has fallen to.
+	#[test]
+	fn an_expired_hold_starts_over_from_the_target() {
+		let mut jitter = Jitter::new();
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
+		jitter.starved(ms(82), now);
+		let frames = ((HOLD + 2500.0) / 20.0) as usize;
+		let now = steady(&mut jitter, frames, 20.0, 50.0, after(500, 20.0, 0.0));
+		assert_eq!(jitter.target(), ms(80));
+
+		jitter.starved(ms(10), now);
+		assert_eq!(jitter.target(), ms(100));
+	}
+
+	#[test]
+	fn a_run_dry_never_raises_the_target_past_the_ceiling() {
+		let mut jitter = Jitter::new();
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
+		jitter.starved(ms(5000), now);
+		assert_eq!(jitter.target(), CEILING);
+	}
+
+	/// A discontinuity moves the timeline, not the player: what it ran dry at still stands.
+	#[test]
+	fn reanchoring_keeps_a_running_hold() {
+		let mut jitter = Jitter::new();
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
+		jitter.starved(ms(82), now);
+
+		// The media timeline jumps a hundred seconds ahead; the wall clock does not.
+		jitter.reanchor();
+		for i in 0..500u64 {
+			let media = 110_000 + i * 20;
+			jitter.observe(ms(media), now + 20.0 + (i * 20) as f64, Observation::default());
+		}
+		assert_eq!(jitter.target(), ms(120));
 	}
 
 	#[test]

@@ -19,7 +19,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Time } from "@moq/net";
-import { Jitter } from "./jitter.ts";
+import { HOLD, Jitter } from "./jitter.ts";
 
 /** The corpus format, so a reader can tell a schema change from a value change. */
 export const ALGORITHM = "moq-playout-01";
@@ -38,14 +38,25 @@ export type Arrival = {
 	reanchor_before?: boolean;
 };
 
+/** The player running dry, reported to the estimator in place of an arrival. */
+export type Starved = {
+	/** How much audio the player ran out of, milliseconds: the `gap` handed to `starved()`. */
+	starved_ms: number;
+	/** When the report reached the estimator, milliseconds on the clock arrivals are stamped with. */
+	arrival_ms: number;
+};
+
+/** One entry of a trace: a frame arriving, or the player reporting that it ran dry. */
+export type Event = Arrival | Starved;
+
 /** One trace and the target series it must produce. */
 export type Case = {
 	name: string;
 	description: string;
 	/** The publisher's declared flush span this trace starts from, when it declares one. */
 	start_ms?: number;
-	arrivals: Arrival[];
-	/** The target after each arrival, milliseconds, always a whole bucket. */
+	arrivals: Event[];
+	/** The target after each entry, milliseconds, always a whole bucket. */
 	target_ms: number[];
 };
 
@@ -64,6 +75,7 @@ export type Corpus = {
 		max_catchup: number;
 		lower_interval_ms: number;
 		lower_divisor: number;
+		hold_ms: number;
 	};
 	cases: Case[];
 };
@@ -80,19 +92,24 @@ const CONSTANTS: Corpus["constants"] = {
 	max_catchup: 60,
 	lower_interval_ms: 1000,
 	lower_divisor: 6,
+	hold_ms: HOLD,
 };
 
-/** Replay one trace through the estimator and collect the target after each arrival. */
-export function replay(arrivals: Arrival[], start?: number): number[] {
+/** Replay one trace through the estimator and collect the target after each entry. */
+export function replay(events: Event[], start?: number): number[] {
 	const jitter = new Jitter({ start: start as Time.Milli | undefined });
 	const targets: number[] = [];
 
-	for (const arrival of arrivals) {
-		if (arrival.reanchor_before) jitter.reanchor();
-		jitter.observe(arrival.timestamp_us as Time.Micro, arrival.arrival_ms as Time.Milli, {
-			reordered: arrival.reordered,
-			stalled: arrival.stalled,
-		});
+	for (const event of events) {
+		if ("starved_ms" in event) {
+			jitter.starved(event.starved_ms as Time.Milli, event.arrival_ms as Time.Milli);
+		} else {
+			if (event.reanchor_before) jitter.reanchor();
+			jitter.observe(event.timestamp_us as Time.Micro, event.arrival_ms as Time.Milli, {
+				reordered: event.reordered,
+				stalled: event.stalled,
+			});
+		}
 		targets.push(jitter.value.peek());
 	}
 
@@ -163,6 +180,18 @@ function shift(arrivals: Arrival[], ms: number): Arrival[] {
 	return arrivals.map((a) => ({ ...a, arrival_ms: grid(a.arrival_ms + ms) }));
 }
 
+// The player reporting that it ran dry for `gap` ms, before the arrival at each of `before`. Stamped
+// with the arrival ahead of it, so the clock the estimator reads never runs backwards.
+function starved(arrivals: Arrival[], before: number[], gap: (index: number) => number): Event[] {
+	const events: Event[] = [];
+	for (let i = 0; i < arrivals.length; i++) {
+		const report = before.indexOf(i);
+		if (report !== -1) events.push({ starved_ms: gap(report), arrival_ms: arrivals[i - 1].arrival_ms });
+		events.push(arrivals[i]);
+	}
+	return events;
+}
+
 // A receiver whose read loop stops for `stall` ms at `at`. The path is untouched: frames keep
 // landing on time, they just queue until the loop runs again and then come back out of it one every
 // `drain` ms, which is far faster than the media they carry.
@@ -186,7 +215,7 @@ function stalled(
 	});
 }
 
-function cases(): { name: string; description: string; start_ms?: number; arrivals: Arrival[] }[] {
+function cases(): { name: string; description: string; start_ms?: number; arrivals: Event[] }[] {
 	return [
 		{
 			name: "steady",
@@ -370,6 +399,49 @@ function cases(): { name: string; description: string; start_ms?: number; arriva
 				"Twenty seconds of the steady trace on a publisher declaring a 310ms flush span. The declaration is the cold start, rounded up to a whole bucket, and the first resampled observation replaces it outright with the 20ms the unseeded trace settles on: a declaration is a prior, not an observation, so the fall bound has nothing to protect yet.",
 			start_ms: 310,
 			arrivals: paced({ frames: 1000, base: 50, spread: 2, seed: 11 }),
+		},
+		{
+			name: "run-dry",
+			description: `The steady path, and six seconds in the player reports running dry for 82ms, which nothing in the arrivals shows: a receiver freeze whose frames it discounts as its own wait. The target rises from 20ms to 120ms at once, holds there for ${HOLD / 1000}s after the report, and then falls a bucket a second like any other rise.`,
+			arrivals: starved(
+				paced({ frames: 300 + HOLD / FRAME_MS + 350, base: 50, spread: 2, seed: 83 }),
+				[300],
+				() => 82,
+			),
+		},
+		{
+			name: "run-dry-repeated",
+			description: `The same path with twenty reports 1.5s apart. The first asks for 82ms on top of 20ms and the other nineteen for nothing beyond the level it raised, so none of them moves the target, but each restarts the hold: the target stays at 120ms for all 30s of them and falls only ${HOLD / 1000}s after the last.`,
+			arrivals: starved(
+				paced({ frames: 300 + 19 * 75 + HOLD / FRAME_MS + 350, base: 50, spread: 2, seed: 89 }),
+				Array.from({ length: 20 }, (_, report) => 300 + report * 75),
+				(report) => (report === 0 ? 82 : 0),
+			),
+		},
+		{
+			name: "run-dry-below-histogram",
+			description: `Two seconds of the steady path, a report of 40ms that raises the target to 60ms, and then a publisher flushing seven frames at once for the rest of the trace. The arrivals ask for 140ms on their own, above the held level, so from the first flush the target is what they give with no report at all, through the end of the ${HOLD / 1000}s hold and past it.`,
+			arrivals: starved(
+				[
+					...paced({ frames: 100, base: 50, spread: 2, seed: 97 }),
+					...paced({
+						frames: (HOLD + 5000) / FRAME_MS,
+						burst: 7,
+						base: 50,
+						spread: 1,
+						seed: 101,
+						start: 2000,
+					}),
+				],
+				[100],
+				() => 40,
+			),
+		},
+		{
+			name: "run-dry-before-measurement",
+			description:
+				"A report of 60ms before the first resample interval has closed, while the target is still the 80ms cold-start prior. A run-dry is not a guess, so it raises the prior to 140ms at once, and the first measurement, which replaces a prior outright with the 20ms this path settles on, lands on the held level instead.",
+			arrivals: starved(paced({ frames: 250, base: 50, spread: 2, seed: 103 }), [2], () => 60),
 		},
 	];
 }
