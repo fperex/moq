@@ -342,6 +342,19 @@
         "vite": "^8.3.0",
       },
     },
+    "test/audio-quality/clients/js": {
+      "name": "@moq/audio-quality",
+      "dependencies": {
+        "@moq/hang": "workspace:*",
+        "@moq/net": "workspace:*",
+        "@moq/signals": "workspace:*",
+        "@moq/watch": "workspace:*",
+      },
+      "devDependencies": {
+        "playwright": "^1.63.0",
+        "vite": "^8.2.2",
+      },
+    },
     "test/smoke/clients/js": {
       "name": "@moq/smoke-browser",
       "dependencies": {
@@ -638,6 +651,8 @@
     "@libav.js/types": ["@libav.js/types@6.8.8", "", {}, "sha512-Lbik/0Q3x2R8cI7mOtRgt+nUWLqGXh7UinMndmpdXSDY4YEjYyVUDsq6fxkuriL78+LCYx8frZIN1r+oDsvYCQ=="],
 
     "@libav.js/variant-opus-af": ["@libav.js/variant-opus-af@6.10.9", "", {}, "sha512-yULJUCQIHDtwDPbT38t9pP/7EGgqwynVcOau46hZjtCe8TWMp67DTi2X0Emr2M4Ci3nzxNPf25IzO+IXSmHDBg=="],
+
+    "@moq/audio-quality": ["@moq/audio-quality@workspace:test/audio-quality/clients/js"],
 
     "@moq/auth": ["@moq/auth@workspace:js/auth"],
 
