@@ -19,6 +19,8 @@ use crate::{auth, web::MtlsPeer, web::WebState, web::landing_response};
 
 // One axum extractor per fact the upgrade needs; there is no struct to fold them into.
 #[allow(clippy::too_many_arguments)]
+// The `Err` is axum's own `ErrorResponse`, so there is nothing here to box.
+#[expect(clippy::result_large_err, reason = "the error type is axum's, not ours")]
 pub(crate) async fn serve_ws(
 	ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 	OriginalUri(uri): OriginalUri,
@@ -248,7 +250,7 @@ fn ended(err: moq_net::Error) -> anyhow::Result<()> {
 ///
 /// We advertise the configured qmux × moq-net subprotocol matrix, with bare
 /// qmux fallbacks last. axum picks the first entry that the client also offered, so
-/// a modern client lands on `qmux-01.moq-lite-05`; old clients still match
+/// a modern client lands on `qmux-01.moq-lite-06`; old clients still match
 /// `webtransport` or `qmux-00.moql` and negotiate via SETUP.
 ///
 /// When the client offered subprotocols and none of them are ours, the

@@ -874,9 +874,6 @@ static VERSION_NAMES: std::sync::LazyLock<Vec<String>> =
 /// first. Each name borrows a static string valid for the life of the process, so a
 /// caller building a menu can hold them indefinitely.
 ///
-/// Work-in-progress versions are omitted, since they are not advertised unless pinned;
-/// a dial still accepts them by name.
-///
 /// Returns the total count on success, or a negative code on failure.
 ///
 /// # Safety
@@ -1277,8 +1274,8 @@ pub extern "C" fn moq_origin_create() -> i32 {
 
 /// Create a broadcast at `path` on an origin, for publishing media tracks.
 ///
-/// The broadcast starts unadvertised: reachable by exact path, but not visible
-/// to announcement streams. Fill it with the `moq_publish_*` functions, then
+/// The broadcast appears on this origin's local announcement streams immediately.
+/// Fill it with the `moq_publish_*` functions, then advertise it to peers with
 /// [moq_publish_announce] after populating. [moq_publish_finish] unpublishes
 /// immediately.
 ///
@@ -1518,13 +1515,13 @@ pub extern "C" fn moq_origin_announced_cancel(announced: u32) -> i32 {
 	})
 }
 
-/// Consume a broadcast from an origin by path, waiting until it is announced.
+/// Consume a broadcast from an origin by path, waiting until something can serve it.
 ///
 /// Resolves against future announcements: it waits for the announcement to arrive (e.g. over the
 /// network) and then delivers the broadcast handle via `on_broadcast`. Use it right after
 /// [moq_session_connect] to avoid racing announcement gossip. To resolve against only what is
-/// reachable by exact path now (including unannounced broadcasts), use [moq_origin_request]
-/// instead.
+/// reachable by exact path now, use [moq_origin_request] instead. A local
+/// broadcast appears on this origin's cursor when created, before peer advertising.
 ///
 /// `on_broadcast` is invoked with a positive broadcast handle once announced, then exactly once
 /// more with a terminal code: `0` (the wait finished, including after
@@ -1572,9 +1569,9 @@ pub extern "C" fn moq_origin_announced_broadcast_cancel(task: u32) -> i32 {
 /// Request a broadcast from an origin by path, resolving as soon as it can be served.
 ///
 /// Resolves against what is reachable by exact path *now*, where
-/// [moq_origin_announced_broadcast] waits indefinitely for a future announcement: it returns an
-/// existing broadcast at once, whether announced or not, and fails when none is reachable. It does
-/// NOT wait for a later announcement. Serve on-demand paths with [moq_origin_dynamic].
+/// [moq_origin_announced_broadcast] waits indefinitely: it returns an existing broadcast at once,
+/// whether announced or not, and fails when none is reachable. It does NOT wait for a later
+/// announcement. Serve on-demand paths with [moq_origin_dynamic].
 ///
 /// `on_broadcast` is invoked with a positive broadcast handle once served, then exactly once more
 /// with a terminal code: `0` (finished, including after [moq_origin_request_cancel]) or a negative
@@ -1631,7 +1628,7 @@ pub extern "C" fn moq_origin_close(origin: u32) -> i32 {
 /// Advertise a broadcast's exact path as a route.
 ///
 /// Announcing again re-prices the route in place. A NULL `route` uses the default
-/// (no hops, cost 0). An unannounced broadcast stays reachable by exact path.
+/// (no hops, cost 0). The path remains discoverable locally before and after peer advertising.
 ///
 /// Returns a zero on success, or a negative code on failure.
 ///

@@ -49,8 +49,3 @@ a copy for the size column. Wire it into `nightly.yml` beside `Features`. The on
 in hang is worth replacing with a hand parser while the bloat table is open,
 if it is what keeps regex in the link (tracing-subscriber's env filter also
 uses regex-automata, so check the table rather than assume).
-
-## Related
-
-- [Bindgen CLI split](/quest/next/uniffi-cli-feature.md) - the staticlib half of the same hygiene
-- [Network-only bindings](/quest/next/slim-bindings/README.md) - decides on the numbers this quest's report produces

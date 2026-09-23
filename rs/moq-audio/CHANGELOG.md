@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.26](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.25...moq-audio-v0.0.26) - 2026-09-23
+
+### Added
+
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- [**breaking**] borrow publisher finish so abort can still run ([#3714](https://github.com/moq-dev/moq/pull/3714))
+- *(hang)* [**breaking**] timelines only move forward ([#3711](https://github.com/moq-dev/moq/pull/3711))
+
+### Fixed
+
+- *(audio)* [**breaking**] enforce exclusive AEC ownership ([#3844](https://github.com/moq-dev/moq/pull/3844))
+- *(moq-audio,moq-video)* build capture and Android again, and gate both on PRs ([#3850](https://github.com/moq-dev/moq/pull/3850))
+- *(ci)* repair nightly and meta-review failures ([#3799](https://github.com/moq-dev/moq/pull/3799))
+- *(net)* drop origin source track when last reader leaves
+
+### Other
+
+- *(rs)* read constant-size chunks with as_chunks ([#3899](https://github.com/moq-dev/moq/pull/3899))
+- *(quest)* complete the media release review ([#3878](https://github.com/moq-dev/moq/pull/3878))
+- Report dropped playback sample frames ([#3845](https://github.com/moq-dev/moq/pull/3845))
+- *(audio)* [**breaking**] separate configuration contracts ([#3843](https://github.com/moq-dev/moq/pull/3843))
+- *(audio)* [**breaking**] expose demand without track authority ([#3842](https://github.com/moq-dev/moq/pull/3842))
+- Unify mux track and rendition ownership ([#3857](https://github.com/moq-dev/moq/pull/3857))
+- Make media backends optional ([#3839](https://github.com/moq-dev/moq/pull/3839))
+- *(audio)* [**breaking**] remove ineffective FEC flag ([#3841](https://github.com/moq-dev/moq/pull/3841))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
 ### Changed
 
 - PipeWire and PulseAudio host flags no longer activate device I/O without
@@ -15,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replace ambiguous channel counts with `Layout` and add explicit decoder backend selection.
 - [**breaking**] `encode::Producer::finish` borrows (`&mut self`) instead of consuming, so a later
   `abort(self)` can still run after a clean end. Writes after finish fail with `Closed`.
+- [**breaking**] `encode::Producer::track` is replaced by the watch-only `demand()`,
+  `publish_capture` takes `PublicationOptions`, `Resampler` is no longer exported, and
+  `Frame` and `encode::Encoded` are non-exhaustive with `new` constructors.
+- [**breaking**] The `fec` flag is removed from `encode::Settings` and `Options`; it never
+  produced redundancy.
+- [**breaking**] `aec::Canceller` is `aec::Control`, `playback::Engine::canceller` returns
+  `Result`, and `capture::Config::aec` takes a `Control`. An engine owns one AEC reference and a
+  control attaches to one live microphone; conflicts fail with `Error::Busy`.
+- [**breaking**] `playback::Sink::write` returns `playback::Write`, reporting accepted and
+  dropped input sample frames instead of silently discarding overflow.
 
 ## [0.0.25](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.24...moq-audio-v0.0.25) - 2026-09-17
 

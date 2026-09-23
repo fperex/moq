@@ -15,14 +15,16 @@ interrupted publisher. They drive real QUIC over `127.0.0.1` inside one
 process, relay and clients alike, so the impairment can be a userspace UDP
 shaper the test itself owns: the client connects to the shaper's socket,
 which forwards each datagram to the relay after the profile's treatment, and
-back. That is not an HTTP interceptor or a TCP proxy, which cannot impair
+back. It is its own binary from the start, so the audio quality harness can
+put the same shaper in front of a relay from a JS process. That is not an HTTP interceptor or a TCP proxy, which cannot impair
 QUIC; it is a datagram relay, and QUIC is indifferent to the extra hop.
 
 `test/drill/README.md:108-110` already forward-references this quest under
 "Not covered here"; that README is where the shaper is documented once it
 exists, so replace the forward reference with the profile and seed usage.
 
-- A `Shaper` in the drill support code: per-direction delay and jitter,
+- A `shaper` test-support binary under `test/`, with a library face the
+  drills call in-process: per-direction delay and jitter,
   loss, reorder, and a token-bucket rate limit, all driven by one seeded RNG
   so a failing run's seed reproduces the same treatment. Kernel scheduling
   still varies delivery timing; the seed makes the decisions reproducible,
@@ -41,7 +43,3 @@ exists, so replace the forward reference with the profile and seed usage.
 Kernel-real impairment (`netem` in a private network namespace) is out of
 scope: it is Linux only, needs `CAP_NET_ADMIN`, and the drills test the
 protocol's reaction to loss and delay, not the kernel's rendering of them.
-
-## Related
-
-- [Failure artifacts](/quest/next/qa-failure-artifacts.md) - stores profiles, seeds, and traces

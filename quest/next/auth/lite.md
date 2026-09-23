@@ -19,7 +19,6 @@ unions explicitly and refuse every unrepresentable grant. Never widen an
 exact or suffix pattern into a prefix. The pattern-interest quest changes wire
 encoding without another public grant-type migration.
 
-
 ### Wire
 
 Add stream type `0x7` AUTH, creator either, to the bidirectional stream table
@@ -113,10 +112,10 @@ before publishing what that token unlocks. On a miss, abort the session with
 teardown already formats one; log it at error level too, since `Error`
 carries no payload).
 
-Gate everything on `Version::Lite06Wip`; older versions never open the stream
+Gate everything on `Version::Lite06`; older versions never open the stream
 and `auth().grant()` stays `None` there. Land the accept side and the
 `Unsupported` handling before any build opens the stream, since
-`moq-lite-06-wip` is one ALPN with no sub-version.
+`moq-lite-06` is one ALPN with no sub-version.
 
 ### JavaScript
 
@@ -148,5 +147,5 @@ On main, additive.
 
 ## Related
 
-- [Pattern interest](/quest/next/path-patterns/interest.md) - moves the prefix
+- [Pattern interest](/quest/next/path-patterns.md) - moves the prefix
   fields here and in ANNOUNCE_REQUEST to patterns together

@@ -237,7 +237,7 @@ pub struct Server {
 #[cfg(feature = "noq")]
 pub(crate) struct SocketRetainer {
 	#[cfg(feature = "noq")]
-	noq: Option<web_transport_noq::noq::Endpoint>,
+	noq: Option<web_transport_moq::noq::Endpoint>,
 }
 
 impl Server {
@@ -772,7 +772,7 @@ async fn serve_session(request: Request) -> crate::Result<()> {
 
 /// The version set offered on stream (`tcp://`/`unix://`) listeners.
 ///
-/// A URL-less transport carries the request path in the moq-lite-05 SETUP, so
+/// A URL-less transport carries the request path in the moq-lite-05+ SETUP, so
 /// lite-05 is offered on top of the configured versions even when a custom set
 /// omits it. Older versions still work for clients that need no path.
 #[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
@@ -1049,7 +1049,7 @@ type PendingRequest<S> = moq_net::server::Handshake<S>;
 
 pub(crate) enum RequestKind {
 	#[cfg(feature = "noq")]
-	Noq(Box<PendingRequest<crate::transport::Session<web_transport_noq::Session>>>),
+	Noq(Box<PendingRequest<crate::transport::Session<web_transport_moq::Session>>>),
 	#[cfg(feature = "iroh")]
 	Iroh(Box<PendingRequest<crate::transport::Session<web_transport_iroh::Session>>>),
 	#[cfg(any(feature = "tcp", all(feature = "uds", unix), feature = "websocket"))]

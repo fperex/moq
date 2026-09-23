@@ -41,8 +41,8 @@ Their package boundaries are explicit:
 
 The media crates are also 0.0.x, so their changes target main. Adapt callers in
 other packages without breaking their published APIs, C layouts, or wire
-formats. Do not bump versions as part of these quests. The media review records
-when the four crates are ready for a separately requested 0.1 release.
+formats. Do not bump versions as part of these quests. The media review
+found the four crates ready for a separately requested 0.1 release.
 
 Their package boundaries are explicit:
 
@@ -88,10 +88,9 @@ do not add another media abstraction or a renderer crate during stabilization.
 
 ## Quests
 
-- [GPU conversion and NVENC](/quest/main/video-gpu-encode.md) - convert, resize and
-  encode imported frames without CPU pixel transfers or fallback
-- [Video output](/quest/main/video-output.md) - codec output and subscription policy are separate, with native or CPU frames
-- [Media release review](/quest/main/media-release-review.md) - verify the settled contracts before separately authorizing 0.1 releases
+- [Binding parity](/quest/main/binding-parity.md) - every wrapper reaches every moq-ffi method in its own idiom with moq-net's verbs
+- [Binary stats](/quest/main/stats-binary/README.md) - an allocation-free stats tick and an on-demand FlatBuffers `.fb.z` flavor with a checked-in schema
+- [Audio jitter target](/quest/main/audio-jitter-target/README.md) - the audio playout target is a measured estimate of arrival timing in both languages, not a round-trip guess
 
 ## Related
 

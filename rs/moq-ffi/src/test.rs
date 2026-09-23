@@ -1287,31 +1287,38 @@ fn audio_rejects_bad_init_bytes() {
 	);
 }
 
-/// Creating a broadcast does not advertise it. `announced_broadcast` waits until
-/// `announce` makes the exact path discoverable; `request_broadcast` can still
-/// resolve it by exact path in the meantime.
+/// Creating a broadcast makes it discoverable on the origin's local cursor.
+/// Peer advertisements still require `announce`.
 #[tokio::test]
-async fn create_broadcast_does_not_announce() {
+async fn create_broadcast_announces_locally() {
 	let origin = MoqOriginProducer::new(MoqOriginConfig::default());
 	let consumer = origin.consume();
 	let broadcast = origin.create_broadcast("live".into()).unwrap();
 
-	tokio::time::timeout(TIMEOUT, consumer.request_broadcast("live".into()))
+	let announced = consumer.announced(MoqAnnounceConfig::default()).unwrap();
+	let update = tokio::time::timeout(TIMEOUT, announced.next())
 		.await
-		.expect("timed out requesting the unannounced broadcast")
-		.expect("an unannounced broadcast stays reachable by exact path");
+		.expect("timed out waiting for local announcement")
+		.expect("announcement")
+		.expect("cursor is open");
+	assert_eq!(update.prefix(), "live");
+	assert!(update.active());
 
-	let announced = consumer.announced_broadcast("live".into()).unwrap();
-	let pending = tokio::spawn(async move { announced.available().await });
-	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-	assert!(!pending.is_finished(), "create_broadcast must not advertise the path");
-
-	broadcast.announce(MoqRoute::default()).unwrap();
-	tokio::time::timeout(TIMEOUT, pending)
+	let requested = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("live".into()))
 		.await
-		.expect("timed out waiting for announce")
-		.expect("task")
-		.expect("announce makes the path discoverable");
+		.expect("timed out requesting local broadcast")
+		.expect("local broadcast resolves");
+	assert_eq!(requested.inner().info().path.as_str(), "live");
+
+	let waited = tokio::time::timeout(
+		TIMEOUT,
+		consumer.announced_broadcast("live".into()).unwrap().available(),
+	)
+	.await
+	.expect("timed out awaiting local broadcast")
+	.expect("local broadcast resolves");
+	assert_eq!(waited.inner().info().path.as_str(), "live");
+
 	broadcast.finish().unwrap();
 }
 
@@ -1534,39 +1541,54 @@ async fn resolve_returns_a_broadcast_that_resolves_further_references() {
 }
 
 #[tokio::test]
-async fn announce_and_unannounce_toggles_discovery() {
+async fn unannounce_withdraws_only_from_peers() {
 	let origin = MoqOriginProducer::new(MoqOriginConfig::default());
 	let consumer = origin.consume();
 	let broadcast = origin.create_broadcast("live".into()).unwrap();
-	broadcast.announce(MoqRoute::default()).unwrap();
-
-	// The consumer observes the flag through the announce stream: an active
-	// announcement, then its retraction.
 	let announced = consumer.announced(MoqAnnounceConfig::default()).unwrap();
-	async fn wait_live(announced: &MoqAnnounceConsumer, announce: bool) {
-		loop {
-			let announcement = tokio::time::timeout(TIMEOUT, announced.next())
-				.await
-				.expect("timed out waiting for an announce update")
-				.unwrap()
-				.expect("origin ended while waiting for an announce update");
-			if announcement.prefix() == "live" && announcement.active() == announce {
-				return;
-			}
-		}
-	}
-	wait_live(&announced, true).await;
+
+	let first = tokio::time::timeout(TIMEOUT, announced.next())
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	assert!(first.active());
+	assert_eq!(first.route().cost, 0);
+
+	broadcast
+		.announce(MoqRoute {
+			cost: 3,
+			..Default::default()
+		})
+		.unwrap();
+	let advertised = tokio::time::timeout(TIMEOUT, announced.next())
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	assert!(advertised.active());
+	assert_eq!(advertised.route().cost, 3);
 
 	broadcast.unannounce().unwrap();
-	wait_live(&announced, false).await;
-
-	// Unannounced, but still reachable by exact path.
+	let local = tokio::time::timeout(TIMEOUT, announced.next())
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	assert!(local.active());
+	assert_eq!(local.route().cost, 0);
 	tokio::time::timeout(TIMEOUT, consumer.request_broadcast("live".into()))
 		.await
-		.expect("timed out requesting the unannounced broadcast")
-		.expect("an unannounced broadcast stays reachable by exact path");
+		.expect("timed out requesting the local broadcast")
+		.expect("local broadcast stays reachable");
 
 	broadcast.finish().unwrap();
+	let ended = tokio::time::timeout(TIMEOUT, announced.next())
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	assert!(!ended.active());
 }
 
 #[tokio::test]
@@ -1826,6 +1848,114 @@ async fn video_raw_publish_consume() {
 		.expect("expected frame");
 	assert!(!frame.payload.is_empty(), "frame should carry encoded video");
 
+	video.finish().unwrap();
+	broadcast.finish().unwrap();
+}
+
+/// The decode side picks its CPU pixel layout: an unset `format` delivers I420,
+/// and RGBA delivers `width * height * 4` bytes, with each frame naming the
+/// layout it was decoded to.
+#[cfg(feature = "video")]
+#[tokio::test]
+async fn video_decode_format() {
+	use crate::video::*;
+
+	let origin = MoqOriginProducer::new(MoqOriginConfig::default());
+	let broadcast = create_announced(&origin, "video-decode-format");
+
+	let video = broadcast
+		.encode_video(
+			MoqVideoEncoderInput {
+				format: MoqVideoPixelFormat::Rgba,
+				width: 320,
+				height: 240,
+				framerate: 30,
+			},
+			MoqVideoEncoderOutput {
+				codec: MoqVideoCodec::H264,
+				track: Some("camera".into()),
+				bitrate: None,
+				gop: None,
+				// Software both ways so the test is deterministic everywhere.
+				kind: MoqVideoEncoderKind::Software,
+			},
+			None,
+		)
+		.unwrap();
+
+	// Seed the track so a subscriber joining below lands on encoded media.
+	let rgba = vec![0x80u8; 320 * 240 * 4];
+	video.cut().unwrap();
+	for i in 0..10u64 {
+		video
+			.write(MoqVideoFrame {
+				timestamp_us: i * 33_333,
+				data: rgba.clone(),
+			})
+			.unwrap();
+	}
+
+	let consumer = origin.consume();
+	let broadcast_consumer = await_announced(&consumer, "video-decode-format").await;
+	let catalog_consumer = broadcast_consumer.subscribe_catalog().await.unwrap();
+	let catalog = tokio::time::timeout(TIMEOUT, catalog_consumer.next())
+		.await
+		.expect("timed out")
+		.unwrap()
+		.expect("expected catalog");
+	let (track, rendition) = catalog.video.iter().next().unwrap();
+
+	// Two subscribers over one publication, so the same encoded frames are read
+	// twice and only the requested layout differs.
+	let i420 = broadcast_consumer
+		.decode_video(track.clone(), rendition.clone(), MoqVideoDecoderOutput::default())
+		.await
+		.unwrap();
+	let rgba_out = broadcast_consumer
+		.decode_video(
+			track.clone(),
+			rendition.clone(),
+			MoqVideoDecoderOutput {
+				format: Some(MoqVideoPixelFormat::Rgba),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+
+	// Keep the encoder fed so both decoders see frames after they joined.
+	for i in 10..40u64 {
+		video
+			.write(MoqVideoFrame {
+				timestamp_us: i * 33_333,
+				data: rgba.clone(),
+			})
+			.unwrap();
+	}
+
+	let frame = tokio::time::timeout(TIMEOUT, i420.next())
+		.await
+		.expect("timed out")
+		.unwrap()
+		.expect("expected an I420 frame");
+	assert!(matches!(frame.format, MoqVideoPixelFormat::I420));
+	assert_eq!(frame.data.len(), frame.width as usize * frame.height as usize * 3 / 2);
+
+	let frame = tokio::time::timeout(TIMEOUT, rgba_out.next())
+		.await
+		.expect("timed out")
+		.unwrap()
+		.expect("expected an RGBA frame");
+	assert!(matches!(frame.format, MoqVideoPixelFormat::Rgba));
+	assert_eq!(frame.data.len(), frame.width as usize * frame.height as usize * 4);
+	// Every fourth byte is alpha, so an opaque frame proves the conversion ran rather than handing back planes.
+	assert!(
+		frame.data.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF),
+		"RGBA output should be opaque"
+	);
+
+	i420.cancel();
+	rgba_out.cancel();
 	video.finish().unwrap();
 	broadcast.finish().unwrap();
 }
@@ -3182,14 +3312,50 @@ async fn server_cert_fingerprints_rejected_after_cancel() {
 		.expect("listen failed");
 	server.cert_fingerprints().expect("fingerprints available");
 
-	// The listener is dropped off-thread, so this must not depend on that landing first:
-	// cancel is terminal the moment it returns. `Cancelled`, not `Bind`: the wrappers'
+	// Cancel is terminal the moment it returns. `Cancelled`, not `Bind`: the wrappers'
 	// `is_shutdown` helpers read the variant to tell a teardown from a real bind failure.
 	server.cancel();
 	assert!(matches!(
 		server.cert_fingerprints(),
 		Err(crate::error::MoqError::Cancelled)
 	));
+}
+
+/// Cancelling a listening server releases its socket before it returns, so the
+/// same address binds again without a retry. The accept is parked first, so
+/// cancel has to unwind an in-flight run rather than an idle state.
+#[tokio::test]
+async fn server_cancel_releases_the_bound_port() {
+	let server = MoqServer::new();
+	server.set_bind("127.0.0.1:0".into()).unwrap();
+	server.set_tls_generate(vec!["localhost".into()]).unwrap();
+	let addr = server.listen().await.expect("listen failed");
+
+	// Park an accept on the server lock, the state a live server is closed in.
+	let accepting = server.clone();
+	let accept = tokio::spawn(async move { accepting.accept().await });
+	wait_for_config_error(|| server.set_publish(None), |err| matches!(err, MoqError::Busy)).await;
+
+	server.cancel();
+
+	// A raw bind from this thread races the teardown directly rather than
+	// queueing behind it on the FFI runtime, so it only succeeds if cancel
+	// released the socket before returning.
+	std::net::UdpSocket::bind(&addr).expect("cancel should release the socket before it returns");
+
+	// No retry: the socket is already closed, so this must succeed on the first try.
+	let rebound = MoqServer::new();
+	rebound.set_bind(addr.clone()).unwrap();
+	rebound.set_tls_generate(vec!["localhost".into()]).unwrap();
+	rebound.listen().await.expect("the port should rebind immediately");
+
+	let accept = tokio::time::timeout(TIMEOUT, accept)
+		.await
+		.expect("accept task timed out")
+		.expect("accept task panicked");
+	assert!(matches!(accept, Err(MoqError::Cancelled)));
+
+	rebound.cancel();
 }
 
 #[tokio::test]

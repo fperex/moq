@@ -5538,7 +5538,9 @@ mod test {
 		{
 			flagged += frame
 				.payload
-				.chunks_exact(188)
+				.as_chunks::<188>()
+				.0
+				.iter()
 				.filter(|p| p[3] & 0x20 != 0 && p[4] > 0 && p[5] & 0x80 != 0)
 				.count();
 		}

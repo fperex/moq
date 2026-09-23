@@ -56,7 +56,7 @@ session.shutdown()
 ```
 
 The three advertising operations: `session.publish.createBroadcast(path:)`
-returns an unadvertised producer; `broadcast.announce(route:)` /
+returns a locally discoverable producer; `broadcast.announce(route:)` /
 `broadcast.unannounce()` own that exact-path advertisement;
 `session.publish.dynamic(prefix:route:)` claims `prefix` and every path
 beneath it (`""` for everything). Hold the returned `OriginDynamic` while the
@@ -84,6 +84,31 @@ divides the connection's send estimate; pass it to `encodeVideo` /
 `encodeAudio` or `reserve` a share for an app-owned track. `MoqError.isAuth` and
 `isShutdown` classify errors. `protocolError` is the structured protocol failure
 (scope, verbatim code, kind) when the peer sent one.
+
+`decodeVideo` picks the decoded CPU pixel layout: `VideoDecoderOutput.format`
+is `.i420` when unset, or `.rgba` for four bytes a pixel, and every frame
+repeats the layout it was decoded to. `resize` is best effort: only NVDEC has a
+built-in scaler, and VideoToolbox is not it, so read each frame's own `width`
+and `height` rather than assuming it took.
+
+## Connection stats
+
+`session.stats()` returns a `ConnectionStats` snapshot. Each field is `nil`
+when the transport backend does not report it (native QUIC reports all of them;
+browser WebTransport reports few or none) or before it is available, which is
+not the same as zero.
+
+| Field | Unit | Meaning |
+| --- | --- | --- |
+| `rttUs` | microseconds | Smoothed round-trip time. |
+| `estimatedSendRateBps` | bits per second | Send bandwidth from the congestion controller. |
+| `estimatedRecvRateBps` | bits per second | Receive bandwidth from MoQ PROBE. |
+| `bytesSent` | bytes | Total sent, including retransmissions and overhead. |
+| `bytesReceived` | bytes | Total received, including duplicates and overhead. |
+| `bytesLost` | bytes | Total lost, detected via retransmission or acknowledgement. |
+| `packetsSent` | datagrams | Total datagrams sent. |
+| `packetsReceived` | datagrams | Total datagrams received. |
+| `packetsLost` | datagrams | Total datagrams detected as lost. |
 
 - API reference: [Swift Package Index (DocC)](https://swiftpackageindex.com/moq-dev/moq-swift/documentation/moq)
 - Source: [`swift/`](https://github.com/moq-dev/moq/tree/main/swift); `just swift check` builds and tests on a Mac

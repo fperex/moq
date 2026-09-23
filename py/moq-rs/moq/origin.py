@@ -136,10 +136,19 @@ class BroadcastRequest:
 
 
 class OriginDynamic:
-    """A served route: advertises a prefix and yields requests beneath it."""
+    """A served route: advertises a prefix and yields requests beneath it.
+
+    Usable as an async context manager that cancels the route on exit.
+    """
 
     def __init__(self, inner: MoqOriginDynamic) -> None:
         self._inner = inner
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.cancel()
 
     def __aiter__(self):
         return self
@@ -176,7 +185,11 @@ class OriginConsumer:
         return AnnounceConsumer(self._inner.announced(MoqAnnounceConfig(prefix=prefix, filter=filter)))
 
     def announced_broadcast(self, path: str) -> AnnouncedBroadcast:
-        """Await a route covering ``path``, then resolve the broadcast there."""
+        """Await a route covering ``path``, then resolve the broadcast there.
+
+        A local broadcast appears on this origin's cursor when created, before
+        it is advertised to peers.
+        """
         return AnnouncedBroadcast(self._inner.announced_broadcast(path))
 
     async def request_broadcast(self, path: str) -> BroadcastConsumer:
@@ -184,9 +197,9 @@ class OriginConsumer:
 
         Resolution order: a local broadcast at the exact path, then the best
         announced route covering the path (served on demand by the session that
-        announced it), then a dynamic handler on the origin (if any); raises if
-        nothing can serve it. Unlike `announced_broadcast`, this does not wait
-        for a future announcement.
+        announced it), then a dynamic handler on the origin (if any). Unlike
+        `announced_broadcast`, this answers for what is reachable now and raises
+        if nothing can serve the path.
         """
         return BroadcastConsumer(await self._inner.request_broadcast(path))
 
@@ -227,8 +240,8 @@ class OriginProducer:
     def create_broadcast(self, path: str) -> BroadcastProducer:
         """Create a broadcast at ``path``, returning the producer that feeds it.
 
-        The broadcast starts unadvertised: reachable by exact path, but not
-        visible to announcement streams. Advertise it with
+        The broadcast appears on this origin's local announcement streams
+        immediately. Advertise it to peers with
         :meth:`BroadcastProducer.announce` after populating tracks. Create,
         :meth:`dynamic` if tracks are served on demand, populate, then announce.
         ``finish()`` unpublishes immediately, while dropping the producer without

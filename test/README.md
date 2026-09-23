@@ -70,18 +70,21 @@ a running build fails it.
 
 ### Keeping a failure
 
-A failing run keeps its directory on its own, with its logs, configs, and
-`endpoints.txt`, and prints the path along with the command that reproduces the
-run. Nobody has to have predicted the failure to get the evidence for it.
+A run that fails keeps its directory, so its logs, configs, `endpoints.txt`, and
+any Playwright trace survive with the command that reproduces it. A passing run
+deletes its own.
 
 ```bash
 MOQ_TEST_KEEP=1 just test smoke
 ```
 
-The flag adds the passing case, for reading a run that worked. Either way the
-children are still reaped and the ports still released: what is kept is
-evidence, not a live session. Remove it with the `rm -rf` the run prints;
-nothing expires it for you.
+`MOQ_TEST_KEEP=1` keeps a passing run's directory too, for when the problem is in
+what the test did not assert. Either way the children are still reaped and the
+ports still released: what is kept is evidence, not a live session. Remove it
+with the `rm -rf` the run prints; nothing expires it for you.
+
+In CI the harness writes under `MOQ_TEST_RUNS`, and `smoke.yml` and `wasm.yml`
+upload that directory as a short-lived artifact when the job fails.
 
 ## Worktrees
 

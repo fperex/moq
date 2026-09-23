@@ -28,9 +28,8 @@ pub struct MoqAnnounceConfig {
 ///
 /// Pair one with `MoqBroadcastProducer::announce` for an exact path, or with
 /// `MoqOriginProducer::dynamic` for a prefix. Observe them with
-/// `MoqOriginConsumer::announced`. A route claims capability, not inventory: by
-/// convention a publisher announces each broadcast's exact path, so subscribers
-/// can enumerate broadcasts, while a service advertises a prefix and answers
+/// `MoqOriginConsumer::announced`. A route claims capability, not inventory: a publisher advertises each broadcast's exact path to peers once ready,
+/// while local consumers can enumerate it from creation, while a service advertises a prefix and answers
 /// whatever is requested beneath it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct MoqRoute {
@@ -166,7 +165,7 @@ struct AnnouncedBroadcast {
 
 impl AnnouncedBroadcast {
 	async fn available(&mut self) -> Result<Arc<MoqBroadcastConsumer>, MoqError> {
-		// `routed_broadcast` rides out the churn between a route covering the path
+		// `routed_broadcast` rides out the churn between something covering the path
 		// and the path actually resolving (failover, an advertise-only announce
 		// racing its handler).
 		let broadcast = self.origin.routed_broadcast(&self.path).await?;
@@ -294,8 +293,8 @@ impl MoqOriginProducer {
 
 	/// Create a broadcast at `path` on this origin, returning the producer that feeds it.
 	///
-	/// The broadcast starts unadvertised: reachable by exact path for subscribes
-	/// and fetches, but not visible to announcement streams. Advertise it with
+	/// The broadcast appears on this origin's local announcement streams immediately.
+	/// Advertise it to peers with
 	/// [`MoqBroadcastProducer::announce`] after populating tracks; an on-demand
 	/// handler is [`Self::dynamic`]. Create, `dynamic()` if tracks are served on
 	/// demand, populate, then announce.
@@ -329,10 +328,12 @@ impl MoqOriginConsumer {
 		}))
 	}
 
-	/// Wait for a route to cover `path`, then resolve the broadcast there.
+	/// Resolve the broadcast at `path`, waiting until something can serve it.
 	///
 	/// This is how you resolve a path right after connecting: announcements arrive over the
-	/// session after it opens, so `request_broadcast` on its own races them.
+	/// session after it opens, so `request_broadcast` on its own races them. A
+	/// local broadcast appears on this origin's cursor when created, whether or not
+	/// it has been advertised to peers.
 	pub fn announced_broadcast(&self, path: String) -> Result<Arc<MoqAnnouncedBroadcast>, MoqError> {
 		let _guard = crate::ffi::enter();
 		let path = moq_net::Path::new(&path).to_owned();
@@ -358,9 +359,9 @@ impl MoqOriginConsumer {
 	///
 	/// Resolution order: a local broadcast at the exact path, then the best announced route
 	/// covering the path (served on demand by the session that announced it), then a dynamic
-	/// handler on the origin (if any). Errors if nothing can serve it. Unlike
-	/// `announced_broadcast`, this does *not* wait for a future announcement. Drop the
-	/// returned future to cancel.
+	/// handler on the origin (if any). Unlike `announced_broadcast`, this answers for what is
+	/// reachable *now* and errors if nothing can serve the path. Drop the returned future to
+	/// cancel.
 	///
 	/// Calling this straight after connecting therefore races the session's announcements
 	/// and can report a live broadcast as unroutable. Await `announced_broadcast` first.
@@ -496,7 +497,7 @@ impl MoqAnnounceUpdate {
 impl MoqAnnouncedBroadcast {
 	/// Wait until the broadcast is announced. Returns `Closed` if cancelled or the origin is closed.
 	///
-	/// Use `broadcast.closed()` to learn when a broadcast is unannounced.
+	/// Use `broadcast.closed()` to learn when the broadcast ends.
 	pub async fn available(&self) -> Result<Arc<MoqBroadcastConsumer>, MoqError> {
 		self.task.run(|mut state| async move { state.available().await }).await
 	}

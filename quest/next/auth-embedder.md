@@ -11,7 +11,7 @@ and stats-tier step for four gateways and holds no lease for any of them.
 
 ## Plan
 
-Additive on `moq-auth` and `moq-relay`, so on main after the merge:
+Additive on `moq-auth` and `moq-relay`, so on main:
 
 - `lease::Producer::new(grant)` records `revalidate`/`expires`;
   `producer.due().await -> Due::{Revalidate, Expired}`, `update(grant)`
@@ -44,7 +44,4 @@ Additive on `moq-auth` and `moq-relay`, so on main after the merge:
 Public API: additive. Wire: the auth JSON gains transport values and end
 reasons.
 
-## Related
-
-- [Relay embedding](/quest/next/relay-embed.md) - the rest of the embedder surface
 - [Stats retier](/quest/next/stats-retier.md) - what a re-checked tier does to the `stats::Session` handed out here

@@ -555,10 +555,7 @@ impl<S: crate::transport::poll::Session> AnnounceServe<S> {
 		// Register the split-horizon peer on the announce cursor too. The origin
 		// model uses this exposure to park a reflected copy before it can replace
 		// the source we are currently advertising to that peer.
-		let origin = match Hop::new(exclude_hop) {
-			Ok(peer) => origin.excluding(peer),
-			Err(_) => origin,
-		};
+		let origin = origin.excluding(Hop::new(exclude_hop).unwrap_or(Hop::UNKNOWN));
 		let announced = origin.announced();
 		let run = AnnounceRun::new(prefix, self.shared.self_origin, self.shared.version);
 		self.state = AnnounceState::Run { origin, announced, run };
@@ -1498,7 +1495,7 @@ mod test {
 		// On lite-06 the declared budget is what resolves the start, so it stands.
 		let mut declared =
 			producer.subscribe(track::Subscription::default().with_max_age(std::time::Duration::from_secs(5)));
-		position_cursor(&mut declared, Version::Lite06Wip, None);
+		position_cursor(&mut declared, Version::Lite06, None);
 		assert_eq!(drain(&mut declared), vec![0, 1, 2]);
 	}
 
@@ -1642,7 +1639,7 @@ mod announce_test {
 
 	type TestPublisher = Publisher<SinkSession>;
 
-	const VERSION: Version = Version::Lite06Wip;
+	const VERSION: Version = Version::Lite06;
 
 	/// The hops stamped on every harness route.
 	fn pub_hops() -> Hops {
@@ -2212,7 +2209,7 @@ struct TrackRun<S: crate::transport::poll::Session> {
 	emit_range: bool,
 	start_sent: bool,
 	end_sent: bool,
-	// Serve datagrams off this same subscriber, but only on lite-05 over a
+	// Serve datagrams off this same subscriber, but only on lite-05+ over a
 	// datagram-capable transport (qmux/WebSocket/TCP/UDS report size 0). No group
 	// fallback: otherwise off.
 	datagrams: bool,
@@ -2779,7 +2776,7 @@ mod serve_group_test {
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
 			track_priority_seen: 0,
-			version: Version::Lite06Wip,
+			version: Version::Lite06,
 			timescale: Some(crate::Timescale::default()),
 		};
 
@@ -2819,7 +2816,7 @@ mod serve_group_test {
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
 			track_priority_seen: 0,
-			version: Version::Lite06Wip,
+			version: Version::Lite06,
 			timescale: Some(crate::Timescale::default()),
 		};
 
@@ -2862,7 +2859,7 @@ mod serve_group_test {
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
 			track_priority_seen: 0,
-			version: Version::Lite06Wip,
+			version: Version::Lite06,
 			timescale: Some(crate::Timescale::default()),
 		};
 
@@ -2906,7 +2903,7 @@ mod serve_group_test {
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
 			track_priority_seen: 0,
-			version: Version::Lite06Wip,
+			version: Version::Lite06,
 			timescale: Some(crate::Timescale::default()),
 		};
 
@@ -2968,7 +2965,7 @@ mod serve_group_test {
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
 			track_priority_seen: 0,
-			version: Version::Lite06Wip,
+			version: Version::Lite06,
 			timescale: Some(crate::Timescale::default()),
 		};
 
@@ -3037,7 +3034,7 @@ mod serve_group_test {
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
 			track_priority_seen: 0,
-			version: Version::Lite06Wip,
+			version: Version::Lite06,
 			timescale: Some(crate::Timescale::default()),
 		};
 
@@ -3077,7 +3074,7 @@ mod serve_group_test {
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
 			track_priority_seen: 0,
-			version: Version::Lite06Wip,
+			version: Version::Lite06,
 			timescale: Some(crate::Timescale::default()),
 		};
 
@@ -3144,7 +3141,7 @@ mod tests {
 			runtime: crate::time::Clock::tokio(),
 			session: SinkSession::new(Default::default()),
 			origin: origin.consume(),
-			version: Version::Lite06Wip,
+			version: Version::Lite06,
 			peer_setup,
 			goaway,
 			peer_hop: Some(assigned),

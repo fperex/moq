@@ -132,8 +132,8 @@ M2M) with a built-in H.264 software fallback;
 audio is Opus. The camera is opened only while someone is watching, and
 `--bitrate` is the opening ceiling. Backends with live bitrate control lower it
 to fit the connection's bandwidth estimate. `moq devices` prints every source
-id. Requires the `capture` feature; on Linux that needs libclang, V4L2, and
-ALSA headers, and `--display` also needs the `pipewire` feature (links
+id. Requires the `capture` feature; on Linux that needs the ALSA headers for
+the microphone, and `--display` also needs the `pipewire` feature (links
 libpipewire).
 
 ## Transcode
@@ -145,8 +145,9 @@ moq ... transcode --rung 720:2500000 --rung 360:600000 --encoder nvenc --decoder
 
 Publishes `cam.hang/transcode.hang` whose catalog references the source's
 rendition and adds lower rungs that are decoded and encoded only while someone
-watches them. On NVIDIA the whole pipeline stays on the GPU. Requires the
-`transcode` feature.
+watches them. On NVIDIA the whole pipeline stays on the GPU; `--frames cpu`
+forces decoded frames into CPU memory instead of the default `native`.
+Requires the `transcode` feature.
 
 The ladder is sized against the source picture and follows it, so a source that
 changes resolution mid-stream (a window capture renegotiated by a resize, a

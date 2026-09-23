@@ -123,7 +123,7 @@ const browser = await launch(["--autoplay-policy=no-user-gesture-required"]);
 let status = 0;
 let page: Page | undefined;
 try {
-	[page] = await open(browser, pageUrl, { label: values.tag, trace: true });
+	[page] = await open(browser, pageUrl, values.tag, true);
 
 	// The catalog is what says the session is up; without it there is nothing to measure and the
 	// failure is the relay or the publisher, not the player.
