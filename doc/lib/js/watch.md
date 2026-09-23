@@ -221,7 +221,7 @@ separate outages that covered. Turn it off with `conceal` on the audio decoder
 and a gap is a gap again, audibly:
 
 ```ts
-new Watch.Audio.Decoder(source, sync, { conceal: false });
+new Watch.Audio.Decoder({ source, sync, conceal: false });
 ```
 
 It is read when the audio graph is built, since it belongs to the reader inside
