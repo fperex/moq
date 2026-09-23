@@ -1473,6 +1473,8 @@ const durationFormat: ContainerFormat = {
 };
 
 test("Consumer duration-skips a stalled group once it is covered", async () => {
+	// A live stream does this at every group boundary, so it must not read as a warning.
+	const warn = spyOn(console, "warn");
 	const track = new Track.Producer("test");
 	// Latency dwarfs the gap, so only duration coverage can trigger the skip.
 	const consumer = new Consumer(replay(track), { format: durationFormat, maxAge: 10_000 as Time.Milli });
@@ -1493,6 +1495,8 @@ test("Consumer duration-skips a stalled group once it is covered", async () => {
 	const frames = await drainFrames(consumer, 200);
 	expect(frames.map((f) => f.timestamp as number)).toEqual([0, 33_000]);
 	expect(frames.map((f) => f.group)).toEqual([0, 1]);
+	expect(warn).not.toHaveBeenCalled();
+	warn.mockRestore();
 	consumer.close();
 });
 

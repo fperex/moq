@@ -542,7 +542,9 @@ export class Consumer {
 		if (!next || nextStart === undefined || active.end < nextStart) return false;
 
 		this.#groups.shift();
-		console.warn(`skipping covered group: ${active.consumer.sequence} -> ${next.consumer.sequence}`);
+		// Debug rather than warn: a live stream crosses one of these at every group boundary, and
+		// nothing is lost.
+		console.debug(`skipping covered group: ${active.consumer.sequence} -> ${next.consumer.sequence}`);
 		this.#recordPresented(active);
 		this.#active = next.consumer.sequence;
 
