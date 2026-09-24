@@ -25,8 +25,10 @@ export type SourceType = "camera" | "screen" | "file";
  *
  * `always` announces immediately, `never` never announces, and `source` waits until media is
  * actually being captured (a live audio/video track, i.e. permission granted) and then holds until
- * the selected source changes. Defaults to `source` so we don't announce an empty broadcast with no
- * audio/video, while a device being switched or re-acquired keeps its subscribers.
+ * the selected source changes. A camera source waits for every enabled track, so a refused
+ * microphone cannot advertise a partial broadcast. Defaults to `source` so we don't announce an
+ * empty broadcast with no audio/video, while a device being switched or re-acquired keeps its
+ * subscribers.
  */
 export type AnnounceMode = "always" | "source" | "never";
 
@@ -183,23 +185,28 @@ export default class MoqPublish extends HTMLElement {
 			const announce = effect.get(this.controls.announce);
 
 			// A fresh selection has captured nothing yet, so the latch below starts closed.
-			effect.get(this.controls.source);
+			const camera = effect.get(this.controls.source) === "camera";
 			let captured = false;
 
 			effect.run((effect) => {
 				// "source" waits until media is actually being captured -- a live audio or
 				// video track exists -- not merely a source *type* selected. Otherwise we'd
 				// announce an empty broadcast while the getUserMedia/getDisplayMedia
-				// permission prompt is still pending (or after the user denies it).
+				// permission prompt is still pending (or after the user denies it). A camera
+				// source is one publication: it waits for every enabled track, so denying
+				// either permission cannot advertise a partial broadcast.
 				//
-				// It latches: once this selection has produced a track the broadcast stays
+				// It latches: once this selection has produced its tracks the broadcast stays
 				// announced until the selection changes. A track that stops is one source
 				// being switched or re-acquired, not the end of the broadcast, and an
 				// unannounce drops every subscription (catalog included) for the tenth of a
 				// second it takes to open the next device.
-				const hasMedia =
-					effect.get(this.#videoSource) !== undefined || effect.get(this.#audioSource) !== undefined;
-				captured ||= hasMedia;
+				const video = effect.get(this.#videoSource) !== undefined;
+				const audio = effect.get(this.#audioSource) !== undefined;
+				const ready =
+					!camera ||
+					((!effect.get(this.#videoEnabled) || video) && (!effect.get(this.#audioEnabled) || audio));
+				captured ||= (video || audio) && ready;
 				this.#announcing.set(announce === "always" || (announce === "source" && captured));
 			});
 		});

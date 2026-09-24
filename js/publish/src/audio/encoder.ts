@@ -164,6 +164,10 @@ export class Encoder {
 	// discontinuity and re-anchors on.
 	#pipeline: Pipeline | undefined;
 
+	// The exclusive end of the newest frame written to the live track, where a pause's or a demand
+	// gap's discontinuity marker goes. Cleared once a marker is written, so each break is declared once.
+	#end: Time.Micro | undefined;
+
 	// The fatal error an AudioEncoder reported, if any. That instance can never encode again and
 	// reconfiguring it would be a retry, so the rendition stays down for the life of this encoder.
 	#fatal = new Signal<Error | undefined>(undefined);
@@ -265,6 +269,23 @@ export class Encoder {
 			if (!enabled || !format || fatal) return;
 
 			this.#encode(rendition.track, format, effect);
+		});
+
+		// When demand disappears, end the epoch with a discontinuity marker (see
+		// Container.Legacy.Producer.cut) so a later subscriber resumes on the same track without the
+		// pre-gap frames reading as live. Its empty payload marks where the source media ends.
+		effect.run((effect) => {
+			const track = effect.get(rendition.track);
+			if (!track) return;
+			effect.cleanup(() => {
+				const end = this.#end;
+				this.#end = undefined;
+				if (end === undefined || track.closed.peek() !== undefined) return;
+				track.writeFrame({
+					payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
+					timestamp: Time.Timestamp.fromMicros(end),
+				});
+			});
 		});
 
 		effect.run((effect) => {
@@ -392,13 +413,11 @@ export class Encoder {
 
 				const framer = createFramer(resolved, config.sampleRate);
 
-				// Where the audio written so far stops, so muting can say so on the wire. WebCodecs
-				// stamps a duration on the chunk it hands back; the configured frame is the
-				// fallback, which for a fixed-frame codec is its sample count.
+				// How long a chunk lasts when WebCodecs hands one back without stamping its duration:
+				// the configured frame, which for a fixed-frame codec is its sample count. See #end.
 				const frameDuration =
 					resolved.frameDuration ??
 					Time.Micro.fromSecond((AAC_FRAME_SAMPLES / config.sampleRate) as Time.Second);
-				let end: Time.Micro | undefined;
 
 				const encoder = new AudioEncoder({
 					output: (frame, metadata) => {
@@ -416,8 +435,8 @@ export class Encoder {
 						const producer = track.peek();
 						if (!producer) {
 							// Demand went away between framing and encoding, so this chunk is
-							// dropped like the ones the gate below never framed. Either way the
-							// timeline now has a hole in it, which the subscriber detects itself.
+							// dropped like the ones the gate below never framed. The marker
+							// #runRegister wrote as demand left already ends the timeline before it.
 							return;
 						}
 
@@ -428,7 +447,8 @@ export class Encoder {
 							timestamp: Time.Timestamp.fromMicros(frame.timestamp as Time.Micro),
 						});
 
-						end = (frame.timestamp + (frame.duration ?? frameDuration)) as Time.Micro;
+						// Where the audio written so far stops, so a pause can say so on the wire.
+						this.#end = (frame.timestamp + (frame.duration ?? frameDuration)) as Time.Micro;
 					},
 					error: (err) => {
 						console.error("encoder error", err);
@@ -456,6 +476,7 @@ export class Encoder {
 					// whether anything is still feeding the encoder rather than the mute alone.
 					const capture = this.in.capture.peek();
 					const stopped = !this.in.enabled.peek() || !capture || !capture.out.format.peek();
+					const end = this.#end;
 					if (end === undefined || !stopped) return;
 					const producer = track.peek();
 					if (!producer) return;
@@ -464,6 +485,9 @@ export class Encoder {
 						payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
 						timestamp: Time.Timestamp.fromMicros(end),
 					});
+					// The same marker ends a demand gap that follows the pause, so the one #runRegister
+					// writes as demand leaves has nothing left to declare.
+					this.#end = undefined;
 				});
 
 				console.debug("encoding audio", encoderConfig);
@@ -479,10 +503,8 @@ export class Encoder {
 						for (const data of framer.push(input)) {
 							// The demand gate. The framer still consumes every sample so its timestamps stay
 							// on the capture clock, but there is nowhere to send a chunk with no subscriber.
-							// The gap this leaves is a hole in the timeline rather than a declared
-							// pause, and a hole is the subscriber's to find: the first frame after
-							// the gate reopens sits a whole gated interval past the last one, which
-							// is what its decoder measures a break against.
+							// The gap this leaves is declared: #runRegister writes a discontinuity marker
+							// as demand leaves, so the first frame after the gate reopens starts a new run.
 							if (!track.peek()) continue;
 
 							// AudioEncoder can count output samples continuously across input timestamp

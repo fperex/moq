@@ -133,6 +133,8 @@ describe("a rendition that stops encoding", () => {
 			appendGroup: () => {
 				throw new Error("audio wrote a group of its own");
 			},
+			// Open throughout, as the broadcast keeps a rendition's track across demand gaps.
+			closed: { peek: () => undefined },
 		};
 	}
 
@@ -239,6 +241,25 @@ describe("a rendition that stops encoding", () => {
 		}
 	});
 
+	test("declares a pause once when the last subscriber leaves during it", async () => {
+		using _codecs = installFakeAudioCodecs();
+		const { encoder, enabled, rendition, written } = await encoding();
+
+		try {
+			FakeAudioEncoder.last?.output(chunk(0, 20_000));
+			enabled.set(false);
+			await settle();
+			expect(written).toHaveLength(2); // the frame, then the endpoint
+
+			// That endpoint already ends the timeline, so the demand gap after it has nothing to add.
+			rendition.track.set(undefined);
+			await settle();
+			expect(written).toHaveLength(2);
+		} finally {
+			encoder.close();
+		}
+	});
+
 	test("declares nothing when it never encoded anything", async () => {
 		using _codecs = installFakeAudioCodecs();
 		const { encoder, enabled, written } = await encoding();
@@ -252,7 +273,7 @@ describe("a rendition that stops encoding", () => {
 		}
 	});
 
-	test("writes only media after an interval with no subscriber", async () => {
+	test("declares an interval with no subscriber and writes only media after it", async () => {
 		using _codecs = installFakeAudioCodecs();
 		const { encoder, rendition, written } = await encoding();
 
@@ -261,23 +282,28 @@ describe("a rendition that stops encoding", () => {
 			expect(written).toHaveLength(1);
 
 			// The last subscriber leaves. The pipeline deliberately outlives any one subscription, so
-			// nothing tears down and nothing writes an endpoint: the frames encoded meanwhile are
-			// simply dropped, leaving a hole in the timeline.
+			// nothing tears down, and the track outlives it too: the endpoint where the audio stopped
+			// is what a later subscriber lands on, rather than the stale frame before it. The frames
+			// encoded meanwhile are dropped.
 			rendition.track.set(undefined);
 			await settle();
-			FakeAudioEncoder.last?.output(chunk(20_000, 20_000));
-			expect(written).toHaveLength(1);
+			expect(written).toHaveLength(2);
+			const [timestamp, payload] = Moq.Varint.decode(written[1].payload);
+			expect(timestamp).toBe(20_000);
+			expect(payload.byteLength).toBe(0);
 
-			// A new subscriber arrives. The hole the gate left is the subscriber's to find, since
-			// its first frame sits the whole gated interval past the last one, so this writes media
+			FakeAudioEncoder.last?.output(chunk(20_000, 20_000));
+			expect(written).toHaveLength(2);
+
+			// A new subscriber arrives. The endpoint already opened the break, so this writes media
 			// and nothing else.
 			rendition.track.set(trackOf(written));
 			await settle();
 			FakeAudioEncoder.last?.output(chunk(40_000_000, 20_000));
-			expect(written).toHaveLength(2);
+			expect(written).toHaveLength(3);
 
 			FakeAudioEncoder.last?.output(chunk(40_020_000, 20_000));
-			expect(written).toHaveLength(3);
+			expect(written).toHaveLength(4);
 		} finally {
 			encoder.close();
 		}
@@ -340,12 +366,12 @@ describe("a rendition that stops encoding", () => {
 			await settle();
 			expect(second.closed.peek()).toBeUndefined();
 
-			// The track kept running, so the group it held before the mute is still there: the
-			// subscription is served from it rather than answered from a finished track. Nothing was
-			// added while nobody was listening, because the rendition handle is demand-gated and the
-			// mute stopped the encoder with it.
+			// The track kept running, so the subscription is served from it rather than answered from
+			// a finished track. The newest thing on it is the endpoint written as the last subscriber
+			// left, where the audio stopped: nothing else was added while nobody was listening,
+			// because the rendition handle is demand-gated.
 			const drain = draining(second);
-			expect(await drain()).toBe(0);
+			expect(await drain()).toBe(20_000);
 
 			// A new chunk at the live timestamp is published on the same track.
 			FakeAudioEncoder.last?.output(chunk(3_020_000, 20_000));

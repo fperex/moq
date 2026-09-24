@@ -1085,7 +1085,12 @@ export class Decoder {
 	// away here would spend the declared pause as a flush instead of playing it out, and leave the
 	// ring parked with nothing to un-park it. A hole or a conviction has no tail to protect and
 	// still resets.
-	#onNext(next: { discontinuity: number; end?: Time.Micro; frame?: { timestamp: Time.Micro } }): boolean {
+	#onNext(next: {
+		discontinuity: number;
+		group: number;
+		end?: Time.Micro;
+		frame?: { timestamp: Time.Micro };
+	}): boolean {
 		if (!this.#terminal.update(next)) return false;
 		if (!this.#ended) this.#ring?.reset();
 		this.sync.reset();

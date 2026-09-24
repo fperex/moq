@@ -47,8 +47,8 @@
 		"demo/web",
 		"js/moq-boy",
 		"test/audio-quality/clients/js",
-		"test/smoke/clients/js",
-		"test/smoke/clients/js-native",
+		"test/interop/clients/js",
+		"test/interop/clients/js-native",
 		"test/wasm"
 	]
 }

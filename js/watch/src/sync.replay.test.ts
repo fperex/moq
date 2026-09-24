@@ -473,7 +473,7 @@ async function session({
 			track.spread.set(jitter.value.peek());
 			sync.received(media as Time.Milli, "audio");
 
-			terminal.update({ discontinuity: 0, frame: { timestamp } });
+			terminal.update({ discontinuity: 0, group: 0, frame: { timestamp } });
 			const hole = !terminal.continues(timestamp);
 			if (hole && reanchor) {
 				terminal.reanchor();

@@ -109,9 +109,10 @@ owns the clock, video follows the audio playhead instead.
 Each role follows the catalog for as long as it lasts. Each decoder starts at
 the newest cached group, including when a rendition is reopened, so playback
 does not replay the retained backlog. A publisher that retires the rendition
-being played ends that track and the role picks a replacement. Playback is
-behind the `play` feature, since it pulls in windowing and audio-device
-dependencies:
+being played ends that track and the role picks a replacement. A retired audio
+rendition plays out everything it buffered; the last of it, still in the
+speaker, overlaps its replacement filling up. Playback is behind the `play`
+feature, since it pulls in windowing and audio-device dependencies:
 
 ```bash
 cargo install moq-cli --no-default-features --features "iroh,noq,websocket,play"

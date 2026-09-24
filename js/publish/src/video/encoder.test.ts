@@ -96,7 +96,7 @@ test("encoding tracks encoder config in its child effect", async () => {
 	}
 });
 
-test("a demand gap leaves the broadcast-owned track open for resume", async () => {
+test("a demand gap cuts the group and leaves the broadcast-owned track open for resume", async () => {
 	using _videoEncoder = installFakeVideoEncoder();
 	const cut = spyOn(Container.Legacy.Producer.prototype, "cut");
 
@@ -125,6 +125,7 @@ test("a demand gap leaves the broadcast-owned track open for resume", async () =
 		live.set(undefined);
 		await settle();
 		expect(track.closed.peek()).toBeUndefined();
+		expect(cut).toHaveBeenCalledTimes(1);
 
 		live.set(track);
 		await settle();

@@ -530,7 +530,7 @@ test("a rate change after the gesture rebuilds inside the grace and re-arms outs
 test("a player taken off the page releases its context", async () => {
 	// A context is a render thread and one of the handful a browser allows, and a player that is
 	// not in the document can never be heard out of. Held past the detach, a page that cycles its
-	// tiles runs out of contexts and the smoke lane's resource baseline never comes back to zero.
+	// tiles runs out of contexts and the media lane's resource baseline never comes back to zero.
 	const { decoder: built, attached, close } = decoder(true);
 	await flush();
 

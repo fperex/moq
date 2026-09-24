@@ -5,8 +5,8 @@ import { type Effect, Signal } from "@moq/signals";
  *
  * A `MediaStreamTrack` ends when the device disappears, the OS revokes it, or another application
  * takes an exclusive device, and the reopen that follows can itself fail. Both spend budget, so a
- * device that never works stops being asked. A device that is merely busy is not one of those: see
- * {@link BUSY}.
+ * device that never works stops being asked, and a refusal stops it at once: see {@link refused}. A
+ * device that is merely busy is not one of those: see {@link BUSY}.
  *
  * Every outcome reruns the owning effect, including running out of budget. That rerun is what clears
  * `out.source` and stops the stream, via the cleanup the previous run registered, so no caller has to
@@ -111,6 +111,29 @@ export class Retry {
 		this.#wait = this.#delay * (0.5 + Math.random() / 2);
 		this.#delay = Math.min(this.#delay * Retry.DELAY.multiplier, Retry.DELAY.max);
 		this.#rerun.update((rerun) => rerun + 1);
+	}
+
+	/** Stop attempting this capture until its settings, device list, or permission changes. */
+	terminal(): void {
+		this.#failures = Retry.LIMIT + 1;
+		this.#wait = undefined;
+		this.#rerun.update((rerun) => rerun + 1);
+	}
+
+	/**
+	 * `getUserMedia` refused. A device that is merely {@link BUSY} is tried again like any other
+	 * failure; any other refusal is reported into `error` and is {@link terminal}, since asking again
+	 * with nothing changed only earns the same answer.
+	 */
+	refused(reason: unknown): void {
+		const error = asError(reason);
+		if (Retry.BUSY.includes(error.name)) {
+			this.failed(error);
+			return;
+		}
+
+		this.#error.set(error);
+		this.terminal();
 	}
 
 	/** The attempt produced a live track. Reruns the effect if it dies. */

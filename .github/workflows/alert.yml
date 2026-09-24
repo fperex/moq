@@ -35,6 +35,7 @@ on:
       - Cache
       - Cachix
       - Docker
+      - Interop
       - libmoq
       - moq-cli
       - moq-gst
@@ -55,7 +56,6 @@ on:
       - Release Swift Lib
       - release-winget
       - rpm-repo
-      - Smoke
       - Swift
     types:
       - completed

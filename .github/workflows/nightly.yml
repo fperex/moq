@@ -78,6 +78,14 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
 
+      # A single route re-price should expose any slope over the route table or
+      # over independent observers of the new live broadcast map.
+      - name: JS origin broadcast map benchmark
+        if: ${{ !cancelled() }}
+        run: |
+          nix develop --command bun install --frozen-lockfile
+          nix develop --command bun js/net/bench/broadcasts.ts
+
       - name: Audit
         if: ${{ !cancelled() }}
         run: nix develop --command just rs audit
@@ -147,7 +155,7 @@ jobs:
   # what the listener would have heard against `test/audio-quality/budgets.json`.
   #
   # `ubuntu-latest` rather than the arm runner the jobs above use: this is the
-  # third lane in the repository to launch Playwright's Chromium, and smoke.yml
+  # third lane in the repository to launch Playwright's Chromium, and interop.yml
   # and wasm.yml both run theirs on x86 for that reason.
   #
   # audio-quality.yml runs this same job on demand. Keep the two in step.
