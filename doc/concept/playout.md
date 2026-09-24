@@ -505,10 +505,12 @@ Capture, encoding, transport and output-device delays also contribute to the
 end-to-end delay.
 
 The browser's message-based audio buffer timestamps each playhead sample at the
-end of its render quantum. The main thread maps that audio context time through
-`AudioContext.getOutputTimestamp()` before using it to pace video. Message
-delivery time varies with main-thread load; using it as the playback timestamp
-would turn that scheduling jitter into uneven video frame releases.
+end of its render quantum. Whichever thread writes the ring, the page's audio
+worker by default or the page itself, maps that audio context time through
+`AudioContext.getOutputTimestamp()` before the playhead paces video. Only the
+page can call it, so it samples it for the worker once a second. Message
+delivery time varies with the receiving thread's load; using it as the playback
+timestamp would turn that scheduling jitter into uneven video frame releases.
 
 The renderer can retain two adjacent frames spanning at most 20 ms of media and
 paint them on separate display refreshes. Keeping that pair prevents an unpainted
