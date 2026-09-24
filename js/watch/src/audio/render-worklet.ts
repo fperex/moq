@@ -24,13 +24,22 @@ class Render extends AudioWorkletProcessor {
 	// The state message, refilled for every post: `postMessage` copies it on the way out, so one
 	// object serves, rather than a fresh one for this thread's collector every few quanta.
 	#state?: State;
+	// Every port the ring is fed from: the node's own, plus any a writer off the main thread handed
+	// over. State reports go to all of them.
+	#ports: MessagePort[] = [];
 
 	constructor() {
 		super();
+		this.#listen(this.port);
+	}
 
-		this.port.onmessage = (event: MessageEvent<Message>) => {
+	#listen(port: MessagePort): void {
+		this.#ports.push(port);
+		port.onmessage = (event: MessageEvent<Message>) => {
 			const msg = event.data;
-			if (msg.type === "init-shared") {
+			if (msg.type === "port") {
+				this.#listen(msg.port);
+			} else if (msg.type === "init-shared") {
 				const previous = this.#backend instanceof SharedRingBuffer ? this.#backend : undefined;
 				this.#backend = new SharedRingBuffer(msg, previous);
 				this.#reset(msg.rate, msg.channels, msg.conceal);
@@ -128,7 +137,7 @@ class Render extends AudioWorkletProcessor {
 					this.#state.playhead = playhead;
 					this.#state.debug = debug;
 				}
-				this.port.postMessage(this.#state);
+				for (const port of this.#ports) port.postMessage(this.#state);
 			}
 		}
 

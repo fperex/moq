@@ -130,7 +130,8 @@ function samplesToMicro(samples: number, rate: number): Time.Micro {
 }
 
 /**
- * Unified interface for the audio buffer between the main thread and the AudioWorklet.
+ * Unified interface for the audio buffer between the thread that decodes (the page, or a dedicated
+ * worker) and the AudioWorklet.
  *
  * Two implementations exist:
  *   - `SharedAudioBuffer`: backed by SharedArrayBuffer, lock-free writes via Atomics.
@@ -248,10 +249,16 @@ export interface AudioBufferProps {
 }
 
 /**
+ * Where a ring's writes go: the render worklet's node, or any port the worklet takes ring writes from
+ * (see `Port` in `render.ts`), which is how a writer off the main thread reaches it.
+ */
+export type RingTarget = Pick<AudioWorkletNode, "port">;
+
+/**
  * Create the best audio buffer implementation for the current environment.
  * Picks `SharedAudioBuffer` when possible, falling back to `PostAudioBuffer`.
  */
-export function createAudioBuffer(worklet: AudioWorkletNode, props: AudioBufferProps): AudioBuffer {
+export function createAudioBuffer(worklet: RingTarget, props: AudioBufferProps): AudioBuffer {
 	const shared = supportsSharedArrayBuffer();
 	reportTransport(shared);
 	return shared ? new SharedAudioBuffer(worklet, props) : new PostAudioBuffer(worklet, props);
@@ -288,7 +295,7 @@ function reportTransport(shared: boolean): void {
 class SharedAudioBuffer implements AudioBuffer {
 	readonly rate: number;
 	readonly channels: number;
-	#worklet: AudioWorkletNode;
+	#worklet: RingTarget;
 	#ring: SharedRingBuffer;
 
 	readonly #timestamp = new Signal<Time.Micro | undefined>(undefined);
@@ -313,7 +320,7 @@ class SharedAudioBuffer implements AudioBuffer {
 
 	#signals = new Effect();
 
-	constructor(worklet: AudioWorkletNode, props: AudioBufferProps) {
+	constructor(worklet: RingTarget, props: AudioBufferProps) {
 		const { channels, rate, latency, buffered } = props;
 		this.#worklet = worklet;
 		this.channels = channels;
@@ -428,7 +435,7 @@ class SharedAudioBuffer implements AudioBuffer {
 class PostAudioBuffer implements AudioBuffer {
 	readonly rate: number;
 	readonly channels: number;
-	#worklet: AudioWorkletNode;
+	#worklet: RingTarget;
 
 	readonly #timestamp = new Signal<Time.Micro | undefined>(undefined);
 	readonly timestamp: Getter<Time.Micro | undefined> = this.#timestamp;
@@ -456,7 +463,7 @@ class PostAudioBuffer implements AudioBuffer {
 
 	#signals = new Effect();
 
-	constructor(worklet: AudioWorkletNode, props: AudioBufferProps) {
+	constructor(worklet: RingTarget, props: AudioBufferProps) {
 		const { channels, rate, buffered, conceal } = props;
 		this.#worklet = worklet;
 		this.channels = channels;
