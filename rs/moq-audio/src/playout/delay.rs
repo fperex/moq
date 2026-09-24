@@ -71,12 +71,6 @@ pub(crate) const LOWER_DIVISOR: f64 = 6.0;
 /// that froze once.
 pub(crate) const HOLD: f64 = 30_000.0;
 
-/// How far a run-dry report may land from the last arrival flagged `stalled` and still
-/// count, in milliseconds.
-///
-/// The report that counts lands one ring read (50ms at most) after the decoder inserts the backlog those arrivals opened, and four of those cover a page still catching up after a freeze.
-pub(crate) const STALL_WINDOW: f64 = 200.0;
-
 /// Width of one histogram bucket in milliseconds, and the resolution of the target.
 ///
 /// The target is always a whole number of buckets, so a consumer asking whether the
@@ -162,9 +156,6 @@ pub(crate) struct Jitter {
 
 	/// The level playout's run-dries asked for, while their hold lasts.
 	held: Option<Held>,
-
-	/// When the last arrival flagged `stalled` landed, on the arrival clock.
-	stalled_at: Option<f64>,
 }
 
 impl Jitter {
@@ -208,7 +199,6 @@ impl Jitter {
 			target: start,
 			lowered: None,
 			held: None,
-			stalled_at: None,
 		}
 	}
 
@@ -224,13 +214,6 @@ impl Jitter {
 		// arithmetic. The two clocks are never compared: every formula below is a
 		// difference of differences, so a constant offset between them cancels.
 		let ts = timestamp.as_secs_f64() * 1000.0;
-
-		// Whatever order the frame came in, the receiver was blocked before it was read:
-		// that is what makes a run-dry reported around now the receiver's own. See
-		// `starved`.
-		if observation.stalled {
-			self.stalled_at = Some(now);
-		}
 
 		if observation.reordered || self.newest.is_some_and(|newest| ts <= newest) {
 			// Costing a reordered arrival as delay against loss is a separate step,
@@ -298,33 +281,13 @@ impl Jitter {
 	}
 
 	/// Raise the target to cover the `gap` of audio playout just ran out of, and keep
-	/// it up for a while, when the receiver's own block caused it.
+	/// it up for a while.
 	///
-	/// A receiver that keeps freezing is a receiver the arrivals never convict once
-	/// whoever watched it flags them `stalled`: the wait in them is its own, so nothing
-	/// about them says the buffer is too shallow. Running dry does. `now` is on the
-	/// arrival clock.
-	///
-	/// Nothing native calls it. A native receiver never flags an arrival: the task that
-	/// froze is the one that stamps the packets, so its arrivals carry the freeze to
-	/// the histogram themselves. It is here so the shared corpus holds both languages
-	/// to the same algorithm.
-	#[cfg_attr(
-		not(test),
-		expect(dead_code, reason = "native arrivals are never flagged stalled; the corpus holds it")
-	)]
+	/// A receiver that keeps freezing is a receiver the arrivals never convict: the
+	/// wait in them is its own, and whoever watched it discounts it, so nothing about
+	/// them says the buffer is too shallow. Running dry does. `now` is on the arrival
+	/// clock.
 	pub(crate) fn starved(&mut self, gap: Duration, now: f64) {
-		// Only a run-dry the receiver itself caused. Media that is late reaches the
-		// histogram when it lands, and media that is lost no buffer brings back, so
-		// raising the target for either buys latency and nothing else. What tells them
-		// apart is whether the arrivals around the report came out of a block.
-		if !self
-			.stalled_at
-			.is_some_and(|stalled| (now - stalled).abs() <= STALL_WINDOW)
-		{
-			return;
-		}
-
 		// Exact for a whole number of nanoseconds, where `as_secs_f64() * 1000.0` rounds
 		// twice and can land a hair above a bucket edge the ceiling below then counts.
 		let gap = gap.as_nanos() as f64 / 1_000_000.0;
@@ -929,100 +892,26 @@ mod tests {
 		Duration::from_millis(value)
 	}
 
-	/// The page itself was blocked: the frame it held at `media` is read out of the block
-	/// flagged `stalled`, 50ms after its timestamp like the rest of the path. Returns when it
-	/// landed.
-	fn blocked(jitter: &mut Jitter, media: f64) -> f64 {
-		let now = media + 50.0;
-		jitter.observe(
-			Duration::from_secs_f64(media / 1000.0),
-			now,
-			Observation {
-				stalled: true,
-				..Default::default()
-			},
-		);
-		now
-	}
-
 	/// A clean path asks for one bucket. The receiver froze for 120ms with 40ms held, and the
 	/// frames it was not reading are discounted as its own wait, so the 82ms the player ran dry is
 	/// the only thing that says the target was too low.
 	#[test]
 	fn a_run_dry_raises_the_target_at_once() {
 		let mut jitter = Jitter::new();
-		steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		let now = blocked(&mut jitter, after(500, 20.0, 0.0));
-		assert_eq!(jitter.target(), ms(20));
-
-		jitter.starved(ms(82), now);
-		assert_eq!(jitter.target(), ms(120));
-	}
-
-	/// The same report with no stalled arrival near it: lost media, a path that stopped, or a
-	/// tune-in, which the arrivals measure or no buffer can fix.
-	#[test]
-	fn a_run_dry_the_page_did_not_cause_changes_nothing() {
-		let mut reported = Jitter::new();
-		let mut control = Jitter::new();
-		let now = steady(&mut reported, 500, 20.0, 50.0, 0.0);
-		steady(&mut control, 500, 20.0, 50.0, 0.0);
-		reported.starved(ms(82), now);
-		assert_eq!(reported.target(), ms(20));
-
-		// Nor later: the report did not start a hold either.
-		steady(&mut reported, 500, 20.0, 50.0, after(500, 20.0, 0.0));
-		steady(&mut control, 500, 20.0, 50.0, after(500, 20.0, 0.0));
-		assert_eq!(reported.target(), control.target());
-	}
-
-	#[test]
-	fn a_run_dry_reported_further_than_the_window_from_a_block_changes_nothing() {
-		let mut jitter = Jitter::new();
-		steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		let stalled = blocked(&mut jitter, after(500, 20.0, 0.0));
-
-		let frames = 2 + (STALL_WINDOW / 20.0).ceil() as usize;
-		let now = steady(&mut jitter, frames, 20.0, 50.0, after(501, 20.0, 0.0));
-		assert!(now - stalled > STALL_WINDOW);
-		jitter.starved(ms(82), now);
-		assert_eq!(jitter.target(), ms(20));
-	}
-
-	#[test]
-	fn a_run_dry_reported_at_the_edge_of_the_window_counts() {
-		let mut jitter = Jitter::new();
-		steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		let stalled = blocked(&mut jitter, after(500, 20.0, 0.0));
-		jitter.starved(ms(82), stalled + STALL_WINDOW);
-		assert_eq!(jitter.target(), ms(120));
-	}
-
-	/// The flag says the page was blocked before this frame was read, whatever order it came in.
-	#[test]
-	fn a_block_on_a_reordered_frame_counts() {
-		let mut jitter = Jitter::new();
 		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		jitter.observe(
-			Duration::from_secs_f64((after(500, 20.0, 0.0) - 40.0) / 1000.0),
-			now + 20.0,
-			Observation {
-				stalled: true,
-				..Default::default()
-			},
-		);
-		jitter.starved(ms(82), now + 20.0);
+		assert_eq!(jitter.target(), ms(20));
+
+		jitter.starved(ms(82), now);
 		assert_eq!(jitter.target(), ms(120));
 	}
 
 	#[test]
 	fn a_run_dry_holds_the_target_until_hold_after_the_report_then_falls() {
 		let mut jitter = Jitter::new();
-		steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		let at = blocked(&mut jitter, after(500, 20.0, 0.0));
+		let at = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
 		jitter.starved(ms(82), at);
 
-		let start = after(501, 20.0, 0.0);
+		let start = after(500, 20.0, 0.0);
 		let mut previous = jitter.target();
 		let mut bottom = None;
 		for i in 0..((HOLD + 10_000.0) / 20.0) as u64 {
@@ -1054,26 +943,23 @@ mod tests {
 		assert!(bottom <= at + HOLD + 5000.0 + 20.0, "{}", bottom - at);
 	}
 
-	/// The page blocks again and the run-dry is reported with nothing to add: the level stays and
-	/// the hold is measured from the new report.
+	/// The same run-dry reported again with nothing to add keeps the level and restarts the hold.
 	#[test]
 	fn a_report_restarts_the_hold_and_only_raises_the_level() {
 		let mut jitter = Jitter::new();
-		steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		let now = blocked(&mut jitter, after(500, 20.0, 0.0));
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
 		jitter.starved(ms(82), now);
 		assert_eq!(jitter.target(), ms(120));
 
-		steady(&mut jitter, 500, 20.0, 50.0, after(501, 20.0, 0.0));
-		let now = blocked(&mut jitter, after(1001, 20.0, 0.0));
+		let now = steady(&mut jitter, 500, 20.0, 50.0, after(500, 20.0, 0.0));
 		jitter.starved(Duration::ZERO, now);
 		assert_eq!(jitter.target(), ms(120));
 
 		let frames = ((HOLD - 1000.0) / 20.0) as usize;
-		steady(&mut jitter, frames, 20.0, 50.0, after(1002, 20.0, 0.0));
+		steady(&mut jitter, frames, 20.0, 50.0, after(1000, 20.0, 0.0));
 		assert_eq!(jitter.target(), ms(120));
 
-		steady(&mut jitter, 250, 20.0, 50.0, after(1002 + frames, 20.0, 0.0));
+		steady(&mut jitter, 250, 20.0, 50.0, after(1000 + frames, 20.0, 0.0));
 		assert!(jitter.target() < ms(120), "{:?}", jitter.target());
 	}
 
@@ -1082,11 +968,9 @@ mod tests {
 	#[test]
 	fn a_later_run_dry_adds_to_the_target_it_raised() {
 		let mut jitter = Jitter::new();
-		steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		let now = blocked(&mut jitter, after(500, 20.0, 0.0));
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
 		jitter.starved(ms(82), now);
-		steady(&mut jitter, 75, 20.0, 50.0, after(501, 20.0, 0.0));
-		let now = blocked(&mut jitter, after(576, 20.0, 0.0));
+		let now = steady(&mut jitter, 75, 20.0, 50.0, after(500, 20.0, 0.0));
 		jitter.starved(ms(5), now);
 		assert_eq!(jitter.target(), ms(140));
 	}
@@ -1097,16 +981,14 @@ mod tests {
 	fn the_histogram_above_the_held_level_decides() {
 		let mut reported = Jitter::new();
 		let mut control = Jitter::new();
-		steady(&mut reported, 100, 20.0, 50.0, 0.0);
+		let now = steady(&mut reported, 100, 20.0, 50.0, 0.0);
 		steady(&mut control, 100, 20.0, 50.0, 0.0);
-		let now = blocked(&mut reported, after(100, 20.0, 0.0));
-		blocked(&mut control, after(100, 20.0, 0.0));
 		reported.starved(ms(40), now);
 		assert_eq!(reported.target(), ms(60));
 
 		let mut joined = false;
 		for i in 0..((HOLD + 10_000.0) / 20.0) as u64 {
-			let frame = 101 + i;
+			let frame = 100 + i;
 			// Seven frames flushed at once, the packing the public relay serves.
 			let flushed = ((frame / 7) * 7 + 6) * 20 + 50;
 			for jitter in [&mut reported, &mut control] {
@@ -1129,17 +1011,16 @@ mod tests {
 		let mut jitter = Jitter::new();
 		jitter.observe(ms(0), 50.0, Observation::default());
 		jitter.observe(ms(20), 70.0, Observation::default());
-		let now = blocked(&mut jitter, 40.0);
 		assert_eq!(jitter.target(), ms(80));
 
-		jitter.starved(ms(60), now);
+		jitter.starved(ms(60), 80.0);
 		assert_eq!(jitter.target(), ms(140));
 
-		steady(&mut jitter, 50, 20.0, 50.0, 60.0);
+		steady(&mut jitter, 50, 20.0, 50.0, 40.0);
 		assert_eq!(jitter.target(), ms(140));
 
 		let mut control = Jitter::new();
-		steady(&mut control, 53, 20.0, 50.0, 0.0);
+		steady(&mut control, 52, 20.0, 50.0, 0.0);
 		assert_eq!(control.target(), ms(20));
 	}
 
@@ -1148,14 +1029,12 @@ mod tests {
 	#[test]
 	fn an_expired_hold_starts_over_from_the_target() {
 		let mut jitter = Jitter::new();
-		steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		let now = blocked(&mut jitter, after(500, 20.0, 0.0));
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
 		jitter.starved(ms(82), now);
 		let frames = ((HOLD + 2500.0) / 20.0) as usize;
-		steady(&mut jitter, frames, 20.0, 50.0, after(501, 20.0, 0.0));
+		let now = steady(&mut jitter, frames, 20.0, 50.0, after(500, 20.0, 0.0));
 		assert_eq!(jitter.target(), ms(80));
 
-		let now = blocked(&mut jitter, after(501 + frames, 20.0, 0.0));
 		jitter.starved(ms(10), now);
 		assert_eq!(jitter.target(), ms(100));
 	}
@@ -1163,8 +1042,7 @@ mod tests {
 	#[test]
 	fn a_run_dry_never_raises_the_target_past_the_ceiling() {
 		let mut jitter = Jitter::new();
-		steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		let now = blocked(&mut jitter, after(500, 20.0, 0.0));
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
 		jitter.starved(ms(5000), now);
 		assert_eq!(jitter.target(), CEILING);
 	}
@@ -1173,8 +1051,7 @@ mod tests {
 	#[test]
 	fn reanchoring_keeps_a_running_hold() {
 		let mut jitter = Jitter::new();
-		steady(&mut jitter, 500, 20.0, 50.0, 0.0);
-		let now = blocked(&mut jitter, after(500, 20.0, 0.0));
+		let now = steady(&mut jitter, 500, 20.0, 50.0, 0.0);
 		jitter.starved(ms(82), now);
 
 		// The media timeline jumps a hundred seconds ahead; the wall clock does not.

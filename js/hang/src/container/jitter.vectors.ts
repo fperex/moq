@@ -19,7 +19,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Time } from "@moq/net";
-import { HOLD, Jitter, STALL_WINDOW } from "./jitter.ts";
+import { HOLD, Jitter } from "./jitter.ts";
 
 /** The corpus format, so a reader can tell a schema change from a value change. */
 export const ALGORITHM = "moq-playout-01";
@@ -76,7 +76,6 @@ export type Corpus = {
 		lower_interval_ms: number;
 		lower_divisor: number;
 		hold_ms: number;
-		stall_window_ms: number;
 	};
 	cases: Case[];
 };
@@ -94,7 +93,6 @@ const CONSTANTS: Corpus["constants"] = {
 	lower_interval_ms: 1000,
 	lower_divisor: 6,
 	hold_ms: HOLD,
-	stall_window_ms: STALL_WINDOW,
 };
 
 /** Replay one trace through the estimator and collect the target after each entry. */
@@ -215,32 +213,6 @@ function stalled(
 		const queued = read > a.arrival_ms;
 		return { ...a, arrival_ms: grid(read), ...(flag && queued ? { stalled: true } : {}) };
 	});
-}
-
-// A receiver whose page blocks for `stall` ms at each of `freezes`: the frames that land meanwhile
-// are all read the moment it ends, flagged `stalled`, and the player reports the run-dry `delay` ms
-// after that, for `gap` ms. A report lands after every arrival at or before it, so the clock the
-// estimator reads never runs backwards.
-function frozen(arrivals: Arrival[], freezes: { at: number; stall: number; gap: number; delay?: number }[]): Event[] {
-	let frames = arrivals;
-	for (const { at, stall } of freezes) {
-		frames = frames.map((a) =>
-			a.arrival_ms >= at && a.arrival_ms < at + stall ? { ...a, arrival_ms: grid(at + stall), stalled: true } : a,
-		);
-	}
-	const reports: Starved[] = freezes.map(({ at, stall, gap, delay = 0 }) => ({
-		starved_ms: gap,
-		arrival_ms: grid(at + stall + delay),
-	}));
-
-	const events: Event[] = [];
-	let next = 0;
-	for (const arrival of frames) {
-		while (next < reports.length && reports[next].arrival_ms < arrival.arrival_ms) events.push(reports[next++]);
-		events.push(arrival);
-	}
-	while (next < reports.length) events.push(reports[next++]);
-	return events;
 }
 
 function cases(): { name: string; description: string; start_ms?: number; arrivals: Event[] }[] {
@@ -430,27 +402,26 @@ function cases(): { name: string; description: string; start_ms?: number; arriva
 		},
 		{
 			name: "run-dry",
-			description: `The steady path, and six seconds in the receiver's page blocks for 120ms: the frames that land meanwhile are read out of the block flagged stalled, so none of them reaches the histogram, and the player reports running dry for 82ms as the backlog comes in. That is a run-dry the page itself caused, so the target rises from 20ms to 120ms at once, holds there for ${HOLD / 1000}s after the report, and then falls a bucket a second like any other rise.`,
-			arrivals: frozen(paced({ frames: 300 + HOLD / FRAME_MS + 350, base: 50, spread: 2, seed: 83 }), [
-				{ at: 6000, stall: 120, gap: 82 },
-			]),
+			description: `The steady path, and six seconds in the player reports running dry for 82ms, which nothing in the arrivals shows: a receiver freeze whose frames it discounts as its own wait. The target rises from 20ms to 120ms at once, holds there for ${HOLD / 1000}s after the report, and then falls a bucket a second like any other rise.`,
+			arrivals: starved(
+				paced({ frames: 300 + HOLD / FRAME_MS + 350, base: 50, spread: 2, seed: 83 }),
+				[300],
+				() => 82,
+			),
 		},
 		{
 			name: "run-dry-repeated",
-			description: `The same path with the page blocking for 120ms every 1.5s, twenty times, and a report after each. The first asks for 82ms on top of 20ms and the other nineteen for nothing beyond the level it raised, so none of them moves the target, but each restarts the hold: the target stays at 120ms for all 30s of them and falls only ${HOLD / 1000}s after the last.`,
-			arrivals: frozen(
+			description: `The same path with twenty reports 1.5s apart. The first asks for 82ms on top of 20ms and the other nineteen for nothing beyond the level it raised, so none of them moves the target, but each restarts the hold: the target stays at 120ms for all 30s of them and falls only ${HOLD / 1000}s after the last.`,
+			arrivals: starved(
 				paced({ frames: 300 + 19 * 75 + HOLD / FRAME_MS + 350, base: 50, spread: 2, seed: 89 }),
-				Array.from({ length: 20 }, (_, index) => ({
-					at: 6000 + index * 1500,
-					stall: 120,
-					gap: index === 0 ? 82 : 0,
-				})),
+				Array.from({ length: 20 }, (_, report) => 300 + report * 75),
+				(report) => (report === 0 ? 82 : 0),
 			),
 		},
 		{
 			name: "run-dry-below-histogram",
-			description: `Two seconds of the steady path ending in a 120ms page block and a report of 40ms, which raises the target to 60ms, and then a publisher flushing seven frames at once for the rest of the trace. The arrivals ask for 140ms on their own, above the held level, so from the first flush the target is what they give with no report at all, through the end of the ${HOLD / 1000}s hold and past it.`,
-			arrivals: frozen(
+			description: `Two seconds of the steady path, a report of 40ms that raises the target to 60ms, and then a publisher flushing seven frames at once for the rest of the trace. The arrivals ask for 140ms on their own, above the held level, so from the first flush the target is what they give with no report at all, through the end of the ${HOLD / 1000}s hold and past it.`,
+			arrivals: starved(
 				[
 					...paced({ frames: 100, base: 50, spread: 2, seed: 97 }),
 					...paced({
@@ -462,30 +433,15 @@ function cases(): { name: string; description: string; start_ms?: number; arriva
 						start: 2000,
 					}),
 				],
-				[{ at: 1800, stall: 120, gap: 40 }],
+				[100],
+				() => 40,
 			),
 		},
 		{
 			name: "run-dry-before-measurement",
 			description:
-				"A 120ms page block and a report of 60ms before the first resample interval has closed, while the target is still the 80ms cold-start prior. A run-dry is not a guess, so it raises the prior to 140ms at once, and the first measurement, which replaces a prior outright with the 20ms this path settles on, lands on the held level instead.",
-			arrivals: frozen(paced({ frames: 250, base: 50, spread: 2, seed: 103 }), [
-				{ at: 100, stall: 120, gap: 60 },
-			]),
-		},
-		{
-			name: "run-dry-unstalled",
-			description:
-				"The steady path and a report of 82ms six seconds in, with no page block anywhere: the ring ran dry because media was late or lost, which the arrivals measure or no buffer can fix. The report changes nothing, and the series is the steady path's.",
-			arrivals: starved(paced({ frames: 500, base: 50, spread: 2, seed: 107 }), [300], () => 82),
-		},
-		{
-			name: "run-dry-outside-window",
-			description: `Two 120ms page blocks. The first run-dry is reported exactly ${STALL_WINDOW}ms after its block ends, the edge of the window, and counts: 20ms to 120ms. The second, reported a quarter of a millisecond past the window with 200ms more to cover, is no longer the page's and changes nothing.`,
-			arrivals: frozen(paced({ frames: 500, base: 50, spread: 2, seed: 109 }), [
-				{ at: 4000, stall: 120, gap: 82, delay: STALL_WINDOW },
-				{ at: 7000, stall: 120, gap: 200, delay: STALL_WINDOW + 0.25 },
-			]),
+				"A report of 60ms before the first resample interval has closed, while the target is still the 80ms cold-start prior. A run-dry is not a guess, so it raises the prior to 140ms at once, and the first measurement, which replaces a prior outright with the 20ms this path settles on, lands on the held level instead.",
+			arrivals: starved(paced({ frames: 250, base: 50, spread: 2, seed: 103 }), [2], () => 60),
 		},
 	];
 }

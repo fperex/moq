@@ -18,9 +18,6 @@ import type { Snapshot } from "./playout";
  * A postMessage ring's reads queue up behind a freeze and arrive in order after it, the earliest
  * describing the first moments of the run-dry, so it is the last of them that knows how long it was.
  *
- * Every run-dry is reported, whatever caused it. Which ones count is the estimate's call: only those
- * the page's own block caused, which it knows from the arrivals the consumer flagged `stalled`.
- *
  * @internal
  */
 export class Starvation {

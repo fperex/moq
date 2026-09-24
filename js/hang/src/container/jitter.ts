@@ -47,13 +47,6 @@ const LOWER_DIVISOR = 6;
  */
 export const HOLD = 30_000;
 
-/**
- * How far a run-dry report may land from the last arrival flagged `stalled` and still count, in milliseconds.
- *
- * The report that counts lands one ring read (50ms at most) after the decoder inserts the backlog those arrivals opened, and four of those cover a page still catching up after a freeze.
- */
-export const STALL_WINDOW = 200;
-
 // One admitted arrival, on both axes in milliseconds.
 type Arrival = { timestamp: number; arrival: number };
 
@@ -111,10 +104,8 @@ export type JitterProps = {
  *
  * That leaves a receiver that keeps freezing with a target the arrivals will never raise, and a
  * player that runs dry on every freeze. So the player reports each time it does
- * ({@link Jitter.starved}), and when the arrivals around the report came out of a block, the target
- * rises at once to cover what it ran out of and stays there for a while after the last report, then
- * falls the way any other rise does. A run-dry with no block behind it is the path's, which the
- * arrivals already measure or no buffer can fix, and changes nothing.
+ * ({@link Jitter.starved}): the target rises at once to cover what it ran out of and stays there for
+ * a while after the last report, then falls the way any other rise does.
  *
  * The algorithm is written down in `doc/concept/playout.md` and held to it by the conformance
  * corpus at `rs/moq-audio/tests/playout-01.json`. The design is WebRTC's NetEq
@@ -173,9 +164,6 @@ export class Jitter {
 	// The level the player's run-dries asked for, and when that ask runs out.
 	#held?: { level: number; until: number };
 
-	// When the last arrival flagged `stalled` landed, on the arrival clock.
-	#stalledAt?: number;
-
 	#value: Signal<Time.Milli>;
 
 	/** The current target: enough buffer to play `QUANTILE` of arrivals on time. */
@@ -204,10 +192,6 @@ export class Jitter {
 		// visible in the arithmetic instead.
 		const ts = timestamp / 1000;
 		const arrival = now as number;
-
-		// Whatever order the frame came in, the page was blocked before it was read: that is what makes
-		// a run-dry reported around now the page's own. See `starved`.
-		if (stalled) this.#stalledAt = arrival;
 
 		if (reordered || (this.#newest !== undefined && ts <= this.#newest)) {
 			// Costing a reordered arrival as delay against loss is a separate step, not yet written.
@@ -259,16 +243,10 @@ export class Jitter {
 		this.#publish(arrival);
 	}
 
-	/** Raise the target to cover the `gap` of audio the player ran out of while the page was blocked, and keep it up for a while. */
+	/** Raise the target to cover the `gap` of audio the player just ran out of, and keep it up for a while. */
 	starved(gap: Time.Milli, now: Time.Milli): void {
 		if (!(gap >= 0)) throw new RangeError(`jitter: a run-dry of ${gap}ms is not a duration`);
 		const at = now as number;
-
-		// Only a run-dry the page itself caused. Media that is late reaches the histogram when it
-		// lands, and media that is lost no buffer brings back, so raising the target for either buys
-		// latency and nothing else. What tells them apart is whether the arrivals around the report
-		// came out of a block, which `Stall` flags and nothing else can.
-		if (this.#stalledAt === undefined || Math.abs(at - this.#stalledAt) > STALL_WINDOW) return;
 
 		// The player ran dry holding what this target asked for, so covering the gap takes the two
 		// together. A caller reporting the same run-dry twice passes only what the target does not
