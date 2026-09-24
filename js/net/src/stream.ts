@@ -98,6 +98,11 @@ export interface OpenOptions {
 	waitUntilAvailable?: boolean;
 }
 
+// Each session's incoming bidi streams, read through one reader for the session's life and never
+// released. WebKit deadlocks the calling thread, and then the page, when a garbage collection
+// starts inside `releaseLock()` (Safari 26.6), and a session accepts until it closes anyway.
+const incomingBidis = new WeakMap<WebTransport, ReadableStreamDefaultReader<WebTransportBidirectionalStream>>();
+
 /** Options for {@link Writer.tryOpen}. */
 export interface TryOpenOptions extends OpenOptions {
 	/** Give up once this settles, however it settles. */
@@ -131,17 +136,19 @@ export class Stream {
 		this.reader = reader;
 	}
 
+	/** The session's next incoming bidirectional stream, or undefined once it accepts no more. */
 	static async accept(quic: WebTransport, version?: IetfVersion): Promise<Stream | undefined> {
-		for (;;) {
-			const reader =
+		let reader = incomingBidis.get(quic);
+		if (!reader) {
+			reader =
 				quic.incomingBidirectionalStreams.getReader() as ReadableStreamDefaultReader<WebTransportBidirectionalStream>;
-			const next = await reader.read();
-			reader.releaseLock();
-
-			if (next.done) return;
-			const { readable, writable } = next.value;
-			return new Stream({ readable, writable, version });
+			incomingBidis.set(quic, reader);
 		}
+
+		const next = await reader.read();
+		if (next.done) return;
+		const { readable, writable } = next.value;
+		return new Stream({ readable, writable, version });
 	}
 
 	/**
