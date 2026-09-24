@@ -15,7 +15,7 @@
 
 import type * as Catalog from "@moq/hang/catalog";
 import type * as Container from "@moq/hang/container";
-import { Connection, type Time } from "@moq/net";
+import { Connection, Time } from "@moq/net";
 import type { Delay } from "../../sync";
 import type { Stats } from "../decoder";
 import type { Snapshot } from "../playout";
@@ -297,4 +297,66 @@ function detach(worker: Worker): void {
 
 function explain(err: unknown): string {
 	return err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+}
+
+/**
+ * How long a player's worker has to play audio, ten times what a healthy start took on the bench.
+ *
+ * Counted only while the worker has everything it needs from the page; see {@link Deadline}.
+ */
+export const AUDIO_DEADLINE = Time.Milli(5_000);
+
+/**
+ * How often the page checks on its worker.
+ *
+ * A check more than twice this late ran behind a page that was stalled, frozen or hidden, and whatever
+ * the worker said in that time is still queued behind it, so a late check counts for nothing.
+ */
+export const TICK = Time.Milli(250);
+
+/**
+ * Where a player's worker has got to on its way to playing audio: what it is waiting for.
+ *
+ * `audio` waits on the publisher rather than on the worker (nothing to play has reached it), so it never
+ * counts; `played` counts only while audio keeps reaching it, for the same reason.
+ */
+export type Stage = "ready" | "connected" | "resolved" | "audio" | "played";
+
+// What the worker never managed, by the stage it stopped at.
+const STUCK: Record<Exclude<Stage, "audio">, string> = {
+	ready: "it never became ready",
+	connected: "its session to the relay never connected",
+	resolved: "its session never found the broadcast",
+	played: "the audio it read never played",
+};
+
+/**
+ * The time a player's worker has to play audio, counted only while it is the worker's to spend.
+ *
+ * The page ticks it on its own timer, every {@link TICK}, with where the worker is and whether anything
+ * on the page holds the audio up: a mute or a pause, an instant delay, no graph or a context that is not
+ * running, no rendition, or the page's own session or broadcast down. None of those is the worker's to
+ * answer for, and nor is a check the page made late. A worker that has played never needs it again.
+ */
+export class Deadline {
+	#last?: number;
+	#spent = 0;
+
+	/**
+	 * Count the time since the last tick, then say why the page should take the audio back, once the
+	 * worker has spent {@link AUDIO_DEADLINE} without playing it.
+	 *
+	 * `now` is the page's `performance.now()`. `target` is the ring's depth: a ring fills that much before
+	 * it plays anything, so the last stage waits that much longer.
+	 */
+	tick(now: number, at: { stage: Stage; held: boolean; target: Time.Milli }): string | undefined {
+		const elapsed = this.#last === undefined ? 0 : now - this.#last;
+		this.#last = now;
+		if (at.held || at.stage === "audio" || elapsed > 2 * TICK) return undefined;
+
+		this.#spent += elapsed;
+		const limit = at.stage === "played" ? AUDIO_DEADLINE + at.target : AUDIO_DEADLINE;
+		if (this.#spent < limit) return undefined;
+		return `the audio worker played nothing in ${AUDIO_DEADLINE / 1000} s: ${STUCK[at.stage]}`;
+	}
 }

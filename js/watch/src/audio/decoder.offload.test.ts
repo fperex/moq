@@ -50,13 +50,16 @@ class FakeAudioData {
 }
 
 class FakeDecoder {
+	// The codecs the worker's decoder turns down. The page's probe is its own, and takes anything.
+	static refuse = new Set<string>();
+
 	state = "configured";
 	readonly #output: (data: FakeAudioData) => void;
 	constructor(init: { output: (data: FakeAudioData) => void }) {
 		this.#output = init.output;
 	}
-	static async isConfigSupported(): Promise<{ supported: boolean }> {
-		return { supported: true };
+	static async isConfigSupported(config: { codec: string }): Promise<{ supported: boolean }> {
+		return { supported: !FakeDecoder.refuse.has(config.codec) };
 	}
 	configure(): void {}
 	decode(chunk: FakeChunk): void {
@@ -96,6 +99,9 @@ let nextPort: MessagePort | undefined;
 
 /** An AudioContext the autoplay policy starts, whose output clock is the render clock. */
 class MockContext extends EventTarget {
+	// Whether the browser starts a context without a gesture.
+	static autoplay = true;
+
 	state = "suspended";
 	readonly sampleRate: number;
 	readonly audioWorklet = { addModule: () => Promise.resolve() };
@@ -106,6 +112,7 @@ class MockContext extends EventTarget {
 	}
 
 	resume(): Promise<void> {
+		if (!MockContext.autoplay) return Promise.reject(new Error("not allowed"));
 		this.state = "running";
 		this.dispatchEvent(new Event("statechange"));
 		return Promise.resolve();
@@ -127,6 +134,8 @@ class Node {
 	static built: Node[] = [];
 	readonly port: MessagePort;
 	readonly render: Processor;
+	/** The worklet's end of the node's port. */
+	readonly worklet: MessagePort;
 
 	constructor() {
 		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
@@ -134,6 +143,7 @@ class Node {
 		nextPort = port2;
 		this.render = new Render();
 		this.port = port1;
+		this.worklet = port2;
 		Node.built.push(this);
 	}
 
@@ -237,8 +247,15 @@ class Publisher {
 class Relay {
 	readonly origin = new Origin.Producer();
 	readonly sessions: FakeSession[] = [];
+	// Whether a session dialled now never gets through: connecting, with nothing to read.
+	stuck = false;
 	readonly dial: Dial = (url: URL, _transports: Transports) => {
 		const session = new FakeSession(url, this.origin);
+		if (this.stuck) {
+			session.status.set("connecting");
+			session.transport.set(undefined);
+			session.origin.set(undefined);
+		}
 		this.sessions.push(session);
 		return session;
 	};
@@ -253,6 +270,13 @@ let relay = new Relay();
 class InProcessWorker {
 	static created: InProcessWorker[] = [];
 
+	/**
+	 * How the next one behaves: it serves; it cannot be created, as a CSP refusing `blob:` workers makes
+	 * Chromium throw; it fails to load, as the same CSP reaches Firefox; it has no decoder; or it never
+	 * says anything at all.
+	 */
+	static next: "serve" | "throw" | "fail" | "refuse" | "silent" = "serve";
+
 	onmessage: ((event: MessageEvent<FromWorker>) => void) | null = null;
 	onerror: ((event: ErrorEvent) => void) | null = null;
 	onmessageerror: (() => void) | null = null;
@@ -260,14 +284,34 @@ class InProcessWorker {
 	readonly posted: ToWorker[] = [];
 	terminated = false;
 	readonly #port: MessagePort;
-	readonly #stop: () => void;
+	#stop?: () => void;
+	#hung = false;
 
 	constructor() {
+		const behaviour = InProcessWorker.next;
+		if (behaviour === "throw")
+			throw new DOMException("Access to the script at 'blob:...' is denied", "SecurityError");
+
 		const { port1, port2 } = new MessageChannel();
-		this.#stop = serve(port2 as unknown as HostPort, { dial: relay.dial });
 		this.#port = port1;
-		port1.onmessage = (event: MessageEvent<FromWorker>) => this.onmessage?.(event);
+		port1.onmessage = (event: MessageEvent<FromWorker>) => {
+			if (!this.#hung) this.onmessage?.(event);
+		};
 		InProcessWorker.created.push(this);
+
+		if (behaviour === "serve") {
+			this.#stop = serve(port2 as unknown as HostPort, { dial: relay.dial });
+		} else if (behaviour === "fail") {
+			setImmediate(() => this.onerror?.({ message: "worker-src refused", preventDefault() {} } as ErrorEvent));
+		} else if (behaviour === "refuse") {
+			const support = { audioDecoder: false, webTransport: false, webSocket: true };
+			setImmediate(() => this.say({ type: "ready", support }));
+		}
+	}
+
+	/** Say nothing more to the page, as a worker stuck in a loop says nothing. */
+	hang(): void {
+		this.#hung = true;
 	}
 
 	postMessage(msg: ToWorker, transfer: Transferable[] = []): void {
@@ -278,7 +322,7 @@ class InProcessWorker {
 	terminate(): void {
 		if (this.terminated) return;
 		this.terminated = true;
-		this.#stop();
+		this.#stop?.();
 		this.#port.close();
 	}
 
@@ -301,7 +345,8 @@ const { Sync } = await import("../sync");
 const { Broadcast } = await import("../broadcast");
 const { serve } = await import("./worker/host");
 const { resetShared } = await import("./worker/remote");
-const { LINGER } = await import("./worker/pool");
+const { LINGER, LIVENESS } = await import("./worker/pool");
+const { AUDIO_DEADLINE, TICK } = await import("./worker/protocol");
 
 beforeAll(async () => {
 	for (const name of NAMES) saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
@@ -336,6 +381,9 @@ beforeEach(() => {
 	scope.EncodedAudioChunk = FakeChunk;
 	Node.built = [];
 	InProcessWorker.created = [];
+	InProcessWorker.next = "serve";
+	FakeDecoder.refuse.clear();
+	MockContext.autoplay = true;
 	relay = new Relay();
 });
 
@@ -352,11 +400,11 @@ const cleanup: Array<() => void> = [];
 
 // ── the page ────────────────────────────────────────────────────────────────
 
-function rendition(track = "audio"): Catalog.Root {
+function rendition(track = "audio", codec = "opus"): Catalog.Root {
 	return {
 		audio: {
 			renditions: {
-				[track]: { codec: "opus", container: { kind: "legacy" }, sampleRate: RATE, numberOfChannels: 2 },
+				[track]: { codec, container: { kind: "legacy" }, sampleRate: RATE, numberOfChannels: 2 },
 			},
 		},
 	} as unknown as Catalog.Root;
@@ -372,6 +420,8 @@ interface Tile {
 	attached: Signal<boolean>;
 	delay: Signal<Delay>;
 	catalog: Signal<Catalog.Root | undefined>;
+	/** The page's own session's origin. */
+	pageOrigin: Origin.Producer;
 	/** The broadcast on the page's own session. */
 	page: Publisher;
 	/** The same broadcast on the relay the worker dials. */
@@ -380,27 +430,28 @@ interface Tile {
 	write(sequence: number, timestamp: number, track?: string): void;
 }
 
-function tile(props?: { offload?: boolean | Signal<boolean>; tracks?: string[] }): Tile {
+function tile(props?: {
+	/** Absent: the Decoder's own default. */
+	offload?: boolean | Signal<boolean>;
+	/** Null: none. */
+	url?: string | null;
+	tracks?: string[];
+	codec?: string;
+}): Tile {
 	const tracks = props?.tracks ?? ["audio"];
 	const pageOrigin = new Origin.Producer();
 	const page = new Publisher(pageOrigin, tracks);
 	const remote = new Publisher(relay.origin, tracks);
 
-	const catalog = new Signal<Catalog.Root | undefined>(rendition(tracks[0]));
+	const catalog = new Signal<Catalog.Root | undefined>(rendition(tracks[0], props?.codec));
 	const broadcast = new Broadcast({ origin: pageOrigin, name: Path.from(NAME), catalogFormat: "manual", catalog });
 	const source = new Source({ broadcast, supported: async () => true });
 	const delay = new Signal<Delay>("auto");
 	const sync = new Sync({ delay, buffer: Time.Milli.zero });
 	const enabled = new Signal(true);
 	const attached = new Signal(true);
-	const decoder = new Decoder({
-		source,
-		sync,
-		enabled,
-		attached,
-		url: new URL(URL_),
-		offload: props?.offload ?? true,
-	});
+	const url = props?.url === null ? undefined : new URL(props?.url ?? URL_);
+	const decoder = new Decoder({ source, sync, enabled, attached, url, offload: props?.offload });
 
 	// What `Player` wires: the estimate into `Sync`, which sizes the ring's target from it.
 	const wiring = new Effect();
@@ -426,6 +477,7 @@ function tile(props?: { offload?: boolean | Signal<boolean>; tracks?: string[] }
 		attached,
 		delay,
 		catalog,
+		pageOrigin,
 		page,
 		remote,
 		write: (sequence, timestamp, track) => {
@@ -465,7 +517,7 @@ function worker(): InProcessWorker {
 /** A tile the worker plays for: its player, timing and graph sent, and 400 ms of media played. */
 async function playing(props?: { isolated?: boolean; tracks?: string[]; offload?: Signal<boolean> }) {
 	scope.crossOriginIsolated = props?.isolated ?? true;
-	const t = tile({ tracks: props?.tracks, offload: props?.offload });
+	const t = tile({ tracks: props?.tracks, offload: props?.offload ?? true });
 	await until(() => InProcessWorker.created.length === 1 && worker().told("graph").length > 0, "the graph");
 	for (let i = 0; i < 20; i++) t.write(i, i * 20_000);
 	await sleep(100);
@@ -579,7 +631,7 @@ describe("what the page tells the worker", () => {
 	it("samples its output clock when it hands over the graph, when the context changes state, and every second", async () => {
 		jest.useFakeTimers();
 		scope.crossOriginIsolated = false;
-		const t = tile();
+		const t = tile({ offload: true });
 		for (let i = 0; i < 200 && !InProcessWorker.created[0]?.told("graph").length; i++) await immediate();
 		const outputs = () => worker().told("output");
 		expect(outputs().length).toBe(1);
@@ -706,7 +758,7 @@ describe("flushes", () => {
 describe("the player's lifecycle", () => {
 	it("taken off the page, it tells the worker it is gone, and the page lets the worker go after the linger", async () => {
 		jest.useFakeTimers();
-		const t = tile();
+		const t = tile({ offload: true });
 		for (let i = 0; i < 200 && !InProcessWorker.created[0]?.told("graph").length; i++) await immediate();
 		const id = worker().told("player")[0].id;
 		const [session] = relay.sessions;
@@ -809,5 +861,266 @@ describe("the player's lifecycle", () => {
 		(scope.window as EventTarget).dispatchEvent(new Event("pageshow"));
 		await until(() => session.enabled.peek() === true, "the session back");
 		expect(t.remote.live()).toBe(1);
+	});
+});
+
+// ── the page takes the audio back ───────────────────────────────────────────
+
+/** Every warning that audio moved to the page's main thread, silenced. */
+function fallbacks(): string[] {
+	const seen: string[] = [];
+	const warn = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+		const line = args.map(String).join(" ");
+		if (line.includes("main thread")) seen.push(line);
+	});
+	cleanup.push(() => warn.mockRestore());
+	return seen;
+}
+
+/** Let messages and effects run, on fake timers, until `ready` holds. */
+async function settle(ready: () => boolean, what: string): Promise<void> {
+	for (let i = 0; i < 1_000; i++) {
+		if (ready()) return;
+		await immediate();
+	}
+	throw new Error(`never saw ${what}`);
+}
+
+const handed =
+	(count = 1) =>
+	() =>
+		InProcessWorker.created.length === 1 && InProcessWorker.created[0].told("graph").length >= count;
+
+describe.each([
+	["throw", "the worker could not be created: SecurityError: Access to the script at 'blob:...' is denied"],
+	["fail", "the worker failed to load: worker-src refused"],
+	["refuse", "AudioDecoder is not available in a dedicated worker"],
+] as const)("a worker the page cannot start (%s)", (behaviour, reason) => {
+	it("leaves the audio on the page, and every player's after it, with one warning", async () => {
+		const warned = fallbacks();
+		InProcessWorker.next = behaviour;
+		scope.crossOriginIsolated = true;
+
+		const a = tile({ offload: true });
+		await until(() => a.decoder.out.thread.peek()?.kind === "main", "the fallback");
+		expect(a.decoder.out.thread.peek()).toEqual({ kind: "main", reason });
+		await until(() => a.page.live() === 1, "the page's own subscription");
+		for (let i = 0; i < 20; i++) a.write(i, i * 20_000);
+		await sleep(100);
+		expect(loudest(pull(Node.built[Node.built.length - 1], 60))).toBeGreaterThan(0.4);
+		expect(a.remote.total()).toBe(0);
+
+		// Whatever refused it refuses the next one too: no second worker, and no second warning.
+		const b = tile({ offload: true });
+		await until(() => b.decoder.out.thread.peek()?.kind === "main", "the next player's fallback");
+		expect(b.decoder.out.thread.peek()).toEqual({ kind: "main", reason });
+		expect(InProcessWorker.created.length).toBe(behaviour === "throw" ? 0 : 1);
+		expect(warned).toEqual([expect.stringContaining(reason)]);
+	});
+});
+
+describe("the deadline", () => {
+	it("takes back the audio a worker has not played in five seconds, onto a fresh node of the same context", async () => {
+		jest.useFakeTimers();
+		const warned = fallbacks();
+		relay.stuck = true;
+		const t = tile({ offload: true });
+		await settle(handed(), "the graph handed over");
+		expect(t.decoder.out.thread.peek()).toEqual({ kind: "worker", transport: undefined });
+		const context = t.decoder.out.context.peek();
+
+		await advance(AUDIO_DEADLINE - 300);
+		expect(t.decoder.out.thread.peek()?.kind).toBe("worker");
+		await advance(600);
+		const reason = "the audio worker played nothing in 5 s: its session to the relay never connected";
+		expect(t.decoder.out.thread.peek()).toEqual({ kind: "main", reason });
+		expect(warned).toEqual([expect.stringContaining(reason)]);
+
+		// The worker hears the player is gone, and the page plays it on its own session, through a node
+		// nothing the worker held writes into, on the context the viewer's gesture started.
+		await settle(() => t.page.live() === 1 && Node.built.length === 2, "the page's own supply");
+		expect(worker().told("close").length).toBe(1);
+		expect(t.decoder.out.context.peek()).toBe(context);
+		for (let i = 0; i < 20; i++) t.write(i, i * 20_000);
+		await settle(() => (t.decoder.out.stats.peek()?.bytesReceived ?? 0) > 0, "the page's bytes");
+		await advance(100);
+		expect(loudest(pull(Node.built[1], 60))).toBeGreaterThan(0.4);
+		expect(t.remote.total()).toBe(0);
+	});
+
+	it("waits while the page holds the audio up: a mute, an instant delay, a context not running, its own broadcast down", async () => {
+		jest.useFakeTimers();
+		relay.stuck = true;
+		const t = tile({ offload: true });
+		await settle(handed(), "the graph handed over");
+		const context = t.decoder.out.context.peek() as unknown as MockContext;
+
+		t.enabled.set(false);
+		await advance(2 * AUDIO_DEADLINE);
+		t.enabled.set(true);
+		t.delay.set("instant");
+		await advance(2 * AUDIO_DEADLINE);
+		t.delay.set("auto");
+		MockContext.autoplay = false;
+		context.state = "suspended";
+		context.dispatchEvent(new Event("statechange"));
+		await advance(2 * AUDIO_DEADLINE);
+		MockContext.autoplay = true;
+		await context.resume();
+		t.catalog.set(undefined);
+		await advance(2 * AUDIO_DEADLINE);
+		t.catalog.set(rendition());
+		// The page's own session loses the broadcast, which it withdraws when the session drops.
+		t.page.close();
+		await advance(2 * AUDIO_DEADLINE);
+		expect(t.decoder.out.thread.peek()?.kind).toBe("worker");
+
+		// Nothing holds it up any more, so the worker's own time runs.
+		const again = new Publisher(t.pageOrigin, ["audio"]);
+		cleanup.push(() => again.close());
+		await advance(AUDIO_DEADLINE + 300);
+		expect(t.decoder.out.thread.peek()?.kind).toBe("main");
+	});
+
+	it("never counts a publisher that sends no audio", async () => {
+		jest.useFakeTimers();
+		const t = tile({ offload: true });
+		await settle(handed(), "the graph handed over");
+		await advance(4 * AUDIO_DEADLINE);
+		expect(t.decoder.out.thread.peek()).toEqual({ kind: "worker", transport: "webtransport" });
+		expect(t.page.total()).toBe(0);
+	});
+
+	it("counts a worker that never says it is ready", async () => {
+		jest.useFakeTimers();
+		InProcessWorker.next = "silent";
+		fallbacks();
+		const t = tile({ offload: true });
+		await settle(() => Node.built.length === 1 && InProcessWorker.created.length === 1, "the graph and the worker");
+		expect(t.decoder.out.thread.peek()).toBeUndefined();
+		await advance(AUDIO_DEADLINE + 300);
+		expect(t.decoder.out.thread.peek()).toEqual({
+			kind: "main",
+			reason: "the audio worker played nothing in 5 s: it never became ready",
+		});
+		await settle(() => t.page.live() === 1, "the page's own subscription");
+	});
+
+	describe.each(RINGS)("on a %s ring", (_kind, isolated) => {
+		it("is done for good once the ring has played", async () => {
+			jest.useFakeTimers();
+			scope.crossOriginIsolated = isolated;
+			const t = tile({ offload: true });
+			await settle(handed(), "the graph handed over");
+			for (let i = 0; i < 20; i++) t.write(i, i * 20_000);
+			await advance(100);
+			expect(loudest(pull(Node.built[0], 60))).toBeGreaterThan(0.4);
+			await advance(200);
+
+			// The worker's session goes and never comes back: nothing it can play, and the page waits.
+			const [session] = relay.sessions;
+			session.status.set("connecting");
+			session.origin.set(undefined);
+			await advance(4 * AUDIO_DEADLINE);
+			expect(t.decoder.out.thread.peek()?.kind).toBe("worker");
+		});
+	});
+
+	it("hears the ring play on the node's own port, without waiting on the worker", async () => {
+		jest.useFakeTimers();
+		relay.stuck = true;
+		const t = tile({ offload: true });
+		await settle(handed(), "the graph handed over");
+
+		// All the worklet says of it, on the one port the page reads: the ring has played.
+		const [node] = Node.built;
+		const state = { type: "state", contextTime: 0, timeline: 0, playhead: undefined, debug: { fresh: false } };
+		node.worklet.postMessage(state);
+		await advance(10);
+		await advance(4 * AUDIO_DEADLINE);
+		expect(t.decoder.out.thread.peek()?.kind).toBe("worker");
+	});
+});
+
+describe("a worker that stops reporting", () => {
+	it("is given up for every player on the page and every one after, with one warning", async () => {
+		jest.useFakeTimers();
+		const warned = fallbacks();
+		const a = tile({ offload: true });
+		const b = tile({ offload: true });
+		await settle(handed(2), "both graphs handed over");
+		await advance(200);
+		expect(a.decoder.out.thread.peek()?.kind).toBe("worker");
+
+		worker().hang();
+		await advance(LIVENESS + 2 * TICK);
+		const reason = "the audio worker said nothing for 2 s";
+		expect(a.decoder.out.thread.peek()).toEqual({ kind: "main", reason });
+		expect(b.decoder.out.thread.peek()).toEqual({ kind: "main", reason });
+		expect(warned).toEqual([expect.stringContaining(reason)]);
+		expect(worker().terminated).toBe(true);
+		await settle(() => a.page.live() === 1 && b.page.live() === 1, "both on the page's own session");
+
+		const c = tile({ offload: true });
+		await settle(() => c.decoder.out.thread.peek()?.kind === "main", "the next player's fallback");
+		expect(InProcessWorker.created.length).toBe(1);
+		expect(warned.length).toBe(1);
+	});
+});
+
+describe("one player's trouble", () => {
+	it("a rendition the worker refuses takes that player's audio back, and only its", async () => {
+		const warned = fallbacks();
+		FakeDecoder.refuse.add("flac");
+		scope.crossOriginIsolated = true;
+		const a = tile({ offload: true, codec: "flac" });
+		const b = tile({ offload: true });
+		await until(() => a.decoder.out.thread.peek()?.kind === "main", "the refused player's fallback");
+		expect(a.decoder.out.thread.peek()).toEqual({ kind: "main", reason: "the worker cannot decode flac" });
+		expect(warned).toEqual([expect.stringContaining("the worker cannot decode flac")]);
+		await until(() => a.page.live() === 1 && b.remote.live() === 1, "each on its own path");
+		expect(b.decoder.out.thread.peek()?.kind).toBe("worker");
+
+		const c = tile({ offload: true });
+		await until(() => c.decoder.out.thread.peek()?.kind === "worker", "the next player on the worker");
+		expect(InProcessWorker.created.length).toBe(1);
+	});
+
+	it("an error about one player takes that player's audio back, and only its", async () => {
+		const warned = fallbacks();
+		scope.crossOriginIsolated = true;
+		const a = tile({ offload: true });
+		const b = tile({ offload: true });
+		await until(() => handed(2)(), "both graphs handed over");
+		const [first] = worker().told("player");
+		worker().say({ type: "error", id: first.id, message: "TypeError: boom" });
+
+		await until(() => a.decoder.out.thread.peek()?.kind === "main", "that player's fallback");
+		expect(a.decoder.out.thread.peek()).toEqual({ kind: "main", reason: "TypeError: boom" });
+		expect(warned.length).toBe(1);
+		await sleep(50);
+		expect(b.decoder.out.thread.peek()?.kind).toBe("worker");
+		expect(worker().terminated).toBe(false);
+	});
+});
+
+describe("the thread a player's audio runs on", () => {
+	it("is the page's, for no reason, when the player does not offload or has no relay to hand the worker", async () => {
+		const off = tile({ offload: false });
+		const bare = tile({ offload: true, url: null });
+		await until(() => off.page.live() === 1 && bare.page.live() === 1, "both on the page");
+		expect(off.decoder.out.thread.peek()).toEqual({ kind: "main" });
+		expect(bare.decoder.out.thread.peek()).toEqual({ kind: "main" });
+		expect(InProcessWorker.created).toEqual([]);
+	});
+
+	it("is the worker's by default, with the transport its session runs over", async () => {
+		const t = tile();
+		await until(() => t.decoder.out.thread.peek()?.kind === "worker", "the worker");
+		await until(() => {
+			const thread = t.decoder.out.thread.peek();
+			return thread?.kind === "worker" && thread.transport === "webtransport";
+		}, "the worker's transport");
+		expect(t.page.total()).toBe(0);
 	});
 });

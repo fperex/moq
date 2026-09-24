@@ -97,7 +97,7 @@ export class Player {
 			muted: getter(props.muted ?? false),
 			conceal: getter(props.conceal ?? true),
 			url: getter<URL | undefined>(props.url),
-			offload: getter(props.offload ?? false),
+			offload: getter(props.offload ?? true),
 			visible: getter(props.visible ?? "20%"),
 			delay: getter(props.delay ?? "auto"),
 			buffer: getter(props.buffer ?? Time.Milli.zero),

@@ -1,6 +1,7 @@
 import type * as Catalog from "@moq/hang/catalog";
 import type * as Container from "@moq/hang/container";
 import * as Util from "@moq/hang/util";
+import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import {
 	type Computed,
@@ -58,11 +59,13 @@ export type DecoderInput = {
 	url: Getter<URL | undefined>;
 
 	/**
-	 * Whether the audio is fed from a dedicated worker rather than the page's main thread. Defaults to false.
+	 * Whether the audio is fed from a dedicated worker rather than the page's main thread. Defaults to true.
 	 *
 	 * The worker subscribes, decodes and writes the ring on a session of its own to {@link url}, so a busy
 	 * main thread cannot starve the ring. One worker serves every player on the page. Needs a {@link url}
-	 * and a `Worker`; without either the audio stays on the page.
+	 * and a `Worker`; without either the audio stays on the page. So it does, for good, once the worker
+	 * cannot start (a CSP without `worker-src blob:`, say), fails, stops reporting, refuses the rendition, or
+	 * plays nothing in five seconds of trying: `out.thread` says which.
 	 */
 	offload: Getter<boolean>;
 };
@@ -116,7 +119,18 @@ type DecoderOutput = {
 	 * @internal
 	 */
 	debug: Signal<Playout.Debug | undefined>;
+
+	/**
+	 * Which thread feeds the ring: the page's worker, with what its session runs over, or the page's own,
+	 * with why when the worker could have and did not. Undefined while the worker is starting.
+	 *
+	 * @internal
+	 */
+	thread: Signal<Thread | undefined>;
 };
+
+/** Which thread feeds the audio ring. See `Decoder.out.thread`. */
+type Thread = { kind: "worker"; transport: Moq.Connection.Transport | undefined } | { kind: "main"; reason?: string };
 
 /** Cumulative audio statistics since the decoder started. */
 export interface Stats {
@@ -125,10 +139,10 @@ export interface Stats {
 }
 
 // The supply feeding the ring, and the graph built for it.
-interface Active {
-	supply: Supply | Remote;
-	graph: Signal<PageGraph | undefined>;
-}
+type Active = { graph: Signal<PageGraph | undefined> } & (
+	| { kind: "main"; supply: Supply }
+	| { kind: "worker"; supply: Remote }
+);
 
 /**
  * Downloads audio from a track and emits it to an AudioContext.
@@ -153,6 +167,7 @@ export class Decoder {
 		buffered: new Signal<Container.BufferedRanges>([]),
 		spread: new Signal<Time.Milli | undefined>(undefined),
 		debug: new Signal<Playout.Debug | undefined>(undefined),
+		thread: new Signal<Thread | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -167,6 +182,9 @@ export class Decoder {
 
 	// Where the supply runs, once decided. See #runSupply.
 	readonly #mode: Computed<"main" | "worker">;
+
+	// Why the page took the audio back from its worker, once it has: for good. See #runFallback.
+	readonly #fallback = new Signal<string | undefined>(undefined);
 
 	#signals = new Effect();
 
@@ -206,7 +224,7 @@ export class Decoder {
 			attached: getter(props?.attached ?? true),
 			conceal: getter(props?.conceal ?? true),
 			url: getter<URL | undefined>(props?.url),
-			offload: getter(props?.offload ?? false),
+			offload: getter(props?.offload ?? true),
 		};
 
 		this.source = props.source;
@@ -223,6 +241,7 @@ export class Decoder {
 			return decoded ?? config.sampleRate;
 		});
 		this.#mode = this.#signals.computed((effect) => {
+			if (effect.get(this.#fallback) !== undefined) return "main";
 			if (!effect.get(this.in.offload)) return "main";
 			if (effect.get(this.in.url) === undefined) return "main";
 			// No worker to hand it to: server rendering, or a runtime without one.
@@ -253,6 +272,8 @@ export class Decoder {
 		this.#signals.cleanup(() => this.#closeContext());
 
 		this.#signals.run(this.#runSupply.bind(this));
+		this.#signals.run(this.#runFallback.bind(this));
+		this.#signals.run(this.#runThread.bind(this));
 		this.#signals.run(this.#runContext.bind(this));
 		this.#signals.run(this.#runRing.bind(this));
 		this.#signals.run(this.#runClock.bind(this));
@@ -285,13 +306,51 @@ export class Decoder {
 			if (!effect.get(this.in.attached)) return;
 			const supply = new Remote({ ...props, url: this.in.url });
 			effect.cleanup(() => supply.close());
-			effect.set(this.#active, { supply, graph }, undefined);
+			effect.set(this.#active, { kind: "worker", supply, graph }, undefined);
 			return;
 		}
 
 		const supply = new Supply({ ...props, polyfill: Util.Libav.polyfill });
 		effect.cleanup(() => supply.close());
-		effect.set(this.#active, { supply, graph }, undefined);
+		effect.set(this.#active, { kind: "main", supply, graph }, undefined);
+	}
+
+	/**
+	 * Take the audio back from the worker for good once it cannot play it.
+	 *
+	 * The switch is #runSupply's: the worker hears the player is gone, the page's own supply subscribes on
+	 * the page's session, and it writes a fresh node on the same context, so no gesture is spent and nothing
+	 * the worker still had in flight reaches it. The clock goes with the worker's ring, and `Sync` runs on at
+	 * wall speed from where the playhead was until the page's ring has one.
+	 *
+	 * The worker's own trouble reaches every player on the page, which the pool warns about once. A
+	 * player's own is warned about here.
+	 */
+	#runFallback(effect: Effect): void {
+		const active = effect.get(this.#active);
+		if (active?.kind !== "worker") return;
+		const failure = effect.get(active.supply.out.failure);
+		if (!failure) return;
+		if (failure.scope === "player") console.warn(`[audio] falling back to the main thread: ${failure.reason}`);
+		this.#fallback.set(failure.reason);
+	}
+
+	#runThread(effect: Effect): void {
+		const reason = effect.get(this.#fallback);
+		if (reason !== undefined) {
+			this.#out.thread.set({ kind: "main", reason });
+			return;
+		}
+
+		const active = effect.get(this.#active);
+		if (active?.kind !== "worker") {
+			this.#out.thread.set(active && { kind: "main" });
+			return;
+		}
+
+		const ready = effect.get(active.supply.out.ready);
+		const transport = effect.get(active.supply.out.transport);
+		this.#out.thread.set(ready ? { kind: "worker", transport } : undefined);
 	}
 
 	// Mirror the active supply's outputs onto ours.

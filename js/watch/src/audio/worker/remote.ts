@@ -6,6 +6,10 @@
  * ring and where the worklet reads it from, and it applies what the worker reports back to `Sync` and to
  * those outputs, so the `Decoder` reads either supply alike.
  *
+ * It also says when the page has to take the audio back (see `out.failure`): the page's worker is not
+ * available, fails or stops reporting, refuses this player's rendition or fails on it, or plays nothing
+ * within `AUDIO_DEADLINE`.
+ *
  * @module
  */
 
@@ -16,11 +20,11 @@ import { type Computed, Effect, type Getter, type Readonlys, readonlys, Signal }
 import type { Clock, Sync } from "../../sync";
 import type { Stats } from "../decoder";
 import type { Snapshot } from "../playout";
-import type { Port } from "../render";
+import type { Port, State } from "../render";
 import type { Source } from "../source";
 import type { Graph, RingState, SupplyOutput } from "../supply";
 import { type Lease, Pool } from "./pool";
-import type { FromWorker, Output, Report, ToWorker } from "./protocol";
+import { Deadline, type FromWorker, type Output, type Report, type Stage, TICK, type ToWorker } from "./protocol";
 
 // How often the page samples its output clock for the worker. Device and system clocks drift apart by
 // tens of parts per million, so a sample a second old maps a playhead to well under a millisecond.
@@ -88,11 +92,23 @@ export type RemoteProps = RemoteInput & {
 type PlayerMessage = Extract<ToWorker, { type: "player" }>;
 type TimingMessage = Extract<ToWorker, { type: "timing" }>;
 
+/** Why the page has to take a player's audio back from its worker. */
+export interface Failure {
+	reason: string;
+	/**
+	 * Whose trouble it is: this player's alone, or the worker's, which every player on the page shares and
+	 * the pool has already warned about once.
+	 */
+	scope: "player" | "worker";
+}
+
 type RemoteOutput = SupplyOutput & {
 	/** Whether the worker took this player: it is ready, and hears about it. */
 	ready: Signal<boolean>;
 	/** What the worker's session to the relay runs over, or undefined while it has none. */
 	transport: Signal<Moq.Connection.Transport | undefined>;
+	/** Why the page has to take this player's audio back, once it has to. Final. */
+	failure: Signal<Failure | undefined>;
 };
 
 /** A supply that runs in the page's worker, as the page sees it. See the module documentation. */
@@ -110,6 +126,7 @@ export class Remote {
 		ring: new Signal<RingState | undefined>(undefined),
 		ready: new Signal<boolean>(false),
 		transport: new Signal<Moq.Connection.Transport | undefined>(undefined),
+		failure: new Signal<Failure | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -138,6 +155,14 @@ export class Remote {
 	#epoch = 0;
 	#timeline = 0;
 
+	// How long the worker has to play this player's audio, and what it has to go on: the worker's last
+	// report, whether audio reached it since the last check, and whether the ring has ever played.
+	readonly #deadline = new Deadline();
+	#last?: Report;
+	#heard = false;
+	readonly #played = new Signal(false);
+
+	#closed = false;
 	#signals = new Effect();
 
 	constructor(props: RemoteProps) {
@@ -155,8 +180,9 @@ export class Remote {
 		this.#lease = lease;
 		this.#signals.cleanup(() => lease.release());
 		void lease.ready.then((reason) => {
+			if (this.#closed) return;
 			if (reason !== undefined) {
-				console.warn(`[audio] the audio worker is not available: ${reason}`);
+				this.#fail({ reason, scope: "worker" });
 				return;
 			}
 			lease.onmessage = (msg) => this.#receive(msg);
@@ -197,6 +223,7 @@ export class Remote {
 		this.#signals.run(this.#runGraph.bind(this));
 		this.#signals.run(this.#runFlush.bind(this));
 		this.#signals.run(this.#runInstant.bind(this));
+		this.#signals.run(this.#runDeadline.bind(this));
 	}
 
 	// Tell the worker what to play, whole, whenever any of it changes. A player costs the worker a session
@@ -228,9 +255,14 @@ export class Remote {
 		const graph = effect.get(this.in.graph);
 		if (!graph) return;
 
-		// The worklet reports its state to every port it holds, the node's own included, and a port never
-		// started would queue every report for the node's life. Started, what nobody reads is dropped.
+		// The worklet reports its state to every port it holds, the node's own included: read here, where
+		// the page sees the postMessage ring play without waiting on the worker, and read at all, since a
+		// port never started would queue every report for the node's life.
 		const node = graph.target.port;
+		effect.event(node, "message", (event) => {
+			const state = (event as MessageEvent<State>).data;
+			if (state?.type === "state" && !state.debug.fresh) this.#played.set(true);
+		});
 		node.start();
 
 		const { port1, port2 } = new MessageChannel();
@@ -285,15 +317,64 @@ export class Remote {
 				this.#report(msg);
 				return;
 			case "refused":
-				console.warn(`[audio] the audio worker refused this player: ${msg.reason}`);
+				this.#fail({ reason: msg.reason, scope: "player" });
 				return;
 			case "error":
-				console.error(`[audio] the audio worker failed: ${msg.message}`);
+				this.#fail({ reason: msg.message, scope: msg.id === undefined ? "worker" : "player" });
 				return;
 		}
 	}
 
+	#fail(failure: Failure): void {
+		if (this.#out.failure.peek() === undefined) this.#out.failure.set(failure);
+	}
+
+	/**
+	 * Give the worker `AUDIO_DEADLINE` to play, checked on the page's own timer, until it has played.
+	 *
+	 * The page's session and broadcast are read through its broadcast, which a session that drops
+	 * withdraws. A ring that played once is done with the deadline for good: after that, a worker that
+	 * goes wrong is the liveness check's to catch (see `Liveness`), and anything else is the path's.
+	 */
+	#runDeadline(effect: Effect): void {
+		if (effect.get(this.#played)) return;
+		if (effect.get(this.#out.failure) !== undefined) return;
+		effect.interval(() => {
+			const stage = this.#stage();
+			this.#heard = false;
+			const reason = this.#deadline.tick(performance.now(), {
+				stage,
+				held: this.#held(),
+				target: this.in.target.peek(),
+			});
+			if (reason !== undefined) this.#fail({ reason, scope: "player" });
+		}, TICK);
+	}
+
+	// Where the worker is on its way to playing this player's audio. See `Stage`.
+	#stage(): Stage {
+		if (!this.#out.ready.peek()) return "ready";
+		const report = this.#last;
+		if (report?.connection !== "connected") return "connected";
+		if (!report.resolved) return "resolved";
+		return this.#heard ? "played" : "audio";
+	}
+
+	// Whether something on the page holds the audio up, which the worker is not to answer for.
+	#held(): boolean {
+		const broadcast = this.source.in.broadcast.peek();
+		if (!broadcast?.out.active.peek() || broadcast.out.status.peek() !== "live") return true;
+		if (this.source.out.track.peek() === undefined) return true;
+		if (!this.in.enabled.peek() || this.sync.in.delay.peek() === "instant") return true;
+		return this.in.graph.peek()?.context.state !== "running";
+	}
+
 	#report(report: Report): void {
+		// What the deadline goes on, whichever flush it was composed under.
+		this.#last = report;
+		if (report.arrivals.length > 0) this.#heard = true;
+		if (report.ring?.debug?.fresh === false) this.#played.set(true);
+
 		// Composed before the worker applied the page's last flush: it describes the ring that flush threw away.
 		if (report.epoch < this.#epoch) return;
 
@@ -341,6 +422,7 @@ export class Remote {
 	}
 
 	close(): void {
+		this.#closed = true;
 		this.#signals.close();
 	}
 }

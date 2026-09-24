@@ -1,7 +1,19 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Time } from "@moq/net";
-import { decide, type FromWorker, type Report, type Support, spawn, support, type ToWorker } from "./protocol";
+import {
+	AUDIO_DEADLINE,
+	Deadline,
+	decide,
+	type FromWorker,
+	type Report,
+	type Stage,
+	type Support,
+	spawn,
+	support,
+	TICK,
+	type ToWorker,
+} from "./protocol";
 
 const FULL: Support = { audioDecoder: true, webTransport: true, webSocket: true };
 
@@ -352,5 +364,76 @@ describe("spawn", () => {
 		// Nothing it says after that reaches the page.
 		fake.say(REPORT);
 		expect(heard.length).toBe(4);
+	});
+});
+
+// ── the deadline ────────────────────────────────────────────────────────────
+
+/** Tick `deadline` on time, every {@link TICK}, from `from` for `ms`: the first reason it gives, and when. */
+function tick(
+	deadline: Deadline,
+	props: { from: number; ms: number; stage: Stage; held?: boolean; target?: Time.Milli },
+): { reason: string; at: number } | undefined {
+	for (let at = props.from; at <= props.from + props.ms; at += TICK) {
+		const reason = deadline.tick(at, {
+			stage: props.stage,
+			held: props.held ?? false,
+			target: props.target ?? Time.Milli(80),
+		});
+		if (reason !== undefined) return { reason, at };
+	}
+	return undefined;
+}
+
+describe("Deadline", () => {
+	it("gives a worker stuck at any stage five seconds, and says where it stopped", () => {
+		const cases: Array<[Exclude<Stage, "audio">, string]> = [
+			["ready", "it never became ready"],
+			["connected", "its session to the relay never connected"],
+			["resolved", "its session never found the broadcast"],
+			["played", "the audio it read never played"],
+		];
+		for (const [stage, why] of cases) {
+			const deadline = new Deadline();
+			// The ring fills its target before it plays, so the last stage waits that much longer.
+			const target = stage === "played" ? Time.Milli(80) : Time.Milli.zero;
+			const expired = tick(deadline, { from: 1_000, ms: 10_000, stage, target });
+			expect(expired).toEqual({
+				reason: `the audio worker played nothing in 5 s: ${why}`,
+				at: 1_000 + AUDIO_DEADLINE + target + (stage === "played" ? TICK - (target % TICK) : 0),
+			});
+		}
+	});
+
+	it("adds the time up across the stages", () => {
+		const deadline = new Deadline();
+		expect(tick(deadline, { from: 0, ms: 3_000, stage: "connected" })).toBeUndefined();
+		expect(tick(deadline, { from: 3_000 + TICK, ms: 10_000, stage: "resolved" })?.at).toBe(AUDIO_DEADLINE);
+	});
+
+	it("never counts the time the page holds the audio up, or the publisher sends none", () => {
+		const deadline = new Deadline();
+		expect(tick(deadline, { from: 0, ms: 60_000, stage: "connected", held: true })).toBeUndefined();
+		expect(tick(deadline, { from: 60_000 + TICK, ms: 60_000, stage: "audio" })).toBeUndefined();
+		// What was held counts for nothing afterwards either.
+		expect(tick(deadline, { from: 120_000 + TICK, ms: 10_000, stage: "connected" })?.at).toBe(
+			120_000 + TICK + AUDIO_DEADLINE,
+		);
+	});
+
+	it("gives a deep ring the time it takes to fill", () => {
+		const deadline = new Deadline();
+		expect(tick(deadline, { from: 0, ms: 20_000, stage: "played", target: Time.Milli(10_000) })?.at).toBe(15_000);
+	});
+
+	it("does not count a check the page's own timer made late", () => {
+		const deadline = new Deadline();
+		const at = { stage: "connected" as const, held: false, target: Time.Milli.zero };
+		expect(deadline.tick(0, at)).toBeUndefined();
+		// Frozen, hidden or stalled: nothing the page saw in that time was the worker's to answer for.
+		for (let now = 10_000; now <= 60_000; now += 10_000) expect(deadline.tick(now, at)).toBeUndefined();
+		expect(tick(deadline, { from: 60_000 + TICK, ms: 10_000, stage: "connected" })?.at).toBe(
+			60_000 + AUDIO_DEADLINE,
+		);
 	});
 });

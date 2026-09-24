@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, jest } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, jest, spyOn } from "bun:test";
+import type * as Catalog from "@moq/hang/catalog";
 import { Time } from "@moq/net";
-import { LINGER, Pool } from "./pool";
-import { type FromWorker, type Report, type Support, support, type ToWorker } from "./protocol";
+import { LINGER, LIVENESS, Liveness, Pool } from "./pool";
+import { type FromWorker, type Report, type Support, support, TICK, type ToWorker } from "./protocol";
 
 const FULL: Support = { audioDecoder: true, webTransport: true, webSocket: true };
 
@@ -208,18 +209,21 @@ describe("Pool", () => {
 		worker.say(report(b.id));
 		worker.say({ type: "refused", id: b.id, reason: "no" });
 		worker.say({ type: "error", id: a.id, message: "a's" });
-		worker.fail("boom");
+		expect(heard.a).toEqual([report(a.id), { type: "error", id: a.id, message: "a's" }]);
+		expect(heard.b).toEqual([report(b.id), { type: "refused", id: b.id, reason: "no" }]);
 
-		const everyone: FromWorker = { type: "error", message: "the worker failed: boom" };
-		expect(heard.a).toEqual([report(a.id), { type: "error", id: a.id, message: "a's" }, everyone]);
-		expect(heard.b).toEqual([report(b.id), { type: "refused", id: b.id, reason: "no" }, everyone]);
-
-		// A player that let go hears nothing more.
+		// A player that let go hears nothing more, not even the worker's own trouble.
 		a.release();
 		worker.say(report(a.id));
-		worker.fail("again");
-		expect(heard.a.length).toBe(3);
-		expect(heard.b.length).toBe(4);
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		worker.fail("boom");
+		warn.mockRestore();
+		expect(heard.a.length).toBe(2);
+		expect(heard.b).toEqual([
+			report(b.id),
+			{ type: "refused", id: b.id, reason: "no" },
+			{ type: "error", message: "the worker failed: boom" },
+		]);
 	});
 
 	it("remembers a worker the page could not start, for every player after", async () => {
@@ -322,4 +326,187 @@ describe("suspend", () => {
 it("lingers as long as a connection does", () => {
 	// Two seconds, as `@moq/net`'s pool: a tile moved around the page is back well within it.
 	expect(LINGER).toBe(Time.Milli(2_000));
+});
+
+// ── a worker that fails ─────────────────────────────────────────────────────
+
+describe("Liveness", () => {
+	/** Check on time, every {@link TICK}, from `from` for `ms`: when it first gave up, if it did. */
+	function check(liveness: Liveness, from: number, ms: number, playing = true): number | undefined {
+		for (let at = from; at <= from + ms; at += TICK) {
+			if (liveness.tick(at, playing)) return at;
+		}
+		return undefined;
+	}
+
+	it("gives up on a worker that says nothing for two seconds of the page's own checks", () => {
+		expect(check(new Liveness(), 0, 10_000)).toBe(LIVENESS);
+	});
+
+	it("hears anything the worker says as alive", () => {
+		const liveness = new Liveness();
+		expect(check(liveness, 0, LIVENESS - TICK)).toBeUndefined();
+		liveness.heard();
+		expect(check(liveness, LIVENESS, 10_000)).toBe(2 * LIVENESS - TICK);
+	});
+
+	it("waits while the worker plays for nobody, and starts over when it does again", () => {
+		const liveness = new Liveness();
+		expect(check(liveness, 0, LIVENESS - TICK)).toBeUndefined();
+		expect(check(liveness, LIVENESS, 60_000, false)).toBeUndefined();
+		const from = LIVENESS + 60_000 + TICK;
+		expect(check(liveness, from, 10_000)).toBe(from + LIVENESS - TICK);
+	});
+
+	it("does not count a check the page's own timer made late", () => {
+		const liveness = new Liveness();
+		expect(liveness.tick(0, true)).toBe(false);
+		// Frozen, hidden or stalled: whatever the worker said in that time is still queued behind the page.
+		for (let at = 10_000; at <= 60_000; at += 10_000) expect(liveness.tick(at, true)).toBe(false);
+		expect(check(liveness, 60_000 + TICK, 10_000)).toBe(60_000 + LIVENESS);
+	});
+});
+
+describe("a worker that fails", () => {
+	const PLAYER = { url: "https://relay.example/anon", name: "room/alice", announced: true, enabled: true };
+	const CONFIG = { codec: "opus", container: { kind: "legacy" } } as unknown as Catalog.AudioConfig;
+
+	/** Players on a worker started under fake timers, which a FakeWorker says ready on. */
+	async function started(count: number) {
+		jest.useFakeTimers();
+		const shared = pool();
+		const leases = Array.from({ length: count }, () => shared.acquire());
+		await ticks();
+		jest.advanceTimersByTime(1);
+		for (const lease of leases) expect(await lease.ready).toBeUndefined();
+		return { shared, leases };
+	}
+
+	/** Two players on one worker, each with a player the worker would report for. */
+	async function two() {
+		const {
+			shared,
+			leases: [a, b],
+		} = await started(2);
+		const heard = { a: [] as FromWorker[], b: [] as FromWorker[] };
+		a.onmessage = (msg) => heard.a.push(msg);
+		b.onmessage = (msg) => heard.b.push(msg);
+		a.post({ type: "player", id: a.id, ...PLAYER, track: "audio", config: CONFIG });
+		b.post({ type: "player", id: b.id, ...PLAYER, track: "audio", config: CONFIG });
+		const [worker] = FakeWorker.created;
+		return { shared, a, b, heard, worker };
+	}
+
+	it("is given up when it says nothing for two seconds while it plays, for every player now and after, with one warning", async () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const { shared, heard, worker } = await two();
+			jest.advanceTimersByTime(LIVENESS);
+			expect(heard.a).toEqual([]);
+			jest.advanceTimersByTime(TICK);
+
+			const gone: FromWorker = { type: "error", message: "the audio worker said nothing for 2 s" };
+			expect(heard.a).toEqual([gone]);
+			expect(heard.b).toEqual([gone]);
+			expect(worker.terminated).toBe(true);
+			expect(warn).toHaveBeenCalledTimes(1);
+
+			// Whatever stalled it would stall the next one too.
+			const c = shared.acquire();
+			expect(await c.ready).toBe("the audio worker said nothing for 2 s");
+			expect(FakeWorker.created.length).toBe(1);
+			expect(warn).toHaveBeenCalledTimes(1);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("is kept while it reports, and while it plays for nobody", async () => {
+		const {
+			leases: [a],
+		} = await started(1);
+		const [worker] = FakeWorker.created;
+		const heard: FromWorker[] = [];
+		a.onmessage = (msg) => heard.push(msg);
+
+		// No player yet, so nothing to report.
+		jest.advanceTimersByTime(10 * LIVENESS);
+		a.post({ type: "player", id: a.id, ...PLAYER, track: "audio", config: CONFIG });
+		for (let at = 0; at < 10 * LIVENESS; at += 50) {
+			worker.say(report(a.id));
+			jest.advanceTimersByTime(50);
+		}
+		expect(heard.filter((msg) => msg.type === "error")).toEqual([]);
+		expect(worker.terminated).toBe(false);
+	});
+
+	it("is given up on its own error, for every player now and after, with one warning", async () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const { shared, heard, worker } = await two();
+			worker.fail("boom");
+			const gone: FromWorker = { type: "error", message: "the worker failed: boom" };
+			expect(heard.a).toEqual([gone]);
+			expect(heard.b).toEqual([gone]);
+			expect(worker.terminated).toBe(true);
+			expect(warn).toHaveBeenCalledTimes(1);
+
+			const c = shared.acquire();
+			expect(await c.ready).toBe("the worker failed: boom");
+			expect(FakeWorker.created.length).toBe(1);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("is kept when one player's rendition is refused or fails", async () => {
+		const { shared, a, heard, worker } = await two();
+		worker.say({ type: "refused", id: a.id, reason: "no" });
+		worker.say({ type: "error", id: a.id, message: "a's" });
+		expect(heard.b).toEqual([]);
+		expect(worker.terminated).toBe(false);
+
+		const c = shared.acquire();
+		expect(await c.ready).toBeUndefined();
+		expect(FakeWorker.created.length).toBe(1);
+	});
+
+	it("warns once when two it started at once both fail to start", async () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			jest.useFakeTimers();
+			FakeWorker.support = undefined;
+			const shared = pool();
+			// The first is let go while it starts, and lingers out; the next player starts another.
+			shared.acquire().release();
+			jest.advanceTimersByTime(LINGER);
+			const b = shared.acquire();
+			await ticks();
+			expect(FakeWorker.created.length).toBe(2);
+
+			FakeWorker.created[0].fail("first");
+			FakeWorker.created[1].fail("second");
+			expect(await b.ready).toBe("the worker failed to load: second");
+			expect(await shared.acquire().ready).toBe("the worker failed to load: first");
+			expect(warn).toHaveBeenCalledTimes(1);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("warns once when the page cannot start one, however many players ask", async () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			FakeWorker.support = { ...FULL, audioDecoder: false };
+			const shared = pool();
+			const a = shared.acquire();
+			const b = shared.acquire();
+			expect(await a.ready).toBe("AudioDecoder is not available in a dedicated worker");
+			expect(await b.ready).toBe("AudioDecoder is not available in a dedicated worker");
+			expect(await shared.acquire().ready).toBe("AudioDecoder is not available in a dedicated worker");
+			expect(warn).toHaveBeenCalledTimes(1);
+		} finally {
+			warn.mockRestore();
+		}
+	});
 });
