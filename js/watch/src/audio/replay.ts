@@ -276,7 +276,7 @@ export interface Options {
  * pull one render quantum every quantum's worth of wall time through the real playout engine.
  *
  * The estimator runs live, exactly as `Container.Consumer` drives it: observe at arrival, and let
- * the new target reach the ring the way `Sync` and `Decoder.#runLatency` push it there. A settled
+ * the new target reach the ring the way `Sync` and `Supply.#runLatency` push it there. A settled
  * number measured up front would hide the thing the design turns on, which is that the target rises
  * the moment an arrival proves the buffer too shallow.
  */

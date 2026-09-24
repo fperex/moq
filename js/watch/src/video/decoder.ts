@@ -203,7 +203,7 @@ export class Decoder {
 	 * Measure how late frames arrive, for as long as the rendition lasts.
 	 *
 	 * One estimator per rendition rather than per subscription, the same rule the audio decoder
-	 * keeps (`Audio.Decoder`'s `#runSpread`). A rebuild replaces the subscription, and every
+	 * keeps (`#runSpread` in `audio/supply.ts`). A rebuild replaces the subscription, and every
 	 * reason to rebuild is a path that just proved it delivers late; starting the measurement
 	 * over at the publisher's declaration hands Sync a delay sized for a path nobody is on, so
 	 * the shared delay collapses to whatever audio measured and the replacement subscription is

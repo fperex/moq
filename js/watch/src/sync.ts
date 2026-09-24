@@ -460,7 +460,7 @@ export class Sync {
 			// moment later. Re-deriving the hold from a cold window instead is what moves it at the
 			// unmute, which the ring spends as a stall or a stretch just as the sound comes back.
 			// The estimator carries its own measurement across the same pause, for the same reason
-			// (`Decoder.#runSpread`). The window is re-opened at `now` rather than walked forward,
+			// (`Supply.#runSpread`). The window is re-opened at `now` rather than walked forward,
 			// so one arrival costs one rotation however long the pause was.
 			entry.previous = entry.current;
 			entry.current = floor;
