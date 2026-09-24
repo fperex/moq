@@ -33,6 +33,7 @@ in sync at the latency you ask for.
 | `delay` | How far playback trails the live edge: `"auto"` (the default, sized from how late frames actually arrive), a duration like `"300ms"` which is the whole delay, or `"instant"` to paint frames as they decode with no pacing at all. |
 | `buffer` | Future-dated media held beyond the live edge before playback skips ahead, e.g. `"30s"`. Defaults to none. |
 | `conceal` | Cover a gap in the audio with synthesized audio instead of playing it as a gap (default on). `conceal="false"` leaves the loss audible, for a listener who would rather hear it than hear invented audio. Read when the audio graph is built. |
+| `offload` | Feed the audio from a worker, off the page's main thread (default on). `offload="false"` keeps it on the page. See [Audio off the main thread](#audio-off-the-main-thread). |
 | `captions` | The caption track to show, or absent for off. `el.text.out.available` lists the renditions for a picker. |
 | `visible` | Only subscribe to video while the element is on screen: a margin (`"20%"` default, `"200px"`), `"always"`, or `"never"`. |
 | `announced` | Wait for the broadcast to be announced before subscribing (default on), so a player can be mounted before the stream exists. |
@@ -144,6 +145,8 @@ const connection = new Moq.Connection({ url: new URL("https://relay.example.com/
 const player = new Watch.Player({
     origin: connection.origin,
     probe: connection.probe,
+    // The relay the audio worker dials; without it the audio stays on the main thread.
+    url: connection.url,
     name: Moq.Path.from("alice.hang"),
     canvas,
 });
@@ -157,6 +160,46 @@ to change later, such as `muted` or `delay`. `Player` owns the same pipeline as
 `<moq-watch>`; `Watch.Broadcast`, `Sync`, and the per-track components remain
 available for custom composition. Load the element from a CDN
 (`https://esm.sh/@moq/watch/element`) for a no-build embed.
+
+## Audio off the main thread
+
+By default the audio does not wait on the page's main thread. One worker per
+page subscribes to every player's audio, decodes it, and writes the ring the
+audio worklet plays from, so a page busy with layout, video, or its own scripts
+cannot starve the sound. The page keeps the AudioContext, the picture, the
+captions, and the controls, and the worker reports back what the stats and the
+clock need.
+
+`offload="false"`, or `el.offload = false`, keeps a player's audio on the main
+thread.
+
+The worker dials the relay itself, with the same URL (`?jwt=` included) and only
+the transports the page would race. So a page holds one more session per relay
+URL, which all its players share, and the relay's priority of audio over video
+applies within each session, not between the two.
+
+A browser without `Worker` keeps the audio on the page. The page also keeps it,
+or takes it back for good, and warns once in the console, when:
+
+- a Content Security Policy refuses the worker, which starts from a `blob:` URL:
+  allow it with `worker-src blob:`;
+- the worker has no native `AudioDecoder`, or cannot open a transport the page
+  would use;
+- the worker plays nothing within 5 seconds of trying, counting only time the
+  page could play it (unmuted, unpaused, its AudioContext running, the broadcast
+  live);
+- the worker gets stuck: it fails, or says nothing for 2 seconds while it plays.
+
+Taking the audio back costs one gap about as long as tuning in. A worker that
+failed or never started keeps every later player on the page on the main thread
+too.
+
+Safari runs a worker's WebSocket through the page's main thread, and a Safari
+session is a WebSocket, so there a busy page can still hold up the audio's
+bytes on their way in. The decoding and the ring writes stay off it.
+
+`Player` does the same when it has the relay's `url`, which the element passes
+it. Without one, its audio stays on the page.
 
 ## Keeping tracks together
 

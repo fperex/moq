@@ -137,6 +137,38 @@ test("the conceal attribute reaches the audio decoder, defaulting to on", () => 
 	expect(el.audio.in.conceal.peek()).toBe(false);
 });
 
+test("the offload attribute reaches the audio decoder, defaulting to on", () => {
+	const MoqWatch = require("./element").default as new () => {
+		attributeChangedCallback(name: string, old: string | null, value: string | null): void;
+		audio: { in: { offload: { peek(): boolean } } };
+		offload: boolean;
+	};
+	const el = new MoqWatch();
+
+	// A page that never mentions it has its audio fed from the worker.
+	expect(el.offload).toBe(true);
+	expect(el.audio.in.offload.peek()).toBe(true);
+
+	el.attributeChangedCallback("offload", null, "false");
+	expect(el.offload).toBe(false);
+	expect(el.audio.in.offload.peek()).toBe(false);
+
+	// The rule `conceal` follows: only "false" and "0" say off, so a value it does not know is on.
+	el.attributeChangedCallback("offload", "false", "nope");
+	expect(el.offload).toBe(true);
+	expect(el.audio.in.offload.peek()).toBe(true);
+
+	el.attributeChangedCallback("offload", "nope", "0");
+	expect(el.audio.in.offload.peek()).toBe(false);
+
+	el.attributeChangedCallback("offload", "0", "");
+	expect(el.audio.in.offload.peek()).toBe(true);
+
+	el.offload = false;
+	expect(el.offload).toBe(false);
+	expect(el.audio.in.offload.peek()).toBe(false);
+});
+
 test("the audio decoder is told when the element leaves the document", () => {
 	// The download gate alone cannot say it: a muted tile stops downloading too, and it keeps its
 	// audio context so the unmute costs no gesture. Only the element knows it is off the page,
