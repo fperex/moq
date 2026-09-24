@@ -543,8 +543,8 @@ async function session({
 		await flush();
 
 		const next = sync.out.delay.peek();
-		// `Audio.Decoder.#runLatencyReanchor`: a deepening target parks the ring so it refills
-		// rather than keeping on at its old depth.
+		// A deepening target parks the ring so it refills rather than keeping on at its old depth: what
+		// `Supply.#runLatency` does for a delay the viewer set, applied here to any rise past two buckets.
 		if (next - target > 2 * Container.Jitter.BUCKET) {
 			if (buffer) buffer.stall();
 			else ring.stall();

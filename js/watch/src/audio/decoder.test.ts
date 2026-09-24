@@ -667,8 +667,8 @@ test("unmuting continues the arrival estimate rather than starting over at the d
 	expect(measured).toBeLessThan(320 as Time.Milli);
 
 	// Muted: the download stops and the consumer goes with it. What Sync knows about this track
-	// must not go too, or the delay collapses and then deepens on the way back, which is the
-	// decoder's cue to park the playhead a second time (see #runLatencyReanchor).
+	// must not go too, or the delay collapses and then deepens on the way back, which the ring then
+	// has to stretch back up into (see `Supply.#runLatency`).
 	enabled.set(false);
 	await flush();
 	expect(built.out.spread.peek()).toBe(measured);
