@@ -25,13 +25,8 @@ resource lifetime, drain, and refusal on unsupported devices. Wire fixtures
 and contract tests into CI, and record actual hardware execution separately.
 Lack of suitable hardware leaves that implementation unverified, not complete.
 
-Public API: additive capabilities on the m0 extension points. Wire: existing
+Public API: additive capabilities on the extension points settled on main. Wire: existing
 codec signaling, with cross-language fixtures for any metadata change.
-
-## Required
-
-- [Video frames](/quest/m0/video-frames.md) - extensible pixels and frame metadata
-- [NVENC resources](/quest/m0/nvenc-resources.md) - safe input and completion ownership
 
 ## Closes
 
@@ -39,4 +34,4 @@ codec signaling, with cross-language fixtures for any metadata change.
 
 ## Related
 
-- [Codec coverage study](/quest/m3/video-codec-coverage.md) - measure optional software and other native backends separately
+- [Codec coverage study](/quest/m2/video-codec-coverage.md) - measure optional software and other native backends separately

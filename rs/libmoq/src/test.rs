@@ -1803,7 +1803,17 @@ fn announced_free_lifecycle() {
 	let broadcast = publish_broadcast(origin, path);
 
 	let ann_cb = Callback::new();
-	let ann_task = id(unsafe { moq_origin_announced(origin, Some(channel_callback), ann_cb.ptr) });
+	let ann_task = id(unsafe {
+		moq_origin_announced(
+			origin,
+			std::ptr::null(),
+			0,
+			std::ptr::null(),
+			0,
+			Some(channel_callback),
+			ann_cb.ptr,
+		)
+	});
 
 	// The first callback is the announcement for our broadcast.
 	let announced = id(ann_cb.recv());
@@ -1812,6 +1822,9 @@ fn announced_free_lifecycle() {
 	let mut info = moq_announce_update {
 		prefix: std::ptr::null(),
 		prefix_len: 0,
+		captures: std::ptr::null(),
+		captures_len: 0,
+		has_captures: false,
 		active: false,
 	};
 	assert_eq!(unsafe { moq_origin_announced_info(announced, &mut info) }, 0);
@@ -1955,7 +1968,17 @@ fn local_announce() {
 	let origin = id(moq_origin_create());
 
 	let cb = Callback::new();
-	let announced_task = id(unsafe { moq_origin_announced(origin, Some(channel_callback), cb.ptr) });
+	let announced_task = id(unsafe {
+		moq_origin_announced(
+			origin,
+			std::ptr::null(),
+			0,
+			std::ptr::null(),
+			0,
+			Some(channel_callback),
+			cb.ptr,
+		)
+	});
 
 	let path = b"test/broadcast";
 	let broadcast = publish_broadcast(origin, path);
@@ -1965,6 +1988,9 @@ fn local_announce() {
 	let mut info = moq_announce_update {
 		prefix: std::ptr::null(),
 		prefix_len: 0,
+		captures: std::ptr::null(),
+		captures_len: 0,
+		has_captures: false,
 		active: false,
 	};
 	assert_eq!(unsafe { moq_origin_announced_info(announced_id, &mut info) }, 0);
@@ -1981,10 +2007,68 @@ fn local_announce() {
 }
 
 #[test]
-fn announced_deactivation() {
+fn announced_filters_patterns_and_reports_captures() {
 	let origin = id(moq_origin_create());
 	let cb = Callback::new();
-	let announced_task = id(unsafe { moq_origin_announced(origin, Some(channel_callback), cb.ptr) });
+	let prefix = b"room";
+	let filter = b"*/chat";
+	let announced_task = id(unsafe {
+		moq_origin_announced(
+			origin,
+			prefix.as_ptr().cast(),
+			prefix.len(),
+			filter.as_ptr().cast(),
+			filter.len(),
+			Some(channel_callback),
+			cb.ptr,
+		)
+	});
+
+	let audio = publish_broadcast(origin, b"room/alice/audio");
+	let chat = publish_broadcast(origin, b"room/alice/chat");
+	let announced_id = id(cb.recv());
+	let mut info = moq_announce_update {
+		prefix: std::ptr::null(),
+		prefix_len: 0,
+		captures: std::ptr::null(),
+		captures_len: 0,
+		has_captures: false,
+		active: false,
+	};
+	assert_eq!(unsafe { moq_origin_announced_info(announced_id, &mut info) }, 0);
+
+	let announced_prefix =
+		unsafe { std::str::from_utf8(std::slice::from_raw_parts(info.prefix.cast::<u8>(), info.prefix_len)).unwrap() };
+	assert_eq!(announced_prefix, "room/alice/chat");
+	assert!(info.has_captures);
+	assert_eq!(info.captures_len, 1);
+	let capture = unsafe { &*info.captures };
+	let capture = unsafe { std::str::from_utf8(std::slice::from_raw_parts(capture.data.cast(), capture.len)).unwrap() };
+	assert_eq!(capture, "alice");
+
+	assert_eq!(moq_origin_announced_free(announced_id), 0);
+	assert_eq!(moq_origin_announced_cancel(announced_task), 0);
+	assert_eq!(cb.recv_terminal(), 0);
+	assert_eq!(moq_publish_finish(audio), 0);
+	assert_eq!(moq_publish_finish(chat), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
+fn local_announcement_survives_unannounce() {
+	let origin = id(moq_origin_create());
+	let cb = Callback::new();
+	let announced_task = id(unsafe {
+		moq_origin_announced(
+			origin,
+			std::ptr::null(),
+			0,
+			std::ptr::null(),
+			0,
+			Some(channel_callback),
+			cb.ptr,
+		)
+	});
 
 	let path = b"deactivate/test";
 	let broadcast = publish_broadcast(origin, path);
@@ -1993,41 +2077,56 @@ fn announced_deactivation() {
 	let mut info = moq_announce_update {
 		prefix: std::ptr::null(),
 		prefix_len: 0,
+		captures: std::ptr::null(),
+		captures_len: 0,
+		has_captures: false,
 		active: false,
 	};
 	assert_eq!(unsafe { moq_origin_announced_info(announced_id, &mut info) }, 0);
 	assert!(info.active);
 
-	// Going non-live unannounces the broadcast without tearing it down: it stays
-	// reachable by exact path for subscribes and fetches.
+	// Unannouncing withdraws the peer advertisement, while the local cursor
+	// and exact request remain live until the broadcast finishes.
 	assert_eq!(moq_publish_unannounce(broadcast), 0);
+	let _ = request_broadcast(origin, path);
+	assert_eq!(moq_publish_finish(broadcast), 0);
 
 	let deactivated_id = id(cb.recv());
 	assert_eq!(unsafe { moq_origin_announced_info(deactivated_id, &mut info) }, 0);
-	assert!(!info.active, "broadcast should be inactive after unannounce");
+	assert!(!info.active, "broadcast should be inactive after finish");
 
 	assert_eq!(moq_origin_announced_cancel(announced_task), 0);
 	assert_eq!(cb.recv_terminal(), 0, "announced close delivers terminal 0");
-	assert_eq!(moq_publish_finish(broadcast), 0);
 	assert_eq!(moq_origin_close(origin), 0);
 }
 
 #[test]
-fn create_broadcast_does_not_announce() {
+fn create_broadcast_announces_locally() {
 	let origin = id(moq_origin_create());
 	let cb = Callback::new();
-	let announced_task = id(unsafe { moq_origin_announced(origin, Some(channel_callback), cb.ptr) });
+	let announced_task = id(unsafe {
+		moq_origin_announced(
+			origin,
+			std::ptr::null(),
+			0,
+			std::ptr::null(),
+			0,
+			Some(channel_callback),
+			cb.ptr,
+		)
+	});
 
 	let path = b"quiet";
 	let broadcast = id(unsafe { moq_origin_create_broadcast(origin, path.as_ptr() as *const c_char, path.len()) });
-	// Reachable by exact path without being announced.
+	// Creation reaches local cursors and exact requests before peer advertising.
 	let _ = request_broadcast(origin, path);
-
-	assert_eq!(unsafe { moq_publish_announce(broadcast, std::ptr::null()) }, 0);
 	let announced_id = id(cb.recv());
 	let mut info = moq_announce_update {
 		prefix: std::ptr::null(),
 		prefix_len: 0,
+		captures: std::ptr::null(),
+		captures_len: 0,
+		has_captures: false,
 		active: false,
 	};
 	assert_eq!(unsafe { moq_origin_announced_info(announced_id, &mut info) }, 0);
@@ -2844,7 +2943,7 @@ fn consume_audio_follows_a_sibling_broadcast_reference() {
 			.renditions
 			.get_mut(&name)
 			.unwrap()
-			.broadcast = Some(moq_net::PathRelative::new("./source").into_owned());
+			.broadcast = Some(moq_net::path::Relative::new("./source").into_owned());
 	}
 
 	let consume = request_broadcast(origin, b"a/pub");
@@ -3679,14 +3778,14 @@ fn video_raw_publish_rejects_invalid_config() {
 #[test]
 fn video_raw_decode() {
 	// Encode a few gray frames to Annex-B (avc3, SPS/PPS inline on the keyframe).
-	let mut config = moq_video::encode::Config::new(320, 240, 30);
+	let mut config = moq_video::encode::Config::new(320, 240, moq_video::Rate::new(30, 1).unwrap());
 	config.kind = moq_video::encode::Kind::Software;
 	let mut encoder = moq_video::encode::Encoder::new(&config).expect("openh264 encoder");
 	let gray = vec![0x80u8; 320 * 240 * 4];
 	let mut frames: Vec<moq_video::encode::Encoded> = Vec::new();
 	for i in 0..5u64 {
 		if i == 0 {
-			encoder.keyframe();
+			encoder.cut().unwrap();
 		}
 		let surface = moq_video::Surface::rgba(&gray, moq_video::Size::new(320, 240)).unwrap();
 		let frame = moq_video::Frame::new(surface, moq_net::Timestamp::from_micros(i * 33_333).unwrap());

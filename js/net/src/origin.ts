@@ -157,6 +157,16 @@ interface Presented extends Advertised {
 	readonly captures: Path.Pattern[] | undefined;
 }
 
+/** A table mutation invalidates the shared route snapshot before its async notification. */
+class VersionedSignal<T> extends Signal<T> {
+	version = 0;
+
+	override set(value: T, notify?: boolean): void {
+		this.version++;
+		super.set(value, notify);
+	}
+}
+
 /** Reactive backing state shared by origin producers and consumers. */
 class OriginState {
 	// Both tables decouple the application producing into the origin from the
@@ -168,9 +178,46 @@ class OriginState {
 	// prefixes a dynamic handle or a received session covers, newest first. They stay
 	// separate so a session can never announce a received entry back to a peer, which
 	// is what makes an origin shared by both directions echo-free.
-	local = new Signal<Map<Path.Valid, broadcast.Consumer> | undefined>(new Map());
-	advertisedLocal = new Signal<Map<Path.Valid, Route> | undefined>(new Map());
-	routes = new Signal<Map<Path.Valid, RouteEntry[]> | undefined>(new Map());
+	local = new VersionedSignal<Map<Path.Valid, broadcast.Consumer> | undefined>(new Map());
+	advertisedLocal = new VersionedSignal<Map<Path.Valid, Route> | undefined>(new Map());
+	routes = new VersionedSignal<Map<Path.Valid, RouteEntry[]> | undefined>(new Map());
+
+	#snapshotVersion = "";
+	#snapshot = {
+		remote: new Map<Path.Valid, Advertised>(),
+		local: new Map<Path.Valid, Advertised>(),
+		routes: new Map<Path.Valid, Route>(),
+	};
+
+	/** The full route table is built once per mutation, regardless of observer count. */
+	available = new Derived([this.local, this.advertisedLocal, this.routes], () => this.snapshot().routes);
+
+	snapshot(): {
+		remote: ReadonlyMap<Path.Valid, Advertised>;
+		local: ReadonlyMap<Path.Valid, Advertised>;
+		routes: ReadonlyMap<Path.Valid, Route>;
+	} {
+		const version = `${this.local.version}/${this.advertisedLocal.version}/${this.routes.version}`;
+		if (version === this.#snapshotVersion) return this.#snapshot;
+		const remote = new Map<Path.Valid, Advertised>();
+		const local = new Map<Path.Valid, Advertised>();
+		const available = new Map<Path.Valid, Route>();
+		for (const [path, routes] of this.routes.peek() ?? []) {
+			const entry = routes[0];
+			if (!entry) continue;
+			const value = { identity: entry.identity, route: entry.route.peek() };
+			remote.set(path, value);
+			available.set(path, value.route);
+		}
+		for (const [path, front] of this.local.peek() ?? []) {
+			const value = { identity: front, route: this.advertisedLocal.peek()?.get(path) ?? Route.default };
+			local.set(path, value);
+			available.set(path, value.route);
+		}
+		this.#snapshot = { remote, local, routes: available };
+		this.#snapshotVersion = version;
+		return this.#snapshot;
+	}
 
 	// Originated advertisements sessions should forward: exact-path announces plus
 	// originated dynamics. Identity is the local front or the route entry, so a
@@ -339,14 +386,20 @@ export interface Table {
 	/** Whether every attached session announces into the table; see {@link Consumer.discovery}. */
 	readonly discovery: Getter<boolean | undefined>;
 
-	/** Create an unadvertised broadcast at `path`; see {@link Producer.createBroadcast}. */
+	/** Create a locally announced broadcast at `path`; see {@link Producer.createBroadcast}. */
 	createBroadcast(path: Path.Valid): broadcast.Producer;
 
 	/** Resolve `path`, optionally waiting for an announcement; see {@link Consumer.request}. */
 	request(path: Path.Valid, options?: RequestOptions): Requesting;
 
+	/** The available announcements under `scope`, as a live map; see {@link Consumer.broadcasts}. */
+	broadcasts(scope?: Path.Pattern): Getter<ReadonlyMap<Path.Valid, Route>>;
+
 	/** The available broadcasts under `scope`, as a live stream; see {@link Consumer.announced}. */
 	announced(scope?: Path.Pattern): announce.Consumer;
+
+	/** Advertise a prefix and serve requests under it; see {@link Producer.dynamic}. */
+	dynamic(prefix: Path.Valid, route?: Route | { hops?: Route["hops"]; cost?: Route["cost"] | bigint }): Dynamic;
 }
 
 /** Options for resolving a broadcast path. */
@@ -366,7 +419,7 @@ export interface RequestOptions {
  *
  * Create, attach {@link dynamic} for tracks served on demand, populate, then
  * {@link broadcast.Producer.announce}: an exact-path subscribe before the tracks exist is
- * refused, and announcing only makes a path discoverable.
+ * refused, and announcing advertises the path to peers.
  *
  * @public
  */
@@ -404,10 +457,9 @@ export class Producer implements Table {
 	/**
 	 * Create a broadcast at `path`, returning its producer.
 	 *
-	 * The broadcast starts unadvertised: it is reachable by exact path for subscribes
-	 * and fetches. Advertise it once its tracks exist with
-	 * {@link broadcast.Producer.announce}; the two are independent, so cached or
-	 * on-demand content can stay reachable without ever being announced.
+	 * The broadcast appears on this origin's local announce streams immediately.
+	 * Call {@link broadcast.Producer.announce} to advertise it to peers once its
+	 * tracks exist. Local consumers can discover and request it without that call.
 	 *
 	 * Close the producer to drop it. Creating a path again supersedes the previous
 	 * broadcast: the origin drops its handle on the old one, which closes it unless the
@@ -648,6 +700,11 @@ export class Producer implements Table {
 	/** Resolve `path`, optionally waiting for an announcement; see {@link Consumer.request}. */
 	request(path: Path.Valid, options?: RequestOptions): Requesting {
 		return this.#reader.request(path, options);
+	}
+
+	/** The available announcements under `scope`, as a live map; see {@link Consumer.broadcasts}. */
+	broadcasts(scope?: Path.Pattern): Getter<ReadonlyMap<Path.Valid, Route>> {
+		return this.#reader.broadcasts(scope);
 	}
 
 	/** The available broadcasts under `scope`, as a live stream; see {@link Consumer.announced}. */
@@ -979,17 +1036,47 @@ export class Consumer {
 	}
 
 	/**
+	 * The announced routes matching `scope`, as a live map from covered prefix to route.
+	 * Local broadcasts appear on creation; received and dynamic routes retain their
+	 * advertised prefixes. Reads are synchronous, and the getter needs no teardown.
+	 * Unscoped readers share one snapshot; each distinct scope filters the table on changes.
+	 */
+	broadcasts(scope?: Path.Pattern): Getter<ReadonlyMap<Path.Valid, Route>> {
+		if (!scope) return this.#state.available;
+		return new Derived([this.#state.available], () => {
+			const routes = new Map<Path.Valid, Route>();
+			for (const [path, entry] of this.#listed(scope)) routes.set(path, entry.route);
+			return routes;
+		});
+	}
+
+	/**
 	 * The announced routes matching `scope`, as a live stream: every currently advertised
 	 * route arrives first as active, then additions and retractions as they happen.
-	 * Any pattern is accepted. A local broadcast appears only after
-	 * {@link broadcast.Producer.announce}; a dynamic or received route announces the
-	 * prefix it covers when its subtree overlaps the scope. The
+	 * Any pattern is accepted. A local broadcast appears when it is created;
+	 * {@link broadcast.Producer.announce} only forwards it to peers. A dynamic or
+	 * received route announces the prefix it covers when its subtree overlaps the scope. The
 	 * stream ends when the origin closes or the consumer is closed.
 	 */
 	announced(scope: Path.Pattern = Path.Pattern.all()): announce.Consumer {
 		const producer = new announce.Producer();
 		void this.#runAnnounced(producer, scope);
 		return producer.consume();
+	}
+
+	/** One snapshot shared by map readers and announcement-stream diffing. */
+	#listed(scope: Path.Pattern): Map<Path.Valid, Presented> {
+		const next = new Map<Path.Valid, Presented>();
+		const { remote, local } = this.#state.snapshot();
+		for (const [path, entry] of remote) {
+			if (!scopeOverlaps(scope, path)) continue;
+			next.set(path, { identity: entry.identity, route: entry.route, captures: scopeCaptures(scope, path) });
+		}
+		for (const [path, entry] of local) {
+			if (!scope.matches(path)) continue;
+			next.set(path, { identity: entry.identity, route: entry.route, captures: scopeCaptures(scope, path) });
+		}
+		return next;
 	}
 
 	async #runAnnounced(producer: announce.Producer, scope: Path.Pattern): Promise<void> {
@@ -1006,39 +1093,29 @@ export class Consumer {
 				const routes = this.#state.routes.peek();
 				if (local === undefined && advertisedLocal === undefined && routes === undefined) break;
 
-				const next = new Map<Path.Valid, Presented>();
-				// Routes first, so an advertised local at the same path overwrites it: the
-				// announcement points at whatever request() would resolve. A route remains
-				// the prefix it advertised; the pattern is a local filter, not a new claim.
-				for (const [covered, entries] of routes ?? []) {
-					const entry = entries[0];
-					if (!entry) continue;
-					if (!scopeOverlaps(scope, covered)) continue;
-					const snap: Presented = {
-						identity: entry.identity,
-						route: entry.route.peek(),
-						captures: scopeCaptures(scope, covered),
-					};
-					next.set(covered, snap);
-				}
-				for (const [path, front] of local ?? []) {
-					const route = advertisedLocal?.get(path);
-					if (!route) continue;
-					if (scope.matches(path))
-						next.set(path, { identity: front, route, captures: scopeCaptures(scope, path) });
-				}
+				const next = this.#listed(scope);
 
 				for (const [path, snap] of active) {
 					const cur = next.get(path);
 					if (!cur || cur.identity !== snap.identity)
-						producer.append({ path, captures: snap.captures, kind: "retracted", route: snap.route });
+						producer.append({
+							prefix: path,
+							captures: snap.captures,
+							kind: "retracted",
+							route: snap.route,
+						});
 				}
 				for (const [path, snap] of next) {
 					const prev = active.get(path);
 					if (!prev || prev.identity !== snap.identity) {
-						producer.append({ path, captures: snap.captures, kind: "announced", route: snap.route });
+						producer.append({
+							prefix: path,
+							captures: snap.captures,
+							kind: "announced",
+							route: snap.route,
+						});
 					} else if (!routesEqual(prev.route, snap.route)) {
-						producer.append({ path, captures: snap.captures, kind: "updated", route: snap.route });
+						producer.append({ prefix: path, captures: snap.captures, kind: "updated", route: snap.route });
 					}
 				}
 				active = next;

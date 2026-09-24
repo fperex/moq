@@ -2,6 +2,7 @@ import { expect, setSystemTime, test } from "bun:test";
 import { Expired, StreamCode, TooFarBehind } from "./error.ts";
 import { Producer as GroupProducer, MAX_GROUP_FRAMES } from "./group.ts";
 import { hooks } from "./internal.ts";
+import { Writer } from "./stream.ts";
 import { Milli, Timescale, Timestamp } from "./time.ts";
 import { infoDefaults, Producer as TrackProducer } from "./track.ts";
 
@@ -118,6 +119,22 @@ test("appendDatagram delivers to a subscriber", async () => {
 	expect(got?.sequence).toBe(seq);
 	expect(got?.timestamp).toBe(ts);
 	expect(got && dec.decode(got.payload)).toBe("hello");
+});
+
+test("datagram buffers drop oldest at capacity without delaying active subscribers", async () => {
+	const producer = new TrackProducer("test");
+	const slow = producer.subscribe();
+	const fast = producer.subscribe();
+	const count = 192;
+	for (let sequence = 0; sequence < count; sequence++) {
+		producer.appendDatagram(Timestamp.fromMillis(0), enc.encode("x"));
+		expect((await fast.recvDatagram())?.sequence).toBe(sequence);
+	}
+	producer.close();
+	for (let sequence = count - 64; sequence < count; sequence++) {
+		expect((await slow.recvDatagram())?.sequence).toBe(sequence);
+	}
+	expect(await slow.recvDatagram()).toBeUndefined();
 });
 
 test("insertDatagram preserves an explicit sequence", async () => {
@@ -797,6 +814,42 @@ test("a handed-out frame cancels its in-flight operation when it expires", async
 	await expect(guarded).rejects.toThrow("max age budget");
 	release();
 });
+
+for (const alreadyExpired of [false, true]) {
+	test(`a guarded write handles its rejection when the group ${alreadyExpired ? "already expired" : "expires before guarding"}`, async () => {
+		const producer = new TrackProducer("test").accept({ maxAge: Milli(5000) });
+		const track = producer.subscribe();
+		producer.writeString("old");
+		const group = await track.recvGroup();
+		if (!group) throw new Error("missing group");
+		expect(await group.readString()).toBe("old");
+		producer.writeString("new");
+
+		if (alreadyExpired) {
+			await expect(hooks.guardGroup(group, Promise.resolve())).rejects.toBeInstanceOf(Expired);
+		}
+
+		const stream = new TransformStream<Uint8Array, Uint8Array>();
+		const writer = new Writer(stream.writable);
+		const reader = stream.readable.getReader();
+		try {
+			// No reader drains the stream, so resetting it rejects the pending write.
+			const guarded = hooks.guardGroup(group, writer.write(enc.encode("old")));
+			const verdict = await guarded.catch((err: unknown) => err);
+			expect(verdict).toBeInstanceOf(Expired);
+			writer.reset(verdict);
+			await expect(reader.read()).rejects.toMatchObject({ streamErrorCode: StreamCode.DeliveryTimeout });
+			await settle();
+
+			const next = await track.recvGroup();
+			expect(await next?.readString()).toBe("new");
+		} finally {
+			reader.releaseLock();
+			track.close();
+			producer.close();
+		}
+	});
+}
 
 // The two ways a reader loses unread content have to stay distinguishable: the budget gave
 // up on delivering it in time, or the cache dropped it before the reader got there. A bare

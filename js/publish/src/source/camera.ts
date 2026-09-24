@@ -21,7 +21,11 @@ export interface CameraProps extends Inputs<CameraInput> {
 type CameraOutput = {
 	// The live camera track, or undefined while disabled or denied.
 	source: Signal<Media | undefined>;
-	// Why there is no track while the camera is enabled, or undefined while it is capturing.
+	/**
+	 * Why there is no track while the camera is enabled, or undefined while it is capturing: a
+	 * refusal that stands until the settings, device list, or permission changes, or the failure it
+	 * is retrying after.
+	 */
 	error: Signal<Error | undefined>;
 };
 
@@ -81,6 +85,7 @@ export class Camera {
 		if (!enabled) {
 			// Being switched off is the app's reset, so a later enable starts with a full budget.
 			this.#retry.refund();
+			this.#out.error.set(undefined);
 			return;
 		}
 
@@ -97,6 +102,10 @@ export class Camera {
 			const spent = this.device.out.available.peek();
 			effect.subscribe(this.device.out.available, (available) => {
 				if (available !== spent) this.#retry.refund();
+			});
+			const permitted = this.device.out.permission.peek();
+			effect.subscribe(this.device.out.permission, (granted) => {
+				if (granted && !permitted) this.#retry.refund();
 			});
 			return;
 		}
@@ -134,7 +143,8 @@ export class Camera {
 			// A torn-down run is not a failed attempt: whatever cancelled it reruns us.
 			if (effect.abort.aborted || !attempt) return;
 
-			if (!attempt.stream) return this.#retry.failed(attempt.error);
+			// A refusal stands until something changes, unless the device was only busy.
+			if (!attempt.stream) return this.#retry.refused(attempt.error);
 
 			const source = attempt.stream.getVideoTracks()[0] as Video.StreamTrack | undefined;
 

@@ -20,11 +20,11 @@ The permanent root questline.
 
 ## Quests
 
-- [M0](/quest/m0/README.md)
+- [m0](/quest/m0/README.md)
 ";
 
 const M0_README: &str = "\
-# M0
+# m0
 
 ## Goal
 
@@ -276,17 +276,26 @@ fn quest_with_a_questline_index() {
 		"quest/m0/line/one.md",
 		"\n## Quests\n\n- [Two](/quest/m0/line/two.md)\n",
 	);
-	tree.rejects("only a questline README may have '## Quests'");
+	tree.rejects("only a README may have '## Quests'");
 }
 
+/// A README whose last child merged is the line's own remaining work: a leaf
+/// quest, sized and listed as ready like any other.
 #[test]
-fn questline_without_an_index() {
+fn readme_without_an_index_is_a_quest() {
 	let tree = Tree::new();
 	tree.write(
 		"quest/m0/line/sub/README.md",
-		"# Sub\n\n## Goal\n\nA questline that indexes nothing.\n",
+		"# Sub\n\n## Goal\n\nThe end-to-end test once every child has merged.\n",
 	);
-	tree.rejects("a questline needs '## Quests'");
+	tree.append("quest/m0/line/README.md", "- [Sub](/quest/m0/line/sub/README.md)\n");
+	tree.rejects("quest title must be");
+	tree.write(
+		"quest/m0/line/sub/README.md",
+		"# [S] Sub\n\n## Goal\n\nThe end-to-end test once every child has merged.\n",
+	);
+	tree.accepts();
+	assert!(tree.ready().contains(&"quest/m0/line/sub/README.md".to_string()));
 }
 
 /// Completing a questline's last quest deletes the directory. A bare `## Quests`
@@ -771,4 +780,92 @@ fn ready_listing_appends_unindexed_quests() {
 		"# [S] Blocked\n\n## Goal\n\nWait.\n\n## Required\n\n- External condition\n",
 	);
 	assert_eq!(tree.ready(), ["quest/m0/line/one.md", "quest/m0/aaa.md"]);
+}
+
+impl Tree {
+	fn branch(&self, path: &str) -> Vec<String> {
+		quest::branch::chain(self.path(), Path::new(path)).expect("branch")
+	}
+
+	fn branch_err(&self, path: &str) -> String {
+		quest::branch::chain(self.path(), Path::new(path))
+			.expect_err("expected no branch")
+			.to_string()
+	}
+}
+
+/// The chain is the path: the leaf, its line's README, then `main`. Nothing
+/// consults git.
+#[test]
+fn branch_chain_of_a_quest() {
+	let tree = Tree::new();
+	assert_eq!(
+		tree.branch("quest/m0/line/one.md"),
+		["quest/m0/line/one", "quest/m0/line/README", "main"]
+	);
+	assert_eq!(
+		tree.branch("/quest/m0/line/README.md"),
+		["quest/m0/line/README", "main"]
+	);
+}
+
+/// Neither the root nor a milestone has a branch; their children merge into `main`.
+#[test]
+fn root_and_milestone_have_no_branch() {
+	let tree = Tree::new();
+	assert!(tree.branch_err("quest/README.md").contains("no branch"));
+	assert!(tree.branch_err("quest/m0/README.md").contains("no branch"));
+}
+
+/// Every milestone's work branches from `main`, whatever its priority: starting a
+/// quest never moves it.
+#[test]
+fn later_milestone_branches_from_main() {
+	let tree = Tree::new();
+	tree.write(
+		"quest/m2/README.md",
+		"# m2\n\n## Goal\n\nLater work.\n\n## Quests\n\n- [Later](/quest/m2/later.md)\n",
+	);
+	tree.write("quest/m2/later.md", "# [S] Later\n\n## Goal\n\nNot started.\n");
+	tree.append("quest/README.md", "- [m2](/quest/m2/README.md)\n");
+	tree.accepts();
+	assert_eq!(tree.branch("quest/m2/later.md"), ["quest/m2/later", "main"]);
+}
+
+/// A milestone with nothing left is not its own work, so it needs no size and
+/// never lists as ready.
+#[test]
+fn milestone_may_be_empty() {
+	let tree = Tree::new();
+	tree.write("quest/m0/README.md", "# m0\n\n## Goal\n\nEmpty for now.\n");
+	std::fs::remove_dir_all(tree.path().join("quest/m0/line")).expect("rm");
+	tree.accepts();
+	assert!(tree.ready().is_empty(), "{:?}", tree.ready());
+}
+
+/// Lines nest to any depth: every branch ends in a leaf component (the quest
+/// or `README`), so no line's branch is a path prefix of its children's, which
+/// is the one shape git refuses.
+#[test]
+fn branch_chain_of_a_nested_line() {
+	let tree = Tree::new();
+	tree.write(
+		"quest/m0/line/sub/README.md",
+		"# Sub\n\n## Goal\n\nA nested line.\n\n## Quests\n\n- [Three](/quest/m0/line/sub/three.md)\n",
+	);
+	tree.write(
+		"quest/m0/line/sub/three.md",
+		"# [S] Three\n\n## Goal\n\nA nested quest.\n",
+	);
+	tree.append("quest/m0/line/README.md", "- [Sub](/quest/m0/line/sub/README.md)\n");
+	tree.accepts();
+	assert_eq!(
+		tree.branch("quest/m0/line/sub/three.md"),
+		[
+			"quest/m0/line/sub/three",
+			"quest/m0/line/sub/README",
+			"quest/m0/line/README",
+			"main"
+		]
+	);
 }

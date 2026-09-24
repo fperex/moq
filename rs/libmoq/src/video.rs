@@ -207,7 +207,7 @@ fn video_ceiling(
 		.or_else(|| rendition.bitrate.map(moq_net::bandwidth::Rate::from_bps))
 		.unwrap_or_else(|| {
 			moq_net::bandwidth::Rate::from_bps(
-				((config.size().pixels() * config.framerate as u64) as f64 * 0.07) as u64,
+				(config.size().pixels() as f64 * config.framerate.as_f64() * 0.07) as u64,
 			)
 		})
 }
@@ -217,7 +217,7 @@ async fn follow_reservation(
 	mut consumer: moq_net::bandwidth::Consumer,
 	ceiling: Arc<AtomicU64>,
 ) {
-	use moq_video::encode::rate::{Control, Policy};
+	use moq_mux::rate::{Control, Policy};
 
 	let mut max = moq_net::bandwidth::Rate::from_bps(ceiling.load(Ordering::SeqCst));
 	let mut control = Control::new(Policy::new(max));
@@ -328,7 +328,7 @@ impl VideoEncoder {
 		let size = self.size;
 		let surface = match self.format {
 			moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_I420 => {
-				moq_video::Surface::I420(moq_video::I420::new(size.width, size.height, data.to_vec())?)
+				moq_video::Surface::I420(moq_video::I420::new(size, data.to_vec())?)
 			}
 			moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_RGBA => moq_video::Surface::rgba(data, size)?,
 		};
@@ -341,10 +341,10 @@ impl VideoEncoder {
 		Ok(())
 	}
 
-	fn publish_cut(&mut self) {
+	fn publish_cut(&mut self) -> Result<(), Error> {
 		// A keyframe is what a cut is on the wire: the importer closes the open
 		// group and starts a new one at it.
-		self.encoder.keyframe();
+		Ok(block_on(self.encoder.cut())?)
 	}
 
 	fn publish_bitrate(&mut self, bitrate: u64) -> Result<(), Error> {
@@ -469,7 +469,7 @@ impl Video {
 		broadcast: &moq_net::broadcast::Consumer,
 		catalog: &hang::catalog::VideoConfig,
 		name: &str,
-		config: moq_video::decode::Config,
+		options: moq_video::decode::Options,
 		output: DecoderOutput,
 		on_frame: OnStatus,
 	) -> Result<Id, Error> {
@@ -488,7 +488,7 @@ impl Video {
 		// the task to keep this entrypoint non-blocking.
 		tokio::spawn(async move {
 			let res = async move {
-				let consumer = moq_video::decode::Consumer::new(&broadcast, &catalog, name, config).await?;
+				let consumer = moq_video::decode::Consumer::new(&broadcast, &catalog, name, options).await?;
 				Self::run(on_frame, consumer, channel.1, output).await
 			}
 			.await;
@@ -521,23 +521,28 @@ impl Video {
 				},
 			};
 
-			// The backend resize hint is best effort: a backend without a
+			// The decoder's scale hint is best effort: a backend without a
 			// scaler ignores it, so enforce the requested size here rather
-			// than trusting it. Convert outside the lock (a GPU frame
-			// downloads here), then hold the lock only to buffer it; release
-			// before the callback.
+			// than trusting it. The frame is already CPU pixels, so this
+			// scales on the CPU; convert outside the lock, then hold the lock
+			// only to buffer it, and release before the callback.
 			let mut frame = frame;
 			if let Some(size) = output.size
 				&& frame.size() != size
 			{
-				frame = frame.resize(size)?;
+				frame = frame.resize(size, &moq_video::resize::Config::default())?;
 			}
 			let size = frame.size();
 			let data = match output.format {
-				moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_I420 => frame.surface.into_i420()?,
-				moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_RGBA => {
-					bytes::Bytes::from(frame.surface.to_rgba()?.into_data())
+				moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_I420 => {
+					bytes::Bytes::from(frame.surface.into_i420()?.into_data())
 				}
+				moq_video_pixel_format::MOQ_VIDEO_PIXEL_FORMAT_RGBA => bytes::Bytes::from(
+					frame
+						.surface
+						.to_rgba(&moq_video::convert::Config::default())?
+						.into_data(),
+				),
 			};
 			let frame = VideoFrame {
 				// The C ABI carries microseconds; the decoded frame's Timestamp is
@@ -676,14 +681,18 @@ pub unsafe extern "C" fn moq_encode_video(
 
 		let format = pixel_format_from_u32(raw_input.format)?;
 
-		let mut config = moq_video::encode::Config::new(raw_input.width, raw_input.height, raw_input.framerate);
+		let framerate = moq_video::Rate::new(raw_input.framerate, 1)
+			.map_err(|_| Error::Video(moq_video::Error::InvalidFramerate(raw_input.framerate).into()))?;
+		let mut config = moq_video::encode::Config::new(raw_input.width, raw_input.height, framerate);
 		config.codec = codec_from_u32(raw_output.codec)?;
 		config.kind = unsafe { encoder_kind(raw_output)? };
 		// The C ABI spells an unset knob as 0, which neither field accepts as a real
 		// value: a zero bitrate or GOP is the default, not a request.
 		config.bitrate = (raw_output.bitrate != 0).then(|| moq_net::bandwidth::Rate::from_bps(raw_output.bitrate));
 		if raw_output.gop != 0 {
-			config.gop = raw_output.gop;
+			config.gop = moq_video::encode::Gop::Keyframe {
+				interval: raw_output.gop,
+			};
 		}
 
 		// Both before the global lock is taken: bringing up a hardware encoder is slow
@@ -791,13 +800,16 @@ pub unsafe extern "C" fn moq_encode_video_frame(producer: u32, frame: *const moq
 /// The next frame is encoded as a keyframe, which closes the open group and
 /// starts a new one at it. Calling this repeatedly before that frame arrives cuts
 /// once, not several times.
+///
+/// Fails when the selected encoder cannot force a keyframe (a V4L2 driver
+/// without the control): nothing is queued, and groups keep falling every
+/// `gop` frames.
 #[unsafe(no_mangle)]
 pub extern "C" fn moq_encode_video_cut(producer: u32) -> i32 {
 	ffi::enter(move || {
 		let producer = ffi::parse_id(producer)?;
 		let producer = State::lock().video.producer(producer)?;
-		producer.lock().as_mut().ok_or(Error::MediaNotFound)?.publish_cut();
-		Ok(())
+		producer.lock().as_mut().ok_or(Error::MediaNotFound)?.publish_cut()
 	})
 }
 
@@ -885,12 +897,15 @@ pub unsafe extern "C" fn moq_decode_video(
 		let size = decoder_size(raw.width, raw.height)?;
 		let catalog = ffi::parse_id(catalog)?;
 
-		let mut config = moq_video::decode::Config::new();
-		config.start = moq_video::decode::Start::Latest;
-		config.max_age = Duration::from_micros(raw.max_age_us);
+		let mut options = moq_video::decode::Options::new();
+		options.start = moq_video::decode::Start::Latest;
+		options.max_age = Duration::from_micros(raw.max_age_us);
+		// The C caller takes packed pixels, so let a backend that can decode
+		// straight to the CPU do that rather than downloading afterwards.
+		options.decoder.output = moq_video::Output::Cpu;
 		// A backend with a hardware scaler (NVDEC) honors this for free; the
 		// delivery loop still enforces it, since other backends ignore it.
-		config.resize = size;
+		options.decoder.scale_hint = size;
 		let output = DecoderOutput { format, size };
 		let on_frame = unsafe { OnStatus::new(user_data, on_frame)? };
 
@@ -898,7 +913,7 @@ pub unsafe extern "C" fn moq_decode_video(
 		let (broadcast, video_cfg, name) = state.consume.video_rendition(catalog, index as usize)?;
 
 		let State { video, .. } = &mut *state;
-		video.consume(&broadcast, &video_cfg, &name, config, output, on_frame)
+		video.consume(&broadcast, &video_cfg, &name, options, output, on_frame)
 	})
 }
 
@@ -958,7 +973,10 @@ mod tests {
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, config).unwrap();
 		let consumer = broadcast.consume();
 		// Probed rather than hand-built, so the test track carries what a real one would.
-		let rendition = moq_video::encode::Config::new(320, 240, 30).probe().await.unwrap();
+		let rendition = moq_video::encode::Config::new(320, 240, moq_video::Rate::new(30, 1).unwrap())
+			.probe()
+			.await
+			.unwrap();
 		let producer = moq_video::encode::Producer::new(broadcast, catalog, rendition).unwrap();
 
 		let name = producer.demand().name().to_string();

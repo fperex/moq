@@ -40,4 +40,4 @@ were immediately decodable.
 
 ## Required
 
-- [Catalog warmup](/quest/m2/intra-refresh/catalog-warmup.md) - the field import writes
+- [Catalog warmup](/quest/m1/catalog-warmup.md) - the field import writes

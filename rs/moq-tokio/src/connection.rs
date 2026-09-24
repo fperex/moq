@@ -784,7 +784,7 @@ impl Connection {
 					// The connected target owns the policy, including in one-shot mode.
 					if let Ended::Goaway(msg) = &ended
 						&& addr.addresses().is_some()
-						&& goaway.redirect.target(&msg.uri, &url).is_some()
+						&& goaway.redirect.target(msg.uri(), &url).is_some()
 					{
 						return Err(Error::PinnedRedirect);
 					}
@@ -803,7 +803,7 @@ impl Connection {
 						// An accepted redirect is an assignment: keep dialing it from here on, and
 						// only it. The peer named exactly one place to go, which retires
 						// whatever other addresses got us to this session.
-						let url = if let Some(target) = goaway.redirect.target(&msg.uri, &url) {
+						let url = if let Some(target) = goaway.redirect.target(msg.uri(), &url) {
 							addrs = Addrs::new(target.clone());
 							target
 						} else {
@@ -812,7 +812,7 @@ impl Connection {
 
 						// A GOAWAY naming no URI is a drain, not a redirect: the peer is
 						// restarting and telling us to come back to it, so nothing moved.
-						let drained = msg.uri.is_empty();
+						let drained = msg.uri().is_empty();
 
 						// A session waved away before it ever served is no replacement.
 						// Parking it here would retire the predecessor still carrying our
@@ -844,7 +844,7 @@ impl Connection {
 							if let Some(mut old) = draining.take() {
 								old.retire();
 							}
-							draining = Some(Draining::new(session, goaway.handover(msg.timeout)));
+							draining = Some(Draining::new(session, goaway.handover(msg.timeout())));
 						}
 
 						if healthy {

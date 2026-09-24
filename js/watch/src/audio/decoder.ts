@@ -156,7 +156,7 @@ export class Decoder {
 	// The AudioContext the graph runs in, owned here rather than by an effect: it is built by the
 	// gesture that starts it (see #buildContext) and outlives every other change to the graph short
 	// of the player leaving the page (see #runContext).
-	#context: AudioContext | undefined;
+	#context: { audio: AudioContext; effects: Effect } | undefined;
 
 	// The rate the decoder actually outputs, learned from the first decoded frame. This is the source
 	// of truth for the graph: a decoder can output a different rate than it was configured with (e.g.
@@ -266,12 +266,11 @@ export class Decoder {
 		// hear it. See unlockOnGesture. A player off the page builds nothing: the gesture belongs to
 		// whatever the viewer actually clicked.
 		unlockOnGesture(this.#signals, this.#out.context, () =>
-			this.in.attached.peek() ? (this.#context ?? this.#buildContext(this.#rate.peek())) : undefined,
+			this.in.attached.peek() ? (this.#context?.audio ?? this.#buildContext(this.#rate.peek())) : undefined,
 		);
 		this.#signals.cleanup(() => this.#closeContext());
 
 		this.#signals.run(this.#runContext.bind(this));
-		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runFlush.bind(this));
 		this.#signals.run(this.#runInstant.bind(this));
 		this.#signals.run(this.#runClock.bind(this));
@@ -305,7 +304,7 @@ export class Decoder {
 		const rate = effect.get(this.#rate);
 		const enabled = effect.get(this.in.enabled);
 
-		const context = this.#context;
+		const context = this.#context?.audio;
 		if (!context) {
 			// Audio is asked for, so build the graph and let unlockOnGesture try to start it: a
 			// permissive autoplay policy runs it with no gesture at all (the audio-quality lane
@@ -342,11 +341,13 @@ export class Decoder {
 			// Absent rather than undefined, so the browser picks the device default.
 			...(rate !== undefined && { sampleRate: rate }),
 		});
-		this.#context = context;
+		const effects = new Effect();
+		this.#context = { audio: context, effects };
 
 		// Expose the rate the graph actually runs at.
 		this.#out.sampleRate.set(context.sampleRate);
 		this.#out.context.set(context);
+		effects.run((effect) => this.#runWorklet(effect, context));
 
 		return context;
 	}
@@ -357,23 +358,22 @@ export class Decoder {
 		if (!context) return;
 
 		this.#context = undefined;
+		// Cancel module loads before close rejects them; signal propagation happens later.
+		context.effects.close();
 		this.#out.context.set(undefined);
 		this.#out.sampleRate.set(undefined);
 
 		// A context closed twice rejects, and there is nothing to do about a close that fails anyway.
-		context.close().catch(() => {});
+		context.audio.close().catch(() => {});
 	}
 
-	#runWorklet(effect: Effect): void {
+	#runWorklet(effect: Effect, context: AudioContext): void {
 		// It takes a second or so to initialize the AudioWorklet, so do it even if disabled. This is
 		// less efficient for video-only playback but makes muting/unmuting instant, since the first
 		// gesture on the page builds a context for every tile whether or not it is the one clicked.
 
 		//const enabled = effect.get(this.enabled);
 		//if (!enabled) return;
-
-		const context = effect.get(this.#out.context);
-		if (!context) return;
 
 		const config = effect.get(this.#config);
 		if (!config) return;
@@ -410,6 +410,7 @@ export class Decoder {
 
 			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
 			const ring = createAudioBuffer(worklet, {
+				context,
 				channels: channelCount,
 				rate: sampleRate,
 				latency: latencySamples,
@@ -697,9 +698,11 @@ export class Decoder {
 
 			const warmup = new Warmup(LEGACY_WARMUP_CALLBACKS);
 			const anchor = new Anchor();
+			let primed = false;
 
 			const decoder = new AudioDecoder({
 				output: (data) => {
+					primed = true;
 					const decoded = this.#terminal.span(data);
 					if (warmup.drop()) {
 						// Drop initial callbacks to prime the decoder.
@@ -774,6 +777,13 @@ export class Decoder {
 				// of this loop. Stop instead: the error callback already reported the real failure.
 				if (decoder.state === "closed") break;
 				decoder.decode(chunk);
+				// Learn the packet duration before another input can hide a tune-in gap.
+				// Native decoders accumulate output timestamps across unreported gaps.
+				if (!primed) {
+					const flushed = await Promise.race([decoder.flush().then(() => true), effect.cancel]);
+					if (!flushed) break;
+					anchor.restarted();
+				}
 			}
 		});
 	}
@@ -816,8 +826,12 @@ export class Decoder {
 			const loaded = await Util.Libav.polyfill();
 			if (!loaded) return; // cancelled
 
+			let primed = false;
 			const decoder = new AudioDecoder({
-				output: (data) => this.#emit(data),
+				output: (data) => {
+					primed = true;
+					this.#emit(data);
+				},
 				error: (error) => console.error("audio decoder error", error),
 			});
 			effect.cleanup(() => {
@@ -879,6 +893,12 @@ export class Decoder {
 						timestamp: frame.timestamp,
 					}),
 				);
+				// Establish the decoded packet duration before checking the next input gap.
+				if (!primed) {
+					const flushed = await Promise.race([decoder.flush().then(() => true), effect.cancel]);
+					if (!flushed) break;
+					anchor.restarted();
+				}
 			}
 		});
 	}
@@ -1047,7 +1067,12 @@ export class Decoder {
 	// away here would spend the declared pause as a flush instead of playing it out, and leave the
 	// ring parked with nothing to un-park it. A hole or a conviction has no tail to protect and
 	// still resets.
-	#onNext(next: { discontinuity: number; end?: Time.Micro; frame?: { timestamp: Time.Micro } }): boolean {
+	#onNext(next: {
+		discontinuity: number;
+		group: number;
+		end?: Time.Micro;
+		frame?: { timestamp: Time.Micro };
+	}): boolean {
 		if (!this.#terminal.update(next)) return false;
 		if (!this.#ended) this.#ring?.reset();
 		this.sync.reset();

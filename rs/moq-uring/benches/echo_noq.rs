@@ -48,28 +48,31 @@ mod linux {
 		let handle = worker.handle();
 		let certs = support::certs().expect("certificates");
 		let mut server = quic::server::Config::new(quic::Identity::open(&certs.cert, &certs.key).expect("identity"));
-		server.alpn = vec![web_transport_noq::ALPN.to_string()];
+		server.alpn = vec![web_transport_moq::ALPN.to_string()];
 		let socket = handle
 			.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), udp_config)
 			.expect("socket");
-		let endpoint = quic::Endpoint::new(&handle, socket, quic::endpoint::Config::default().with_server(server))
-			.expect("endpoint");
+		let endpoint =
+			quic::Endpoint::new(socket, quic::endpoint::Config::default().with_server(server)).expect("endpoint");
 		let addr = endpoint.local_addr();
 		// Queue the first iteration while the worker finishes driving the client
 		// handshake. A zero-capacity channel would block this thread before it can
 		// poll the endpoint again, leaving the peer to time out mid-CONNECT.
 		let (start_tx, start_rx) = std::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>();
 		let client = std::thread::spawn(move || {
+			// Enabling `ring` beside `aws-lc-rs` (as `--all-features` does) leaves rustls no implicit
+			// default, and the builder would panic on this thread while the server waits forever.
+			let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 			let runtime = tokio::runtime::Builder::new_current_thread()
 				.enable_all()
 				.build()
 				.expect("runtime");
 			runtime.block_on(async move {
-				let client = web_transport_noq::ClientBuilder::new()
+				let client = web_transport_moq::ClientBuilder::new()
 					.dangerous()
 					.with_no_certificate_verification()
 					.expect("client");
-				let request = web_transport_noq::proto::ConnectRequest::new(
+				let request = web_transport_moq::proto::ConnectRequest::new(
 					url::Url::parse(&format!("https://{addr}/echo")).expect("url"),
 				);
 				let session = client.connect(request).await.expect("connect");
@@ -87,7 +90,7 @@ mod linux {
 		let mut session = worker
 			.block_on(async {
 				let conn = endpoint.accept().await.expect("accept");
-				quic::web::Request::accept(&handle, conn)
+				quic::web::Request::accept(conn)
 					.await
 					.expect("handshake")
 					.ok()
@@ -164,7 +167,7 @@ mod linux {
 use linux::benchmark;
 
 #[cfg(not(target_os = "linux"))]
-fn benchmark(_: &mut Criterion) {}
+fn benchmark(_: &mut criterion::Criterion) {}
 
 criterion_group!(benches, benchmark);
 criterion_main!(benches);

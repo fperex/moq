@@ -260,16 +260,16 @@ func Dial(ctx context.Context, url string, opts ...ClientOption) (*Client, error
 	return c, nil
 }
 
-// CreateBroadcast creates an unadvertised broadcast at path. Announce it after populating tracks.
+// CreateBroadcast creates a locally announced broadcast at path. Advertise it to peers after populating tracks.
 //
 // See [OriginProducer.CreateBroadcast].
 func (c *Client) CreateBroadcast(path string) (*BroadcastProducer, error) {
 	return c.publisher.CreateBroadcast(path)
 }
 
-// Announced streams routes announced by the remote under prefix.
-func (c *Client) Announced(prefix string) (*AnnounceConsumer, error) {
-	return c.consumer.Announced(prefix)
+// Announced streams routes announced by the remote under a pattern scope.
+func (c *Client) Announced(options AnnounceOptions) (*AnnounceConsumer, error) {
+	return c.consumer.Announced(options)
 }
 
 // AnnouncedBroadcast waits for a route covering path, then resolves the

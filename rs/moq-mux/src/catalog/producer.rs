@@ -371,11 +371,27 @@ impl<E: CatalogExt> Producer<E> {
 		}
 	}
 
+	/// Edit the catalog in place and publish the result.
+	///
+	/// The closure receives the current catalog, composed from every owner so far. Edit it in place;
+	/// on return the result is published, a no-op if the closure changed nothing. Independent owners
+	/// can each edit only their own sections, so they compose instead of clobbering one another.
+	///
+	/// This is [`modify`](Self::modify) opened and committed for you; take the guard to hold the lock
+	/// across several edits, or to reach a [`Guard`] method like
+	/// [`set_section`](Guard::set_section).
+	pub fn mutate(&mut self, f: impl FnOnce(&mut Catalog<E>)) -> crate::Result<()> {
+		let mut guard = self.modify()?;
+		f(&mut guard);
+		guard.commit()
+	}
+
 	/// Get mutable access to the catalog, publishing it after any changes.
 	///
-	/// The publish happens when the returned [`Guard`] drops. Fails once the catalog tracks are
-	/// closed, the one publication failure that happens in normal operation, so nothing is left to
-	/// check after the guard drops. Anything else that stops the drop from publishing (an extension
+	/// The publish happens when the returned [`Guard`] drops. Use [`mutate`](Self::mutate) for a
+	/// single edit, which is this guard opened and committed for you. Fails once the catalog tracks
+	/// are closed, the one publication failure that happens in normal operation, so nothing is left
+	/// to check after the guard drops. Anything else that stops the drop from publishing (an extension
 	/// that won't serialize, a catalog too large for a frame) aborts the catalog tracks with that
 	/// error: consumers see it instead of a stale catalog, and the next `modify` returns it here.
 	/// Call [`Guard::commit`] to get the error back immediately instead.
@@ -412,12 +428,11 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// Begin reserving the initial track set, returning a clonable [`Reserved`](super::Reserved).
 	///
-	/// Hand it (or clones) to importers; each reserves its rendition via
-	/// [`Reserved::init`](super::Reserved::init). The catalog is withheld from the broadcast until
-	/// every `Reserved` is dropped, counting both the ones importers hold and the one each unfulfilled
-	/// [`Rendition`](super::Rendition) holds until its config resolves. So a one-shot muxer (fMP4,
-	/// MPEG-TS) sees the complete track list in the first snapshot instead of a half-converged one.
-	/// Producers that don't reserve publish incrementally as before.
+	/// Hand it (or clones) to importers, or call its role-specific track constructors. The catalog is
+	/// withheld until every reservation is dropped and every created producer either publishes its
+	/// config or drops. A one-shot muxer therefore publishes the complete track list in its first
+	/// snapshot instead of a half-converged one. Producers created directly on this catalog publish
+	/// incrementally.
 	pub fn reserve(&self) -> super::Reserved<E> {
 		super::Reserved::new(self.clone())
 	}
@@ -429,11 +444,72 @@ impl<E: CatalogExt> Producer<E> {
 	/// publishes the config on [`set`](super::Rendition::set), and retires it on
 	/// drop. Use [`reserve`](Self::reserve) when the initial catalog must wait for
 	/// the complete track set instead.
-	pub fn rendition<C: super::RenditionConfig<E>>(
+	pub(super) fn rendition<C: super::RenditionConfig<E>>(
 		&self,
 		name: impl Into<String>,
 	) -> crate::Result<super::Rendition<E, C>> {
 		super::Rendition::live(self.clone(), name.into())
+	}
+
+	/// Publish a video track and own its catalog rendition.
+	pub fn video<C: crate::container::Container>(
+		&self,
+		track: moq_net::track::Producer,
+		container: C,
+		config: impl Into<Option<hang::catalog::VideoConfig>>,
+	) -> crate::Result<crate::container::Producer<C, hang::catalog::VideoConfig>>
+	where
+		crate::Error: From<C::Error>,
+	{
+		self.track(track, container, config)
+	}
+
+	/// Publish an audio track and own its catalog rendition.
+	pub fn audio<C: crate::container::Container>(
+		&self,
+		track: moq_net::track::Producer,
+		container: C,
+		config: impl Into<Option<hang::catalog::AudioConfig>>,
+	) -> crate::Result<crate::container::Producer<C, hang::catalog::AudioConfig>>
+	where
+		crate::Error: From<C::Error>,
+	{
+		self.track(track, container, config)
+	}
+
+	/// Publish a text track and own its catalog rendition.
+	pub fn text<C: crate::container::Container>(
+		&self,
+		track: moq_net::track::Producer,
+		container: C,
+		config: impl Into<Option<hang::catalog::TextConfig>>,
+	) -> crate::Result<crate::container::Producer<C, hang::catalog::TextConfig>>
+	where
+		crate::Error: From<C::Error>,
+	{
+		self.track(track, container, config)
+	}
+
+	/// Publish a track using a custom catalog config.
+	pub fn track<C, R>(
+		&self,
+		track: moq_net::track::Producer,
+		container: C,
+		config: impl Into<Option<R>>,
+	) -> crate::Result<crate::container::Producer<C, R>>
+	where
+		C: crate::container::Container,
+		R: super::RenditionConfig<E>,
+		crate::Error: From<C::Error>,
+	{
+		let rendition = self.rendition(track.name())?;
+		self.media(track, container, rendition, config.into())
+	}
+
+	/// Whether a live producer or published config already claims `name` in `R`'s section.
+	pub fn is_claimed<R: super::RenditionConfig<E>>(&self, name: &str) -> bool {
+		let mut state = take(&self.current);
+		R::get_mut(&mut state.catalog, name).is_some() || state.owned.contains(&owner_key::<R>(name))
 	}
 
 	/// Take `name` in `C`'s section for a new [`Rendition`](super::Rendition), which owns it until
@@ -499,19 +575,47 @@ impl<E: CatalogExt> Producer<E> {
 	///
 	/// The broadcast's one timeline track is created (and advertised in the catalog's root
 	/// `archive` entry) on first use; see [`timeline`](crate::timeline) for the whole model.
-	pub fn media_producer<C: crate::container::Container>(
-		&mut self,
+	pub(super) fn media<C, R>(
+		&self,
 		track: moq_net::track::Producer,
 		container: C,
-	) -> crate::Result<crate::container::Producer<C>> {
-		let recorder = self.enroll(track.name())?;
+		rendition: super::Rendition<E, R>,
+		config: Option<R>,
+	) -> crate::Result<crate::container::Producer<C, R>>
+	where
+		C: crate::container::Container,
+		R: super::RenditionConfig<E>,
+		crate::Error: From<C::Error>,
+	{
+		let mut catalog = self.clone();
+		let recorder = catalog.enroll(track.name())?;
+		let mut producer = crate::container::Producer::with_rendition(track, container, rendition)
+			.with_recorder(recorder)
+			.with_bandwidth(self.bandwidth.clone());
+		if let Some(config) = config {
+			producer.set(config)?;
+		}
+		Ok(producer)
+	}
+
+	/// Build an internal container producer for a non-rendition catalog entry.
+	pub(crate) fn media_raw<C>(
+		&self,
+		track: moq_net::track::Producer,
+		container: C,
+	) -> crate::Result<crate::container::Producer<C>>
+	where
+		C: crate::container::Container,
+		crate::Error: From<C::Error>,
+	{
+		let mut catalog = self.clone();
+		let recorder = catalog.enroll(track.name())?;
 		Ok(crate::container::Producer::new(track, container)
 			.with_recorder(recorder)
 			.with_bandwidth(self.bandwidth.clone()))
 	}
 
-	/// The allocator passthrough tracks claim on. fMP4 writes groups by hand
-	/// (no [`media_producer`](Self::media_producer)), so it reads this itself.
+	/// The allocator passthrough tracks claim on. fMP4 writes groups by hand, so it reads this itself.
 	pub(crate) fn bandwidth(&self) -> moq_net::bandwidth::Allocator {
 		self.bandwidth.clone()
 	}
@@ -519,10 +623,9 @@ impl<E: CatalogExt> Producer<E> {
 	/// Enroll `track` in the broadcast's timeline, advertising the timeline in the catalog's
 	/// root section the first time.
 	///
-	/// [`media_producer`](Self::media_producer) calls this for you; call it directly for a track
-	/// that isn't built through a [`container::Producer`](crate::container::Producer) (an fMP4
-	/// passthrough writing groups by hand).
-	pub fn enroll(&mut self, track: &str) -> crate::Result<crate::timeline::Recorder> {
+	/// The role-specific track constructors call this for you. fMP4 passthrough calls it directly
+	/// because it writes groups by hand instead of using a [`container::Producer`](crate::container::Producer).
+	pub(crate) fn enroll(&mut self, track: &str) -> crate::Result<crate::timeline::Recorder> {
 		let recorder = self.timeline.pacing_track(track)?;
 
 		let section = self.timeline.section();
@@ -549,8 +652,8 @@ impl<E: CatalogExt> Producer<E> {
 
 	/// Publish `track` as a latest-value JSON track, advertising it in the catalog.
 	///
-	/// The caller creates the track on the broadcast, as it does for a media track
-	/// ([`media_producer`](Self::media_producer)); this writes its catalog entry and removes the
+	/// The caller creates the track on the broadcast, as it does for a media track; this writes its
+	/// catalog entry and removes the
 	/// entry when the returned handle drops. The catalog key is [`track.name()`](moq_net::track::Producer::name)
 	/// verbatim, with no `.z` suffix even when compressed, since the entry's compression flag is
 	/// what a consumer reads.
@@ -974,6 +1077,43 @@ mod test {
 	}
 
 	#[test]
+	fn mutate_composes_independent_owners() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let mut catalog = Producer::new(&mut broadcast, Config::default()).unwrap();
+		let mut plain = Consumer::new(catalog.outputs.hang.consume());
+
+		catalog
+			.mutate(|c| {
+				c.audio
+					.renditions
+					.insert("audio0".to_string(), AudioConfig::new(AudioCodec::Opus, 48_000, 2));
+			})
+			.unwrap();
+
+		// The second owner starts from the published catalog and adds its own section.
+		catalog
+			.mutate(|c| {
+				c.video.renditions.insert("video0".to_string(), h264_config());
+			})
+			.unwrap();
+
+		// A closure that changes nothing publishes nothing: the catalog track runs one snapshot per
+		// group, so a third publish would open a third group.
+		catalog.mutate(|_| {}).unwrap();
+		assert_eq!(catalog.outputs.hang_track.latest(), Some(1));
+
+		let expected = catalog.snapshot();
+		let waiter = kio::Waiter::noop();
+		let mut last = None;
+		while let Poll::Ready(Ok(Some(c))) = plain.poll_next(&waiter) {
+			last = Some(c);
+		}
+		assert_eq!(last.unwrap(), expected);
+		assert!(expected.audio.renditions.contains_key("audio0"));
+		assert!(expected.video.renditions.contains_key("video0"));
+	}
+
+	#[test]
 	fn modify_refuses_a_finished_catalog() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut catalog = Producer::new(&mut broadcast, Config::default()).unwrap();
@@ -1144,8 +1284,8 @@ mod test {
 		let waiter = kio::Waiter::noop();
 
 		let reserved = catalog.reserve();
-		let mut audio = reserved.audio("audio0").unwrap();
-		let mut video = reserved.video("video0").unwrap();
+		let mut audio = reserved.init::<AudioConfig>("audio0").unwrap();
+		let mut video = reserved.init::<VideoConfig>("video0").unwrap();
 		drop(reserved); // done reserving; both renditions still outstanding
 
 		// Audio resolves first: withheld, because video is still outstanding.
@@ -1202,8 +1342,8 @@ mod test {
 		let waiter = kio::Waiter::noop();
 
 		let reserved = catalog.reserve();
-		let mut audio = reserved.audio("audio0").unwrap();
-		let video = reserved.video("video0").unwrap();
+		let mut audio = reserved.init::<AudioConfig>("audio0").unwrap();
+		let video = reserved.init::<VideoConfig>("video0").unwrap();
 		drop(reserved);
 
 		audio.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2)).unwrap();
@@ -1235,7 +1375,7 @@ mod test {
 		// Meanwhile an eager rendition resolves and stages a catalog change. The importer keeps its
 		// rendition alive (dropping it would retire the track), so bind it.
 		let early = catalog.reserve();
-		let mut a0 = early.audio("audio0").unwrap();
+		let mut a0 = early.init::<AudioConfig>("audio0").unwrap();
 		a0.set(AudioConfig::new(AudioCodec::Opus, 48_000, 2)).unwrap();
 		drop(early);
 		assert!(
@@ -1244,7 +1384,7 @@ mod test {
 		);
 
 		// The deferred importer finally builds its rendition and resolves it.
-		let mut late = deferred.audio("audio1").unwrap();
+		let mut late = deferred.init::<AudioConfig>("audio1").unwrap();
 		drop(deferred); // the importer releases its own hold; only the rendition's remains
 		assert!(matches!(consumer.poll_next(&waiter), Poll::Pending));
 		late.set(AudioConfig::new(AudioCodec::Opus, 48_000, 1)).unwrap();

@@ -76,10 +76,16 @@ jobs:
       - name: Test direnv hook
         run: bash .claude/hooks/direnv.test.sh
 
+      - name: Test upstream sync command
+        run: bash .agents/commands/sync-upstream.test.sh
+
       - name: Check
         run: nix develop --command just check
         env:
           MOQ_STRICT: 1
+
+      - name: Media feature contracts
+        run: nix develop --command just rs media-features
 
   test:
     name: Test

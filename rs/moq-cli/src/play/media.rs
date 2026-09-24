@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use hang::moq_net;
+use moq_audio::playback::{Engine, Sink};
 use moq_mux::catalog::{self, Stream};
 use winit::event_loop::EventLoopProxy;
 
@@ -48,7 +49,7 @@ const AUDIO_DEVICE_CUSHION: Duration = Duration::from_millis(30);
 /// deepest audio is still playing.
 /// Rounded up, so the three quarters taken back off it still cover the range.
 const AUDIO_MAX_AGE: Duration =
-	Duration::from_nanos((moq_audio::decode::Config::DELAY_MAX.as_nanos() as u64 * 4).div_ceil(3));
+	Duration::from_nanos((moq_audio::decode::Options::DELAY_MAX.as_nanos() as u64 * 4).div_ceil(3));
 
 /// How much audio is handed to the speaker per write.
 ///
@@ -99,9 +100,17 @@ impl Media {
 		let mut catalogs = catalog.select(self.args.select.selection(None));
 		let mut tasks = tokio::task::JoinSet::new();
 		let mut playback = Playback::default();
+		// Shared by an audio rendition and the retired tails still playing beside
+		// it, so their sinks mix on one stream: a second stream on an exclusive
+		// device would fail to open. Released once none of them is left, so an
+		// idle `play` does not hold the device.
+		let mut engine = None;
+		// Retired audio sinks still playing out what they hold.
+		let mut tails = tokio::task::JoinSet::new();
 
 		loop {
 			if playback.done() {
+				tails.join_all().await;
 				return Ok(());
 			}
 
@@ -113,14 +122,25 @@ impl Media {
 			if playback.pending().is_none() {
 				tokio::select! {
 					result = tasks.join_next(), if !tasks.is_empty() => {
-						let ended = joined(result.expect("guarded by is_empty"))?;
-						if ended == Some(Kind::Audio) {
-							// Nothing holds playback to the speaker's cadence any more, so
-							// video takes the playout anchor back.
-							self.presentation.lock().unwrap().stopped();
-						}
+						let ended = joined(result.expect("guarded by is_empty"))?.map(|(kind, sink)| {
+							if kind == Kind::Audio {
+								// The tail still sounds, so the speaker keeps the anchor, but a
+								// replacement is a track boundary whose timestamps need not
+								// continue this one: its first frame re-pins.
+								self.presentation.lock().unwrap().restarted();
+							}
+							// The retired sink still holds what the device has not played, and a
+							// replacement fills its own jitter buffer before its first sample
+							// sounds. Played one after the other, a rendition switch costs that
+							// in silence, so the tail plays out while the replacement fills.
+							if let Some(sink) = sink {
+								tails.spawn(drain(sink));
+							}
+							kind
+						});
 						playback.ended(ended);
 					}
+					_ = tails.join_next(), if !tails.is_empty() => {}
 					// Followed for as long as it lasts, not just until something is
 					// playing: a publisher retires renditions (a transcode ladder
 					// resizing under a source that changed resolution) by naming the
@@ -137,6 +157,13 @@ impl Media {
 						}
 					}
 				}
+			}
+
+			// The engine is only open while some audio is, so releasing it marks the
+			// last of it going quiet: nothing holds playback to the speaker's cadence
+			// any more, and video takes the anchor back.
+			if !playback.playing(Kind::Audio) && tails.is_empty() && engine.take().is_some() {
+				self.presentation.lock().unwrap().stopped();
 			}
 
 			// Start whatever isn't playing from the newest snapshot, which is not
@@ -166,7 +193,7 @@ impl Media {
 							continue;
 						}
 					};
-					let mut decode = moq_video::decode::Config::new();
+					let mut decode = moq_video::decode::Options::new();
 					decode.start = moq_video::decode::Start::Latest;
 					// Nothing older than the playhead is worth presenting, so the delay
 					// doubles as the staleness budget on the wire.
@@ -181,7 +208,9 @@ impl Media {
 							tasks.spawn(async move {
 								(
 									Kind::Video,
-									play_video(consumer, presentation, video, drained, proxy).await,
+									play_video(consumer, presentation, video, drained, proxy)
+										.await
+										.map(|()| None),
 								)
 							});
 							playback.started(Kind::Video);
@@ -210,21 +239,25 @@ impl Media {
 					// itself: the consumer measures what arrives and holds at least
 					// this much, and the budget it keeps on the wire follows that
 					// measurement rather than the ceiling below.
-					let mut decode = moq_audio::decode::Config::new();
+					let mut decode = moq_audio::decode::Options::new();
 					decode.start = moq_audio::decode::Start::Latest;
 					decode.delay = Some(self.args.delay.into_std());
 					decode.max_age = AUDIO_MAX_AGE;
 					// The sink and the frame-duration math below both assume f32,
 					// so ask for it rather than inheriting the decoder default.
-					decode.format = moq_audio::Format::F32;
+					decode.output.format = moq_audio::Format::F32;
 					match moq_audio::decode::Consumer::new(&rendition, &config, &name, decode).await {
 						Ok(consumer) => {
 							tracing::info!(track = name, "playing audio rendition");
+							if engine.is_none() {
+								engine = Some(Engine::open(Default::default()).await?);
+							}
 							let audio = AudioPlayback {
+								engine: engine.clone().expect("opened above"),
 								presentation: self.presentation.clone(),
 								proxy: self.proxy.clone(),
 							};
-							tasks.spawn(async move { (Kind::Audio, play_audio(consumer, audio).await) });
+							tasks.spawn(async move { (Kind::Audio, play_audio(consumer, audio).await.map(Some)) });
 							playback.started(Kind::Audio);
 							break;
 						}
@@ -280,12 +313,18 @@ async fn play_video(
 }
 
 struct AudioPlayback {
+	engine: Engine,
 	presentation: Arc<Mutex<Presentation>>,
 	proxy: EventLoopProxy<Event>,
 }
 
-async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPlayback) -> anyhow::Result<()> {
-	let AudioPlayback { presentation, proxy } = playback;
+/// Play a track until it ends, handing back the sink with what it still holds.
+async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPlayback) -> anyhow::Result<Sink> {
+	let AudioPlayback {
+		engine,
+		presentation,
+		proxy,
+	} = playback;
 
 	// The playout delay lives in the consumer's jitter buffer, which hands back one
 	// block at a time whatever the network is doing; the speaker holds only the
@@ -294,12 +333,12 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 	// the blocks come out on the device's clock, and the window schedules video
 	// against where the speaker has actually reached.
 	let sample_rate = consumer.sample_rate();
-	let channels = consumer.channels();
-	let engine = moq_audio::playback::Engine::open(Default::default()).await?;
+	let layout = consumer.layout();
+	let channels = layout.channels();
 	let mut input = moq_audio::playback::Input::default();
 	input.format = moq_audio::Format::F32;
 	input.sample_rate = sample_rate;
-	input.channels = channels;
+	input.layout = layout;
 	input.latency = AUDIO_DEVICE_CUSHION;
 	let mut sink = engine.sink(input.clone())?;
 
@@ -355,7 +394,7 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 		if let Some(excess) = sink.buffered().checked_sub(AUDIO_DEVICE_CUSHION) {
 			tokio::time::sleep(excess).await;
 		}
-		sink.write(&frame.data)?;
+		let _ = sink.write(&frame.data)?;
 
 		// Anchor the playout clock on where the speaker has actually reached, which
 		// is the only half of the pipeline that cannot skip ahead. A move has to
@@ -370,8 +409,12 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 		}
 	}
 
-	// The track ended, but the speaker is still a buffer behind. Play it out
-	// instead of cutting the tail off by dropping the sink.
+	Ok(sink)
+}
+
+/// Play out what a retired sink still holds, instead of cutting the tail off
+/// by dropping it.
+async fn drain(sink: Sink) {
 	let drain = async {
 		// A partial period is left to the device: waiting on the last few
 		// milliseconds costs a wakeup per iteration and can never fully settle.
@@ -379,12 +422,10 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 			tokio::time::sleep(remaining.max(Duration::from_millis(10))).await;
 		}
 	};
-	// A write tops the ring up to the cushion and then adds a block, so that sum is
-	// the deepest it can be when the track ends, and draining it takes exactly that
-	// long in real time.
-	let _ = tokio::time::timeout(AUDIO_DEVICE_CUSHION + AUDIO_CHUNK + AUDIO_DRAIN_GRACE, drain).await;
-
-	Ok(())
+	// A write tops the ring up to its latency, the device cushion, and then adds a block, so that
+	// sum is the deepest it can be when the track ends, and draining it takes exactly that long in
+	// real time.
+	let _ = tokio::time::timeout(sink.input().latency + AUDIO_CHUNK + AUDIO_DRAIN_GRACE, drain).await;
 }
 
 #[cfg(test)]
@@ -400,9 +441,9 @@ mod tests {
 	#[test]
 	fn the_budget_leaves_the_estimator_room_to_rise() {
 		assert!(
-			AUDIO_MAX_AGE * 3 / 4 >= moq_audio::decode::Config::DELAY_MAX,
+			AUDIO_MAX_AGE * 3 / 4 >= moq_audio::decode::Options::DELAY_MAX,
 			"{AUDIO_MAX_AGE:?} caps the target below {:?}",
-			moq_audio::decode::Config::DELAY_MAX
+			moq_audio::decode::Options::DELAY_MAX
 		);
 	}
 

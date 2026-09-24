@@ -15,17 +15,25 @@ import { toHang } from "./msf";
  * publisher that emits one has a bug, and quietly serving the rest hides that while the
  * missing rendition resurfaces later as a track that never fills.
  */
+function broadcastRefs(
+	section: Record<string, { broadcast?: Path.Relative }> | undefined,
+): [string, Path.Relative | undefined][] {
+	return Object.entries(section ?? {}).map(([name, config]) => [name, config.broadcast]);
+}
+
 function findEscaping(base: Moq.Path.Valid, catalog: Catalog.Root): string | undefined {
-	// Every section carrying renditions must be listed here; one left out silently exempts
-	// its renditions from the containment check.
-	const renditions = [
-		...Object.entries(catalog.video?.renditions ?? {}),
-		...Object.entries(catalog.audio?.renditions ?? {}),
-		...Object.entries(catalog.text?.renditions ?? {}),
+	// Every section carrying a `broadcast` reference must be listed here, including data
+	// tracks. One left out silently exempts its tracks from the containment check.
+	const refs = [
+		...broadcastRefs(catalog.video?.renditions),
+		...broadcastRefs(catalog.audio?.renditions),
+		...broadcastRefs(catalog.text?.renditions),
+		...broadcastRefs(catalog.json?.tracks),
+		...broadcastRefs(catalog.binary?.tracks),
 	];
 
-	for (const [name, config] of renditions) {
-		if (config.broadcast && Path.tryResolve(base, config.broadcast) === undefined) return name;
+	for (const [name, rel] of refs) {
+		if (rel && Path.tryResolve(base, rel) === undefined) return name;
 	}
 
 	return undefined;
@@ -33,6 +41,7 @@ function findEscaping(base: Moq.Path.Valid, catalog: Catalog.Root): string | und
 
 /** Throw if any rendition's `broadcast` reference escapes the root. */
 function assertResolvable(base: Moq.Path.Valid, catalog: Catalog.Root): Catalog.Root {
+	Catalog.checkRenditions(catalog);
 	const escaping = findEscaping(base, catalog);
 	if (escaping !== undefined) {
 		throw new Error(`rendition ${JSON.stringify(escaping)}: broadcast reference escapes the root ${base}`);
@@ -41,7 +50,7 @@ function assertResolvable(base: Moq.Path.Valid, catalog: Catalog.Root): Catalog.
 }
 
 type ReferencedRendition = {
-	broadcast?: string;
+	broadcast?: Path.Relative;
 };
 
 // Either the catalog's own broadcast, or a sibling to consume by path.
@@ -49,14 +58,14 @@ type RelativeTarget = { local: true } | { local: false; path: Moq.Path.Valid };
 
 function filterRenditions<T extends ReferencedRendition>(
 	renditions: Record<string, T>,
-	usable: (rel: string | undefined) => boolean,
+	usable: (rel: Path.Relative | undefined) => boolean,
 ): Record<string, T> {
 	return Object.fromEntries(Object.entries(renditions).filter(([, config]) => usable(config.broadcast)));
 }
 
-// Every section carrying renditions must be listed here, same as `findEscaping`; one left
-// out silently exempts its renditions from the reachability filter.
-function filterCatalog(catalog: Catalog.Root, usable: (rel: string | undefined) => boolean): Catalog.Root {
+// Every section carrying a `broadcast` reference must be listed here, same as `findEscaping`;
+// one left out silently exempts its tracks from the reachability filter.
+function filterCatalog(catalog: Catalog.Root, usable: (rel: Path.Relative | undefined) => boolean): Catalog.Root {
 	return {
 		...catalog,
 		video: catalog.video
@@ -67,6 +76,10 @@ function filterCatalog(catalog: Catalog.Root, usable: (rel: string | undefined) 
 			: undefined,
 		text: catalog.text
 			? { ...catalog.text, renditions: filterRenditions(catalog.text.renditions, usable) }
+			: undefined,
+		json: catalog.json ? { ...catalog.json, tracks: filterRenditions(catalog.json.tracks, usable) } : undefined,
+		binary: catalog.binary
+			? { ...catalog.binary, tracks: filterRenditions(catalog.binary.tracks, usable) }
 			: undefined,
 	};
 }
@@ -191,8 +204,8 @@ export class Broadcast {
 				if (!entry) break;
 				this.#announced.mutate((active) => {
 					if (!active) return;
-					if (Announce.isActive(entry.kind)) active.add(entry.path);
-					else active.delete(entry.path);
+					if (Announce.isActive(entry.kind)) active.add(entry.prefix);
+					else active.delete(entry.prefix);
 				});
 			}
 		});
@@ -204,7 +217,7 @@ export class Broadcast {
 	// arrive, so a rendition appears once its broadcast does.
 	#runFiltered(effect: Effect): void {
 		const raw = effect.get(this.#raw);
-		const usable = (rel: string | undefined) => this.#relativeTarget(effect, rel) !== undefined;
+		const usable = (rel: Path.Relative | undefined) => this.#relativeTarget(effect, rel) !== undefined;
 		effect.set(this.#out.catalog, raw ? filterCatalog(raw, usable) : undefined);
 	}
 
@@ -279,12 +292,12 @@ export class Broadcast {
 			// catalog is rejected the same way a fetched one is, minus the throw: this runs in
 			// the effect body, where an exception would surface as an unhandled error.
 			const catalog = effect.get(this.in.catalog);
-			const escaping = catalog && findEscaping(name, catalog);
-			if (escaping !== undefined) {
-				console.error("rejecting catalog: broadcast reference escapes the root", name, escaping);
+			let accepted: Catalog.Root | undefined;
+			try {
+				accepted = catalog && assertResolvable(name, catalog);
+			} catch (err) {
+				console.error("rejecting catalog", name, err);
 			}
-
-			const accepted = escaping === undefined ? catalog : undefined;
 			this.#raw.set(accepted, true);
 			effect.cleanup(() => this.#raw.set(undefined, true));
 			this.#out.status.set(accepted ? "live" : "loading");
@@ -344,7 +357,7 @@ export class Broadcast {
 	// Where a rendition's `broadcast` reference points once resolved and gated on the announcement
 	// stream, or `undefined` when it names nothing consumable right now. Playback and rendition
 	// selection both go through this so they cannot disagree about what is reachable.
-	#relativeTarget(effect: Effect, rel: string | undefined): RelativeTarget | undefined {
+	#relativeTarget(effect: Effect, rel: Path.Relative | undefined): RelativeTarget | undefined {
 		if (!rel) return { local: true };
 
 		const base = effect.get(this.in.name);
@@ -389,7 +402,7 @@ export class Broadcast {
 	 * reference resolves lazily and reacts to `enabled` / connection / announcement
 	 * changes exactly like the catalog broadcast.
 	 */
-	relativeBroadcast(effect: Effect, rel: string | undefined): Moq.Broadcast.Consumer | undefined {
+	relativeBroadcast(effect: Effect, rel: Path.Relative | undefined): Moq.Broadcast.Consumer | undefined {
 		const target = this.#relativeTarget(effect, rel);
 		if (!target) return undefined;
 		if (target.local) return effect.get(this.out.active);

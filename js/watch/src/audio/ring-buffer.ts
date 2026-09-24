@@ -44,7 +44,7 @@ export class AudioRingBuffer implements RingReader {
 	// What the playout engine is holding, plus what the writer threw away. The shared transport
 	// keeps the same numbers in its control array; here the worklet owns both ends, so they are
 	// plain fields shipped to the main thread in the state message.
-	#counters: Counters = {
+	readonly #counters: Counters = {
 		queued: 0,
 		stretched: 0,
 		output: 0,
@@ -67,10 +67,10 @@ export class AudioRingBuffer implements RingReader {
 	#jumped = 0;
 
 	// The widest chunk written so far, which capacity has to hold on top of the target. A high-water
-	// mark rather than the current chunk, because growing the array replaces the timeline and the
-	// reader drops the block it was holding: a publisher alternating two frame durations would
-	// otherwise pay that on every other write. It only costs memory, since the band is measured
-	// against the current chunk either way.
+	// mark rather than the current chunk, because shrinking the array back can leave samples behind,
+	// which replaces the timeline: a publisher alternating two frame durations would otherwise risk
+	// that on every other write. It only costs memory, since the band is measured against the current
+	// chunk either way.
 	#largest = 0;
 
 	// The depth the ring keeps between flushes, which is the one that says a surplus is real.
@@ -78,6 +78,45 @@ export class AudioRingBuffer implements RingReader {
 	#lastOutput = 0;
 	#lastStretched = 0;
 	#lastConcealed = 0;
+
+	// What `view`, `playhead`, and `debug` hand back, filled in place: all three run on the audio
+	// thread, where an object per call is garbage for its collector. The main thread only ever sees
+	// the copy the state message makes.
+	readonly #view: RingView = {
+		buffered: 0,
+		target: 0,
+		chunk: 0,
+		skip: 0,
+		stalled: true,
+		ended: false,
+		unstable: false,
+		converge: true,
+		skipped: 0,
+		generation: 0,
+	};
+	readonly #playhead: Playhead = { timestamp: Time.Micro.zero, rate: 0 };
+	readonly #snapshot: Snapshot = {
+		queued: 0,
+		stretched: 0,
+		output: 0,
+		concealed: 0,
+		accelerates: 0,
+		expands: 0,
+		merges: 0,
+		short: 0,
+		buffered: 0,
+		target: 0,
+		chunk: 0,
+		skip: 0,
+		stalled: true,
+		underruns: 0,
+		skips: 0,
+		skipped: 0,
+		discarded: 0,
+		trimmed: 0,
+		fresh: true,
+		anchor: 0,
+	};
 
 	constructor(props: {
 		rate: number;
@@ -145,7 +184,8 @@ export class AudioRingBuffer implements RingReader {
 	 * first write anchors the ring.
 	 *
 	 * Read in the worklet and posted to the main thread, which extrapolates between messages, so it
-	 * is stateful: the rate is measured between reads of this getter.
+	 * is stateful: the rate is measured between reads of this getter. The same object every read,
+	 * so copy it to keep it.
 	 *
 	 * The rate is the reader's own, `1 + (dSTRETCHED - dCONCEALED)/dOUTPUT`: it consumes a sample of
 	 * media per output frame while playing normally, a few percent more or less while a time stretch
@@ -161,32 +201,44 @@ export class AudioRingBuffer implements RingReader {
 		this.#lastStretched = this.#counters.stretched;
 		this.#lastConcealed = this.#counters.concealed;
 
-		return { timestamp: this.timestamp, rate: elapsed > 0 ? 1 + moved / elapsed : 0 };
+		const playhead = this.#playhead;
+		playhead.timestamp = this.timestamp;
+		playhead.rate = elapsed > 0 ? 1 + moved / elapsed : 0;
+		return playhead;
 	}
 
 	/**
-	 * Every counter at once, for the quality harness and the stats panel.
+	 * Every counter at once, for the quality harness and the stats panel. The same object every
+	 * call, so copy it to keep it.
 	 *
 	 * @internal
 	 */
 	debug(): Snapshot {
-		return {
-			...this.#counters,
-			buffered: this.length,
-			target: this.#latencySamples,
-			chunk: this.#chunk,
-			skip: this.#skip,
-			stalled: this.#stalled,
-			underruns: this.#underruns,
-			skips: this.#skips,
-			skipped: this.#skipped,
-			discarded: this.#discarded,
-			trimmed: this.#trimmed,
-			// `#fresh` stands until the reader commits a sample from this timeline, which is exactly
-			// what "nothing has been played yet" means; an unanchored ring has no timeline at all.
-			fresh: !this.#anchored || this.#fresh,
-			anchor: this.#anchor,
-		};
+		const snapshot = this.#snapshot;
+		const counters = this.#counters;
+		snapshot.queued = counters.queued;
+		snapshot.stretched = counters.stretched;
+		snapshot.output = counters.output;
+		snapshot.concealed = counters.concealed;
+		snapshot.accelerates = counters.accelerates;
+		snapshot.expands = counters.expands;
+		snapshot.merges = counters.merges;
+		snapshot.short = counters.short;
+		snapshot.buffered = this.length;
+		snapshot.target = this.#latencySamples;
+		snapshot.chunk = this.#chunk;
+		snapshot.skip = this.#skip;
+		snapshot.stalled = this.#stalled;
+		snapshot.underruns = this.#underruns;
+		snapshot.skips = this.#skips;
+		snapshot.skipped = this.#skipped;
+		snapshot.discarded = this.#discarded;
+		snapshot.trimmed = this.#trimmed;
+		// `#fresh` stands until the reader commits a sample from this timeline, which is exactly
+		// what "nothing has been played yet" means; an unanchored ring has no timeline at all.
+		snapshot.fresh = !this.#anchored || this.#fresh;
+		snapshot.anchor = this.#anchor;
+		return snapshot;
 	}
 
 	get length(): number {
@@ -233,10 +285,14 @@ export class AudioRingBuffer implements RingReader {
 		}
 
 		// Update state for the new buffer, only stall if empty.
+		const dropped = this.length - samplesToKeep;
 		this.#buffer = newBuffer;
 		this.#readIndex = this.#writeIndex - samplesToKeep;
 		if (samplesToKeep === 0) this.#stalled = true;
-		this.#generation++;
+		// Samples left behind are media the reader skips, which is a new timeline. A copy that kept
+		// them all, an empty ring included, is the one it was playing: a new generation there would
+		// make it forget what it learned about the stream on every step of the target.
+		if (dropped > 0) this.#generation++;
 	}
 
 	write(timestamp: Time.Micro, data: Float32Array[]): void {
@@ -347,17 +403,18 @@ export class AudioRingBuffer implements RingReader {
 			this.#readIndex = to;
 		}
 
-		// Write the actual samples
+		// Write the actual samples: the last `samples` of each channel, read in place rather than
+		// through a `subarray` view, because this runs on the audio thread.
 		for (let channel = 0; channel < this.channels; channel++) {
-			let src = data[channel];
-			src = src.subarray(src.length - samples);
+			const src = data[channel];
+			const from = src.length - samples;
 
 			const dst = this.#buffer[channel];
-			if (src.length !== samples) throw new Error("mismatching number of samples");
+			if (from < 0) throw new Error("mismatching number of samples");
 
 			for (let i = 0; i < samples; i++) {
 				const writePos = (start + i) % dst.length;
-				dst[writePos] = src[i];
+				dst[writePos] = src[from + i];
 			}
 		}
 
@@ -471,21 +528,21 @@ export class AudioRingBuffer implements RingReader {
 	 */
 	view(): RingView {
 		const buffered = this.#writeIndex - this.#readIndex;
-		return {
-			buffered: this.#stalled ? 0 : buffered,
-			target: this.#latencySamples,
-			chunk: this.#chunk,
-			skip: this.#skip,
-			stalled: this.#stalled,
-			// A declared endpoint only reaches the output once everything written before it has
-			// played; until then there is real audio to hand over.
-			ended: this.#ended && buffered <= 0,
-			unstable: false,
-			converge: !this.#buffered,
-			// The writer bounds this ring on the way in, so the jump is on its side rather than here.
-			skipped: this.#jumped,
-			generation: this.#generation,
-		};
+		const view = this.#view;
+		view.buffered = this.#stalled ? 0 : buffered;
+		view.target = this.#latencySamples;
+		view.chunk = this.#chunk;
+		view.skip = this.#skip;
+		view.stalled = this.#stalled;
+		// A declared endpoint only reaches the output once everything written before it has
+		// played; until then there is real audio to hand over.
+		view.ended = this.#ended && buffered <= 0;
+		view.unstable = false;
+		view.converge = !this.#buffered;
+		// The writer bounds this ring on the way in, so the jump is on its side rather than here.
+		view.skipped = this.#jumped;
+		view.generation = this.#generation;
+		return view;
 	}
 
 	/** Copy `count` buffered samples into `dst` at `offset`, without advancing the playhead. */
@@ -522,9 +579,21 @@ export class AudioRingBuffer implements RingReader {
 		this.#underruns++;
 	}
 
-	/** Record what the reader's playout engine is holding, so the state message can carry it. */
+	/**
+	 * Record what the reader's playout engine is holding, so the state message can carry it.
+	 *
+	 * Copied rather than kept, because the engine refills the same object every quantum.
+	 */
 	report(counters: Counters): void {
-		this.#counters = counters;
+		const own = this.#counters;
+		own.queued = counters.queued;
+		own.stretched = counters.stretched;
+		own.output = counters.output;
+		own.concealed = counters.concealed;
+		own.accelerates = counters.accelerates;
+		own.expands = counters.expands;
+		own.merges = counters.merges;
+		own.short = counters.short;
 	}
 
 	/**

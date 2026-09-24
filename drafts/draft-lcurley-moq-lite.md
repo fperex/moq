@@ -101,6 +101,7 @@ A Session consists of a connection between a client and a server.
 There is currently no P2P support within QUIC so it's out of scope for moq-lite.
 
 The moq-lite version identifier is `moq-lite-xx` where `xx` is the two-digit draft version.
+The identifier for this draft is `moq-lite-06`.
 For bare QUIC, this is negotiated as an ALPN token during the QUIC handshake.
 For WebTransport over HTTP/3, the QUIC ALPN remains `h3` and the moq-lite version is advertised via the `WT-Available-Protocols` and `WT-Protocol` CONNECT headers.
 
@@ -312,6 +313,8 @@ Sent when resetting a stream (RESET_STREAM), or when refusing to receive one (ST
 |  0x12  | MALFORMED_TRACK | The track's content could not be parsed. |
 | ------- | ------------- | ----------- |
 |  0x30  | NO_CAPACITY | The publisher could serve this request but has no capacity for it now. Permits one re-resolution (see [Resolution](#resolution)); elsewhere it is terminal like any refusal. Bridges to NO_CAPACITY in {{I-D.lcurley-moq-pattern}}. |
+| ------- | ------------- | ----------- |
+|  0x31  | CONTROL_TIMEOUT | The peer took too long to answer a control request. Distinct from DELIVERY_TIMEOUT, which is content that missed its deadline; it has no moq-transport value and bridges to INTERNAL_ERROR. |
 | ------- | ------------- | ----------- |
 |  0x32  | GROUP_TOO_LARGE | The group grew past the publisher's cache budget and was aborted. |
 | ------- | ------------- | ----------- |
@@ -1320,6 +1323,7 @@ The `Message Length` describes the payload size on the wire.
 
 ## moq-lite-06
 
+- Assigned `moq-lite-06` as this draft's protocol identifier.
 - Require error-code translation when bridging protocols and draft versions.
 - Made a repeated non-zero Hop ID in one announcement's Hop ID list a PROTOCOL_VIOLATION, matching draft-lcurley-moq-cluster. Repeated 0 entries stay legal.
 - Moved the Qmux-over-WebSocket binding details to draft-lcurley-qmux-websocket; the binding itself is unchanged.
@@ -1331,6 +1335,7 @@ The `Message Length` describes the payload size on the wire.
 - Split the reserved stream error range: 32 through 47 stays reserved, and 48 through 63 is moq-lite's own, assigned by the tables and mapped rather than forwarded across a bridge. Assigned 0x30 NO_CAPACITY there: it permits one re-resolution within the tier excluding the refusing advertiser, and a receiver that has spent or lacks that retry resets downstream with another code. Assigned 0x32 GROUP_TOO_LARGE: a group that grew past the publisher's cache budget is aborted. Every other code is terminal.
 - Assigned 0x33 NOT_FOUND, 0x34 OLD, and 0x35 EVICTED in the stream error table: a group the publisher cannot serve because it was never here, has been superseded, or was dropped under memory pressure.
 - Assigned 0x36 UNROUTABLE, 0x37 WRONG_SIZE, 0x38 FRAME_TOO_LARGE, and 0x39 TIMESTAMP_MISMATCH in the stream error table, moving them out of the reserved 32 through 47 range, which no longer carries provisional placeholders.
+- Assigned 0x31 CONTROL_TIMEOUT in the stream error table: a request stream torn down because the peer never answered, which DELIVERY_TIMEOUT described as late content. It has no moq-transport value and bridges to INTERNAL_ERROR.
 - A disallowed stream type, a role mismatch, or a missing extension is a PROTOCOL_VIOLATION; the session table gains no code for them, so nothing is sent from the reserved 32 through 47 range in either registry.
 - Added implicit Announce IDs: each ANNOUNCE_START assigns the next per-stream ordinal.
 - ANNOUNCE_END and ANNOUNCE_UPDATE reference the Announce ID instead of repeating the broadcast path.

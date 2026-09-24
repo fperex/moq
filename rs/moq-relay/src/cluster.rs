@@ -103,7 +103,7 @@ impl Peer {
 	}
 
 	/// What this relay declares in SETUP as its own price toward the peer.
-	/// Defaults to [`Self::cost`]; anything else is rejected until m2.
+	/// Defaults to [`Self::cost`]; anything else is rejected for now.
 	pub fn egress(&self) -> Option<u64> {
 		self.egress
 	}
@@ -1071,6 +1071,11 @@ pub struct Cluster {
 }
 
 impl Cluster {
+	/// The origin ID used by this relay on the wire.
+	pub fn id(&self) -> u64 {
+		self.origin.hop().id()
+	}
+
 	/// Creates a cluster with one origin, using [`Options`] for identity
 	/// and cache.
 	///
@@ -1309,7 +1314,7 @@ impl Cluster {
 			client
 				.iter()
 				.any(|version| Self::carries_request_path(version) && server.contains(version)),
-			"--cluster-lan needs --connect-version and --listen-version to share a version that carries a request path (moq-lite-05 or any moq-transport version)"
+			"--cluster-lan needs --connect-version and --listen-version to share a version that carries a request path (moq-lite-05 and newer, or any moq-transport version)"
 		);
 		Ok(())
 	}
@@ -1352,7 +1357,7 @@ impl Cluster {
 			if let Some(connect) = &self.connect {
 				anyhow::ensure!(
 					connect.versions().iter().any(Self::carries_request_path),
-					"--cluster-lan needs --connect-version to include a version that carries a request path (moq-lite-05 or any moq-transport version)"
+					"--cluster-lan needs --connect-version to include a version that carries a request path (moq-lite-05 and newer, or any moq-transport version)"
 				);
 			} else {
 				anyhow::bail!("`--cluster-lan` needs a dial template (call Cluster::with_connect)");
@@ -1581,7 +1586,7 @@ impl Cluster {
 			tokio::select! {
 				ann = announced.next() => {
 					let Some(update) = ann else { return; };
-					let relative = update.path;
+					let relative = update.prefix;
 					// The address to dial, which keeps its query: `run_remote` reads
 					// `?cost=` and `?jwt=` off it. The key is only its identity.
 					let peer = advertised_node_url(relative.as_str());
@@ -3004,7 +3009,7 @@ mod tests {
 
 		// The self-registration route must be visible on the origin.
 		let update = watcher.try_next().expect("self-registration must be published");
-		assert_eq!(update.path.as_str(), ".internal/origins/rendezvous.example.com:4443");
+		assert_eq!(update.prefix.as_str(), ".internal/origins/rendezvous.example.com:4443");
 		assert!(update.kind.is_active());
 
 		// run() must NOT have returned: dropping the broadcast (via run returning)
@@ -3588,7 +3593,7 @@ mod tests {
 			.await
 			.expect("timed out waiting for from-node")
 			.expect("origin closed");
-		assert_eq!(update.path.as_str(), "from-node");
+		assert_eq!(update.prefix.as_str(), "from-node");
 
 		let _from_fp = fingerprint.origin.create_broadcast("from-fingerprint").expect("create");
 		_from_fp.announce(Default::default()).expect("announce");
@@ -3598,7 +3603,7 @@ mod tests {
 				.await
 				.expect("timed out waiting for from-fingerprint")
 				.expect("origin closed");
-			if update.path.as_str() == "from-fingerprint" {
+			if update.prefix.as_str() == "from-fingerprint" {
 				break;
 			}
 		}

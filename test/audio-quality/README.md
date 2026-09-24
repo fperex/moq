@@ -65,15 +65,17 @@ The nightly `audio-quality` job runs the Chromium lane and keeps the run directo
 week: each process's log, the shaper's counters, the raw ndjson, the per-row summaries, and a
 Playwright trace of the page that failed. It is nightly rather than a merge gate because it is half
 an hour of real-time playback and every number in it is a timing one, which moves with whatever else
-the runner is doing.
+the runner is doing. The `Audio quality` workflow runs the same job for a branch on demand, and runs
+the replay lane under `--enforce` on every pull request that touches the player, the estimator, their
+native twin, or this harness: that lane takes seconds and cannot be unlucky.
 
 `--runtime` picks which of three lanes runs, and each measures a different thing:
 
 | Runtime | What it is | Shaper | Where |
 | --- | --- | --- | --- |
-| `chromium` | Headless Chromium over WebTransport, the matrix above | yes | nightly and locally |
+| `chromium` | Headless Chromium over WebTransport, the matrix above | yes | nightly, on demand, and locally |
 | `safari` | Real Safari over a WebSocket, the two control profiles | no | locally, on macOS |
-| `replay` | The recorded traces through the same player, on a simulated clock | no | anywhere, in a second |
+| `replay` | The recorded traces through the same player, on a simulated clock | no | pull requests, nightly, and anywhere else, in a second |
 
 ## How the browser reaches the relay
 

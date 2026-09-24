@@ -37,7 +37,7 @@ const TRACK: &str = "drill";
 
 /// A relay on its own runtime, so a drill can kill it the way a crash does.
 ///
-/// Aborting the `run` task is not enough: [`moq_relay::serve`] spawns a task per
+/// Aborting the `run` task is not enough: the relay accept loop spawns a task per
 /// connection, and those keep serving a relay whose accept loop is gone. Owning
 /// the runtime means one shutdown takes the accept loop, every connection task,
 /// and the UDP socket at once.
@@ -149,8 +149,7 @@ fn client(url: &url::Url) -> moq_tokio::Client {
 	quic.keep_alive = Duration::from_millis(250);
 
 	// Fast enough to keep a relay bounce inside the drill's budget, paced enough
-	// that the loop is still a backoff. `linger` is derived from `timeout`, so
-	// the give-up budget also sets how long a broadcast survives the gap.
+	// that the loop is still a backoff.
 	config.backoff.initial = Duration::from_millis(50);
 	config.backoff.max = Duration::from_millis(200);
 	config.backoff.timeout = Duration::from_secs(5);
@@ -521,19 +520,21 @@ async fn interrupted_publisher_republishes_new_content() {
 	let (_, payload) = read_group(&mut reader, "before the interrupt").await;
 	assert_eq!(payload, b"original", "delivery is broken before the drill even starts");
 
-	// The interrupt: everything the publisher owned disappears at once, with no
-	// finish and no unannounce, which is what a crashed publisher looks like. The
-	// subscriber's handles on it go too, so nothing local keeps the dead
+	// The interrupt: the session goes first, so the relay loses the publisher
+	// with no finish and no unannounce, which is what a crashed publisher looks
+	// like. Dropping the broadcast while the session was still up would send a
+	// clean unannounce instead and never reach the crash path. The rest goes
+	// after, including the subscriber's handles, so nothing local keeps the dead
 	// broadcast alive for the assertions below.
+	drop(first_session);
 	drop(reader);
 	drop(track);
 	drop(broadcast);
 	drop(first);
-	drop(first_session);
 
-	// Terminal result: the name stops being announced. The relay lingers a
-	// broadcast whose publisher vanished, so this is also the proof that the
-	// linger window ends rather than parking subscribers forever.
+	// Terminal result: the name stops being announced. Nothing told the relay
+	// the broadcast ended, so this is the proof that losing the publisher's
+	// session withdraws what it announced rather than parking subscribers on it.
 	expect_announce(&mut announced, "live", false, "the interrupted publisher").await;
 	println!("fault activated: the interrupted publisher's broadcast was withdrawn");
 
@@ -578,7 +579,7 @@ async fn expect_announce(announced: &mut moq_net::announce::Consumer, path: &str
 			.await
 			.unwrap_or_else(|_| panic!("{who}: no announcement change within {TIMEOUT:?}"))
 			.unwrap_or_else(|| panic!("{who}: the announcement stream closed"));
-		if update.path.as_str() == path && update.kind.is_active() == want {
+		if update.prefix.as_str() == path && update.kind.is_active() == want {
 			return;
 		}
 	}
@@ -615,7 +616,7 @@ async fn no_publisher_never_delivers() {
 
 	let mut announced = subscribed.announced();
 	if let Ok(update) = tokio::time::timeout(quiet, announced.next()).await {
-		let path = update.map(|update| update.path.to_string());
+		let path = update.map(|update| update.prefix.to_string());
 		panic!("the announcement stream reported {path:?} with no publisher");
 	}
 

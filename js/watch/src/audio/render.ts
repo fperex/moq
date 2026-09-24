@@ -76,6 +76,8 @@ export interface Latency {
 /** State update from the worklet back to main thread (fallback path only). */
 export interface State {
 	type: "state";
+	/** Audio context time at the end of the rendered quantum. */
+	contextTime: Time.Second;
 	/**
 	 * Which timeline this describes: the {@link Reset.timeline} of the last flush the worklet applied.
 	 *
@@ -86,7 +88,7 @@ export interface State {
 	 */
 	timeline: number;
 	// Where the reader is and how fast it is moving, or undefined until the first write anchors the
-	// ring. The main thread stamps it with its arrival and extrapolates until the next one.
+	// ring. The main thread maps contextTime to the output clock and extrapolates from it.
 	playhead: Playhead | undefined;
 	// Every counter the shared transport keeps in its control array, since the main thread cannot
 	// read this ring's memory directly.

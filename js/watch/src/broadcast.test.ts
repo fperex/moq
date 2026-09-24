@@ -61,10 +61,10 @@ describe("relativeBroadcast", () => {
 		const { source, owner } = broadcast("a/b", ["a/b", "a/source", "a/sub"]);
 		const effect = new Effect();
 		try {
-			expect(source.relativeBroadcast(effect, "./source")).toBeDefined();
-			expect(source.relativeBroadcast(effect, "sub")).toBeDefined();
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative("./source"))).toBeDefined();
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative("sub"))).toBeDefined();
 			// Nothing routes an unpublished sibling, so the reference stays pending.
-			expect(source.relativeBroadcast(effect, "./missing")).toBeUndefined();
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative("./missing"))).toBeUndefined();
 		} finally {
 			effect.close();
 			source.close();
@@ -79,11 +79,11 @@ describe("relativeBroadcast", () => {
 			// Clamping would subscribe to an unrelated `x` instead of dropping the rendition;
 			// `x` is published, so a defined result here would prove the clamp bug.
 			withoutWarnings(() => {
-				expect(source.relativeBroadcast(effect, "../../x")).toBeUndefined();
-				expect(source.relativeBroadcast(effect, "../..")).toBeUndefined();
+				expect(source.relativeBroadcast(effect, Path.normalizeRelative("../../x"))).toBeUndefined();
+				expect(source.relativeBroadcast(effect, Path.normalizeRelative("../.."))).toBeUndefined();
 			});
 			// Popping to exactly the root stops at it, and the root still names a broadcast.
-			expect(source.relativeBroadcast(effect, "..")).toBeDefined();
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative(".."))).toBeDefined();
 		} finally {
 			effect.close();
 			source.close();
@@ -130,6 +130,29 @@ describe("relativeBroadcast", () => {
 			console.error = error;
 			source.close();
 			owner.close();
+		}
+	});
+
+	it("rejects a catalog whose json or binary track escapes the root", async () => {
+		// Data tracks carry the same `broadcast` reference as renditions. Rust rejects an
+		// escaping one; leaving the section out of the check would let it through.
+		const track = { mode: "snapshot", broadcast: Path.normalizeRelative("../../x") };
+		for (const section of ["json", "binary"] as const) {
+			const { source, owner } = manualCatalog({
+				video: { renditions: { good: rendition() } },
+				[section]: { tracks: { status: track } },
+			} as Catalog.Root);
+
+			const error = console.error;
+			console.error = () => {};
+			try {
+				await Promise.resolve();
+				expect(source.out.catalog.peek()).toBeUndefined();
+			} finally {
+				console.error = error;
+				source.close();
+				owner.close();
+			}
 		}
 	});
 
@@ -185,8 +208,8 @@ describe("relativeBroadcast", () => {
 			const own = source.out.active.peek();
 			expect(own).toBeDefined();
 			expect(source.relativeBroadcast(effect, undefined)).toBe(own);
-			expect(source.relativeBroadcast(effect, "")).toBe(own);
-			expect(source.relativeBroadcast(effect, "./b")).toBe(own);
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative(""))).toBe(own);
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative("./b"))).toBe(own);
 		} finally {
 			effect.close();
 			source.close();
@@ -269,6 +292,50 @@ describe("cross-broadcast renditions", () => {
 			published.close();
 			await settle();
 			expect(videoRenditions(source)).toEqual(["local"]);
+		} finally {
+			source.close();
+			owner.close();
+		}
+	});
+
+	it("hides a data track until its broadcast is announced", async () => {
+		const owner = new Origin.Producer();
+		const source = new Broadcast({
+			origin: owner,
+			name: Path.from("public/transcode.hang"),
+			enabled: true,
+			catalogFormat: "manual",
+			catalog: {
+				json: {
+					tracks: {
+						local: { mode: "snapshot" },
+						remote: { mode: "snapshot", broadcast: Path.normalizeRelative("../private/source") },
+					},
+				},
+				binary: {
+					tracks: {
+						blob: { mode: "snapshot", broadcast: Path.normalizeRelative("../private/source") },
+					},
+				},
+			} as Catalog.Root,
+		});
+		const tracks = (section: "json" | "binary"): string[] =>
+			Object.keys(source.out.catalog.peek()?.[section]?.tracks ?? {}).sort();
+
+		try {
+			await settle();
+			expect(tracks("json")).toEqual(["local"]);
+			expect(tracks("binary")).toEqual([]);
+
+			const published = publish(owner, Path.from("private/source"));
+			await settle();
+			expect(tracks("json")).toEqual(["local", "remote"]);
+			expect(tracks("binary")).toEqual(["blob"]);
+
+			published.close();
+			await settle();
+			expect(tracks("json")).toEqual(["local"]);
+			expect(tracks("binary")).toEqual([]);
 		} finally {
 			source.close();
 			owner.close();

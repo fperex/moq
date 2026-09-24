@@ -162,7 +162,9 @@ export function post(rate: number): Build {
 			insert: (timestamp, data) => ring.write(timestamp, data),
 			end: () => ring.end(),
 			setLatency: (ms) => ring.resize(ms as Time.Milli),
-			debug: () => ring.debug(),
+			// A copy, which is what the main thread gets from the state message: the ring refills
+			// one object, and a read kept for comparison with the next would otherwise be the next.
+			debug: () => ({ ...ring.debug() }),
 			get length() {
 				return ring.length;
 			},

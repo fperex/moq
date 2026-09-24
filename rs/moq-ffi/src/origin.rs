@@ -13,13 +13,23 @@ pub struct MoqOriginConfig {
 	pub cache_capacity_bytes: Option<u64>,
 }
 
+/// Scope for an announcement stream.
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct MoqAnnounceConfig {
+	/// Literal path prefix beneath the origin.
+	#[uniffi(default = "")]
+	pub prefix: String,
+	/// Pattern relative to `prefix`, or `None` for every path beneath it.
+	#[uniffi(default = None)]
+	pub filter: Option<String>,
+}
+
 /// A path-prefix route: hops and costs for an advertisement.
 ///
 /// Pair one with `MoqBroadcastProducer::announce` for an exact path, or with
 /// `MoqOriginProducer::dynamic` for a prefix. Observe them with
-/// `MoqOriginConsumer::announced`. A route claims capability, not inventory: by
-/// convention a publisher announces each broadcast's exact path, so subscribers
-/// can enumerate broadcasts, while a service advertises a prefix and answers
+/// `MoqOriginConsumer::announced`. A route claims capability, not inventory: a publisher advertises each broadcast's exact path to peers once ready,
+/// while local consumers can enumerate it from creation, while a service advertises a prefix and answers
 /// whatever is requested beneath it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct MoqRoute {
@@ -135,7 +145,10 @@ impl Announced {
 	async fn next(&mut self) -> Result<Option<Arc<MoqAnnounceUpdate>>, MoqError> {
 		match self.inner.next().await {
 			Some(update) => Ok(Some(Arc::new(MoqAnnounceUpdate {
-				prefix: update.path.to_string(),
+				prefix: update.prefix.to_string(),
+				captures: update
+					.captures
+					.map(|captures| captures.into_iter().map(|capture| capture.to_string()).collect()),
 				route: update.route.into(),
 				active: update.kind.is_active(),
 			}))),
@@ -152,7 +165,7 @@ struct AnnouncedBroadcast {
 
 impl AnnouncedBroadcast {
 	async fn available(&mut self) -> Result<Arc<MoqBroadcastConsumer>, MoqError> {
-		// `routed_broadcast` rides out the churn between a route covering the path
+		// `routed_broadcast` rides out the churn between something covering the path
 		// and the path actually resolving (failover, an advertise-only announce
 		// racing its handler).
 		let broadcast = self.origin.routed_broadcast(&self.path).await?;
@@ -164,11 +177,12 @@ impl AnnouncedBroadcast {
 ///
 /// Carries no broadcast: resolve a specific path with
 /// `MoqOriginConsumer::request_broadcast` (after this update proves it is
-/// covered). Its prefix is relative to the prefix requested from
-/// `MoqOriginConsumer::announced`. The application decides which paths name broadcasts.
+/// covered). Its prefix is relative to the origin. The application decides
+/// which paths name broadcasts.
 #[derive(uniffi::Object)]
 pub struct MoqAnnounceUpdate {
 	prefix: String,
+	captures: Option<Vec<String>>,
 	route: MoqRoute,
 	active: bool,
 }
@@ -206,10 +220,9 @@ impl MoqOriginProducer {
 /// Build an origin producer, spawning its driver on the FFI runtime.
 pub(crate) fn spawn(config: moq_net::origin::Config) -> moq_net::origin::Producer {
 	let (producer, driver) = moq_net::origin::Producer::new(config);
-	#[cfg(not(target_arch = "wasm32"))]
-	crate::ffi::spawn(driver.run(moq_tokio::runtime::Runtime::<()>::new()));
-	#[cfg(target_arch = "wasm32")]
-	crate::ffi::spawn(driver.run(crate::runtime::Runtime));
+	crate::ffi::spawn(async move {
+		moq_net::time::run(driver).await;
+	});
 	producer
 }
 
@@ -280,8 +293,8 @@ impl MoqOriginProducer {
 
 	/// Create a broadcast at `path` on this origin, returning the producer that feeds it.
 	///
-	/// The broadcast starts unadvertised: reachable by exact path for subscribes
-	/// and fetches, but not visible to announcement streams. Advertise it with
+	/// The broadcast appears on this origin's local announcement streams immediately.
+	/// Advertise it to peers with
 	/// [`MoqBroadcastProducer::announce`] after populating tracks; an on-demand
 	/// handler is [`Self::dynamic`]. Create, `dynamic()` if tracks are served on
 	/// demand, populate, then announce.
@@ -299,12 +312,15 @@ impl MoqOriginProducer {
 
 #[uniffi::export]
 impl MoqOriginConsumer {
-	/// Subscribe to routes under a requested prefix; updates return covered prefixes relative to it.
-	pub fn announced(&self, prefix: String) -> Result<Arc<MoqAnnounceConsumer>, MoqError> {
+	/// Subscribe to routes matching a pattern scope; updates stay relative to the origin.
+	pub fn announced(&self, config: MoqAnnounceConfig) -> Result<Arc<MoqAnnounceConsumer>, MoqError> {
 		let _guard = crate::ffi::enter();
-		let origin = self
-			.inner
-			.scope(prefix, &moq_net::Patterns::from(moq_net::Pattern::all()))?;
+		let filter = match config.filter {
+			Some(filter) => filter.parse::<moq_net::Pattern>()?,
+			None => moq_net::Pattern::all(),
+		};
+		let filter = filter.rooted(&config.prefix)?;
+		let origin = self.inner.scope("", &moq_net::Patterns::from(filter))?;
 		Ok(Arc::new(MoqAnnounceConsumer {
 			task: Task::new(Announced {
 				inner: origin.announced(),
@@ -312,10 +328,12 @@ impl MoqOriginConsumer {
 		}))
 	}
 
-	/// Wait for a route to cover `path`, then resolve the broadcast there.
+	/// Resolve the broadcast at `path`, waiting until something can serve it.
 	///
 	/// This is how you resolve a path right after connecting: announcements arrive over the
-	/// session after it opens, so `request_broadcast` on its own races them.
+	/// session after it opens, so `request_broadcast` on its own races them. A
+	/// local broadcast appears on this origin's cursor when created, whether or not
+	/// it has been advertised to peers.
 	pub fn announced_broadcast(&self, path: String) -> Result<Arc<MoqAnnouncedBroadcast>, MoqError> {
 		let _guard = crate::ffi::enter();
 		let path = moq_net::Path::new(&path).to_owned();
@@ -341,9 +359,9 @@ impl MoqOriginConsumer {
 	///
 	/// Resolution order: a local broadcast at the exact path, then the best announced route
 	/// covering the path (served on demand by the session that announced it), then a dynamic
-	/// handler on the origin (if any). Errors if nothing can serve it. Unlike
-	/// `announced_broadcast`, this does *not* wait for a future announcement. Drop the
-	/// returned future to cancel.
+	/// handler on the origin (if any). Unlike `announced_broadcast`, this answers for what is
+	/// reachable *now* and errors if nothing can serve the path. Drop the returned future to
+	/// cancel.
 	///
 	/// Calling this straight after connecting therefore races the session's announcements
 	/// and can report a live broadcast as unroutable. Await `announced_broadcast` first.
@@ -451,9 +469,14 @@ impl MoqAnnounceConsumer {
 
 #[uniffi::export]
 impl MoqAnnounceUpdate {
-	/// The covered prefix, relative to the requested announcements prefix.
+	/// The covered prefix, relative to the origin.
 	pub fn prefix(&self) -> String {
 		self.prefix.clone()
+	}
+
+	/// What each wildcard matched, or `None` when the route only overlaps the scope.
+	pub fn captures(&self) -> Option<Vec<String>> {
+		self.captures.clone()
 	}
 
 	/// The route serving the prefix: its hops and costs.
@@ -474,7 +497,7 @@ impl MoqAnnounceUpdate {
 impl MoqAnnouncedBroadcast {
 	/// Wait until the broadcast is announced. Returns `Closed` if cancelled or the origin is closed.
 	///
-	/// Use `broadcast.closed()` to learn when a broadcast is unannounced.
+	/// Use `broadcast.closed()` to learn when the broadcast ends.
 	pub async fn available(&self) -> Result<Arc<MoqBroadcastConsumer>, MoqError> {
 		self.task.run(|mut state| async move { state.available().await }).await
 	}

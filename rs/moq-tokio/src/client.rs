@@ -346,9 +346,7 @@ impl Client {
 		if url.scheme() == "tcp" {
 			let session =
 				crate::tcp::connect(url, &self.versions.alpns(), self.failover_delay, self.resolution_delay).await?;
-			return Ok(moq
-				.connect(crate::runtime::Runtime::new(), crate::transport::Session::new(session))
-				.await?);
+			return Ok(connect_session(&moq, crate::transport::Session::new(session)).await?);
 		}
 
 		// Unix domain socket (qmux, no TLS). Same-host only; the server can
@@ -356,9 +354,7 @@ impl Client {
 		#[cfg(all(feature = "uds", unix))]
 		if url.scheme() == "unix" {
 			let session = crate::unix::connect(url, &self.versions.alpns()).await?;
-			return Ok(moq
-				.connect(crate::runtime::Runtime::new(), crate::transport::Session::new(session))
-				.await?);
+			return Ok(connect_session(&moq, crate::transport::Session::new(session)).await?);
 		}
 
 		// A WebSocket URL names its transport. No QUIC backend can dial it, so there is
@@ -383,9 +379,7 @@ impl Client {
 				crate::iroh::Binding::H3 => self.moq.clone(),
 			};
 
-			return Ok(moq
-				.connect(crate::runtime::Runtime::new(), crate::transport::Session::new(session))
-				.await?);
+			return Ok(connect_session(&moq, crate::transport::Session::new(session)).await?);
 		}
 
 		#[cfg(feature = "noq")]
@@ -407,7 +401,7 @@ impl Client {
 			#[cfg(not(feature = "websocket"))]
 			{
 				let session = quic_handle.await?;
-				return Ok(moq.connect(crate::runtime::Runtime::new(), session).await?);
+				return Ok(connect_session(&moq, session).await?);
 			}
 		}
 
@@ -425,10 +419,7 @@ impl Client {
 		let alpns = self.versions.alpns();
 		let session =
 			crate::websocket::connect(&self.websocket, &self.tls, self.tls_host_name.as_deref(), addr, &alpns).await?;
-		Ok(self
-			.moq
-			.connect(crate::runtime::Runtime::new(), crate::transport::Session::new(session))
-			.await?)
+		Ok(connect_session(&self.moq, crate::transport::Session::new(session)).await?)
 	}
 
 	/// Race the QUIC dial against the WebSocket fallback, handshaking whichever wins.
@@ -461,14 +452,10 @@ impl Client {
 		};
 
 		match race_transport_connect(quic, websocket).await? {
-			TransportRace::Quic(quic) => Ok(moq.connect(crate::runtime::Runtime::new(), quic).await?),
-			TransportRace::WebSocket(websocket) => Ok(self
-				.moq
-				.connect(
-					crate::runtime::Runtime::new(),
-					crate::transport::Session::new(websocket),
-				)
-				.await?),
+			TransportRace::Quic(quic) => Ok(connect_session(moq, quic).await?),
+			TransportRace::WebSocket(websocket) => {
+				Ok(connect_session(&self.moq, crate::transport::Session::new(websocket)).await?)
+			}
 		}
 	}
 }
@@ -598,6 +585,25 @@ where
 		(Some(err), None) | (None, Some(err)) => Err(err),
 		(None, None) => Err(Error::ConnectFailed),
 	}
+}
+
+#[cfg(any(
+	feature = "noq",
+	feature = "iroh",
+	feature = "websocket",
+	feature = "tcp",
+	all(feature = "uds", unix)
+))]
+async fn connect_session<S: moq_net::transport::poll::Boxable>(
+	client: &moq_net::Client,
+	transport: S,
+) -> Result<moq_net::Session, moq_net::Error> {
+	let (session, driver) = client
+		.connect(tokio::time::Instant::now().into_std(), transport)
+		.await?;
+	use tracing::Instrument;
+	tokio::spawn(moq_net::time::run(driver).instrument(tracing::Span::current()));
+	Ok(session)
 }
 
 #[cfg(test)]

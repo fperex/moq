@@ -160,6 +160,10 @@ export class Consumer {
 		}
 		this.spread = this.#spread.value;
 
+		this.#signals.run((effect) => {
+			effect.get(this.#maxAge);
+			this.#checkMaxAge();
+		});
 		this.#signals.spawn(this.#run.bind(this));
 		this.#signals.cleanup(() => {
 			this.#stall.close();
@@ -340,6 +344,7 @@ export class Consumer {
 				const next = this.#groups[this.#groups.indexOf(group) + 1];
 				this.#active = continues(group, next) ? next.consumer.sequence : group.consumer.sequence + 1;
 			}
+			this.#checkMaxAge();
 
 			// Recompute buffered ranges now that this group is done,
 			// so consecutive done groups can merge into a single range.
@@ -424,7 +429,10 @@ export class Consumer {
 			if (live === undefined) break;
 
 			const age = live - reach;
-			if (age <= threshold) break;
+			if (age < threshold) break;
+			// Closed wire groups have no delivery left to wait for. Let their reader
+			// finish parsing buffered frames before deciding whether anything is missing.
+			if (!first.done && first.consumer.isClosed) break;
 
 			// The budget has run out, and what that costs depends on where the head sits.
 			//
@@ -515,7 +523,9 @@ export class Consumer {
 		if (!next || nextStart === undefined || active.end < nextStart) return false;
 
 		this.#groups.shift();
-		console.warn(`skipping covered group: ${active.consumer.sequence} -> ${next.consumer.sequence}`);
+		// Debug rather than warn: a live stream crosses one of these at every group boundary, and
+		// nothing is lost.
+		console.debug(`skipping covered group: ${active.consumer.sequence} -> ${next.consumer.sequence}`);
 		this.#recordPresented(active);
 		this.#active = next.consumer.sequence;
 
@@ -609,16 +619,25 @@ export class Consumer {
 			// non-sequential) next group has since arrived -- promote #active to the first real
 			// group so delivery resumes instead of stalling on a nonexistent sequence.
 			// Promote #active to the first buffered group when it continues the timeline we left off at,
-			// when a completed empty group can be walked (empty groups mean nothing), or when a
-			// zero-budget hole is already proven. After track termination no missing group can arrive,
-			// so drain across any remaining gap. Otherwise wait: #checkMaxAge skips once the budget
-			// is spent, and #tryDurationSkip once the duration covers it.
+			// when a completed empty group can be walked (empty groups mean nothing), or when the hole
+			// is proven: the head already reaches past where presentation left off by more than the
+			// max age, so anything still missing in between would arrive too old to play. Proving it
+			// here matters: #checkMaxAge would instead drop the head, the very group to play next.
+			// After track termination no missing group can arrive, so drain across any remaining gap.
+			// Otherwise wait: #checkMaxAge skips once the budget is spent, and #tryDurationSkip once
+			// the duration covers it.
 			if (this.#active !== undefined && this.#groups.length > 0) {
 				const head = this.#groups[0];
 				if (head.consumer.sequence > this.#active) {
 					const contiguous = ptsContiguous(this.#presentedEnd, head.frames.at(0)?.timestamp);
 					const empty = head.empty && head.consumer.done;
-					const skipHole = this.#maxAge.peek() === 0 && head.frames.length > 0;
+					const maxAge = Moq.Time.Micro.fromMilli(this.#maxAge.peek());
+					const skipHole =
+						head.frames.length > 0 &&
+						(maxAge === 0 ||
+							(this.#presentedEnd !== undefined &&
+								head.latest !== undefined &&
+								head.latest - this.#presentedEnd > maxAge));
 					if (empty || contiguous || skipHole || ended !== undefined) {
 						if ((skipHole || ended !== undefined) && !contiguous && !empty) this.#markPlayhead();
 						if (!contiguous) this.#gap = true;

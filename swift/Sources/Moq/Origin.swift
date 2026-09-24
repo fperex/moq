@@ -32,8 +32,8 @@ public final class OriginProducer: Sendable {
 
     /// Create a broadcast at `path`, returning the producer that feeds it.
     ///
-    /// The broadcast starts unadvertised: reachable by exact path, but not
-    /// visible to announcement streams. Advertise it with
+    /// The broadcast appears on this origin's local announcement streams
+    /// immediately. Advertise it to peers with
     /// `BroadcastProducer.announce(route:)` after populating tracks. `finish()`
     /// unpublishes immediately, while releasing the producer without finishing
     /// also unpublishes but reads to subscribers as a failure rather than a
@@ -112,9 +112,9 @@ public final class OriginConsumer: Sendable {
         self.ffi = ffi
     }
 
-    /// Stream routes under the requested prefix; each update returns a relative covered prefix.
-    public func announced(prefix: String) throws -> AnnounceConsumer {
-        AnnounceConsumer(try ffi.announced(prefix: prefix))
+    /// Stream routes under a literal prefix matching an optional pattern filter.
+    public func announced(prefix: String = "", filter: String? = nil) throws -> AnnounceConsumer {
+        AnnounceConsumer(try ffi.announced(config: MoqAnnounceConfig(prefix: prefix, filter: filter)))
     }
 
     /// Wait for a route covering an exact path, then resolve the broadcast there.
@@ -167,7 +167,7 @@ public final class AnnounceConsumer: AsyncSequence, Sendable {
 ///
 /// A route claims that `prefix` and every path beneath it can be served; it
 /// carries no broadcast. Resolve a specific path with `OriginConsumer.requestBroadcast`.
-/// By convention a publisher announces each broadcast's exact path.
+/// Local broadcasts appear on creation; announce to forward them to peers.
 public final class AnnounceUpdate: Sendable {
     let ffi: MoqAnnounceUpdate
 
@@ -175,9 +175,14 @@ public final class AnnounceUpdate: Sendable {
         self.ffi = ffi
     }
 
-    /// The covered prefix, relative to the requested announcements prefix.
+    /// The covered prefix, relative to the origin.
     public var prefix: String {
         ffi.prefix()
+    }
+
+    /// What each filter wildcard matched, or `nil` for a partial overlap.
+    public var captures: [String]? {
+        ffi.captures()
     }
 
     /// Whether the route is active (`true`) or was retracted (`false`). A

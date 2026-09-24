@@ -5,11 +5,14 @@ pub mod frame;
 pub mod group;
 pub mod track;
 
-// The origin + announce subsystem shares one implementation (a broadcast tree).
+// The origin + announce subsystem shares one implementation (a route table).
 // It stays in a single private module and is surfaced as two curated public
 // modules so neither leaks the other's plumbing.
 #[path = "origin.rs"]
 mod origin_impl;
+// The failover state machine origin fronts run; pure, so its transitions are
+// tested without a runtime.
+mod front;
 
 mod bytes;
 pub(crate) mod clock;
@@ -35,7 +38,7 @@ pub use time::*;
 
 /// Publishing broadcasts, announcing routes, and consuming both through an origin.
 pub mod origin {
-	pub use super::origin_impl::{Config, Consumer, Cost, Driver, Dynamic, Producer, Request, Requesting, Route, Run};
+	pub use super::origin_impl::{Config, Consumer, Cost, Driver, Dynamic, Producer, Request, Requesting, Route};
 }
 
 /// Subscribing to route (un)announcements from an origin.

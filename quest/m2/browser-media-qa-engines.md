@@ -9,7 +9,7 @@ measured and which APIs each one lacked.
 
 ## Plan
 
-`just test smoke-media` measures presented frame progress, tone presence,
+`just test media` measures presented frame progress, tone presence,
 and audio/video skew against a deterministic fixture, but `harness.ts`
 launches only Playwright's Chromium and nothing installs another engine. Its
 capability probe already enumerates what the player needs (WebTransport,
@@ -35,4 +35,3 @@ which is the path a real Firefox viewer takes today.
 ## Related
 
 - [Runtime QA hosts](/quest/m2/runtime-qa-hosts.md) - where an engine that will not run on the CI image runs
-- [Failure artifacts](/quest/m2/qa-failure-artifacts.md) - shared trace and sample output

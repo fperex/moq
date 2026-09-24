@@ -23,4 +23,4 @@ catches a typed `MoqException`, on the host runtime.
 
 ## Related
 
-- [C++ generator](/quest/m2/cpp/generator.md) - the same port against the C++ generator
+- [C++ generator](/quest/m1/cpp/generator.md) - the same port against the C++ generator

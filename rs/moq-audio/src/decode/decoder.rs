@@ -16,129 +16,34 @@ use super::Decoded;
 use crate::aac;
 use crate::opus;
 use crate::pcm;
-use crate::{Activity, Error, Format};
+use crate::{Activity, Error, Layout};
 
 /// Opus packets cap at 120 ms (RFC 6716 §2.1.4).
 const MAX_FRAME_MS: usize = 120;
 
-/// Where a decoder starts on a track that already holds groups.
-///
-/// A track keeps its groups for a while after they are read, so a decoder does
-/// not always open on an empty one: a player rebuilding its decoder subscribes
-/// while its predecessor still holds groups, and a rendition switched away from
-/// and back to stays warm on the origin for the track's idle linger (cached
-/// groups, not an upstream subscription). What to do with that
-/// backlog depends on the consumer, and the two answers are opposites, so it is
-/// asked rather than guessed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Decoder backend selection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Start {
-	/// The oldest group the track still holds, decoding everything cached.
-	///
-	/// What a recorder, an export, or anything reading a complete track wants,
-	/// and the default because dropping media a caller has not asked to drop is
-	/// the worse mistake.
+pub enum Kind {
+	/// Pick the available backend automatically.
 	#[default]
-	Oldest,
-	/// The newest group, skipping whatever is already cached.
-	///
-	/// What a live player wants. Without it a rebuilt decoder walks the whole
-	/// backlog at decode speed before reaching live media, which a viewer sees
-	/// as playback jumping backwards and then sprinting to catch up.
-	Latest,
+	Auto,
+	/// Require the built-in software backend.
+	Software,
+	/// Require a backend by its stable lowercase name.
+	Named(String),
 }
 
-/// Decoder configuration: the PCM layout to emit, plus the subscription's
-/// latency budget.
-///
-/// The mirror of [`encode::Config`](crate::encode::Config): it describes the
-/// output, since the codec's own shape is read from the catalog.
-///
-/// `#[non_exhaustive]`: build via [`Config::new`] (or `default()`) and set the
-/// optional fields, so future knobs don't break callers.
-#[derive(Clone, Debug)]
+/// Low-level decoder configuration.
+#[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct Config {
-	/// How to pack samples in each emitted frame.
-	pub format: Format,
-	/// Sample rate to emit at. `None` uses the codec's native rate from the
-	/// catalog; anything else resamples.
-	pub sample_rate: Option<u32>,
-	/// Channel count to emit. `None` uses the codec's native count; anything
-	/// else remixes mono and stereo at the decode boundary.
-	pub channels: Option<u32>,
-	/// How far playback may drift from the live edge before skipping a stalled group.
-	///
-	/// Applied to the initial transport subscription and inherited by
-	/// [`moq_mux::container::Consumer`]. Defaults to
-	/// [`std::time::Duration::ZERO`](std::time::Duration::ZERO), which skips aggressively.
-	/// Set [`max_age`](Self::max_age) to the playout buffer you can
-	/// tolerate (typically tens to a few hundred ms) for the best
-	/// congestion-vs-quality trade-off.
-	///
-	/// With [`delay`](Self::delay) set this is a ceiling rather than the budget
-	/// itself: playout claims three quarters of it, and the budget on the wire then
-	/// follows the measured target so the arrivals it was sized to cover are not
-	/// skipped before the estimator can see them.
-	pub max_age: std::time::Duration,
-	/// Where to start on a track that already holds groups.
-	pub start: Start,
-	/// How much audio to hold before playing it, so a late arrival still makes its
-	/// slot: `Some` turns the jitter buffer on and [`Consumer`](super::Consumer)
-	/// hands back playout blocks instead of decoded packets.
-	///
-	/// A floor, not a target. The buffer is sized from what actually arrives
-	/// (`doc/concept/playout.md`), and this is the least it may size itself to, for
-	/// a caller who knows something the arrivals do not say. The estimator raises it
-	/// whenever the path asks for more.
-	///
-	/// It has to fit under [`max_age`](Self::max_age), which is the ceiling on how
-	/// deep the buffer may grow rather than the budget in force: playout claims three
-	/// quarters of it, always leaves it the headroom it has to keep above the target
-	/// (a bucket, a block, and a time stretch, 105 ms), and never takes more than
-	/// [`DELAY_MAX`](Self::DELAY_MAX) whatever the budget says. A floor that does not
-	/// fit is refused rather than clamped, since clamping would leave playback
-	/// holding less than the caller asked for and say nothing. Leave room above the
-	/// floor, or the estimator has nowhere to raise the target to.
-	///
-	/// `None`, the default, decodes without buffering: each packet comes back as it
-	/// is decoded, which is what a recorder or an export wants.
-	pub delay: Option<std::time::Duration>,
-	/// Whether a gap in the media is concealed with synthesized audio, or played as
-	/// a ramp into silence (default: `true`).
-	///
-	/// Only read when [`delay`](Self::delay) turns playout on. Concealment repeats
-	/// the pitch period of what was playing and fades toward the room tone, which is
-	/// what a listener hears as continuous speech over a lost packet rather than a
-	/// click.
-	pub conceal: bool,
-}
-
-impl Default for Config {
-	fn default() -> Self {
-		Self {
-			format: Format::default(),
-			sample_rate: None,
-			channels: None,
-			max_age: std::time::Duration::ZERO,
-			start: Start::default(),
-			delay: None,
-			conceal: true,
-		}
-	}
+	/// Backend selection policy.
+	pub kind: Kind,
 }
 
 impl Config {
-	/// The deepest buffer [`delay`](Self::delay) may ask for.
-	///
-	/// The estimator describes delay with a hundred twenty millisecond buckets
-	/// (`doc/concept/playout.md`), so two seconds is the widest target it can
-	/// produce and the widest floor it can be held to. The effective bound is often
-	/// lower, since [`max_age`](Self::max_age) caps it too.
-	pub const DELAY_MAX: std::time::Duration = crate::playout::delay::CEILING;
-
-	/// A default config: the codec's native rate and channel count, interleaved
-	/// `f32`, real-time latency, and no jitter buffer.
+	/// Select the available backend automatically.
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -151,7 +56,7 @@ impl Config {
 pub struct Decoder {
 	backend: Backend,
 	sample_rate: u32,
-	channel_count: u32,
+	layout: Layout,
 	delay: usize,
 }
 
@@ -187,7 +92,23 @@ impl Decoder {
 	/// Parses the OpusHead `description` if present; falls back to the catalog's
 	/// declared sample rate / channel count. PCM uses those catalog fields
 	/// directly and requires an absent `description`.
-	pub fn new(catalog: &hang::catalog::AudioConfig) -> Result<Self, Error> {
+	pub fn new(catalog: &hang::catalog::AudioConfig, config: &Config) -> Result<Self, Error> {
+		let name = match &catalog.codec {
+			hang::catalog::AudioCodec::Opus => "opus",
+			hang::catalog::AudioCodec::Pcm => "pcm",
+			#[cfg(feature = "aac")]
+			hang::catalog::AudioCodec::AAC(_) => "aac",
+			codec => return Err(Error::Unsupported(format!("unsupported audio codec: {codec}"))),
+		};
+		match &config.kind {
+			Kind::Auto | Kind::Software => {}
+			Kind::Named(requested) if requested == name => {}
+			Kind::Named(requested) => {
+				return Err(Error::Unsupported(format!(
+					"audio decoder backend {requested:?} is unavailable for {name}"
+				)));
+			}
+		}
 		match &catalog.codec {
 			hang::catalog::AudioCodec::Opus => Self::new_opus(catalog),
 			hang::catalog::AudioCodec::Pcm => Self::new_pcm(catalog),
@@ -229,7 +150,7 @@ impl Decoder {
 				in_dtx: false,
 			}),
 			sample_rate,
-			channel_count,
+			layout: Layout::from_channels(channel_count)?,
 			delay: pre_skip_remaining,
 		})
 	}
@@ -272,7 +193,7 @@ impl Decoder {
 		Ok(Self {
 			backend: Backend::Aac(Box::new(Aac { inner })),
 			sample_rate,
-			channel_count: channel_count as u32,
+			layout: Layout::from_channels(channel_count as u32)?,
 			delay: 0,
 		})
 	}
@@ -298,7 +219,7 @@ impl Decoder {
 		Ok(Self {
 			backend: Backend::Pcm { bytes_per_frame },
 			sample_rate: catalog.sample_rate,
-			channel_count: catalog.channel_count,
+			layout: Layout::from_channels(catalog.channel_count)?,
 			delay: 0,
 		})
 	}
@@ -308,9 +229,9 @@ impl Decoder {
 		self.sample_rate
 	}
 
-	/// The channel count the codec decodes at, read from the catalog.
-	pub fn channel_count(&self) -> u32 {
-		self.channel_count
+	/// The PCM layout decoded from the catalog.
+	pub fn layout(&self) -> Layout {
+		self.layout
 	}
 
 	/// Reset codec history and reapply startup delay for a new discontinuous epoch.
@@ -366,7 +287,8 @@ impl Decoder {
 	pub fn decode(&mut self, packet: &[u8]) -> Result<Decoded, Error> {
 		match &mut self.backend {
 			Backend::Opus(opus) => {
-				let mut out = vec![0.0f32; opus.max_frame_size * self.channel_count as usize];
+				let channels = self.layout.channels() as usize;
+				let mut out = vec![0.0f32; opus.max_frame_size * channels];
 				// SAFETY: `inner` owns a live OpusDecoder; packet/out slices are
 				// bounded by the lengths we pass.
 				let samples = unsafe {
@@ -382,10 +304,10 @@ impl Decoder {
 				if samples < 0 {
 					return Err(crate::opus::decode_error(samples));
 				}
-				out.truncate(samples as usize * self.channel_count as usize);
+				out.truncate(samples as usize * channels);
 				let trim_frames = opus.pre_skip_remaining.min(samples as usize);
 				if trim_frames > 0 {
-					let trim_samples = trim_frames * self.channel_count as usize;
+					let trim_samples = trim_frames * channels;
 					out.copy_within(trim_samples.., 0);
 					out.truncate(out.len() - trim_samples);
 					opus.pre_skip_remaining -= trim_frames;
@@ -403,7 +325,9 @@ impl Decoder {
 				}
 
 				let out = packet
-					.chunks_exact(pcm::BYTES_PER_SAMPLE)
+					.as_chunks::<{ pcm::BYTES_PER_SAMPLE }>()
+					.0
+					.iter()
 					.map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]))
 					.collect();
 				Ok(Decoded {
@@ -480,9 +404,9 @@ mod tests {
 	#[cfg(feature = "aac")]
 	#[test]
 	fn aac_decodes_a_sine() {
-		let mut decoder = Decoder::new(&aac_catalog()).unwrap();
+		let mut decoder = Decoder::new(&aac_catalog(), &Config::default()).unwrap();
 		assert_eq!(decoder.sample_rate(), 44_100);
-		assert_eq!(decoder.channel_count(), 1);
+		assert_eq!(decoder.layout(), Layout::Mono);
 
 		let decoded: Vec<Vec<f32>> = AAC_FRAMES
 			.iter()
@@ -505,7 +429,7 @@ mod tests {
 	#[cfg(feature = "aac")]
 	#[test]
 	fn aac_reports_a_truncated_packet_as_decode() {
-		let mut decoder = Decoder::new(&aac_catalog()).unwrap();
+		let mut decoder = Decoder::new(&aac_catalog(), &Config::default()).unwrap();
 
 		let truncated = &AAC_FRAMES[0][..16];
 		assert!(matches!(decoder.decode(truncated), Err(Error::Decode(_))));
@@ -518,7 +442,7 @@ mod tests {
 		let mut catalog = aac_catalog();
 		catalog.description = None;
 
-		let mut decoder = Decoder::new(&catalog).unwrap();
+		let mut decoder = Decoder::new(&catalog, &Config::default()).unwrap();
 		assert_eq!(decoder.sample_rate(), 44_100);
 		assert_eq!(decoder.decode(AAC_FRAMES[0]).unwrap().samples.len(), 1024);
 	}
@@ -532,7 +456,7 @@ mod tests {
 		let mut catalog = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, 2);
 		catalog.description = Some(head);
 
-		let mut decoder = Decoder::new(&catalog).unwrap();
+		let mut decoder = Decoder::new(&catalog, &Config::default()).unwrap();
 
 		// Not a valid TOC byte sequence: libopus reports OPUS_INVALID_PACKET.
 		assert!(matches!(decoder.decode(&[0xFF; 3]), Err(Error::Decode(_))));
@@ -541,7 +465,7 @@ mod tests {
 	#[test]
 	fn pcm_rejects_incomplete_channel_frame() {
 		let catalog = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Pcm, 48_000, 2);
-		let mut decoder = Decoder::new(&catalog).unwrap();
+		let mut decoder = Decoder::new(&catalog, &Config::default()).unwrap();
 
 		assert!(matches!(
 			decoder.decode(&[]),
@@ -557,7 +481,10 @@ mod tests {
 	fn decoder_rejects_unknown_codec() {
 		let catalog = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Unknown("future".into()), 48_000, 2);
 
-		assert!(matches!(Decoder::new(&catalog), Err(Error::Unsupported(_))));
+		assert!(matches!(
+			Decoder::new(&catalog, &Config::default()),
+			Err(Error::Unsupported(_))
+		));
 	}
 
 	#[test]
@@ -565,6 +492,18 @@ mod tests {
 		let mut catalog = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Pcm, 48_000, 2);
 		catalog.bitrate = Some(1);
 
-		assert!(matches!(Decoder::new(&catalog), Err(Error::Unsupported(_))));
+		assert!(matches!(
+			Decoder::new(&catalog, &Config::default()),
+			Err(Error::Unsupported(_))
+		));
+	}
+
+	#[test]
+	fn refuses_unavailable_backend() {
+		let catalog = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Pcm, 48_000, 2);
+		let config = Config {
+			kind: Kind::Named("missing".into()),
+		};
+		assert!(matches!(Decoder::new(&catalog, &config), Err(Error::Unsupported(_))));
 	}
 }

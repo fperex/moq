@@ -21,7 +21,11 @@ export interface MicrophoneProps extends Inputs<MicrophoneInput> {
 type MicrophoneOutput = {
 	// The live microphone track, or undefined while disabled or denied.
 	source: Signal<Media | undefined>;
-	// Why there is no track while the microphone is enabled, or undefined while it is capturing.
+	/**
+	 * Why there is no track while the microphone is enabled, or undefined while it is capturing: a
+	 * refusal that stands until the settings, device list, or permission changes, or the failure it
+	 * is retrying after.
+	 */
 	error: Signal<Error | undefined>;
 };
 
@@ -66,6 +70,7 @@ export class Microphone {
 		if (!enabled) {
 			// Being switched off is the app's reset, so a later enable starts with a full budget.
 			this.#retry.refund();
+			this.#out.error.set(undefined);
 			return;
 		}
 
@@ -82,6 +87,10 @@ export class Microphone {
 			const spent = this.device.out.available.peek();
 			effect.subscribe(this.device.out.available, (available) => {
 				if (available !== spent) this.#retry.refund();
+			});
+			const permitted = this.device.out.permission.peek();
+			effect.subscribe(this.device.out.permission, (granted) => {
+				if (granted && !permitted) this.#retry.refund();
 			});
 			return;
 		}
@@ -117,7 +126,8 @@ export class Microphone {
 			// A torn-down run is not a failed attempt: whatever cancelled it reruns us.
 			if (effect.abort.aborted || !attempt) return;
 
-			if (!attempt.stream) return this.#retry.failed(attempt.error);
+			// A refusal stands until something changes, unless the device was only busy.
+			if (!attempt.stream) return this.#retry.refused(attempt.error);
 
 			const track = attempt.stream.getAudioTracks()[0] as Audio.StreamTrack | undefined;
 			const settings = track?.getSettings();

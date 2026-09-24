@@ -207,39 +207,66 @@ async fn an_immediately_drained_replacement_keeps_the_serving_session() {
 ///
 /// A GOAWAY with no URI says "reconnect to me", so naming it a redirect misreports
 /// the one line an operator reads when a client gives up.
-#[tokio::test]
+///
+/// Time moves only when the test advances it, and only while the loop sleeps
+/// between attempts. A budget that runs out mid-dial ends the loop on that dial's
+/// timeout instead of the drain: a real clock allows that at random, and a paused
+/// clock left to auto-advance forces it, jumping to the next deadline whenever the
+/// runtime waits on a socket.
+#[tokio::test(start_paused = true)]
 async fn a_peer_draining_every_session_names_the_drain() {
+	// A running blocking task holds auto-advance off, tokio's documented way. It
+	// returns when the test ends and drops the sender.
+	let (_release, hold) = std::sync::mpsc::channel::<()>();
+	let _frozen = tokio::task::spawn_blocking(move || hold.recv());
+
 	let (port, mut sessions, _task) = spawn_server().await;
 	let url: url::Url = format!("tcp://localhost:{port}/").parse().expect("parse url");
 
+	// Both at the 50ms floor, so no backoff wait is longer than `max`.
 	let mut backoff = moq_tokio::Backoff::default();
-	backoff.initial = Duration::from_millis(20);
-	backoff.max = Duration::from_millis(40);
+	backoff.initial = Duration::from_millis(50);
+	backoff.max = Duration::from_millis(50);
 	backoff.timeout = Duration::from_millis(200);
-	let connection = client(backoff).connect(url);
+	let (wait, budget) = (backoff.max, backoff.timeout);
 
-	// Held, not dropped: a session dropped on the way out of the loop would close
-	// before its GOAWAY reached the wire, and the client would see a plain close.
-	let drainer = tokio::spawn(async move {
-		let mut held = Vec::new();
-		while let Some(session) = sessions.recv().await {
-			let _ = session.drain().send(moq_net::goaway::Goaway::new());
-			held.push(session);
-		}
-	});
+	let started = tokio::time::Instant::now();
+	let mut connection = client(backoff).connect(url);
 
-	let err = tokio::time::timeout(Duration::from_secs(10), connection.closed())
-		.await
-		.expect("reconnect loop never gave up")
-		.expect_err("reconnect loop stopped without an error");
+	// Held, not dropped: a session dropped here would close before its GOAWAY
+	// reached the wire, and the client would see a plain close.
+	let mut held = Vec::new();
+	let err = loop {
+		let session = tokio::select! {
+			closed = connection.closed() => break closed.expect_err("reconnect loop stopped without an error"),
+			session = sessions.recv() => session.expect("server stopped accepting"),
+		};
+		assert!(
+			started.elapsed() < budget,
+			"dialed again after the {budget:?} budget ran out"
+		);
+
+		// Each step waits for the one before, so no status change can coalesce away.
+		let status = connection.status().await.expect("reconnect loop stopped");
+		assert_eq!(status, moq_tokio::Status::Connected);
+		session
+			.drain()
+			.send(moq_net::goaway::Goaway::new())
+			.expect("send goaway");
+		let status = connection.status().await.expect("reconnect loop stopped");
+		assert_eq!(status, moq_tokio::Status::Migrating);
+		held.push(session);
+
+		// Drained before it served, so the loop is asleep in its backoff.
+		tokio::time::advance(wait).await;
+	};
+
 	let message = err.to_string();
 	assert!(message.contains("peer is draining"), "gave up with {message}");
 	assert!(
 		!message.contains("redirected"),
 		"gave up with {message}, calling a drain a redirect"
 	);
-
-	drainer.abort();
 }
 
 /// A peer away for longer than a relay restart takes is still reconnected to, on

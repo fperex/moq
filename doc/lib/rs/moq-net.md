@@ -16,7 +16,7 @@ above ([hang](/lib/rs/hang)); relays and CDNs implement only this.
 ## What it gives you
 
 - **Origins** scope what a session can see, and merge duplicate subscriptions so a broadcast is pulled upstream once no matter how many local readers.
-- **Broadcasts** are created unadvertised, then announced as an exact route, or served below a prefix with `dynamic`. Discovery accepts pattern unions; events carry the advertised prefix and captures for a complete match.
+- **Broadcasts** appear on local announce cursors when created, then can be advertised to peers as an exact route, or served below a prefix with `dynamic`. Discovery accepts pattern unions; events carry the advertised prefix and captures for a complete match.
 - **Patterns** (`Pattern`, `Patterns`) are re-exported from [`moq-pattern`](https://docs.rs/moq-pattern). Literal `Path` stays a coordinate.
 - **Tracks** carry groups with a priority, a retention window, and a timescale. Subscribers set their own priority and max age and can change them live.
 - **Groups** are written frame by frame and delivered on independent streams. Old groups are cached for fetch-by-sequence; stale groups are skipped per the subscriber's budget.
@@ -24,7 +24,7 @@ above ([hang](/lib/rs/hang)); relays and CDNs implement only this.
 - **Routes** record the relay hops and a cost, which is what the relay [cluster](/bin/relay/cluster) routes on. A hop of 0 marks the chain anonymous: `Route::is_anonymous()` is true, and that route ranks below every fully identified one.
 - **Stats** counters per broadcast and session, drained by [`moq-stats`](https://docs.rs/moq-stats).
 
-It runs over anything implementing `web_transport_trait::Session`: noq, the
+It runs over anything implementing `web_transport_trait::poll::Session`: noq, the
 browser, iroh, or qmux over TCP, Unix sockets, and
 WebSockets. [`moq-tokio`](https://docs.rs/moq-tokio) wires those up.
 
@@ -36,6 +36,39 @@ See the [Rust quick start](/lib/rs/#quick-start) and
 [docs.rs/moq-net](https://docs.rs/moq-net). The TypeScript twin is
 [`@moq/net`](/lib/js/net). The [path pattern](/concept/moq-lite#path-patterns)
 grammar lives on the concept page.
+
+## Driving sessions
+
+`Client::connect(now, transport)`, `Server::accept(now, transport)`, and
+`server::Handshake::ok()` return `(Session, Driver)`. `moq-net` never spawns
+tasks or reads the clock: the caller polls the driver and supplies the time.
+`moq_net::time::run` does that on tokio or in the browser.
+
+```rust
+let now = tokio::time::Instant::now().into_std();
+let (session, driver) = client.connect(now, transport).await?;
+tokio::spawn(moq_net::time::run(driver));
+```
+
+A custom event loop calls `driver.poll(now, waiter)` with a nondecreasing
+`moq_net::time::Instant`. `Ok(Some(at))` asks to be polled again by `at` or
+on external activity, `Ok(None)` only on external activity, and `Err` is the
+terminal error (`Error::Closed` for a clean finish): stop polling. Tests drive
+the same interface with explicitly advanced instants.
+
+Dropping the last session handle requests closure on the next poll. Dropping
+the driver cancels the session. `moq-tokio` and `moq-wasm` drive sessions for
+their callers.
+
+`origin::Producer::new` returns a driver with the same `time::Driver`
+interface. It calls `cache::Pool::gc(now)` after each poll and folds the next
+cleanup time into its returned deadline. A standalone pool needs `gc(now)`
+called by its owner, at least by the returned deadline; `None` means expiry is
+disabled.
+
+Cache activity is dated lazily: reads and writes mark a group active without
+reading a clock, and the next `gc` pass stamps it with the supplied instant.
+Expiry is therefore approximate; a late `gc` extends retention.
 
 ## Patterns
 
@@ -75,8 +108,8 @@ Three operations, on an origin:
 
 - `origin.publish(path, route)` creates and advertises a broadcast in one call.
 - `origin.create_broadcast(path)` returns a producer. The broadcast is
-  reachable by exact path immediately and invisible to discovery until
-  advertised.
+  reachable and visible to local discovery immediately. Peers see it only after
+  `broadcast.announce(route)`.
 - `broadcast.announce(route)` / `broadcast.unannounce()` own that
   advertisement. Announcing again re-prices the standing route. The route
   retracts on `unannounce()`, `finish()`, or the last producer dropping.

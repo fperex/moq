@@ -262,24 +262,26 @@ async function negotiate(url: URL, session: WebTransport, wiring: SessionProps):
 	// Choose setup encoding based on negotiated WebTransport protocol (if any).
 	let setupVersion: Ietf.Version;
 	const modernVersion =
-		protocol === Ietf.ALPN.DRAFT_21
-			? Ietf.Version.DRAFT_21
-			: protocol === Ietf.ALPN.DRAFT_20
-				? Ietf.Version.DRAFT_20
-				: protocol === Ietf.ALPN.DRAFT_19
-					? Ietf.Version.DRAFT_19
-					: protocol === Ietf.ALPN.DRAFT_18
-						? Ietf.Version.DRAFT_18
-						: protocol === Ietf.ALPN.DRAFT_17
-							? Ietf.Version.DRAFT_17
-							: undefined;
+		protocol === Ietf.ALPN.DRAFT_22
+			? Ietf.Version.DRAFT_22
+			: protocol === Ietf.ALPN.DRAFT_21
+				? Ietf.Version.DRAFT_21
+				: protocol === Ietf.ALPN.DRAFT_20
+					? Ietf.Version.DRAFT_20
+					: protocol === Ietf.ALPN.DRAFT_19
+						? Ietf.Version.DRAFT_19
+						: protocol === Ietf.ALPN.DRAFT_18
+							? Ietf.Version.DRAFT_18
+							: protocol === Ietf.ALPN.DRAFT_17
+								? Ietf.Version.DRAFT_17
+								: undefined;
 	if (modernVersion !== undefined) {
 		return await handshakeAlpn(url, session, modernVersion, wiring);
 	} else if (protocol === Ietf.ALPN.DRAFT_16) {
 		setupVersion = Ietf.Version.DRAFT_16;
 	} else if (protocol === Ietf.ALPN.DRAFT_15) {
 		setupVersion = Ietf.Version.DRAFT_15;
-	} else if (protocol === Lite.ALPN_06_WIP) {
+	} else if (protocol === Lite.ALPN_06) {
 		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_06, ...wiring });
 	} else if (protocol === Lite.ALPN_05) {
 		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_05, ...wiring });
@@ -431,12 +433,12 @@ async function connectWebTransport(
 		allowPooling: false,
 		congestionControl: "low-latency",
 		protocols: [
-			// Lite.ALPN_06_WIP is intentionally omitted: lite-06 is work-in-progress and
-			// not advertised by default (connect.ts still accepts it if a server negotiates it).
+			Lite.ALPN_06,
 			Lite.ALPN_05,
 			Lite.ALPN_04,
 			Lite.ALPN_03,
 			Lite.ALPN,
+			Ietf.ALPN.DRAFT_22,
 			Ietf.ALPN.DRAFT_21,
 			Ietf.ALPN.DRAFT_20,
 			Ietf.ALPN.DRAFT_19,
@@ -517,11 +519,12 @@ async function connectWebSocket(url: URL, delay: number, cancel: Promise<void>):
 	// advertises every QMux draft it knows about and the server picks one.
 	// Insertion order is the negotiation preference on the wire.
 	const versions = {
-		// Lite.ALPN_06_WIP omitted on purpose: lite-06 is work-in-progress, not advertised by default.
+		[Lite.ALPN_06]: null,
 		[Lite.ALPN_05]: null,
 		[Lite.ALPN_04]: null,
 		[Lite.ALPN_03]: null,
 		[Lite.ALPN]: null,
+		[Ietf.ALPN.DRAFT_22]: "qmux-01",
 		[Ietf.ALPN.DRAFT_21]: "qmux-01",
 		[Ietf.ALPN.DRAFT_20]: "qmux-01",
 		[Ietf.ALPN.DRAFT_19]: "qmux-01",

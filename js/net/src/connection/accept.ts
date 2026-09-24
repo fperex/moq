@@ -68,6 +68,9 @@ async function acceptInner(
 		publish: props.publish,
 	};
 
+	if (protocol === Ietf.ALPN.DRAFT_22) {
+		return acceptAlpn(transport, url, Ietf.Version.DRAFT_22, wiring);
+	}
 	if (protocol === Ietf.ALPN.DRAFT_21) {
 		return acceptAlpn(transport, url, Ietf.Version.DRAFT_21, wiring);
 	}
@@ -84,7 +87,7 @@ async function acceptInner(
 		return acceptSetup(transport, url, Ietf.Version.DRAFT_16, wiring);
 	} else if (protocol === Ietf.ALPN.DRAFT_15) {
 		return acceptSetup(transport, url, Ietf.Version.DRAFT_15, wiring);
-	} else if (protocol === Lite.ALPN_06_WIP) {
+	} else if (protocol === Lite.ALPN_06) {
 		return new Lite.Connection({ url, quic: transport, version: Lite.Version.DRAFT_06, ...wiring });
 	} else if (protocol === Lite.ALPN_05) {
 		return new Lite.Connection({ url, quic: transport, version: Lite.Version.DRAFT_05, ...wiring });

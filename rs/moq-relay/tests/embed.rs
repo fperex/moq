@@ -60,9 +60,21 @@ fn client() -> moq_tokio::Client {
 }
 
 async fn wait_for_http(port: u16) {
+	let client = reqwest::Client::builder()
+		.no_proxy()
+		.timeout(Duration::from_secs(1))
+		.build()
+		.expect("readiness client");
+	let url = format!("http://127.0.0.1:{port}/health");
 	let deadline = std::time::Instant::now() + Duration::from_secs(5);
 	loop {
-		if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+		// Linux can connect a TCP socket to itself without a listener.
+		if client
+			.get(&url)
+			.send()
+			.await
+			.is_ok_and(|response| response.status().is_success())
+		{
 			return;
 		}
 		if std::time::Instant::now() >= deadline {
@@ -70,6 +82,30 @@ async fn wait_for_http(port: u16) {
 		}
 		tokio::time::sleep(Duration::from_millis(25)).await;
 	}
+}
+
+#[tokio::test]
+async fn http_readiness_requires_a_response() {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+	let ready = tokio::spawn(wait_for_http(port));
+	let (mut stream, _) = tokio::time::timeout(TIMEOUT, listener.accept()).await.unwrap().unwrap();
+	let expected = b"GET /health HTTP/1.1\r\n";
+	let mut request = [0; 22];
+	tokio::time::timeout(TIMEOUT, stream.read_exact(&mut request))
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(&request, expected);
+	assert!(!ready.is_finished(), "TCP connection alone reported HTTP readiness");
+	stream
+		.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+		.await
+		.unwrap();
+	tokio::time::timeout(TIMEOUT, ready).await.unwrap().unwrap();
 }
 
 async fn assert_owner_stopped(quic: SocketAddr, http: SocketAddr) {
@@ -111,7 +147,13 @@ async fn embed_and_stop(mut config: Config) {
 	config.drain_timeout = Duration::ZERO;
 	let http = config.web.http.listen.expect("http listener configured");
 	let relay = Relay::load(config.clone()).await.expect("load relay");
-	let quic = relay.addr().expect("quic listener bound");
+	let quic = relay.quic_addr().expect("quic listener bound");
+	assert_eq!(relay.web_addrs().http, Some(http));
+	assert_eq!(
+		relay.config().quic.max_streams,
+		Some(moq_tokio::quic::DEFAULT_MAX_STREAMS)
+	);
+	assert_eq!(relay.cluster().id(), relay.cluster().origin.hop().id());
 	// Pin the replacement to the same ports, including a `:0` first bind.
 	config.listen.bind = Some(moq_tokio::listen::Bind::Addr(quic));
 
@@ -120,11 +162,18 @@ async fn embed_and_stop(mut config: Config) {
 	// are cloned before `run` consumes the relay.
 	let origin = relay.cluster().origin.clone();
 	let trigger = relay.shutdown_trigger().clone();
+	let ready = relay.ready();
 	let web = relay
 		.web()
 		.routes()
-		.route("/embedded", axum::routing::get(|| async { "embedded\n" }));
+		.route("/embedded", axum::routing::get(|| async { "embedded\n" }))
+		.route(
+			"/restricted",
+			axum::routing::post(|| async { ([("access-control-allow-origin", "https://trusted.example")], "private") }),
+		)
+		.route("/plain-post", axum::routing::post(|| async { "plain" }));
 	let running = tokio::spawn(relay.with_web(web).run());
+	ready.wait().await.expect("relay ready");
 
 	wait_for_http(http.port()).await;
 	assert!(!running.is_finished(), "the relay stopped while serving");
@@ -136,6 +185,78 @@ async fn embed_and_stop(mut config: Config) {
 		.await
 		.expect("read embedded response");
 	assert_eq!(body, "embedded\n");
+	let response = reqwest::Client::new()
+		.get(format!("http://127.0.0.1:{}/embedded", http.port()))
+		.header(reqwest::header::ORIGIN, "https://example.test")
+		.send()
+		.await
+		.expect("fetch embedded route with Origin");
+	assert_eq!(
+		response
+			.headers()
+			.get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+			.unwrap(),
+		"*"
+	);
+	let response = reqwest::Client::new()
+		.post(format!("http://127.0.0.1:{}/restricted", http.port()))
+		.header(reqwest::header::ORIGIN, "https://untrusted.example")
+		.send()
+		.await
+		.expect("post to restricted embedder route");
+	assert_eq!(
+		response
+			.headers()
+			.get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+			.unwrap(),
+		"https://trusted.example",
+		"relay CORS must preserve the embedder's policy on POST"
+	);
+	let response = reqwest::Client::new()
+		.post(format!("http://127.0.0.1:{}/plain-post", http.port()))
+		.header(reqwest::header::ORIGIN, "https://untrusted.example")
+		.send()
+		.await
+		.expect("post to plain embedder route");
+	assert!(
+		response
+			.headers()
+			.get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+			.is_none(),
+		"relay CORS must not grant wildcard access to POST"
+	);
+	let response = reqwest::Client::new()
+		.request(
+			reqwest::Method::OPTIONS,
+			format!("http://127.0.0.1:{}/embedded", http.port()),
+		)
+		.header(reqwest::header::ORIGIN, "https://example.test")
+		.header(reqwest::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+		.header(reqwest::header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+		.send()
+		.await
+		.expect("preflight embedded GET route");
+	assert_eq!(
+		response
+			.headers()
+			.get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+			.unwrap(),
+		"*"
+	);
+	assert_eq!(
+		response
+			.headers()
+			.get(reqwest::header::ACCESS_CONTROL_ALLOW_METHODS)
+			.unwrap(),
+		"GET"
+	);
+	assert_eq!(
+		response
+			.headers()
+			.get(reqwest::header::ACCESS_CONTROL_ALLOW_HEADERS)
+			.unwrap(),
+		"authorization"
+	);
 
 	let broadcast = origin.create_broadcast("test").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("announce");
@@ -166,7 +287,7 @@ async fn embed_and_stop(mut config: Config) {
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	assert_eq!(update.path.as_str(), "test");
+	assert_eq!(update.prefix.as_str(), "test");
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 	let announced = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test"))
 		.await
@@ -225,6 +346,55 @@ fn http_and_quic(cert: &std::path::Path, key: &std::path::Path, quic_bind: Strin
 	config
 }
 
+/// A late TCP bind failure must close readiness without reporting success.
+#[tokio::test]
+async fn tcp_bind_failure_does_not_report_ready() {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let occupied = TcpListener::bind("127.0.0.1:0").expect("reserve TCP port");
+	let mut config = http_and_quic(&cert, &key, "127.0.0.1:0".into());
+	config.listen.tcp.bind = Some(occupied.local_addr().expect("reserved address"));
+	let relay = Relay::load(config).await.expect("load relay before TCP bind");
+	let ready = relay.ready();
+	let running = tokio::spawn(relay.run());
+
+	let result = tokio::time::timeout(TIMEOUT, ready.wait())
+		.await
+		.expect("readiness never resolved");
+	assert!(result.is_err(), "failed TCP bind reported readiness");
+	let error = running
+		.await
+		.expect("run panicked")
+		.expect_err("run accepted an occupied TCP port");
+	assert!(error.to_string().contains("failed to bind listeners"), "{error:#}");
+}
+
+/// An occupied internal port must fail before the relay reports readiness.
+#[tokio::test]
+async fn internal_bind_failure_does_not_report_ready() {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let occupied = TcpListener::bind("127.0.0.1:0").expect("reserve internal port");
+	let mut config = http_and_quic(&cert, &key, "127.0.0.1:0".into());
+	config.internal.listen = Some(occupied.local_addr().expect("reserved address"));
+	let relay = Relay::load(config).await.expect("load relay before internal bind");
+	let ready = relay.ready();
+	let running = tokio::spawn(relay.run());
+
+	let result = tokio::time::timeout(TIMEOUT, ready.wait())
+		.await
+		.expect("readiness never resolved");
+	assert!(result.is_err(), "failed internal bind reported readiness");
+	let error = running
+		.await
+		.expect("run panicked")
+		.expect_err("run accepted an occupied internal port");
+	assert!(
+		error.to_string().contains("failed to bind internal listener"),
+		"{error:#}"
+	);
+}
+
 /// Shared Tokio runtime: one work-stealing runtime owns QUIC.
 #[tokio::test]
 async fn shared_tokio_custom_route_and_quic() {
@@ -266,4 +436,68 @@ async fn uring_custom_route_and_quic() {
 	config.runtime.pin = false;
 	config.runtime.io_uring = true;
 	embed_and_stop(config).await;
+}
+
+/// An embedder-owned accept loop joins the relay's own /metrics exposition.
+#[tokio::test]
+async fn embedded_listener_health_reaches_metrics() {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut config = http_and_quic(&cert, &key, "127.0.0.1:0".into());
+	config.internal.listen = Some(format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap());
+	config.drain_timeout = Duration::ZERO;
+	let internal = config.internal.listen.unwrap();
+	let relay = Relay::load(config).await.expect("load relay");
+	let ready = relay.ready();
+	let trigger = relay.shutdown_trigger().clone();
+	let health = moq_tokio::accept::Health::new("embedded");
+	let running = tokio::spawn(relay.with_listeners([health]).run());
+	ready.wait().await.expect("relay ready");
+	let body = reqwest::get(format!("http://{internal}/metrics"))
+		.await
+		.expect("fetch metrics")
+		.text()
+		.await
+		.expect("read metrics");
+	assert!(
+		body.contains("moq_relay_accept_failures_total{listener=\"embedded\",class=\"exhausted\"} 0"),
+		"{body}"
+	);
+	stop(trigger, running).await;
+}
+
+#[derive(usage::Cli, Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+#[usage(name = "embedded-relay", unknown_flags = "error", args_override_self = false)]
+#[usage(settings)]
+struct EmbeddedConfig {
+	#[usage(flatten)]
+	#[serde(flatten)]
+	relay: Config,
+	#[usage(long = "worker-name")]
+	#[serde(skip)]
+	worker_name: Option<String>,
+}
+
+/// A flattened relay merges its settings without resetting the embedder's flags.
+#[test]
+fn embedded_cli_merges_only_relay_settings() {
+	let (mut parsed, cli) = EmbeddedConfig::parse_from_with_settings(&[
+		std::ffi::OsStr::new("--worker-name"),
+		std::ffi::OsStr::new("recorder"),
+		std::ffi::OsStr::new("--cluster-id"),
+		std::ffi::OsStr::new("9"),
+	])
+	.expect("parse embedding CLI");
+	let file = toml::from_str::<toml::Value>("[cluster]\nid = 7\n").unwrap();
+	let source = moq_tokio::cli::FileSource {
+		path: std::path::Path::new("relay.toml"),
+		value: &file,
+	};
+	parsed
+		.relay
+		.merge_into(&cli, &usage::config::EnvLayer::from_process(), Some(source))
+		.unwrap();
+	assert_eq!(parsed.worker_name.as_deref(), Some("recorder"));
+	assert_eq!(parsed.relay.cluster.id, Some(9));
 }

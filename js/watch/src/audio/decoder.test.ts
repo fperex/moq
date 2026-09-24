@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Group, Broadcast as MoqBroadcast, Time, Varint } from "@moq/net";
 import { type Effect, Signal } from "@moq/signals";
@@ -38,11 +38,19 @@ class MockContext extends EventTarget {
 	// Whether the browser's autoplay policy starts a context with no gesture at all, which is how
 	// the audio-quality lane launches Chromium.
 	static autoplay = false;
+	static deferModule = false;
+	module?: ReturnType<typeof Promise.withResolvers<void>>;
 
 	state = "suspended";
 	resumeCalls = 0;
 	readonly sampleRate: number;
-	readonly audioWorklet = { addModule: async () => {} };
+	readonly audioWorklet = {
+		addModule: () => {
+			if (!MockContext.deferModule) return Promise.resolve();
+			this.module ??= Promise.withResolvers<void>();
+			return this.module.promise;
+		},
+	};
 
 	constructor(options?: { sampleRate?: number }) {
 		super();
@@ -69,6 +77,7 @@ class MockContext extends EventTarget {
 
 	close(): Promise<void> {
 		this.state = "closed";
+		this.module?.reject(new DOMException("Unable to load a worklet module.", "AbortError"));
 		return Promise.resolve();
 	}
 }
@@ -136,6 +145,10 @@ class MockAudioDecoder {
 
 /** Enough of an AudioWorkletNode for the ring to be built against. */
 class MockWorkletNode {
+	static built: MockContext[] = [];
+	constructor(context: MockContext) {
+		MockWorkletNode.built.push(context);
+	}
 	readonly port = { postMessage: () => {}, onmessage: null, addEventListener: () => {}, start: () => {} };
 	connect(): void {}
 	disconnect(): void {}
@@ -190,9 +203,11 @@ beforeEach(() => {
 	(globalThis as Record<string, unknown>).AudioEncoder = class {};
 	(globalThis as Record<string, unknown>).EncodedAudioChunk = MockEncodedChunk;
 	MockContext.built = [];
+	MockWorkletNode.built = [];
 	MockContext.activation = false;
 	MockContext.grace = false;
 	MockContext.autoplay = false;
+	MockContext.deferModule = false;
 });
 
 afterEach(() => {
@@ -366,6 +381,51 @@ test("a catalog frame that only adds the codec description keeps the running con
 	close();
 });
 
+test("a worklet load failure in the current context remains an error", async () => {
+	MockContext.deferModule = true;
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	const tile = decoder(true);
+	try {
+		await flush();
+		const failure = new Error("module failed");
+		const context = MockContext.built[0];
+		expect(context.module).toBeDefined();
+		context.module?.reject(failure);
+		await flush();
+		expect(errors).toHaveBeenCalledWith("spawn error", failure);
+		expect(MockWorkletNode.built).toEqual([]);
+	} finally {
+		tile.close();
+		errors.mockRestore();
+	}
+});
+
+test("a catalog rate replacing the gesture context cancels its pending worklet before closing it", async () => {
+	MockContext.deferModule = true;
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	const tile = decoder(true, { catalog: {} as Catalog.Root });
+	try {
+		await flush();
+		click();
+		MockContext.grace = true;
+		tile.catalog.set(catalog({ rate: 44100 }));
+		await flush();
+		const [first, second] = MockContext.built;
+		expect(first.module).toBeDefined();
+		expect(first.state).toBe("closed");
+		expect(second.sampleRate).toBe(44100);
+		expect(second.module).toBeDefined();
+		second.module?.resolve();
+		await flush();
+		expect(tile.decoder.out.context.peek()).toBe(second as unknown as AudioContext);
+		expect(MockWorkletNode.built).toEqual([second]);
+		expect(errors).not.toHaveBeenCalled();
+	} finally {
+		tile.close();
+		errors.mockRestore();
+	}
+});
+
 test("a gesture before the catalog builds at the device default, and the real rate replaces it", async () => {
 	// The tile is clicked for a broadcast that has not started yet, so there is no rate to build at
 	// and waiting for one would mean waiting past the gesture. The device default is what a context
@@ -438,7 +498,7 @@ test("a rate change after the gesture rebuilds inside the grace and re-arms outs
 test("a player taken off the page releases its context", async () => {
 	// A context is a render thread and one of the handful a browser allows, and a player that is
 	// not in the document can never be heard out of. Held past the detach, a page that cycles its
-	// tiles runs out of contexts and the smoke lane's resource baseline never comes back to zero.
+	// tiles runs out of contexts and the media lane's resource baseline never comes back to zero.
 	const { decoder: built, attached, close } = decoder(true);
 	await flush();
 
@@ -532,6 +592,50 @@ function writeGroup(track: { writeGroup: (group: Group.Producer) => void }, sequ
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+test("a tune-in gap before the first decoded callback keeps audio on the source timeline", async () => {
+	class DeferredDecoder extends MockAudioDecoder {
+		readonly output: (data: MockAudioData) => void;
+		pending: MockAudioData[] = [];
+		next: number | undefined;
+
+		constructor(init: { output: (data: MockAudioData) => void }) {
+			super(init);
+			this.output = init.output;
+		}
+
+		override decode(chunk: MockEncodedChunk): void {
+			this.next ??= chunk.timestamp;
+			this.pending.push(new MockAudioData(this.next));
+			this.next += 20_000;
+			setTimeout(() => this.drain(), 0);
+		}
+		drain(): void {
+			for (const sample of this.pending.splice(0)) this.output(sample);
+		}
+		override async flush(): Promise<void> {
+			this.drain();
+		}
+		override reset(): void {
+			this.next = undefined;
+			this.pending = [];
+		}
+	}
+	Object.assign(globalThis, { AudioDecoder: DeferredDecoder });
+	const producer = new MoqBroadcast.Producer();
+	const track = producer.createTrack("audio");
+	const tile = decoder(true, { active: producer.consume() });
+	try {
+		await flush();
+		writeGroup(track, 0, 1_000_000);
+		for (let i = 0; i < 6; i++) writeGroup(track, i + 1, 2_140_000 + i * 20_000);
+		await flush();
+		expect(tile.decoder.out.buffered.peek().at(-1)?.end).toBe(Time.Milli(2_260));
+	} finally {
+		tile.close();
+		producer.close();
+	}
+});
 
 test("unmuting continues the arrival estimate rather than starting over at the declaration", async () => {
 	// Muting stops the download, so unmuting subscribes again and builds a second container

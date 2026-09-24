@@ -264,7 +264,7 @@ describe("the event loop monitor", () => {
 		expect(timer.posts()).toBeGreaterThan(0);
 		expect(timer.posts()).toBeLessThanOrEqual(10_000 / 50);
 
-		// The ports go with the last holder; the smoke lane counts what a client leaves open.
+		// The ports go with the last holder; the media lane counts what a client leaves open.
 		stall.close();
 		expect(timer.released()).toBe(true);
 	});

@@ -15,7 +15,7 @@ use support::mock::create_mock_session_pair;
 /// Build an origin producer, spawning its driver on the ambient runtime.
 fn produce_origin(hop: Hop) -> moq_net::origin::Producer {
 	let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::new(hop));
-	tokio::spawn(driver.run(support::harness::TokioRuntime::<()>::new()));
+	tokio::spawn(support::harness::run(driver));
 	producer
 }
 
@@ -57,10 +57,10 @@ async fn goaway_send_receive_all_versions() {
 				.recv()
 				.await
 				.expect("session closed before GOAWAY");
-			assert_eq!(&*goaway.uri, "https://new.example.com", "version {version}");
+			assert_eq!(goaway.uri(), "https://new.example.com", "version {version}");
 			assert!(pair.client.draining().peek().is_some(), "version {version}");
 			// No deadline was advertised.
-			assert_eq!(goaway.timeout, None, "version {version}");
+			assert_eq!(goaway.timeout(), None, "version {version}");
 
 			// A session sends at most one GOAWAY: a second is refused, not silently
 			// swapped in behind the peer's back.
@@ -99,8 +99,8 @@ async fn goaway_wire_timeout_moq_transport_17() {
 			.recv()
 			.await
 			.expect("session closed before GOAWAY");
-		assert_eq!(&*goaway.uri, "moqt://relay.example/");
-		assert_eq!(goaway.timeout, Some(Duration::from_secs(5)));
+		assert_eq!(goaway.uri(), "moqt://relay.example/");
+		assert_eq!(goaway.timeout(), Some(Duration::from_secs(5)));
 
 		drop(pair.client);
 		pair.server.closed().await;
@@ -124,7 +124,7 @@ async fn goaway_client_to_server_moq_lite_04() {
 			.recv()
 			.await
 			.expect("session closed before GOAWAY");
-		assert_eq!(&*goaway.uri, "", "empty URI = reconnect to the same endpoint");
+		assert_eq!(goaway.uri(), "", "empty URI = reconnect to the same endpoint");
 		assert!(pair.server.draining().peek().is_some());
 
 		drop(pair.server);
@@ -189,7 +189,7 @@ async fn goaway_client_redirect_refused_moq_transport_19() {
 			.recv()
 			.await
 			.expect("session closed before GOAWAY");
-		assert_eq!(&*goaway.uri, "");
+		assert_eq!(goaway.uri(), "");
 	})
 	.await
 	.expect("test timed out (likely a mock deadlock)");
@@ -215,7 +215,7 @@ async fn goaway_timeout_force_close_moq_transport_17() {
 			.recv()
 			.await
 			.expect("session closed before GOAWAY");
-		assert_eq!(goaway.timeout, Some(Duration::from_millis(100)));
+		assert_eq!(goaway.timeout(), Some(Duration::from_millis(100)));
 
 		// The deadline fires and the driver force-closes with GOAWAY_TIMEOUT (0x10),
 		// which the peer decodes back through the session registry.
@@ -274,11 +274,13 @@ async fn duplicate_goaway_keeps_first_payload_moq_lite_04() {
 		let client = moq_net::Client::new().with_versions(version.into());
 		let server = moq_net::Server::new().with_versions(version.into());
 		let (client_result, server_result) = tokio::join!(
-			client.connect(support::harness::TokioRuntime::new(), client_transport),
-			server.accept(support::harness::TokioRuntime::new(), server_transport)
+			client.connect(support::harness::now(), client_transport),
+			server.accept(support::harness::now(), server_transport)
 		);
-		let client_session = client_result.expect("client handshake failed");
-		let _server_session = server_result.expect("server handshake failed");
+		let (client_session, client_driver) = client_result.expect("client handshake failed");
+		tokio::spawn(support::harness::run(client_driver));
+		let (_server_session, server_driver) = server_result.expect("server handshake failed");
+		tokio::spawn(support::harness::run(server_driver));
 
 		// First GOAWAY: observed with its URI. Waiting for the peer to close the
 		// stream guarantees the control message was fully processed.
@@ -290,7 +292,7 @@ async fn duplicate_goaway_keeps_first_payload_moq_lite_04() {
 			.recv()
 			.await
 			.expect("session closed before GOAWAY");
-		assert_eq!(&*goaway.uri, "a");
+		assert_eq!(goaway.uri(), "a");
 		assert!(client_session.draining().peek().is_some());
 
 		// Second GOAWAY: once the client has fully processed the stream, the
@@ -303,7 +305,7 @@ async fn duplicate_goaway_keeps_first_payload_moq_lite_04() {
 			.recv()
 			.await
 			.expect("session closed before GOAWAY");
-		assert_eq!(&*goaway.uri, "a", "duplicate GOAWAY must not replace the first payload");
+		assert_eq!(goaway.uri(), "a", "duplicate GOAWAY must not replace the first payload");
 	})
 	.await
 	.expect("test timed out (likely a mock deadlock)");
@@ -443,7 +445,7 @@ async fn goaway_drains_routes(version: Version) {
 		loop {
 			let update = announced.next().await.expect("update");
 			if update.kind.is_active()
-				&& update.path.as_str() == "test"
+				&& update.prefix.as_str() == "test"
 				&& update.route.cost == moq_net::origin::Cost::DRAIN
 			{
 				break;

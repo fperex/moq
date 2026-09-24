@@ -17,7 +17,7 @@ pub fn spawn() -> moq_net::origin::Producer {
 /// Build and spawn an origin producer with an explicit configuration.
 pub fn spawn_config(config: moq_net::origin::Config) -> moq_net::origin::Producer {
 	let (producer, driver) = moq_net::origin::Producer::new(config);
-	tokio::spawn(driver.run(crate::runtime::Runtime::<()>::new()));
+	tokio::spawn(moq_net::time::run(driver));
 	producer
 }
 
@@ -36,7 +36,7 @@ mod tests {
 		broadcast.announce(Default::default()).expect("create broadcast");
 
 		let update = announced.next().await.expect("announce");
-		assert_eq!(update.path.as_str(), "cam");
+		assert_eq!(update.prefix.as_str(), "cam");
 		assert!(update.kind.is_active());
 
 		broadcast.finish();

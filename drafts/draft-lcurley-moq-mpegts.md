@@ -110,6 +110,7 @@ type Mpegts = {
   "programDescriptors": Descriptor[] | undefined,
   "program": Program | undefined,
   "si": Map<PidString, Si> | undefined,
+  "muxRate": number | undefined,
 }
 ~~~
 
@@ -168,6 +169,7 @@ type SiEntry = {
 
 JSON object keys are strings, so both are decimal with no leading zeros: `"17"` for PID 0x0011, `"66"` for `table_id` 0x42.
 A consumer MUST refuse a catalog whose PID key is not an integer in 0..8191, or whose `table_id` key is not an integer in 0..255.
+A consumer MAY additionally accept the pre-`table_id` form, where a PID maps to `{"interval", "sections"}` with the sections inline: it decodes into one entry per `table_id` (byte 0 of each section) naming no track. A producer MUST NOT write that form.
 
 `table_id` is byte 0 of generic section syntax ({{mpeg2}} Section 2.4.4), so the key is no less generic than the PID; which ranges mean what is a delivery-system convention this document does not rely on.
 
@@ -180,6 +182,13 @@ It MUST omit `interval` for a `table_id` whose requirement it does not know; a c
 The key is `table_id` rather than PID because that is the granularity the requirements are defined at: one PID carries tables wanting different rates.
 
 PAT and PMT are never carried here: they are rebuilt from `program`, `programDescriptors`, and the per-track entries.
+
+## muxRate {#field-mux-rate}
+The rate the source's PCR clock paced the whole multiplex at, in bits per second: every PID, the PSI, and the null packets, measured as the packets between two PCRs over the time they span.
+It is not a sum of the elementary streams, and a track's own bitrate keeps its codec meaning.
+
+A publisher MUST include `muxRate` only while the source holds a constant rate, and MUST omit it for a variable-rate or unpaced source; a value that has become invalid is removed rather than left stale.
+A consumer rebuilding a transport stream SHOULD pad its output with null packets to `muxRate` ({{rebuild}}).
 
 ### SI Track {#si-track}
 Each group is a complete picture of the entry's current sections: one frame per sub-table, each frame that sub-table's sections concatenated verbatim in `section_number` order.
@@ -260,6 +269,7 @@ A consumer rebuilding a transport stream:
 - MUST re-emit each track's `descriptors` as its ES-level descriptors, and `programDescriptors` as the PMT's `program_info`.
 - MUST re-emit each `si` entry's sections byte-for-byte on that entry's PID, reading them from its track ({{si-track}}), at least as often as its `interval` when declared.
 - MUST repacketize each verbatim track per its `framing` and `streamType`, using `streamId` when recorded.
+- SHOULD pad the output with null packets to `muxRate` when present, so the rebuilt stream is constant-rate again; a source that exceeds the rate is passed through rather than delayed or dropped.
 
 With no `program` the consumer synthesizes an identity, and SHOULD then omit any carried `si`, which describes a program that no longer exists.
 
@@ -334,6 +344,8 @@ A broadcast demultiplexed from a DVB transport stream: video and audio described
 - Initial version.
 - The `Si` type is keyed by `table_id` only; the PID lives on the enclosing `si` map.
 - A consumer refuses a catalog with an unrecognized `framing` or an invalid `si` map key.
+- Added `muxRate`, the source's constant multiplex rate.
+- A consumer may read the pre-`table_id` inline `sections` form; writing stays track-only.
 
 
 # Acknowledgments

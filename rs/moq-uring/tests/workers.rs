@@ -1,10 +1,11 @@
 //! A steered thread-per-core group, end to end: two workers on two threads,
-//! each with its own socket in one `SO_REUSEPORT` group and an endpoint
-//! issuing steering-prefixed connection ids, serving clients that dial the
-//! shared port. Whichever worker the Initial hashes to owns the connection,
-//! and the prefix keeps every later packet (handshake continuation included)
-//! on that worker; a wrong prefix stalls the handshake, so every dial
-//! completing is what proves the steering.
+//! each adopting its own member of one `SO_REUSEPORT` group and serving an
+//! endpoint on it, for clients that dial the shared port. The member carries
+//! the slot, so the endpoint issues steering-prefixed connection ids without
+//! being told which. Whichever worker the Initial hashes to owns the
+//! connection, and the prefix keeps every later packet (handshake
+//! continuation included) on that worker; a wrong prefix stalls the
+//! handshake, so every dial completing is what proves the steering.
 //!
 //! Kernel-gated: skips loudly below the Linux 6.12 floor (GitHub-hosted CI),
 //! and runs everywhere else.
@@ -80,10 +81,14 @@ fn a_steered_group_serves_a_shared_port() {
 	// guarantees it. The group is held for as long as the sockets are served,
 	// since it is what holds the port.
 	let mut group = Group::acquire("127.0.0.1:0".parse().expect("addr"), WORKERS).expect("group");
-	let mut members = Vec::new();
+	let mut claims = Vec::new();
 	while let Some(member) = group.member() {
-		let shard = member.shard();
-		members.push((shard, member.bind().expect("bind group member")));
+		claims.push(member.bind().expect("bind group member"));
+	}
+	let mut group = group.complete(claims).expect("complete group");
+	let mut members = Vec::new();
+	while let Some(member) = group.member().expect("clone retained socket") {
+		members.push(member);
 	}
 	let addr = group.addr();
 
@@ -95,24 +100,23 @@ fn a_steered_group_serves_a_shared_port() {
 	let threads: Vec<_> = members
 		.into_iter()
 		.zip(&stops)
-		.map(|((shard, socket), stop)| {
+		.map(|(member, stop)| {
 			let accepted = accepted.clone();
 			let stop = stop.clone();
 			let cert = certs.cert.clone();
 			let key = certs.key.clone();
 			std::thread::spawn(move || {
+				let shard = member.shard();
 				let mut worker = Worker::new(Config::default()).expect("worker");
 				let handle = worker.handle();
-				let socket = handle.udp(socket, udp::Config::default()).expect("socket");
+				// The member is adopted whole: its slot is what the endpoint
+				// steers with, and there is no other way to hand one over.
+				let socket = handle.udp(member, udp::Config::default()).expect("socket");
 
 				let mut server = quic::server::Config::new(quic::Identity::open(cert, key).expect("identity"));
 				server.alpn = vec![ALPN.to_string()];
-				let endpoint = quic::Endpoint::new(
-					&handle,
-					socket,
-					quic::endpoint::Config::default().with_server(server).with_shard(shard),
-				)
-				.expect("endpoint");
+				let endpoint = quic::Endpoint::new(socket, quic::endpoint::Config::default().with_server(server))
+					.expect("endpoint");
 
 				handle.spawn(async move {
 					// Accepted connections are dropped once counted; the
@@ -140,7 +144,7 @@ fn a_steered_group_serves_a_shared_port() {
 				let socket = handle
 					.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), udp::Config::default())
 					.expect("client socket");
-				let mut conn = quic::client::connect(&handle, socket, &dial).await.expect("connect");
+				let mut conn = quic::client::connect(socket, &dial).await.expect("connect");
 				assert_eq!(
 					web_transport_trait::poll::Session::protocol(&conn),
 					Some(ALPN),
@@ -161,7 +165,7 @@ fn a_steered_group_serves_a_shared_port() {
 					std::time::Instant::now() < deadline,
 					"only {total} of {DIALS} dials were accepted"
 				);
-				moq_net::runtime::Deadline::after(&handle, std::time::Duration::from_millis(10))
+				moq_uring::Timer::after(&handle, std::time::Duration::from_millis(10))
 					.wait()
 					.await;
 			}

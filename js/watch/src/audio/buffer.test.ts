@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import type { Time } from "@moq/net";
+import { Time } from "@moq/net";
 import { Effect } from "@moq/signals";
 import { type AudioBuffer, ClockSource, createAudioBuffer } from "./buffer";
 import type { Playhead } from "./playhead";
@@ -147,6 +147,7 @@ class FakeWorklet extends EventTarget {
 function state(worklet: FakeWorklet, reader: Playhead | undefined, stalled: boolean): State {
 	return {
 		type: "state",
+		contextTime: Time.Second((performance.now() - 1) / 1000),
 		timeline: worklet.timeline,
 		playhead: reader,
 		debug: {
@@ -207,6 +208,7 @@ describe("AudioBuffer, transport", () => {
 		// a page that is not isolated is supposed to run on.
 		const build = () =>
 			createAudioBuffer(new FakeWorklet() as unknown as AudioWorkletNode, {
+				context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
 				channels: 1,
 				rate: 48000,
 				latency: 4800,
@@ -230,6 +232,56 @@ describe("AudioBuffer, transport", () => {
 	});
 });
 
+describe("AudioBuffer output clock", () => {
+	it("keeps the audio timeline stable when worklet messages arrive unevenly", () => {
+		clock = fakeClock(1010);
+		const worklet = new FakeWorklet();
+		let output = { contextTime: 0, performanceTime: 0 };
+		const shared = globalThis.SharedArrayBuffer;
+		(globalThis as { SharedArrayBuffer?: SharedArrayBufferConstructor }).SharedArrayBuffer = undefined;
+		let buffer: AudioBuffer;
+		try {
+			buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+				context: { getOutputTimestamp: () => output },
+				channels: 1,
+				rate: 48000,
+				latency: 4800,
+				buffered: false,
+				conceal: true,
+			});
+		} finally {
+			globalThis.SharedArrayBuffer = shared;
+		}
+		try {
+			worklet.deliver({ ...state(worklet, playhead(500, 1), false), contextTime: Time.Second(1) });
+			expect(buffer.clock.peek()).toBeUndefined();
+			output = { contextTime: 1, performanceTime: 1000 };
+			worklet.deliver({ ...state(worklet, playhead(500, 1), false), contextTime: Time.Second(1) });
+			expect(buffer.clock.peek()).toEqual({
+				timestamp: Time.Micro(500_000),
+				reference: Time.Milli(1000),
+				rate: 1,
+			});
+			clock.advance(25);
+			worklet.deliver({ ...state(worklet, playhead(520, 1), false), contextTime: Time.Second(1.02) });
+			expect(buffer.clock.peek()).toEqual({
+				timestamp: Time.Micro(520_000),
+				reference: Time.Milli(1020),
+				rate: 1,
+			});
+			clock.advance(1);
+			worklet.deliver({ ...state(worklet, playhead(530, 1), false), contextTime: Time.Second(1.03) });
+			expect(buffer.clock.peek()).toEqual({
+				timestamp: Time.Micro(530_000),
+				reference: Time.Milli(1030),
+				rate: 1,
+			});
+		} finally {
+			buffer.close();
+		}
+	});
+});
+
 describe("AudioBuffer, flushed", () => {
 	it("never reports the old playhead once the postMessage ring is flushed", async () => {
 		const worklet = new FakeWorklet();
@@ -239,6 +291,7 @@ describe("AudioBuffer, flushed", () => {
 		let buffer: AudioBuffer;
 		try {
 			buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+				context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
 				channels: 1,
 				rate: 48000,
 				latency: 4800,
@@ -298,6 +351,7 @@ describe("AudioBuffer, flushed", () => {
 	it("never reports the old playhead once the shared ring is flushed", async () => {
 		const worklet = new FakeWorklet();
 		const buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+			context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
 			channels: 1,
 			rate: 48000,
 			latency: 4800,

@@ -45,7 +45,7 @@ export class ClockSource {
 	}
 
 	/** Stamp `playhead`, or return undefined when it should not be driving playback. */
-	sample(playhead: Playhead | undefined): Clock | undefined {
+	sample(playhead: Playhead | undefined, reference = Time.Milli.now()): Clock | undefined {
 		const now = Time.Milli.now();
 
 		if (!playhead) {
@@ -61,7 +61,7 @@ export class ClockSource {
 			if (Time.Milli.sub(now, this.#parked) > PARK_LIMIT) return undefined;
 		}
 
-		return { timestamp: playhead.timestamp, reference: now, rate: playhead.rate };
+		return { timestamp: playhead.timestamp, reference, rate: playhead.rate };
 	}
 }
 
@@ -233,6 +233,8 @@ export function supportsSharedArrayBuffer(): boolean {
 
 /** How the ring behind the worklet is built. */
 export interface AudioBufferProps {
+	/** Maps render time to the audio device's output clock. */
+	context: Pick<AudioContext, "getOutputTimestamp">;
 	/** Channels of planar PCM the graph runs at. */
 	channels: number;
 	/** Samples per second per channel. */
@@ -482,9 +484,18 @@ class PostAudioBuffer implements AudioBuffer {
 				this.#stalled.set(data.debug.stalled);
 				this.#underruns.set(data.debug.underruns);
 				this.#debug.set(data.debug);
-				// Stamped on arrival rather than at the send, so the clock carries the transport's
-				// own lag; the main thread extrapolates from here until the next message.
-				this.#clock.set(this.#clockSource.sample(data.playhead));
+				const { contextTime, performanceTime } = props.context.getOutputTimestamp();
+				if (contextTime === undefined || performanceTime === undefined) {
+					throw new Error("Audio output timestamp is missing");
+				}
+				// Message delivery varies with main-thread load. Anchor the playhead to when its
+				// samples reach the output device so that delivery jitter does not pace video.
+				const reference = Time.Milli(performanceTime + (data.contextTime - contextTime) * 1000);
+				this.#clock.set(
+					contextTime === 0 && performanceTime === 0
+						? undefined
+						: this.#clockSource.sample(data.playhead, reference),
+				);
 				// While stalled the playhead is parked, so release the decode loop to refill the floor;
 				// once playing, hold it to ~the floor ahead.
 				if (data.debug.stalled || timestamp === undefined) this.#backpressure.flush();

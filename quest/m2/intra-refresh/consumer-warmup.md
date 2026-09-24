@@ -58,8 +58,8 @@ replaces both: the rule is timestamp arithmetic on the group start.
 
 ## Required
 
-- [Catalog warmup](/quest/m2/intra-refresh/catalog-warmup.md) - the field this reads
+- [Catalog warmup](/quest/m1/catalog-warmup.md) - the field this reads
 
 ## Related
 
-- [Open-GOP leading pictures](/quest/m2/open-gop-leading-pictures.md) - trims frames stamped before the keyframe; this trims frames after the start, on the same signal
+- [Open-GOP leading pictures](/quest/m1/open-gop-leading-pictures.md) - trims frames stamped before the keyframe; this trims frames after the start, on the same signal

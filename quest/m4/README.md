@@ -1,22 +1,19 @@
-# m4: deferred
+# m4: upstream
 
 ## Goal
 
-Work whose first step is outside this repository: a machine or device nobody
-on the team has, a partner or customer, a hosting provider's offer, or an
-upstream release. Nothing here can start by opening an editor.
+Work waiting on an upstream release or external dependency to ship, kept here
+so it is not forgotten.
 
 ## Plan
 
-A quest lands here when its gate is the outside world, not its priority.
-Each states the condition in prose or as a plain-text `Required` bullet.
-When the condition clears, move the quest back to the milestone its work
-belongs in rather than starting it from here.
+Each quest states its gate as a plain-text `Required` bullet. Re-check the
+gates periodically; when one clears, remove the bullet and promote the quest to
+the milestone its priority belongs in.
 
 ## Quests
 
-- [DPDK](/quest/m4/dpdk.md) - a kernel-bypass UDP path for the relay, once a provider offers SR-IOV or bare metal
-- [Video hardware validation](/quest/m4/video-hardware.md) - run the encode, capture, and zero-copy paths that were written but never run on real machines
-- [#2893](/quest/m4/2893-video-validate-pipewire-dma-buf-capture-on-kde-hardware.md) - video: validate PipeWire DMA-BUF capture on KDE hardware
-- [Embedded video](/quest/m4/video-embedded.md) - EGL import in the renderer, so moq-video presents on a Pi
-- [Vision worker](/quest/m4/processor-vision.md) - a documented customer-run vision worker proves the processor contract
+- [VAAPI encode and decode](/quest/m4/video-vaapi.md) - DMA-BUF encode, H.265 decode, and pre-generated bindings that remove the libclang build dependency, all gated on a moq-dev/vaapi release
+- [#2907](/quest/m4/2907-bind-the-browser-through-moq-ffi-uniffi-instead-of-a.md) - the browser reaches moq-ffi through a generated TypeScript binding once a JS generator is stable
+- [Safari WebTransport](/quest/m4/safari-webtransport.md) - WebKit browsers return to WebTransport once WebKit 319818 ships fixed
+- [MSFTS convergence](/quest/m4/msfts-convergence.md) - the demultiplexed TS lane maps onto MSFTS ES-level carriage once msfts#33 settles the payload unit

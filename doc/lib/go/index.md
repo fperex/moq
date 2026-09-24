@@ -27,7 +27,8 @@ if err != nil {
 }
 defer client.Close()
 
-announced, err := client.Announced("live/")
+filter := "*/camera"
+announced, err := client.Announced(moq.AnnounceOptions{Prefix: "live/", Filter: &filter})
 if err != nil {
     log.Fatal(err)
 }
@@ -36,8 +37,9 @@ for ann, err := range announced.All(ctx) {
         if moq.IsShutdown(err) { break }
         log.Fatal(err)
     }
-    // The requested prefix scopes discovery; each update's prefix is relative to it.
-    broadcast, err := client.RequestBroadcast(ctx, "live/" + ann.Prefix())
+    // Updates stay origin-relative; Captures reports what each wildcard matched.
+    fmt.Printf("captures: %v\n", ann.Captures())
+    broadcast, err := client.RequestBroadcast(ctx, ann.Prefix())
     if err != nil {
         log.Fatal(err)
     }
@@ -68,14 +70,14 @@ broadcast.Finish()   // keep the producer reachable while publishing, then finis
 ```
 
 The three advertising operations: `client.CreateBroadcast(path)` (or
-`origin.CreateBroadcast`) returns an unadvertised producer;
+`origin.CreateBroadcast`) returns a locally discoverable producer;
 `broadcast.Announce(route)` / `broadcast.Unannounce()` own that exact-path
 advertisement; `origin.Dynamic(prefix, route)` claims `prefix` and every
 path beneath it (`""` for everything). Hold the returned `OriginDynamic`
 while the claim should stay advertised, and reject the requests you will not
-serve. A route is a capability, not an inventory. `Announced(prefix)` is the
-requested discovery scope; `ann.Prefix()` is the concrete covered prefix
-relative to it.
+serve. A route is a capability, not an inventory. `Announced(options)` combines
+a literal prefix with an optional relative pattern; `ann.Prefix()` stays
+relative to the origin and `ann.Captures()` reports the wildcard matches.
 
 Every call that can block takes a `context.Context` first. Cancelling it
 returns `ctx.Err()` promptly and tears the in-flight native work down, so a
@@ -102,8 +104,33 @@ take anything `encoding/json` handles and return `json.RawMessage`. The rest
 of the [shared feature list](/lib/#what-every-binding-can-do) maps one to
 one: `FetchGroup`/`FetchMediaGroup`, `Dynamic()` with `Requests(ctx)`,
 `Session.Bandwidth()` to divide the send estimate,
-`AppendDatagram`/`Datagrams(ctx)`, `SetCatalogSection`, `Used`/`Unused`,
+`AppendDatagram`/`Datagrams(ctx)`, `SetCatalogSection`, `Demand()` for `Used`/`Unused`,
 `Session().Stats()`. `moq.IsAuthError` and `moq.IsShutdown` classify errors. `moq.ProtocolError(err)` is the structured protocol failure (scope, verbatim code, kind) when the peer sent one.
+
+`DecodeVideo` picks the decoded CPU pixel layout: `VideoDecoderOutput.Format`
+is I420 when nil, or `VideoPixelFormatRgba` for four bytes a pixel, and every
+`VideoDecodedFrame` repeats the layout it was decoded to. `Resize` is best
+effort: only NVDEC has a built-in scaler, so read each frame's own `Width` and
+`Height` rather than assuming it took.
+
+## Connection stats
+
+`Session().Stats()` returns a `ConnectionStats` snapshot. Each field is a
+pointer, nil when the transport backend does not report it (native QUIC reports
+all of them; browser WebTransport reports few or none) or before it is
+available, which is not the same as zero.
+
+| Field | Unit | Meaning |
+| --- | --- | --- |
+| `RttUs` | microseconds | Smoothed round-trip time. |
+| `EstimatedSendRateBps` | bits per second | Send bandwidth from the congestion controller. |
+| `EstimatedRecvRateBps` | bits per second | Receive bandwidth from MoQ PROBE. |
+| `BytesSent` | bytes | Total sent, including retransmissions and overhead. |
+| `BytesReceived` | bytes | Total received, including duplicates and overhead. |
+| `BytesLost` | bytes | Total lost, detected via retransmission or acknowledgement. |
+| `PacketsSent` | datagrams | Total datagrams sent. |
+| `PacketsReceived` | datagrams | Total datagrams received. |
+| `PacketsLost` | datagrams | Total datagrams detected as lost. |
 
 - API reference: [pkg.go.dev/moq.dev/moq](https://pkg.go.dev/moq.dev/moq)
 - Source: [`go/`](https://github.com/moq-dev/moq/tree/main/go); `just go check` builds and tests locally

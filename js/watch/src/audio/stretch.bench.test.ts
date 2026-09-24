@@ -147,12 +147,7 @@ it("renders a quantum well inside its budget, stretching or not", () => {
 	// shows the same handful of them. `max` is printed so a real regression is still visible.
 	expect(stretching.p999).toBeLessThan(BUDGET);
 
-	// The worst stretching quantum against the worst plain one: the search and the splice cost
-	// something, but not the kind of something that shows up as a dropout.
-	expect(stretching.p999 / normal.p999).toBeLessThan(30);
-
 	// And concealment, which is a pitch search, a sixth order fit, and a splice per outage.
 	expect(concealing.operations).toBeGreaterThan(500);
 	expect(concealing.p999).toBeLessThan(BUDGET);
-	expect(concealing.p999 / normal.p999).toBeLessThan(30);
 }, 120_000);

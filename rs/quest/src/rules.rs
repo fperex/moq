@@ -124,13 +124,10 @@ fn headings(found: &mut Findings, doc: &Doc) {
 		}
 	}
 
-	// A questline is a README with `## Quests`; a quest is everything else and
-	// must not have one. Only quests are executed, so the distinction decides
-	// what a reader is allowed to pick up.
-	match (doc.is_questline(), doc.has("Quests")) {
-		(true, false) => found.on(&doc.path, "a questline needs '## Quests'"),
-		(false, true) => found.on(&doc.path, "only a questline README may have '## Quests'"),
-		_ => {}
+	// Only a README indexes children; a quest is a leaf and must not, since the
+	// index is what makes a file a questline and questlines are not picked up.
+	if doc.has("Quests") && !doc.is_questline() {
+		found.on(&doc.path, "only a README may have '## Quests'");
 	}
 	for heading in &doc.headings {
 		if LIST_SECTIONS.contains(&heading.text.as_str()) && doc.entries(&heading.text).next().is_none() {

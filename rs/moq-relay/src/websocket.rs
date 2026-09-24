@@ -19,6 +19,8 @@ use crate::{auth, web::MtlsPeer, web::WebState, web::landing_response};
 
 // One axum extractor per fact the upgrade needs; there is no struct to fold them into.
 #[allow(clippy::too_many_arguments)]
+// The `Err` is axum's own `ErrorResponse`, so there is nothing here to box.
+#[expect(clippy::result_large_err, reason = "the error type is axum's, not ours")]
 pub(crate) async fn serve_ws(
 	ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 	OriginalUri(uri): OriginalUri,
@@ -182,14 +184,16 @@ where
 	if let Some(publish) = publish {
 		server = server.with_subscriber(publish);
 	}
-	// Hold the session so it doesn't close early; the machine serves it in place
-	// (an Inline runtime hands it back instead of spawning), so its lifetime and
-	// teardown stay tied to this handler task.
-	let runtime = moq_tokio::runtime::Inline::new();
-	let session = server
-		.accept(runtime.clone(), moq_tokio::transport::Session::new(ws))
+	// Keep the driver in this task so cancellation tears down the transport.
+	let (session, driver) = server
+		.accept(
+			tokio::time::Instant::now().into_std(),
+			moq_tokio::transport::Session::new(ws),
+		)
 		.await?;
-	let mut driver = runtime.take().expect("accept hands the machine to its runtime");
+
+	let driver = moq_net::time::run(driver);
+	tokio::pin!(driver);
 
 	// The handshake is done, so this is a MoQ session now: only now can a push
 	// be serviced, and only now does the session appear in the live table.
@@ -203,21 +207,15 @@ where
 			}
 		};
 		tokio::select! {
-			res = &mut driver => {
-				lease.close(
-					match &res {
-						Ok(()) => "closed".to_string(),
-						Err(err) => err.to_string(),
-					},
-					crate::connection::session_bytes(&session),
-				);
-				return res.map_err(Into::into);
+			err = &mut driver => {
+				lease.close(err.to_string(), crate::connection::session_bytes(&session));
+				return ended(err);
 			}
 			why = lease.ended() => {
 				tracing::info!(%why, "lease ended, closing session");
 				session.abort(moq_net::Error::Unauthorized);
 				// Drive the teardown so the close reaches the peer.
-				let res = driver.await.map_err(Into::into);
+				let res = ended(driver.await);
 				lease.close(why, crate::connection::session_bytes(&session));
 				return res;
 			}
@@ -229,8 +227,8 @@ where
 				let drain = shutdown.drain_session(&session);
 				let mut drain = std::pin::pin!(drain);
 				let res = tokio::select! {
-					res = &mut driver => res.map_err(Into::into),
-					_ = &mut drain => driver.await.map_err(Into::into),
+					err = &mut driver => ended(err),
+					_ = &mut drain => ended(driver.await),
 				};
 				lease.close("shutdown", crate::connection::session_bytes(&session));
 				return res;
@@ -240,11 +238,19 @@ where
 	}
 }
 
+/// The driver's terminal error as a session outcome: a clean close is not a failure.
+fn ended(err: moq_net::Error) -> anyhow::Result<()> {
+	match err {
+		moq_net::Error::Closed => Ok(()),
+		err => Err(err.into()),
+	}
+}
+
 /// Pick a subprotocol for the upgrade, or fail the handshake outright.
 ///
 /// We advertise the configured qmux × moq-net subprotocol matrix, with bare
 /// qmux fallbacks last. axum picks the first entry that the client also offered, so
-/// a modern client lands on `qmux-01.moq-lite-05`; old clients still match
+/// a modern client lands on `qmux-01.moq-lite-06`; old clients still match
 /// `webtransport` or `qmux-00.moql` and negotiate via SETUP.
 ///
 /// When the client offered subprotocols and none of them are ours, the
@@ -295,7 +301,7 @@ const QMUX_VERSIONS: &[qmux::Version] = &[qmux::Version::QMux01, qmux::Version::
 
 /// moq-transport-18 and newer require qmux-01, so we never pair them with qmux-00.
 /// Mirrors `js/net`'s `connect.ts` and moq-tokio's `websocket_subprotocols`.
-const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19", "moqt-20", "moqt-21"];
+const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19", "moqt-20", "moqt-21", "moqt-22"];
 
 /// Subprotocols to advertise on the WebSocket upgrade.
 ///
@@ -306,7 +312,7 @@ const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19", "moqt-20", "moqt-21"]
 /// qmux can't resolve a moq version from it, and the relay silently
 /// downgrades clients to Lite02 via SETUP-based negotiation.
 ///
-/// `qmux-00.moqt-{18,19,20,21}` is excluded: moq-transport-18 and newer require
+/// `qmux-00.moqt-{18,19,20,21,22}` is excluded: moq-transport-18 and newer require
 /// qmux-01, so those pairs are illegal.
 fn supported_subprotocols(alpns: &[&str]) -> Vec<String> {
 	let mut out = Vec::with_capacity(QMUX_VERSIONS.len() * alpns.len() + qmux::ALPNS.len());
@@ -532,13 +538,19 @@ mod tests {
 	#[test]
 	fn supported_subprotocols_lists_full_matrix() {
 		// Guard the literals: they must stay the IETF draft-18-and-newer ALPNs
-		// (wire 0xff000012 through 0xff000015).
+		// (wire 0xff000012 through 0xff000016).
 		assert_eq!(
 			QMUX01_ONLY_ALPNS
 				.iter()
 				.map(|&a| moq_net::Version::from_alpn(a).map(|v| v.code()))
 				.collect::<Vec<_>>(),
-			vec![Some(0xff000012), Some(0xff000013), Some(0xff000014), Some(0xff000015)]
+			vec![
+				Some(0xff000012),
+				Some(0xff000013),
+				Some(0xff000014),
+				Some(0xff000015),
+				Some(0xff000016)
+			]
 		);
 
 		let list = supported_subprotocols(moq_net::ALPNS);
@@ -549,7 +561,7 @@ mod tests {
 		assert_eq!(list.first().map(String::as_str), Some(expected_first.as_str()));
 
 		// Every moq ALPN must appear under every qmux wire version, except the
-		// illegal `qmux-00.moqt-{18,19,20,21}` pairs (moq-transport-18 and newer need qmux-01).
+		// illegal `qmux-00.moqt-{18,19,20,21,22}` pairs (moq-transport-18 and newer need qmux-01).
 		for &version in QMUX_VERSIONS {
 			for &alpn in moq_net::ALPNS {
 				let entry = format!("{}{alpn}", version.prefix());

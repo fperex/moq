@@ -38,7 +38,7 @@ import map required:
 ```
 
 Pin a version range in the URL for production, e.g.
-`https://esm.sh/@moq/publish@0.2/element`. jsDelivr's `+esm` endpoint
+`https://esm.sh/@moq/publish@0.5/element`. jsDelivr's `+esm` endpoint
 (`https://cdn.jsdelivr.net/npm/@moq/publish/element.js/+esm`) works the same way
 if you prefer it.
 
@@ -69,9 +69,17 @@ The simplest way to publish a stream:
 | `muted`     | boolean | false    | Release the microphone. The audio rendition stays in the catalog, paused, so unmuting resumes on the subscriptions it already has. |
 | `invisible` | boolean | false    | Disable video capture           |
 | `preview`   | string  | `"source"` | What the preview renders: `"source"`, `"encoded"`, `"none"` |
-| `announce`  | string  | `"source"` | When to advertise: `"always"`, `"never"`, `"source"` (once media is actually captured). The broadcast is created while connected either way. |
+| `announce`  | string  | `"source"` | When to advertise: `"always"`, `"never"`, `"source"` (once media is captured). A camera source waits for every enabled track. The broadcast is created while connected either way. |
 
 A nested `<video>` shows the raw capture; a `<canvas>` is drawn by the element.
+Camera and microphone failures are observable through `el.sources.video`
+and `el.sources.audio`. When those signals hold a `Source.Camera` or
+`Source.Microphone`, read its `out.error` signal. It contains an `Error` (for
+example, a `NotAllowedError` when permission is refused). A refused capture is not retried until permission, device selection,
+constraints, or the source's enabled state changes. A device that is only busy
+(`NotReadableError`), held by another application or still being released, is
+tried again until it frees. `<moq-publish-ui>` shows
+capture failures in its status badge.
 
 ## JavaScript API
 

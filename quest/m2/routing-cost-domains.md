@@ -53,9 +53,9 @@ quests. Open wire/API choices belong to this design exercise.
 
 ## Related
 
-- [Peer reconfigure](/quest/m2/pop-skipping/peer-reconfigure.md) - existing
+- [Peer reconfigure](/quest/m1/pop-skipping/peer-reconfigure.md) - existing
   charged versus declared directional policy
-- [PoP skipping](/quest/m2/pop-skipping/README.md) - coordinated fleet economics
+- [PoP skipping](/quest/m1/pop-skipping/README.md) - coordinated fleet economics
   and warm-route behavior
 - [#3769](https://github.com/moq-dev/moq/pull/3769) - measurement-based pricing
   prompted the separation of measurement, operator policy, and protocol

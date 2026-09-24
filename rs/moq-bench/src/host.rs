@@ -14,6 +14,7 @@
 //! its `/proc` entry. Combine with the load generator's `--output` to compute CPU
 //! per connection and CPU per message (see the README).
 
+#[cfg(target_os = "linux")]
 mod duration;
 
 #[cfg(target_os = "linux")]
@@ -46,7 +47,7 @@ mod linux {
 	/// Sample CPU, memory, and context-switch counters for a running process.
 	#[derive(usage::Cli, Debug)]
 	#[usage(unknown_flags = "error", args_override_self = false)]
-	#[usage(name = "moq-bench-host", version = env!("VERSION"))]
+	#[usage(name = "moq-bench-host", version = env!("CARGO_PKG_VERSION"))]
 	#[usage(completion)]
 	pub struct Args {
 		/// Sample these PIDs. When set, --name is ignored.

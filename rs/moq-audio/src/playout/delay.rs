@@ -27,8 +27,9 @@ const BUCKETS: usize = 100;
 const QUANTILE: f64 = 0.95;
 
 /// Steady-state forget factor, applied once per resampled observation rather than
-/// per arrival. `500ms / (1 - 0.983)` is about 29s of wall-clock memory.
-const FORGET: f64 = 0.983;
+/// per arrival. At 500ms per observation, old mass falls below the 5% tail in 15s.
+/// A longer history buffers a recovered path for a minute after a temporary queue.
+pub(crate) const FORGET: f64 = 0.9;
 
 /// Cold-start ramp: the first observations replace the seeded prior instead of
 /// nudging it.
@@ -57,9 +58,8 @@ const LOWER_INTERVAL: f64 = 1000.0;
 /// The share of the remaining distance one fall step closes.
 ///
 /// Written as a divisor rather than an `f64` sixth so the floor below it lands on the
-/// same bucket in every language. A sixth a second closes the histogram's whole range
-/// inside the 29s the histogram remembers, so the limiter can never outlast the
-/// observation that raised the target.
+/// same bucket in every language. The limiter smooths reductions after the
+/// histogram has released an old delay, while the playout buffer catches up.
 pub(crate) const LOWER_DIVISOR: f64 = 6.0;
 
 /// Width of one histogram bucket in milliseconds, and the resolution of the target.
@@ -730,6 +730,34 @@ mod tests {
 		// The path's own delay is steady, so the reference holds and the spread it
 		// measures is the 150ms it really is rather than nothing at all.
 		assert!(jitter.target() <= Duration::from_millis(40), "{:?}", jitter.target());
+	}
+
+	#[test]
+	fn releases_a_temporary_queue_after_twenty_seconds_of_paced_arrivals() {
+		let mut jitter = Jitter::new();
+		for i in 0..6000u64 {
+			jitter.observe(
+				Duration::from_millis(i * 20),
+				(i * 20 + 50) as f64,
+				Observation::default(),
+			);
+		}
+		for i in 0..300u64 {
+			let timestamp = 120_000 + i * 20;
+			let arrival = 120_000 + ((i / 25) + 1) * 500 + 50;
+			jitter.observe(Duration::from_millis(timestamp), arrival as f64, Observation::default());
+		}
+		assert!(jitter.target() >= Duration::from_millis(480));
+
+		for i in 0..1000u64 {
+			let timestamp = 126_000 + i * 20;
+			jitter.observe(
+				Duration::from_millis(timestamp),
+				(timestamp + 50) as f64,
+				Observation::default(),
+			);
+		}
+		assert!(jitter.target() <= Duration::from_millis(200), "{:?}", jitter.target());
 	}
 
 	/// A sixth of the distance left, floored to a bucket, with a bucket as the floor.

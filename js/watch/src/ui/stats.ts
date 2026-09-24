@@ -72,7 +72,7 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	const vRes = line(videoCard.grid, "Resolution");
 	const vCodec = line(videoCard.grid, "Codec");
 	const vBitrateGraph = graph(parent, "Bitrate", { color: "#a855f7", format: formatBitrate });
-	const vFpsGraph = graph(parent, "Frame rate", { color: "#facc15", format: formatFps });
+	const vFpsGraph = graph(parent, "Rendered frame rate", { color: "#facc15", format: formatFps });
 	videoCard.el.append(vBitrateGraph.el, vFpsGraph.el);
 	track(parent, videoCard, {
 		catalog: watch.video.source.out.catalog,
@@ -107,7 +107,13 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 
 	container.append(videoCard.el, audioCard.el, netCard.el);
 
-	let vPrev = { frames: 0, bytes: 0, when: performance.now() };
+	let rendered = 0;
+	parent.cleanup(
+		watch.renderer.out.timestamp.subscribe((timestamp) => {
+			if (timestamp !== undefined) rendered++;
+		}),
+	);
+	let vPrev = { frames: rendered, bytes: 0, when: performance.now() };
 	let aPrev = { bytes: 0, when: performance.now() };
 
 	parent.interval(() => {
@@ -123,15 +129,14 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 		vCodec.textContent = vConf?.codec ?? "—";
 
 		let fps: number | undefined;
-		if (vStats && vPrev.frames > 0) {
+		if (watch.renderer.out.timestamp.peek() !== undefined) {
 			const elapsed = now - vPrev.when;
-			const delta = vStats.frameCount - vPrev.frames;
-			if (delta > 0 && elapsed > 0) fps = delta / (elapsed / 1000);
+			if (elapsed > 0) fps = (rendered - vPrev.frames) / (elapsed / 1000);
 		}
 		const vBitrate = vStats ? rate(vPrev, vStats.bytesReceived, now) : undefined;
 		vBitrateGraph.push(vBitrate);
 		vFpsGraph.push(fps);
-		if (vStats) vPrev = { frames: vStats.frameCount, bytes: vStats.bytesReceived, when: now };
+		vPrev = { frames: rendered, bytes: vStats?.bytesReceived ?? 0, when: now };
 
 		// Audio.
 		const aConf = watch.audio.source.out.config.peek();

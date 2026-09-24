@@ -47,8 +47,8 @@ func (o *OriginProducer) Dynamic(prefix string, route Route) (*OriginDynamic, er
 // CreateBroadcast creates a broadcast at the given path, returning the producer
 // that feeds it.
 //
-// The broadcast starts unadvertised: reachable by exact path, but not visible
-// to announcement streams. Advertise it with [BroadcastProducer.Announce]
+// The broadcast appears on this origin's local announcement streams immediately.
+// Advertise it to peers with [BroadcastProducer.Announce]
 // after populating tracks. Finish unpublishes immediately, while dropping the
 // producer without finishing also unpublishes but reads to subscribers as a
 // failure rather than a deliberate end.
@@ -119,9 +119,20 @@ type OriginConsumer struct {
 	inner *ffi.MoqOriginConsumer
 }
 
-// Announced streams routes under the requested prefix. Each update returns a covered prefix relative to it.
-func (o *OriginConsumer) Announced(prefix string) (*AnnounceConsumer, error) {
-	inner, err := o.inner.Announced(prefix)
+// AnnounceOptions scopes an announcement stream.
+type AnnounceOptions struct {
+	// Prefix is a literal path root beneath the origin.
+	Prefix string
+	// Filter is a pattern relative to Prefix. Nil matches every path beneath it.
+	Filter *string
+}
+
+// Announced streams routes under a literal prefix matching an optional pattern filter.
+func (o *OriginConsumer) Announced(options AnnounceOptions) (*AnnounceConsumer, error) {
+	inner, err := o.inner.Announced(ffi.MoqAnnounceConfig{
+		Prefix: options.Prefix,
+		Filter: options.Filter,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -159,9 +170,21 @@ type AnnounceUpdate struct {
 	inner *ffi.MoqAnnounceUpdate
 }
 
-// Prefix is the covered prefix, relative to the requested announcements prefix.
+// Prefix is the covered prefix, relative to the origin.
 func (a *AnnounceUpdate) Prefix() string {
 	return a.inner.Prefix()
+}
+
+// Captures reports what each filter wildcard matched. Nil means the route only
+// overlaps the scope without pinning every wildcard.
+func (a *AnnounceUpdate) Captures() []string {
+	captures := a.inner.Captures()
+	if captures == nil {
+		return nil
+	}
+	result := make([]string, len(*captures))
+	copy(result, *captures)
+	return result
 }
 
 // Active reports whether the route is active (true) or was retracted (false).

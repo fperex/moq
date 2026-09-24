@@ -25,11 +25,17 @@ on:
     # Rust cache on `main`, and that push run is nobody's check, so a break in
     # it would otherwise go unseen. The cost is a skipped Alert run per Swift
     # pull request.
+    #
+    # Audio quality is here for its manual matrix run, which is not a pull
+    # request. The cost is a skipped Alert run per pull request its replay lane
+    # runs on.
     workflows:
       - apt-repo
+      - Audio quality
       - Cache
       - Cachix
       - Docker
+      - Interop
       - libmoq
       - moq-cli
       - moq-gst
@@ -50,7 +56,6 @@ on:
       - Release Swift Lib
       - release-winget
       - rpm-repo
-      - Smoke
       - Swift
     types:
       - completed

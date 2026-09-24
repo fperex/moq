@@ -583,12 +583,12 @@ mod tests {
 		let mut stream = crate::capture::open(&capture).await.expect("portal screen capture");
 
 		for index in 0..16 {
-			let surface = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read())
+			let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read())
 				.await
 				.unwrap_or_else(|_| panic!("timed out waiting for frame {index}"))
 				.unwrap_or_else(|error| panic!("capture failed before frame {index}: {error}"))
 				.unwrap_or_else(|| panic!("capture ended before frame {index}"));
-			let Surface::DmaBuf(buffer) = &surface else {
+			let Surface::DmaBuf(buffer) = &frame.surface else {
 				panic!("frame {index} used shared memory instead of DMA-BUF");
 			};
 			assert!(
@@ -603,7 +603,6 @@ mod tests {
 				buffer.format().as_raw()
 			);
 
-			let frame = Frame::new(surface, Timestamp::ZERO);
 			let imported = renderer
 				.source
 				.import(&device, &frame.surface)
@@ -759,7 +758,9 @@ mod tests {
 			// BT.709, so rendering by size alone skews this back.
 			let sd = solid(Size::new(640, 480), rgba);
 			assert_eq!(sd.surface.color(), Some(crate::Color::Bt601Limited));
-			let scaled = sd.resize(size).expect("scale past 576 lines");
+			let scaled = sd
+				.resize(size, &crate::resize::Config::default())
+				.expect("scale past 576 lines");
 			assert_eq!(
 				scaled.surface.color(),
 				Some(crate::Color::Bt601Limited),
@@ -1014,7 +1015,7 @@ mod tests {
 		// checking.
 		let uploaded = {
 			let nv12 = pattern(crate::DrmFormat::NV12, size, color);
-			let i420 = crate::frame::I420::from_nv12(&nv12, size.width, size.height).expect("deinterleave NV12");
+			let i420 = crate::frame::I420::from_nv12(&nv12, size).expect("deinterleave NV12");
 			let frame = Frame::new(Surface::I420(i420), Timestamp::ZERO);
 			let mut renderer = Renderer::new(device, queue, config.clone()).expect("a renderer");
 			let texture = renderer.render(&frame).expect("a rendered frame");
@@ -1129,7 +1130,7 @@ mod tests {
 	/// pictures have to agree.
 	///
 	/// Through `decode::backend` rather than `moq_vaapi` directly, so what this
-	/// covers is the path `Config::gpu_frames` actually turns on rather than an
+	/// covers is the path `Output::Native` actually turns on rather than an
 	/// arrangement only the test knows how to build.
 	///
 	/// A gradient rather than the block palette, because this one is checking
@@ -1151,7 +1152,7 @@ mod tests {
 			eprintln!("skipping: no Vulkan adapter with DMA-BUF external memory");
 			return;
 		};
-		let decode = |gpu_frames| {
+		let decode = |output| {
 			backend::open(
 				Codec::H264,
 				&crate::decode::Config {
@@ -1159,16 +1160,16 @@ mod tests {
 					// nothing fails to open, which reads here as absent hardware
 					// and skips the test.
 					kind: crate::decode::Kind::Named(vaapi::NAME.into()),
-					gpu_frames,
+					output,
 					..crate::decode::Config::new()
 				},
 			)
 		};
-		let Ok(mut exporting) = decode(true) else {
+		let Ok(mut exporting) = decode(crate::Output::Native) else {
 			eprintln!("skipping: no VA-API H.264 decoder");
 			return;
 		};
-		let mut downloading = decode(false).expect("a second decoder");
+		let mut downloading = decode(crate::Output::Cpu).expect("a second decoder");
 
 		// A gradient in both axes, so the chroma planes carry structure and a
 		// plane split or stride mistake corrupts the picture rather than
@@ -1188,7 +1189,7 @@ mod tests {
 
 		let mut encoder = crate::encode::Encoder::new(&crate::encode::Config {
 			kind: crate::encode::Kind::Software,
-			..crate::encode::Config::new(width, height, 30)
+			..crate::encode::Config::new(width, height, crate::Rate::new(30, 1).unwrap())
 		})
 		.expect("a software H.264 encoder");
 
@@ -1196,7 +1197,7 @@ mod tests {
 		let mut downloaded = Vec::new();
 		for index in 0..8u64 {
 			if index == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
 			let surface = Surface::rgba(&rgba, size).expect("a valid RGBA frame");
 			let frame = Frame::new(surface, Timestamp::from_micros(index * 33_333).unwrap());
@@ -1218,7 +1219,7 @@ mod tests {
 		assert_eq!(exported.len(), downloaded.len(), "the two decoders disagreed");
 
 		let Surface::DmaBuf(first) = &exported[0].surface else {
-			panic!("gpu_frames did not produce a DMA-BUF surface");
+			panic!("native output did not produce a DMA-BUF surface");
 		};
 		eprintln!(
 			"decoded {} pictures, exported at modifier {:#x}",
@@ -1242,7 +1243,7 @@ mod tests {
 			}
 			assert!(
 				matches!(cpu.surface, Surface::I420(_)),
-				"picture {index} was not downloaded without gpu_frames"
+				"picture {index} was not downloaded under CPU output"
 			);
 
 			// Which branch ran, per picture: the decoder's own surfaces import
@@ -1294,7 +1295,9 @@ mod tests {
 			crate::Surface::PixelBuffer(crate::frame::macos::PixelBuffer::new(uploaded, size.width, size.height));
 		// The transfer session's pool is NV12 and IOSurface-backed, which is what
 		// makes the result importable; a plain upload is neither.
-		planar.resize(size).expect("a transfer into the NV12 pool")
+		planar
+			.resize(size, &crate::resize::Config::default())
+			.expect("a transfer into the NV12 pool")
 	}
 
 	/// Rendering must survive the decoder recycling its buffers underneath us.

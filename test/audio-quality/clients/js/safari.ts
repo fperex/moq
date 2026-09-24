@@ -31,7 +31,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { serve } from "../../../smoke/clients/js/harness.ts";
+import { serve } from "../../../interop/clients/js/harness.ts";
 import { type Beacon, type Environment, type Ring, SAMPLE_INTERVAL_MS, type Sample, type Void } from "./src/schema.ts";
 import { WebDriver } from "./webdriver.ts";
 

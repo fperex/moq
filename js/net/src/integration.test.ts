@@ -91,14 +91,14 @@ async function runPublishSubscribeFlow(protocol: string, version?: number) {
 	const announced = client.announced();
 	const entry = await announced.next();
 	if (!entry) throw new Error("expected entry");
-	expect(entry.path).toBe("test" as Path.Valid);
+	expect(entry.prefix).toBe("test" as Path.Valid);
 	expect(entry.kind).toBe("announced");
 
 	// Scoped discovery only echoes the suffix on the wire, but presents the whole path.
 	const prefixed = client.announced(Path.Pattern.subtree(Path.from("root")));
 	const prefixedEntry = await prefixed.next();
 	if (!prefixedEntry) throw new Error("expected prefixed entry");
-	expect(prefixedEntry.path).toBe("root/child" as Path.Valid);
+	expect(prefixedEntry.prefix).toBe("root/child" as Path.Valid);
 	expect(prefixedEntry.kind).toBe("announced");
 
 	// Client consumes the broadcast and subscribes to a track
@@ -358,11 +358,11 @@ test("integration: lite refuses an empty requested range on open and on update",
 
 test("integration: lite draft-06", async () => {
 	// Exercises announce ids: every active assigns an ordinal on the wire.
-	await runPublishSubscribeFlow(Lite.ALPN_06_WIP);
+	await runPublishSubscribeFlow(Lite.ALPN_06);
 });
 
 test("integration: lite draft-06 announce lifecycle", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
@@ -375,28 +375,28 @@ test("integration: lite draft-06 announce lifecycle", async () => {
 	const announced = client.announced();
 	let entry = await announced.next();
 	if (!entry) throw new Error("expected announce");
-	expect(entry.path).toBe("first" as Path.Valid);
+	expect(entry.prefix).toBe("first" as Path.Valid);
 	expect(entry.kind).toBe("announced");
 
 	// A live announce.
 	const second = publish(origin, Path.from("second"));
 	entry = await announced.next();
 	if (!entry) throw new Error("expected announce");
-	expect(entry.path).toBe("second" as Path.Valid);
+	expect(entry.prefix).toBe("second" as Path.Valid);
 	expect(entry.kind).toBe("announced");
 
 	// Unannounce: retracted by announce id on the wire.
 	second.close();
 	entry = await announced.next();
 	if (!entry) throw new Error("expected unannounce");
-	expect(entry.path).toBe("second" as Path.Valid);
+	expect(entry.prefix).toBe("second" as Path.Valid);
 	expect(entry.kind).toBe("retracted");
 
 	// Re-announce the same path: a fresh announce assigning a fresh id.
 	const secondAgain = publish(origin, Path.from("second"));
 	entry = await announced.next();
 	if (!entry) throw new Error("expected re-announce");
-	expect(entry.path).toBe("second" as Path.Valid);
+	expect(entry.prefix).toBe("second" as Path.Valid);
 	expect(entry.kind).toBe("announced");
 
 	// Cleanup
@@ -636,7 +636,7 @@ class Reset extends Error {
 }
 
 test("integration: a group reset carries the peer's code to the subscriber", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 
 	const [client, server] = await Promise.all([
@@ -676,7 +676,7 @@ test("integration: a group reset carries the peer's code to the subscriber", asy
 });
 
 test("integration: a locally raised group error reaches the peer as its own code", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 
 	const [client, server] = await Promise.all([
@@ -719,7 +719,7 @@ test("integration: a locally raised group error reaches the peer as its own code
 });
 
 test("integration: subscribing to an unserved broadcast is refused as NotFound", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 
 	const [client, server] = await Promise.all([
@@ -1067,7 +1067,7 @@ async function runSubscriberTeardown(protocol: string, version?: number) {
 }
 
 test("integration: lite subscriber teardown on last unsubscribe", async () => {
-	await runSubscriberTeardown(Lite.ALPN_06_WIP);
+	await runSubscriberTeardown(Lite.ALPN_06);
 });
 
 test("integration: ietf subscriber teardown on last unsubscribe", async () => {
@@ -1121,7 +1121,7 @@ test("integration: ietf draft-14 subscriber teardown on last unsubscribe", async
 // A fetched group can stay open indefinitely (a catalog track, a JSON stream), so abandoning the
 // fetch must cancel the FETCH stream rather than wait for a stream end that never comes.
 test("integration: lite fetch teardown when the reader abandons an open group", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
@@ -1161,7 +1161,7 @@ test("integration: lite draft-01 subscriber teardown on last unsubscribe", async
 // Two subscribers to one track dedupe onto a single wire subscription: closing one keeps it alive
 // for the other, and only the last close tears it down.
 test("integration: lite fan-out keeps the upstream until the last subscriber leaves", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
@@ -1198,7 +1198,7 @@ test("integration: lite fan-out keeps the upstream until the last subscriber lea
 // Repeated subscribe/unsubscribe cycles must each tear down and re-open cleanly (the 40-toggle
 // scenario in the issue), never wedging the shared cache or leaking a subscription.
 test("integration: lite re-subscribe re-opens the upstream after each teardown", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
@@ -1229,7 +1229,7 @@ test("integration: lite re-subscribe re-opens the upstream after each teardown",
 // Coalesced fetches of one open group share a single FETCH stream: closing one keeps it flowing
 // for the other, and only the last abandon cancels it.
 test("integration: lite coalesced fetch stays until every reader abandons the open group", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
@@ -1268,7 +1268,7 @@ test("integration: lite coalesced fetch stays until every reader abandons the op
 // A finite group must still deliver every frame and end cleanly (the demand watch must not disturb
 // normal completion), exercising the per-frame loop many times.
 test("integration: lite fetch delivers every frame of a finite multi-frame group", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
@@ -1383,7 +1383,7 @@ async function waitFor<T>(signal: Getter<T>, pred: (value: T) => boolean): Promi
 }
 
 test("integration: an announced request waits for a late publisher", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const clientOrigin = new OriginProducer();
 	const [client, server] = await Promise.all([
@@ -1440,7 +1440,7 @@ test("integration: an announced request waits for a late publisher", async () =>
 });
 
 test("integration: an announced request consumes blind without discovery", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const clientOrigin = new OriginProducer();
 	const [client, server] = await Promise.all([
@@ -1472,7 +1472,7 @@ test("integration: an announced request consumes blind without discovery", async
 });
 
 test("integration: a republish is not served from the previous generation's cache", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const clientOrigin = new OriginProducer();
 	const [client, server] = await Promise.all([
@@ -1584,7 +1584,7 @@ async function runRepublishCycle(protocol: string, version?: number) {
 }
 
 test("integration: lite republish on one session swaps the handle every generation", async () => {
-	await runRepublishCycle(Lite.ALPN_06_WIP);
+	await runRepublishCycle(Lite.ALPN_06);
 });
 
 test("integration: ietf republish on one session swaps the handle every generation", async () => {
@@ -1592,7 +1592,7 @@ test("integration: ietf republish on one session swaps the handle every generati
 });
 
 test("integration: a blind handle picks up a publisher that arrives late", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const clientOrigin = new OriginProducer();
 	const [client, server] = await Promise.all([
@@ -1631,7 +1631,7 @@ test("integration: a blind handle picks up a publisher that arrives late", async
 });
 
 test("integration: a blind handle goes offline when the session dies", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const clientOrigin = new OriginProducer();
 	const [client, server] = await Promise.all([
@@ -1730,7 +1730,7 @@ async function runOriginFlow(protocol: string, version?: number) {
 	// The announcement lands in the client's origin.
 	const reader = clientOrigin.consume();
 	const announced = reader.announced();
-	expect(await announced.next()).toMatchObject({ path: Path.from("test"), kind: "announced" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("test"), kind: "announced" });
 
 	// Consuming through the origin reaches the wire.
 	const remote = await routed(reader, Path.from("test"));
@@ -1740,7 +1740,7 @@ async function runOriginFlow(protocol: string, version?: number) {
 
 	// Unpublishing retracts the entry over the wire and out of the origin.
 	broadcast.close();
-	expect(await announced.next()).toMatchObject({ path: Path.from("test"), kind: "retracted" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("test"), kind: "retracted" });
 	await until(() => !wireOf(reader).routes(Path.from("test")));
 
 	await serving;
@@ -2075,7 +2075,7 @@ test("origin: a standby session re-answers a request when the answerer dies", as
 });
 
 test("create then announce is discoverable on the wire", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 
 	const [client, server] = await Promise.all([
@@ -2090,7 +2090,7 @@ test("create then announce is discoverable on the wire", async () => {
 	const pending = announced.next();
 	broadcast.announce();
 	const entry = await pending;
-	expect(entry?.path).toBe("later" as Path.Valid);
+	expect(entry?.prefix).toBe("later" as Path.Valid);
 	expect(entry?.kind).toBe("announced");
 
 	announced.close();
@@ -2101,7 +2101,7 @@ test("create then announce is discoverable on the wire", async () => {
 });
 
 test("a handle serves a request under live/** over the wire", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	const origin = new OriginProducer();
 	const handle = origin.dynamic(Path.from("live"));
 
@@ -2120,7 +2120,7 @@ test("a handle serves a request under live/** over the wire", async () => {
 
 	const announced = client.announced();
 	const entry = await announced.next();
-	expect(entry?.path).toBe("live" as Path.Valid);
+	expect(entry?.prefix).toBe("live" as Path.Valid);
 	expect(entry?.kind).toBe("announced");
 
 	const remote = wireOf(client).consume(Path.from("live/cam"));

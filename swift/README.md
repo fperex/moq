@@ -16,7 +16,7 @@ The Swift integration ships as two SPM packages, each mirrored to its own repo:
 ## Install
 
 ```swift
-.package(url: "https://github.com/moq-dev/moq-swift", from: "0.4.6"),
+.package(url: "https://github.com/moq-dev/moq-swift", from: "0.5.0"),
 ```
 
 SPM resolves `MoqFFI` (and its prebuilt `MoqFFI.xcframework`, attached to the matching `moq-ffi-v*` GitHub Release) transitively. You only depend on `moq-swift`.
@@ -33,12 +33,14 @@ let session = try await client.connect(to: "https://relay.example.com")
 // origin you wired via setPublish / setConsume before connect, or by a fresh
 // auto-created one. The duplex no-config path (the typical client) shares one
 // origin between both sides.
-let announced = try session.consume.announced(prefix: "demos/")
+let announced = try session.consume.announced(prefix: "demos/", filter: "*/camera")
 for try await announcement in announced {
-    // The returned covered prefix is relative to the requested "demos/" prefix.
+    // Prefix stays origin-relative; captures reports what * matched.
     print("got broadcast \(announcement.prefix)")
+    print("captures \(announcement.captures ?? [])")
 
-    let catalog = try announcement.broadcast.subscribeCatalog()
+    let broadcast = try await session.consume.requestBroadcast(path: announcement.prefix)
+    let catalog = try broadcast.subscribeCatalog()
     for try await update in catalog {
         print("catalog: \(update)")
     }

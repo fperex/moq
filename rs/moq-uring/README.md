@@ -17,7 +17,7 @@ the UDP sockets bound through it.
   (the shape a later `SENDMSG_ZC` needs).
 - **Timers**: a heap the worker sweeps; the earliest deadline rides
   `io_uring_enter` as an absolute timeout. Zero timeout SQEs. The worker's
-  `Handle` implements `moq_net::Timers`.
+  `Handle::run` drives MoQ with the worker clock and a single timer.
 - **Parking**: a futex word per worker. Remote wakes are an atomic store, plus
   one `futex(2)` wake only while the worker is actually parked (a `FUTEX_WAIT`
   SQE armed on the word).
@@ -29,10 +29,10 @@ the UDP sockets bound through it.
 - **WebTransport**: browsers negotiate `h3` and `quic::web::Request` runs the
   HTTP/3 CONNECT handshake (SETTINGS, subprotocol selection, capsule close)
   over the same adapter via `web-transport-proto`. `quic::web::Session` is
-  the one transport type the runtime drives, raw or web (`Session::raw`), so
-  `connect_lite`/`accept_lite` run moq-lite sessions on the worker either
-  way, with stream and close codes mapped through the HTTP/3 error space in
-  web mode.
+  a raw or web transport (`Session::raw`). `connect_lite`/`accept_lite` return
+  the session and its driver; poll the driver or await it inside a
+  `Handle::spawn` task to run it on the worker. Web mode maps stream and close codes through the
+  HTTP/3 error space.
 - **qlog**: `quic::qlog::Sink` points a group of workers at a directory and
   `quic::Transport::qlog` turns capture on. The pinned worker never writes to
   the file: the QUIC stacks want a `Send + Sync` writer, which cannot hold the
@@ -48,10 +48,14 @@ the UDP sockets bound through it.
   thread that spawned the worker, or read the worker's own with
   `Handle::metrics`. `moq-relay` publishes them at `/metrics` on its internal
   listener.
-- **Steering**: an endpoint whose socket sits in a `moq-sock` steered
-  `SO_REUSEPORT` group sets `endpoint::Config::shard`, and every issued
-  connection id leads with the group's steering byte, so the kernel keeps a
-  connection (and a cluster dial's responses) on the worker that owns it.
+- **Identity**: the socket names its worker. `Handle::udp` adopts a lone
+  `UdpSocket` or a member of a completed `moq-sock` steered `SO_REUSEPORT`
+  group (`udp::Bound`), and a `quic::Endpoint` built on it runs its demux and
+  every connection driver on that worker, whichever handle built it. A member
+  brings its slot along, so every issued connection id leads with the group's
+  steering byte and the kernel keeps a connection (and a cluster dial's
+  responses) on the worker that owns it. An endpoint on a dropped worker is
+  refused.
 
 Requires **Linux 6.12**; `Worker::new` refuses older kernels with a legible
 error rather than degrading (note that default container seccomp policies
@@ -60,13 +64,13 @@ the tokio stack.
 
 ## Backends
 
-The `quic` module uses the sans-IO [noq-proto](https://github.com/kixelated/noq)
+The `quic` module uses the sans-IO [moq-noq-proto](https://github.com/moq-dev/noq)
 stack with rustls. The `noq` feature is enabled by default and remains optional
 so the worker, timers, and UDP socket can be built without QUIC.
 
 | Feature | Stack | TLS |
 |---|---|---|
-| `noq` (default) | [noq-proto](https://github.com/kixelated/noq) | rustls |
+| `noq` (default) | [moq-noq-proto](https://github.com/moq-dev/noq) | rustls |
 
 Building without default features leaves the `quic` module out entirely.
 
@@ -88,7 +92,7 @@ handshake, half a megabyte each way, and timers driven by noq's timeout.
 `tests/endpoint.rs` covers the endpoint mechanics (dial+accept on one socket,
 version negotiation, the dial-only refusal), `tests/workers.rs` runs a
 steered two-worker reuseport group serving one port across threads, and
-`tests/web.rs` is WebTransport interop against `web-transport-noq`: stream and
+`tests/web.rs` is WebTransport interop against `web-transport-moq`: stream and
 datagram echo through the H3 framing,
 close codes through the capsule, and a full moq-lite session over
 WebTransport. All of them skip (loudly) below the kernel floor, which

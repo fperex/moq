@@ -54,28 +54,31 @@ fn echo_noq_peer() {
 	let certs = support::certs().expect("certificates");
 
 	let mut server = quic::server::Config::new(quic::Identity::open(&certs.cert, &certs.key).expect("identity"));
-	server.alpn = vec![web_transport_noq::ALPN.to_string()];
+	server.alpn = vec![web_transport_moq::ALPN.to_string()];
 	let socket = handle
 		.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), udp::Config::default())
 		.expect("socket");
 	let endpoint =
-		quic::Endpoint::new(&handle, socket, quic::endpoint::Config::default().with_server(server)).expect("endpoint");
+		quic::Endpoint::new(socket, quic::endpoint::Config::default().with_server(server)).expect("endpoint");
 	let addr = endpoint.local_addr();
 	let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i * 31 % 251) as u8).collect();
 	let expected = payload.clone();
 	let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
 	let client = std::thread::spawn(move || {
+		// Enabling `ring` beside `aws-lc-rs` (as `--all-features` does) leaves rustls no implicit
+		// default, and the builder would panic on this thread while the server waits forever.
+		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_all()
 			.build()
 			.expect("runtime");
 		runtime.block_on(async move {
-			let client = web_transport_noq::ClientBuilder::new()
+			let client = web_transport_moq::ClientBuilder::new()
 				.dangerous()
 				.with_no_certificate_verification()
 				.expect("client");
-			let request = web_transport_noq::proto::ConnectRequest::new(
+			let request = web_transport_moq::proto::ConnectRequest::new(
 				url::Url::parse(&format!("https://{addr}/echo")).expect("url"),
 			);
 			let session = client.connect(request).await.expect("connect");
@@ -91,7 +94,7 @@ fn echo_noq_peer() {
 	worker
 		.block_on(async move {
 			let conn = endpoint.accept().await.expect("accept");
-			let request = quic::web::Request::accept(&handle, conn).await.expect("handshake");
+			let request = quic::web::Request::accept(conn).await.expect("handshake");
 			let mut session = request.ok().await.expect("respond");
 			let (mut send, mut recv) = std::future::poll_fn(|cx| session.poll_accept_bi(cx))
 				.await

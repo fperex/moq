@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.2.22"
+version = "0.3.0"
 edition = "2024"
 rust-version.workspace = true
 
@@ -16,10 +16,6 @@ categories = ["multimedia", "network-programming", "web-programming"]
 ignored = ["getrandom"]
 
 [features]
-# The deterministic runtime::Test, for tests in this crate and downstream ones.
-# A feature rather than cfg(test) because integration tests and other crates'
-# tests compile against the normal library build.
-test-runtime = []
 # Exposes the wire codecs to the `fuzz/` harness through the hidden `fuzz` module.
 # Off by default and hidden from the docs; nothing depends on it but that harness.
 fuzz = []
@@ -41,9 +37,6 @@ web-transport-trait = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-# Enable the test runtime for our own unit and integration tests. A crate may
-# dev-depend on itself to turn features on for its test builds only.
-moq-net = { path = ".", features = ["test-runtime"] }
 serde_json = { workspace = true }
 # test-util (tokio::time::pause/advance) is test-only and is NOT supported on
 # wasm, so it must not leak into the normal dependency feature set.
@@ -73,6 +66,10 @@ path = "examples/fuzz-seeds.rs"
 required-features = ["fuzz"]
 
 [[bench]]
+name = "origin"
+harness = false
+
+[[bench]]
 name = "group"
 harness = false
 
@@ -82,4 +79,8 @@ harness = false
 
 [[bench]]
 name = "priority"
+harness = false
+
+[[bench]]
+name = "stats"
 harness = false

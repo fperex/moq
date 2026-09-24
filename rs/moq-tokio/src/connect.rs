@@ -204,7 +204,7 @@ pub(crate) struct Legacy {
 			"moq-lite-03",
 			"moq-lite-04",
 			"moq-lite-05",
-			"moq-lite-06-wip",
+			"moq-lite-06",
 			"moq-transport-14",
 			"moq-transport-15",
 			"moq-transport-16",
@@ -212,7 +212,8 @@ pub(crate) struct Legacy {
 			"moq-transport-18",
 			"moq-transport-19",
 			"moq-transport-20",
-			"moq-transport-21"
+			"moq-transport-21",
+			"moq-transport-22"
 		),
 		hide = true
 	)]
@@ -592,7 +593,7 @@ pub struct Config {
 			"moq-lite-03",
 			"moq-lite-04",
 			"moq-lite-05",
-			"moq-lite-06-wip",
+			"moq-lite-06",
 			"moq-transport-14",
 			"moq-transport-15",
 			"moq-transport-16",
@@ -600,7 +601,8 @@ pub struct Config {
 			"moq-transport-18",
 			"moq-transport-19",
 			"moq-transport-20",
-			"moq-transport-21"
+			"moq-transport-21",
+			"moq-transport-22"
 		)
 	)]
 	pub version: Vec<moq_net::Version>,

@@ -11,7 +11,7 @@
 //! Kernel-gated: skips loudly below the Linux 6.12 floor (GitHub-hosted CI),
 //! and runs everywhere else.
 
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "noq"))]
 
 #[path = "support.rs"]
 mod support;
@@ -60,7 +60,13 @@ fn a_send_staged_on_the_way_out_still_goes() {
 		.block_on(async {
 			let mut tx = sock.acquire().await.expect("acquire");
 			tx[..3].copy_from_slice(b"bye");
-			tx.send(3, peer_addr, 3).expect("send");
+			tx.send(udp::Transmit {
+				to: peer_addr,
+				len: 3,
+				segment: 3,
+				ecn: None,
+			})
+			.expect("send");
 		})
 		.expect("worker");
 	drop(sock);
@@ -103,7 +109,6 @@ fn a_published_close_has_already_left_the_client() {
 		let handle = worker.handle();
 		let sock = handle.udp(server_sock, udp::Config::default()).expect("server socket");
 		let endpoint = quic::Endpoint::new(
-			&handle,
 			sock,
 			quic::endpoint::Config::default().with_server(server_config(&certs)),
 		)
@@ -123,7 +128,7 @@ fn a_published_close_has_already_left_the_client() {
 			udp::Config::default(),
 		)
 		.expect("client socket");
-	let endpoint = quic::Endpoint::new(&handle, sock, quic::endpoint::Config::default()).expect("client endpoint");
+	let endpoint = quic::Endpoint::new(sock, quic::endpoint::Config::default()).expect("client endpoint");
 
 	client_worker
 		.block_on(async move {

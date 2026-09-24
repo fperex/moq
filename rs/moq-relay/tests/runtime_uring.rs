@@ -160,7 +160,7 @@ async fn uring_workers_serve_webtransport_and_raw_quic() {
 			.await
 			.unwrap_or_else(|_| panic!("subscriber {index} announcement timeout"))
 			.expect("origin closed");
-		assert_eq!(update.path.as_str(), "test");
+		assert_eq!(update.prefix.as_str(), "test");
 		assert!(update.kind.is_active(), "expected announce, got retraction");
 		let broadcast = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test"))
 			.await
@@ -316,7 +316,7 @@ async fn an_mtls_client_authenticates_without_a_token() {
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	assert_eq!(update.path.as_str(), "test");
+	assert_eq!(update.prefix.as_str(), "test");
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 	let announced = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test"))
 		.await
@@ -377,7 +377,7 @@ async fn uring_workers_write_qlog_traces() {
 	// rather than a connection that only ever exchanged Initials.
 	let url: url::Url = format!("moql://127.0.0.1:{port}/qlog").parse().expect("parse url");
 	let origin = moq_tokio::origin::spawn();
-	let mut broadcast = origin.create_broadcast("test").expect("create broadcast");
+	let broadcast = origin.create_broadcast("test").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
 	let track = broadcast.create_track("video", None).expect("create track");
 	let mut group = track.append_group().expect("append group");

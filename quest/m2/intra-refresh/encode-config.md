@@ -9,25 +9,26 @@ with keyframes, a fresh sweep with refresh. In refresh mode the producer opens
 a group at every sweep start and publishes `warmup` as the actual sweep
 duration, which can be shorter than the cycle. Every
 backend that cannot encode refresh mode refuses it when configured, and the
-CLI and transcoder expose the choice. This extends the settled m0 contract
+CLI and transcoder expose the choice. This extends the settled main contract
 without replacing an API after 0.1.
 
 ## Plan
 
-- Extend the non-exhaustive `Gop` contract from m0 with refresh mode. Keep
+- Extend the non-exhaustive `Gop` contract from main with refresh mode. Keep
   the settled frame-count units and `cut()` operation; do not replace the
   public config or rename the operation again. A cut in refresh mode asks
   the backend to restart the sweep, including the producer's forced cut on
   every reopen.
-- `Backend::encode(frame, keyframe)` in `rs/moq-video/src/encode/backend/mod.rs`
-  becomes `encode(frame, cut)`, and each backend gets the mode at construction.
+- `Backend::encode(frame, cut)` in `rs/moq-video/src/encode/backend/mod.rs`
+  keeps its flag, and each backend gets the mode at construction.
   VideoToolbox, openh264, VAAPI, Media Foundation, and MediaCodec return an
   error for `Refresh` (supported or refused, never a silent fallback to
   keyframes). The test-only probe backend accepts it so the producer logic is
   testable without hardware.
-- Group boundaries in refresh mode come from counting: backends report
-  `keyframe = false` for a sweep start, so the producer marks the first frame
-  of each cycle by frame count from the last cut and opens the group there.
+- Group boundaries in refresh mode come from counting: the splitter sees no
+  IDR at a sweep start (only a recovery-point SEI where the backend emits
+  one), so the producer marks the first frame of each cycle by frame count
+  from the last cut and tells the importer to open the group there.
   A backend reports the sweep length it actually configured, which can be
   shorter than the cycle (NVENC needs it strictly shorter), and the producer
   publishes `warmup` as that length over the framerate.
@@ -42,6 +43,4 @@ without replacing an API after 0.1.
 
 ## Required
 
-- [Video GOP](/quest/m0/video-gop.md) - the extensible group contract and cut operation
-
-- [Catalog warmup](/quest/m2/intra-refresh/catalog-warmup.md) - the field the producer publishes
+- [Catalog warmup](/quest/m1/catalog-warmup.md) - the field the producer publishes

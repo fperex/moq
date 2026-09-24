@@ -6,9 +6,14 @@ Settle the public contracts of `moq-archive`, `moq-e2ee`, `moq-sock`,
 `moq-uring`, `moq-audio`, `moq-video`, `moq-transcode`, and `moq-nvenc`
 before the imminent release, while supplying the reusable GPU media support
 needed to remove raw-pixel CPU transfers from the Pronto CARLA demo. These are
-independent immediate tracks rather than mutual prerequisites.
+independent immediate tracks rather than mutual prerequisites. Then cut the
+release moq.pro adopts from the merged tree.
 
 ## Plan
+
+dev landed on main as #3793 on 2026-09-20;
+[Release](/quest/m0/release.md) names what gates the release that follows.
+Published API or wire breaks still land on dev; the quest's Plan says so.
 
 The archive, E2EE, socket, and uring crates are 0.0.1 on main after the dev
 merge. Their six API quests gate the release and target main under the 0.0.x
@@ -41,14 +46,14 @@ Their package boundaries are explicit:
 
 The media crates are also 0.0.x, so their changes target main. Adapt callers in
 other packages without breaking their published APIs, C layouts, or wire
-formats. Do not bump versions as part of these quests. The media review records
-when the four crates are ready for a separately requested 0.1 release.
+formats. Do not bump versions as part of these quests. The media review
+found the four crates ready for a separately requested 0.1 release.
 
 Their package boundaries are explicit:
 
 - `moq-audio` owns the PCM/layout and codec configuration split, decoder entry
-  point, publication authority, FEC removal, AEC attachment, playback outcome,
-  and extensible audio frame and packet construction.
+  point, publication authority, and extensible audio frame and packet
+  construction.
 - `moq-video` owns frame conversion and construction, decoder output policy,
   synchronous codec thread confinement, capture timestamps and rational rates,
   extensible group configuration and `cut` naming, and its feature defaults.
@@ -88,33 +93,11 @@ do not add another media abstraction or a renderer crate during stabilization.
 
 ## Quests
 
-- [E2EE path](/quest/m0/e2ee-path.md) - align the unpublished path derivation and vectors before the core adopts them
-- [E2EE API](/quest/m0/e2ee-api.md) - epoch-scoped ownership replaces raw crypto, catalog helpers, and process-global claims
-- [Socket group](/quest/m0/sock-group.md) - complete formation and retained sockets precede usable serving handles
-- [uring identity](/quest/m0/uring-identity.md) - sockets and connections carry their worker and steering identity
-- [Archive ranges](/quest/m0/archive-ranges.md) - one finite inclusive range convention replaces reversed integer pairs
-- [Archive listing](/quest/m0/archive-listing.md) - one recording-scoped query exposes only supported listing behavior
-- [Vulkan/CUDA surfaces](/quest/m0/video-vulkan-cuda.md) - retain producer slots
-  and synchronize GPU access safely across Vulkan and CUDA
-- [NVENC registration rollback](/quest/m0/nvenc-registration.md) - release resources when mapping fails after registration
-- [GPU conversion and NVENC](/quest/m0/video-gpu-encode.md) - convert, resize and
-  encode imported frames without CPU pixel transfers or fallback
-- [NVENC resources](/quest/m0/nvenc-resources.md) - a small safe facade retains submitted resources through completion
-- [NVENC loading](/quest/m0/nvenc-loading.md) - unavailable or incompatible drivers return errors instead of panicking
-- [Codec threads](/quest/m0/video-thread-ownership.md) - synchronous codec handles cannot escape their owning thread
-- [Media features](/quest/m0/media-features.md) - OpenH264 can be excluded, rendering is opt-in, and feature aliases disappear
-- [Shared rate policy](/quest/m0/media-rate-policy.md) - the planned public namespace move happens before 0.1
-- [Audio configuration](/quest/m0/audio-config.md) - PCM layout, codec settings, and subscription policy have distinct contracts
-- [Audio publication](/quest/m0/audio-publication.md) - callers get demand authority and supported options, not internal transport or resampler machinery
-- [Remove ineffective FEC](/quest/m0/audio-fec.md) - no public flag promises redundancy the encoder never emits
-- [AEC ownership](/quest/m0/audio-aec.md) - one microphone owns an adaptive canceller and controls remain shareable
-- [Playback outcome](/quest/m0/audio-playback.md) - nonblocking writes report accepted and dropped audio
-- [Video output](/quest/m0/video-output.md) - codec output and subscription policy are separate, with native or CPU frames
-- [Video frames](/quest/m0/video-frames.md) - conversions preserve typed pixels and frame records can grow
-- [Video timing](/quest/m0/video-timing.md) - capture time and fractional frame rates survive capture, encoding, and transcode
-- [Video GOP](/quest/m0/video-gop.md) - the group contract is extensible before intra-refresh implementation
-- [Media release review](/quest/m0/media-release-review.md) - verify the settled contracts before separately authorizing 0.1 releases
+- [Release](/quest/m0/release.md) - the release moq.pro adopts: binding docs, an upgrade page, and a staging soak gate it rather than the merge
+- [Binary stats](/quest/m0/stats-binary/README.md) - an allocation-free stats tick and an on-demand FlatBuffers `.fb.z` flavor with a checked-in schema
+- [Audio jitter target](/quest/m0/audio-jitter-target/README.md) - the audio playout target is a measured estimate of arrival timing in both languages, not a round-trip guess
+- [A/V clock](/quest/m0/plan-av-clock.md) - the audio playhead drives Sync.reference while audio plays, through per-track sync handles
 
 ## Related
 
-- [Pronto GPU integration](https://github.com/moq-dev/moq.pro/tree/main/quest/m0/pronto/gpu) - CARLA bridge, release adoption and desktop installation
+- [Pronto GPU integration](https://github.com/moq-dev/moq.pro/tree/main/quest/main/pronto/gpu) - CARLA bridge, release adoption and desktop installation

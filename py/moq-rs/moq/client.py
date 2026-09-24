@@ -125,18 +125,18 @@ class Client:
         self._session = None
 
     def create_broadcast(self, path: str) -> BroadcastProducer:
-        """Create an unadvertised broadcast at ``path``. Announce it after populating tracks.
+        """Create a locally announced broadcast at ``path``. Advertise it to peers after populating tracks.
 
         See :meth:`OriginProducer.create_broadcast`.
         """
         return self._require_publisher().create_broadcast(path)
 
-    def announced(self, prefix: str = "") -> AnnounceConsumer:
-        """Async-iterate broadcasts announced under ``prefix`` (empty matches all).
+    def announced(self, prefix: str = "", *, filter: str | None = None) -> AnnounceConsumer:
+        """Async-iterate broadcasts under ``prefix`` matching an optional pattern.
 
         See :meth:`OriginConsumer.announced`.
         """
-        return self._require_consumer().announced(prefix)
+        return self._require_consumer().announced(prefix, filter=filter)
 
     def announced_broadcast(self, path: str) -> AnnouncedBroadcast:
         """Await announcement of the broadcast at exactly ``path``.

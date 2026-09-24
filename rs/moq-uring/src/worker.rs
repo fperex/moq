@@ -1,7 +1,7 @@
 //! The per-thread worker: ring ownership, the drive loop, and parking.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -478,8 +478,8 @@ impl std::fmt::Debug for Worker {
 /// A worker's cloneable, thread-local handle.
 ///
 /// Everything that is not the drive loop goes through this:
-/// [`spawn`](Self::spawn), [`udp`](Self::udp), and the [`moq_net::Timers`]
-/// impl for deadlines. `!Send`, like everything the worker owns.
+/// [`spawn`](Self::spawn), [`udp`](Self::udp), [`timer`](Self::timer), and
+/// [`run`](Self::run) for MoQ drivers. `!Send`, like everything the worker owns.
 pub struct Handle {
 	shared: Rc<Shared>,
 }
@@ -522,11 +522,72 @@ impl Handle {
 	///
 	/// The caller configures and binds the socket (options, addresses); this
 	/// takes over receive and send. `config` picks the batching mechanisms.
-	pub fn udp(&self, socket: std::net::UdpSocket, config: udp::Config) -> Result<udp::Socket, Error> {
+	///
+	/// The socket is what names this worker from here on: an
+	/// [`Endpoint`](crate::quic::Endpoint) built on it runs its tasks here,
+	/// whichever thread's handle built it. A member of a steered reuseport
+	/// group ([`moq_sock::shard::Socket`]) brings its slot along, so the
+	/// connection ids issued through it steer back to this socket.
+	pub fn udp(&self, socket: impl Into<udp::Bound>, config: udp::Config) -> Result<udp::Socket, Error> {
 		if self.shared.stopped.get() {
 			return Err(Shared::gone_error().into());
 		}
-		udp::Socket::bind(&self.shared, socket, config)
+		udp::Socket::bind(&self.shared, socket.into(), config)
+	}
+}
+
+/// The worker behind a socket, endpoint, or connection, held weakly.
+///
+/// I/O carries its owner so it cannot be driven through a different worker,
+/// but a handle to that I/O must not keep a dropped worker's ring alive, so
+/// this holds no strong reference. Once the worker is gone, spawning is a
+/// no-op (like [`Handle::spawn`]) and timers never fire, which is what the
+/// tasks that would have consumed them expect.
+#[derive(Clone)]
+pub(crate) struct Owner {
+	shared: Weak<Shared>,
+	/// Held directly: a timer on a dropped worker still has to exist, since
+	/// the driver that owns it is torn down by the same drop that would need
+	/// it.
+	timers: Rc<RefCell<timer::Heap>>,
+}
+
+impl Owner {
+	pub(crate) fn new(shared: &Rc<Shared>) -> Self {
+		Self {
+			shared: Rc::downgrade(shared),
+			timers: shared.timers.clone(),
+		}
+	}
+
+	/// The worker's core while it is still allocated, torn down or not.
+	pub fn upgrade(&self) -> Option<Rc<Shared>> {
+		self.shared.upgrade()
+	}
+
+	/// A strong handle, or `None` once the worker is dropped or torn down.
+	pub fn handle(&self) -> Option<Handle> {
+		let shared = self.shared.upgrade()?;
+		(!shared.stopped.get()).then_some(Handle { shared })
+	}
+
+	/// Run a `!Send` future on the worker, or drop it if the worker is gone.
+	pub fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+		if let Some(handle) = self.handle() {
+			handle.spawn(future);
+		}
+	}
+
+	/// A disarmed timer on the worker.
+	pub fn timer(&self) -> crate::Timer {
+		crate::Timer::from_heap(self.timers.clone())
+	}
+
+	/// A timer that expires after `duration`.
+	pub fn after(&self, duration: Duration) -> crate::Timer {
+		let mut timer = self.timer();
+		timer.set(Instant::now().checked_add(duration));
+		timer
 	}
 }
 
@@ -536,29 +597,28 @@ impl std::fmt::Debug for Handle {
 	}
 }
 
-impl moq_net::Timers for Handle {
-	type Timer = crate::Timer;
-
-	fn timer(&self) -> Self::Timer {
-		crate::Timer::new(self.shared.timers.clone())
+impl Handle {
+	/// Allocate a disarmed timer on this worker.
+	pub fn timer(&self) -> crate::Timer {
+		crate::Timer::from_heap(self.shared.timers.clone())
 	}
-}
 
-// Without a QUIC backend there is no transport to name, so the worker is a
-// task and timer runtime only.
-#[cfg(feature = "noq")]
-impl moq_net::Runtime for Handle {
-	type Transport = crate::quic::web::Session;
-
-	fn spawn(&self, machine: moq_net::runtime::Machine<Self>) {
-		// The machine is `!Send` (its transport is), which is exactly what the
-		// worker's local spawn takes. Its result is the session outcome, which
-		// the `Session` handle also observes; here it is just the task ending.
-		self.spawn(async move {
-			if let Err(err) = machine.await {
-				tracing::debug!(%err, "session machine ended");
+	/// Run a MoQ driver with this worker's timer and monotonic clock, resolving
+	/// with its terminal error.
+	pub async fn run<D: moq_net::time::Driver>(&self, mut driver: D) -> moq_net::Error {
+		let mut timer = self.timer();
+		kio::wait(|waiter| {
+			loop {
+				match driver.poll(Instant::now(), waiter) {
+					Ok(at) => timer.set(at),
+					Err(err) => return Poll::Ready(err),
+				}
+				if timer.poll(waiter).is_pending() {
+					return Poll::Pending;
+				}
 			}
-		});
+		})
+		.await
 	}
 }
 
@@ -604,8 +664,8 @@ fn retry_teardown_submit(interruptions: &mut usize, err: std::io::Error) -> std:
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use moq_net::Timers;
-	use moq_net::runtime::Deadline;
+
+	use crate::Timer as Deadline;
 	use std::time::Duration;
 
 	/// Kernel-gated: `None` (with a loud skip) below the 6.12 floor, so these
@@ -683,7 +743,6 @@ mod tests {
 
 	#[test]
 	fn timer_rearm_and_disarm() {
-		use moq_net::runtime::Timer as _;
 		let Some(mut worker) = worker() else { return };
 		let handle = worker.handle();
 		let mut timer = handle.timer();
@@ -732,7 +791,15 @@ mod tests {
 		assert!(handle.udp(bind(), udp::Config::default()).is_err());
 		assert!(matches!(sock.poll_recv(&kio::Waiter::noop()), Poll::Ready(Err(_))));
 		assert!(matches!(sock.poll_acquire(&kio::Waiter::noop()), Poll::Ready(Err(_))));
-		assert!(tx.send(1200, to, 1200).is_err());
+		assert!(
+			tx.send(udp::Transmit {
+				to,
+				len: 1200,
+				segment: 1200,
+				ecn: None,
+			})
+			.is_err()
+		);
 		// And a late spawn is dropped rather than parked forever.
 		handle.spawn(async {});
 		drop(sock);
@@ -870,7 +937,13 @@ mod tests {
 		}
 		assert_eq!(held.len(), usize::from(ceiling));
 		for tx in held.drain(..) {
-			tx.send(1200, to, 1200).expect("send");
+			tx.send(udp::Transmit {
+				to,
+				len: 1200,
+				segment: 1200,
+				ecn: None,
+			})
+			.expect("send");
 		}
 
 		// The point of the test is the overflow, so prove it happened: the
@@ -983,7 +1056,13 @@ mod tests {
 		let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
 			panic!("no tx buffer");
 		};
-		tx.send(64 * 1024, to, 1000).expect("send 66 datagrams");
+		tx.send(udp::Transmit {
+			to,
+			len: 64 * 1024,
+			segment: 1000,
+			ecn: None,
+		})
+		.expect("send 66 datagrams");
 		drop(worker);
 	}
 
@@ -1005,7 +1084,14 @@ mod tests {
 		let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
 			panic!("no tx buffer");
 		};
-		let err = tx.send(64 * 1024, to, 1).expect_err("65536 datagrams from one buffer");
+		let err = tx
+			.send(udp::Transmit {
+				to,
+				len: 64 * 1024,
+				segment: 1,
+				ecn: None,
+			})
+			.expect_err("65536 datagrams from one buffer");
 		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 		drop(worker);
 	}
@@ -1027,7 +1113,12 @@ mod tests {
 		// `UDP_SEGMENT` is a u16: without validation this would truncate to a
 		// one-byte stride instead of one segment.
 		let err = tx
-			.send(60_000, to, usize::from(u16::MAX) + 2)
+			.send(udp::Transmit {
+				to,
+				len: 60_000,
+				segment: usize::from(u16::MAX) + 2,
+				ecn: None,
+			})
 			.expect_err("oversized segment");
 		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 		drop(worker);
@@ -1059,7 +1150,13 @@ mod tests {
 			panic!("no tx buffer");
 		};
 		tx[..4 * 1200].fill(7);
-		tx.send(4 * 1200, to, 1200).expect("send");
+		tx.send(udp::Transmit {
+			to,
+			len: 4 * 1200,
+			segment: 1200,
+			ecn: None,
+		})
+		.expect("send");
 
 		// Drive the worker until the loopback delivers, parking on a timer each
 		// turn so the park and timer counters see traffic too.
@@ -1136,7 +1233,13 @@ mod tests {
 		assert!(sock.poll_acquire(&kio::Waiter::noop()).is_pending());
 		assert!(sock.poll_acquire(&kio::Waiter::noop()).is_pending());
 		assert_eq!(metrics.snapshot().tx_stalls, 1);
-		tx.send(1200, to, 1200).expect("send");
+		tx.send(udp::Transmit {
+			to,
+			len: 1200,
+			segment: 1200,
+			ecn: None,
+		})
+		.expect("send");
 
 		// Hold the received packet: its buffer is the pool, so the re-arm has
 		// nowhere to receive into.
@@ -1175,7 +1278,6 @@ mod tests {
 	/// derived heap depth has to come back to zero.
 	#[test]
 	fn metrics_count_timer_churn() {
-		use moq_net::runtime::Timer as _;
 		let metrics = Metrics::default();
 		let config = Config {
 			metrics: metrics.clone(),

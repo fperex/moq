@@ -203,6 +203,20 @@ export class SharedRingBuffer implements RingReader {
 	#pending = 0;
 	// The depth the ring keeps between flushes, which is the one that says a surplus is real.
 	#floor = new Floor();
+	// What `view` hands back, filled in place: it runs every block on the audio thread, where an
+	// object per call is garbage for its collector.
+	readonly #view: RingView = {
+		buffered: 0,
+		target: 0,
+		chunk: 0,
+		skip: 0,
+		stalled: true,
+		ended: false,
+		unstable: false,
+		converge: true,
+		skipped: 0,
+		generation: 0,
+	};
 
 	// Where the last `commit` left the cursor, or undefined before the first one. Anything past it
 	// is the writer having dropped the oldest samples out from under the reader, which the playout
@@ -547,18 +561,18 @@ export class SharedRingBuffer implements RingReader {
 		// played; until then there is real audio to hand over.
 		const ended = Atomics.load(this.#control, ENDED) === 1 && ((write - read) | 0) <= 0;
 
-		return {
-			buffered: stalled || unstable ? 0 : (write - read) | 0,
-			target,
-			chunk,
-			skip,
-			stalled,
-			ended,
-			unstable,
-			converge: !this.buffered,
-			skipped: jumped + this.#pending,
-			generation: epochOf(state),
-		};
+		const view = this.#view;
+		view.buffered = stalled || unstable ? 0 : (write - read) | 0;
+		view.target = target;
+		view.chunk = chunk;
+		view.skip = skip;
+		view.stalled = stalled;
+		view.ended = ended;
+		view.unstable = unstable;
+		view.converge = !this.buffered;
+		view.skipped = jumped + this.#pending;
+		view.generation = epochOf(state);
+		return view;
 	}
 
 	/**

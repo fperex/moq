@@ -220,12 +220,23 @@ impl Internal {
 	/// resolves), so it drops cleanly into a `select!` as a disabled no-op -
 	/// mirroring how the relay treats other optional services.
 	pub async fn serve(self, app: Router) -> anyhow::Result<()> {
-		let Some(listen) = self.config.listen else {
+		let listener = self.bind()?;
+		self.serve_bound(app, listener).await
+	}
+
+	pub(crate) fn bind(&self) -> anyhow::Result<Option<net::TcpListener>> {
+		self.config
+			.listen
+			.map(|listen| moq_tokio::bind::tcp(listen).context("failed to bind internal listener"))
+			.transpose()
+	}
+
+	pub(crate) async fn serve_bound(self, app: Router, listener: Option<net::TcpListener>) -> anyhow::Result<()> {
+		let Some(listener) = listener else {
 			std::future::pending::<()>().await;
 			return Ok(());
 		};
 
-		let listener = moq_tokio::bind::tcp(listen).context("failed to bind internal listener")?;
 		// No blanket "…server failed" context here: the caller (main.rs) adds
 		// that single top-level layer, matching `Web::serve` / `Cluster::run`.
 		// No accept-time work: the ops router never hands a connection to qmux, so
@@ -911,7 +922,7 @@ mod tests {
 		let update = announced.next().await.unwrap();
 		assert!(update.kind.is_active());
 		let bc = egress
-			.request_broadcast(moq_net::Path::new(update.path.as_str()))
+			.request_broadcast(moq_net::Path::new(update.prefix.as_str()))
 			.await
 			.unwrap();
 		let mut egress_sub = bc.track("video").unwrap().subscribe(None).await.unwrap();

@@ -7,7 +7,8 @@
  * cursor, keeping a little already played audio behind the cursor because a preemptive expand
  * splices onto what has already been heard, and concealment will want the same history.
  *
- * Fixed capacity and no allocation after construction: this runs on the audio thread.
+ * Fixed capacity and no allocation after construction: this runs on the audio thread. That is why
+ * the copies are loops rather than `set(subarray())`, since a view is an allocation too.
  */
 export class Sync {
 	readonly channels: number;
@@ -47,9 +48,11 @@ export class Sync {
 			throw new RangeError(`audio playout: a ${count} frame block does not fit the output buffer`);
 		}
 
+		const at = this.#length;
 		for (let channel = 0; channel < this.channels; channel++) {
 			const src = pcm[Math.min(channel, pcm.length - 1)];
-			this.#samples[channel].set(src.subarray(offset, offset + count), this.#length);
+			const dst = this.#samples[channel];
+			for (let i = 0; i < count; i++) dst[at + i] = src[offset + i];
 		}
 		this.#length += count;
 	}
@@ -58,9 +61,11 @@ export class Sync {
 	pull(out: Float32Array[], offset: number, count: number): void {
 		if (count > this.queued) throw new RangeError("audio playout: pulled more than was queued");
 
+		const from = this.#cursor;
 		for (let channel = 0; channel < out.length; channel++) {
 			const src = this.#samples[Math.min(channel, this.channels - 1)];
-			out[channel].set(src.subarray(this.#cursor, this.#cursor + count), offset);
+			const dst = out[channel];
+			for (let i = 0; i < count; i++) dst[offset + i] = src[from + i];
 		}
 		this.#cursor += count;
 	}
@@ -73,9 +78,11 @@ export class Sync {
 	 */
 	borrow(dst: Float32Array[], count: number): number {
 		const take = Math.min(count, this.#cursor);
+		const from = this.#cursor - take;
 		for (let channel = 0; channel < dst.length; channel++) {
 			const src = this.#samples[Math.min(channel, this.channels - 1)];
-			dst[channel].set(src.subarray(this.#cursor - take, this.#cursor), 0);
+			const out = dst[channel];
+			for (let i = 0; i < take; i++) out[i] = src[from + i];
 		}
 		return take;
 	}

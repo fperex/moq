@@ -131,11 +131,11 @@ function publisher(
 
 // The header is part of the group's lifetime too. If it blocks on flow control, advancing
 // the live edge must reset the stream without waiting for that write to finish.
-test("a blocked group header is reset when the group expires", async () => {
+test.each(["header", "FIN"] as const)("a blocked group %s is reset when the group expires", async (phase) => {
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 
 	let started!: () => void;
-	const headerStarted = new Promise<void>((resolve) => {
+	const operationStarted = new Promise<void>((resolve) => {
 		started = resolve;
 	});
 	let release!: () => void;
@@ -146,15 +146,20 @@ test("a blocked group header is reset when the group expires", async () => {
 	const streamReset = new Promise<void>((resolve) => {
 		reset = resolve;
 	});
-	const closed = new Promise<void>(() => {});
+	const closed = phase === "FIN" ? blocked : new Promise<void>(() => {});
 	const writable = {
 		getWriter: () => ({
 			closed,
 			write: async () => {
+				if (phase !== "header") return;
 				started();
 				await blocked;
 			},
-			close: async () => {},
+			close: async () => {
+				if (phase !== "FIN") return;
+				started();
+				await blocked;
+			},
 			abort: async () => {
 				reset();
 			},
@@ -185,7 +190,7 @@ test("a blocked group header is reset when the group expires", async () => {
 		old.writeFrame({ payload: new TextEncoder().encode("old"), timestamp: Timestamp.fromMillis(0) });
 		old.close();
 		track.writeGroup(old);
-		await headerStarted;
+		await operationStarted;
 
 		const edge = new GroupProducer(1);
 		edge.writeFrame({ payload: new TextEncoder().encode("edge"), timestamp: Timestamp.fromMillis(10_000) });
@@ -759,6 +764,7 @@ const ALPNS: Record<IetfVersion, string> = {
 	[Version.DRAFT_19]: ALPN.DRAFT_19,
 	[Version.DRAFT_20]: ALPN.DRAFT_20,
 	[Version.DRAFT_21]: ALPN.DRAFT_21,
+	[Version.DRAFT_22]: ALPN.DRAFT_22,
 };
 
 /**

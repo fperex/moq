@@ -24,7 +24,7 @@ The reference implementation. Every crate is on
 | [moq-room](/lib/rs/moq-room) | Headless rooms: announce-derived roster, token claims, and a chat track. |
 | [moq-json](/lib/rs/moq-json) | JSON over tracks: snapshots with merge-patch deltas, or append logs. |
 | [moq-binary](/lib/rs/moq-binary) | Opaque payloads over tracks: snapshots or append logs. |
-| [moq-e2ee](https://docs.rs/moq-e2ee) | End-to-end encryption of groups, datagrams, catalogs, and track names. |
+| [moq-e2ee](https://docs.rs/moq-e2ee) | End-to-end encryption of groups, datagrams, and track names, scoped to a publisher epoch. |
 | [moq-flate](https://docs.rs/moq-flate) | Group-scoped DEFLATE for any track. |
 | [moq-loc](https://docs.rs/moq-loc), [moq-msf](https://docs.rs/moq-msf) | The IETF LOC container and MSF catalog. |
 | [moq-stats](https://docs.rs/moq-stats) | Publish and consume relay traffic counters as tracks. |
@@ -52,7 +52,7 @@ let consumer = origin.consume();
 let mut announced = consumer.announced();
 while let Some(update) = announced.next().await {
     if !update.kind.is_active() { continue }
-    let broadcast = consumer.request_broadcast(&update.path).await?;
+    let broadcast = consumer.request_broadcast(&update.prefix).await?;
     let catalog = broadcast
         .track(hang::Catalog::DEFAULT_NAME)?
         .subscribe(hang::Catalog::default_subscription())

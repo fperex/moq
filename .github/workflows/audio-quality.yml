@@ -1,0 +1,158 @@
+name: Audio quality
+
+# The audio quality harness on demand, and its replay lane on the pull requests
+# that can move it. See test/audio-quality/README.md.
+#
+# The two lanes gate differently because they measure differently. The replay
+# lane drives the recorded arrival traces through the real estimator, rings and
+# playout engine on a simulated clock: seconds, no browser, and the same numbers
+# on every run, so its budgets are exact and a breach is always the change under
+# review. The Chromium matrix is half an hour of real-time playback whose every
+# number moves with the runner's load, which is why nightly.yml owns it; the
+# `workflow_dispatch` button runs the same job for a branch that wants its
+# answer before tomorrow.
+#
+# The filter is the code the replay lane runs, the player (js/watch) and the
+# estimator it replays through (js/hang), plus the harness with its budgets and
+# the native twin of both (rs/moq-audio), which shares their corpus and changes
+# in step with them.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    # `closed` is here only so merging/closing a PR cancels its in-flight run
+    # via the concurrency group below; the job itself is skipped on close.
+    types: [opened, synchronize, reopened, closed]
+    paths:
+      - "js/watch/**"
+      - "js/hang/**"
+      - "rs/moq-audio/**"
+      - "test/audio-quality/**"
+      - ".github/workflows/audio-quality.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: audio-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    name: Audio quality (replay)
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    # The runner the nightly grades this lane on, so a budget that holds there
+    # holds here.
+    runs-on: ubuntu-latest
+    # Seconds of replay; the rest is the dev shell.
+    timeout-minutes: 30
+
+    env:
+      # Somewhere `upload-artifact` can reach. The harness's default is under
+      # $TMPDIR, which is outside the workspace.
+      MOQ_TEST_RUNS: ${{ github.workspace }}/test-runs
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
+        with:
+          tool-cache: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
+        with:
+          determinate: false
+          # Trust the flake's cachix substituter, so the dev shell substitutes
+          # instead of building from source. See check.yml for the full story.
+          extra-conf: |
+            extra-substituters = https://kixelated.cachix.org
+            extra-trusted-public-keys = kixelated.cachix.org-1:CmFcV0lyM6KuVM2m9mih0q4SrAa0XyCsiM7GHrz3KKk=
+
+      # No Rust cache and no browser: the replay lane runs under bun alone.
+      - name: Audio quality (replay)
+        run: nix develop --command just test audio-quality --runtime replay --enforce
+        shell: bash -leo pipefail {0}
+
+      # The per-row summaries and the grade, which is the whole diagnosis of a
+      # replay breach.
+      - name: Keep the failing run
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: audio-quality-replay-run
+          path: test-runs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The nightly job, on demand: the replay lane, then the Chromium matrix over
+  # the seeded UDP shaper, graded against `test/audio-quality/budgets.json`.
+  # Keep the two in step.
+  matrix:
+    name: Audio quality
+    if: github.event_name == 'workflow_dispatch'
+    # x64 for Playwright's Chromium, as in nightly.yml.
+    runs-on: ubuntu-latest
+    # Two dozen rows at a minute each is about half an hour on its own, and the
+    # relay, the CLI, and the shaper build from source ahead of them.
+    timeout-minutes: 90
+
+    env:
+      # Somewhere `upload-artifact` can reach. The harness's default is under
+      # $TMPDIR, which is outside the workspace.
+      MOQ_TEST_RUNS: ${{ github.workspace }}/test-runs
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
+        with:
+          tool-cache: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
+        with:
+          determinate: false
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-on-failure: true
+
+      # Playwright's Chromium isn't in the nix devShell. Install it plus its apt
+      # runtime libs (`--with-deps` needs the host package manager); run.sh's own
+      # `playwright install` then no-ops.
+      - name: Playwright Chromium
+        run: nix develop --command bash -c "bun install --frozen-lockfile && bunx playwright install --with-deps chromium"
+        shell: bash -leo pipefail {0}
+
+      # Seconds, and no browser or relay involved, so it runs ahead of the matrix
+      # and a regression in the ring or the estimator is reported without waiting
+      # half an hour for the rows that need Chromium.
+      - name: Audio quality (replay)
+        run: nix develop --command just test audio-quality --runtime replay --enforce
+        shell: bash -leo pipefail {0}
+
+      - name: Audio quality
+        run: nix develop --command just test audio-quality --enforce
+        shell: bash -leo pipefail {0}
+
+      # The run directory is the whole diagnosis: each process's log, the
+      # shaper's counters, the raw ndjson, the per-row summaries, and a
+      # Playwright trace of any page that failed. The harness keeps it on a
+      # failure without being asked. Short retention because it is large and
+      # only useful while the failure is fresh.
+      - name: Keep the failing run
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: audio-quality-run
+          path: test-runs/
+          retention-days: 7
+          if-no-files-found: ignore

@@ -1,3 +1,4 @@
+import { Time } from "@moq/net";
 import { Stretcher } from "./playout";
 import type { Message, State } from "./render";
 import { AudioRingBuffer } from "./ring-buffer";
@@ -20,6 +21,9 @@ class Render extends AudioWorkletProcessor {
 	#timeline = 0;
 	// Whether the previous quantum ended short, so the next one fades back in.
 	#short = false;
+	// The state message, refilled for every post: `postMessage` copies it on the way out, so one
+	// object serves, rather than a fresh one for this thread's collector every few quanta.
+	#state?: State;
 
 	constructor() {
 		super();
@@ -113,13 +117,18 @@ class Render extends AudioWorkletProcessor {
 			this.#stateCounter++;
 			if (this.#stateCounter >= 5) {
 				this.#stateCounter = 0;
-				const state: State = {
-					type: "state",
-					timeline: this.#timeline,
-					playhead: backend.playhead,
-					debug: backend.debug(),
-				};
-				this.port.postMessage(state);
+				const contextTime = Time.Second((currentFrame + output[0].length) / sampleRate);
+				const playhead = backend.playhead;
+				const debug = backend.debug();
+				if (this.#state === undefined) {
+					this.#state = { type: "state", contextTime, timeline: this.#timeline, playhead, debug };
+				} else {
+					this.#state.contextTime = contextTime;
+					this.#state.timeline = this.#timeline;
+					this.#state.playhead = playhead;
+					this.#state.debug = debug;
+				}
+				this.port.postMessage(this.#state);
 			}
 		}
 

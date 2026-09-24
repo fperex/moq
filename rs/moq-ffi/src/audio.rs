@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::bandwidth::{MoqBandwidth, MoqReservation};
 use crate::consumer::MoqBroadcastConsumer;
+use crate::demand::MoqTrackDemand;
 use crate::error::MoqError;
 use crate::ffi::Task;
 use crate::producer::MoqBroadcastProducer;
@@ -175,10 +176,10 @@ pub struct MoqAudioProducer {
 }
 
 impl MoqAudioProducer {
-	fn demand(&self) -> Result<moq_net::track::Demand, MoqError> {
+	fn track_demand(&self) -> Result<moq_net::track::Demand, MoqError> {
 		let guard = self.inner.lock().unwrap();
 		let producer = guard.as_ref().ok_or(MoqError::Closed)?;
-		Ok(producer.track().demand())
+		Ok(producer.demand())
 	}
 }
 
@@ -187,18 +188,27 @@ impl MoqAudioProducer {
 	/// Return the name of this audio track.
 	pub fn name(&self) -> Result<String, MoqError> {
 		let _guard = crate::ffi::enter();
-		Ok(self.demand()?.name().to_string())
+		Ok(self.track_demand()?.name().to_string())
+	}
+
+	/// A watch-only handle to whether this audio track has subscribers.
+	pub fn demand(&self) -> Result<Arc<MoqTrackDemand>, MoqError> {
+		Ok(MoqTrackDemand::new(self.track_demand()?))
 	}
 
 	/// Wait until this audio track has at least one active consumer.
+	///
+	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn used(&self) -> Result<(), MoqError> {
-		let demand = self.demand()?;
+		let demand = self.track_demand()?;
 		crate::ffi::detached(async move { demand.used().await }).await
 	}
 
 	/// Wait until this audio track has no active consumers.
+	///
+	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn unused(&self) -> Result<(), MoqError> {
-		let demand = self.demand()?;
+		let demand = self.track_demand()?;
 		crate::ffi::detached(async move { demand.unused().await }).await
 	}
 
@@ -259,20 +269,23 @@ impl MoqBroadcastProducer {
 	) -> Result<Arc<MoqAudioProducer>, MoqError> {
 		let _guard = crate::ffi::runtime().enter();
 
-		let input = moq_audio::encode::Input {
-			format: input.format.into(),
-			sample_rate: input.sample_rate,
-			channels: input.channels,
-		};
+		let format = input.format.into();
+		let layout = moq_audio::Layout::from_channels(input.channels)?;
+		let mut input = moq_audio::encode::Input::new(input.sample_rate, layout);
+		input.format = format;
 		// The binding surface takes an explicit track name, so pin it here rather
 		// than letting the codec derive one.
 		let mut options = moq_audio::encode::Options::default();
 		options.track = Some(name);
-		options.codec = output.codec.codec();
-		options.sample_rate = output.sample_rate;
-		options.channels = output.channels;
-		options.bitrate = output.bitrate.map(|bps| moq_net::bandwidth::Rate::from_bps(bps.into()));
-		options.frame_duration = Duration::from_micros(output.frame_duration_us.into());
+		options.settings = moq_audio::encode::Settings::from_input(output.codec.codec(), &input);
+		if let Some(sample_rate) = output.sample_rate {
+			options.settings.sample_rate = sample_rate;
+		}
+		if let Some(channels) = output.channels {
+			options.settings.layout = moq_audio::Layout::from_channels(channels)?;
+		}
+		options.settings.bitrate = output.bitrate.map(|bps| moq_net::bandwidth::Rate::from_bps(bps.into()));
+		options.settings.frame_duration = Duration::from_micros(output.frame_duration_us.into());
 		if let Some(bandwidth) = &bandwidth {
 			options.bandwidth = bandwidth.allocator().clone();
 		}
@@ -287,7 +300,7 @@ impl MoqBroadcastProducer {
 		// means the Rust producer will reserve and follow whenever it starts to.
 		let reservation = bandwidth
 			.as_ref()
-			.map(|bandwidth| bandwidth.reserve_demand(&producer.track().demand(), producer.bitrate().as_bps()));
+			.map(|bandwidth| bandwidth.reserve_demand(&producer.demand(), producer.bitrate().as_bps()));
 
 		Ok(Arc::new(MoqAudioProducer {
 			inner: std::sync::Mutex::new(Some(producer)),
@@ -371,10 +384,10 @@ impl MoqBroadcastConsumer {
 		let cfg = audio_config(catalog_audio)?;
 		let broadcast = self.resolve_inner(reference.as_deref()).await?;
 
-		let mut config = moq_audio::decode::Config::default();
-		config.format = output.format.into();
-		config.sample_rate = output.sample_rate;
-		config.channels = output.channels;
+		let mut config = moq_audio::decode::Options::default();
+		config.output.format = output.format.into();
+		config.output.sample_rate = output.sample_rate;
+		config.output.layout = output.channels.map(moq_audio::Layout::from_channels).transpose()?;
 		config.max_age = output.max_age_us.map(Duration::from_micros).unwrap_or_default();
 
 		let consumer = moq_audio::decode::Consumer::new(&broadcast, &cfg, name, config).await?;
@@ -433,7 +446,7 @@ mod tests {
 	#[test]
 	fn default_frame_duration_matches_moq_audio() {
 		assert_eq!(
-			moq_audio::encode::Options::default().frame_duration,
+			moq_audio::encode::Options::default().settings.frame_duration,
 			Duration::from_micros(20_000),
 			"update #[uniffi(default)] on MoqAudioEncoderOutput::frame_duration_us"
 		);

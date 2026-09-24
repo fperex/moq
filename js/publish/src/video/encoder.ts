@@ -151,6 +151,8 @@ export class Encoder {
 
 	#signals = new Effect();
 	#stalled = new Catalog.Stalled.Detector();
+	// A reconfiguration can shorten frames, but the stream's advertised bound cannot shrink.
+	#jitter: Catalog.VideoConfig["jitter"];
 	#firstCaptured?: Time.Micro;
 	#lastCaptured?: Time.Micro;
 	#lastAccepted?: Time.Micro;
@@ -238,9 +240,10 @@ export class Encoder {
 		this.#lastCaptureWall = performance.now();
 
 		const producer = new Container.Legacy.Producer(track, new Container.Legacy.Format("video"));
-		// The broadcast owns this static track across demand gaps. End only the current
-		// group when demand disappears so a later subscriber can resume on the same track.
-		// A fatal encoder error still aborts the track through producer.close(err) below.
+		// The broadcast owns this static track across demand gaps. When demand disappears, cut the
+		// current group, marking the break so a later subscriber resumes on the same track without
+		// the pre-gap group reading as live. A fatal encoder error still aborts the track through
+		// producer.close(err) below.
 		effect.cleanup(() => {
 			if (track.closed.peek() === undefined) producer.cut();
 		});
@@ -423,6 +426,9 @@ export class Encoder {
 			effect.set(this.#out.catalog, undefined);
 			return;
 		}
+		if (config.framerate) {
+			this.#jitter = Catalog.u53(Math.max(this.#jitter ?? 0, Math.ceil(1000 / config.framerate)));
+		}
 
 		const catalog: Catalog.VideoConfig = {
 			codec: config.codec,
@@ -432,8 +438,8 @@ export class Encoder {
 			codedHeight: Catalog.u53(config.height),
 			optimizeForLatency: true,
 			container: { kind: "legacy" } as const,
-			// Each frame is flushed immediately, so the jitter is one frame duration.
-			jitter: config.framerate ? Catalog.u53(Math.ceil(1000 / config.framerate)) : undefined,
+			// Each frame is flushed immediately; retain the longest advertised frame duration.
+			jitter: this.#jitter,
 			stalled: this.#stalled.flag(),
 		};
 

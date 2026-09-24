@@ -64,6 +64,14 @@ discarding the old mux buffer. The first new clock packet signals the break and
 stdout pacing re-anchors. Every rendition joins the new program generation;
 no track is fenced across the marker.
 
+A constant-rate MPEG-TS source records its multiplex rate in the catalog
+(`mpegts.muxRate`, measured off the PCR clock, null stuffing included), and
+`export ts` pads its output with null packets back to that rate so an IRD or
+groomer receives a constant-rate stream. `--mux-rate 5000000` pads to an explicit
+rate instead, including for a broadcast that recorded none. Media is never delayed
+or dropped to fit: a source that sustains more than the rate overruns it, and a
+VBR source records nothing, so export without either stays unpadded.
+
 fMP4 export writes one fragment per publisher group on each track. Audio follows
 the publisher's cuts; video normally follows GOPs. Closing a group flushes it
 even when the live publisher pauses. `--fragment-duration 2s` caps
@@ -101,9 +109,10 @@ owns the clock, video follows the audio playhead instead.
 Each role follows the catalog for as long as it lasts. Each decoder starts at
 the newest cached group, including when a rendition is reopened, so playback
 does not replay the retained backlog. A publisher that retires the rendition
-being played ends that track and the role picks a replacement. Playback is
-behind the `play` feature, since it pulls in windowing and audio-device
-dependencies:
+being played ends that track and the role picks a replacement. A retired audio
+rendition plays out everything it buffered; the last of it, still in the
+speaker, overlaps its replacement filling up. Playback is behind the `play`
+feature, since it pulls in windowing and audio-device dependencies:
 
 ```bash
 cargo install moq-cli --no-default-features --features "iroh,noq,websocket,play"
@@ -124,8 +133,8 @@ M2M) with a built-in H.264 software fallback;
 audio is Opus. The camera is opened only while someone is watching, and
 `--bitrate` is the opening ceiling. Backends with live bitrate control lower it
 to fit the connection's bandwidth estimate. `moq devices` prints every source
-id. Requires the `capture` feature; on Linux that needs libclang, V4L2, and
-ALSA headers, and `--display` also needs the `pipewire` feature (links
+id. Requires the `capture` feature; on Linux that needs the ALSA headers for
+the microphone, and `--display` also needs the `pipewire` feature (links
 libpipewire).
 
 ## Transcode
@@ -137,8 +146,9 @@ moq ... transcode --rung 720:2500000 --rung 360:600000 --encoder nvenc --decoder
 
 Publishes `cam.hang/transcode.hang` whose catalog references the source's
 rendition and adds lower rungs that are decoded and encoded only while someone
-watches them. On NVIDIA the whole pipeline stays on the GPU. Requires the
-`transcode` feature.
+watches them. On NVIDIA the whole pipeline stays on the GPU; `--frames cpu`
+forces decoded frames into CPU memory instead of the default `native`.
+Requires the `transcode` feature.
 
 The ladder is sized against the source picture and follows it, so a source that
 changes resolution mid-stream (a window capture renegotiated by a resize, a

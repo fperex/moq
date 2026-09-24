@@ -15,7 +15,7 @@ use moq_tokio::moq_net;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The newest moq-lite ALPN both sides should converge on. Derived from
-/// `moq_net::ALPNS` so a future bump (e.g. lite-05 promoted out of WIP)
+/// `moq_net::ALPNS` so a future version bump
 /// doesn't break this test independently of the production negotiation.
 /// We filter on the `moq-lite-` prefix specifically; the relay smoke test
 /// is asserting lite behavior, not IETF moqt drafts.
@@ -210,7 +210,7 @@ async fn relay_websocket_round_trip_uses_newest_version() {
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	let path = moq_net::Path::new(update.path.as_str()).to_owned();
+	let path = moq_net::Path::new(update.prefix.as_str()).to_owned();
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 	// Auth root for `/smoke` is "smoke"; the broadcast "test" announces underneath.
 	assert_eq!(path.as_str(), "test");
@@ -401,7 +401,7 @@ async fn relay_websocket_root_path_upgrades() {
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	let path = moq_net::Path::new(update.path.as_str()).to_owned();
+	let path = moq_net::Path::new(update.prefix.as_str()).to_owned();
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 	assert_eq!(path.as_str(), "test");
 	let bc = sub_consumer
@@ -490,7 +490,7 @@ async fn two_publish_only_clients_coexist() {
 			.expect("announcement timeout")
 			.expect("origin closed");
 		if update.kind.is_active() {
-			seen.insert(update.path.as_str().to_owned());
+			seen.insert(update.prefix.as_str().to_owned());
 		}
 	}
 	assert!(
@@ -632,7 +632,7 @@ async fn internal_tcp_round_trip() {
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	let path = moq_net::Path::new(update.path.as_str()).to_owned();
+	let path = moq_net::Path::new(update.prefix.as_str()).to_owned();
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 	assert_eq!(path.as_str(), "test");
 	let bc = sub_consumer
@@ -746,7 +746,7 @@ async fn internal_unix_round_trip() {
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	assert_eq!(update.path.as_str(), "test");
+	assert_eq!(update.prefix.as_str(), "test");
 	assert!(update.kind.is_active(), "expected announce, got retraction");
 	let bc = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast("test"))
 		.await
@@ -776,13 +776,13 @@ async fn internal_unix_round_trip() {
 	handle.abort();
 }
 
-/// Every version whose SETUP carries a request path the server reads: moq-lite-05
+/// Every version whose SETUP carries a request path the server reads: moq-lite-05/06
 /// (Setup Stream) and moq-transport 14-18 (the `Path` SETUP parameter, in-band on
-/// the bidi stream for 14-16 and the uni Setup Stream for 17-18). lite-06-wip shares
-/// lite-05's SETUP path handling but is opt-in only, so it isn't exercised here.
+/// the bidi stream for 14-16 and the uni Setup Stream for 17-18).
 fn path_versions() -> Vec<moq_net::Version> {
 	[
 		"moq-lite-05",
+		"moq-lite-06",
 		"moq-transport-14",
 		"moq-transport-15",
 		"moq-transport-16",
@@ -829,7 +829,7 @@ async fn path_round_trip(version: moq_net::Version, pub_url: url::Url, sub_url: 
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
-	let path = moq_net::Path::new(update.path.as_str()).to_owned();
+	let path = moq_net::Path::new(update.prefix.as_str()).to_owned();
 
 	drop(track);
 	drop(bc);

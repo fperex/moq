@@ -1,7 +1,7 @@
 import * as announce from "../announced.ts";
 import * as broadcast from "../broadcast.ts";
 import { BroadcastCache } from "../consume.ts";
-import { error, ProtocolViolation, reason } from "../error.ts";
+import { controlTimeout, error, ProtocolViolation, reason } from "../error.ts";
 import * as netGroup from "../group.ts";
 import { Cost, type Route, routesEqual, UNKNOWN_HOP } from "../hop.ts";
 import { scopeCaptures, scopeHead, scopeOverlaps } from "../internal.ts";
@@ -9,7 +9,7 @@ import * as Path from "../path.ts";
 import type { Reader, Stream } from "../stream.ts";
 import { type Timescale, Timestamp } from "../time.ts";
 import type * as track from "../track.ts";
-import { withTimeout } from "../util/timeout.ts";
+import { TimeoutError, withTimeout } from "../util/timeout.ts";
 import { overrideBroadcastWire, wireOf } from "../wire.ts";
 import type { Session } from "./adapter.ts";
 import { DuplicateTrackAlias, RetiredTrackAlias, TrackAliases } from "./aliases.ts";
@@ -162,7 +162,7 @@ export class Subscriber {
 		for (const [active, info] of this.#announced) {
 			if (!scopeOverlaps(scope, active)) continue;
 			announced.append({
-				path: active,
+				prefix: active,
 				captures: scopeCaptures(scope, active),
 				kind: "announced",
 				route: info.route,
@@ -193,7 +193,7 @@ export class Subscriber {
 		console.debug(`announced: broadcast=${path} active=true`);
 		for (const [consumer, scope] of this.#announcedConsumers) {
 			if (!scopeOverlaps(scope, path)) continue;
-			consumer.append({ path, captures: scopeCaptures(scope, path), kind: "announced", route });
+			consumer.append({ prefix: path, captures: scopeCaptures(scope, path), kind: "announced", route });
 		}
 	}
 
@@ -209,7 +209,7 @@ export class Subscriber {
 		console.debug(`announced: broadcast=${path} rerouted`);
 		for (const [consumer, scope] of this.#announcedConsumers) {
 			if (!scopeOverlaps(scope, path)) continue;
-			consumer.append({ path, captures: scopeCaptures(scope, path), kind: "updated", route });
+			consumer.append({ prefix: path, captures: scopeCaptures(scope, path), kind: "updated", route });
 		}
 	}
 
@@ -235,7 +235,7 @@ export class Subscriber {
 			if (!scopeOverlaps(scope, path)) continue;
 			try {
 				consumer.append({
-					path,
+					prefix: path,
 					captures: scopeCaptures(scope, path),
 					kind: "retracted",
 					route: existing.route,
@@ -488,7 +488,8 @@ export class Subscriber {
 			trackAlias = result.alias;
 			console.debug(`subscribe ok: id=${requestId} broadcast=${broadcast} track=${request.name}`);
 		} catch (err) {
-			const e = error(err);
+			// A control request that timed out is not late content, so it carries its own code.
+			const e = err instanceof TimeoutError ? controlTimeout(err) : error(err);
 			producer.close(e);
 			console.warn(
 				`subscribe error: id=${requestId} broadcast=${broadcast} track=${request.name} error=${reason(e)}`,

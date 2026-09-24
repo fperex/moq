@@ -72,7 +72,7 @@ const CONSTANTS: Corpus["constants"] = {
 	bucket_ms: Jitter.BUCKET,
 	buckets: 100,
 	quantile: 0.95,
-	forget: 0.983,
+	forget: 0.9,
 	start_forget_weight: 2,
 	resample_ms: 500,
 	window_ms: 2000,

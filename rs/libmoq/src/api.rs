@@ -682,9 +682,16 @@ unsafe fn parse_route(route: *const moq_route) -> Result<moq_net::origin::Route,
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct moq_announce_update {
-	/// The covered prefix, relative to the requested announcements prefix, NOT NULL terminated
+	/// The covered prefix, relative to the origin, NOT NULL terminated
 	pub prefix: *const c_char,
 	pub prefix_len: usize,
+
+	/// What each requested filter wildcard matched. Each string is NOT NULL terminated.
+	/// Meaningful only when `has_captures` is true; false means the route overlaps
+	/// the filter without pinning every wildcard.
+	pub captures: *const moq_string,
+	pub captures_len: usize,
+	pub has_captures: bool,
 
 	/// Whether the route is active or was retracted
 	/// This MUST toggle between true and false over the lifetime of the route
@@ -867,9 +874,6 @@ static VERSION_NAMES: std::sync::LazyLock<Vec<String>> =
 /// first. Each name borrows a static string valid for the life of the process, so a
 /// caller building a menu can hold them indefinitely.
 ///
-/// Work-in-progress versions are omitted, since they are not advertised unless pinned;
-/// a dial still accepts them by name.
-///
 /// Returns the total count on success, or a negative code on failure.
 ///
 /// # Safety
@@ -923,7 +927,7 @@ fn micros(duration: std::time::Duration) -> u64 {
 pub struct moq_client_config {
 	/// Protocol versions to offer during the handshake, most preferred first.
 	/// NULL/0 offers everything this build supports. Names are spelled the way
-	/// the CLI spells them (`moq-lite-05`, `moq-transport-21`); [moq_versions]
+	/// the CLI spells them (`moq-lite-05`, `moq-transport-22`); [moq_versions]
 	/// lists what is on offer.
 	pub versions: *const moq_string,
 	pub versions_len: usize,
@@ -1270,8 +1274,8 @@ pub extern "C" fn moq_origin_create() -> i32 {
 
 /// Create a broadcast at `path` on an origin, for publishing media tracks.
 ///
-/// The broadcast starts unadvertised: reachable by exact path, but not visible
-/// to announcement streams. Fill it with the `moq_publish_*` functions, then
+/// The broadcast appears on this origin's local announcement streams immediately.
+/// Fill it with the `moq_publish_*` functions, then advertise it to peers with
 /// [moq_publish_announce] after populating. [moq_publish_finish] unpublishes
 /// immediately.
 ///
@@ -1418,7 +1422,11 @@ pub extern "C" fn moq_broadcast_request_free(request: u32) -> i32 {
 	})
 }
 
-/// Learn about all broadcasts published to an origin.
+/// Learn about broadcasts matching a pattern scope under an origin.
+///
+/// `prefix` is a literal path root. `filter` is a pattern relative to that
+/// prefix, or NULL for every path beneath it. Empty is a valid exact filter.
+/// Delivered [moq_announce_update] prefixes remain relative to the origin.
 ///
 /// `on_announce` is invoked with a positive announced ID for each broadcast,
 /// then exactly once more with a terminal code: `0` (stopped cleanly) or a
@@ -1437,21 +1445,31 @@ pub extern "C" fn moq_broadcast_request_free(request: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moq_origin_announced(
 	origin: u32,
+	prefix: *const c_char,
+	prefix_len: usize,
+	filter: *const c_char,
+	filter_len: usize,
 	on_announce: ffi::moq_status_callback,
 	user_data: *mut c_void,
 ) -> i32 {
 	ffi::enter(move || {
 		let origin = ffi::parse_id(origin)?;
+		let prefix = unsafe { ffi::parse_str(prefix, prefix_len)? }.to_string();
+		let filter = if filter.is_null() {
+			None
+		} else {
+			Some(unsafe { ffi::parse_str(filter, filter_len)? }.to_string())
+		};
 		let on_announce = unsafe { ffi::OnStatus::new(user_data, on_announce)? };
-		State::lock().origin.announced(origin, on_announce)
+		State::lock().origin.announced(origin, prefix, filter, on_announce)
 	})
 }
 
 /// Query information about a broadcast discovered by [moq_origin_announced].
 ///
-/// The destination is filled with the route information. The `prefix` pointer borrows
-/// the announcement's storage: copy it out before calling [moq_origin_announced_free], which
-/// invalidates it.
+/// The destination is filled with the route information. The `prefix`, `captures`,
+/// and capture string pointers borrow the announcement's storage: copy them out
+/// before calling [moq_origin_announced_free], which invalidates them.
 ///
 /// Returns a zero on success, or a negative code on failure.
 ///
@@ -1471,8 +1489,8 @@ pub unsafe extern "C" fn moq_origin_announced_info(announced: u32, dst: *mut moq
 /// Each announce / unannounce event hands the callback a distinct announcement handle (read
 /// with [moq_origin_announced_info]); release it here once done to avoid leaking one per event
 /// over the life of the listener. This is per-announcement and distinct from
-/// [moq_origin_announced_cancel], which stops the listener itself. After freeing, any `prefix`
-/// pointer obtained from [moq_origin_announced_info] for this handle is dangling.
+/// [moq_origin_announced_cancel], which stops the listener itself. After freeing,
+/// any pointer obtained from [moq_origin_announced_info] for this handle is dangling.
 ///
 /// Returns zero on success, or a negative code if the handle is unknown.
 #[unsafe(no_mangle)]
@@ -1497,13 +1515,13 @@ pub extern "C" fn moq_origin_announced_cancel(announced: u32) -> i32 {
 	})
 }
 
-/// Consume a broadcast from an origin by path, waiting until it is announced.
+/// Consume a broadcast from an origin by path, waiting until something can serve it.
 ///
 /// Resolves against future announcements: it waits for the announcement to arrive (e.g. over the
 /// network) and then delivers the broadcast handle via `on_broadcast`. Use it right after
 /// [moq_session_connect] to avoid racing announcement gossip. To resolve against only what is
-/// reachable by exact path now (including unannounced broadcasts), use [moq_origin_request]
-/// instead.
+/// reachable by exact path now, use [moq_origin_request] instead. A local
+/// broadcast appears on this origin's cursor when created, before peer advertising.
 ///
 /// `on_broadcast` is invoked with a positive broadcast handle once announced, then exactly once
 /// more with a terminal code: `0` (the wait finished, including after
@@ -1551,9 +1569,9 @@ pub extern "C" fn moq_origin_announced_broadcast_cancel(task: u32) -> i32 {
 /// Request a broadcast from an origin by path, resolving as soon as it can be served.
 ///
 /// Resolves against what is reachable by exact path *now*, where
-/// [moq_origin_announced_broadcast] waits indefinitely for a future announcement: it returns an
-/// existing broadcast at once, whether announced or not, and fails when none is reachable. It does
-/// NOT wait for a later announcement. Serve on-demand paths with [moq_origin_dynamic].
+/// [moq_origin_announced_broadcast] waits indefinitely: it returns an existing broadcast at once,
+/// whether announced or not, and fails when none is reachable. It does NOT wait for a later
+/// announcement. Serve on-demand paths with [moq_origin_dynamic].
 ///
 /// `on_broadcast` is invoked with a positive broadcast handle once served, then exactly once more
 /// with a terminal code: `0` (finished, including after [moq_origin_request_cancel]) or a negative
@@ -1610,7 +1628,7 @@ pub extern "C" fn moq_origin_close(origin: u32) -> i32 {
 /// Advertise a broadcast's exact path as a route.
 ///
 /// Announcing again re-prices the route in place. A NULL `route` uses the default
-/// (no hops, cost 0). An unannounced broadcast stays reachable by exact path.
+/// (no hops, cost 0). The path remains discoverable locally before and after peer advertising.
 ///
 /// Returns a zero on success, or a negative code on failure.
 ///

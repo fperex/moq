@@ -56,6 +56,7 @@ impl<E: CatalogExt> Consumer<E> {
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Catalog<E>>>> {
 		let catalog = ready!(self.inner.poll_next(waiter))?;
 		if let Some(catalog) = catalog.as_ref() {
+			catalog.check_renditions()?;
 			check_resolvable(&self.base, catalog)?;
 		}
 		Poll::Ready(Ok(catalog))
@@ -152,7 +153,7 @@ mod test {
 
 	fn referencing(rel: &str) -> hang::catalog::AudioConfig {
 		let mut config = opus();
-		config.broadcast = Some(moq_net::PathRelative::new(rel).into_owned());
+		config.broadcast = Some(moq_net::path::Relative::new(rel).into_owned());
 		config
 	}
 
@@ -243,6 +244,21 @@ mod test {
 		publish_catalog_served(published).await
 	}
 
+	#[test]
+	fn refuses_oversized_catalog_before_reconciling_renditions() {
+		let mut published = Catalog::<()>::default();
+		for i in 0..=hang::catalog::MAX_RENDITIONS {
+			published.audio.renditions.insert(format!("audio{i}"), opus());
+		}
+		assert!(matches!(
+			publish_catalog(published),
+			Err(crate::Error::Hang(hang::Error::TooManyRenditions {
+				count: 65,
+				max: 64
+			}))
+		));
+	}
+
 	/// A reference that stops at or below the root names a broadcast, so the catalog stands.
 	/// `a/pub` resolves against `a`, so `..` is what lands on the root itself.
 	#[tokio::test]
@@ -321,7 +337,7 @@ mod test {
 		published.audio.renditions.insert("here".to_string(), opus());
 
 		let mut text = hang::catalog::TextConfig::new(hang::catalog::TextFormat::Vtt);
-		text.broadcast = Some(moq_net::PathRelative::new("../../../elsewhere").into_owned());
+		text.broadcast = Some(moq_net::path::Relative::new("../../../elsewhere").into_owned());
 		published.text.renditions.insert("captions".to_string(), text);
 
 		match publish_catalog(published) {
@@ -340,7 +356,7 @@ mod test {
 			let mut published = Catalog::<()>::default();
 			published.audio.renditions.insert("here".to_string(), opus());
 
-			let escaping = moq_net::PathRelative::new("../../../elsewhere").into_owned();
+			let escaping = moq_net::path::Relative::new("../../../elsewhere").into_owned();
 			match section {
 				"json" => {
 					let mut config = hang::catalog::JsonConfig::new(hang::catalog::Mode::Stream);

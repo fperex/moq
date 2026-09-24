@@ -110,7 +110,7 @@ pub(crate) enum Parts {
 	/// the member in here is what stops a group member and a stream-only server
 	/// from being asked for at once.
 	#[cfg_attr(not(feature = "noq"), expect(dead_code, reason = "no QUIC backend is compiled in"))]
-	Member(crate::listen::Member),
+	Member(crate::listen::Socket),
 }
 
 impl Parts {
@@ -128,11 +128,10 @@ impl Parts {
 		matches!(self, Self::All | Self::Streams)
 	}
 
-	/// This server's claim on a slot in the group, when it is a member of one.
-	/// Consuming, because binding it is what joins the group and only one
-	/// backend does that.
+	/// This server's socket in a complete group, when it is a member of one.
+	/// Consuming, because only one backend may own the serving handle.
 	#[cfg_attr(not(feature = "noq"), expect(dead_code, reason = "no QUIC backend is compiled in"))]
-	fn member(self) -> Option<crate::listen::Member> {
+	fn member(self) -> Option<crate::listen::Socket> {
 		match self {
 			Self::Member(member) => Some(member),
 			_ => None,
@@ -238,7 +237,7 @@ pub struct Server {
 #[cfg(feature = "noq")]
 pub(crate) struct SocketRetainer {
 	#[cfg(feature = "noq")]
-	noq: Option<web_transport_noq::noq::Endpoint>,
+	noq: Option<web_transport_moq::noq::Endpoint>,
 }
 
 impl Server {
@@ -308,8 +307,8 @@ impl Server {
 			}
 		}
 
-		// The member is a claim on a slot in a reuseport group, which binding
-		// spends, so the backend may take it only once.
+		// The member is a serving handle released by a complete reuseport group,
+		// so the backend may take it only once.
 		#[cfg(feature = "noq")]
 		let member = parts.member();
 
@@ -587,7 +586,7 @@ impl Server {
 							// (like the stream bindings).
 							let Accepted { session, url, identity, authority, mut link } = super::noq::accept(_conn, alpns).await?;
 							link.local = local;
-							let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session)).await?;
+							let request = server.accept_request(tokio::time::Instant::now().into_std(), crate::transport::Session::new(session)).await?;
 							Ok(Request { transport: Transport::Quic, url, identity, authority, link, kind: RequestKind::Noq(Box::new(request)) })
 						}.boxed());
 					}
@@ -596,7 +595,7 @@ impl Server {
 					#[cfg(feature = "iroh")]
 					self.accept.push(async move {
 						let Accepted { session, url, identity, authority, link } = super::iroh::accept(_conn).await?;
-						let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session)).await?;
+						let request = server.accept_request(tokio::time::Instant::now().into_std(), crate::transport::Session::new(session)).await?;
 						Ok(Request { transport: Transport::Iroh, url, identity, authority, link, kind: RequestKind::Iroh(Box::new(request)) })
 					}.boxed());
 				}
@@ -608,7 +607,7 @@ impl Server {
 							// slow peer doesn't stall the accept loop (spawned like the others).
 							let local = self.websocket_local_addr();
 							self.accept.push(async move {
-								let request = server.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session)).await?;
+								let request = server.accept_request(tokio::time::Instant::now().into_std(), crate::transport::Session::new(session)).await?;
 								let authority = url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 								let link = Link { remote: Some(accepted.remote), local, alpn: accepted.protocol, ..Default::default() };
 								Ok(Request { transport: Transport::WebSocket, url: Some(url), authority, identity: None, link, kind: RequestKind::Qmux(Box::new(request)) })
@@ -773,7 +772,7 @@ async fn serve_session(request: Request) -> crate::Result<()> {
 
 /// The version set offered on stream (`tcp://`/`unix://`) listeners.
 ///
-/// A URL-less transport carries the request path in the moq-lite-05 SETUP, so
+/// A URL-less transport carries the request path in the moq-lite-05+ SETUP, so
 /// lite-05 is offered on top of the configured versions even when a custom set
 /// omits it. Older versions still work for clients that need no path.
 #[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
@@ -1017,7 +1016,10 @@ fn spawn_stream_request(
 ) {
 	tokio::spawn(async move {
 		match server
-			.accept_request(crate::runtime::Runtime::new(), crate::transport::Session::new(session))
+			.accept_request(
+				tokio::time::Instant::now().into_std(),
+				crate::transport::Session::new(session),
+			)
 			.await
 		{
 			Ok(request) => {
@@ -1043,11 +1045,11 @@ fn spawn_stream_request(
 /// every transport before the caller authorizes. The variant only distinguishes the
 /// underlying session type; all of them delegate identically.
 /// A pending moq-net request over transport `S`, driven by our tokio runtime.
-type PendingRequest<S> = moq_net::server::Handshake<S, crate::runtime::Runtime<S>>;
+type PendingRequest<S> = moq_net::server::Handshake<S>;
 
 pub(crate) enum RequestKind {
 	#[cfg(feature = "noq")]
-	Noq(Box<PendingRequest<crate::transport::Session<web_transport_noq::Session>>>),
+	Noq(Box<PendingRequest<crate::transport::Session<web_transport_moq::Session>>>),
 	#[cfg(feature = "iroh")]
 	Iroh(Box<PendingRequest<crate::transport::Session<web_transport_iroh::Session>>>),
 	#[cfg(any(feature = "tcp", all(feature = "uds", unix), feature = "websocket"))]
@@ -1297,7 +1299,12 @@ impl Request {
 
 	/// Accept the session, starting the MoQ session loops.
 	pub async fn ok(self) -> crate::Result<Session> {
-		Ok(request_into!(self.kind, request => request.ok().await?))
+		Ok(request_into!(self.kind, request => {
+			let (session, driver) = request.ok().await?;
+			use tracing::Instrument;
+			tokio::spawn(moq_net::time::run(driver).instrument(tracing::Span::current()));
+			session
+		}))
 	}
 
 	/// Returns the network transport carrying this session.
@@ -1579,7 +1586,7 @@ mod tests {
 			.await
 			.expect("announce timeout")
 			.expect("origin closed");
-		assert_eq!(update.path.as_str(), "test");
+		assert_eq!(update.prefix.as_str(), "test");
 		assert!(update.kind.is_active());
 		let broadcast = consumer.request_broadcast("test").await.expect("resolve");
 

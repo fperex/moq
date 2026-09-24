@@ -10,9 +10,7 @@ use crate::tls::{FingerprintVerifier, ServeCerts};
 use std::net;
 use std::sync::Arc;
 use std::time::Duration;
-use web_transport_noq::noq;
-
-pub use web_transport_noq;
+use web_transport_moq::noq;
 
 /// Attach a qlog factory writing into the configured directory, if any.
 ///
@@ -203,7 +201,7 @@ pub enum Error {
 		message: String,
 		/// The HTTP status the server answered the CONNECT with, when it answered with one.
 		///
-		/// Read at conversion time rather than kept as a `web-transport-noq` error, so the
+		/// Read at conversion time rather than kept as a `web-transport-moq` error, so the
 		/// classification survives without that crate appearing in this crate's public API.
 		status: Option<u16>,
 	},
@@ -253,7 +251,7 @@ impl crate::failover::Aggregate for Error {
 crate::error::from_message! {
 	noq::ConnectError => Connect,
 	noq::ConnectionError => Connection,
-	web_transport_noq::ServerError => Server,
+	web_transport_moq::ServerError => Server,
 	hex::FromHexError => InvalidFingerprint,
 }
 
@@ -263,8 +261,8 @@ impl From<noq::crypto::rustls::NoInitialCipherSuite> for Error {
 	}
 }
 
-impl From<web_transport_noq::ClientError> for Error {
-	fn from(err: web_transport_noq::ClientError) -> Self {
+impl From<web_transport_moq::ClientError> for Error {
+	fn from(err: web_transport_moq::ClientError) -> Self {
 		Self::Client {
 			status: client_status(&err),
 			message: crate::error::message(err),
@@ -330,7 +328,7 @@ impl NoqClient {
 		tls: &rustls::ClientConfig,
 		addr: crate::connect::Addr,
 		versions: &moq_net::Versions,
-	) -> Result<web_transport_noq::Session> {
+	) -> Result<web_transport_moq::Session> {
 		let mut url = addr.url().clone();
 		let mut config = tls.clone();
 
@@ -385,7 +383,7 @@ impl NoqClient {
 		}
 
 		let alpns: Vec<Vec<u8>> = match url.scheme() {
-			"https" => vec![web_transport_noq::ALPN.as_bytes().to_vec()],
+			"https" => vec![web_transport_moq::ALPN.as_bytes().to_vec()],
 			"moqt" | "moql" => versions.alpns().iter().map(|alpn| alpn.as_bytes().to_vec()).collect(),
 			_ => return Err(Error::InvalidScheme),
 		};
@@ -416,15 +414,15 @@ impl NoqClient {
 
 		let session = match url.scheme() {
 			"https" => {
-				let mut request = web_transport_noq::proto::ConnectRequest::new(url.clone());
+				let mut request = web_transport_moq::proto::ConnectRequest::new(url.clone());
 				for alpn in versions.alpns() {
 					request = request.with_protocol(alpn.to_string());
 				}
-				web_transport_noq::Session::connect(connection, request)
+				web_transport_moq::Session::connect(connection, request)
 					.await
 					.map_err(map_client_error)?
 			}
-			"moqt" | "moql" => web_transport_noq::Session::raw(connection),
+			"moqt" | "moql" => web_transport_moq::Session::raw(connection),
 			_ => return Err(Error::UnsupportedScheme(url.scheme().to_string())),
 		};
 
@@ -470,7 +468,7 @@ impl Error {
 	}
 }
 
-fn map_client_error(err: web_transport_noq::ClientError) -> Error {
+fn map_client_error(err: web_transport_moq::ClientError) -> Error {
 	match client_status(&err).and_then(crate::ConnectError::from_status_u16) {
 		Some(rejected) => rejected.into(),
 		None => err.into(),
@@ -484,25 +482,25 @@ fn map_client_error(err: web_transport_noq::ClientError) -> Error {
 /// [`crate::ConnectError`], and [`Error::status`] hands it to the caller, whose backoff consults
 /// the status. A `404` or `405` is the server's settled answer, so retrying
 /// it just burns the reconnect budget on a URL that will never work.
-fn client_status(err: &web_transport_noq::ClientError) -> Option<u16> {
+fn client_status(err: &web_transport_moq::ClientError) -> Option<u16> {
 	match err {
-		web_transport_noq::ClientError::HttpError(err) => connect_status(err),
+		web_transport_moq::ClientError::HttpError(err) => connect_status(err),
 		_ => None,
 	}
 }
 
-fn connect_status(err: &web_transport_noq::ConnectError) -> Option<u16> {
+fn connect_status(err: &web_transport_moq::ConnectError) -> Option<u16> {
 	match err {
-		web_transport_noq::ConnectError::ErrorStatus(status) => Some(status.as_u16()),
-		web_transport_noq::ConnectError::ProtoError(err) => proto_status(err),
+		web_transport_moq::ConnectError::ErrorStatus(status) => Some(status.as_u16()),
+		web_transport_moq::ConnectError::ProtoError(err) => proto_status(err),
 		_ => None,
 	}
 }
 
-fn proto_status(err: &web_transport_noq::proto::ConnectError) -> Option<u16> {
+fn proto_status(err: &web_transport_moq::proto::ConnectError) -> Option<u16> {
 	match err {
-		web_transport_noq::proto::ConnectError::ErrorStatus(status)
-		| web_transport_noq::proto::ConnectError::WrongStatus(Some(status)) => Some(status.as_u16()),
+		web_transport_moq::proto::ConnectError::ErrorStatus(status)
+		| web_transport_moq::proto::ConnectError::WrongStatus(Some(status)) => Some(status.as_u16()),
 		_ => None,
 	}
 }
@@ -516,7 +514,7 @@ pub(crate) struct NoqServer {
 }
 
 impl NoqServer {
-	pub fn new(config: listen::Config, quic: &crate::quic::Config, member: Option<listen::Member>) -> Result<Self> {
+	pub fn new(config: listen::Config, quic: &crate::quic::Config, member: Option<listen::Socket>) -> Result<Self> {
 		let mut transport = noq::TransportConfig::default();
 		let quic = quic.resolve();
 		apply_transport(&mut transport, &quic);
@@ -547,7 +545,7 @@ impl NoqServer {
 			.iter()
 			.map(|alpn| alpn.as_bytes().to_vec())
 			.collect();
-		alpns.push(web_transport_noq::ALPN.as_bytes().to_vec());
+		alpns.push(web_transport_moq::ALPN.as_bytes().to_vec());
 
 		tls.alpn_protocols = alpns;
 		tls.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -580,7 +578,7 @@ impl NoqServer {
 
 		// Configure connection ID generator with server ID if provided
 		let mut endpoint_config = noq::EndpointConfig::default();
-		if let Some(shard) = member.as_ref().map(listen::Member::shard) {
+		if let Some(shard) = member.as_ref().map(listen::Socket::shard) {
 			if load_balancer.is_some() {
 				return Err(Error::ShardWithQuicLb);
 			}
@@ -612,14 +610,12 @@ impl NoqServer {
 			}));
 		}
 
-		// A group member binds the address its group holds, not the one this
-		// config resolved: the group is what guarantees every member shares one
-		// port, in the order the kernel steers by.
+		// A group socket was released only after every member bound and the
+		// steering filter covered the final array.
 		let socket = match member {
-			Some(member) => member.bind(),
-			None => crate::bind::udp(crate::bind::Udp::new(listen)),
-		}
-		.map_err(Error::BindSocket)?;
+			Some(member) => member.into_inner(),
+			None => crate::bind::udp(crate::bind::Udp::new(listen)).map_err(Error::BindSocket)?,
+		};
 
 		// Create the generic QUIC endpoint.
 		let quic = noq::Endpoint::new(endpoint_config, Some(tls), socket, runtime).map_err(Error::CreateEndpoint)?;
@@ -659,7 +655,7 @@ impl NoqServer {
 pub(crate) async fn accept(
 	conn: noq::Incoming,
 	alpns: Vec<&'static str>,
-) -> Result<crate::server::Accepted<web_transport_noq::Session>> {
+) -> Result<crate::server::Accepted<web_transport_moq::Session>> {
 	let mut conn = conn.accept()?;
 
 	let handshake = conn
@@ -692,10 +688,10 @@ pub(crate) async fn accept(
 	};
 
 	match alpn.as_str() {
-		web_transport_noq::ALPN => {
+		web_transport_moq::ALPN => {
 			// Wait for the CONNECT request, then capture its URL and mTLS identity before
 			// the response consumes it.
-			let request = web_transport_noq::Request::accept(conn)
+			let request = web_transport_moq::Request::accept(conn)
 				.await
 				.map_err(|err| Error::RecvRequest(crate::error::message(err)))?;
 			let url = Some(request.url.clone());
@@ -703,7 +699,7 @@ pub(crate) async fn accept(
 			// The authority the client put in its CONNECT URL.
 			let authority = request.url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 
-			let mut response = web_transport_noq::proto::ConnectResponse::OK;
+			let mut response = web_transport_moq::proto::ConnectResponse::OK;
 			let mut link = link;
 			if let Some(protocol) = request.protocols.iter().find(|p| alpns.contains(&p.as_str())) {
 				response = response.with_protocol(protocol);
@@ -723,14 +719,14 @@ pub(crate) async fn accept(
 		}
 		// Recognize any moq ALPN this server actually offered (its configured versions),
 		// not the global default set. rustls only negotiates an ALPN the server offered, so
-		// this covers opt-in / work-in-progress versions (e.g. moq-lite-06-wip) that are
-		// deliberately absent from `moq_net::ALPNS`.
+		// this also covers versions omitted from `moq_net::ALPNS` but enabled
+		// in this server's configuration.
 		alpn if alpns.contains(&alpn) => {
 			let identity = crate::tls::PeerIdentity::from_any(conn.peer_identity());
 			// Raw QUIC carries no request URL; the path rides the SETUP. The TLS SNI is the
 			// only authority the client can offer here, and it is optional.
 			let authority = (!host.is_empty()).then_some(host);
-			let session = web_transport_noq::Session::raw(conn);
+			let session = web_transport_moq::Session::raw(conn);
 			Ok(crate::server::Accepted {
 				session,
 				url: None,
@@ -911,7 +907,7 @@ mod tests {
 				.await
 				.expect("connect failed");
 
-			// web_transport_noq::Session derefs to the noq connection.
+			// web_transport_moq::Session derefs to the noq connection.
 			assert!(is_bbr3(&session), "client connection is not running BBRv3");
 			assert!(
 				accepted.await.expect("server task panicked"),
