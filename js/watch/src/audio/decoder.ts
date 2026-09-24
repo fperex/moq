@@ -13,15 +13,17 @@ import {
 	readonlys,
 	Signal,
 } from "@moq/signals";
+import { accumulate } from "../media";
 import type { Delay, Sync } from "../sync";
 import { audioMaxAge, type DecoderConfig, decoderConfig } from "./config";
 import type * as Playout from "./playout";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
-import { type Graph, Supply } from "./supply";
+import { Supply } from "./supply";
 import { supported } from "./supported";
 import { unlockOnGesture } from "./unlock";
+import { type PageGraph, Remote } from "./worker/remote";
 
 export type DecoderInput = {
 	// Whether to download the audio track. Defaults to true.
@@ -48,6 +50,21 @@ export type DecoderInput = {
 	 * Read when the audio graph is built, since it belongs to the reader running inside the worklet.
 	 */
 	conceal: Getter<boolean>;
+
+	/**
+	 * The relay the broadcast is read from, which the page's audio worker dials for the audio. Without one
+	 * the audio stays on the page.
+	 */
+	url: Getter<URL | undefined>;
+
+	/**
+	 * Whether the audio is fed from a dedicated worker rather than the page's main thread. Defaults to false.
+	 *
+	 * The worker subscribes, decodes and writes the ring on a session of its own to {@link url}, so a busy
+	 * main thread cannot starve the ring. One worker serves every player on the page. Needs a {@link url}
+	 * and a `Worker`; without either the audio stays on the page.
+	 */
+	offload: Getter<boolean>;
 };
 
 /** Constructor properties for {@link Decoder}. */
@@ -107,6 +124,12 @@ export interface Stats {
 	bytesReceived: number;
 }
 
+// The supply feeding the ring, and the graph built for it.
+interface Active {
+	supply: Supply | Remote;
+	graph: Signal<PageGraph | undefined>;
+}
+
 /**
  * Downloads audio from a track and emits it to an AudioContext.
  *
@@ -138,11 +161,12 @@ export class Decoder {
 	// of the player leaving the page (see #runContext).
 	#context: { audio: AudioContext; effects: Effect } | undefined;
 
-	// The worklet node the supply writes the ring into, while there is one. See #runWorklet.
-	readonly #graph = new Signal<Graph | undefined>(undefined);
+	// Everything that feeds the ring (the subscription, the estimator, the decoder and the writes) and the
+	// graph it writes into: on the page, or in the page's worker. See #runSupply.
+	readonly #active = new Signal<Active | undefined>(undefined);
 
-	// Everything that feeds the ring: the subscription, the estimator, the decoder and the writes.
-	readonly #supply: Supply;
+	// Where the supply runs, once decided. See #runSupply.
+	readonly #mode: Computed<"main" | "worker">;
 
 	#signals = new Effect();
 
@@ -181,6 +205,8 @@ export class Decoder {
 			enabled: getter(props?.enabled ?? true),
 			attached: getter(props?.attached ?? true),
 			conceal: getter(props?.conceal ?? true),
+			url: getter<URL | undefined>(props?.url),
+			offload: getter(props?.offload ?? false),
 		};
 
 		this.source = props.source;
@@ -192,7 +218,16 @@ export class Decoder {
 		this.#rate = this.#signals.computed((effect) => {
 			const config = effect.get(this.#config);
 			if (!config) return undefined;
-			return effect.get(this.#supply.out.rate) ?? config.sampleRate;
+			const active = effect.get(this.#active);
+			const decoded = active ? effect.get(active.supply.out.rate) : undefined;
+			return decoded ?? config.sampleRate;
+		});
+		this.#mode = this.#signals.computed((effect) => {
+			if (!effect.get(this.in.offload)) return "main";
+			if (effect.get(this.in.url) === undefined) return "main";
+			// No worker to hand it to: server rendering, or a runtime without one.
+			if (typeof Worker !== "function") return "main";
+			return "worker";
 		});
 
 		// What the ring holds on top of the chunk: the estimator's answer plus however much later
@@ -207,16 +242,6 @@ export class Decoder {
 			(maxAge, delay, config) => audioMaxAge(maxAge, config, delay === "instant"),
 		);
 
-		this.#supply = new Supply({
-			source: this.source,
-			sync: this.sync,
-			polyfill: Util.Libav.polyfill,
-			enabled: this.in.enabled,
-			graph: this.#graph,
-			target: this.#target,
-			maxAge: this.#maxAge,
-		});
-
 		// There is no context until a user gesture builds one (see #buildContext). Armed for the
 		// decoder's lifetime rather than while audio is enabled: the click that unmutes a tile is the
 		// activation, and listeners armed as a consequence of it are armed one microtask too late to
@@ -226,18 +251,69 @@ export class Decoder {
 			this.in.attached.peek() ? (this.#context?.audio ?? this.#buildContext(this.#rate.peek())) : undefined,
 		);
 		this.#signals.cleanup(() => this.#closeContext());
-		this.#signals.cleanup(() => this.#supply.close());
 
+		this.#signals.run(this.#runSupply.bind(this));
 		this.#signals.run(this.#runContext.bind(this));
 		this.#signals.run(this.#runRing.bind(this));
 		this.#signals.run(this.#runClock.bind(this));
+		this.#signals.run(this.#runOutputs.bind(this));
+	}
+
+	/**
+	 * Run the supply where it belongs: in the page's worker when the player offloads, on the page otherwise.
+	 *
+	 * Each supply gets a graph of its own (see #runWorklet), so one taking over from another never writes
+	 * into a node the other was writing.
+	 */
+	#runSupply(effect: Effect): void {
+		const mode = effect.get(this.#mode);
+		if (mode === undefined) return;
+
+		const graph = new Signal<PageGraph | undefined>(undefined);
+		const props = {
+			source: this.source,
+			sync: this.sync,
+			enabled: this.in.enabled,
+			graph,
+			target: this.#target,
+			maxAge: this.#maxAge,
+		};
+
+		if (mode === "worker") {
+			// A player off the page holds no share of the worker, so the page's last player to leave lets
+			// it go.
+			if (!effect.get(this.in.attached)) return;
+			const supply = new Remote({ ...props, url: this.in.url });
+			effect.cleanup(() => supply.close());
+			effect.set(this.#active, { supply, graph }, undefined);
+			return;
+		}
+
+		const supply = new Supply({ ...props, polyfill: Util.Libav.polyfill });
+		effect.cleanup(() => supply.close());
+		effect.set(this.#active, { supply, graph }, undefined);
+	}
+
+	// Mirror the active supply's outputs onto ours.
+	#runOutputs(effect: Effect): void {
+		const active = effect.get(this.#active);
+		if (!active) return;
+		const out = active.supply.out;
 
 		// Unlike the counters, the estimate goes when the player does: Sync holds the buffer open for
 		// any track still publishing one.
-		this.#signals.run((effect) => effect.set(this.#out.spread, effect.get(this.#supply.out.spread)));
-		this.#signals.proxy(this.#out.buffered, this.#supply.out.buffered);
-		this.#signals.proxy(this.#out.skipped, this.#supply.out.skipped);
-		this.#signals.proxy(this.#out.stats, this.#supply.out.stats);
+		effect.run((inner) => inner.set(this.#out.spread, inner.get(out.spread)));
+		effect.proxy(this.#out.buffered, out.buffered);
+
+		// The counters carry across a supply taking over from another, so they never run backwards.
+		accumulate(effect, this.#out.skipped, out.skipped);
+		let received = 0;
+		effect.run((inner) => {
+			const bytes = inner.get(out.stats)?.bytesReceived;
+			if (bytes === undefined) return;
+			this.#out.stats.update((stats) => ({ bytesReceived: (stats?.bytesReceived ?? 0) + bytes - received }));
+			received = bytes;
+		});
 	}
 
 	/**
@@ -340,6 +416,11 @@ export class Decoder {
 		const config = effect.get(this.#config);
 		if (!config) return;
 
+		// A node of its own for every supply: a writer reaches a node through what it was handed at build,
+		// so a supply taking over from another gets one nothing else writes into.
+		const active = effect.get(this.#active);
+		if (!active) return;
+
 		const sampleRate = context.sampleRate;
 		const channelCount = config.numberOfChannels;
 
@@ -366,7 +447,7 @@ export class Decoder {
 			effect.cleanup(() => worklet.disconnect());
 
 			// The supply builds the ring against the node and writes it from here on.
-			effect.set(this.#graph, {
+			effect.set(active.graph, {
 				target: worklet,
 				context,
 				rate: sampleRate,
@@ -380,7 +461,9 @@ export class Decoder {
 
 	// Mirror ring state onto our public signals, for as long as the supply has a ring.
 	#runRing(effect: Effect): void {
-		const ring = effect.get(this.#supply.out.ring);
+		const active = effect.get(this.#active);
+		if (!active) return;
+		const ring = effect.get(active.supply.out.ring);
 		if (!ring) return;
 
 		// A flushed ring reports no playhead until the next insert re-anchors it.
@@ -425,7 +508,9 @@ export class Decoder {
 		if (!effect.get(this.in.enabled)) return;
 
 		// Gate on the supply's ring so this effect re-runs once the ring is created.
-		const ring = effect.get(this.#supply.out.ring);
+		const active = effect.get(this.#active);
+		if (!active) return;
+		const ring = effect.get(active.supply.out.ring);
 		if (!ring) return;
 
 		const track = this.sync.track("audio");
@@ -436,7 +521,7 @@ export class Decoder {
 	// Flush the audio buffer and re-stall, re-anchoring playback to the next frame.
 	// Use in buffered mode at an utterance boundary (see Sync.reset).
 	reset(): void {
-		this.#supply.reset();
+		this.#active.peek()?.supply.reset();
 	}
 
 	close() {

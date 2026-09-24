@@ -663,6 +663,45 @@ describe("the host", () => {
 		expect(page.reports().length).toBe(reported);
 	});
 
+	it("plays nothing while the page picks no rendition, and keeps the estimate for the one that comes back", async () => {
+		const { track, page } = await started({ interval: 20, isolated: true });
+		for (let i = 0; i < 5; i++) writeGroup(track, i, i * 20_000);
+		const playing = await page.report((report) => report.arrivals.length > 0 && report.spread !== undefined);
+		const spread = playing.spread;
+
+		// The publisher hides its microphone: the rendition leaves the page's catalog.
+		page.post({
+			type: "player",
+			id: 1,
+			url: "https://relay.example/anon",
+			name: NAME,
+			announced: true,
+			enabled: true,
+		});
+		const gone = await page.report((report) => report.spread === undefined);
+		const after = page.reports().indexOf(gone);
+		for (let i = 5; i < 10; i++) writeGroup(track, i, i * 20_000);
+		await sleep(60);
+		expect(
+			page
+				.reports()
+				.slice(after + 1)
+				.flatMap((report) => report.arrivals),
+		).toEqual([]);
+
+		// And puts it back: the same rendition, measured as before, and read again from the live edge.
+		page.post(player(1));
+		const back = await page.report((report) => report.spread !== undefined, after);
+		expect(back.spread).toBe(spread);
+		writeGroup(track, 10, 200_000);
+		await page.report((report) => report.arrivals.some((arrival) => arrival.timestamp === 200), after);
+		const read = page
+			.reports()
+			.slice(after + 1)
+			.flatMap((report) => report.arrivals.map((arrival) => arrival.timestamp));
+		expect(read).toEqual([Time.Milli(180), Time.Milli(200)]);
+	});
+
 	it("refuses a rendition this realm's decoder cannot play", async () => {
 		FakeDecoder.supported = false;
 		const { origin, dial } = relay();

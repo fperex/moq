@@ -77,7 +77,8 @@ export type SupplyProps = SupplyInput & {
 	polyfill?: () => Promise<boolean>;
 };
 
-type SupplyOutput = {
+/** What a {@link Supply} publishes. */
+export type SupplyOutput = {
 	// The rate the decoder actually outputs, learned from the first decoded frame. This is the source
 	// of truth for the graph: a decoder can output a different rate than it was configured with (e.g.
 	// Opus decodes to 48kHz on Chrome/Firefox but to the configured rate on Safari). Until a frame

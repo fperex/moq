@@ -196,6 +196,8 @@ export default class MoqWatch extends HTMLElement {
 
 		this.player = new Player({
 			origin: this.connection.origin,
+			// The same relay, for the audio worker's own session.
+			url: this.connection.url,
 			probe: this.connection.probe,
 			enabled: this.#enabled,
 			name: this.#name,

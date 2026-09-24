@@ -36,6 +36,10 @@ export type PlayerInput = {
 	muted: Getter<boolean>;
 	/** Whether a gap in the audio is concealed rather than played as a gap. See {@link Audio.DecoderInput.conceal}. */
 	conceal: Getter<boolean>;
+	/** The relay the broadcast is read from, which the audio worker dials. See {@link Audio.DecoderInput.url}. */
+	url: Getter<URL | undefined>;
+	/** Whether the audio is fed from a dedicated worker. See {@link Audio.DecoderInput.offload}. */
+	offload: Getter<boolean>;
 	/** Canvas visibility policy for video downloads. */
 	visible: Getter<Video.Visible>;
 	/** Playback distance from the live edge. */
@@ -92,6 +96,8 @@ export class Player {
 			volume: getter(props.volume ?? 0.5),
 			muted: getter(props.muted ?? false),
 			conceal: getter(props.conceal ?? true),
+			url: getter<URL | undefined>(props.url),
+			offload: getter(props.offload ?? false),
 			visible: getter(props.visible ?? "20%"),
 			delay: getter(props.delay ?? "auto"),
 			buffer: getter(props.buffer ?? Time.Milli.zero),
@@ -135,6 +141,8 @@ export class Player {
 			// stops the download and keeps the context, so the unmute needs no gesture.
 			attached: this.in.enabled,
 			conceal: this.in.conceal,
+			url: this.in.url,
+			offload: this.in.offload,
 		});
 		this.#signals.proxy(this.sync.track("audio").spread, this.audio.out.spread);
 		this.#signals.cleanup(() => {

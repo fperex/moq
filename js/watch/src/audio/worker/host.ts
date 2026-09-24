@@ -240,7 +240,7 @@ class Player {
 		this.#name = new Signal(Path.from(msg.name));
 		this.#announced = new Signal(msg.announced);
 		this.#enabled = new Signal(msg.enabled);
-		this.#catalog = new Signal<Catalog.Root | undefined>(pick(msg));
+		this.#catalog = new Signal(pick(msg));
 
 		// The session to the relay the page named, held only while the page is not put away.
 		this.#signals.run((effect) => {
@@ -414,7 +414,9 @@ class Player {
 	}
 }
 
-// The catalog the worker's broadcast holds: the page's pick, alone.
-function pick(msg: PlayerMessage): Catalog.Root {
+// The catalog the worker's broadcast holds: the page's pick, alone, or none while the page has none. The
+// supply keeps its estimate across the gap, as the page's does across a rendition that blinks.
+function pick(msg: PlayerMessage): Catalog.Root | undefined {
+	if (msg.track === undefined) return undefined;
 	return { audio: { renditions: { [msg.track]: msg.config } } } as Catalog.Root;
 }

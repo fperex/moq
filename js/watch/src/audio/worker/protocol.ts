@@ -82,6 +82,12 @@ export interface Output {
 	at: number;
 }
 
+/**
+ * The rendition the page picked, or none: the page's pick went away (a publisher hiding its microphone
+ * takes it out of the catalog for a moment), and the worker plays nothing until it comes back.
+ */
+export type Rendition = { track: string; config: Catalog.AudioConfig } | { track?: undefined; config?: undefined };
+
 /** What the page tells the worker. Everything but `hello` and `suspend` is about the player named by `id`. */
 export type ToWorker =
 	// The transports the worker's connections may race: what the page's would. Sent once, straight
@@ -89,16 +95,14 @@ export type ToWorker =
 	| { type: "hello"; transports: Transports }
 	// Play this rendition of this broadcast, or keep playing it with this changed. Sent whole on any
 	// change; the first one starts the player. `enabled` is whether to download at all (a mute).
-	| {
+	| ({
 			type: "player";
 			id: number;
 			url: string;
 			name: string;
 			announced: boolean;
 			enabled: boolean;
-			track: string;
-			config: Catalog.AudioConfig;
-	  }
+	  } & Rendition)
 	// What the supply reads of the page's `Sync`: the ring's target (`out.delay` plus `out.offset`),
 	// the age budget, the delay mode, the configured lookahead (`in.buffer`) and whether it applies
 	// (`out.buffered`). Sent whole on any change. The player downloads nothing until the first one.
