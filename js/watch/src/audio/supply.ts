@@ -68,6 +68,13 @@ export type SupplyProps = SupplyInput & {
 	source: Source;
 	/** Shared playback clock. */
 	sync: SupplySync;
+	/**
+	 * Makes WebCodecs' `AudioDecoder` available before the first decode, resolving true once it is: the
+	 * page's polyfill for a browser without one. Absent, the decoder must be native, as it is in the audio
+	 * worker, which is refused one that is not (see `decide` in `worker/protocol.ts`). Handed in rather
+	 * than called from here, so the worker's bundle leaves the polyfill out.
+	 */
+	polyfill?: () => Promise<boolean>;
 };
 
 type SupplyOutput = {
@@ -153,6 +160,9 @@ export class Supply {
 	// the rendition leaves the catalog. See `Estimator`.
 	#estimator = new Estimator();
 
+	// See `SupplyProps.polyfill`.
+	readonly #polyfill: () => Promise<boolean>;
+
 	constructor(props: SupplyProps) {
 		this.in = {
 			enabled: props.enabled,
@@ -163,6 +173,7 @@ export class Supply {
 
 		this.source = props.source;
 		this.sync = props.sync;
+		this.#polyfill = props.polyfill ?? (async () => true);
 		this.#identity = this.#signals.computed((effect) => {
 			const config = effect.get(this.source.out.config);
 			return config ? playbackIdentity(config) : undefined;
@@ -419,7 +430,7 @@ export class Supply {
 		accumulate(effect, this.#out.skipped, consumer.skipped);
 
 		effect.spawn(async () => {
-			const loaded = await Util.Libav.polyfill();
+			const loaded = await this.#polyfill();
 			if (!loaded) return; // cancelled
 
 			const warmup = new Warmup(LEGACY_WARMUP_CALLBACKS);
@@ -549,7 +560,7 @@ export class Supply {
 		accumulate(effect, this.#out.skipped, consumer.skipped);
 
 		effect.spawn(async () => {
-			const loaded = await Util.Libav.polyfill();
+			const loaded = await this.#polyfill();
 			if (!loaded) return; // cancelled
 
 			let primed = false;

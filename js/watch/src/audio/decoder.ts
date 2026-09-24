@@ -1,5 +1,6 @@
 import type * as Catalog from "@moq/hang/catalog";
 import type * as Container from "@moq/hang/container";
+import * as Util from "@moq/hang/util";
 import { Time } from "@moq/net";
 import {
 	type Computed,
@@ -209,6 +210,7 @@ export class Decoder {
 		this.#supply = new Supply({
 			source: this.source,
 			sync: this.sync,
+			polyfill: Util.Libav.polyfill,
 			enabled: this.in.enabled,
 			graph: this.#graph,
 			target: this.#target,
