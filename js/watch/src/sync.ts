@@ -525,9 +525,13 @@ export class Sync {
 
 	// Fold a newly received frame into the reference. The reference anchors playback to the
 	// wall clock; we lower it (skip ahead) only when keeping it would push the lookahead past `maxAge`.
-	received(timestamp: Time.Milli, label = ""): void {
+	//
+	// `at` is when the frame arrived, on this thread's `Time.Milli.now()` clock, for a frame read on
+	// another thread and reported here later: measured at the report instead, the hop would read as
+	// the path delivering late.
+	received(timestamp: Time.Milli, label = "", at?: Time.Milli): void {
 		this.#out.timestamp.update((current) => (current === undefined || timestamp > current ? timestamp : current));
-		const now = Time.Milli.now();
+		const now = at ?? Time.Milli.now();
 		if (label === "audio" || label === "video") this.#observeArrival(label, timestamp, now);
 		const playhead = this.#playhead(now);
 

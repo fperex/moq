@@ -348,6 +348,19 @@ describe("clock", () => {
 		sync.close();
 	});
 
+	it("anchors on when a frame arrived rather than when it was reported", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: 100 as Time.Milli });
+		await flush();
+
+		// Read on another thread 300ms ago and reported now: playback is 300ms further along than a
+		// frame arriving this instant would put it.
+		sync.received(5000 as Time.Milli, "audio", Time.Milli.sub(clock.at, Time.Milli(300)));
+		expect(sync.now()).toBe(5200 as Time.Milli);
+
+		sync.close();
+	});
+
 	it("re-anchors on reset", async () => {
 		clock = fakeClock();
 		const sync = new Sync({ delay: 100 as Time.Milli });
@@ -613,6 +626,29 @@ describe("the cross-track arrival offset", () => {
 			expect(sync.out.offset.peek()).toBe(Time.Milli.zero);
 			expect(sync.out.delay.peek()).toBe(Time.Milli(40));
 			expect(sync.out.maxAge.peek()).toBe(Time.Milli(40));
+		} finally {
+			sync.close();
+		}
+	});
+
+	it("measures the sound when it arrived, not when a report of it did", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: Time.Milli(40) });
+		try {
+			// The sound is read on another thread and reaches this one 60ms later, in a report that
+			// says when each frame actually arrived. The picture still lands 70ms after the sound.
+			const lag = Time.Milli(60);
+			for (let media = 0; media < 8000; media += 20) {
+				clock.advance(20);
+				const heard = media - lag;
+				if (heard >= 0) sync.received(heard as Time.Milli, "audio", Time.Milli.sub(clock.at, lag));
+				if (media % 40 === 0) sync.received(Math.max(0, media - 70) as Time.Milli, "video");
+			}
+			await flush();
+
+			// Measured at the report instead, its lag reads as the sound arriving late and cancels
+			// most of the picture's.
+			expect(sync.out.offset.peek()).toBe(Time.Milli(40));
 		} finally {
 			sync.close();
 		}
