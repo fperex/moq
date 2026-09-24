@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, jest, mock } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
 import { Group, Origin, Path, Time, Varint } from "@moq/net";
@@ -133,11 +133,13 @@ afterAll(() => {
 beforeEach(() => {
 	FakeDecoder.supported = true;
 	scope.currentFrame = 0;
+	jest.useFakeTimers();
 });
 
 afterEach(() => {
 	delete scope.crossOriginIsolated;
 	for (const stop of cleanup.splice(0)) stop();
+	jest.useRealTimers();
 });
 
 // Everything a case opened, closed after it whether it passed or not.
@@ -314,7 +316,18 @@ function graph(page: Page, id = 1): { render: Processor; states: State[] } {
 	return { render, states };
 }
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const immediate = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/**
+ * Let `ms` pass. The timers are fake, so time moves only here: ten milliseconds at a time, with the
+ * messages and effects each step sets off let run in between.
+ */
+async function sleep(ms: number): Promise<void> {
+	for (let left = ms; left > 0; left -= 10) {
+		jest.advanceTimersByTime(Math.min(10, left));
+		for (let i = 0; i < 4; i++) await immediate();
+	}
+}
 const now = () => performance.timeOrigin + performance.now();
 
 /** Pull `quanta` render quanta of stereo and return the left channel. */
