@@ -22,7 +22,7 @@ This is not an HTTP interceptor or a TCP proxy. Neither can impair QUIC.
 Put the shaper between the client and the relay, and point the client at the shaper:
 
 ```bash
-moq-relay --server-bind '127.0.0.1:4443' &
+moq-relay --listen '127.0.0.1:4443' &
 
 moq-shaper \
     --listen 127.0.0.1:4499 \
@@ -32,7 +32,7 @@ moq-shaper \
     --report run/shaper.json &
 
 ffmpeg -re -i video.mp4 -c copy -f mpegts - | \
-    moq --client-connect https://127.0.0.1:4499/anon --broadcast bbb.hang import ts
+    moq --connect https://127.0.0.1:4499/anon --broadcast bbb.hang import ts
 ```
 
 A browser loads the page against `https://localhost:4499` the same way. The relay's
