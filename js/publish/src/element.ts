@@ -317,7 +317,11 @@ export default class MoqPublish extends HTMLElement {
 				effect.get(this.#videoEnabled) && source instanceof Source.Camera
 					? effect.get(source.out.error)
 					: undefined;
-			if (failed) console.error(`moq-publish: camera unavailable: ${failed.message}`);
+			if (failed) {
+				// A refusal is the user's answer rather than a fault, and `errors` already carries it.
+				const log = failed.name === "NotAllowedError" ? console.warn : console.error;
+				log(`moq-publish: camera unavailable: ${failed.message}`);
+			}
 
 			// The capture reports its own stall, loudly, so only the source is logged here.
 			effect.set(this.#errors.video, failed ?? effect.get(this.#capture.out.stopped));
@@ -329,7 +333,11 @@ export default class MoqPublish extends HTMLElement {
 				effect.get(this.#audioEnabled) && source instanceof Source.Microphone
 					? effect.get(source.out.error)
 					: undefined;
-			if (failed) console.error(`moq-publish: microphone unavailable: ${failed.message}`);
+			if (failed) {
+				// A refusal is the user's answer rather than a fault, and `errors` already carries it.
+				const log = failed.name === "NotAllowedError" ? console.warn : console.error;
+				log(`moq-publish: microphone unavailable: ${failed.message}`);
+			}
 
 			effect.set(this.#errors.audio, failed);
 		});
