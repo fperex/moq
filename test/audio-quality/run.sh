@@ -5,11 +5,13 @@
 # --duration seconds. The numbers that come out are the listener's: how often the ring ran dry, how
 # much of the run was silent, how far the playhead jumped, and where the delay settled.
 #
-# Three things make a row trustworthy, and each one voids the row rather than quietly passing it:
+# Four things make a row trustworthy, and each one voids the row rather than quietly passing it:
 #
 #   - The impairment applied. The shaper counts what it delayed, and a profile that treated nothing
 #     turns an impaired run into an unimpaired pass.
-#   - The transport was WebTransport. A WebSocket fallback is TCP and never touches the UDP shaper.
+#   - The transport was WebTransport, on the page's session and on its audio worker's own. A
+#     WebSocket fallback is TCP and never touches the UDP shaper.
+#   - The audio came from the page's audio worker, the player's default, not its main thread.
 #   - The ring that ran is the one the row asked for, which is decided by whether the document is
 #     cross-origin isolated, not by anything the page can assert about itself.
 #

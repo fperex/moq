@@ -19,7 +19,7 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { Page } from "playwright";
 import { Failure, launch, open, saveTrace, serve } from "../../../interop/clients/js/harness.ts";
-import type { Ring, Void } from "./src/schema.ts";
+import { type Ring, type Thread, threadVoid, type Void } from "./src/schema.ts";
 
 const { values } = parseArgs({
 	options: {
@@ -92,6 +92,7 @@ console.log(`endpoint: page ${pageUrl}`);
 type Status = {
 	crossOriginIsolated: boolean;
 	transport?: string;
+	thread?: Thread;
 	timestamp?: number;
 	stalled?: boolean;
 	underruns?: number;
@@ -114,6 +115,16 @@ const voids: Void[] = [];
 const note = (assertion: string, detail: string) => {
 	console.error(`void: ${assertion}: ${detail}`);
 	voids.push({ assertion, detail });
+};
+
+// The audio's own path, which the page's transport cannot show: the page hands its audio to a worker whose
+// session is a second one, and takes it back for good when the worker cannot play it. So it is checked
+// once the audio plays and again at the end.
+const checkThread = (status: Status | undefined) => {
+	const found = threadVoid(status?.thread, "webtransport");
+	if (found && !voids.some((v) => v.assertion === found.assertion && v.detail === found.detail)) {
+		note(found.assertion, found.detail);
+	}
 };
 
 // --autoplay-policy so an AudioContext starts without a click; the page still offers the button for
@@ -160,6 +171,10 @@ try {
 		if (state && state.stalled === false && typeof state.timestamp === "number") break;
 		await sleep(200);
 	}
+	const playing = await readStatus(page);
+	console.log(`thread: ${JSON.stringify(playing?.thread ?? null)}`);
+	checkThread(playing);
+
 	const clock0 = await page.evaluate(() => performance.now());
 	const audio0 = await contextTime(page);
 	await sleep(10_000);
@@ -183,6 +198,7 @@ try {
 
 	const final = await readStatus(page);
 	console.log(`final: ${JSON.stringify(final)}`);
+	checkThread(final);
 
 	// Closing the page is what fires `pagehide`, which is what flushes the last batch. Without this
 	// the run's final seconds are the ones that never arrive.

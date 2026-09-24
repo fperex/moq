@@ -306,6 +306,13 @@ export const rowKey = (row: Row): string => `${row.runtime}-${row.codec}-${row.r
 
 // ── what the page emits ─────────────────────────────────────────────────────
 
+/**
+ * Which thread fed the ring, from `audio.out.thread`: the page's audio worker, with the transport its own
+ * session ran over, or the page's main thread, with why the page took the audio back when it did.
+ * `pending` while the worker is starting.
+ */
+export type Thread = { kind: "worker"; transport?: string } | { kind: "main"; reason?: string } | { kind: "pending" };
+
 /** One 250 ms probe sample: everything public the page could read at that instant. */
 export type Sample = {
 	/** Milliseconds since the page started sampling, on the viewer clock. */
@@ -331,6 +338,11 @@ export type Sample = {
 	skipped?: number;
 	/** `audio.out.stats`, passed through as-is: whatever the build publishes. */
 	stats?: Record<string, unknown>;
+	/**
+	 * `audio.out.thread`: which thread fed the ring. Absent on a build without the signal, which is a
+	 * different answer from `pending`: that build cannot say, rather than has not started.
+	 */
+	thread?: Thread;
 
 	/** `sync.out.delay`: the resolved playout target, in ms. */
 	delay?: Ms;
@@ -376,7 +388,10 @@ export type Sample = {
 export type Environment = {
 	/** Whether the document is cross-origin isolated, and therefore which ring can run. */
 	crossOriginIsolated: boolean;
-	/** The transport the session negotiated. Anything but WebTransport bypasses the UDP shaper. */
+	/**
+	 * The transport the page's session negotiated. Anything but WebTransport bypasses the UDP shaper. The
+	 * audio worker's own session is a second one, reported in {@link Sample.thread}.
+	 */
 	transport?: string;
 	/** Round-trip time the connection reports, in ms. */
 	rtt?: Ms;
@@ -431,6 +446,25 @@ export type Void = {
 	detail: string;
 };
 
+/**
+ * Why a browser row's audio did not run where every such row expects it, or undefined when it did: on the
+ * page's audio worker, whose own session negotiated `transport`, the lane's. That session is a second one,
+ * which the page's `transport` does not show. A build that cannot say which thread is not voided for it.
+ */
+export function threadVoid(thread: Thread | undefined, transport: string): Void | undefined {
+	if (thread === undefined) return undefined;
+	if (thread.kind === "pending") return { assertion: "thread", detail: "the audio worker never started" };
+	if (thread.kind === "main") {
+		const why = thread.reason === undefined ? "" : `: ${thread.reason}`;
+		return { assertion: "thread", detail: `the audio played on the main thread${why}` };
+	}
+	if (thread.transport === transport) return undefined;
+	const detail = thread.transport
+		? `the audio worker's session negotiated ${thread.transport}`
+		: "the audio worker had no session";
+	return { assertion: "transport", detail };
+}
+
 /** Everything one matrix row produced: the graded numbers plus what makes them trustworthy. */
 export type Summary = {
 	/** Schema version, bumped when a metric's meaning changes rather than when one is added. */
@@ -447,6 +481,12 @@ export type Summary = {
 	rate: number;
 	/** What the page reported about itself. */
 	environment: Environment | null;
+	/**
+	 * Which thread fed the ring when the run ended. The page never gives the audio back to its worker once
+	 * it takes it, so this is the one that held. Null on a build that cannot say; absent on a lane with no
+	 * page.
+	 */
+	thread?: Thread | null;
 	/** Reasons this row is not gradeable. Empty means it is. */
 	voids: Void[];
 

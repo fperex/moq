@@ -511,6 +511,10 @@ const metrics: Record<string, number | null> = {
 	media_drift_last: round1(mediaDrift),
 };
 
+// Which thread fed the ring when the run ended. The page never hands the audio back to its worker once it
+// has taken it, so the last word is the one that held; the drivers void a row that was not on the worker.
+const thread = samples.findLast((s) => s.thread !== undefined)?.thread ?? null;
+
 const summary: Summary = {
 	version: 1,
 	row,
@@ -519,6 +523,7 @@ const summary: Summary = {
 	warmupSec,
 	rate,
 	environment,
+	thread,
 	voids,
 	metrics,
 	targetSeries,
@@ -535,10 +540,20 @@ await Bun.write(join(run, `${tag}.summary.json`), JSON.stringify(summary, null, 
 
 // ── the table ───────────────────────────────────────────────────────────────
 
+const threadLine =
+	thread === null
+		? "a thread this build does not report"
+		: thread.kind === "worker"
+			? `the page's audio worker, over ${thread.transport ?? "no session"}`
+			: thread.kind === "main"
+				? `the main thread${thread.reason === undefined ? "" : ` (${thread.reason})`}`
+				: "the audio worker, still starting";
 const lines: string[] = [
 	`## ${tag}`,
 	"",
 	`window ${summary.windowSec}s after a ${warmupSec}s warmup, ${window.length} samples at ${SAMPLE_INTERVAL_MS}ms, rate ${rate}Hz`,
+	"",
+	`audio fed by ${threadLine}`,
 	"",
 ];
 if (voids.length > 0) {

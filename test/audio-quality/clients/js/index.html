@@ -21,6 +21,9 @@
       // Both names, because qmux prefers `WebSocketStream` where the browser has it and only falls
       // back to `WebSocket`. Removing one and not the other looks like it works and changes nothing.
       //
+      // The player's audio worker races only what this page races, so its own session loses the
+      // fallback here too.
+      //
       // `?fallback=1` keeps them, and is how the Safari lane runs at all: `@moq/net` refuses
       // WebTransport on every WebKit engine (quest/m0/webkit-webtransport-gate.md), so a Safari row
       // has nowhere to go but the WebSocket. It is also why that lane runs against the relay

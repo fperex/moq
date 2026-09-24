@@ -16,7 +16,7 @@ import "@moq/watch/element"; // defines <moq-watch>
 import "@moq/watch/ui"; // defines <moq-watch-ui>
 import type MoqWatch from "@moq/watch/element";
 import { beacon } from "./beacon.ts";
-import { probe } from "./probe.ts";
+import { probe, threadOf } from "./probe.ts";
 
 const params = new URLSearchParams(location.search);
 const required = (name: string): string => {
@@ -100,6 +100,9 @@ setInterval(() => {
 			webSocket: typeof (globalThis as unknown as { WebSocket?: unknown }).WebSocket,
 			crossOriginIsolated: globalThis.crossOriginIsolated === true,
 			transport: environment?.transport,
+			// The audio's own path: the page's audio worker has a session of its own, which `transport`
+			// does not see.
+			thread: threadOf(watch),
 			timestamp: peek(() => watch.audio.out.timestamp.peek()),
 			stalled: peek(() => watch.audio.out.stalled.peek()),
 			underruns: peek(() => watch.audio.out.underruns.peek()),

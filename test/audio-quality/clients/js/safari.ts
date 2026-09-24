@@ -32,7 +32,16 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { serve } from "../../../interop/clients/js/harness.ts";
-import { type Beacon, type Environment, type Ring, SAMPLE_INTERVAL_MS, type Sample, type Void } from "./src/schema.ts";
+import {
+	type Beacon,
+	type Environment,
+	type Ring,
+	SAMPLE_INTERVAL_MS,
+	type Sample,
+	type Thread,
+	threadVoid,
+	type Void,
+} from "./src/schema.ts";
 import { WebDriver } from "./webdriver.ts";
 
 const { values } = parseArgs({
@@ -108,6 +117,7 @@ console.log(`endpoint: page ${pageUrl}`);
 type Status = {
 	crossOriginIsolated: boolean;
 	transport?: string;
+	thread?: Thread;
 	timestamp?: number;
 	stalled?: boolean;
 	underruns?: number;
@@ -122,6 +132,14 @@ let sentEnvironment = false;
 const note = (assertion: string, detail: string) => {
 	console.error(`void: ${assertion}: ${detail}`);
 	voids.push({ assertion, detail });
+};
+
+// The audio's own path, over the WebSocket this lane runs on. See `driver.ts`.
+const checkThread = (status: Status | undefined) => {
+	const found = threadVoid(status?.thread, "websocket");
+	if (found && !voids.some((v) => v.assertion === found.assertion && v.detail === found.detail)) {
+		note(found.assertion, found.detail);
+	}
 };
 
 // Outside the try below only so the helpers can name it; a driver that never starts is a row that
@@ -204,6 +222,9 @@ try {
 		await collect();
 		await sleep(200);
 	}
+	const started = await readStatus();
+	console.log(`thread: ${JSON.stringify(started?.thread ?? null)}`);
+	checkThread(started);
 
 	const before = await readClock();
 	const clockWindow = Date.now() + 10_000;
@@ -233,6 +254,7 @@ try {
 
 	const final = await readStatus();
 	console.log(`final: ${JSON.stringify(final)}`);
+	checkThread(final);
 	await collect(true);
 } catch (err) {
 	const message = err instanceof Error ? err.message : String(err);

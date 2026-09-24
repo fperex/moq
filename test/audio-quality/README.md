@@ -120,6 +120,10 @@ not the other looks like it works and changes nothing. With the fallback gone th
 runs on WebTransport, the shaper reports 990 datagrams up and 6267 down, and the resolved target
 rises from 100 ms to 440 ms, which is the impairment the row exists to measure.
 
+The player's audio worker dials a session of its own and races only what the page races, so the
+same removal keeps the audio's session on QUIC too. The driver checks both: the page's session is
+`transport` in the status block, the worker's is inside `thread`.
+
 ## The Safari lane
 
 Real Safari, driven through `safaridriver` over plain W3C WebDriver ([`clients/js/webdriver.ts`](clients/js/webdriver.ts),
@@ -132,8 +136,9 @@ Three things follow from the engine, and each one changes what the lane may clai
 **The session is a WebSocket.** `@moq/net` refuses WebTransport on every WebKit engine, because
 WebKit's flow-control window never refills ([webkit-webtransport-gate](../../quest/m0/webkit-webtransport-gate.md)).
 So the page keeps its WebSocket for this lane (`?fallback=1`, the one thing the Chromium lane denies
-outright) and the row records `transport: websocket`. A row that somehow negotiates anything else is
-void, because these budgets were measured on the reliable transport.
+outright) and the row records `transport: websocket`, as does the audio worker's own session. A row
+that somehow negotiates anything else on either is void, because these budgets were measured on the
+reliable transport.
 
 **The shaper is therefore not in the path.** A WebSocket is TCP, and the shaper passes TCP through
 untouched by design. There is no impairment to apply and none to claim, so the lane runs against the
@@ -327,10 +332,15 @@ Two derivations have to survive that, and both were wrong before they were measu
 A row that cannot be trusted is void, and a void row is reported rather than graded. Marking it
 passed would be worse than failing it, so under `--enforce` a void row fails the run.
 
+The thread is not a matrix axis. Every browser row expects the worker, and each summary records the
+thread that held at the end as `thread`: the worker with its session's transport, or the main thread
+with the page's reason.
+
 | Void | Why |
 | --- | --- |
 | `shaper` | An active profile's `delayed` counter is zero, so the impairment never applied and an impaired run became an unimpaired pass. `near-zero` and `fixed-250` are exempt: zero is the right answer for the control. |
-| `transport` | The session negotiated something other than WebTransport. A WebSocket fallback is TCP and never touches the UDP shaper. The page denies the fallback outright (below), so this is a backstop rather than the usual outcome. |
+| `transport` | The page's session, or its audio worker's own, negotiated something other than WebTransport. A WebSocket fallback is TCP and never touches the UDP shaper. The page denies the fallback outright (below), for the worker too, so this is a backstop rather than the usual outcome. The Safari lane expects a WebSocket instead. |
+| `thread` | The audio did not come from the page's audio worker, the player's default: the page played it on its main thread (the detail says why), or the worker never started. Checked once the audio plays and again at the end, since the page takes the audio back for good. A build that predates the worker cannot say, and is not voided for it. |
 | `ring` | The document's `crossOriginIsolated` does not match the ring the row asked for, so the other ring ran. |
 | `clock` | `AudioContext.currentTime` drifted more than 1% from wall time over the first ten seconds, or was never readable. |
 | `window` | No samples survived the warmup. |
@@ -370,6 +380,7 @@ clients/js/
   src/probe.ts              samples the element's public signals every 250ms
   src/beacon.ts             batches to the sink, sendBeacon on pagehide
   src/schema.ts             the metric contract
+  src/*.test.ts             the thread void rule and how the probe reads the thread, under `just test`
   driver.ts                 one row in headless Chromium, and the void checks
   replay.ts                 the recorded traces, with no relay, shaper, or browser
   safari.ts                 one row in real Safari, and the void checks it needs instead

@@ -20,7 +20,7 @@
  * @module
  */
 import type MoqWatch from "@moq/watch/element";
-import { type Environment, SAMPLE_INTERVAL_MS, type Sample } from "./schema.ts";
+import { type Environment, SAMPLE_INTERVAL_MS, type Sample, type Thread } from "./schema.ts";
 
 /** Anything with a `peek()`, which is every signal under an `out`. */
 type Peekable<T> = { peek(): T };
@@ -45,6 +45,22 @@ function maybe<T>(read: () => T): T | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Which thread feeds the ring, from `audio.out.thread`, or undefined on a build without the signal.
+ *
+ * A build that predates the audio worker cannot say, which is a different answer from a worker still
+ * starting (`pending`), the way `clock` below tells a missing signal from the wall clock. Copied field by
+ * field, so the sample carries plain data.
+ */
+export function threadOf(watch: MoqWatch): Thread | undefined {
+	const out = maybe(() => watch.audio.out);
+	if (!out || !("thread" in out)) return undefined;
+	const thread = maybe(() => out.thread.peek());
+	if (!thread) return { kind: "pending" };
+	if (thread.kind === "worker") return { kind: "worker", transport: thread.transport };
+	return { kind: "main", reason: thread.reason };
 }
 
 /**
@@ -169,6 +185,7 @@ export function probe(watch: MoqWatch): Probe {
 			// probe does not read it, so those metrics are null on the browser lanes and filled only
 			// by the replay lane, which drives the engine directly.
 			stats: maybe(() => audio.stats.peek()) as Record<string, unknown> | undefined,
+			thread: threadOf(watch),
 
 			delay: num(sync.delay),
 			jitter: num(sync.jitter),
