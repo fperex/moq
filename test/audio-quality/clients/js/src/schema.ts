@@ -447,12 +447,28 @@ export type Void = {
 };
 
 /**
- * Why a browser row's audio did not run where every such row expects it, or undefined when it did: on the
- * page's audio worker, whose own session negotiated `transport`, the lane's. That session is a second one,
- * which the page's `transport` does not show. A build that cannot say which thread is not voided for it.
+ * Why a browser row's audio did not run where the row expects it, or undefined when it did: on the page's
+ * audio worker, whose own session negotiated `transport`, the lane's. That session is a second one, which
+ * the page's `transport` does not show. A row that keeps its audio on the page (`expect` "main") expects
+ * the main thread by choice instead, so a fallback to it, which carries a reason, means the page tried the
+ * worker after all. A build that cannot say which thread is not voided for it.
  */
-export function threadVoid(thread: Thread | undefined, transport: string): Void | undefined {
+export function threadVoid(
+	thread: Thread | undefined,
+	transport: string,
+	expect: "worker" | "main" = "worker",
+): Void | undefined {
 	if (thread === undefined) return undefined;
+	if (expect === "main") {
+		if (thread.kind === "main" && thread.reason === undefined) return undefined;
+		const detail =
+			thread.kind === "main"
+				? `the page fell back to the main thread rather than keeping the audio there: ${thread.reason}`
+				: thread.kind === "worker"
+					? "the audio played on the worker, where the row keeps it on the main thread"
+					: "the audio had no thread yet, where the row keeps it on the main thread";
+		return { assertion: "thread", detail };
+	}
 	if (thread.kind === "pending") return { assertion: "thread", detail: "the audio worker never started" };
 	if (thread.kind === "main") {
 		const why = thread.reason === undefined ? "" : `: ${thread.reason}`;

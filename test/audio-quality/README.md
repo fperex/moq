@@ -13,6 +13,7 @@ just test audio-quality --out ~/runs/after                 # keep the run direct
 just test audio-quality --enforce                          # fail on the budgets
 just test audio-quality --runtime safari                   # real Safari, local only
 just test audio-quality --runtime replay                   # the recorded traces, in a second
+just test audio-quality --offload false                    # the audio on the page's main thread
 ```
 
 The matrix is codec x jitter profile x ring path: 24 rows, about 30 minutes at the default 60
@@ -334,13 +335,15 @@ passed would be worse than failing it, so under `--enforce` a void row fails the
 
 The thread is not a matrix axis. Every browser row expects the worker, and each summary records the
 thread that held at the end as `thread`: the worker with its session's transport, or the main thread
-with the page's reason.
+with the page's reason. `--offload false` (Chromium only) runs every row with the audio kept on the
+page's main thread instead, so the two can be compared on the same matrix, and those rows expect the
+main thread with no reason: a reason is a fallback, meaning the page tried the worker after all.
 
 | Void | Why |
 | --- | --- |
 | `shaper` | An active profile's `delayed` counter is zero, so the impairment never applied and an impaired run became an unimpaired pass. `near-zero` and `fixed-250` are exempt: zero is the right answer for the control. |
 | `transport` | The page's session, or its audio worker's own, negotiated something other than WebTransport. A WebSocket fallback is TCP and never touches the UDP shaper. The page denies the fallback outright (below), for the worker too, so this is a backstop rather than the usual outcome. The Safari lane expects a WebSocket instead. |
-| `thread` | The audio did not come from the page's audio worker, the player's default: the page played it on its main thread (the detail says why), or the worker never started. Checked once the audio plays and again at the end, since the page takes the audio back for good. A build that predates the worker cannot say, and is not voided for it. |
+| `thread` | The audio did not come from the page's audio worker, the player's default: the page played it on its main thread (the detail says why), or the worker never started. Under `--offload false`, the audio did not stay on the main thread by choice: it played on the worker, or fell back with a reason. Checked once the audio plays and again at the end, since the page takes the audio back for good. A build that predates the worker cannot say, and is not voided for it. |
 | `ring` | The document's `crossOriginIsolated` does not match the ring the row asked for, so the other ring ran. |
 | `clock` | `AudioContext.currentTime` drifted more than 1% from wall time over the first ten seconds, or was never readable. |
 | `window` | No samples survived the warmup. |

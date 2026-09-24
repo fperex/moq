@@ -32,6 +32,12 @@ const tag = required("tag");
 // unit because the element requires one: `delay="250"` is rejected, `delay="250ms"` is not.
 const delay = params.get("delay") ?? "auto";
 const sink = params.get("sink");
+// `offload=false` keeps the audio on this page's main thread rather than the player's audio worker, so the
+// lane can grade the page's own path against the worker's. Absent, the element's default: the worker.
+const offload = params.get("offload");
+if (offload !== null && offload !== "true" && offload !== "false") {
+	throw new Error(`?offload takes true or false, not ${JSON.stringify(offload)}`);
+}
 
 document.title = `moq audio quality: ${tag}`;
 
@@ -44,6 +50,7 @@ watch.setAttribute("delay", delay);
 // The window is never frontmost in a headless run, and the default visibility policy would stop
 // downloading video and take the audio track's pacing with it.
 watch.setAttribute("visible", "always");
+if (offload !== null) watch.setAttribute("offload", offload);
 watch.appendChild(document.createElement("canvas"));
 
 const ui = document.createElement("moq-watch-ui");

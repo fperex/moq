@@ -33,13 +33,14 @@ const { values } = parseArgs({
 		out: { type: "string" },
 		ring: { type: "string", default: "plain" },
 		port: { type: "string", default: "0" },
+		offload: { type: "string", default: "true" },
 	},
 });
 
 const durationSec = Number.parseFloat(values.duration);
 if (!values.url || !values.broadcast || !values.page || !values.tag || !values.out) {
 	console.error(
-		"usage: driver.ts --url U --broadcast B --page DIR --tag T --out DIR [--delay auto] [--duration 60] [--sink URL] [--ring plain|isolated]",
+		"usage: driver.ts --url U --broadcast B --page DIR --tag T --out DIR [--delay auto] [--duration 60] [--sink URL] [--ring plain|isolated] [--offload true|false]",
 	);
 	process.exit(2);
 }
@@ -52,6 +53,12 @@ if (ring !== "plain" && ring !== "isolated") {
 	console.error(`error: --ring must be plain or isolated (got '${values.ring}')`);
 	process.exit(2);
 }
+// `false` keeps the page's audio on its main thread, which the row then expects instead of the worker.
+if (values.offload !== "true" && values.offload !== "false") {
+	console.error(`error: --offload must be true or false (got '${values.offload}')`);
+	process.exit(2);
+}
+const expectThread = values.offload === "false" ? "main" : "worker";
 
 const out = resolve(values.out);
 mkdirSync(out, { recursive: true });
@@ -85,6 +92,7 @@ const query = new URLSearchParams({
 	tag: values.tag,
 });
 if (values.sink) query.set("sink", values.sink);
+if (values.offload === "false") query.set("offload", "false");
 const pageUrl = `${server.origin}/${ring}/?${query}`;
 console.log(`endpoint: page ${pageUrl}`);
 
@@ -119,9 +127,9 @@ const note = (assertion: string, detail: string) => {
 
 // The audio's own path, which the page's transport cannot show: the page hands its audio to a worker whose
 // session is a second one, and takes it back for good when the worker cannot play it. So it is checked
-// once the audio plays and again at the end.
+// once the audio plays and again at the end. A row run with `--offload false` expects the main thread.
 const checkThread = (status: Status | undefined) => {
-	const found = threadVoid(status?.thread, "webtransport");
+	const found = threadVoid(status?.thread, "webtransport", expectThread);
 	if (found && !voids.some((v) => v.assertion === found.assertion && v.detail === found.detail)) {
 		note(found.assertion, found.detail);
 	}

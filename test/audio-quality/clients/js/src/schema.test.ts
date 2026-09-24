@@ -30,4 +30,19 @@ test("a worker that never started voids the row", () => {
 
 test("a build that cannot say which thread fed the ring is not voided for it", () => {
 	expect(threadVoid(undefined, "webtransport")).toBeUndefined();
+	expect(threadVoid(undefined, "webtransport", "main")).toBeUndefined();
+});
+
+test("a row that keeps its audio on the page counts only the main thread it chose", () => {
+	expect(threadVoid({ kind: "main" }, "webtransport", "main")).toBeUndefined();
+	expect(threadVoid({ kind: "worker", transport: "webtransport" }, "webtransport", "main")).toEqual({
+		assertion: "thread",
+		detail: "the audio played on the worker, where the row keeps it on the main thread",
+	});
+	expect(threadVoid({ kind: "pending" }, "webtransport", "main")?.assertion).toBe("thread");
+	// A reason is a fallback: the page tried the worker the row told it not to use.
+	expect(threadVoid({ kind: "main", reason: "the worker failed to load" }, "webtransport", "main")).toEqual({
+		assertion: "thread",
+		detail: "the page fell back to the main thread rather than keeping the audio there: the worker failed to load",
+	});
 });

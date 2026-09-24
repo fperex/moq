@@ -11,7 +11,8 @@
 #     turns an impaired run into an unimpaired pass.
 #   - The transport was WebTransport, on the page's session and on its audio worker's own. A
 #     WebSocket fallback is TCP and never touches the UDP shaper.
-#   - The audio came from the page's audio worker, the player's default, not its main thread.
+#   - The audio came from the page's audio worker, the player's default, not its main thread; or,
+#     under `--offload false`, from the main thread the page was told to keep it on.
 #   - The ring that ran is the one the row asked for, which is decided by whether the document is
 #     cross-origin isolated, not by anything the page can assert about itself.
 #
@@ -64,6 +65,8 @@ SEED_SET=0
 OUT=""
 LIST=0
 ENFORCE=0
+OFFLOAD=true
+OFFLOAD_SET=0
 PROFILE="${AQ_PROFILE:-debug}"
 
 split() {
@@ -130,6 +133,12 @@ while [[ $# -gt 0 ]]; do
             ENFORCE=1
             shift
             ;;
+        --offload)
+            need "$1" $# "${2:-}"
+            OFFLOAD="$2"
+            OFFLOAD_SET=1
+            shift 2
+            ;;
         *)
             echo "unknown arg: $1" >&2
             exit 2
@@ -157,6 +166,15 @@ valid() {
     exit 2
 }
 valid "$RUNTIME" runtime "${ALL_RUNTIMES[@]}"
+valid "$OFFLOAD" offload true false
+
+# `--offload false` keeps every row's audio on the page's main thread instead of the player's audio
+# worker, and the row then expects that thread. Only the Chromium driver takes it: the replay lane has
+# no page, and the Safari driver would otherwise run its rows on the worker under the flag.
+if [[ $OFFLOAD_SET -eq 1 && "$RUNTIME" != chromium ]]; then
+    echo "error: --offload is the chromium runtime's; the $RUNTIME runtime does not take it" >&2
+    exit 2
+fi
 
 # The runtime decides which profiles exist, so the default is resolved after it is known and an
 # explicit list is checked against that runtime's set rather than against every name the file knows.
@@ -479,6 +497,7 @@ for entry in "${ROWS[@]}"; do
             --duration "$DURATION" \
             --tag "$tag" \
             --sink "$SINK_URL/log" \
+            --offload "$OFFLOAD" \
             --out "$HARNESS_RUN" || true
     fi
     harness_wait "$HARNESS_PID" || status=$?
