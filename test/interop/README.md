@@ -124,6 +124,11 @@ Each run covers, against a real local relay:
   is not a person clicking a browser prompt.
 - **pause and resume**, **unsubscribe and rejoin**, **detach and reattach**,
   **publisher stop and same-path republish**, and **late join**.
+- **audio thread** - every measured window must find the player's audio on the
+  thread the run expects, read off `audio.out.thread`: the page's audio worker
+  by default, and the page's own main thread in a second run that sets
+  `offload="false"` and repeats every case that plays the audio. Each run is the
+  other's control: a reading stuck on either thread fails one of them.
 - **resources return to baseline** - the page wraps `WebTransport`, `WebSocket`,
   `AudioContext`, and `Worker` to count live instances, so a detach that leaks a
   session is visible rather than merely invisible.

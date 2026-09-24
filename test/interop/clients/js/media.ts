@@ -11,7 +11,11 @@
  * Launches with Chromium's gesture-required autoplay policy. The capture case adds a fake device
  * while Playwright controls permission. No page reloads: the publisher reports when it is ready.
  *
- *     bun media.ts --url http://127.0.0.1:4443 [--timeout 30] [--cases pause,detach]
+ * Every measured window also requires the audio on the thread the pass expects: the page's audio
+ * worker by default, the page's own main thread under `--offload false`, which sets the player's
+ * `offload="false"`.
+ *
+ *     bun media.ts --url http://127.0.0.1:4443 [--timeout 30] [--cases pause,detach] [--offload false]
  *     bun media.ts --url ... --fault silent-audio --cases none --expect-fail "audio tone"
  *
  * @module
@@ -44,6 +48,7 @@ import {
 	waitForWatch,
 } from "./harness";
 import {
+	type AudioThread,
 	type CaptureState,
 	FAULTS,
 	KEYFRAME_INTERVAL_MS,
@@ -64,6 +69,7 @@ const { values } = parseArgs({
 		fault: { type: "string", default: "none" },
 		cases: { type: "string" },
 		leak: { type: "boolean", default: false },
+		offload: { type: "string", default: "true" },
 		"expect-fail": { type: "string" },
 	},
 });
@@ -76,13 +82,25 @@ const selected = new Set<string>(
 	values.cases === undefined ? CASES : values.cases === "none" ? [] : values.cases.split(","),
 );
 const unknown = [...selected].filter((name) => !CASES.some((c) => c === name));
-if (!url || !Number.isFinite(timeoutMs) || timeoutMs <= 0 || !FAULTS.some((f) => f === fault) || unknown.length > 0) {
+if (
+	!url ||
+	!Number.isFinite(timeoutMs) ||
+	timeoutMs <= 0 ||
+	!FAULTS.some((f) => f === fault) ||
+	unknown.length > 0 ||
+	(values.offload !== "true" && values.offload !== "false")
+) {
 	console.error(
-		`usage: media.ts --url U [--timeout S>0] [--fault ${FAULTS.join("|")}] [--cases none|${CASES.join(",")}] [--leak] [--expect-fail TEXT]`,
+		`usage: media.ts --url U [--timeout S>0] [--fault ${FAULTS.join("|")}] [--cases none|${CASES.join(",")}] [--leak] [--offload true|false] [--expect-fail TEXT]`,
 	);
 	process.exit(2);
 }
 const wants = (name: Case) => selected.has(name);
+
+// Whether the player hands its audio to the page's worker, which is its default, and so where every
+// measured window has to find it.
+const offload = values.offload === "true";
+const thread: AudioThread = offload ? "worker" : "main";
 
 // process.exit narrows `url` above, but not inside the function declarations below.
 const relay: string = url;
@@ -179,7 +197,7 @@ function traceLine(sample: PlayerState, start: number): string {
 	return (
 		`    +${((sample.at - start) / 1000).toFixed(2)}s frame=${sample.frameId ?? "-"} ` +
 		`step=${sample.toneStep ?? "-"}/${step} tone=${margin.toFixed(0)}dB ${sample.toneHz?.toFixed(0) ?? "-"}Hz ` +
-		`paused=${sample.paused}`
+		`paused=${sample.paused} thread=${sample.audioThread ?? "-"}`
 	);
 }
 
@@ -203,6 +221,16 @@ function assertMedia(samples: PlayerState[], label: string): void {
 
 function measure(samples: PlayerState[], label: string): void {
 	check(samples.length >= 10, "sampling", () => `${label}: only ${samples.length} samples in the window`);
+
+	// A state rather than a reading: no sample may name the other thread, and the window has to end on
+	// this one. A sample still waiting on the worker is allowed, as the picture can be back before it.
+	const astray = samples.find((s) => s.audioThread !== undefined && s.audioThread !== thread);
+	const ending = samples[samples.length - 1]?.audioThread;
+	check(
+		astray === undefined && ending === thread,
+		"audio thread",
+		() => `${label}: the audio ran on ${astray?.audioThread ?? ending ?? "no thread yet"}, not ${thread}`,
+	);
 
 	const readable = samples.filter((s) => s.frameId !== undefined);
 	check(
@@ -263,7 +291,7 @@ function measure(samples: PlayerState[], label: string): void {
 	);
 	console.error(
 		`  ${label}: ${rate.toFixed(1)}fps presented over ${advance} frames, tone ${margin.toFixed(0)}dB above the floor, ` +
-			`skew median ${median.toFixed(0)}ms p95 ${p95.toFixed(0)}ms (browser output, not a speaker)`,
+			`skew median ${median.toFixed(0)}ms p95 ${p95.toFixed(0)}ms, audio on ${thread} (browser output, not a speaker)`,
 	);
 }
 
@@ -353,8 +381,15 @@ async function subscriber(
 	const [page, errors] = await open(
 		await browserFor(),
 		// visible="always" because the window is never frontmost in a headless run, and the default
-		// policy would stop downloading video and leave the canvas black.
-		pageUrl(server.origin, "subscribe", { url: relay, broadcast, visible: "always", muted: String(muted) }),
+		// policy would stop downloading video and leave the canvas black. `offload` only when it is off,
+		// so the default pass runs the element's own default.
+		pageUrl(server.origin, "subscribe", {
+			url: relay,
+			broadcast,
+			visible: "always",
+			muted: String(muted),
+			...(offload ? {} : { offload: "false" }),
+		}),
 		label,
 		trace,
 	);

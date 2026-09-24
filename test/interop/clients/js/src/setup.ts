@@ -80,6 +80,11 @@ if (role === "publish") {
 	const visible = params.get("visible");
 	if (visible) el.setAttribute("visible", visible);
 
+	// The media driver's second pass keeps the audio on the page's main thread; absent, the element's
+	// default feeds it from the audio worker.
+	const offload = params.get("offload");
+	if (offload) el.setAttribute("offload", offload);
+
 	const player = document.createElement("moq-watch-ui");
 	player.appendChild(el);
 	document.body.appendChild(player);
@@ -105,6 +110,7 @@ if (role === "publish") {
 			stray.setAttribute("url", url);
 			stray.setAttribute("name", broadcast);
 			stray.setAttribute("visible", "always");
+			if (offload) stray.setAttribute("offload", offload);
 			stray.appendChild(document.createElement("canvas"));
 			leak.appendChild(stray);
 		},
