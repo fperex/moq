@@ -62,10 +62,10 @@ export type DecoderInput = {
 	 * Whether the audio is fed from a dedicated worker rather than the page's main thread. Defaults to true.
 	 *
 	 * The worker subscribes, decodes and writes the ring on a session of its own to {@link url}, so a busy
-	 * main thread cannot starve the ring. One worker serves every player on the page. Needs a {@link url}
-	 * and a `Worker`; without either the audio stays on the page. So it does, for good, once the worker
-	 * cannot start (a CSP without `worker-src blob:`, say), fails, stops reporting, refuses the rendition, or
-	 * plays nothing in five seconds of trying: `out.thread` says which.
+	 * main thread cannot starve the ring. One worker serves every player on the page. Needs a {@link url},
+	 * a `Worker` and Web Audio; without them the audio stays on the page. So it does, for good, once the
+	 * worker cannot start (a CSP without `worker-src blob:`, say), fails, stops reporting, refuses the
+	 * rendition, or plays nothing in five seconds of trying: `out.thread` says which.
 	 */
 	offload: Getter<boolean>;
 };
@@ -244,8 +244,8 @@ export class Decoder {
 			if (effect.get(this.#fallback) !== undefined) return "main";
 			if (!effect.get(this.in.offload)) return "main";
 			if (effect.get(this.in.url) === undefined) return "main";
-			// No worker to hand it to: server rendering, or a runtime without one.
-			if (typeof Worker !== "function") return "main";
+			// No worker to hand it to, or no Web Audio for it to feed: server rendering, a test runner.
+			if (typeof Worker !== "function" || typeof AudioContext !== "function") return "main";
 			return "worker";
 		});
 

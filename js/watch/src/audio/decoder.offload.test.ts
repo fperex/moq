@@ -1114,6 +1114,15 @@ describe("the thread a player's audio runs on", () => {
 		expect(InProcessWorker.created).toEqual([]);
 	});
 
+	it("is the page's, for no reason, where nothing can play audio at all, so the worker is never loaded", async () => {
+		// Server rendering, or a test runner: no Web Audio, so no ring for a worker to feed.
+		Reflect.deleteProperty(globalThis, "AudioContext");
+		const t = tile({ offload: true });
+		await until(() => t.page.live() === 1, "the page's own subscription");
+		expect(t.decoder.out.thread.peek()).toEqual({ kind: "main" });
+		expect(InProcessWorker.created).toEqual([]);
+	});
+
 	it("is the worker's by default, with the transport its session runs over", async () => {
 		const t = tile();
 		await until(() => t.decoder.out.thread.peek()?.kind === "worker", "the worker");
