@@ -23,6 +23,7 @@ import "@moq/watch/ui"; // defines <moq-watch-ui>
 import { Hang, Net, Signals } from "@moq/watch";
 import type MoqWatch from "@moq/watch/element";
 import MoqWatchSupport from "@moq/watch/support/element";
+import { stallFrom } from "./stall";
 import { bufferBars, formatBitrate, formatFps, graph, renderRows } from "./viz";
 
 /** Re-exported so bundlers keep the `<moq-watch-support>` element registration. */
@@ -30,6 +31,16 @@ export { MoqWatchSupport };
 
 // Injected by Vite (see justfile). Defaults to the local relay.
 const RELAY_URL = import.meta.env.VITE_RELAY_URL ?? "http://localhost:4443";
+
+// Bench tools, off unless the query asks: `?offload=0` keeps every tile's audio on the main thread
+// rather than the page's audio worker, `?stall=MS/EVERY` freezes the main thread (see stall.ts), and
+// `?csp=1` refuses the worker (see watch.html).
+const bench = new URLSearchParams(location.search);
+const offload = bench.get("offload");
+if (offload !== null && offload !== "0" && offload !== "1") {
+	throw new Error(`?offload takes 0 or 1, not ${JSON.stringify(offload)}`);
+}
+stallFrom(bench);
 
 const $ = <T extends HTMLElement>(id: string): T => {
 	const el = document.getElementById(id);
@@ -133,6 +144,7 @@ function createTile(name: string): WatchTile {
 	// rather than hardcoding "auto" is what keeps a viewer's choice through a republish, which
 	// rebuilds the tile from scratch.
 	watch.delay = delay.peek();
+	if (offload === "0") watch.setAttribute("offload", "false");
 	const canvas = document.createElement("canvas");
 	canvas.style.cssText = "width: 100%; height: auto;";
 	watch.appendChild(canvas);
