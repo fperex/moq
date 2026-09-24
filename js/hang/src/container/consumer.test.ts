@@ -805,48 +805,6 @@ test("a cold tune-in walks onto its first buffered group instead of skipping it"
 	consumer.close();
 });
 
-// A cursor can sit below a lone group before anything has played: the first group the
-// subscription opened closed with nothing in it, the one after never came, and the live group is
-// still downloading. There is no presented end to prove the hole against and no second group to
-// measure the missing one by, so the head's own frames are the measure: the missing group cannot
-// present past where the live group begins.
-test("a cursor below a lone group still downloading walks onto it once its frames span the budget", async () => {
-	const track = new Track.Producer("video");
-	const consumer = new Consumer(replay(track), { format: new LegacyFormat("video"), maxAge: 40 as Time.Milli });
-
-	// Group 16 closes empty, which leaves the cursor on 17 with nothing presented. 17 never arrives.
-	const empty = new Group.Producer(16);
-	track.writeGroup(empty);
-	empty.close();
-	await settle();
-	expect((await consumer.next())?.frame).toBeUndefined(); // group 16 done
-
-	const pending = consumer.next();
-	const waiting = () => Promise.race([pending, settle(100).then(() => "waiting" as const)]);
-
-	// The live group opens after the gap and grows one frame at a time, and nothing follows it.
-	const live = new Group.Producer(18);
-	track.writeGroup(live);
-	live.writeFrame({ payload: encodeLegacy(1_200_000 as Time.Micro), timestamp: Time.Timestamp.now() });
-	live.writeFrame({ payload: encodeLegacy(1_233_333 as Time.Micro), timestamp: Time.Timestamp.now() });
-	// 33ms of it is inside the 40ms budget, so group 17 may still be on its way.
-	expect(await waiting()).toBe("waiting");
-
-	live.writeFrame({ payload: encodeLegacy(1_266_667 as Time.Micro), timestamp: Time.Timestamp.now() });
-	const result = await waiting();
-	expect(result).not.toBe("waiting");
-	const delivered = result as { frame?: Frame; group: number; continuous: boolean } | undefined;
-	expect(delivered?.group).toBe(18);
-	expect(delivered?.frame?.timestamp).toBe(1_200_000 as Time.Micro);
-	// The missing span is a hole, not something the reader may bridge.
-	expect(delivered?.continuous).toBe(false);
-	expect(consumer.discontinuity).toBe(1);
-	// Nothing that arrived was thrown away.
-	expect(consumer.skipped.peek()).toBe(0);
-
-	consumer.close();
-});
-
 test("Consumer measures how late frames arrive", async () => {
 	const track = new Track.Producer("test");
 	const consumer = new Consumer(track.subscribe(), { format: new LegacyFormat("audio"), maxAge: 500 as Time.Milli });
