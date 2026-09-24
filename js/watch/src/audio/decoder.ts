@@ -27,7 +27,6 @@ import * as Playout from "./playout";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
-import { Starvation } from "./starvation";
 import { type DecodedSpan, Terminal } from "./terminal";
 import { unlockOnGesture } from "./unlock";
 import { Warmup } from "./warmup";
@@ -195,9 +194,6 @@ export class Decoder {
 	// What makes "as long as the rendition lasts" outlive the effect below, which ends the moment
 	// the rendition leaves the catalog. See `Estimator`.
 	#estimator = new Estimator();
-
-	// The current rendition's arrival estimate, which the ring reports running dry to. See #runSpread.
-	#jitter?: Container.Jitter;
 
 	// The decoder fields that require a new worklet and ring. Routing and metadata changes leave
 	// them alone.
@@ -457,14 +453,6 @@ export class Decoder {
 				this.#out.debug.set(debug && { ...debug, budget: inner.get(this.#maxAge) });
 			});
 
-			// The ring running dry is the one thing about this receiver its arrivals cannot show, so
-			// the rendition's estimate hears it from here. See Starvation.
-			const starvation = new Starvation(ring.rate);
-			effect.run((inner) => {
-				const debug = inner.get(ring.debug);
-				if (debug) starvation.update(debug, this.#jitter, Time.Milli.now());
-			});
-
 			effect.set(this.#out.root, worklet);
 		});
 	}
@@ -601,12 +589,6 @@ export class Decoder {
 		if (!identity) return;
 
 		const spread = this.#estimator.spread(identity, effect.get(this.source.out.jitter));
-
-		// The ring outlives any one rendition, so it finds the estimate it reports to here.
-		this.#jitter = spread;
-		effect.cleanup(() => {
-			if (this.#jitter === spread) this.#jitter = undefined;
-		});
 
 		// Published for as long as the estimator lives, not for as long as a subscription does. A
 		// mute would otherwise drop what Sync knows about this track and hand it back a moment

@@ -325,50 +325,6 @@ describe.each(RINGS)("%s ring, the rare tail", (ring, build) => {
 	});
 });
 
-/**
- * A receiver whose own event loop freezes for `freeze` ms every `every` ms, `count` times from `from`.
- *
- * The path is untouched: every frame lands on time. The ones that land while the loop is frozen are
- * read the moment it runs again, and every frame read within one tick of that moment is flagged
- * `stalled`, which is what `Stall.blocked` answers there. The estimator discounts all of them, so
- * nothing in the arrivals says the ring is too shallow; only the ring running dry can.
- */
-function frozen(t: Arrival[], options: { from: number; every: number; freeze: number; count: number }): Arrival[] {
-	// `Stall`'s tick: an arrival read further than this from the end of a block is read by a loop
-	// already running normally.
-	const TICK = 50;
-	const { from, every, freeze, count } = options;
-
-	return t.map((a) => {
-		const index = Math.floor((a.arrival - from) / every);
-		if (index < 0 || index >= count) return a;
-		const start = from + index * every;
-		const end = start + freeze;
-		if (a.arrival < end) return { ...a, arrival: end, stalled: true };
-		if (a.arrival - end <= TICK) return { ...a, stalled: true };
-		return a;
-	});
-}
-
-describe.each(RINGS)("%s ring, a receiver that freezes", (ring, build) => {
-	it("stops running dry once the first run-dry has raised the target", () => {
-		// What the bench measured on a plain page: a 120ms freeze every 1.5s for 30s. The arrivals
-		// cannot say the ring is too shallow, since every frame the freeze held is the receiver's own
-		// wait, so the target sits on one bucket and the ring, holding 40ms, runs dry on every freeze.
-		const t = frozen(trace(1800, 1, 2), { from: 5000, every: 1500, freeze: 120, count: 20 });
-		const measured = play(build, t, { rate: RATE, floorMs: FLOOR, warmupMs: 4000 });
-
-		console.log(
-			`${ring}/freeze: ${measured.underruns} underruns, ${measured.concealed} concealed samples over ${measured.merges} merges, ${measured.accelerates} accelerates, ${measured.skipped} skipped samples, target ${measured.target}ms at the end`,
-		);
-
-		// The first freeze runs it dry and says by how much; the second may still find it a few
-		// milliseconds short. After that the raised target covers every freeze the hold spans.
-		expect(measured.underruns).toBeLessThanOrEqual(2);
-		expect(measured.short).toBe(0);
-	});
-});
-
 // --- The age budget above the decoder ---
 
 /** The recording's own frame duration, which is the floor this harness holds the target above. */

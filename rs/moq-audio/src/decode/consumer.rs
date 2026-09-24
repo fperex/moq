@@ -522,9 +522,8 @@ impl Consumer {
 		}
 
 		let at = playout.engine.playhead().unwrap_or_default();
-		let now = playout.now();
 		let mut block = std::mem::take(&mut playout.block);
-		playout.engine.pull(&mut block, now);
+		playout.engine.pull(&mut block);
 		let bytes = format.from_interleaved_f32(&block, channels);
 		playout.block = block;
 

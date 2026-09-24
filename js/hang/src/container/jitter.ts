@@ -37,16 +37,6 @@ const LOWER_INTERVAL = 1000;
 // released an old delay. A divisor rather than a fraction keeps the arithmetic exact in every language.
 const LOWER_DIVISOR = 6;
 
-/**
- * How long the target stays up after the player last ran dry, in milliseconds.
- *
- * A run-dry says what the arrivals cannot: that this receiver stops, whether its page froze or its
- * device did, and nothing says when it will stop again. The hold is how long that is believed. It
- * has to outlast the gap between the freezes that cause it, or the fall walks the target back into
- * the next one, and every second past that is latency paid by a receiver that froze once.
- */
-export const HOLD = 30_000;
-
 // One admitted arrival, on both axes in milliseconds.
 type Arrival = { timestamp: number; arrival: number };
 
@@ -102,11 +92,6 @@ export type JitterProps = {
  * that can see the receiver was blocked says so with {@link JitterObservation.stalled}; the spacing
  * the estimator infers it from covers a caller that cannot.
  *
- * That leaves a receiver that keeps freezing with a target the arrivals will never raise, and a
- * player that runs dry on every freeze. So the player reports each time it does
- * ({@link Jitter.starved}): the target rises at once to cover what it ran out of and stays there for
- * a while after the last report, then falls the way any other rise does.
- *
  * The algorithm is written down in `doc/concept/playout.md` and held to it by the conformance
  * corpus at `rs/moq-audio/tests/playout-01.json`. The design is WebRTC's NetEq
  * (`modules/audio_coding/neteq/`: `underrun_optimizer.cc`, `packet_arrival_history.cc`,
@@ -160,9 +145,6 @@ export class Jitter {
 	// The published target, and when it last moved.
 	#target: number;
 	#lowered?: number;
-
-	// The level the player's run-dries asked for, and when that ask runs out.
-	#held?: { level: number; until: number };
 
 	#value: Signal<Time.Milli>;
 
@@ -243,25 +225,6 @@ export class Jitter {
 		this.#publish(arrival);
 	}
 
-	/** Raise the target to cover the `gap` of audio the player just ran out of, and keep it up for a while. */
-	starved(gap: Time.Milli, now: Time.Milli): void {
-		if (!(gap >= 0)) throw new RangeError(`jitter: a run-dry of ${gap}ms is not a duration`);
-		const at = now as number;
-
-		// The player ran dry holding what this target asked for, so covering the gap takes the two
-		// together. A caller reporting the same run-dry twice passes only what the target does not
-		// already cover, which is what lets each report be measured from the target it finds.
-		const level = Math.min(Jitter.CEILING, Math.ceil((this.#target + gap) / Jitter.BUCKET) * Jitter.BUCKET);
-
-		// A report inside a running hold can only raise its level, and every report restarts it: the
-		// hold is measured from the last time the player ran dry, not the first.
-		const held = this.#held;
-		const running = held !== undefined && at < held.until;
-		this.#held = { level: running ? Math.max(held.level, level) : level, until: at + HOLD };
-
-		this.#publish(at);
-	}
-
 	/**
 	 * Forget the arrival reference, keeping the measured distribution.
 	 *
@@ -334,27 +297,15 @@ export class Jitter {
 	}
 
 	#publish(now: number): void {
-		// A run-dry's level stands until its hold runs out, and is gone for good after that: from
-		// then on the fall below walks the target back toward what the histogram asks for.
-		if (this.#held !== undefined && now >= this.#held.until) this.#held = undefined;
-		const held = this.#held?.level;
+		const optimal = this.#optimal;
 
 		// A seed is a prior, not an observation. It holds the target until the histogram has
 		// measured something, and the first measurement then replaces it outright however far below
 		// it that lands: there is no earlier measurement for the fall bound to protect, and walking
 		// down from a guess keeps a viewer above their real buffer for tens of seconds. NetEq does
 		// the same, replacing `kStartDelayMs` with the first optimal delay it gets rather than
-		// approaching it (`delay_manager.cc`). A run-dry is not a guess, so it can raise the prior
-		// before then, and the first measurement does not land below it.
-		if (this.#optimal === undefined) {
-			if (held !== undefined && held > this.#target) this.#set(held);
-			return;
-		}
-
-		// The held level is one more thing the target has to cover, exactly as though the histogram
-		// had asked for it: the target rises to it at once, and comes down through the same limiter
-		// once the hold lets it go.
-		const optimal = held === undefined ? this.#optimal : Math.max(this.#optimal, held);
+		// approaching it (`delay_manager.cc`).
+		if (optimal === undefined) return;
 		if (!this.#measured) {
 			this.#measured = true;
 			this.#lowered = now;

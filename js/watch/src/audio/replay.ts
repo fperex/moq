@@ -19,13 +19,9 @@ import { type RingReader, type Snapshot, Stretcher } from "./playout";
 import { speech } from "./playout/fixture";
 import { AudioRingBuffer } from "./ring-buffer";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
-import { Starvation } from "./starvation";
 
 /** An AudioWorklet render quantum, in frames. */
 const QUANTUM = 128;
-
-/** How often the main thread reads the ring's counters, in ms: `SharedAudioBuffer`'s poll. */
-const POLL = 50;
 
 /** One Opus frame, which is the chunk a synthetic trace is built from. */
 export const CHUNK_MS = 20;
@@ -282,8 +278,7 @@ export interface Options {
  * The estimator runs live, exactly as `Container.Consumer` drives it: observe at arrival, and let
  * the new target reach the ring the way `Sync` and `Decoder.#runLatency` push it there. A settled
  * number measured up front would hide the thing the design turns on, which is that the target rises
- * the moment an arrival proves the buffer too shallow. It hears the ring run dry the way `Decoder`
- * reports it too, through `Starvation`, on reads a block in the trace holds back.
+ * the moment an arrival proves the buffer too shallow.
  */
 export function replay(build: Build, t: Arrival[], options: Options): Result {
 	const { rate, floorMs, warmupMs, fixed, sampleMs, conceal = true, capture = false } = options;
@@ -297,9 +292,6 @@ export function replay(build: Build, t: Arrival[], options: Options): Result {
 
 	const ring = build(latency());
 	const engine = new Stretcher(rate, 1, conceal);
-	const starvation = new Starvation(rate);
-	// When the main thread next reads the ring. See the loop below.
-	let read = 0;
 	// The tone restarts with every replay, so a row is the same whether it ran alone or after five
 	// others: the splice the correlation search picks depends on the phase it is handed.
 	voiceAt = 0;
@@ -319,17 +311,6 @@ export function replay(build: Build, t: Arrival[], options: Options): Result {
 	let length = 0;
 
 	for (let now = 0; now < end; now += step) {
-		// The main thread reads the ring's counters on a timer, the way `SharedAudioBuffer` polls
-		// them, and hands what it reads to the estimator the way `Decoder` does. A block holds that
-		// read back with everything else on the thread: a frame still waiting to be read out of one
-		// says the thread has not come back yet. Ahead of the arrivals of the same instant, so the
-		// first read after a freeze reaches the estimator before the backlog reaches the ring.
-		const blocked = next < t.length && t[next].stalled === true && t[next].arrival > now;
-		if (now >= read && !blocked) {
-			starvation.update(ring.debug(), jitter, now as Time.Milli);
-			read = now + POLL;
-		}
-
 		while (next < t.length && t[next].arrival <= now) {
 			if (t[next].endpoint) {
 				// A declared pause carries no media: nothing to insert, and nothing to measure a
