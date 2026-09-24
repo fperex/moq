@@ -2,8 +2,8 @@
  * Types each chunk so a decoder run always opens with one the decoder will accept.
  *
  * A decoder that was just configured, reset, or flushed only accepts a chunk marked `key`, and the
- * container only marks a group's first frame as one. Re-anchoring the decoder mid-group (see the
- * Decoder's `#reanchor`) would otherwise hand the fresh decoder a `delta` and throw `DataError`,
+ * container only marks a group's first frame as one. Re-anchoring the decoder mid-group (see
+ * `Supply.#reanchor`) would otherwise hand the fresh decoder a `delta` and throw `DataError`,
  * which kills the decode loop and leaves the rest of the session silent.
  *
  * Every frame of the audio codecs hang carries is independently decodable, which is what makes

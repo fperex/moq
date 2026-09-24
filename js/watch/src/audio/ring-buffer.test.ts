@@ -1063,7 +1063,7 @@ describe("latency increase re-anchor", () => {
 		expect(buffer.stalled).toBe(false);
 
 		// reset() re-stalls, so the ring refills to the (new) floor before playing again, and it also
-		// throws the buffer away and re-anchors. The Decoder parks with stall() instead (#runLatency),
+		// throws the buffer away and re-anchors. The supply parks with stall() instead (`Supply.#runLatency`),
 		// and only for a delay the viewer set past the stretch bound; reset() contrasts with resize().
 		buffer.reset();
 		expect(buffer.stalled).toBe(true);

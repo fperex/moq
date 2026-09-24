@@ -224,7 +224,7 @@ describe("video follows the audio playhead", () => {
 // the audio a listener hears: the decoder has to be told about it (`Terminal.continues`), because
 // it timestamps its output by accumulating frame durations from the chunk that opened its run and
 // would otherwise put live audio seconds in the past; and the ring has to be flushed while nothing
-// is draining it (`Audio.Decoder.#runFlush`), because replaying what it still holds steps the
+// is draining it (`Supply.#runFlush`), because replaying what it still holds steps the
 // playhead back to where the mute started. Each is switched off in turn below as the control.
 
 // 20ms of media per frame, the Opus packet this suite's traces carry.
@@ -358,7 +358,7 @@ function postAudioBuffer(worklet: FakeWorklet, latency: number): AudioBuffer {
 /**
  * Replay the viewer's sequence through a real ring, a real estimator and a real `Sync`.
  *
- * `reanchor` is `Audio.Decoder.#reanchor`, `flush` is `Audio.Decoder.#runFlush`; both are what this
+ * `reanchor` is `Supply.#reanchor`, `flush` is `Supply.#runFlush`; both are what this
  * is regression-testing, so each can be switched off to reproduce the desync it fixes.
  *
  * `port` runs the playhead through the real fallback transport instead of reading the ring directly:
