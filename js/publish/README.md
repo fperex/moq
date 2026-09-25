@@ -66,7 +66,7 @@ The simplest way to publish a stream:
 | `url`       | string  | required | Relay server URL                |
 | `name`      | string  | required | Broadcast name                  |
 | `source`    | string  | —        | `"camera"`, `"screen"`, `"file"` |
-| `muted`     | boolean | false    | Mute audio capture              |
+| `muted`     | boolean | false    | Release the microphone. The audio rendition stays in the catalog, paused, so unmuting resumes on the subscriptions it already has. |
 | `invisible` | boolean | false    | Disable video capture           |
 | `preview`   | string  | `"source"` | What the preview renders: `"source"`, `"encoded"`, `"none"` |
 | `announce`  | string  | `"source"` | When to advertise: `"always"`, `"never"`, `"source"` (once media is captured). A camera source waits for every enabled track. The broadcast is created while connected either way. |
@@ -76,7 +76,9 @@ Camera and microphone failures are observable through `el.sources.video`
 and `el.sources.audio`. When those signals hold a `Source.Camera` or
 `Source.Microphone`, read its `out.error` signal. It contains an `Error` (for
 example, a `NotAllowedError` when permission is refused). A refused capture is not retried until permission, device selection,
-constraints, or the source's enabled state changes. `<moq-publish-ui>` shows
+constraints, or the source's enabled state changes. A device that is only busy
+(`NotReadableError`), held by another application or still being released, is
+tried again until it frees. `<moq-publish-ui>` shows
 capture failures in its status badge.
 
 ## JavaScript API
@@ -87,7 +89,9 @@ more encoders:
 
 Standalone components start enabled when `enabled` is omitted. Camera and microphone sources may
 request permission immediately. Create an enabled screen source during the user gesture that
-authorizes screen capture, or pass a live input that is false until that gesture.
+authorizes screen capture, or pass a live input that is false until that gesture. Audio capture
+that starts before the page's first click or keypress waits for one: browsers suspend Web Audio
+until then, and the audio rendition stays out of the catalog until samples flow.
 
 ```typescript
 import * as Publish from "@moq/publish";

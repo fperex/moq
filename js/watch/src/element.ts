@@ -27,6 +27,8 @@ const OBSERVED = [
 	"announced",
 	"delay",
 	"buffer",
+	"conceal",
+	"offload",
 	// Released spellings are observed only so assigning them can fail loudly instead of being ignored.
 	"reload",
 	"latency",
@@ -153,11 +155,17 @@ export default class MoqWatch extends HTMLElement {
 	// Broadcast configuration owned here and wired into `broadcast` as inputs.
 	#name = new Signal<Moq.Path.Valid>(Moq.Path.empty());
 	#announced = new Signal(true);
+	#conceal = new Signal(true);
+	#offload = new Signal(true);
 	#catalogFormat = new Signal<CatalogFormat | undefined>(undefined);
 	#catalog = new Signal<Catalog.Root | undefined>(undefined);
 
 	// The canvas element to render into.
 	#canvas = new Signal<HTMLCanvasElement | undefined>(undefined);
+
+	// Re-resolve the canvas child and republish it. Held so `connectedCallback` can re-arm the
+	// renderer's download gate; the constructor owns the closure.
+	#setCanvas?: (force?: boolean) => void;
 
 	// The overlay element captions are drawn into, created lazily on connect (custom elements may not
 	// touch children in their constructor). Positioned to fill the element, above the canvas.
@@ -190,10 +198,14 @@ export default class MoqWatch extends HTMLElement {
 
 		this.player = new Player({
 			origin: this.connection.origin,
+			// The same relay, for the audio worker's own session.
+			url: this.connection.url,
 			probe: this.connection.probe,
 			enabled: this.#enabled,
 			name: this.#name,
 			announced: this.#announced,
+			conceal: this.#conceal,
+			offload: this.#offload,
 			catalogFormat: this.#catalogFormat,
 			catalog: this.#catalog,
 			canvas: this.#canvas,
@@ -228,7 +240,14 @@ export default class MoqWatch extends HTMLElement {
 		});
 
 		// Watch to see if the canvas element is added or removed.
-		const setCanvas = () => {
+		//
+		// `force` republishes an unchanged canvas. The renderer's download gate is an
+		// IntersectionObserver armed on this node, and an observer armed on a node that is not in a
+		// document reports it as not intersecting with nothing to re-check when it lands in one.
+		// A page that re-appends its tiles to reorder them moves the node, which is the same story
+		// with the same answer. So `connectedCallback` republishes: the canvas object has not
+		// changed, but where it sits has, and where it sits is the whole of what the gate reads.
+		const setCanvas = (force = false) => {
 			const canvas = this.querySelector("canvas") ?? undefined;
 
 			// A <video> child used to render via MSE. Nothing renders it now, and audio still plays,
@@ -237,13 +256,17 @@ export default class MoqWatch extends HTMLElement {
 				console.warn("moq-watch: rendering requires a <canvas> child; a <video> child does nothing.");
 			}
 
-			this.#canvas.set(canvas);
+			this.#canvas.set(canvas, force || undefined);
 		};
+		this.#setCanvas = setCanvas;
 
-		const observer = new MutationObserver(setCanvas);
+		const observer = new MutationObserver(() => setCanvas());
 		observer.observe(this, { childList: true, subtree: true });
 		this.signals.cleanup(() => observer.disconnect());
 		setCanvas();
+		// A custom element may not touch its children in the constructor, so a page that appends
+		// the canvas after `createElement` arms the gate on a detached node. `connectedCallback`
+		// is what fixes that up.
 
 		// Optionally update attributes to match the library state.
 		// This is kind of dangerous because it can create loops.
@@ -335,6 +358,11 @@ export default class MoqWatch extends HTMLElement {
 		this.style.display = "block";
 		this.style.position = "relative";
 
+		// Re-arm the renderer's download gate on this node's new place in the document. See
+		// `setCanvas`: without it a tile built before it was inserted, or moved by a page
+		// reordering its tiles, downloads audio and never asks for video again.
+		this.#setCanvas?.(true);
+
 		// Create the caption overlay once, on first connect (the constructor may not add children).
 		if (!this.#captionsOverlayEl) {
 			const overlay = document.createElement("div");
@@ -352,6 +380,10 @@ export default class MoqWatch extends HTMLElement {
 	disconnectedCallback() {
 		// Stop everything but don't actually cleanup just in case we get added back to the DOM.
 		this.#enabled.set(false);
+
+		// A canvas out of the document is not on screen, so the download gate closes with it. The
+		// element keeps the child; `connectedCallback` republishes it.
+		this.#canvas.set(undefined);
 	}
 
 	attributeChangedCallback(name: Observed, oldValue: string | null, newValue: string | null) {
@@ -378,6 +410,10 @@ export default class MoqWatch extends HTMLElement {
 			this.controls.delay.set(parseDelay(newValue));
 		} else if (name === "buffer") {
 			this.controls.buffer.set(parseBuffer(newValue));
+		} else if (name === "conceal") {
+			this.#conceal.set(parseBoolean(newValue, true));
+		} else if (name === "offload") {
+			this.#offload.set(parseBoolean(newValue, true));
 		} else if (name === "reload") {
 			console.warn("moq-watch: `reload` was renamed to `announced`");
 		} else if (name === "latency" || name === "latency-min" || name === "jitter") {
@@ -454,10 +490,28 @@ export default class MoqWatch extends HTMLElement {
 		throw new Error("moq-watch: `reload` was renamed to `announced`");
 	}
 
+	/** Whether a gap in the audio is concealed rather than played as a gap. See {@link Audio.DecoderInput.conceal}. */
+	get conceal(): boolean {
+		return this.#conceal.peek();
+	}
+
+	set conceal(value: boolean) {
+		this.#conceal.set(value);
+	}
+
+	/** Whether the audio is fed from the page's audio worker rather than its main thread. See {@link Audio.DecoderInput.offload}. */
+	get offload(): boolean {
+		return this.#offload.peek();
+	}
+
+	set offload(value: boolean) {
+		this.#offload.set(value);
+	}
+
 	/**
 	 * How far playback trails the live edge, in milliseconds. See {@link Delay}.
 	 *
-	 * `"auto"` (the default) sizes the jitter buffer from the connection RTT. `"instant"` drops the
+	 * `"auto"` (the default) sizes the jitter buffer from how late frames arrive. `"instant"` drops the
 	 * clock instead: video paints the moment it decodes and audio is disabled.
 	 */
 	get delay(): Delay {

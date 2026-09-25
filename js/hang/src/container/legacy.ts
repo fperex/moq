@@ -144,6 +144,8 @@ export class Producer {
 		this.#interval = undefined;
 		const timestamp = end ?? this.#liveEdge;
 		if (this.#format.kind === "data" || this.#marked || timestamp === undefined) return;
+		// A closed track has nowhere to put the marker either, and nobody left to tell. See #close.
+		if (this.#track.closed.peek() !== undefined) return;
 
 		const group = this.#track.appendGroup();
 		this.#timeline?.record(group.sequence, timestamp, false);
@@ -160,6 +162,16 @@ export class Producer {
 	// Flush and close the current group at the supplied or estimated end timestamp.
 	#close(end?: Time.Micro) {
 		if (!this.#group) return;
+		// A closed track tore its groups down with it, so an endpoint has nowhere to go: writing one
+		// throws instead of publishing anything. Nothing is waiting for it either, since the track
+		// closing is what told every subscriber the timeline stopped.
+		if (this.#track.closed.peek() !== undefined) {
+			this.#group = undefined;
+			this.#end = undefined;
+			this.#previous = undefined;
+			this.#reordered = false;
+			return;
+		}
 		if (
 			this.#format.kind === "video" &&
 			!this.#reordered &&

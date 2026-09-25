@@ -30,8 +30,10 @@ in sync at the latency you ask for.
 | --- | --- |
 | `url`, `name` | Relay URL (with `?jwt=` if needed) and broadcast name. |
 | `paused`, `muted`, `volume` | The usual player controls, mirrored as reactive properties. |
-| `delay` | How far playback trails the live edge: `"auto"` (derived from RTT, the default), a duration like `"300ms"`, or `"instant"` to paint frames as they decode with no pacing at all. |
+| `delay` | How far playback trails the live edge: `"auto"` (the default, sized from how late frames actually arrive), a duration like `"300ms"` which is the whole delay, or `"instant"` to paint frames as they decode with no pacing at all. |
 | `buffer` | Future-dated media held beyond the live edge before playback skips ahead, e.g. `"30s"`. Defaults to none. |
+| `conceal` | Cover a gap in the audio with synthesized audio instead of playing it as a gap (default on). `conceal="false"` leaves the loss audible, for a listener who would rather hear it than hear invented audio. Read when the audio graph is built. |
+| `offload` | Feed the audio from a worker, off the page's main thread (default on). `offload="false"` keeps it on the page. See [Audio off the main thread](#audio-off-the-main-thread). |
 | `captions` | The caption track to show, or absent for off. `el.text.out.available` lists the renditions for a picker. |
 | `visible` | Only subscribe to video while the element is on screen: a margin (`"20%"` default, `"200px"`), `"always"`, or `"never"`. |
 | `announced` | Wait for the broadcast to be announced before subscribing (default on), so a player can be mounted before the stream exists. |
@@ -39,6 +41,8 @@ in sync at the latency you ask for.
 
 The overlay adds play/pause, volume, fullscreen, a quality selector, a
 buffering indicator, an unsupported-codec warning, and a stats panel.
+The stats panel counts rendered frames, so its frame-rate graph shows zero
+when the displayed picture stops advancing.
 `<moq-watch-support>` shows what the browser can play.
 
 ## Binding from a framework
@@ -106,7 +110,7 @@ const dispose = el.signals.run((effect) => {
     const consumer = new Json.Snapshot.Consumer<unknown>({ track });
     effect.spawn(async () => {
         for (;;) {
-            const value = await Promise.race([effect.cancel, consumer.next()]);
+            const value = await effect.race(consumer.next());
             if (value === undefined) break;
             console.log("metadata", value);
         }
@@ -141,6 +145,8 @@ const connection = new Moq.Connection({ url: new URL("https://relay.example.com/
 const player = new Watch.Player({
     origin: connection.origin,
     probe: connection.probe,
+    // The relay the audio worker dials; without it the audio stays on the main thread.
+    url: connection.url,
     name: Moq.Path.from("alice.hang"),
     canvas,
 });
@@ -154,6 +160,120 @@ to change later, such as `muted` or `delay`. `Player` owns the same pipeline as
 `<moq-watch>`; `Watch.Broadcast`, `Sync`, and the per-track components remain
 available for custom composition. Load the element from a CDN
 (`https://esm.sh/@moq/watch/element`) for a no-build embed.
+
+## Audio off the main thread
+
+By default the audio does not wait on the page's main thread. One worker per
+page subscribes to every player's audio, decodes it, and writes the ring the
+audio worklet plays from, so a page busy with layout, video, or its own scripts
+cannot starve the sound. The page keeps the AudioContext, the picture, the
+captions, and the controls, and the worker reports back what the stats and the
+clock need.
+
+The worker writes the ring with messages, on a cross-origin isolated page too.
+Only audio kept on the page writes it through shared memory, which isolation
+allows.
+
+`offload="false"`, or `el.offload = false`, keeps a player's audio on the main
+thread.
+
+The worker dials the relay itself, with the same URL (`?jwt=` included) and only
+the transports the page would race. So a page holds one more session per relay
+URL, which all its players share, and the relay's priority of audio over video
+applies within each session, not between the two.
+
+A browser without `Worker` keeps the audio on the page. The page also keeps it,
+or takes it back for good, and warns once in the console, when:
+
+- a Content Security Policy refuses the worker, which starts from a `blob:` URL:
+  allow it with `worker-src blob:`;
+- the worker has no native `AudioDecoder`, or cannot open a transport the page
+  would use;
+- the worker plays nothing within 5 seconds of trying, counting only time the
+  page could play it (unmuted, unpaused, its AudioContext running, the broadcast
+  live);
+- the audio worklet cannot read a message it is sent;
+- the worker gets stuck: it fails, or says nothing for 2 seconds while it plays.
+
+Taking the audio back costs one gap about as long as tuning in. A worker that
+failed or never started keeps every later player on the page on the main thread
+too.
+
+Safari runs a worker's WebSocket through the page's main thread, and a Safari
+session is a WebSocket, so there a busy page can still hold up the audio's
+bytes on their way in. The decoding and the ring writes stay off it.
+
+`Player` does the same when it has the relay's `url`, which the element passes
+it. Without one, its audio stays on the page.
+
+## Keeping tracks together
+
+`Watch.Sync` is the clock the tracks render against. It takes the playback
+settings, `delay` and `buffer`, and nothing else; each track is wired through a
+handle of its own:
+
+```ts
+const sync = new Watch.Sync({ delay: "auto" });
+
+const audio = sync.track("audio");
+audio.spread; // how late its frames actually arrived
+```
+
+`"auto"` is that measurement, the largest across every track;
+`sync.track("text")` joins on the same footing. What the selected rendition
+says it flushes at once is not a second term: it is the same quantity measured
+by the publisher, so it is where the measurement starts (the container
+consumer's `jitter`) and the arrivals take it from there, up or down. A fixed
+`delay` is exactly the number asked for, with nothing added to it.
+
+While audio plays, its ring publishes where it is (`audio.clock`) and
+everything else is paced against that: `sync.wait()` for video frames,
+`sync.now()` for captions. A ring that re-buffers parks its playhead, and
+video parks with it instead of running away from the audio you can hear. Mute
+the player or end the track and the clock is handed back to the wall clock
+where the playhead left it, so nothing jumps. `sync.out.clock` names whichever
+track is driving, or is empty while playback runs on wall time.
+
+## Converging on the delay
+
+The audio ring is almost never exactly on its target: a publisher that flushes
+several frames at once fills it in steps, the network moves the arrivals around,
+and the target itself follows what arrives. Rather than jump, the ring plays the
+media very slightly faster or slower until it is back where it belongs, the way
+WebRTC's NetEq does. Each correction drops or repeats one pitch period, at most
+15ms per 100ms of audio and only where the waveform repeats, so convergence is
+inaudible.
+
+Skipping ahead is left for what the stretch cannot close in half a second.
+`audio.out.underruns` counts the times the ring ran dry, and the stats panel
+shows the corrections beside it: `Stretch` counts the blocks played fast and then
+the blocks played slow, and `Skipped` what was thrown away. A healthy stream
+shows corrections and no skips; skips mean the delay is moving faster than the
+stretch can follow.
+
+## Covering what never arrived
+
+A stretch bends a few percent, so it cannot cover a packet that is a whole
+hundred milliseconds late or a group the network gave up on. Rather than play the
+hole as silence, the player carries the audio on: it takes the pitch period of
+the last real audio, repeats it, and fades it out if the outage runs on, the way
+WebRTC's NetEq conceals one. When the media comes back it is lined up against the
+concealment and crossfaded in, so neither end of the outage is a click. The fade
+ends in digital silence rather than in room tone, which is what the pinned
+Chromium tree does and what tells a paused talker apart from a dead stream; a
+publisher that means to pause says so on the wire instead, and the player renders
+that as silence with no concealment at all.
+
+The stats panel's `Concealed` row is how much audio was invented and how many
+separate outages that covered. Turn it off with `conceal` on the audio decoder
+and a gap is a gap again, audibly:
+
+```ts
+new Watch.Audio.Decoder({ source, sync, conceal: false });
+```
+
+It is read when the audio graph is built, since it belongs to the reader inside
+the worklet.
 
 ## Buffered playback
 

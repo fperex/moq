@@ -4,7 +4,7 @@
  * @module
  */
 import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
-import { FrameTooLarge, GroupTooLarge, TooFarBehind } from "./error.ts";
+import { Expired, FrameTooLarge, GroupTooLarge, TooFarBehind } from "./error.ts";
 import { hooks, type ReadGroupFrame } from "./internal.ts";
 import { Timestamp } from "./time.ts";
 
@@ -410,7 +410,7 @@ export class Consumer {
 		if (!this.#expiry?.expired()) return false;
 
 		if (unread) {
-			this.#terminal = new Error("group exceeded the subscription max age budget");
+			this.#terminal = new Expired();
 		} else {
 			this.#ended = true;
 		}
@@ -419,10 +419,8 @@ export class Consumer {
 	}
 
 	#guard<T>(operation: Promise<T>): Promise<T> {
-		if (this.#expire(true)) return Promise.reject(this.#terminal);
-		if (this.#terminal) return Promise.reject(this.#terminal);
 		const expiry = this.#expiry;
-		if (!expiry) return operation;
+		if (!expiry && !this.#terminal) return operation;
 
 		return new Promise<T>((resolve, reject) => {
 			let settled = false;
@@ -441,7 +439,9 @@ export class Consumer {
 				}
 			};
 
-			for (const changed of expiry.changed) disposes.push(changed.subscribe(check));
+			for (const changed of expiry?.changed ?? []) disposes.push(changed.subscribe(check));
+			// The write has already started. Observe it before an expiry verdict can reset
+			// the stream and reject it, including when the group expired before this call.
 			operation.then(
 				(value) => finish(() => resolve(value)),
 				(error: unknown) => finish(() => reject(error)),

@@ -461,7 +461,7 @@ enum AnnounceState {
 	Decode,
 	/// Waiting on the peer's SETUP for the session-wide excluded origin
 	/// (lite-05, whose wire carries no per-stream exclude_hop).
-	ExcludeHop { prefix: crate::PathOwned },
+	ExcludeHop { prefix: crate::PathOwned, hidden: bool },
 	/// Streaming announce updates.
 	Run {
 		origin: origin::Consumer,
@@ -487,6 +487,7 @@ impl<S: crate::transport::poll::Session> AnnounceServe<S> {
 					let mut cx = Context::from_waker(waiter.waker());
 					let interest = ready!(stream.reader.poll_decode::<lite::AnnounceRequest>(&mut cx))?;
 					let prefix = interest.prefix.to_owned();
+					let hidden = interest.hidden;
 
 					// The identity whose routes we filter out. Lite-04/05 carry it per
 					// announce stream; lite-06+ reads the session-wide SETUP Hop
@@ -499,20 +500,20 @@ impl<S: crate::transport::poll::Session> AnnounceServe<S> {
 							0 => assigned,
 							id => id,
 						};
-						self.start(prefix, exclude_hop);
+						self.start(prefix, exclude_hop, hidden);
 					} else if self.shared.version.has_setup_stream() {
-						self.state = AnnounceState::ExcludeHop { prefix };
+						self.state = AnnounceState::ExcludeHop { prefix, hidden };
 					} else {
-						self.start(prefix, assigned);
+						self.start(prefix, assigned, hidden);
 					}
 				}
-				AnnounceState::ExcludeHop { prefix } => {
+				AnnounceState::ExcludeHop { prefix, hidden } => {
 					let assigned = self.shared.peer_hop.map(|origin| origin.id()).unwrap_or(0);
 					let exclude_hop = ready!(self.shared.peer_setup.poll_hop(waiter))
 						.map(|origin| origin.id())
 						.unwrap_or(assigned);
-					let prefix = prefix.clone();
-					self.start(prefix, exclude_hop);
+					let (prefix, hidden) = (prefix.clone(), *hidden);
+					self.start(prefix, exclude_hop, hidden);
 				}
 				AnnounceState::Run { origin, announced, run } => {
 					let stream = self.stream.as_mut().expect("stream present");
@@ -537,7 +538,7 @@ impl<S: crate::transport::poll::Session> AnnounceServe<S> {
 		}
 	}
 
-	fn start(&mut self, prefix: crate::PathOwned, exclude_hop: u64) {
+	fn start(&mut self, prefix: crate::PathOwned, exclude_hop: u64, hidden: bool) {
 		// If the requested prefix is outside our scope (an empty origin, or a token
 		// that doesn't grant it), we simply have nothing to announce. Respond with an
 		// empty set and keep the stream open (the subscriber treats a FIN here as a
@@ -556,6 +557,12 @@ impl<S: crate::transport::poll::Session> AnnounceServe<S> {
 		// model uses this exposure to park a reflected copy before it can replace
 		// the source we are currently advertising to that peer.
 		let origin = origin.excluding(Hop::new(exclude_hop).unwrap_or(Hop::UNKNOWN));
+		// Hidden routes are left out unless the peer opted in. A publish origin that
+		// already opted in (the caller's choice for this peer) keeps them either way.
+		let origin = match hidden {
+			true => origin.with_hidden(true),
+			false => origin,
+		};
 		let announced = origin.announced();
 		let run = AnnounceRun::new(prefix, self.shared.self_origin, self.shared.version);
 		self.state = AnnounceState::Run { origin, announced, run };
@@ -2420,6 +2427,28 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 	/// every failure as Cancel.
 	fn poll_serve(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		loop {
+			if let GroupState::Serve { writer, .. } | GroupState::Closed { writer } = &mut self.state {
+				// Queue and SUBSCRIBE_UPDATE priority changes apply on every pass,
+				// whatever the write pipeline is blocked on. The rank is re-read as
+				// a send order when handled, since the two conventions are inverted.
+				while let Poll::Ready(rank) = self.priority.poll_next(waiter) {
+					writer.set_priority(PriorityHandle::send_order_of(rank));
+				}
+				let seen = self.ctx.track_priority_seen;
+				// A dropped producer just disables this arm, like the queue arm above.
+				if let Poll::Ready(Ok(value)) = self.ctx.track_priority.poll(waiter, |value| {
+					if **value != seen {
+						Poll::Ready(**value)
+					} else {
+						Poll::Pending
+					}
+				}) {
+					self.ctx.track_priority_seen = value;
+					let rank = self.priority.set_track(value);
+					writer.set_priority(PriorityHandle::send_order_of(rank));
+				}
+			}
+
 			match &mut self.state {
 				GroupState::Open => {
 					if self.group.poll_expired(waiter) {
@@ -2463,26 +2492,6 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 					batch_pos,
 				} => {
 					let mut cx = Context::from_waker(waiter.waker());
-
-					// Queue and SUBSCRIBE_UPDATE priority changes apply on every pass,
-					// whatever the write pipeline is blocked on. The rank is re-read as
-					// a send order when handled, since the two conventions are inverted.
-					while let Poll::Ready(rank) = self.priority.poll_next(waiter) {
-						writer.set_priority(PriorityHandle::send_order_of(rank));
-					}
-					let seen = self.ctx.track_priority_seen;
-					// A dropped producer just disables this arm, like the queue arm above.
-					if let Poll::Ready(Ok(value)) = self.ctx.track_priority.poll(waiter, |value| {
-						if **value != seen {
-							Poll::Ready(**value)
-						} else {
-							Poll::Pending
-						}
-					}) {
-						self.ctx.track_priority_seen = value;
-						let rank = self.priority.set_track(value);
-						writer.set_priority(PriorityHandle::send_order_of(rank));
-					}
 
 					let outcome = 'serve: {
 						// The peer closing first cancels the group.
@@ -2607,7 +2616,22 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 					// poll_close releases the stream on completion: the peer acknowledged
 					// everything, so the Drop fallback must not reset the stream and
 					// discard bytes still retransmitting.
-					let res = ready!(writer.poll_close(&mut cx));
+					let res = match writer.poll_close(&mut cx) {
+						Poll::Ready(res) => res,
+						Poll::Pending => {
+							// FIN does not release queued bytes until the peer acknowledges them.
+							if self.group.poll_expired_while_pending(waiter, true) {
+								let GroupState::Closed { writer } =
+									std::mem::replace(&mut self.state, GroupState::Done)
+								else {
+									unreachable!()
+								};
+								writer.abort(&Error::Old);
+								return Poll::Ready(Err(Error::Old));
+							}
+							return Poll::Pending;
+						}
+					};
 					self.state = GroupState::Done;
 					return Poll::Ready(res.map(|()| {
 						tracing::debug!(sequence = self.sequence, "finished group");
@@ -2827,6 +2851,49 @@ mod serve_group_test {
 		assert_eq!(log.resets(), vec![crate::StreamError::Old.to_code()]);
 	}
 
+	#[tokio::test]
+	async fn unacknowledged_fin_expires_with_the_group() {
+		tokio::time::pause();
+
+		let gate = kio::Producer::new(false);
+		let session = SinkSession::new(Log::default()).with_fin_gate(gate.consume());
+		let log = session.log.clone();
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			version: Version::Lite06,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut subscriber = track.subscribe(None);
+		let mut old = track.append_group().unwrap();
+		old.write_frame(Timestamp::ZERO, b"old".as_slice()).unwrap();
+		old.finish().unwrap();
+		let group = subscriber.recv_group().await.unwrap().expect("old group");
+
+		let handle = subscription.priority.insert(Priority::new(0, 0, 0));
+		let mut serve = std::pin::pin!(subscription.serve_group(0, 0, handle, group));
+		assert!(
+			futures::poll!(serve.as_mut()).is_pending(),
+			"FIN acknowledgement is blocked"
+		);
+
+		tokio::time::advance(Duration::from_secs(1)).await;
+		let mut edge = track.append_group().unwrap();
+		edge.write_frame(Timestamp::from_millis(1000).unwrap(), b"edge".as_slice())
+			.unwrap();
+		edge.finish().unwrap();
+
+		assert!(matches!(futures::poll!(serve.as_mut()), Poll::Ready(Err(Error::Old))));
+		assert_eq!(log.resets(), vec![crate::StreamError::Old.to_code()]);
+	}
+
 	/// The final payload remains guarded after its frame has advanced the group cursor.
 	#[tokio::test]
 	async fn blocked_final_transport_chunk_expires_with_the_group() {
@@ -2999,6 +3066,43 @@ mod serve_group_test {
 			priorities.iter().all(|&p| p == 255),
 			"rank 0 must reach the transport as send order 255: {priorities:?}",
 		);
+	}
+	#[tokio::test]
+	async fn unacknowledged_fin_keeps_newest_first_priority() {
+		let log = Log::default();
+		let gate = kio::Producer::new(false);
+		let session = SinkSession::new(log.clone()).with_fin_gate(gate.consume());
+
+		let track_priority = kio::Producer::new(0u8);
+		let subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			version: Version::Lite06,
+			timescale: Some(crate::Timescale::default()),
+		};
+
+		let track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let mut group = track.create_group(group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(Timestamp::from_millis(0).unwrap(), b"hello".as_slice())
+			.unwrap();
+		let consumer = group.consume();
+		group.finish().unwrap();
+
+		let handle = subscription.priority.insert(Priority::new(0, 0, 0));
+		let queue = subscription.priority.clone();
+		let mut serving = std::pin::pin!(subscription.serve_group(0, 0, handle, consumer));
+		assert!(futures::poll!(serving.as_mut()).is_pending());
+		assert_eq!(log.priorities().last(), Some(&255));
+
+		let _newer = queue.insert(Priority::new(0, 0, 1));
+		assert!(futures::poll!(serving.as_mut()).is_pending());
+		assert_eq!(log.priorities().last(), Some(&254));
+		assert!(log.resets().is_empty());
 	}
 }
 

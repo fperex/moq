@@ -230,6 +230,26 @@ mod tests {
 	}
 
 	#[test]
+	fn sets_the_websocket_fallback() {
+		let client = MoqClient::new();
+		let resolved = client.task.lock().unwrap().config.websocket.resolve();
+		assert!(resolved.enabled);
+		assert_eq!(resolved.delay, std::time::Duration::from_millis(200));
+
+		client.set_websocket_enabled(false).unwrap();
+		client.set_websocket_delay(0).unwrap();
+		let resolved = client.task.lock().unwrap().config.websocket.resolve();
+		assert!(!resolved.enabled);
+		assert_eq!(resolved.delay, std::time::Duration::ZERO);
+
+		client.set_websocket_enabled(true).unwrap();
+		client.set_websocket_delay(1_500).unwrap();
+		let resolved = client.task.lock().unwrap().config.websocket.resolve();
+		assert!(resolved.enabled);
+		assert_eq!(resolved.delay, std::time::Duration::from_micros(1_500));
+	}
+
+	#[test]
 	fn setters_fail_after_cancel() {
 		let client = MoqClient::new();
 		client.set_tls_verify(false).unwrap();
@@ -250,7 +270,7 @@ mod tests {
 /// attempt, and caps at `max_us`. After `timeout_us` of consecutive failures the
 /// connection gives up for good (0 retries forever); the window resets whenever a
 /// session stays up past `initial_us`. The defaults mirror the native
-/// [`moq_tokio::Backoff`]: 1s, x2, 5s, and a 10s window.
+/// [`moq_tokio::Backoff`]: 1s, x2, 5s, and a 60s window.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MoqBackoff {
@@ -264,7 +284,7 @@ pub struct MoqBackoff {
 	#[uniffi(default = 5000000)]
 	pub max_us: u64,
 	/// Time spent retrying before giving up, in microseconds. 0 retries forever.
-	#[uniffi(default = 10000000)]
+	#[uniffi(default = 60000000)]
 	pub timeout_us: u64,
 }
 
@@ -525,6 +545,27 @@ impl MoqClient {
 	pub fn set_quic_max_streams(&self, max_streams: u64) -> Result<(), MoqError> {
 		self.configure(|state| {
 			state.quic.max_streams = Some(max_streams);
+		})
+	}
+
+	/// Enable or disable the WebSocket fallback. Enabled by default.
+	///
+	/// The fallback races a WebSocket dial against QUIC for `http(s)` URLs, for networks
+	/// that block UDP. Disable it for a relay that only serves QUIC, so a failed QUIC dial
+	/// reports its own error instead of the fallback's.
+	pub fn set_websocket_enabled(&self, enabled: bool) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.config.websocket.enabled = Some(enabled);
+		})
+	}
+
+	/// Set the head start, in microseconds, QUIC gets before the WebSocket fallback joins
+	/// the race. Defaults to 200ms.
+	///
+	/// Zero races both at once. A server where WebSocket already won skips the head start.
+	pub fn set_websocket_delay(&self, delay_us: u64) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.config.websocket.delay = std::time::Duration::from_micros(delay_us);
 		})
 	}
 

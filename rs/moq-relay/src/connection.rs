@@ -79,6 +79,22 @@ impl Connection {
 	/// Admits and serves this connection until it closes.
 	#[tracing::instrument("conn", skip_all, fields(id = self.id, remote = self.request.remote_addr().map(tracing::field::display), session = tracing::field::Empty))]
 	pub async fn run(self) -> anyhow::Result<()> {
+		// A relay that is going away has nothing to offer a new session: it would be
+		// drained on arrival, which costs a reconnecting client the session it was
+		// still being served on and spends its give-up budget on an endpoint that is
+		// leaving. Refuse it with the status a client retries, so the dial fails the
+		// way it will once the process is actually gone.
+		if self.shutdown.draining() {
+			tracing::info!("relay shutting down; refusing a new session");
+			let _ = self
+				.request
+				.reject(moq_tokio::server::Reject::App(
+					http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+				))
+				.await;
+			return Ok(());
+		}
+
 		let peer_hop = self.request.peer_hop();
 		let (lease, registration) = match self.admit().await {
 			Ok(admitted) => admitted,
@@ -95,7 +111,8 @@ impl Connection {
 
 		let transport = self.request.transport();
 		let role = self.request.role();
-		let grants = match authorize(&self.cluster, lease.token(), role, &transport) {
+		let cluster_peer = self.request.peer_identity().is_some() || cluster::Cluster::is_lan_path(self.request.path());
+		let grants = match authorize(&self.cluster, lease.token(), role, cluster_peer, &transport) {
 			Ok(grants) => grants,
 			Err(err) => {
 				let _ = self.request.reject(moq_tokio::server::Reject::Forbidden).await;
@@ -110,9 +127,10 @@ impl Connection {
 		//
 		// moq-net defaults the unset side to a fresh no-op origin, which is fine for a
 		// publish-only or subscribe-only session.
+		let lease = lease.with_stats(grants.stats.clone());
 		let mut request = self.request.with_stats(grants.stats);
 		if let Some(subscribe) = grants.subscribe {
-			request = request.with_publisher(&subscribe);
+			request = request.with_publisher(subscribe);
 		}
 		if let Some(publish) = grants.publish {
 			request = request.with_subscriber(publish);
@@ -177,10 +195,10 @@ impl Connection {
 /// What an authorized session may serve: the token-scoped origin pair, pruned
 /// to the advertised role, plus its stats context.
 pub(crate) struct Grants {
-	/// What the client may subscribe to (we publish it).
-	pub(crate) publish: Option<moq_net::origin::Producer>,
 	/// What the client may publish (we subscribe to it).
-	pub(crate) subscribe: Option<moq_net::origin::Producer>,
+	pub(crate) publish: Option<moq_net::origin::Producer>,
+	/// What the client may subscribe to (we publish it).
+	pub(crate) subscribe: Option<moq_net::origin::Consumer>,
 	/// The session's billing/attribution context.
 	pub(crate) stats: moq_net::stats::Session,
 }
@@ -195,10 +213,18 @@ pub(crate) struct Grants {
 /// missing that direction's scope is rejected here during the handshake,
 /// instead of being accepted and then silently carrying no media (the bug
 /// that motivated the role hint).
+///
+/// `cluster_peer` marks an authenticated cluster peer (a verified client
+/// certificate or the LAN credential), which discovers hidden routes whether
+/// or not it asks. A peer that predates the hidden opt-in (below moq-lite-07,
+/// or moq-transport without MoQ Hidden) would otherwise lose `.internal/origins`
+/// and every other dot path during a rolling upgrade.
+// TODO: drop the exemption once deployed peers all opt in.
 pub(crate) fn authorize(
 	cluster: &cluster::Cluster,
 	token: &auth::Token,
 	role: Option<moq_net::Role>,
+	cluster_peer: bool,
 	transport: &dyn std::fmt::Display,
 ) -> anyhow::Result<Grants> {
 	let publish = cluster.publisher(token);
@@ -248,6 +274,7 @@ pub(crate) fn authorize(
 		// Bidirectional or an unrecognized future role: keep whatever the token grants.
 		None | Some(_) => (publish, subscribe),
 	};
+	let subscribe = subscribe.map(|subscribe| subscribe.consume().with_hidden(cluster_peer));
 
 	Ok(Grants {
 		publish,

@@ -21,9 +21,16 @@ export interface MicrophoneProps extends Inputs<MicrophoneInput> {
 type MicrophoneOutput = {
 	// The live microphone track, or undefined while disabled or denied.
 	source: Signal<Media | undefined>;
-	/** A terminal getUserMedia failure, cleared when a new capture attempt begins. */
+	/**
+	 * Why there is no track while the microphone is enabled, or undefined while it is capturing: a
+	 * refusal that stands until the settings, device list, or permission changes, or the failure it
+	 * is retrying after.
+	 */
 	error: Signal<Error | undefined>;
 };
+
+// A capture attempt: the stream the browser handed over, or why it would not.
+type Attempt = { stream: MediaStream; error?: undefined } | { stream?: undefined; error: unknown };
 
 /** Captures audio from a microphone, tracking the available devices. */
 export class Microphone {
@@ -42,7 +49,11 @@ export class Microphone {
 	readonly out = readonlys(this.#out);
 
 	#signals = new Effect();
-	#retry = new Retry();
+	#retry = new Retry(this.#out.error);
+
+	// The release of the capture the previous run held, awaited before the next attempt. See
+	// `Camera` for why: a device we have not finished handing back rejects the next attempt.
+	#released: Promise<void> = Promise.resolve();
 
 	constructor(props?: MicrophoneProps) {
 		this.in = {
@@ -84,48 +95,50 @@ export class Microphone {
 			return;
 		}
 
-		this.#out.error.set(undefined);
-
 		const finalConstraints: MediaTrackConstraints = {
 			...constraints,
 			deviceId: device ? { exact: device } : undefined,
 		};
 
 		effect.spawn(async () => {
-			const media = navigator.mediaDevices.getUserMedia({ audio: finalConstraints });
+			// Let go of the last capture before asking for a device again: the browser is still
+			// holding it otherwise, and it answers that with a failure like any other.
+			await effect.race(this.#released);
+			if (effect.abort.aborted) return;
 
-			// If the effect is cancelled, stop any stream that arrives after cancellation too.
-			effect.cleanup(() =>
-				media.then(
-					(stream) =>
-						stream.getTracks().forEach((track) => {
-							track.stop();
-						}),
-					() => {},
-				),
-			);
+			const media = navigator.mediaDevices
+				.getUserMedia({ audio: finalConstraints })
+				.then((stream): Attempt => ({ stream }))
+				.catch((error: unknown): Attempt => ({ error }));
 
-			let stream: MediaStream | undefined;
-			try {
-				stream = await Promise.race([media, effect.cancel.then(() => undefined)]);
-			} catch (error) {
-				if (effect.abort.aborted) return;
-				this.#out.error.set(error instanceof Error ? error : new Error(String(error)));
-				this.#retry.terminal();
-				return;
-			}
+			// If the effect is cancelled for any reason (ex. cancel), stop any media that we got,
+			// and keep the release for the next attempt to wait on.
+			effect.cleanup(() => {
+				this.#released = media.then(({ stream }) => {
+					stream?.getTracks().forEach((track) => {
+						track.stop();
+					});
+				});
+			});
+
+			const attempt = await effect.race(media);
 
 			// A torn-down run is not a failed attempt: whatever cancelled it reruns us.
-			if (effect.abort.aborted || !stream) return;
+			if (effect.abort.aborted || !attempt) return;
 
-			const track = stream.getAudioTracks()[0] as Audio.StreamTrack | undefined;
+			// A refusal stands until something changes, unless the device was only busy.
+			if (!attempt.stream) return this.#retry.refused(attempt.error);
+
+			const track = attempt.stream.getAudioTracks()[0] as Audio.StreamTrack | undefined;
 			const settings = track?.getSettings();
 
 			// getUserMedia resolved, so we have permission even if no track came back.
 			effect.cleanup(this.device.capture(settings?.deviceId));
 
 			// A track that arrives dead already fired "ended", so nothing would ever rerun us.
-			if (!track || track.readyState === "ended") return this.#retry.failed();
+			if (!track || track.readyState === "ended") {
+				return this.#retry.failed(new Error("the microphone produced no live track"));
+			}
 
 			this.#retry.succeeded(effect, track);
 			effect.set(this.#out.source, { audio: { track, kind: "voice" } });

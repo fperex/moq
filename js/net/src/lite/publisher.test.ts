@@ -1,5 +1,6 @@
 import { expect, mock, spyOn, test } from "bun:test";
 import { Signal } from "@moq/signals";
+import { Expired } from "../error.ts";
 import { Producer as GroupProducer } from "../group.ts";
 import { randomHop } from "../hop.ts";
 import { hooks } from "../internal.ts";
@@ -9,6 +10,7 @@ import * as Path from "../path.ts";
 import { Reader, Stream, Writer } from "../stream.ts";
 import { Milli, Timestamp } from "../time.ts";
 import { DEFAULT_MAX_AGE_MS } from "../track.ts";
+import { wireOf } from "../wire.ts";
 import { AnnounceRequest } from "./announce.ts";
 import { Fetch } from "./fetch.ts";
 import { Group as GroupMessage } from "./group.ts";
@@ -1088,6 +1090,14 @@ test("lite draft-06: a subscription starting mid-group skips the head", async ()
 	expect(served).toEqual([{ sequence: 0, frameStart: 2, payloads: ["c", "d"] }]);
 });
 
+// A start at the group's final frame count is a valid, empty range: FIN, don't reset.
+// A relay resuming a parked track asks for exactly this.
+test("lite draft-06: a subscription starting at the end of a group serves it empty", async () => {
+	const { start, served } = await serve({ 0: ["a", "b"] }, { startGroup: 0, startFrame: 2 });
+	expect(start).toBe(0);
+	expect(served).toEqual([{ sequence: 0, frameStart: 2, payloads: [] }]);
+});
+
 // The end bound is inclusive.
 test("lite draft-06: a subscription capped mid-group stops at the end frame", async () => {
 	const { served } = await serve(
@@ -1230,11 +1240,11 @@ test("lite draft-05: group streams do not ask the transport to wait for a slot",
 
 // The header is part of the group's lifetime too. If it blocks on flow control, advancing
 // the live edge must reset the stream without waiting for that write to finish.
-test("lite draft-05: a blocked group header is reset when the group expires", async () => {
+test.each(["header", "FIN"] as const)("a blocked group %s is reset when the group expires", async (phase) => {
 	const pair = createMockTransportPair(ALPN_05);
 
 	let started!: () => void;
-	const headerStarted = new Promise<void>((resolve) => {
+	const operationStarted = new Promise<void>((resolve) => {
 		started = resolve;
 	});
 	let release!: () => void;
@@ -1245,15 +1255,20 @@ test("lite draft-05: a blocked group header is reset when the group expires", as
 	const streamReset = new Promise<void>((resolve) => {
 		reset = resolve;
 	});
-	const closed = new Promise<void>(() => {});
+	const closed = phase === "FIN" ? blocked : new Promise<void>(() => {});
 	const writable = {
 		getWriter: () => ({
 			closed,
 			write: async () => {
+				if (phase !== "header") return;
 				started();
 				await blocked;
 			},
-			close: async () => {},
+			close: async () => {
+				if (phase !== "FIN") return;
+				started();
+				await blocked;
+			},
 			abort: async () => {
 				reset();
 			},
@@ -1280,7 +1295,7 @@ test("lite draft-05: a blocked group header is reset when the group expires", as
 		old.writeFrame({ payload: new TextEncoder().encode("old"), timestamp: Timestamp.fromMillis(0) });
 		old.close();
 		track.writeGroup(old);
-		await headerStarted;
+		await operationStarted;
 
 		const edge = new GroupProducer(1);
 		edge.writeFrame({ payload: new TextEncoder().encode("edge"), timestamp: Timestamp.fromMillis(1000) });
@@ -1297,6 +1312,64 @@ test("lite draft-05: a blocked group header is reset when the group expires", as
 		publisher.close();
 		client.close();
 		broadcast.close();
+	}
+});
+
+test("lite draft-05: expiry before a group opens leaves later groups publishable", async () => {
+	const pair = createMockTransportPair(ALPN_05);
+	const opening = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const open = pair.server.createUnidirectionalStream.bind(pair.server);
+	let first = true;
+	pair.server.createUnidirectionalStream = async (options) => {
+		const stream = await open(options);
+		if (first) {
+			first = false;
+			opening.resolve();
+			await release.promise;
+		}
+		return stream;
+	};
+
+	const origin = new OriginProducer();
+	const broadcast = publish(origin, Path.from("test"));
+	const track = broadcast.createTrack("video");
+	const publisher = new Publisher(pair.server, Version.DRAFT_05, randomHop(), origin.consume());
+	const client = await Stream.open(pair.client);
+	const server = await Stream.accept(pair.server);
+	if (!server) throw new Error("missing subscribe stream");
+	const serving = publisher.runSubscribe(
+		new Subscribe({ id: 0n, broadcast: Path.from("test"), track: "video", priority: 0 }),
+		server,
+	);
+	const incoming = pair.client.incomingUnidirectionalStreams.getReader();
+	try {
+		track.writeString("old");
+		await opening.promise;
+		const old = await incoming.read();
+		if (old.done) throw new Error("missing old group stream");
+
+		track.writeString("new");
+		release.resolve();
+		// The type byte may have reached the peer before reset; the rest must fail.
+		await expect(new Reader(old.value).readAll()).rejects.toBeInstanceOf(Expired);
+
+		const next = await incoming.read();
+		if (next.done) throw new Error("missing next group stream");
+		const reader = new Reader(next.value);
+		expect(await reader.u53()).toBe(0);
+		expect((await GroupMessage.decode(reader, Version.DRAFT_05)).sequence).toBe(1);
+		await reader.u62(); // Frame timestamp delta.
+		expect(await reader.string()).toBe("new");
+		expect(await reader.readAll()).toEqual(new Uint8Array());
+	} finally {
+		release.resolve();
+		client.close();
+		await serving;
+		incoming.releaseLock();
+		publisher.close();
+		broadcast.close();
+		origin.close();
 	}
 });
 
@@ -1376,5 +1449,62 @@ test("a version without the latency field serves a non-dropping budget", async (
 		} finally {
 			await sub.close();
 		}
+	}
+});
+
+// A watcher that re-subscribes (a decoder rebuild, a hide and show) opens a second SUBSCRIBE while
+// the first track is still live. The publishing wire layer subscribes through the broadcast
+// consumer, so the second one fans out from the producer the first raised rather than raising a
+// fresh request: the track handed over on accept serves every later subscription too, and closing
+// it ends all of them, and every one that follows, for good.
+test("a repeat subscription fans out from the live track instead of raising a request", async () => {
+	const pair = createMockTransportPair(ALPN_05);
+	const origin = new OriginProducer();
+	const publisher = new Publisher(pair.server, Version.DRAFT_05, randomHop(), origin.consume());
+	const broadcast = publish(origin, Path.from("test"));
+
+	const first = await Stream.open(pair.client);
+	const firstServer = await Stream.accept(pair.server);
+	if (!firstServer) throw new Error("publisher never accepted the subscribe stream");
+	void publisher.runSubscribe(
+		replaySubscribe({ id: 0n, broadcast: Path.from("test"), track: "video", priority: 0 }),
+		firstServer,
+	);
+
+	const request = await wireOf(broadcast).requested();
+	if (!request) throw new Error("expected a track request");
+	expect(request.name).toBe("video");
+	const track = request.accept();
+
+	const opened = pair.client.incomingUnidirectionalStreams.getReader();
+	const second = await Stream.open(pair.client);
+
+	try {
+		const secondServer = await Stream.accept(pair.server);
+		if (!secondServer) throw new Error("publisher never accepted the second subscribe stream");
+		void publisher.runSubscribe(
+			replaySubscribe({ id: 1n, broadcast: Path.from("test"), track: "video", priority: 0 }),
+			secondServer,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		// No second request: the live producer answers it.
+		const none = Symbol("none");
+		expect(await Promise.race([wireOf(broadcast).requested(), Promise.resolve(none)])).toBe(none);
+
+		// And it is served: one group written now opens a stream for each subscription.
+		const group = new GroupProducer(0);
+		group.writeString("hello");
+		track.writeGroup(group);
+		await servingNextGroup(opened);
+		await servingNextGroup(opened);
+		expect(pair.server.sendStreams.uni).toHaveLength(2);
+		group.close();
+	} finally {
+		opened.releaseLock();
+		track.close();
+		publisher.close();
+		second.close();
+		first.close();
 	}
 });

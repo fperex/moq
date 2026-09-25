@@ -22,7 +22,7 @@ export type PlayerInput = {
 	catalogFormat: Getter<CatalogFormat | undefined>;
 	/** Catalog supplied when the format is `manual`. */
 	catalog: Getter<Catalog.Root | undefined>;
-	/** Connection probe used for rendition selection and delay. */
+	/** Connection probe used for video rendition selection; the delay is sized from measured arrivals instead. */
 	probe: Getter<Moq.Connection.Probe | undefined>;
 	/** Canvas to paint video into. */
 	canvas: Getter<HTMLCanvasElement | undefined>;
@@ -34,6 +34,12 @@ export type PlayerInput = {
 	volume: Getter<number>;
 	/** Silence audio and stop its download. */
 	muted: Getter<boolean>;
+	/** Whether a gap in the audio is concealed rather than played as a gap. See {@link Audio.DecoderInput.conceal}. */
+	conceal: Getter<boolean>;
+	/** The relay the broadcast is read from, which the audio worker dials. See {@link Audio.DecoderInput.url}. */
+	url: Getter<URL | undefined>;
+	/** Whether the audio is fed from a dedicated worker. See {@link Audio.DecoderInput.offload}. */
+	offload: Getter<boolean>;
 	/** Canvas visibility policy for video downloads. */
 	visible: Getter<Video.Visible>;
 	/** Playback distance from the live edge. */
@@ -89,6 +95,9 @@ export class Player {
 			paused: getter(props.paused ?? false),
 			volume: getter(props.volume ?? 0.5),
 			muted: getter(props.muted ?? false),
+			conceal: getter(props.conceal ?? true),
+			url: getter<URL | undefined>(props.url),
+			offload: getter(props.offload ?? true),
 			visible: getter(props.visible ?? "20%"),
 			delay: getter(props.delay ?? "auto"),
 			buffer: getter(props.buffer ?? Time.Milli.zero),
@@ -117,11 +126,25 @@ export class Player {
 		this.text = new Text.Source({ broadcast: this.broadcast, target: this.in.captions });
 		this.#signals.cleanup(() => this.text.close());
 
-		this.sync = new Sync({ delay: this.in.delay, buffer: this.in.buffer, probe: this.in.probe });
+		this.sync = new Sync({ delay: this.in.delay, buffer: this.in.buffer });
 		this.#signals.cleanup(() => this.sync.close());
 
+		// The decoders own rendition handoffs and measure how late frames arrive, but they need Sync
+		// to exist first, so its per-track handles are what they wire into.
 		this.video = new Video.Decoder({ source: videoSource, sync: this.sync, enabled: this.#videoEnabled });
-		this.audio = new Audio.Decoder({ source: audioSource, sync: this.sync, enabled: this.#audioEnabled });
+		this.#signals.proxy(this.sync.track("video").spread, this.video.out.spread);
+		this.audio = new Audio.Decoder({
+			source: audioSource,
+			sync: this.sync,
+			enabled: this.#audioEnabled,
+			// A disabled player can never be heard, so it releases its audio context. A mute only
+			// stops the download and keeps the context, so the unmute needs no gesture.
+			attached: this.in.enabled,
+			conceal: this.in.conceal,
+			url: this.in.url,
+			offload: this.in.offload,
+		});
+		this.#signals.proxy(this.sync.track("audio").spread, this.audio.out.spread);
 		this.#signals.cleanup(() => {
 			this.video.close();
 			this.audio.close();

@@ -79,7 +79,10 @@ The accessors borrow and `run` consumes the relay, so clone `cluster`,
 `auth`, `client`, `stats`, `shutdown`, and `shutdown_trigger` for application
 tasks before calling it. `trigger.start()` drains every session with a GOAWAY
 and `run` returns once the drain window elapses, with the listeners released
-and the workers joined. Build routes from `web().routes()` (or
+and the workers joined. A relay that has started draining refuses new sessions
+with `503` on every transport, so a client redialing during a restart backs off
+and keeps the session it is still being served on, instead of being handed one
+that is waved away on arrival. Build routes from `web().routes()` (or
 `internal().routes()`): `with_web` replaces the router, so `Router::new()`
 drops the built-in routes. Extra listeners (RTMP, SRT, ...) sit beside `run`
 in the application's `select!`. `runtime.workers` and `runtime.io_uring` stay

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
-import { Origin, Path, Track } from "@moq/net";
+import { type Group, Origin, Path, Track } from "@moq/net";
 import { Effect } from "@moq/signals";
 import { Broadcast } from "./broadcast.ts";
 
@@ -182,3 +182,37 @@ test("keeps the current catalog snapshot for a reconnecting viewer", async () =>
 		performance.now = real;
 	}
 });
+
+test("seeds a later catalog subscriber after the first one is reset", async () => {
+	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name: Path.from("test.hang") });
+	broadcast.video("video").config.set(videoConfig);
+	await settle();
+
+	const net = broadcast.net.peek();
+	if (!net) throw new Error("expected a network producer once connected");
+
+	// Read the raw groups rather than through a Json.Snapshot consumer: what a later viewer is
+	// seeded with is the group it lands in.
+	const first = net.track(Broadcast.CATALOG_TRACK).subscribe();
+	expect(await readSnapshot(await first.recvGroup())).toBe("avc1.640028");
+
+	// The peer reset the subscribe stream (StreamCode.Cancel, "remote error: 1" on the wire).
+	first.close(new Error("remote error: 1"));
+	await settle();
+
+	// The next viewer has to see the catalog too. A browser publisher that served its first viewer
+	// and starved every later one is single use: the tile appears, the subscription is accepted and
+	// no catalog ever arrives, so no rendition is chosen and nothing plays.
+	const second = net.track(Broadcast.CATALOG_TRACK).subscribe();
+	expect(await readSnapshot(await second.recvGroup())).toBe("avc1.640028");
+
+	second.close();
+	broadcast.close();
+});
+
+// The codec in a catalog snapshot frame, read straight off the group. CatalogProducer disables
+// deltas, so every frame is a whole catalog in a group of its own.
+async function readSnapshot(group: Group.Consumer | undefined): Promise<string | undefined> {
+	const catalog = (await group?.readJson()) as Catalog.Root | undefined;
+	return catalog?.video?.renditions.video?.codec;
+}

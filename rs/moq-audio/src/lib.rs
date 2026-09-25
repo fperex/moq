@@ -54,6 +54,9 @@ mod frame;
 mod layout;
 mod opus;
 mod pcm;
+// The jitter buffer: the target estimator, the decision loop, and the DSP they
+// drive. `decode::Consumer` is what runs it.
+mod playout;
 mod resample;
 
 #[cfg(feature = "aec")]

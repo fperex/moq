@@ -1,4 +1,4 @@
-import type { Effect } from "@moq/signals";
+import { type Effect, type Getter, Signal } from "@moq/signals";
 
 // How many values a reader may fall behind before it starts losing its oldest.
 const QUEUE = 4;
@@ -44,6 +44,18 @@ export class Fanout<T> {
 	// Why the source stopped, when it stopped by failing. Readers surface this rather than seeing a
 	// clean end, so a consumer can tell "the capture died" from "the capture finished".
 	#failure: { error: unknown } | undefined;
+
+	readonly #ended = new Signal<Error | null | undefined>(undefined);
+
+	/**
+	 * Why the source stopped: `null` when it ended, an `Error` when it failed, `undefined` while it
+	 * is still delivering.
+	 *
+	 * Readers learn the same thing when their stream ends, but an owner holding the fanout has no
+	 * reader of its own, and without this a source that quietly stopped is indistinguishable from
+	 * one that has nothing to say yet.
+	 */
+	readonly ended: Getter<Error | null | undefined> = this.#ended;
 
 	constructor(source: ReadableStream<T>, props?: FanoutProps<T>) {
 		this.#queue = validateQueue(props?.queue ?? QUEUE);
@@ -118,6 +130,9 @@ export class Fanout<T> {
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
+
+		const failure = this.#failure?.error;
+		this.#ended.set(failure === undefined ? null : failure instanceof Error ? failure : new Error(String(failure)));
 
 		// The source is ours to release. Without this the pump stays parked on a read, holding the
 		// stream locked and letting a swapped-out capture keep producing into nothing.

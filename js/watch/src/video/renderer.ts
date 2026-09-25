@@ -146,34 +146,61 @@ export class Renderer {
 		const ctx = effect.get(this.#ctx);
 		if (!ctx) return;
 
-		const frame = effect.get(this.decoder.out.frame);
-		const video = effect.get(this.decoder.source.out.catalog);
-
-		// Request a callback to render the frame based on the monitor's refresh rate.
-		// Always render, even when paused (to show last frame).
-		let animate: number | undefined = requestAnimationFrame(() => {
-			this.#render(ctx, frame, video);
-
-			if (frame) {
-				this.#out.frame.update((current) => {
-					current?.close();
-					return frame.clone();
-				});
-				this.#out.timestamp.set(Time.Milli.fromMicro(frame.timestamp as Time.Micro));
-			} else {
-				this.#out.frame.update((current) => {
-					current?.close();
-					return undefined;
-				});
-				this.#out.timestamp.set(undefined);
-			}
-
+		let animate: number | undefined;
+		let dirty = false;
+		let source: VideoFrame | undefined;
+		const frames: VideoFrame[] = [];
+		const clear = () => {
+			for (const frame of frames) frame.close();
+			frames.length = 0;
+		};
+		const render = () => {
 			animate = undefined;
+			if (dirty || frames.length) {
+				dirty = false;
+				const pending = frames.shift();
+				const frame = pending ?? (source ? this.#out.frame.peek() : undefined);
+				const video = this.decoder.source.out.catalog.peek();
+				try {
+					this.#render(ctx, frame, video);
+					const retained = frame?.clone();
+					this.#out.frame.update((current) => {
+						current?.close();
+						return retained;
+					});
+					this.#out.timestamp.set(frame ? Time.Milli.fromMicro(frame.timestamp as Time.Micro) : undefined);
+				} finally {
+					pending?.close();
+				}
+			}
+			// Keep a place in every display refresh while playing. Rescheduling from a
+			// frame update during that refresh would miss its already-snapshotted callbacks.
+			if (this.decoder.in.enabled.peek()) animate = requestAnimationFrame(render);
+		};
+		effect.run((inner) => {
+			const frame = inner.get(this.decoder.out.frame);
+			inner.get(this.decoder.source.out.catalog);
+			const enabled = inner.get(this.decoder.in.enabled);
+			const reset = !enabled || !this.#out.frame.peek() || !frame;
+			if (reset) clear();
+			if (frame && (frame !== source || reset)) {
+				frames.push(frame.clone());
+				// Timers can release adjacent frames on opposite sides of a display refresh.
+				// Preserve that pair, but never turn it into a stale presentation backlog.
+				while (frames.length > 2 || (frames[0] && frame.timestamp - frames[0].timestamp > 20_000)) {
+					frames.shift()?.close();
+				}
+			}
+			source = frame;
+			dirty = true;
+			// A paused tile still paints changed metadata or its final frame once.
+			if (animate === undefined) animate = requestAnimationFrame(render);
 		});
 
 		// Clean up any pending animation request.
 		effect.cleanup(() => {
 			if (animate !== undefined) cancelAnimationFrame(animate);
+			clear();
 		});
 	}
 

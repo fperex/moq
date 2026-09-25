@@ -21,6 +21,7 @@ import { Publisher } from "./publisher.ts";
 import { RequestError, RequestOk } from "./request.ts";
 import { Subscribe, SubscribeOk } from "./subscribe.ts";
 import { SubscribeNamespace } from "./subscribe_namespace.ts";
+import { TrackStatusRequest } from "./track.ts";
 import { ALPN, type IetfVersion, Version } from "./version.ts";
 
 function publish(origin: OriginProducer, path: Path.Valid) {
@@ -129,13 +130,57 @@ function publisher(
 	};
 }
 
+test("TRACK_STATUS gets exact NOT_SUPPORTED refusal bytes on every draft", async () => {
+	const phrase = new TextEncoder().encode("TRACK_STATUS is not supported");
+	for (const version of [
+		Version.DRAFT_14,
+		Version.DRAFT_15,
+		Version.DRAFT_16,
+		Version.DRAFT_17,
+		Version.DRAFT_18,
+		Version.DRAFT_19,
+		Version.DRAFT_20,
+		Version.DRAFT_21,
+		Version.DRAFT_22,
+	] as const) {
+		const pair = createMockTransportPair(ALPN.DRAFT_19);
+		const session = new NativeSession(pair.server, version, true);
+		const { pub, origin } = publisher(pair.server, { session });
+		const written: Uint8Array[] = [];
+		const stream = new Stream({
+			readable: new ReadableStream<Uint8Array>(),
+			writable: new WritableStream<Uint8Array>({
+				write: (chunk) => {
+					written.push(new Uint8Array(chunk));
+				},
+			}),
+			version,
+		});
+		await pub.runTrackStatusRequest(
+			new TrackStatusRequest({ requestId: 7n, trackNamespace: Path.from("test"), trackName: "video" }),
+			stream,
+		);
+		await stream.writer.closed;
+		const body = [
+			...(version <= Version.DRAFT_16 ? [7] : []),
+			3,
+			...(version >= Version.DRAFT_16 ? [0] : []),
+			phrase.length,
+			...phrase,
+		];
+		const expected = [version === Version.DRAFT_14 ? 0x0f : 0x05, 0, body.length, ...body];
+		expect(written.flatMap((chunk) => Array.from(chunk))).toEqual(expected);
+		origin.close();
+	}
+});
+
 // The header is part of the group's lifetime too. If it blocks on flow control, advancing
 // the live edge must reset the stream without waiting for that write to finish.
-test("a blocked group header is reset when the group expires", async () => {
+test.each(["header", "FIN"] as const)("a blocked group %s is reset when the group expires", async (phase) => {
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 
 	let started!: () => void;
-	const headerStarted = new Promise<void>((resolve) => {
+	const operationStarted = new Promise<void>((resolve) => {
 		started = resolve;
 	});
 	let release!: () => void;
@@ -146,15 +191,20 @@ test("a blocked group header is reset when the group expires", async () => {
 	const streamReset = new Promise<void>((resolve) => {
 		reset = resolve;
 	});
-	const closed = new Promise<void>(() => {});
+	const closed = phase === "FIN" ? blocked : new Promise<void>(() => {});
 	const writable = {
 		getWriter: () => ({
 			closed,
 			write: async () => {
+				if (phase !== "header") return;
 				started();
 				await blocked;
 			},
-			close: async () => {},
+			close: async () => {
+				if (phase !== "FIN") return;
+				started();
+				await blocked;
+			},
 			abort: async () => {
 				reset();
 			},
@@ -185,7 +235,7 @@ test("a blocked group header is reset when the group expires", async () => {
 		old.writeFrame({ payload: new TextEncoder().encode("old"), timestamp: Timestamp.fromMillis(0) });
 		old.close();
 		track.writeGroup(old);
-		await headerStarted;
+		await operationStarted;
 
 		const edge = new GroupProducer(1);
 		edge.writeFrame({ payload: new TextEncoder().encode("edge"), timestamp: Timestamp.fromMillis(10_000) });

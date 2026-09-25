@@ -293,3 +293,22 @@ describe("Fanout", () => {
 		effect.close();
 	});
 });
+
+test("a fanout says why its source stopped", async () => {
+	// Readers learn this when their own stream ends, but the owner holding the fanout has no reader
+	// of its own, so without this a source that quietly stopped looks like one with nothing to say.
+	const clean = new Fanout<number>(new ReadableStream<number>({ start: (c) => c.close() }));
+	await Bun.sleep(0);
+	expect(clean.ended.peek()).toBeNull();
+
+	const boom = new Error("processor died");
+	const error = console.error;
+	console.error = () => {};
+	try {
+		const failed = new Fanout<number>(new ReadableStream<number>({ start: (c) => c.error(boom) }));
+		await Bun.sleep(0);
+		expect(failed.ended.peek()).toBe(boom);
+	} finally {
+		console.error = error;
+	}
+});

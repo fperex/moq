@@ -21,6 +21,15 @@ name: Nightly
 # the wheel builds in a manylinux container, the Kotlin/Swift/Go/Dart packages
 # link the FFI on every platform) and nothing notices until the tag is pushed.
 #
+# `audio-quality` is here because of what it measures rather than what it covers.
+# It plays two dozen rows of real media in real time, a minute each, so the run
+# is half an hour of wall clock that no merge gate should carry. And every number
+# it grades is a timing one: underruns, the share of the run that was silent, and
+# where the playout delay settled. Those move with whatever else the runner is
+# doing, so a per-PR arm would fail on unrelated load often enough to be muted,
+# which is worse than not running it. Nightly it competes with nothing, and a
+# regression surfaces a day late against a budget that is still meaningful.
+#
 # A failure here lands on main rather than being caught in review, which is the
 # accepted trade. Anything that must block a merge belongs in check.yml.
 
@@ -141,6 +150,78 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
           MOQ_STRICT: 1
+
+  # Plays the matrix in headless Chromium over the seeded UDP shaper and grades
+  # what the listener would have heard against `test/audio-quality/budgets.json`.
+  #
+  # `ubuntu-latest` rather than the arm runner the jobs above use: this is the
+  # third lane in the repository to launch Playwright's Chromium, and interop.yml
+  # and wasm.yml both run theirs on x86 for that reason.
+  #
+  # audio-quality.yml runs this same job on demand. Keep the two in step.
+  audio-quality:
+    name: Audio quality
+    runs-on: ubuntu-latest
+    # Two dozen rows at a minute each is about half an hour on its own, and the
+    # relay, the CLI, and the shaper build from source ahead of them.
+    timeout-minutes: 90
+
+    env:
+      # Somewhere `upload-artifact` can reach. The harness's default is under
+      # $TMPDIR, which is outside the workspace.
+      MOQ_TEST_RUNS: ${{ github.workspace }}/test-runs
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
+        with:
+          tool-cache: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
+        with:
+          determinate: false
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-on-failure: true
+
+      # Playwright's Chromium isn't in the nix devShell. Install it plus its apt
+      # runtime libs (`--with-deps` needs the host package manager); run.sh's own
+      # `playwright install` then no-ops.
+      - name: Playwright Chromium
+        run: nix develop --command bash -c "bun install --frozen-lockfile && bunx playwright install --with-deps chromium"
+        shell: bash -leo pipefail {0}
+
+      # Seconds, and no browser or relay involved, so it runs ahead of the matrix
+      # and a regression in the ring or the estimator is reported without waiting
+      # half an hour for the rows that need Chromium.
+      - name: Audio quality (replay)
+        run: nix develop --command just test audio-quality --runtime replay --enforce
+        shell: bash -leo pipefail {0}
+
+      - name: Audio quality
+        run: nix develop --command just test audio-quality --enforce
+        shell: bash -leo pipefail {0}
+
+      # The run directory is the whole diagnosis: each process's log, the
+      # shaper's counters, the raw ndjson, the per-row summaries, and a
+      # Playwright trace of any page that failed. The harness keeps it on a
+      # failure without being asked. Short retention because it is large and
+      # only useful while the failure is fresh.
+      - name: Keep the failing run
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: audio-quality-run
+          path: test-runs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   # Every tag-driven release workflow, run against main with publishing skipped:
   # the workflows gate their publish jobs on `github.ref_type == 'tag'`, and no

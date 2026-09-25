@@ -3,6 +3,8 @@ import * as Moq from "@moq/net";
 import { Effect, type Getter, type GetterInit, getter, Once, Signal } from "@moq/signals";
 
 import type { Format } from "./format";
+import { Jitter } from "./jitter";
+import { Stall } from "./stall";
 import type { BufferedRanges, Frame } from "./types";
 
 /** Options for constructing a {@link Consumer}. */
@@ -12,12 +14,29 @@ export interface ConsumerProps {
 	/**
 	 * How stale a group may get before it is skipped, in milliseconds (default: 0).
 	 *
-	 * Measured as the span from the oldest buffered frame to the newest, so it bounds how long a
-	 * late or missing group is waited for. The local half of the subscription's
-	 * `maxAge`; both measure the same budget, one on the wire and one as frames are read.
+	 * A group is measured by how far it could still present, which the first timestamp of the next
+	 * group holding a frame bounds, against the newest frame the track has reached. So it bounds
+	 * how long a late or missing group is waited for without reading a long group as a late one.
+	 * The local half of the subscription's `maxAge`; both measure the same budget, one on the wire
+	 * and one as frames are read.
 	 */
 	// Read-only: a Getter (e.g. another component's output) is accepted directly.
 	maxAge?: GetterInit<Time.Milli>;
+
+	/**
+	 * Where {@link Consumer.spread} starts: the rendition's declared flush span, or an estimator
+	 * already measuring this rendition (default: neither, so the estimator's own guess).
+	 *
+	 * A duration is the publisher's catalog `jitter`, a prior the first measurement replaces. A
+	 * {@link Jitter} is a measurement already made: a receiver that stops and restarts reading the
+	 * same rendition hands its estimator to the replacement consumer rather than starting over at
+	 * the declaration, which is a guess it has already improved on. The consumer reanchors it,
+	 * since the arrival reference describes a stretch of timeline nobody was reading.
+	 *
+	 * A plain value, not a getter: a rendition that changes its declaration is a different
+	 * rendition and gets a new consumer.
+	 */
+	jitter?: Time.Milli | Jitter;
 }
 
 interface Group {
@@ -100,6 +119,29 @@ export class Consumer {
 	/** The time ranges currently buffered and ready to play. */
 	readonly buffered: Getter<BufferedRanges> = this.#buffered;
 
+	// Measured at arrival, before any group is skipped: a target derived from what survives the
+	// age budget would only ever confirm the budget it was cut to.
+	#spread: Jitter;
+
+	// Whether this receiver's own event loop was blocked before an arrival. The estimator cannot see
+	// that in the arrival timing, since a blocked receiver and a bursty path read the same there.
+	#stall = Stall.acquire();
+
+	/**
+	 * How late frames arrive relative to the earliest one, measured as they land.
+	 *
+	 * Size the playback buffer with this rather than with the round trip, which says nothing about
+	 * how evenly a publisher emits frames. Starts at {@link ConsumerProps.jitter}: the publisher's
+	 * own declaration until the first arrivals replace it, or what a handed-in estimator already
+	 * measured.
+	 */
+	readonly spread: Getter<Time.Milli>;
+
+	#skipped = new Signal(0);
+
+	/** Groups that lost content because the local age budget skipped them or the transport gave up. */
+	readonly skipped: Getter<number> = this.#skipped;
+
 	#signals = new Effect();
 	#closed = new Once<Error | null>();
 
@@ -108,9 +150,23 @@ export class Consumer {
 		this.#track = track;
 		this.#format = props.format;
 		this.#maxAge = getter(props.maxAge ?? Moq.Time.Milli.zero);
+		if (props.jitter instanceof Jitter) {
+			// Continuing a measurement: keep the distribution, drop the arrival reference, which
+			// describes a stretch of timeline this receiver was not reading.
+			this.#spread = props.jitter;
+			this.#spread.reanchor();
+		} else {
+			this.#spread = new Jitter({ start: props.jitter });
+		}
+		this.spread = this.#spread.value;
 
+		this.#signals.run((effect) => {
+			effect.get(this.#maxAge);
+			this.#checkMaxAge();
+		});
 		this.#signals.spawn(this.#run.bind(this));
 		this.#signals.cleanup(() => {
+			this.#stall.close();
 			this.#track.close();
 			for (const group of this.#groups) {
 				group.consumer.close();
@@ -173,6 +229,14 @@ export class Consumer {
 				if (!next) break;
 				group.empty = false;
 
+				// One arrival time per wire frame, read before the payload is parsed: every sample a
+				// container frame carries reached the receiver together, so sampling the clock per
+				// sample would fold this receiver's decode cost into a measurement of the path, and
+				// fold it in proportionally to the segment size.
+				const now = Moq.Time.Milli.now();
+				// Asked at the same instant, because the answer is about this arrival: a block that
+				// ended a tick ago is what this frame spent queued rather than in flight.
+				const stalled = this.#stall.blocked(now);
 				const decoded = this.#format.decode(next.payload);
 
 				for (const sample of decoded) {
@@ -215,6 +279,12 @@ export class Consumer {
 
 					if (!marker && this.#abortIfRewound(group, frame.timestamp)) return;
 
+					// Measured once the timeline is settled and before the age budget can skip
+					// the group: a reneged straggler is already gone, a rewound group has already
+					// aborted the track above, and a target derived from what survives the budget
+					// would only ever confirm the budget it was cut to.
+					if (!marker) this.#spread.observe(frame.timestamp, now, { stalled });
+
 					let skipped = false;
 					if (group.consumer.sequence !== this.#active) {
 						// A non-active group can also be too slow to wait for. This runs even when
@@ -250,6 +320,13 @@ export class Consumer {
 			// The tail is gone though, so the next group does not continue this one.
 			group.truncated = true;
 			if (!(err instanceof Moq.Error.Stream)) throw err;
+
+			// A stream verdict is a delivery outcome, not a task failure: the subscription's
+			// max age gave up on the group (Expired), the cache dropped it (TooFarBehind), the
+			// publisher reset it. Counting it here rather than rethrowing is what keeps a
+			// routine skip out of the effect's `spawn error` log, and what lets a viewer see
+			// that content was censored above the decoder.
+			this.#skipped.set(this.#skipped.peek() + 1);
 		} finally {
 			group.done = true;
 
@@ -267,6 +344,7 @@ export class Consumer {
 				const next = this.#groups[this.#groups.indexOf(group) + 1];
 				this.#active = continues(group, next) ? next.consumer.sequence : group.consumer.sequence + 1;
 			}
+			this.#checkMaxAge();
 
 			// Recompute buffered ranges now that this group is done,
 			// so consecutive done groups can merge into a single range.
@@ -305,52 +383,122 @@ export class Consumer {
 		if (this.#active === undefined) return;
 
 		let skipped = false;
+		let walked = false;
 		let hole = false;
 
-		// Keep skipping the oldest group while the buffered span exceeds the max age.
-		// This also handles gaps in group sequence numbers: if #active points to a missing
-		// group, the span proves the missing content is too old to wait for.
+		// Walk the delivery cursor forward while what the oldest group could still present has aged
+		// past the budget. This is also what ends the wait on a gap in group sequence numbers: if
+		// #active points to a missing group, the start of the next group holding a frame proves the
+		// missing content is too old to wait for. What happens to the oldest group when the budget
+		// runs out depends on what it holds; see the verdict below.
 		while (this.#groups.length >= 2) {
 			const threshold = Moq.Time.Micro.fromMilli(this.#maxAge.peek());
 			const first = this.#groups[0];
+			// Where delivery stands, which decides what a verdict against the head means.
+			const cursor = this.#active;
 
-			// Check the difference between the earliest and latest known frames.
-			let min: number | undefined;
-			let max: number | undefined;
+			// A group is measured by how far it could still reach, not by how far behind it
+			// started: it cannot present past where the next group holding a frame begins, so
+			// that bound is the freshest thing still worth waiting for, and the newest frame the
+			// track has reached is what it has aged against. This is the wire budget's rule
+			// verbatim (`Subscription::max_age`, `is_stale` in `rs/moq-net/src/model/track.rs`),
+			// which is the point: the two halves of one budget cannot be allowed to disagree.
+			//
+			// Measuring the head's own oldest undelivered frame instead makes the verdict a
+			// function of the group's length. Audio groups hold one frame, so it reads as
+			// lateness; a 2s video GOP whose tail is merely late is convicted the moment its
+			// successor opens, throwing away the rest of the GOP and leaving the picture frozen
+			// until the next keyframe, once per GOP for as long as the path stays slow.
+			//
+			// Stopping at the immediate successor instead is no bound at all when that successor
+			// holds nothing: a starved path opens groups it never fills, so the head is waited on
+			// forever while the groups behind those hold seconds of playable media. Only a group
+			// with a frame says where the timeline resumes, which is what `rs/moq-mux` measures
+			// against too.
+			let reach: Time.Micro | undefined;
+			for (let i = 1; i < this.#groups.length && reach === undefined; i++) {
+				reach = this.#groups[i].start;
+			}
+			if (reach === undefined) break;
 
+			let live: number | undefined;
 			for (const group of this.#groups) {
 				if (group.latest === undefined) continue;
-
-				const frame = group.frames.at(0)?.timestamp ?? group.latest;
-				if (min === undefined || frame < min) min = frame;
-				if (max === undefined || group.latest > max) max = group.latest;
+				if (live === undefined || group.latest > live) live = group.latest;
 			}
+			if (live === undefined) break;
 
-			if (min === undefined || max === undefined) break;
+			const age = live - reach;
+			if (age < threshold) break;
+			// Closed wire groups have no delivery left to wait for. Let their reader
+			// finish parsing buffered frames before deciding whether anything is missing.
+			if (!first.done && first.consumer.isClosed) break;
 
-			const age = max - min;
-			if (age <= threshold) break;
+			// The budget has run out, and what that costs depends on where the head sits.
+			//
+			// A finished group the cursor has reached belongs to next(), not to the budget: next()
+			// hands over whatever is still queued there and pops the group once it is spent, both
+			// within a microtask of being asked. Convicting one either throws away media sitting in
+			// memory ready to play, which is what a tune-in burst is, or reports a group the
+			// listener has already heard as lost. On legacy audio the second is not even quiet: a
+			// frame carries no duration, so a spent group's end reads as its last timestamp and the
+			// contiguous successor one frame later is judged a hole, which re-anchors the reader.
+			// `rs/moq-mux`'s consumer cannot reach either verdict: its read arm returns a buffered
+			// frame, and closes out a spent group as `GroupEnd`, before the budget is consulted.
+			if (first.done && cursor !== undefined && first.consumer.sequence <= cursor) break;
+
+			// Above the cursor the group it sits on never arrived, and now it never will. Give up
+			// on those sequences rather than on the media that did arrive: walk the cursor onto the
+			// head, the way the same consumer walks onto the first arrived group instead of
+			// dropping it. A head that finished holding nothing cannot be walked onto, so it is
+			// convicted below along with a head that is still downloading.
+			if (first.done && first.frames.length > 0) {
+				// Whether that cost anything is the one thing the reader has to be told: a head
+				// that continues the timeline we left off at means the sequence numbers merely
+				// jumped, and a head that does not means a span of media is missing.
+				if (!ptsContiguous(this.#presentedEnd, first.frames.at(0)?.timestamp)) hole = true;
+				this.#active = first.consumer.sequence;
+				walked = true;
+				break;
+			}
 
 			this.#groups.shift();
 			this.#active = this.#groups[0]?.consumer.sequence;
+			// Everything the verdict was reached on, since the same line has to answer whether the
+			// group was actually late or merely long: what it still held, how much of that nobody
+			// had read, where delivery stood, whether more was coming, and the three numbers the
+			// budget was compared against. Timestamps in microseconds.
 			console.warn(
-				`skipping slow group: track=${this.#track.name} ${first.consumer.sequence} -> ${this.#active}`,
+				`skipping slow group: track=${this.#track.name} ${first.consumer.sequence} -> ${this.#active} ` +
+					`first=${first.frames.at(0)?.timestamp ?? first.start} last=${first.latest} ` +
+					`queued=${first.frames.length} cursor=${cursor} ${first.done ? "closed" : "open"} ` +
+					`reach=${reach} live=${live} budget=${threshold}`,
 			);
 
-			const nextStart = this.#groups[0]?.frames.at(0)?.timestamp ?? this.#groups[0]?.end;
+			// Where the timeline picks up is where the next group holding a frame starts, the same
+			// bound the verdict was reached on. Anything convicted in between held nothing, and a
+			// group that held nothing says nothing about the timeline, so reading the immediate
+			// successor here would call a starved group a hole and re-anchor the reader over media
+			// that turned out to be contiguous.
 			const marker = !first.empty && !first.media;
-			if (marker || !ptsContiguous(first.end ?? this.#presentedEnd, nextStart)) {
+			if (marker || !ptsContiguous(first.end ?? this.#presentedEnd, reach)) {
 				hole = true;
 			}
 			first.consumer.close();
 			first.frames.length = 0;
 			skipped = true;
 			this.#gap = true;
+			// The local half of the same verdict the wire budget reaches, so it lands in the
+			// same counter. #tryDurationSkip does not: it only drops a group the next one
+			// already covers, so nothing is lost there.
+			this.#skipped.set(this.#skipped.peek() + 1);
 		}
 
 		if (hole) this.#markPlayhead();
 
-		if (skipped) {
+		// A walk moved delivery onto a group already buffered, so the reader has something to read
+		// even though nothing was dropped.
+		if (skipped || walked) {
 			this.#updateBuffered();
 
 			// Wake up any consumers waiting for a new frame.
@@ -375,7 +523,9 @@ export class Consumer {
 		if (!next || nextStart === undefined || active.end < nextStart) return false;
 
 		this.#groups.shift();
-		console.warn(`skipping covered group: ${active.consumer.sequence} -> ${next.consumer.sequence}`);
+		// Debug rather than warn: a live stream crosses one of these at every group boundary, and
+		// nothing is lost.
+		console.debug(`skipping covered group: ${active.consumer.sequence} -> ${next.consumer.sequence}`);
 		this.#recordPresented(active);
 		this.#active = next.consumer.sequence;
 
@@ -424,6 +574,10 @@ export class Consumer {
 	 * legacy marker. The overall result is undefined once closed. When `discontinuity`
 	 * jumps relative to the previous call, re-apply startup delay and skip: it is a playhead
 	 * event, not a decoder flush.
+	 *
+	 * A media-less marker group raises that event on the result that closes it, after its
+	 * endpoint and any terminal packets behind it, so the endpoint ends the run it belongs to
+	 * rather than trimming the one that resumes.
 	 *
 	 * `continuous` is true when this result picks up exactly where the previous frame left off, so
 	 * the span between them can be treated as delivered. It is false on the first frame, after a
@@ -502,7 +656,6 @@ export class Consumer {
 					const seq = this.#groups[0].consumer.sequence;
 					const end = this.#format.end?.(frame);
 					if (end !== undefined) {
-						if (!this.#groups[0].media) this.#markPlayhead();
 						if (this.#liveEdge === undefined || end > this.#liveEdge.timestamp) {
 							this.#liveEdge = { group: seq, timestamp: end };
 						}
@@ -548,6 +701,11 @@ export class Consumer {
 					if (group) {
 						const seq = group.consumer.sequence;
 						if (group.truncated) this.#gap = true;
+						// A group that carried wire frames but no media is the publisher's declared
+						// break. Raised as the group closes rather than on the marker frame, so the
+						// endpoint still belongs to the run it ends and the reader only re-anchors
+						// once every terminal packet behind the marker has been delivered.
+						if (!group.empty && !group.media) this.#markPlayhead();
 						this.#updateBuffered();
 						return {
 							frame: undefined,
@@ -591,6 +749,7 @@ export class Consumer {
 		this.#discontinuity++;
 		this.#deliveredGroup = undefined;
 		this.#gap = true;
+		this.#spread.reanchor();
 	}
 
 	#updateBuffered(): void {

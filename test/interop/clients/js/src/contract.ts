@@ -74,6 +74,9 @@ export const TONE_FLOOR_DB = 15;
  */
 export const AUDIBLE_RMS = 0.02;
 
+/** Which thread feeds a player's audio ring: the page's audio worker, or the page's own main thread. */
+export type AudioThread = "worker" | "main";
+
 /** Live instances of each resource the page's wrappers count. */
 export type Resources = {
 	/** Open `WebTransport` sessions, i.e. connections to the relay. */
@@ -130,6 +133,8 @@ export type Sample = {
 	audioTimestamp?: number;
 	/** Whether the audio buffer is waiting to refill. */
 	audioStalled: boolean;
+	/** Which thread feeds the audio ring (`audio.out.thread`), absent while the worker is starting. */
+	audioThread?: AudioThread;
 	/** Peak frequency in the tone band, absent until the graph exists. */
 	toneHz?: number;
 	/** The tone step that peak names, absent when no tone stands above the floor. */

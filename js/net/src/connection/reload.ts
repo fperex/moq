@@ -29,7 +29,7 @@ export type ReloadDelay = {
 
 	/**
 	 * Maximum total time to spend retrying the current URL before giving up
-	 * (default: 10000ms). Resets after each successful connection, a URL change, or a
+	 * (default: 60000ms). Resets after each successful connection, a URL change, or a
 	 * disable/re-enable. Set to 0 for unlimited retries.
 	 */
 	timeout?: Time.Milli;
@@ -64,17 +64,18 @@ export type ReloadProps = Omit<ConnectProps, "url" | "signal" | "transport"> & {
 /**
  * The backoff applied to whichever {@link ReloadDelay} fields a caller leaves out.
  *
- * The timeout is short on purpose: a failure that clears within it was transient, and one that
- * doesn't should surface on {@link Reload.error} rather than leave the page silently
- * reconnecting for minutes. A loop nobody watches wants `timeout: 0` instead, since there is
- * no one to react. Giving up does not dispose the loop: a new URL or a disable/re-enable
- * starts another sequence.
+ * The timeout has to outlast a relay restart, which is the common reason a live page is
+ * disconnected: a graceful relay drains for its own window (10s by default) before the process
+ * even exits. Past that it is deliberately short, so a failure that has not cleared surfaces on
+ * {@link Reload.error} rather than leaving the page silently reconnecting for the rest of the
+ * afternoon. A loop nobody watches wants `timeout: 0` instead, since there is no one to react.
+ * Giving up does not dispose the loop: a new URL or a disable/re-enable starts another sequence.
  */
 const DEFAULT_DELAY: Required<ReloadDelay> = {
 	initial: Time.Milli(1000),
 	multiplier: 2,
 	max: Time.Milli(5000),
-	timeout: Time.Milli(10000),
+	timeout: Time.Milli(60000),
 };
 
 /** How often the send-rate estimate is sampled from the live transport. */
@@ -255,7 +256,7 @@ export class Reload {
 				if (pending) return;
 				pending = true;
 				try {
-					const stats = await Promise.race([effect.cancel, connection.stats()]);
+					const stats = await effect.race(connection.stats());
 					if (stats) this.#estimate.set(stats.estimatedSendRate);
 				} finally {
 					pending = false;
@@ -341,7 +342,7 @@ export class Reload {
 				// A cancelled effect resolves undefined, so the sentinel tells the session
 				// closing (null for clean, an Error otherwise) apart from this run being
 				// torn down.
-				const closed = await Promise.race([effect.cancel, connection.closed]);
+				const closed = await effect.race(connection.closed);
 				if (closed === undefined) return;
 
 				console.warn("connection closed, reconnecting");
@@ -443,10 +444,10 @@ export class Reload {
 	 *
 	 * Stays empty while the relay lacks {@link Established.discovery}.
 	 */
-	announced(scope: Path.Pattern = Path.Pattern.all()): Announce.Consumer {
+	announced(scope: Path.Pattern = Path.Pattern.all(), options?: Announce.Options): Announce.Consumer {
 		// With a consume origin the table already spans reconnects (the forwarder retracts
 		// a dead session's entries), so its stream is the same thing with less machinery.
-		if (this.consume) return this.consume.announced(scope);
+		if (this.consume) return this.consume.announced(scope, options);
 
 		const producer = new Announce.Producer();
 		const consumer = producer.consume();
@@ -460,7 +461,7 @@ export class Reload {
 			// consumer empty rather than opening a subscription that can't be answered.
 			if (!conn.discovery) return;
 
-			const upstream = conn.announced(scope);
+			const upstream = conn.announced(scope, options);
 			effect.cleanup(() => upstream.close());
 
 			// Track what this connection announced so we can retract it if the connection
@@ -470,7 +471,7 @@ export class Reload {
 			effect.spawn(async () => {
 				try {
 					for (;;) {
-						const entry = await Promise.race([effect.cancel, upstream.next()]);
+						const entry = await effect.race(upstream.next());
 						if (!entry) break;
 						if (Announce.isActive(entry.kind)) active.set(entry.prefix, entry);
 						else active.delete(entry.prefix);

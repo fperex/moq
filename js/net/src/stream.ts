@@ -1,3 +1,4 @@
+import { race } from "@moq/signals";
 import { fromTransport, StreamCode, StreamError, toStreamCode, toTransport } from "./error.ts";
 import type { IetfVersion } from "./ietf/version.ts";
 import { Version } from "./ietf/version.ts";
@@ -98,10 +99,15 @@ export interface OpenOptions {
 	waitUntilAvailable?: boolean;
 }
 
+// Each session's incoming bidi streams, read through one reader for the session's life and never
+// released. WebKit deadlocks the calling thread, and then the page, when a garbage collection
+// starts inside `releaseLock()` (Safari 26.6), and a session accepts until it closes anyway.
+const incomingBidis = new WeakMap<WebTransport, ReadableStreamDefaultReader<WebTransportBidirectionalStream>>();
+
 /** Options for {@link Writer.tryOpen}. */
 export interface TryOpenOptions extends OpenOptions {
-	/** Give up once this settles, however it settles. */
-	cancel: Promise<unknown>;
+	/** Give up once this resolves. */
+	cancel: Promise<void>;
 }
 
 export class Stream {
@@ -131,17 +137,19 @@ export class Stream {
 		this.reader = reader;
 	}
 
+	/** The session's next incoming bidirectional stream, or undefined once it accepts no more. */
 	static async accept(quic: WebTransport, version?: IetfVersion): Promise<Stream | undefined> {
-		for (;;) {
-			const reader =
+		let reader = incomingBidis.get(quic);
+		if (!reader) {
+			reader =
 				quic.incomingBidirectionalStreams.getReader() as ReadableStreamDefaultReader<WebTransportBidirectionalStream>;
-			const next = await reader.read();
-			reader.releaseLock();
-
-			if (next.done) return;
-			const { readable, writable } = next.value;
-			return new Stream({ readable, writable, version });
+			incomingBidis.set(quic, reader);
 		}
+
+		const next = await reader.read();
+		if (next.done) return;
+		const { readable, writable } = next.value;
+		return new Stream({ readable, writable, version });
 	}
 
 	/**
@@ -523,27 +531,29 @@ export class Writer {
 	 * an over-limit open instead of rejecting it.
 	 */
 	static async tryOpen(quic: WebTransport, options: TryOpenOptions): Promise<Writer | undefined> {
-		// A rejected `cancel` (STOP_SENDING) means the peer is gone too, so both settle
-		// paths mean "give up" and neither is left unhandled. Built before the open, and
-		// raced ahead of it, so an already-cancelled caller wins even against a slot that
-		// is free right now.
-		const cancelled = options.cancel.then(
-			() => undefined,
-			() => undefined,
-		);
+		// Raced ahead of the open, so an already-cancelled caller wins even against a slot
+		// that is free right now. `race` rather than `Promise.race`: the caller shares one
+		// `cancel` across every group of a subscription, which must not gain a reaction per call.
 		const open = Writer.open(quic, options);
 
+		// Resets a stream that opens after we gave up; a no-op if the open itself failed.
+		const abandon = () => {
+			const abandoned = new Error("abandoned waiting for a stream slot");
+			open.then((w) => w.reset(abandoned)).catch(() => void 0);
+		};
+
 		try {
-			const stream = await Promise.race([cancelled, open]);
+			const stream = await race([options.cancel, open]);
 			if (stream) return stream;
 		} catch (err: unknown) {
 			// open already discarded the late stream on its way out.
-			if (!(err instanceof TimeoutError)) throw err;
-			return undefined;
+			if (err instanceof TimeoutError) return undefined;
+			// A rejected `cancel` still leaves the open pending.
+			abandon();
+			throw err;
 		}
 
-		const abandoned = new Error("abandoned waiting for a stream slot");
-		open.then((w) => w.reset(abandoned)).catch(() => void 0);
+		abandon();
 		return undefined;
 	}
 }

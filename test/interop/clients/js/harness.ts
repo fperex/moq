@@ -69,17 +69,51 @@ export const POLL_INTERVAL_MS = 100;
 /** Sleep for `ms`. */
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Serve the prebuilt page on localhost, a secure context so WebTransport and WebCodecs are enabled. */
-export function serve(): { origin: string; stop: () => void } {
-	const root = join(new URL(".", import.meta.url).pathname, "dist");
+/**
+ * A path prefix served with extra response headers.
+ *
+ * The prefix is stripped before the file lookup, so the same built page is reachable under several
+ * of them. That is how one build gets served both cross-origin isolated and not: the headers decide
+ * which ring the page can use, and serving them from two prefixes lets one run exercise both without
+ * rebuilding or restarting anything.
+ */
+export type Route = {
+	/** Path prefix to match, without a trailing slash: `/isolated`. */
+	prefix: string;
+	/** Headers added to every response under the prefix. */
+	headers: Record<string, string>;
+};
+
+/** Where to serve from, on what port, and under which prefixes. */
+export type ServeProps = {
+	/** Directory of the built page. Defaults to this file's own `dist`, which is the interop client's. */
+	root?: string;
+	/** Port to bind. Defaults to 0, an OS-assigned one. */
+	port?: number;
+	/** Prefixes served with extra headers. Matched longest first; anything else is served plain. */
+	routes?: Route[];
+};
+
+/**
+ * Serve the prebuilt page on localhost, a secure context so WebTransport and WebCodecs are enabled.
+ *
+ * The no-argument call serves the interop client's own build with no extra headers, which is what its
+ * two drivers want.
+ */
+export function serve(props: ServeProps = {}): { origin: string; stop: () => void } {
+	const root = props.root ?? join(new URL(".", import.meta.url).pathname, "dist");
+	const ordered = [...(props.routes ?? [])].sort((a, b) => b.prefix.length - a.prefix.length);
 	const server = Bun.serve({
-		port: 0,
+		port: props.port ?? 0,
 		async fetch(req) {
 			let path = new URL(req.url).pathname;
-			if (path === "/") path = "/index.html";
+			const route = ordered.find((r) => path === r.prefix || path.startsWith(`${r.prefix}/`));
+			if (route) path = path.slice(route.prefix.length);
+			if (path === "" || path === "/") path = "/index.html";
+			const headers = route?.headers;
 			const file = Bun.file(join(root, path));
-			if (await file.exists()) return new Response(file);
-			return new Response(Bun.file(join(root, "index.html"))); // SPA fallback
+			if (await file.exists()) return new Response(file, { headers });
+			return new Response(Bun.file(join(root, "index.html")), { headers }); // SPA fallback
 		},
 	});
 	return { origin: `http://localhost:${server.port}`, stop: () => server.stop(true) };
@@ -158,6 +192,23 @@ export async function open(
 	if (trace) await startTrace(page, label);
 	await page.goto(url, { waitUntil: "load" });
 	return [page, errors];
+}
+
+/**
+ * Write the trace of a page opened with `trace` to `file`, and say where it went.
+ *
+ * For a driver that names its own trace rather than leaving it to {@link finishTraces}. Only worth
+ * calling on the way out of a failure: a trace is large, and a passing run's is noise. Never throws,
+ * because it runs from a failure path and the failure is the thing worth reporting.
+ */
+export async function saveTrace(page: Page, file: string): Promise<void> {
+	try {
+		await page.context().tracing.stop({ path: file });
+		console.error(`trace: ${file}`);
+		console.error(`view it with: bunx playwright show-trace ${file}`);
+	} catch (err) {
+		console.error(`trace: not saved (${err instanceof Error ? err.message : String(err)})`);
+	}
 }
 
 /** Throw everything the page has reported so far, if anything. */

@@ -634,6 +634,11 @@ if [[ "$MEDIA" -eq 1 ]]; then
     else
         echo "=== media output and lifecycle ==="
         run_media "media output + lifecycle"
+        # The same player with its audio kept on the page (offload="false"): the path a page gets when
+        # its audio worker cannot run. Every case that plays the player's audio; the capture case
+        # never does.
+        run_media "media output + lifecycle, audio on the main thread" --offload false \
+            --cases pause,rejoin,detach,republish,late-join
         run_media "control: frozen video" --fault frozen-video --cases none --expect-fail "video progress"
         run_media "control: silent audio" --fault silent-audio --cases none --expect-fail "audio tone"
         run_media "control: offset audio" --fault audio-offset --cases none --expect-fail "audio/video sync"

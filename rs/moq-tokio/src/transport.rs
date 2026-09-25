@@ -226,7 +226,7 @@ pub struct SendStream<S: web_transport_trait::SendStream + 'static> {
 	completed: Bytes,
 	/// Cancels the in-flight write so a reset applies immediately instead of
 	/// waiting behind blocked I/O (whose partial progress a reset discards
-	/// anyway). Fired by [`reset`](wt_poll::SendStream::reset) and by [`Drop`].
+	/// anyway). An acknowledgement watch can also be interrupted to apply priority updates.
 	interrupt: Option<futures::channel::oneshot::Sender<()>>,
 }
 
@@ -242,7 +242,7 @@ enum SendState<S: web_transport_trait::SendStream + 'static> {
 		chunk: Bytes,
 	},
 	/// The closed() acknowledgement watch; a `None` result means it was
-	/// interrupted by a late reset (see [`SendStream::interrupt`]).
+	/// interrupted by a reset or priority update (see [`SendStream::interrupt`]).
 	Closing(#[allow(clippy::type_complexity)] OpBox<(S, Option<Result<(), S::Error>>)>),
 }
 
@@ -373,6 +373,13 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 	fn set_priority(&mut self, order: u8) {
 		match self.state.get_mut().unwrap().as_mut() {
 			Some(SendState::Idle(stream)) => stream.set_priority(order),
+			Some(SendState::Closing(_)) => {
+				self.priority = Some(order);
+				// Reclaim the stream from the acknowledgement watch to update queued bytes.
+				if let Some(tx) = self.interrupt.take() {
+					let _ = tx.send(());
+				}
+			}
 			_ => self.priority = Some(order),
 		}
 	}
@@ -471,9 +478,7 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 						self.interrupt = None;
 						self.settle(&mut stream);
 						*self.state.get_mut().unwrap() = Some(SendState::Idle(stream));
-						// An interrupted watch was abandoned for a late reset,
-						// which settle just applied; the next iteration watches
-						// the now-reset stream, which resolves promptly.
+						// Apply a late reset or priority update before watching again.
 						if let Some(res) = res {
 							return Poll::Ready(res);
 						}
@@ -993,6 +998,24 @@ mod tests {
 		// The re-armed watch on the reset stream is allowed to stay pending in
 		// this fake (it never acks); what matters is the reset went out.
 		let _ = closed;
+	}
+
+	#[test]
+	fn unacknowledged_fin_applies_priority_updates() {
+		let fake = FakeSend::default();
+		fake.never_ack.store(true, Ordering::SeqCst);
+		let mut send = SendStream::new(fake.clone());
+		let mut cx = cx();
+
+		assert_eq!(send.poll_write(&mut cx, b"queued"), Poll::Ready(Ok(6)));
+		send.finish().unwrap();
+		assert!(send.poll_closed(&mut cx).is_pending());
+
+		send.set_priority(7);
+		assert!(send.poll_closed(&mut cx).is_pending());
+		assert_eq!(fake.priorities.lock().unwrap().as_slice(), &[7]);
+		assert!(fake.resets.lock().unwrap().is_empty());
+		assert_eq!(fake.writes.lock().unwrap().as_slice(), b"queued");
 	}
 
 	// The poll contract allows retrying a pending write with a SHORTER buffer;

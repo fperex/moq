@@ -1,10 +1,11 @@
-import * as Catalog from "@moq/hang/catalog";
-import * as Container from "@moq/hang/container";
+import type * as Catalog from "@moq/hang/catalog";
+import type * as Container from "@moq/hang/container";
 import * as Util from "@moq/hang/util";
 import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import {
 	type Computed,
+	Derived,
 	Effect,
 	type Getter,
 	getter,
@@ -13,30 +14,61 @@ import {
 	readonlys,
 	Signal,
 } from "@moq/signals";
-import { base64ToBytes } from "../base64";
-import { nextMedia, subscribeMedia } from "../media";
-
-import type { Sync } from "../sync";
-import { type AudioBuffer, createAudioBuffer } from "./buffer";
-import { type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
-import { Handover } from "./handover";
-import { reanchorFloor, ringSamples } from "./latency";
+import { accumulate } from "../media";
+import type { Delay, Sync } from "../sync";
+import { reportTransport, supportsSharedArrayBuffer } from "./buffer";
+import { audioMaxAge, type DecoderConfig, decoderConfig } from "./config";
+import type * as Playout from "./playout";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
-import { type DecodedSpan, Terminal } from "./terminal";
-import { unlockOnGesture } from "./unlock";
-import { Warmup } from "./warmup";
-
-// How long the latency target must hold steady before a floor increase re-anchors. Coalesces a
-// slider drag (many small steps) into a single re-anchor once the user settles on a value.
-const LATENCY_REANCHOR_DEBOUNCE_MS = 150;
-
-const LEGACY_WARMUP_CALLBACKS = 3;
+import { Supply } from "./supply";
+import { supported } from "./supported";
+import { type PageGraph, Remote } from "./worker/remote";
 
 export type DecoderInput = {
 	// Whether to download the audio track. Defaults to true.
 	enabled: Getter<boolean>;
+
+	/**
+	 * Whether the player is on the page at all. Defaults to true.
+	 *
+	 * A player that is not can never be heard, so it releases its audio context, the render thread
+	 * behind it and the ring, and builds them again if it comes back. Separate from `enabled`, which
+	 * a mute also clears: a muted tile keeps the context it has, so the unmute costs no gesture.
+	 */
+	attached: Getter<boolean>;
+
+	/**
+	 * Whether a gap in the audio is concealed with synthesized audio rather than played as a ramp
+	 * into silence. Defaults to true.
+	 *
+	 * Concealment repeats the pitch period of the last real audio, fades it out over a long outage
+	 * and ends in digital silence, and splices the media back on where it lines up. Turning it off
+	 * leaves a gap audible as a gap, which is what a listener who would rather hear the loss than
+	 * hear invented audio wants.
+	 *
+	 * Read when the audio graph is built, since it belongs to the reader running inside the worklet.
+	 */
+	conceal: Getter<boolean>;
+
+	/**
+	 * The relay the broadcast is read from, which the page's audio worker dials for the audio. Without one
+	 * the audio stays on the page.
+	 */
+	url: Getter<URL | undefined>;
+
+	/**
+	 * Whether the audio is fed from a dedicated worker rather than the page's main thread. Defaults to true.
+	 *
+	 * The worker subscribes, decodes and writes the ring on a session of its own to {@link url}, so a busy
+	 * main thread cannot starve the ring. One worker serves every player on the page. Needs a {@link url},
+	 * a `Worker` and Web Audio; without them the audio stays on the page. So it does, for good, once the
+	 * worker cannot start (a CSP without `worker-src blob:`, say), fails, stops reporting, refuses the
+	 * rendition, or plays nothing in five seconds of trying, or once the worklet cannot read what it is
+	 * sent: `out.thread` says which.
+	 */
+	offload: Getter<boolean>;
 };
 
 /** Constructor properties for {@link Decoder}. */
@@ -63,15 +95,55 @@ type DecoderOutput = {
 	// Whether the audio buffer is stalled (waiting to fill)
 	stalled: Signal<boolean>;
 
+	// Whether playback stopped rather than started: the ring is stalled after it had been playing.
+	interrupted: Signal<boolean>;
+
+	// How many times the ring ran dry mid-playback, so the UI can show that the target is too low.
+	underruns: Signal<number>;
+
+	// Groups that lost content above the decoder: the age budget skipped them, or the transport
+	// gave up on delivering them in time.
+	skipped: Signal<number>;
+
 	// Combined buffered ranges (network jitter + decode buffer)
 	buffered: Signal<Container.BufferedRanges>;
+
+	// How late audio frames arrive relative to the earliest one, measured for as long as the
+	// rendition lasts. Wired into Sync by the parent, which sizes the "auto" delay from it.
+	spread: Signal<Time.Milli | undefined>;
+
+	/**
+	 * Every audio ring counter at once: what it holds, what the playout engine did with it, what
+	 * either end threw away, and the budget its supply is skipped against. Undefined until the graph
+	 * is built and the first sample lands.
+	 *
+	 * @internal
+	 */
+	debug: Signal<Playout.Debug | undefined>;
+
+	/**
+	 * Which thread feeds the ring: the page's worker, with what its session runs over, or the page's own,
+	 * with why when the worker could have and did not. Undefined while the worker is starting.
+	 *
+	 * @internal
+	 */
+	thread: Signal<Thread | undefined>;
 };
+
+/** Which thread feeds the audio ring. See `Decoder.out.thread`. */
+type Thread = { kind: "worker"; transport: Moq.Connection.Transport | undefined } | { kind: "main"; reason?: string };
 
 /** Cumulative audio statistics since the decoder started. */
 export interface Stats {
 	/** Number of encoded bytes received. */
 	bytesReceived: number;
 }
+
+// The supply feeding the ring, and the graph built for it.
+type Active = { graph: Signal<PageGraph | undefined> } & (
+	| { kind: "main"; supply: Supply }
+	| { kind: "worker"; supply: Remote }
+);
 
 /**
  * Downloads audio from a track and emits it to an AudioContext.
@@ -90,68 +162,329 @@ export class Decoder {
 		stats: new Signal<Stats | undefined>(undefined),
 		timestamp: new Signal<Time.Milli | undefined>(undefined),
 		stalled: new Signal<boolean>(true),
+		interrupted: new Signal<boolean>(false),
+		underruns: new Signal<number>(0),
+		skipped: new Signal<number>(0),
 		buffered: new Signal<Container.BufferedRanges>([]),
+		spread: new Signal<Time.Milli | undefined>(undefined),
+		debug: new Signal<Playout.Debug | undefined>(undefined),
+		thread: new Signal<Thread | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
-	// Decode buffer: audio sent to worklet but not yet played
-	#decodeBuffered = new Signal<Container.BufferedRanges>([]);
+	// The AudioContext the graph runs in, owned here rather than by an effect: it is built by the
+	// gesture that starts it (see #buildContext) and outlives every other change to the graph short
+	// of the player leaving the page (see #runContext).
+	#context: { audio: AudioContext; effects: Effect } | undefined;
 
-	// Audio ring bridging main thread and worklet (shared memory or postMessage transport).
-	#ring: AudioBuffer | undefined;
+	// Everything that feeds the ring (the subscription, the estimator, the decoder and the writes) and the
+	// graph it writes into: on the page, or in the page's worker. See #runSupply.
+	readonly #active = new Signal<Active | undefined>(undefined);
 
-	// The rate the decoder actually outputs, learned from the first decoded frame. This is the source
-	// of truth for the graph: a decoder can output a different rate than it was configured with (e.g.
-	// Opus decodes to 48kHz on Chrome/Firefox but to the configured rate on Safari). Until a frame
-	// arrives we pre-build the graph from the catalog rate; if the real rate differs we rebuild it.
-	#decodedSampleRate = new Signal<number | undefined>(undefined);
+	// Where the supply runs, once decided. See #runSupply.
+	readonly #mode: Computed<"main" | "worker">;
 
-	// Ordered discontinuity and endpoint state from the container consumer.
-	#terminal = new Terminal();
-
-	// The latency floor as of the last settled change, to detect a floor *increase* (needs a deeper
-	// cushion) versus a decrease or a real-time RTT wiggle. See #runLatencyReanchor.
-	#prevFloor?: Time.Milli;
-
-	// Which subscription the ring's buffered samples came from. See #runDecoder.
-	#handover = new Handover();
+	// Why the page took the audio back from its worker, once it has: for good. See #runFallback.
+	readonly #fallback = new Signal<string | undefined>(undefined);
 
 	#signals = new Effect();
 
-	// The catalog fields that require a replacement subscription or decoder.
-	readonly #identity: Computed<PlaybackIdentity | undefined>;
-
-	// The decoder fields that require a new audio graph. Routing and metadata changes leave the
-	// context, worklet, and ring alone.
+	// The decoder fields that require a new worklet and ring. Routing and metadata changes leave
+	// them alone.
 	readonly #config: Computed<DecoderConfig | undefined>;
+
+	// The rate the graph runs at: what the decoder turns out to emit, else what the catalog claims.
+	// Deduped, so a decoded rate confirming the catalog's does not count as a change.
+	readonly #rate: Computed<number | undefined>;
+
+	/**
+	 * The age budget for audio: `Sync.out.maxAge` plus what the ring can absorb past it.
+	 *
+	 * See {@link audioMaxAge} for what it adds and why.
+	 *
+	 * Audio only, and deliberately not `Sync.out.maxAge` itself. That value is also the lookahead
+	 * cap in `Sync.received`, which bounds how far ahead of the playhead an *early* frame may be
+	 * held before playback skips forward. Widening it would let buffered playback drift a headroom
+	 * further from the live edge to solve a problem that only exists for late arrivals. Video is
+	 * untouched for the same reason: it drops a late frame at render rather than losing the group.
+	 *
+	 * It reads synchronously from the first peek, which is what `subscribeMedia` and
+	 * `Container.Consumer` need at construction.
+	 */
+	// The ring's depth: `sync.out.delay` plus `sync.out.offset`. See the constructor.
+	readonly #target: Derived<readonly [Getter<Time.Milli>, Getter<Time.Milli>], Time.Milli>;
+
+	readonly #maxAge: Derived<
+		readonly [Getter<Time.Milli>, Getter<Delay>, Getter<Catalog.AudioConfig | undefined>],
+		Time.Milli
+	>;
 
 	constructor(props: DecoderProps) {
 		this.in = {
 			enabled: getter(props?.enabled ?? true),
+			attached: getter(props?.attached ?? true),
+			conceal: getter(props?.conceal ?? true),
+			url: getter<URL | undefined>(props?.url),
+			offload: getter(props?.offload ?? true),
 		};
 
 		this.source = props.source;
 		this.sync = props.sync;
-		this.#signals.cleanup(this.sync.register(this.source.out.jitter));
-		this.#identity = this.#signals.computed((effect) => {
-			const config = effect.get(this.source.out.config);
-			return config ? playbackIdentity(config) : undefined;
-		});
 		this.#config = this.#signals.computed((effect) => {
 			const config = effect.get(this.source.out.config);
 			return config ? decoderConfig(config) : undefined;
 		});
+		this.#rate = this.#signals.computed((effect) => {
+			const config = effect.get(this.#config);
+			if (!config) return undefined;
+			const active = effect.get(this.#active);
+			const decoded = active ? effect.get(active.supply.out.rate) : undefined;
+			return decoded ?? config.sampleRate;
+		});
+		this.#mode = this.#signals.computed((effect) => {
+			if (effect.get(this.#fallback) !== undefined) return "main";
+			if (!effect.get(this.in.offload)) return "main";
+			if (effect.get(this.in.url) === undefined) return "main";
+			// No worker to hand it to, or no Web Audio for it to feed: server rendering, a test runner.
+			if (typeof Worker !== "function" || typeof AudioContext !== "function") return "main";
+			return "worker";
+		});
 
-		this.#signals.run(this.#runWorklet.bind(this));
-		this.#signals.run(this.#runEnabled.bind(this));
-		this.#signals.run(this.#runLatency.bind(this));
-		this.#signals.run(this.#runLatencyReanchor.bind(this));
-		this.#signals.run(this.#runDecoder.bind(this));
+		// What the ring holds on top of the chunk: the estimator's answer plus however much later
+		// the picture arrives than the sound for the same timestamp. `sync.out.delay` stays the
+		// estimator's answer alone, which is what the player's jitter buffer row reports; this is
+		// the quantity the listener actually waits, and the one that puts the picture back in sync.
+		this.#target = new Derived([this.sync.out.delay, this.sync.out.offset] as const, (delay, offset) =>
+			Time.Milli.add(delay, offset),
+		);
+		this.#maxAge = new Derived(
+			[this.sync.out.maxAge, this.sync.in.delay, this.source.out.config] as const,
+			(maxAge, delay, config) => audioMaxAge(maxAge, config, delay === "instant"),
+		);
+
+		// There is no context until a user gesture builds one (see #buildContext). Armed for the
+		// decoder's lifetime rather than while audio is enabled: the click that unmutes a tile is the
+		// activation, and listeners armed as a consequence of it are armed one microtask too late to
+		// hear it. Built and resumed inside the handler, because an effect the gesture schedules runs
+		// a microtask later. A player off the page builds nothing: the gesture belongs to whatever the
+		// viewer actually clicked. Nothing to arm where there is no document (server rendering, a test
+		// runner). A mouse grants activation on `pointerdown`, touch and pen only on `pointerup`.
+		if (typeof document !== "undefined") {
+			const build = () => {
+				if (this.#context || !this.in.attached.peek()) return;
+				this.#buildContext(this.#rate.peek())
+					.resume()
+					.catch(() => {});
+			};
+			this.#signals.event(document, "pointerdown", build);
+			this.#signals.event(document, "pointerup", build);
+			this.#signals.event(document, "keydown", build);
+		}
+		// Whatever context there is, including one built outside a handler or rebuilt at a new rate,
+		// is started now if the browser allows it and on every gesture until it runs.
+		this.#signals.run((effect) => {
+			const context = effect.get(this.#out.context);
+			if (context) Util.Gesture.unlock(effect, context);
+		});
+		this.#signals.cleanup(() => this.#closeContext());
+
+		this.#signals.run(this.#runSupply.bind(this));
+		this.#signals.run(this.#runFallback.bind(this));
+		this.#signals.run(this.#runThread.bind(this));
+		this.#signals.run(this.#runContext.bind(this));
+		this.#signals.run(this.#runRing.bind(this));
+		this.#signals.run(this.#runClock.bind(this));
+		this.#signals.run(this.#runOutputs.bind(this));
 	}
 
-	#runWorklet(effect: Effect): void {
-		// It takes a second or so to initialize the AudioContext/AudioWorklet, so do it even if disabled.
-		// This is less efficient for video-only playback but makes muting/unmuting instant.
+	/**
+	 * Run the supply where it belongs: in the page's worker when the player offloads, on the page otherwise.
+	 *
+	 * Each supply gets a graph of its own (see #runWorklet), so one taking over from another never writes
+	 * into a node the other was writing.
+	 */
+	#runSupply(effect: Effect): void {
+		const mode = effect.get(this.#mode);
+		if (mode === undefined) return;
+
+		const graph = new Signal<PageGraph | undefined>(undefined);
+		const props = {
+			source: this.source,
+			sync: this.sync,
+			enabled: this.in.enabled,
+			graph,
+			target: this.#target,
+			maxAge: this.#maxAge,
+		};
+
+		if (mode === "worker") {
+			// A player off the page holds no share of the worker, so the page's last player to leave lets
+			// it go.
+			if (!effect.get(this.in.attached)) return;
+			const supply = new Remote({ ...props, url: this.in.url });
+			effect.cleanup(() => supply.close());
+			effect.set(this.#active, { kind: "worker", supply, graph }, undefined);
+			return;
+		}
+
+		const supply = new Supply({ ...props, polyfill: Util.Libav.polyfill });
+		effect.cleanup(() => supply.close());
+		effect.set(this.#active, { kind: "main", supply, graph }, undefined);
+	}
+
+	/**
+	 * Take the audio back from the worker for good once it cannot play it.
+	 *
+	 * The switch is #runSupply's: the worker hears the player is gone, the page's own supply subscribes on
+	 * the page's session, and it writes a fresh node on the same context, so no gesture is spent and nothing
+	 * the worker still had in flight reaches it. The clock goes with the worker's ring, and `Sync` runs on at
+	 * wall speed from where the playhead was until the page's ring has one.
+	 *
+	 * The worker's own trouble reaches every player on the page, which the pool warns about once. A
+	 * player's own is warned about here.
+	 */
+	#runFallback(effect: Effect): void {
+		const active = effect.get(this.#active);
+		if (active?.kind !== "worker") return;
+		const failure = effect.get(active.supply.out.failure);
+		if (!failure) return;
+		if (failure.scope === "player") console.warn(`[audio] falling back to the main thread: ${failure.reason}`);
+		this.#fallback.set(failure.reason);
+	}
+
+	#runThread(effect: Effect): void {
+		const reason = effect.get(this.#fallback);
+		if (reason !== undefined) {
+			this.#out.thread.set({ kind: "main", reason });
+			return;
+		}
+
+		const active = effect.get(this.#active);
+		if (active?.kind !== "worker") {
+			this.#out.thread.set(active && { kind: "main" });
+			return;
+		}
+
+		const ready = effect.get(active.supply.out.ready);
+		const transport = effect.get(active.supply.out.transport);
+		this.#out.thread.set(ready ? { kind: "worker", transport } : undefined);
+	}
+
+	// Mirror the active supply's outputs onto ours.
+	#runOutputs(effect: Effect): void {
+		const active = effect.get(this.#active);
+		if (!active) return;
+		const out = active.supply.out;
+
+		// Unlike the counters, the estimate goes when the player does: Sync holds the buffer open for
+		// any track still publishing one.
+		effect.run((inner) => inner.set(this.#out.spread, inner.get(out.spread)));
+		effect.proxy(this.#out.buffered, out.buffered);
+
+		// The counters carry across a supply taking over from another, so they never run backwards.
+		accumulate(effect, this.#out.skipped, out.skipped);
+		let received = 0;
+		effect.run((inner) => {
+			const bytes = inner.get(out.stats)?.bytesReceived;
+			if (bytes === undefined) return;
+			this.#out.stats.update((stats) => ({ bytesReceived: (stats?.bytesReceived ?? 0) + bytes - received }));
+			received = bytes;
+		});
+	}
+
+	/**
+	 * Build the context for a tile whose audio is on, replace it when the rate it must run at
+	 * changes, and release it when the player leaves the page.
+	 *
+	 * A context's rate is fixed for its lifetime, so the rate the decoder turns out to emit (see
+	 * `Supply.#emit`) is the one change worth a new context. Everything else that rebuilds the graph
+	 * (a later catalog frame carrying the codec description, a channel count change) rebuilds the
+	 * worklet and ring *under* the context that is already playing, since replacing it would spend a
+	 * gesture that may never come again. The replacement here is built outside a handler, so it
+	 * starts only while the page's activation is still live; `Util.Gesture.unlock` stays armed and
+	 * spends the next gesture on it otherwise.
+	 *
+	 * A player taken off the page releases its context and pays for a new one if it comes back:
+	 * nothing can be heard out of it, and what it holds is a render thread and one of the handful of
+	 * contexts a browser allows. Keyed on `attached` rather than on `enabled`, which a mute also
+	 * clears, so a muted tile keeps the context it has.
+	 */
+	#runContext(effect: Effect): void {
+		if (!effect.get(this.in.attached)) {
+			this.#closeContext();
+			return;
+		}
+
+		const rate = effect.get(this.#rate);
+		const enabled = effect.get(this.in.enabled);
+
+		const context = this.#context?.audio;
+		if (!context) {
+			// Audio is asked for, so build the graph and let `Util.Gesture.unlock` try to start it: a
+			// permissive autoplay policy runs it with no gesture at all (the audio-quality lane
+			// launches Chromium that way and never clicks), a strict one leaves it suspended until the
+			// next gesture, and a tile unmuted by a click the listeners never saw is still inside that
+			// click's activation. A muted tile builds nothing, which is the load-time cost the viewer
+			// sees: three muted tiles were three contexts nothing could start and three autoplay
+			// warnings. Waits for the rate, unlike the gesture path, which cannot.
+			if (enabled && rate !== undefined) this.#buildContext(rate);
+			return;
+		}
+
+		if (rate !== undefined && context.sampleRate !== rate) this.#buildContext(rate);
+	}
+
+	/**
+	 * Build the AudioContext the graph runs in, replacing the one it has.
+	 *
+	 * Called from the gesture handler, synchronously, because a context is the only thing here a
+	 * user gesture starts: one built later can only be started while the page's activation lasts, a
+	 * few seconds in WebKit, and past that it stays suspended and nothing is ever rendered while
+	 * video keeps painting. Building one at load instead costs an autoplay warning per tile in
+	 * Chromium and a render thread per muted tile, for a graph nobody has asked to hear yet.
+	 *
+	 * `rate` is what the catalog claims, or what the decoder turns out to emit once a frame has
+	 * arrived (see `Supply.#emit`). It is undefined when the gesture lands before the catalog does,
+	 * and the context then runs at the device default until a rate that differs replaces it.
+	 */
+	#buildContext(rate: number | undefined): AudioContext {
+		this.#closeContext();
+
+		const context = new AudioContext({
+			latencyHint: "interactive", // We don't use real-time because of the buffer.
+			// Absent rather than undefined, so the browser picks the device default.
+			...(rate !== undefined && { sampleRate: rate }),
+		});
+		const effects = new Effect();
+		this.#context = { audio: context, effects };
+
+		// Expose the rate the graph actually runs at.
+		this.#out.sampleRate.set(context.sampleRate);
+		this.#out.context.set(context);
+		effects.run((effect) => this.#runWorklet(effect, context));
+
+		return context;
+	}
+
+	/** Tear down the context and everything built against it, which the graph rebuilds without. */
+	#closeContext(): void {
+		const context = this.#context;
+		if (!context) return;
+
+		this.#context = undefined;
+		// Cancel module loads before close rejects them; signal propagation happens later.
+		context.effects.close();
+		this.#out.context.set(undefined);
+		this.#out.sampleRate.set(undefined);
+
+		// A context closed twice rejects, and there is nothing to do about a close that fails anyway.
+		context.audio.close().catch(() => {});
+	}
+
+	#runWorklet(effect: Effect, context: AudioContext): void {
+		// It takes a second or so to initialize the AudioWorklet, so do it even if disabled. This is
+		// less efficient for video-only playback but makes muting/unmuting instant, since the first
+		// gesture on the page builds a context for every tile whether or not it is the one clicked.
 
 		//const enabled = effect.get(this.enabled);
 		//if (!enabled) return;
@@ -159,22 +492,13 @@ export class Decoder {
 		const config = effect.get(this.#config);
 		if (!config) return;
 
-		// Pre-build the graph at the catalog rate so warm-up starts before the first frame arrives. The
-		// decoder's actual output rate is the source of truth (see #emit); if it differs, #emit sets
-		// #decodedSampleRate, which re-runs this effect and rebuilds the graph at the real rate.
-		const sampleRate = effect.get(this.#decodedSampleRate) ?? config.sampleRate;
+		// A node of its own for every supply: a writer reaches a node through what it was handed at build,
+		// so a supply taking over from another gets one nothing else writes into.
+		const active = effect.get(this.#active);
+		if (!active) return;
+
+		const sampleRate = context.sampleRate;
 		const channelCount = config.numberOfChannels;
-
-		// Expose the rate the graph actually runs at.
-		effect.set(this.#out.sampleRate, sampleRate);
-
-		const context = new AudioContext({
-			latencyHint: "interactive", // We don't use real-time because of the buffer.
-			sampleRate,
-		});
-		effect.set(this.#out.context, context);
-
-		effect.cleanup(() => context.close());
 
 		effect.spawn(async () => {
 			// Register the AudioWorklet processor, racing the load against teardown. If teardown wins,
@@ -182,10 +506,7 @@ export class Decoder {
 			// abandoned, so building against its name would throw. Gate on the race result, not
 			// `context.state`, because `AudioContext.close()` only flips `.state` to "closed" synchronously
 			// on Chrome (Firefox/Safari report "suspended").
-			const loaded = await Promise.race([
-				context.audioWorklet.addModule(RenderWorklet).then(() => true),
-				effect.cancel,
-			]);
+			const loaded = await effect.race(context.audioWorklet.addModule(RenderWorklet).then(() => true));
 			if (!loaded) return;
 
 			// Create the worklet node. outputChannelCount must be set explicitly
@@ -198,434 +519,88 @@ export class Decoder {
 			});
 			effect.cleanup(() => worklet.disconnect());
 
-			// Initial ring depth in samples.
-			const delay = this.sync.out.delay.peek();
-			const latencySamples = ringSamples(sampleRate, delay);
-			const buffered = this.sync.out.buffered.peek();
+			// Shared memory wherever the page can have it, for the page's own writes: the worker's ring is
+			// messages on any page (see `Player` in `worker/host.ts`), so only the page's is worth naming.
+			const shared = supportsSharedArrayBuffer();
+			if (active.kind === "main") reportTransport(shared);
 
-			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
-			const ring = createAudioBuffer(worklet, channelCount, sampleRate, latencySamples, buffered);
-			this.#ring = ring;
-			effect.cleanup(() => {
-				ring.close();
-				this.#ring = undefined;
-			});
-
-			// Mirror ring state (timestamp/stalled) onto our public signals.
-			effect.run((inner) => {
-				const ts = Time.Milli.fromMicro(inner.get(ring.timestamp));
-				this.#out.timestamp.set(ts);
-				this.#trimDecodeBuffered(ts);
-			});
-			effect.run((inner) => {
-				this.#out.stalled.set(inner.get(ring.stalled));
+			// The supply builds the ring against the node and writes it from here on.
+			effect.set(active.graph, {
+				target: worklet,
+				context,
+				rate: sampleRate,
+				channels: channelCount,
+				conceal: this.in.conceal.peek(),
+				shared,
 			});
 
 			effect.set(this.#out.root, worklet);
 		});
 	}
 
-	#runEnabled(effect: Effect): void {
-		const enabled = effect.get(this.in.enabled);
-		if (!enabled) return;
-		if (effect.get(this.sync.in.delay) === "instant") {
-			this.reset();
-			return;
-		}
-
-		const context = effect.get(this.#out.context);
-		if (!context) return;
-
-		// The context is built at page load (see #runWorklet), before any user gesture, so it
-		// must be started from a real interaction. See unlockOnGesture.
-		unlockOnGesture(effect, context);
-
-		// NOTE: You should disconnect/reconnect the worklet to save power when disabled.
-	}
-
-	#runLatency(effect: Effect): void {
-		// Gate on the worklet signal so this effect re-runs once the ring is created.
-		const worklet = effect.get(this.#out.root);
-		if (!worklet) return;
-
-		const ring = this.#ring;
+	// Mirror ring state onto our public signals, for as long as the supply has a ring.
+	#runRing(effect: Effect): void {
+		const active = effect.get(this.#active);
+		if (!active) return;
+		const ring = effect.get(active.supply.out.ring);
 		if (!ring) return;
 
-		const delay = effect.get(this.sync.out.delay);
-		ring.setLatency(ringSamples(ring.rate, delay));
-	}
-
-	// Re-anchor when the delay floor *increases*. A larger floor needs a deeper cushion: video
-	// rebuilds it implicitly (its per-frame sync.wait() reads the live buffer, so it just holds
-	// longer), but the audio ring keeps draining at its old depth -- resize() (via setLatency) only
-	// re-stalls an *empty* ring, so a mid-playback ring never refills to the new floor and audio runs
-	// ahead of video (the "raise latency, only video re-buffers" desync). reset() re-stalls the ring
-	// so it refills to the new floor. Watch the latency target and media delay, excluding adaptive
-	// RTT jitter, and debounce so a slider drag coalesces into one re-anchor. Decreases are left to
-	// natural catch-up.
-	#runLatencyReanchor(effect: Effect): void {
-		const delay = effect.get(this.sync.out.delay);
-		const jitter = effect.get(this.sync.out.jitter);
-		const floor = reanchorFloor({
-			delay: effect.get(this.sync.in.delay),
-			media: Time.Milli.sub(delay, jitter),
+		// A flushed ring reports no playhead until the next insert re-anchors it.
+		effect.run((inner) => {
+			const timestamp = inner.get(ring.timestamp);
+			this.#out.timestamp.set(timestamp === undefined ? undefined : Time.Milli.fromMicro(timestamp));
 		});
-		if (this.#prevFloor === undefined) {
-			// Startup: the initial fill already builds the cushion; just record the baseline.
-			this.#prevFloor = floor;
-			return;
-		}
-		// When the timer fires, the floor read above is still current: any change would have rerun
-		// this effect (tearing down the timer), so compare it against the pre-change baseline directly.
-		const baseline = this.#prevFloor;
-		effect.timer(() => {
-			if (floor > baseline) this.reset();
-			this.#prevFloor = floor;
-		}, LATENCY_REANCHOR_DEBOUNCE_MS);
+		// A stall means one of two things and the ring reports one flag for both, so the
+		// distinction is drawn here: a ring nobody has played from is filling, whatever it
+		// holds, and only a ring that stops after it has played has interrupted anything.
+		effect.run((inner) => {
+			const stalled = inner.get(ring.stalled);
+			this.#out.stalled.set(stalled);
+
+			// The download being off disconnects the emitter, so nothing is draining the ring
+			// and whatever plays next is a fresh fill rather than playback resuming.
+			const enabled = inner.get(this.in.enabled);
+			const fresh = inner.get(ring.debug)?.fresh ?? true;
+			this.#out.interrupted.set(enabled && stalled && !fresh);
+		});
+		effect.run((inner) => {
+			this.#out.underruns.set(inner.get(ring.underruns));
+		});
+		effect.run((inner) => {
+			const debug = inner.get(ring.debug);
+			this.#out.debug.set(debug && { ...debug, budget: inner.get(this.#maxAge) });
+		});
 	}
 
-	#runDecoder(effect: Effect): void {
-		const enabled = effect.get(this.in.enabled);
-		if (!enabled) return;
-		if (effect.get(this.sync.in.delay) === "instant") return;
+	/**
+	 * Drive playback from the ring's playhead while audio is being played.
+	 *
+	 * The ring consumes media on a clock of its own (the AudioContext's), so pacing video against a
+	 * wall clock lets the two drift apart every time the ring re-buffers or skips. Publishing the
+	 * playhead makes it the reference every other track is paced against instead.
+	 *
+	 * Gated on `enabled` rather than on the ring existing: the graph is built up front so unmuting
+	 * is instant, and a muted ring drains to a playhead that stopped meaning anything. `Sync` keeps
+	 * the last value it saw, so handing the clock back costs no jump.
+	 */
+	#runClock(effect: Effect): void {
+		if (!effect.get(this.in.enabled)) return;
 
-		const broadcast = effect.get(this.source.in.broadcast);
-		if (!broadcast) return;
-
-		const track = effect.get(this.source.out.track);
-		if (!track) return;
-
-		const identity = effect.get(this.#identity);
-		if (!identity) return;
-
-		const config = identity.decoder;
-
-		// Honor a per-rendition `broadcast` override: subscribe on the resolved source
-		// broadcast instead of the catalog's own broadcast.
-		const active = broadcast.relativeBroadcast(effect, identity.broadcast);
+		// Gate on the supply's ring so this effect re-runs once the ring is created.
+		const active = effect.get(this.#active);
 		if (!active) return;
+		const ring = effect.get(active.supply.out.ring);
+		if (!ring) return;
 
-		// The ring outlives this effect (it's keyed on the sample rate and channel count), so a
-		// replacement subscription (a rendition swap, a republished broadcast, a reconnect) inherits
-		// whatever its predecessor decoded. Samples are timestamp indexed, so the replacement
-		// overwrites the slots it lands on, but a publisher writing ahead of real-time leaves seconds
-		// of tail beyond them. Drop that once the replacement's first frame says where it starts.
-		this.#handover.opened();
-
-		const sub = subscribeMedia(effect, {
-			broadcast: active,
-			track,
-			priority: Catalog.PRIORITY.audio,
-			maxAge: this.sync.out.maxAge,
-		});
-		if (!sub) return;
-
-		if (config.container.kind === "cmaf") {
-			this.#runCmafDecoder(effect, sub, config);
-		} else {
-			this.#runLegacyDecoder(effect, sub, config);
-		}
-	}
-
-	#runLegacyDecoder(effect: Effect, sub: Moq.Track.Subscriber, config: DecoderConfig): void {
-		const preSkip =
-			config.codec === "opus" && config.description ? Util.Opus.preSkip(Util.Hex.toBytes(config.description)) : 0;
-		this.#terminal.clear(preSkip);
-		const format =
-			config.container.kind === "loc" ? new Container.Loc.Format("audio") : new Container.Legacy.Format(config);
-		// Create consumer with slightly less latency than the render worklet to avoid underflowing.
-		// TODO include JITTER_UNDERHEAD
-		const consumer = new Container.Consumer(sub, {
-			format,
-			maxAge: this.sync.out.maxAge,
-		});
-		effect.cleanup(() => consumer.close());
-
-		// Combine network jitter buffer with decode buffer
-		effect.run((inner) => {
-			const network = inner.get(consumer.buffered);
-			const decode = inner.get(this.#decodeBuffered);
-			this.#out.buffered.update(() => Container.mergeBufferedRanges(network, decode));
-		});
-
-		effect.spawn(async () => {
-			const loaded = await Util.Libav.polyfill();
-			if (!loaded) return; // cancelled
-
-			const warmup = new Warmup(LEGACY_WARMUP_CALLBACKS);
-
-			const decoder = new AudioDecoder({
-				output: (data) => {
-					const decoded = this.#terminal.span(data);
-					if (warmup.drop()) {
-						// Drop initial callbacks to prime the decoder.
-						data.close();
-						return;
-					}
-					this.#emit(data, decoded);
-				},
-				error: (error) => console.error("audio decoder error", error),
-			});
-			effect.cleanup(() => {
-				if (decoder.state !== "closed") decoder.close();
-			});
-
-			// Opus in CMAF uses raw packets; dOps is not a valid OGG Identification Header.
-			const description =
-				config.codec === "opus"
-					? undefined
-					: config.description
-						? Util.Hex.toBytes(config.description)
-						: undefined;
-			const decoderConfig: AudioDecoderConfig = {
-				codec: config.codec,
-				sampleRate: config.sampleRate,
-				numberOfChannels: config.numberOfChannels,
-				description,
-			};
-			decoder.configure(decoderConfig);
-
-			for (;;) {
-				const next = await nextMedia(consumer);
-				if (!next) break;
-				if (this.#onNext(next)) {
-					decoder.reset();
-					decoder.configure(decoderConfig);
-				}
-				if (next.end !== undefined) {
-					continue;
-				}
-
-				const { frame } = next;
-				if (!frame) continue;
-
-				// Mark that we received this frame right now.
-				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
-				this.sync.received(timestamp, "audio");
-
-				this.#out.stats.update((stats) => ({
-					bytesReceived: (stats?.bytesReceived ?? 0) + frame.payload.byteLength,
-				}));
-
-				// Backpressure: in buffered mode this holds the encoded frame until the playhead nears
-				// it, keeping the lookahead above the floor as Opus instead of decoded PCM. No-op live.
-				await this.#ring?.wait(frame.timestamp as Time.Micro);
-
-				const chunk = new EncodedAudioChunk({
-					type: frame.keyframe ? "key" : "delta",
-					data: frame.payload,
-					timestamp: frame.timestamp,
-				});
-
-				// A fatal decode error closes the decoder, so decoding again throws InvalidStateError out
-				// of this loop. Stop instead: the error callback already reported the real failure.
-				if (decoder.state === "closed") break;
-				decoder.decode(chunk);
-			}
-		});
-	}
-
-	#runCmafDecoder(effect: Effect, sub: Moq.Track.Subscriber, config: DecoderConfig): void {
-		if (config.container.kind !== "cmaf") return; // just to help typescript
-
-		const initSegment = base64ToBytes(config.container.init);
-		const init = Container.Cmaf.decodeInitSegment(initSegment);
-		const opusDescription = config.description ? Util.Hex.toBytes(config.description) : init.description;
-		const preSkip = config.codec === "opus" && opusDescription ? Util.Opus.preSkip(opusDescription) : 0;
-		this.#terminal.clear(preSkip);
-		// Opus in CMAF uses raw packets (not OGG-wrapped), so description must be omitted.
-		// The dOps box from the init segment is not a valid OGG Identification Header.
-		const description =
-			config.codec === "opus"
-				? undefined
-				: config.description
-					? Util.Hex.toBytes(config.description)
-					: init.description;
-
-		const consumer = new Container.Consumer(sub, {
-			format: new Container.Cmaf.Format(init),
-			maxAge: this.sync.out.maxAge,
-		});
-		effect.cleanup(() => consumer.close());
-
-		// Combine network jitter buffer with decode buffer
-		effect.run((inner) => {
-			const network = inner.get(consumer.buffered);
-			const decode = inner.get(this.#decodeBuffered);
-			this.#out.buffered.update(() => Container.mergeBufferedRanges(network, decode));
-		});
-
-		effect.spawn(async () => {
-			const loaded = await Util.Libav.polyfill();
-			if (!loaded) return; // cancelled
-
-			const decoder = new AudioDecoder({
-				output: (data) => this.#emit(data),
-				error: (error) => console.error("audio decoder error", error),
-			});
-			effect.cleanup(() => {
-				if (decoder.state !== "closed") decoder.close();
-			});
-
-			// Configure decoder with description from catalog
-			const decoderConfig: AudioDecoderConfig = {
-				codec: config.codec,
-				sampleRate: config.sampleRate,
-				numberOfChannels: config.numberOfChannels,
-				description,
-			};
-			decoder.configure(decoderConfig);
-
-			for (;;) {
-				const next = await nextMedia(consumer);
-				if (!next) break;
-
-				// Reset and re-anchor before decoding the first frame of a new codec epoch.
-				if (this.#onNext(next)) {
-					decoder.reset();
-					decoder.configure(decoderConfig);
-				}
-
-				const { frame } = next;
-				if (!frame) continue;
-
-				const timestamp = Time.Milli.fromMicro(frame.timestamp);
-				this.sync.received(timestamp, "audio");
-
-				this.#out.stats.update((stats) => ({
-					bytesReceived: (stats?.bytesReceived ?? 0) + frame.payload.byteLength,
-				}));
-
-				// Backpressure: in buffered mode this holds the encoded frame until the playhead nears
-				// it, keeping the lookahead above the floor as Opus instead of decoded PCM. No-op live.
-				await this.#ring?.wait(frame.timestamp);
-
-				if (decoder.state === "closed") break;
-				decoder.decode(
-					new EncodedAudioChunk({
-						type: frame.keyframe ? "key" : "delta",
-						data: frame.payload,
-						timestamp: frame.timestamp,
-					}),
-				);
-			}
-		});
-	}
-
-	#emit(sample: AudioData, decoded: DecodedSpan = this.#terminal.span(sample)) {
-		const { timestamp, frameOffset, frames } = decoded;
-		const timestampMilli = Time.Milli.fromMicro(timestamp);
-		if (frames === 0) {
-			sample.close();
-			return;
-		}
-
-		const ring = this.#ring;
-		if (!ring) {
-			// We're probably in the process of closing.
-			sample.close();
-			return;
-		}
-
-		// sample.sampleRate is the source of truth, and it can differ from the rate we pre-built the
-		// graph against (Opus decodes to 48kHz on Chrome/Firefox but to the configured rate on Safari).
-		// If they disagree, rebuild the graph at the real rate and drop this frame; the ring being torn
-		// down can't accept it, and the next frame lands in the correctly-rated ring.
-		if (sample.sampleRate !== ring.rate) {
-			this.#decodedSampleRate.set(sample.sampleRate);
-			sample.close();
-			return;
-		}
-
-		// Calculate end time from sample duration
-		const durationMicro = ((frames / sample.sampleRate) * 1_000_000) as Time.Micro;
-		const durationMilli = Time.Milli.fromMicro(durationMicro);
-		const end = Time.Milli.add(timestampMilli, durationMilli);
-
-		// A new subscription has taken over the timeline: drop the previous one's write-ahead tail
-		// rather than letting it play out after this frame. See #runDecoder.
-		if (this.#handover.takeover()) {
-			ring.truncate(timestamp);
-			this.#truncateDecodeBuffered(timestampMilli);
-		}
-
-		// Add to decode buffer
-		this.#addDecodeBuffered(timestampMilli, end);
-
-		// Firefox's Opus decoder sometimes outputs more channels than requested
-		// (e.g. 6 for stereo). Clamp to the ring's channel count.
-		const channels = Math.min(sample.numberOfChannels, ring.channels);
-		const channelData: Float32Array[] = [];
-		for (let channel = 0; channel < channels; channel++) {
-			const data = new Float32Array(frames);
-			sample.copyTo(data, { format: "f32-planar", planeIndex: channel, frameOffset, frameCount: frames });
-			channelData.push(data);
-		}
-
-		// Hand off to the ring. Shared transport writes directly; post transport
-		// transfers the ArrayBuffers.
-		ring.insert(timestamp, channelData);
-
-		sample.close();
-	}
-
-	#addDecodeBuffered(start: Time.Milli, end: Time.Milli): void {
-		if (start > end) return;
-
-		this.#decodeBuffered.mutate((current) => {
-			for (const range of current) {
-				// Extend range if new sample overlaps or is adjacent (1ms tolerance for float precision)
-				if (start <= range.end + 1 && end >= range.start) {
-					range.start = Time.Milli.min(range.start, start);
-					range.end = Time.Milli.max(range.end, end);
-					return;
-				}
-			}
-
-			current.push({ start, end });
-			current.sort((a, b) => a.start - b.start);
-		});
-	}
-
-	// Drop reported decode ranges at or after `timestamp`, mirroring a ring truncation.
-	#truncateDecodeBuffered(timestamp: Time.Milli): void {
-		this.#decodeBuffered.mutate((current) => {
-			while (current.length > 0 && current[current.length - 1].start >= timestamp) current.pop();
-			const last = current[current.length - 1];
-			if (last && last.end > timestamp) last.end = timestamp;
-		});
-	}
-
-	#trimDecodeBuffered(timestamp: Time.Milli): void {
-		this.#decodeBuffered.mutate((current) => {
-			while (current.length > 0) {
-				if (current[0].end >= timestamp) {
-					current[0].start = Time.Milli.max(current[0].start, timestamp);
-					break;
-				}
-				current.shift();
-			}
-		});
+		const track = this.sync.track("audio");
+		effect.run((inner) => track.clock.set(inner.get(ring.clock)));
+		effect.cleanup(() => track.clock.set(undefined));
 	}
 
 	// Flush the audio buffer and re-stall, re-anchoring playback to the next frame.
 	// Use in buffered mode at an utterance boundary (see Sync.reset).
 	reset(): void {
-		this.#ring?.reset();
-	}
-
-	// Apply ordered container metadata before handling the result. An endpoint that also
-	// starts a new epoch must survive the reset so its following drain is trimmed.
-	#onNext(next: {
-		discontinuity: number;
-		group: number;
-		end?: Time.Micro;
-		frame?: { timestamp: Time.Micro };
-	}): boolean {
-		if (!this.#terminal.update(next)) return false;
-		this.#ring?.reset();
-		this.sync.reset();
-		return true;
+		this.#active.peek()?.supply.reset();
 	}
 
 	close() {
@@ -634,44 +609,4 @@ export class Decoder {
 
 	// Whether the WebCodecs audio decoder can play this config.
 	static supported = supported;
-}
-
-async function supported(config: Catalog.AudioConfig): Promise<boolean> {
-	if (!Catalog.containerSupported(config.container)) {
-		// `kind` is the literal "unknown" tag; the container the publisher actually named is in `raw`.
-		const kind = config.container.kind === "unknown" ? config.container.raw.kind : config.container.kind;
-		console.warn(`audio: ignoring rendition with unknown container: ${kind}`);
-		return false;
-	}
-
-	// Opus only runs at its native rates, so a catalog advertising anything else is wrong and Safari
-	// refuses to decode it. Warn rather than reject: Chrome and Firefox ignore the configured rate and
-	// play these streams fine, so rejecting would silence them for a publisher they handle today.
-	if (config.codec === "opus" && !Util.Opus.supportsRate(config.sampleRate)) {
-		console.warn(`audio: opus advertised at ${config.sampleRate}Hz, which some browsers cannot decode`);
-	}
-
-	// Opus in CMAF uses raw packets; dOps is not a valid OGG Identification Header.
-	let description: Uint8Array | undefined;
-	if (config.codec !== "opus") {
-		if (config.description) {
-			description = Util.Hex.toBytes(config.description);
-		} else if (config.container.kind === "cmaf") {
-			try {
-				description = Container.Cmaf.decodeInitSegment(base64ToBytes(config.container.init)).description;
-			} catch (err) {
-				// A malformed init segment means we can't extract the codec
-				// description, so we can't probe support reliably. Reject the
-				// track rather than letting isConfigSupported pass on a
-				// description-less config and then having decode() fail later.
-				console.warn(`audio: malformed CMAF init segment for codec ${config.codec}`, err);
-				return false;
-			}
-		}
-	}
-	const res = await AudioDecoder.isConfigSupported({
-		...config,
-		description,
-	});
-	return res.supported ?? false;
 }

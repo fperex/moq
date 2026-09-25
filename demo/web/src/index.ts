@@ -23,6 +23,7 @@ import "@moq/watch/ui"; // defines <moq-watch-ui>
 import { Hang, Net, Signals } from "@moq/watch";
 import type MoqWatch from "@moq/watch/element";
 import MoqWatchSupport from "@moq/watch/support/element";
+import { stallFrom } from "./stall";
 import { bufferBars, formatBitrate, formatFps, graph, renderRows } from "./viz";
 
 /** Re-exported so bundlers keep the `<moq-watch-support>` element registration. */
@@ -30,6 +31,16 @@ export { MoqWatchSupport };
 
 // Injected by Vite (see justfile). Defaults to the local relay.
 const RELAY_URL = import.meta.env.VITE_RELAY_URL ?? "http://localhost:4443";
+
+// Bench tools, off unless the query asks: `?offload=0` keeps every tile's audio on the main thread
+// rather than the page's audio worker, `?stall=MS/EVERY` freezes the main thread (see stall.ts), and
+// `?csp=1` refuses the worker (see watch.html).
+const bench = new URLSearchParams(location.search);
+const offload = bench.get("offload");
+if (offload !== null && offload !== "0" && offload !== "1") {
+	throw new Error(`?offload takes 0 or 1, not ${JSON.stringify(offload)}`);
+}
+stallFrom(bench);
 
 const $ = <T extends HTMLElement>(id: string): T => {
 	const el = document.getElementById(id);
@@ -65,6 +76,16 @@ const broadcasts = new Signals.Signal<string[]>([]);
 
 // The active tile: the only one that plays audio. undefined => all muted.
 const active = new Signals.Signal<string | undefined>(undefined);
+
+// The broadcast the viewer clicked, kept even while it is not announced. A publisher reload is an
+// unannounce and a re-announce a couple of seconds apart, so without this the page moves the viewer
+// to whatever sorts first and never hands them back the stream they picked.
+let chosen: string | undefined;
+
+// The page's playback delay, and the value every tile is built with. The delay visualization and the
+// player chrome both edit the active tile's own control, so the page mirrors that back here: a tile
+// rebuilt after a republish then keeps the viewer's preset instead of reverting to "auto".
+const delay = new Signals.Signal<MoqWatch["delay"]>("auto");
 
 // The active tile's <moq-watch> element, or undefined when nothing is active.
 // The right-hand stats panel reads everything off this.
@@ -119,9 +140,11 @@ function createTile(name: string): WatchTile {
 	const watch = document.createElement("moq-watch") as MoqWatch;
 	watch.name = name;
 	watch.muted = true; // unmuted only while active (see below)
-	// Default to a fixed 100ms jitter buffer (instead of adaptive "auto") so
-	// the delay visualization has something to show. Drag it in the panel.
-	watch.setAttribute("delay", "100ms");
+	// The page's preset, adaptive until the viewer drags the delay visualization. Reading it here
+	// rather than hardcoding "auto" is what keeps a viewer's choice through a republish, which
+	// rebuilds the tile from scratch.
+	watch.delay = delay.peek();
+	if (offload === "0") watch.setAttribute("offload", "false");
 	const canvas = document.createElement("canvas");
 	canvas.style.cssText = "width: 100%; height: auto;";
 	watch.appendChild(canvas);
@@ -134,7 +157,17 @@ function createTile(name: string): WatchTile {
 
 	// Clicking anywhere in the tile makes it the active audio source. The click
 	// doubles as the user gesture browsers require before audio can start.
-	effects.event(el, "pointerdown", () => active.set(name));
+	effects.event(el, "pointerdown", () => {
+		chosen = name;
+		active.set(name);
+	});
+
+	// The delay controls write to the tile they are bound to, so the page follows the tile rather
+	// than the other way round: whatever the viewer sets on one tile is what the next one is built
+	// with.
+	effects.run((effect) => {
+		delay.set(effect.get(watch.controls.delay));
+	});
 
 	// Follow the editable relay URL in its own effect. Keeping this separate from
 	// the active-state effect below is important: `watch.url =` reassigns a fresh
@@ -266,9 +299,12 @@ prefixEl.value = prefixInput.peek();
 prefixEl.addEventListener("input", () => prefixInput.set(prefixEl.value));
 
 // Keep the active tile valid: auto-pick the first broadcast and switch away from
-// one that disappears, but never steal focus once the user has chosen.
+// one that disappears, but never steal focus once the user has chosen. A choice survives its
+// broadcast going away, so the tile the page rebuilds on the re-announce is selected again instead
+// of coming back silent behind whatever sorts first.
 ui.run((effect) => {
 	const list = effect.get(broadcasts);
+	if (chosen !== undefined) return;
 	const cur = active.peek();
 	if (cur && list.includes(cur)) return;
 	active.set(list[0]);

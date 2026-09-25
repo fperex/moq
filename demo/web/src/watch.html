@@ -8,6 +8,19 @@
 
 	<link rel="stylesheet" href="index.css">
 	<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+
+	<script>
+		// Bench tool, off unless asked for: `?csp=1` refuses every worker, as a strict site's policy
+		// refuses the `blob:` one the build starts (the dev server's is not a `blob:`), so the audio's
+		// fallback to the page can be tried. Here, before any module, because a policy in a <meta>
+		// applies only from when it is inserted.
+		if (new URLSearchParams(location.search).get("csp") === "1") {
+			const meta = document.createElement("meta");
+			meta.httpEquiv = "Content-Security-Policy";
+			meta.content = "worker-src 'none'";
+			document.head.append(meta);
+		}
+	</script>
 </head>
 
 <body class="p-4 max-w-6xl mx-auto">
