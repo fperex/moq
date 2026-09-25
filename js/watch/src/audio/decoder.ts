@@ -16,6 +16,7 @@ import {
 } from "@moq/signals";
 import { accumulate } from "../media";
 import type { Delay, Sync } from "../sync";
+import { reportTransport, supportsSharedArrayBuffer } from "./buffer";
 import { audioMaxAge, type DecoderConfig, decoderConfig } from "./config";
 import type * as Playout from "./playout";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
@@ -505,6 +506,11 @@ export class Decoder {
 			});
 			effect.cleanup(() => worklet.disconnect());
 
+			// Shared memory wherever the page can have it, for the page's own writes: the worker's ring is
+			// messages on any page (see `Player` in `worker/host.ts`), so only the page's is worth naming.
+			const shared = supportsSharedArrayBuffer();
+			if (active.kind === "main") reportTransport(shared);
+
 			// The supply builds the ring against the node and writes it from here on.
 			effect.set(active.graph, {
 				target: worklet,
@@ -512,6 +518,7 @@ export class Decoder {
 				rate: sampleRate,
 				channels: channelCount,
 				conceal: this.in.conceal.peek(),
+				shared,
 			});
 
 			effect.set(this.#out.root, worklet);

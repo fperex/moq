@@ -36,6 +36,11 @@ export interface Graph {
 	channels: number;
 	/** Whether the reader conceals a gap with synthesized audio. See `DecoderInput.conceal`. */
 	conceal: boolean;
+	/**
+	 * Whether the ring is shared memory rather than messages: the page's own writes on a cross-origin
+	 * isolated page, and never the audio worker's (see `Player` in `worker/host.ts`).
+	 */
+	shared: boolean;
 }
 
 /** What the ring reports about itself, and nothing that writes to it. */
@@ -197,7 +202,6 @@ export class Supply {
 		const latencySamples = ringSamples(graph.rate, delay);
 		const buffered = this.sync.out.buffered.peek();
 
-		// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
 		const ring = createAudioBuffer(graph.target, {
 			context: graph.context,
 			channels: graph.channels,
@@ -205,6 +209,7 @@ export class Supply {
 			latency: latencySamples,
 			buffered,
 			conceal: graph.conceal,
+			shared: graph.shared,
 		});
 		this.#ring = ring;
 		effect.cleanup(() => {

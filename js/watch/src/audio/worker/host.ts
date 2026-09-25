@@ -355,6 +355,9 @@ class Player {
 						rate: ring.rate,
 						channels: ring.channels,
 						conceal: ring.conceal,
+						// Messages on any page: Firefox 156 drops shared memory posted on this port (`messageerror`
+						// in the worklet) when the page hands the worklet its end first and is busy just after.
+						shared: false,
 					},
 				);
 				return;

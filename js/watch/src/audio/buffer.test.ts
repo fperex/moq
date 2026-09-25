@@ -202,33 +202,49 @@ describe("AudioBuffer, transport", () => {
 		return seen;
 	}
 
-	it("names the transport once per document, not once per player", () => {
+	/**
+	 * The module evaluated again, so it has named no transport yet: the runner shares one registry
+	 * across files, and any of them may have named it already.
+	 */
+	function fresh(tag: string): Promise<typeof import("./buffer")> {
+		// A variable specifier keeps the type checker from resolving the query as a path.
+		const specifier = `./buffer.ts?${tag}`;
+		return import(specifier);
+	}
+
+	it("names the page's transport once per document, not once per player", async () => {
 		// Cross-origin isolation is a property of the page, so every player on it lands on the same
 		// transport. A page of tiles used to say so once per tile, at warning level, about the path
 		// a page that is not isolated is supposed to run on.
-		const build = () =>
-			createAudioBuffer(new FakeWorklet() as unknown as AudioWorkletNode, {
-				context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
-				channels: 1,
-				rate: 48000,
-				latency: 4800,
-				buffered: false,
-				conceal: true,
-			});
+		const { reportTransport } = await fresh("once");
+		const first = captured(() => reportTransport(false));
+		const second = captured(() => reportTransport(false));
 
-		const first = captured(build);
-		const second = captured(build);
-
-		// The second player is silent whatever ran before this test, which is the whole claim.
-		expect(second.info).toHaveLength(0);
-		expect(second.log).toHaveLength(0);
-		expect(second.warn).toHaveLength(0);
-
-		// The first is at most one line, and never a warning: this is the page, not a fault. It is
-		// silent when an earlier test in the same process already built a ring.
+		// One line, and never a warning: this is the page, not a fault.
+		expect(first.info).toHaveLength(1);
 		expect(first.log).toHaveLength(0);
 		expect(first.warn).toHaveLength(0);
-		expect(first.info.length).toBeLessThanOrEqual(1);
+		expect(second).toEqual({ info: [], log: [], warn: [] });
+	});
+
+	it("builds either ring without a word, since the audio worker builds one on any page", async () => {
+		// The worker's ring is messages whatever the page is, so advice to isolate the page would be
+		// wrong coming from it. Only the page names its transport.
+		const { createAudioBuffer: build } = await fresh("quiet");
+		const seen = captured(() => {
+			for (const shared of [false, true]) {
+				build(new FakeWorklet() as unknown as AudioWorkletNode, {
+					context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
+					channels: 1,
+					rate: 48000,
+					latency: 4800,
+					buffered: false,
+					conceal: true,
+					shared,
+				}).close();
+			}
+		});
+		expect(seen).toEqual({ info: [], log: [], warn: [] });
 	});
 });
 
@@ -237,21 +253,15 @@ describe("AudioBuffer output clock", () => {
 		clock = fakeClock(1010);
 		const worklet = new FakeWorklet();
 		let output = { contextTime: 0, performanceTime: 0 };
-		const shared = globalThis.SharedArrayBuffer;
-		(globalThis as { SharedArrayBuffer?: SharedArrayBufferConstructor }).SharedArrayBuffer = undefined;
-		let buffer: AudioBuffer;
-		try {
-			buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
-				context: { getOutputTimestamp: () => output },
-				channels: 1,
-				rate: 48000,
-				latency: 4800,
-				buffered: false,
-				conceal: true,
-			});
-		} finally {
-			globalThis.SharedArrayBuffer = shared;
-		}
+		const buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+			context: { getOutputTimestamp: () => output },
+			channels: 1,
+			rate: 48000,
+			latency: 4800,
+			buffered: false,
+			conceal: true,
+			shared: false,
+		});
 		try {
 			worklet.deliver({ ...state(worklet, playhead(500, 1), false), contextTime: Time.Second(1) });
 			expect(buffer.clock.peek()).toBeUndefined();
@@ -285,22 +295,15 @@ describe("AudioBuffer output clock", () => {
 describe("AudioBuffer, flushed", () => {
 	it("never reports the old playhead once the postMessage ring is flushed", async () => {
 		const worklet = new FakeWorklet();
-		const shared = globalThis.SharedArrayBuffer;
-		// Taking the global away is how the factory is made to pick the fallback transport.
-		(globalThis as { SharedArrayBuffer?: SharedArrayBufferConstructor }).SharedArrayBuffer = undefined;
-		let buffer: AudioBuffer;
-		try {
-			buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
-				context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
-				channels: 1,
-				rate: 48000,
-				latency: 4800,
-				buffered: false,
-				conceal: true,
-			});
-		} finally {
-			globalThis.SharedArrayBuffer = shared;
-		}
+		const buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+			context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
+			channels: 1,
+			rate: 48000,
+			latency: 4800,
+			buffered: false,
+			conceal: true,
+			shared: false,
+		});
 
 		// A signal write notifies on the microtask, so each step settles before the next one.
 		const settle = () => sleep(0);
@@ -357,6 +360,7 @@ describe("AudioBuffer, flushed", () => {
 			latency: 4800,
 			buffered: false,
 			conceal: true,
+			shared: true,
 		});
 
 		const effect = new Effect();

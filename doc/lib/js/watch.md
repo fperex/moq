@@ -170,6 +170,10 @@ cannot starve the sound. The page keeps the AudioContext, the picture, the
 captions, and the controls, and the worker reports back what the stats and the
 clock need.
 
+The worker writes the ring with messages, on a cross-origin isolated page too.
+Only audio kept on the page writes it through shared memory, which isolation
+allows.
+
 `offload="false"`, or `el.offload = false`, keeps a player's audio on the main
 thread.
 

@@ -337,22 +337,17 @@ class FakeWorklet extends EventTarget {
 	}
 }
 
-/** Build the fallback buffer: taking the global away is how the factory is made to pick it. */
+/** Build the postMessage buffer. */
 function postAudioBuffer(worklet: FakeWorklet, latency: number): AudioBuffer {
-	const shared = globalThis.SharedArrayBuffer;
-	(globalThis as { SharedArrayBuffer?: SharedArrayBufferConstructor }).SharedArrayBuffer = undefined;
-	try {
-		return createAudioBuffer(worklet as unknown as AudioWorkletNode, {
-			context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
-			channels: 1,
-			rate: RATE,
-			latency,
-			buffered: false,
-			conceal: true,
-		});
-	} finally {
-		globalThis.SharedArrayBuffer = shared;
-	}
+	return createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+		context: { getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 1 }) },
+		channels: 1,
+		rate: RATE,
+		latency,
+		buffered: false,
+		conceal: true,
+		shared: false,
+	});
 }
 
 /**

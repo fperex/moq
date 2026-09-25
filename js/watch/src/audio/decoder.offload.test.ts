@@ -529,12 +529,14 @@ async function playing(props?: { isolated?: boolean; tracks?: string[]; offload?
 
 // ── the cases ───────────────────────────────────────────────────────────────
 
-const RINGS: Array<["shared" | "post", boolean]> = [
-	["shared", true],
-	["post", false],
-];
+// The worker's ring is messages on either page (see `shared` in worker/host.ts), so a page's isolation
+// changes nothing for a player that offloads, which is the point of running both.
+const PAGES = [
+	["an isolated", true],
+	["a plain", false],
+] as const;
 
-describe.each(RINGS)("a player offloaded on a %s ring", (_kind, isolated) => {
+describe.each(PAGES)("a player offloaded from %s page", (_page, isolated) => {
 	it("plays through the worker, and the counters, clock, spread and arrivals reach the page", async () => {
 		const clocks: Array<Clock | undefined> = [];
 		const arrivals: Array<{ timestamp: Time.Milli; at: Time.Milli | undefined; heard: Time.Milli }> = [];
@@ -606,7 +608,15 @@ describe("the audio's download", () => {
 		await until(() => Node.built.length > 0 && t.page.live() === 1, "the page's subscription");
 		for (let i = 0; i < 20; i++) t.write(i, i * 20_000);
 		await sleep(100);
-		expect(loudest(pull(Node.built[0], 60))).toBeGreaterThan(0.4);
+
+		// The page's own ring is shared memory on an isolated page, which the worklet posts nothing about.
+		const [node] = Node.built;
+		const posted: unknown[] = [];
+		node.port.addEventListener("message", (event) => posted.push(event.data));
+		node.port.start();
+		expect(loudest(pull(node, 60))).toBeGreaterThan(0.4);
+		await sleep(20);
+		expect(posted).toEqual([]);
 
 		expect(t.remote.total()).toBe(0);
 		expect(InProcessWorker.created).toEqual([]);
@@ -624,7 +634,11 @@ describe("what the page tells the worker", () => {
 		});
 
 		t.delay.set(Time.Milli(200));
-		await until(() => t.decoder.out.debug.peek()?.target === (RATE * 200) / 1000, "the deeper ring");
+		// The worker's ring is messages, so its depth comes back in what the worklet reports as it renders.
+		await until(() => {
+			pull(t.node, 5);
+			return t.decoder.out.debug.peek()?.target === (RATE * 200) / 1000;
+		}, "the deeper ring");
 		expect(worker().told("timing").at(-1)).toMatchObject({ target: Time.Milli(200), delay: Time.Milli(200) });
 	});
 
@@ -1006,7 +1020,7 @@ describe("the deadline", () => {
 		await settle(() => t.page.live() === 1, "the page's own subscription");
 	});
 
-	describe.each(RINGS)("on a %s ring", (_kind, isolated) => {
+	describe.each(PAGES)("on %s page", (_page, isolated) => {
 		it("is done for good once the ring has played", async () => {
 			jest.useFakeTimers();
 			scope.crossOriginIsolated = isolated;

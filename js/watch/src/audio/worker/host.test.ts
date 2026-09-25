@@ -3,7 +3,7 @@ import type * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
 import { Group, Origin, Path, Time, Varint } from "@moq/net";
 import { Signal } from "@moq/signals";
-import type { Port as Handoff, State } from "../render";
+import type { Port as Handoff, Message, State, ToMain } from "../render";
 import { type Dial, type Port, restrict, type Session, serve } from "./host";
 import type { FromWorker, Report, ToWorker, Transports } from "./protocol";
 
@@ -11,7 +11,7 @@ import type { FromWorker, Report, ToWorker, Transports } from "./protocol";
 // host running the real `Supply` per player, a real `MessageChannel` standing in for the worker
 // boundary, and the real render worklet reading the port the page hands over. Only WebCodecs is
 // faked, and the worklet's global scope. What a thread boundary does to timing is the browser rows'
-// question; this is whether the page hears everything it needs, on both ring transports.
+// question; this is whether the page hears everything it needs, isolated or not.
 
 // libav is the page's polyfill for a browser without WebCodecs audio, and a worker never loads it:
 // it is refused one without a native decoder. Recorded rather than loaded, so a regression shows up
@@ -297,8 +297,76 @@ class Page {
 	}
 }
 
+/** What the page hands out for one graph: a port for the worklet, and the port that reaches it for the worker. */
+interface Handed {
+	worklet: MessagePort;
+	writer: MessagePort;
+	/** Told the worklet's own copy of `worklet` once the worklet has it. */
+	taken?(port: MessagePort): void;
+}
+
+/** One channel, as the page builds it. */
+function direct(): Handed {
+	const { port1, port2 } = new MessageChannel();
+	return { worklet: port1, writer: port2 };
+}
+
+/** The ports {@link unsettled} hands out, and what it did with them. */
+interface Unsettled extends Handed {
+	/** The type of every message that never reached the worklet. */
+	dropped: string[];
+	/** Mark the page's end settled: from then on, everything passes. */
+	settle(): void;
+}
+
+/**
+ * The ports as Firefox 156 treats them when the page hands the worklet its end first and is busy just after:
+ * until the page settles, shared memory never reaches the worklet, which gets `messageerror`. The rest passes.
+ */
+function unsettled(): Unsettled {
+	const writer = new MessageChannel();
+	const worklet = new MessageChannel();
+	const dropped: string[] = [];
+	let settled = false;
+	let taken: MessagePort | undefined;
+	writer.port1.onmessage = (event: MessageEvent<Message>) => {
+		const msg = event.data;
+		if (!settled && carriesShared(msg)) {
+			if (!taken) throw new Error("shared memory reached the port before the worklet had its end");
+			dropped.push(msg.type);
+			taken.dispatchEvent(new MessageEvent("messageerror"));
+			return;
+		}
+		worklet.port2.postMessage(msg, msg.type === "data" ? msg.data.map((channel) => channel.buffer) : []);
+	};
+	worklet.port2.onmessage = (event: MessageEvent<ToMain>) => writer.port1.postMessage(event.data);
+	cleanup.push(() => {
+		writer.port1.close();
+		worklet.port2.close();
+	});
+	return {
+		worklet: worklet.port1,
+		writer: writer.port2,
+		taken: (port) => {
+			taken = port;
+		},
+		dropped,
+		settle: () => {
+			settled = true;
+		},
+	};
+}
+
+/** Whether a SharedArrayBuffer is anywhere in `value`, as a structured clone would find it. */
+function carriesShared(value: unknown): boolean {
+	if (value instanceof SharedArrayBuffer) return true;
+	if (ArrayBuffer.isView(value)) return value.buffer instanceof SharedArrayBuffer;
+	if (typeof value !== "object" || value === null) return false;
+	return Object.values(value).some(carriesShared);
+}
+
 /** The page's half of one graph: a render worklet behind a node's port, and a channel handed to the worker. */
-function graph(page: Page, id = 1): { render: Processor; states: State[] } {
+function graph(page: Page, id = 1, handed: Handed = direct()): { render: Processor; states: State[] } {
 	if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
 	const node = new MessageChannel();
 	nextPort = node.port1;
@@ -307,11 +375,17 @@ function graph(page: Page, id = 1): { render: Processor; states: State[] } {
 	node.port2.onmessage = (event: MessageEvent<State>) => states.push(event.data);
 	cleanup.push(() => node.port2.close());
 
-	const channel = new MessageChannel();
-	const handoff: Handoff = { type: "port", port: channel.port1 };
-	node.port2.postMessage(handoff, [channel.port1]);
-	page.post({ type: "graph", id, ring: { port: channel.port2, rate: RATE, channels: 2, conceal: false } }, [
-		channel.port2,
+	// The worklet's own copy of the port it is handed, as its listener receives it.
+	const { taken } = handed;
+	if (taken) {
+		node.port1.addEventListener("message", (event: MessageEvent<Message>) => {
+			if (event.data.type === "port") taken(event.data.port);
+		});
+	}
+	const handoff: Handoff = { type: "port", port: handed.worklet };
+	node.port2.postMessage(handoff, [handed.worklet]);
+	page.post({ type: "graph", id, ring: { port: handed.writer, rate: RATE, channels: 2, conceal: false } }, [
+		handed.writer,
 	]);
 	return { render, states };
 }
@@ -345,7 +419,7 @@ function pull(render: Processor, quanta: number): Float32Array {
 const loudest = (samples: Float32Array) => samples.reduce((max, v) => Math.max(max, Math.abs(v)), 0);
 
 /** A page with one player on a publishing relay, its timing and graph sent, ready for media. */
-async function started(props: { interval: number; isolated: boolean }) {
+async function started(props: { interval: number; isolated: boolean; handed?: Handed }) {
 	scope.crossOriginIsolated = props.isolated;
 	const { origin, sessions, dial } = relay();
 	const { broadcast, track } = publish(origin);
@@ -353,24 +427,32 @@ async function started(props: { interval: number; isolated: boolean }) {
 	page.post({ type: "hello", transports: TRANSPORTS });
 	page.post(player(1));
 	page.post(timing(1));
-	const { render, states } = graph(page);
+	const { render, states } = graph(page, 1, props.handed);
 	await sleep(30);
 	return { origin, sessions, broadcast, track, page, render, states };
 }
 
+/**
+ * The page samples its device, which the worker's clock maps the worklet's context time through: it
+ * started a moment ago, so context time zero left it now.
+ */
+function sample(page: Page): { contextTime: number; at: number } {
+	const output = { contextTime: 0, at: now() };
+	page.post({ type: "output", id: 1, output });
+	return output;
+}
+
 // ── the cases ───────────────────────────────────────────────────────────────
 
-const RINGS: Array<["shared" | "post", boolean]> = [
-	["shared", true],
-	["post", false],
-];
-
-describe.each(RINGS)("a player on a %s ring", (kind, isolated) => {
+// The worker's ring is messages on either page (see `shared` in host.ts), so a page's isolation
+// changes nothing here, which is the point of running both.
+describe.each([
+	["an isolated", true],
+	["a plain", false],
+] as const)("a player on %s page", (_page, isolated) => {
 	it("plays through the real worklet, and its counters, clock and arrivals reach the page", async () => {
 		const { track, page, render, states } = await started({ interval: 50, isolated });
-		// The device started a moment ago: context time zero left it now.
-		const output = { contextTime: 0, at: now() };
-		page.post({ type: "output", id: 1, output });
+		const output = sample(page);
 
 		// 400 ms of media, past the three callbacks the legacy warmup drops.
 		const before = now();
@@ -381,7 +463,7 @@ describe.each(RINGS)("a player on a %s ring", (kind, isolated) => {
 		const played = pull(render, 60);
 		expect(loudest(played)).toBeGreaterThan(0.4);
 
-		// Past a few reports, and past one of the shared ring's 50 ms polls.
+		// Past a few reports.
 		await sleep(150);
 		const reports = page.reports();
 		const last = reports.at(-1);
@@ -405,15 +487,13 @@ describe.each(RINGS)("a player on a %s ring", (kind, isolated) => {
 		expect(last.ring?.stalled).toBe(last.ring?.debug?.stalled);
 		expect(last.ring?.underruns).toBe(last.ring?.debug?.underruns);
 
-		// The clock. The shared ring's is stamped when the worker polled it, on the absolute timeline;
-		// the postMessage ring's maps the worklet's context time through the page's sample, which the
-		// output clock case checks exactly.
+		// The clock maps the worklet's context time through the page's sample, which the output clock
+		// case checks exactly.
 		const clocked = reports.filter((report) => report.clock !== undefined);
 		expect(clocked.length).toBeGreaterThan(0);
 		for (const { clock } of clocked) {
 			expect(clock?.timestamp).toBeGreaterThan(0);
 			expect(clock?.at).toBeGreaterThanOrEqual(output.at);
-			if (kind === "shared") expect(clock?.at).toBeLessThanOrEqual(now());
 		}
 
 		// Every frame the worker read, once, in order, stamped when the worker read it.
@@ -426,10 +506,41 @@ describe.each(RINGS)("a player on a %s ring", (kind, isolated) => {
 			expect(at).toBeLessThanOrEqual(read);
 		}
 
-		// The node's own port still hears the worklet on the postMessage ring, which is where the page
-		// can tell the ring has played; the shared ring posts nothing.
-		if (kind === "post") expect(states.length).toBeGreaterThan(0);
-		else expect(states.length).toBe(0);
+		// The node's own port hears the worklet too, which is where the page can tell the ring has
+		// played without waiting on the worker.
+		expect(states.length).toBeGreaterThan(0);
+	});
+});
+
+describe("a port handed over right before the page gets busy", () => {
+	/** Play 400 ms through `handed` on an isolated page, and say what the worklet and the worker made of it. */
+	async function play(handed: Unsettled) {
+		const { track, page, render } = await started({ interval: 50, isolated: true, handed });
+		for (let i = 0; i < 20; i++) writeGroup(track, i, i * 20_000);
+		await sleep(100);
+
+		const played = pull(render, 60);
+		await sleep(150);
+		const debug = page.reports().at(-1)?.ring?.debug;
+		return {
+			loud: loudest(played) > 0.4,
+			// The worker's last report: the worklet has read the ring and played from it.
+			output: (debug?.output ?? 0) > 0,
+			fresh: debug?.fresh,
+			dropped: handed.dropped,
+		};
+	}
+
+	const PLAYED = { loud: true, output: true, fresh: false, dropped: [] };
+
+	it("plays the worker's audio on a page that never settles, since the worker sends no shared memory", async () => {
+		expect(await play(unsettled())).toEqual(PLAYED);
+	});
+
+	it("plays it on a page settled before the handoff, where shared memory passes too", async () => {
+		const handed = unsettled();
+		handed.settle();
+		expect(await play(handed)).toEqual(PLAYED);
 	});
 });
 
@@ -474,21 +585,27 @@ describe("reports", () => {
 	it("go out at once when the clock appears and when it changes rate", async () => {
 		// An interval nothing here waits out, so every report is one sent at once.
 		const { track, page, render } = await started({ interval: 10_000, isolated: true });
+		sample(page);
 		expect(page.reports().length).toBe(0);
 
-		// The first frame anchors the ring: a playhead parked while it fills is a clock already.
-		for (let i = 0; i < 20; i++) writeGroup(track, i, i * 20_000);
+		// The first frames past the warmup anchor the ring short of its target: a playhead parked while
+		// it fills is a clock already, once the worklet says where it is.
+		for (let i = 0; i < 5; i++) writeGroup(track, i, i * 20_000);
+		await sleep(100);
+		pull(render, 10);
 		const filling = await page.report((report) => report.clock !== undefined);
 		expect(filling.clock?.rate).toBe(0);
 		const reported = page.reports().length;
 
-		// The next poll finds it moving.
+		// The rest fills it past the target, and it moves.
+		for (let i = 5; i < 20; i++) writeGroup(track, i, i * 20_000);
+		await sleep(100);
 		pull(render, 60);
 		const playing = await page.report((report) => (report.clock?.rate ?? 0) > 0, reported);
 
-		// Nothing pulls any more, so the poll after finds it parked again.
+		// Nothing more arrives, so it runs dry and parks again.
+		pull(render, 150);
 		const parked = await page.report((report) => report.clock?.rate === 0, page.reports().indexOf(playing));
-		expect(parked.ring?.debug?.output).toBe(playing.ring?.debug?.output);
 		expect(parked.ring?.debug?.output).toBeGreaterThan(0);
 	});
 
@@ -555,6 +672,7 @@ describe("the worker's own flushes", () => {
 	/** A player that has played, with its clock reported. */
 	async function playing() {
 		const setup = await started({ interval: 10_000, isolated: true });
+		sample(setup.page);
 		for (let i = 0; i < 20; i++) writeGroup(setup.track, i, i * 20_000);
 		await sleep(100);
 		pull(setup.render, 60);

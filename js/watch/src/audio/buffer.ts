@@ -135,9 +135,9 @@ function samplesToMicro(samples: number, rate: number): Time.Micro {
  *
  * Two implementations exist:
  *   - `SharedAudioBuffer`: backed by SharedArrayBuffer, lock-free writes via Atomics.
- *   - `PostAudioBuffer`: backed by postMessage transfer (the fallback when SAB is unavailable).
+ *   - `PostAudioBuffer`: backed by postMessage transfer.
  *
- * Use `createAudioBuffer()` to pick the right implementation automatically.
+ * `createAudioBuffer()` builds the one the graph's builder asked for (see `AudioBufferProps.shared`).
  */
 export interface AudioBuffer {
 	readonly rate: number;
@@ -246,6 +246,11 @@ export interface AudioBufferProps {
 	buffered: boolean;
 	/** Whether the reader conceals a gap with synthesized audio or plays it as a ramp into silence. */
 	conceal: boolean;
+	/**
+	 * Whether the ring is shared memory rather than messages. Shared memory needs
+	 * {@link supportsSharedArrayBuffer}, and the graph's builder decides: see `Graph.shared` in `supply.ts`.
+	 */
+	shared: boolean;
 }
 
 /**
@@ -254,14 +259,9 @@ export interface AudioBufferProps {
  */
 export type RingTarget = Pick<AudioWorkletNode, "port">;
 
-/**
- * Create the best audio buffer implementation for the current environment.
- * Picks `SharedAudioBuffer` when possible, falling back to `PostAudioBuffer`.
- */
+/** Create the audio buffer `props.shared` asks for: `SharedAudioBuffer`, or `PostAudioBuffer`. */
 export function createAudioBuffer(worklet: RingTarget, props: AudioBufferProps): AudioBuffer {
-	const shared = supportsSharedArrayBuffer();
-	reportTransport(shared);
-	return shared ? new SharedAudioBuffer(worklet, props) : new PostAudioBuffer(worklet, props);
+	return props.shared ? new SharedAudioBuffer(worklet, props) : new PostAudioBuffer(worklet, props);
 }
 
 // Whether the transport has been named already, since it is the same answer for the rest of the
@@ -269,14 +269,17 @@ export function createAudioBuffer(worklet: RingTarget, props: AudioBufferProps):
 let reported = false;
 
 /**
- * Say which transport this document got, once.
+ * Say which transport the page's own ring writes run on, once per document.
  *
  * Cross-origin isolation is a property of the page, so every player on it lands on the same
  * transport and each one saying so is the same line repeated. Neither answer is a fault: a page
  * that is not isolated cannot have shared memory and the postMessage ring is what it runs on, so
  * this is a note about the page rather than a warning about the player.
+ *
+ * The page's alone: the audio worker writes by message whatever the page is, so isolating the page
+ * would change nothing for it, and advice to do so would be wrong.
  */
-function reportTransport(shared: boolean): void {
+export function reportTransport(shared: boolean): void {
 	if (reported) return;
 	reported = true;
 
@@ -431,7 +434,7 @@ class SharedAudioBuffer implements AudioBuffer {
 	}
 }
 
-/** postMessage-backed fallback implementation. Samples are transferred, not shared. */
+/** postMessage-backed implementation. Samples are transferred, not shared. */
 class PostAudioBuffer implements AudioBuffer {
 	readonly rate: number;
 	readonly channels: number;
