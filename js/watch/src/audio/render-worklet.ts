@@ -1,6 +1,6 @@
 import { Time } from "@moq/net";
 import { Stretcher } from "./playout";
-import type { Message, State } from "./render";
+import type { Message, State, Unreadable } from "./render";
 import { AudioRingBuffer } from "./ring-buffer";
 import { SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -27,6 +27,8 @@ class Render extends AudioWorkletProcessor {
 	// Every port the ring is fed from: the node's own, plus any a writer off the main thread handed
 	// over. State reports go to all of them.
 	#ports: MessagePort[] = [];
+	// Whether a message has already failed to deserialize, which is said once. See #unreadable.
+	#unread = false;
 
 	constructor() {
 		super();
@@ -35,6 +37,7 @@ class Render extends AudioWorkletProcessor {
 
 	#listen(port: MessagePort): void {
 		this.#ports.push(port);
+		port.onmessageerror = () => this.#unreadable();
 		port.onmessage = (event: MessageEvent<Message>) => {
 			const msg = event.data;
 			if (msg.type === "port") {
@@ -67,6 +70,19 @@ class Render extends AudioWorkletProcessor {
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.end();
 			}
 		};
+	}
+
+	/**
+	 * Say once, on every port and in the console, that a message could not be deserialized (see
+	 * `Unreadable`). A page whose worker writes the ring takes the audio back on it; a page writing
+	 * the ring itself has nowhere else to play it, so the console is where it shows.
+	 */
+	#unreadable(): void {
+		if (this.#unread) return;
+		this.#unread = true;
+		console.error("[audio] the render worklet could not deserialize a message sent to it");
+		const msg: Unreadable = { type: "unreadable" };
+		for (const port of this.#ports) port.postMessage(msg);
 	}
 
 	/**

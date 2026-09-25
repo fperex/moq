@@ -1100,6 +1100,20 @@ describe("one player's trouble", () => {
 		expect(InProcessWorker.created.length).toBe(1);
 	});
 
+	it("a worklet that could not read what it was sent takes that player's audio back, and says it was the worklet", async () => {
+		const warned = fallbacks();
+		const t = tile({ offload: true });
+		await until(() => handed()(), "the graph handed over");
+
+		// All the worklet says of it, on the one port the page reads.
+		Node.built[0].worklet.postMessage({ type: "unreadable" });
+		await until(() => t.decoder.out.thread.peek()?.kind === "main", "the fallback");
+		const reason = "the audio worklet could not deserialize a message sent to it";
+		expect(t.decoder.out.thread.peek()).toEqual({ kind: "main", reason });
+		expect(warned).toEqual([expect.stringContaining(reason)]);
+		await until(() => t.page.live() === 1, "the page's own subscription");
+	});
+
 	it("an error about one player takes that player's audio back, and only its", async () => {
 		const warned = fallbacks();
 		scope.crossOriginIsolated = true;

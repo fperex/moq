@@ -5,7 +5,18 @@ import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
 /** Everything a writer sends the render worklet: over the node's own port, or over one handed to it as a {@link Port}. */
 export type Message = InitShared | InitPost | Data | End | Latency | Reset | Stall | Truncate | Port;
-export type ToMain = State;
+/** Everything the render worklet sends back, to every port it holds. */
+export type ToMain = State | Unreadable;
+
+/**
+ * A message reached the worklet and could not be deserialized, so whatever it carried never arrived:
+ * a ring, samples, a flush. Sent once, the first time any port reports one.
+ *
+ * The ring cannot say so itself: it just plays silence.
+ */
+export interface Unreadable {
+	type: "unreadable";
+}
 
 /**
  * Another port the worklet takes every other {@link Message} from, exactly as it takes them from its own.

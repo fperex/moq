@@ -192,6 +192,7 @@ or takes it back for good, and warns once in the console, when:
 - the worker plays nothing within 5 seconds of trying, counting only time the
   page could play it (unmuted, unpaused, its AudioContext running, the broadcast
   live);
+- the audio worklet cannot read a message it is sent;
 - the worker gets stuck: it fails, or says nothing for 2 seconds while it plays.
 
 Taking the audio back costs one gap about as long as tuning in. A worker that

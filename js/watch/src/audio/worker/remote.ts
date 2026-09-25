@@ -8,7 +8,7 @@
  *
  * It also says when the page has to take the audio back (see `out.failure`): the page's worker is not
  * available, fails or stops reporting, refuses this player's rendition or fails on it, or plays nothing
- * within `AUDIO_DEADLINE`.
+ * within `AUDIO_DEADLINE`, or the worklet could not read what it was sent.
  *
  * @module
  */
@@ -20,7 +20,7 @@ import { type Computed, Effect, type Getter, type Readonlys, readonlys, Signal }
 import type { Clock, Sync } from "../../sync";
 import type { Stats } from "../decoder";
 import type { Snapshot } from "../playout";
-import type { Port, State } from "../render";
+import type { Port, ToMain } from "../render";
 import type { Source } from "../source";
 import type { Graph, RingState, SupplyOutput } from "../supply";
 import { type Lease, Pool } from "./pool";
@@ -255,13 +255,20 @@ export class Remote {
 		const graph = effect.get(this.in.graph);
 		if (!graph) return;
 
-		// The worklet reports its state to every port it holds, the node's own included: read here, where
-		// the page sees the postMessage ring play without waiting on the worker, and read at all, since a
-		// port never started would queue every report for the node's life.
+		// The worklet reports to every port it holds, the node's own included: read here, where the page
+		// sees the ring play, or hears that the worklet could not read what it was sent, without waiting
+		// on the worker, and read at all, since a port never started would queue every report for the
+		// node's life.
 		const node = graph.target.port;
 		effect.event(node, "message", (event) => {
-			const state = (event as MessageEvent<State>).data;
-			if (state?.type === "state" && !state.debug.fresh) this.#played.set(true);
+			const msg = (event as MessageEvent<ToMain>).data;
+			if (msg?.type === "state" && !msg.debug.fresh) this.#played.set(true);
+			if (msg?.type === "unreadable") {
+				this.#fail({
+					reason: "the audio worklet could not deserialize a message sent to it",
+					scope: "player",
+				});
+			}
 		});
 		node.start();
 

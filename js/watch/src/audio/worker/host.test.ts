@@ -3,7 +3,7 @@ import type * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
 import { Group, Origin, Path, Time, Varint } from "@moq/net";
 import { Signal } from "@moq/signals";
-import type { Port as Handoff, Message, State, ToMain } from "../render";
+import type { Port as Handoff, Message, ToMain } from "../render";
 import { type Dial, type Port, restrict, type Session, serve } from "./host";
 import type { FromWorker, Report, ToWorker, Transports } from "./protocol";
 
@@ -366,13 +366,13 @@ function carriesShared(value: unknown): boolean {
 }
 
 /** The page's half of one graph: a render worklet behind a node's port, and a channel handed to the worker. */
-function graph(page: Page, id = 1, handed: Handed = direct()): { render: Processor; states: State[] } {
+function graph(page: Page, id = 1, handed: Handed = direct()): { render: Processor; states: ToMain[] } {
 	if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
 	const node = new MessageChannel();
 	nextPort = node.port1;
 	const render = new Render();
-	const states: State[] = [];
-	node.port2.onmessage = (event: MessageEvent<State>) => states.push(event.data);
+	const states: ToMain[] = [];
+	node.port2.onmessage = (event: MessageEvent<ToMain>) => states.push(event.data);
 	cleanup.push(() => node.port2.close());
 
 	// The worklet's own copy of the port it is handed, as its listener receives it.
@@ -515,7 +515,7 @@ describe.each([
 describe("a port handed over right before the page gets busy", () => {
 	/** Play 400 ms through `handed` on an isolated page, and say what the worklet and the worker made of it. */
 	async function play(handed: Unsettled) {
-		const { track, page, render } = await started({ interval: 50, isolated: true, handed });
+		const { track, page, render, states } = await started({ interval: 50, isolated: true, handed });
 		for (let i = 0; i < 20; i++) writeGroup(track, i, i * 20_000);
 		await sleep(100);
 
@@ -527,11 +527,12 @@ describe("a port handed over right before the page gets busy", () => {
 			// The worker's last report: the worklet has read the ring and played from it.
 			output: (debug?.output ?? 0) > 0,
 			fresh: debug?.fresh,
+			unreadable: states.filter((msg) => msg.type === "unreadable"),
 			dropped: handed.dropped,
 		};
 	}
 
-	const PLAYED = { loud: true, output: true, fresh: false, dropped: [] };
+	const PLAYED = { loud: true, output: true, fresh: false, unreadable: [], dropped: [] };
 
 	it("plays the worker's audio on a page that never settles, since the worker sends no shared memory", async () => {
 		expect(await play(unsettled())).toEqual(PLAYED);
@@ -573,7 +574,7 @@ describe("the output clock", () => {
 		const report = await page.report((report) => report.clock !== undefined, reported);
 		// The first state the worklet sent after the sample, mapped through it.
 		const state = states[seen];
-		if (!state?.playhead) throw new Error("the worklet reported no playhead");
+		if (state?.type !== "state" || !state.playhead) throw new Error("the worklet reported no playhead");
 		expect(report.clock?.timestamp).toBe(state.playhead.timestamp);
 		expect(report.clock?.rate).toBe(state.playhead.rate);
 		expect(report.clock?.at).toBeCloseTo(output.at + (state.contextTime - output.contextTime) * 1_000, 3);

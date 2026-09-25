@@ -1,6 +1,6 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { Time } from "@moq/net";
-import type { Data, InitPost, Port, State } from "./render";
+import type { Data, InitPost, Message, Port, State, ToMain } from "./render";
 
 // The render worklet itself, loaded into a stand-in for its global scope: `AudioWorkletProcessor`
 // hands each processor the port the test gives it, `registerProcessor` captures the class, and
@@ -119,6 +119,52 @@ describe("render worklet ports", () => {
 		expect(last.type).toBe("state");
 		expect(last.debug.output).toBeGreaterThan(0);
 		expect(page[page.length - 1]).toEqual(last);
+
+		node.port2.close();
+		extra.port2.close();
+	});
+
+	it("says once, on every port it holds, that a message could not be deserialized", async () => {
+		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
+
+		const node = new MessageChannel();
+		nextPort = node.port1;
+		new Render();
+
+		// The worklet's own end of the port it is handed, as its listener receives it.
+		const received: MessagePort[] = [];
+		node.port1.addEventListener("message", (event: MessageEvent<Message>) => {
+			if (event.data.type === "port") received.push(event.data.port);
+		});
+		const extra = new MessageChannel();
+		const handoff: Port = { type: "port", port: extra.port1 };
+		node.port2.postMessage(handoff, [extra.port1]);
+		await settle();
+		const [handed] = received;
+		if (!handed) throw new Error("the worklet was handed no port");
+
+		const page: ToMain[] = [];
+		const writer: ToMain[] = [];
+		node.port2.onmessage = (event: MessageEvent<ToMain>) => page.push(event.data);
+		extra.port2.onmessage = (event: MessageEvent<ToMain>) => writer.push(event.data);
+
+		// What a browser fires in place of a message it could not deserialize: on the port a worker
+		// writes the ring over, then on the node's own.
+		const errors: unknown[][] = [];
+		const error = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+			errors.push(args);
+		});
+		try {
+			handed.dispatchEvent(new MessageEvent("messageerror"));
+			node.port1.dispatchEvent(new MessageEvent("messageerror"));
+			await settle();
+		} finally {
+			error.mockRestore();
+		}
+
+		expect(page).toEqual([{ type: "unreadable" }]);
+		expect(writer).toEqual([{ type: "unreadable" }]);
+		expect(errors).toEqual([["[audio] the render worklet could not deserialize a message sent to it"]]);
 
 		node.port2.close();
 		extra.port2.close();
