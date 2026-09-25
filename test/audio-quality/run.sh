@@ -458,8 +458,8 @@ for entry in "${ROWS[@]}"; do
     page_url="$RELAY_URL"
     if [[ "$RUNTIME" != safari ]]; then
         harness_spawn "shaper-$tag" "$HARNESS_RUN/shaper-$tag.ndjson" \
-            "$SHAPER" --listen "127.0.0.1:$shaper_port" --upstream "127.0.0.1:$RELAY_PORT" \
-            --profile "$(shaper_of "$profile")" --seed "$SEED" \
+            "$SHAPER" --listen "127.0.0.1:$shaper_port" --target "127.0.0.1:$RELAY_PORT" \
+            --profile "$(shaper_of "$profile")" --seed "$SEED" --tcp-passthrough \
             --report-interval 1s --report "$HARNESS_RUN/shaper-$tag.json"
         shaper_pid="$HARNESS_PID"
         if ! harness_ready "http://127.0.0.1:$shaper_port/certificate.sha256" 15 "$shaper_pid"; then

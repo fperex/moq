@@ -354,7 +354,10 @@ main thread with no reason: a reason is a fallback, meaning the page tried the w
 ## Profiles
 
 Loss, reorder, and rate limiting stay off here. The buffer's job is absorbing arrival spread, and
-mixing congestion response into an audio quality number makes a failure hard to attribute.
+mixing congestion response into an audio quality number makes a failure hard to attribute. For the
+same reason every profile, in `rs/moq-shaper/profiles/`, draws its jitter from the shaper's gaussian
+model, which never lets a datagram overtake the one in front, and puts the page's session and its
+audio worker's on one shared path, as they are on a real host.
 
 | Profile | What it is |
 | --- | --- |

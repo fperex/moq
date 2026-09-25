@@ -580,7 +580,7 @@ lines.push(
 if (shaper) {
 	lines.push(
 		"",
-		`shaper ${shaper.profile} seed ${shaper.seed}: up delivered ${shaper.up.delivered} delayed ${shaper.up.delayed} dropped ${shaper.up.dropped}, down delivered ${shaper.down.delivered} delayed ${shaper.down.delayed} dropped ${shaper.down.dropped}`,
+		`shaper ${shaper.profile} seed ${shaper.seed}: up packets ${shaper.up.packets} delayed ${shaper.up.delayed} lost ${shaper.up.lost}, down packets ${shaper.down.packets} delayed ${shaper.down.delayed} lost ${shaper.down.lost}`,
 	);
 }
 if (notes.length > 0) lines.push("", "notes:", ...notes.slice(0, 20).map((n) => `- ${n}`));

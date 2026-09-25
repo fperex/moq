@@ -430,12 +430,12 @@ export type Stats = {
 
 /** The shaper's own counters for one direction, copied through so a row records its impairment. */
 export type ShaperCounters = {
-	delivered: number;
-	dropped: number;
+	packets: number;
+	lost: number;
+	overflowed: number;
+	throttled: number;
 	delayed: number;
 	reordered: number;
-	rate_limited: number;
-	queue_max: number;
 };
 
 /** Why a row is not gradeable. A void row is reported, never silently passed. */

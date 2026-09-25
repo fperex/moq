@@ -277,8 +277,8 @@ await Bun.write(
 		{
 			profile: "none",
 			seed: 0,
-			up: { delivered: 0, dropped: 0, delayed: 0, reordered: 0, rate_limited: 0, queue_max: 0 },
-			down: { delivered: 0, dropped: 0, delayed: 0, reordered: 0, rate_limited: 0, queue_max: 0 },
+			up: { packets: 0, lost: 0, overflowed: 0, throttled: 0, delayed: 0, reordered: 0 },
+			down: { packets: 0, lost: 0, overflowed: 0, throttled: 0, delayed: 0, reordered: 0 },
 		},
 		null,
 		1,
