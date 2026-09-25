@@ -13,6 +13,7 @@ import {
 	Signal,
 } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
+import { RenditionJitter } from "../jitter";
 import { hardwareReliable } from "../support/video";
 import type { Capture } from "./capture";
 import { normalizeSource, type Source } from "./types";
@@ -151,12 +152,11 @@ export class Encoder {
 
 	#signals = new Effect();
 	#stalled = new Catalog.Stalled.Detector();
-	// A reconfiguration can shorten frames, but the stream's advertised bound cannot shrink.
-	#jitter: Catalog.VideoConfig["jitter"];
 	#firstCaptured?: Time.Micro;
 	#lastCaptured?: Time.Micro;
 	#lastAccepted?: Time.Micro;
 	#lastCaptureWall?: number;
+	#jitter = new RenditionJitter();
 
 	constructor(name: string, props?: EncoderProps) {
 		this.name = name;
@@ -274,6 +274,11 @@ export class Encoder {
 					}));
 
 					producer.encode(frame, frame.timestamp as Time.Micro, key);
+					const jitter = this.#jitter.observe(frame.timestamp);
+					if (jitter !== undefined) {
+						const catalog = this.#out.catalog.peek();
+						if (catalog) this.#out.catalog.set({ ...catalog, jitter: Catalog.u53(jitter) });
+					}
 					this.#lastAccepted = frame.timestamp as Time.Micro;
 					this.#observe({ demand: true, idle: false, frame: true });
 				},
@@ -304,7 +309,7 @@ export class Encoder {
 
 				effect.spawn(async () => {
 					for (;;) {
-						const next = await Promise.race([reader.read(), effect.cancel]);
+						const next = await effect.race(reader.read());
 						if (!next?.value) break;
 
 						// Ours now: every path below has to close it.
@@ -426,9 +431,6 @@ export class Encoder {
 			effect.set(this.#out.catalog, undefined);
 			return;
 		}
-		if (config.framerate) {
-			this.#jitter = Catalog.u53(Math.max(this.#jitter ?? 0, Math.ceil(1000 / config.framerate)));
-		}
 
 		const catalog: Catalog.VideoConfig = {
 			codec: config.codec,
@@ -438,8 +440,7 @@ export class Encoder {
 			codedHeight: Catalog.u53(config.height),
 			optimizeForLatency: true,
 			container: { kind: "legacy" } as const,
-			// Each frame is flushed immediately; retain the longest advertised frame duration.
-			jitter: this.#jitter,
+			jitter: this.#jitter.current ? Catalog.u53(this.#jitter.current) : undefined,
 			stalled: this.#stalled.flag(),
 		};
 
@@ -461,7 +462,7 @@ export class Encoder {
 			// A rerun waits for this task, so a probe that outlives its run holds the encoder at the
 			// old answer: showing video again while one is still running would wait out the whole
 			// probe before the rendition came back. The probe itself stops at its next step.
-			const detected = await Promise.race([this.#bestCodec(effect, required, dimensions), effect.cancel]);
+			const detected = await effect.race(this.#bestCodec(effect, required, dimensions));
 			if (!detected) return;
 
 			effect.set(this.#codec, { ...detected, required, ...dimensions });

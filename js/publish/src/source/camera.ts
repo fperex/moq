@@ -120,7 +120,7 @@ export class Camera {
 		effect.spawn(async () => {
 			// Let go of the last capture before asking for a device again: the browser is still
 			// holding it otherwise, and it answers that with a failure like any other.
-			await Promise.race([this.#released, effect.cancel]);
+			await effect.race(this.#released);
 			if (effect.abort.aborted) return;
 
 			const media = navigator.mediaDevices
@@ -138,7 +138,7 @@ export class Camera {
 				});
 			});
 
-			const attempt = await Promise.race([media, effect.cancel]);
+			const attempt = await effect.race(media);
 
 			// A torn-down run is not a failed attempt: whatever cancelled it reruns us.
 			if (effect.abort.aborted || !attempt) return;

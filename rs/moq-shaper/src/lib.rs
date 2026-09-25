@@ -1,1185 +1,727 @@
-//! A seeded userspace UDP shaper, so a test can put an impaired path in front of a relay.
+//! A seeded userspace UDP impairment relay.
 //!
-//! The shaper binds one socket, forwards every datagram to an upstream address after the
-//! profile's treatment, and forwards the replies back. QUIC is indifferent to the extra
-//! hop, so a browser or a native client reaches the relay through a path with delay,
-//! jitter, loss, reorder, bunching, and a rate limit, with no capabilities and nothing
-//! touching the host's network.
+//! The shaper sits between clients and a target and forwards each datagram,
+//! both ways, after applying a [`Profile`]: loss, a token-bucket rate limit,
+//! delay, jitter, and reordering. QUIC is indifferent to the extra hop, so this
+//! impairs a real transport with no capabilities and nothing touching the
+//! host's network, on any OS.
 //!
-//! Jitter is queueing delay on a FIFO path: it stretches and compresses the spacing
-//! between datagrams, and never lets a later one overtake an earlier one. Only the
-//! `reorder` draw does that, which is what keeps a reorder a deliberate act rather than a
-//! side effect of the noise. A shaper that let jitter reorder would be read by QUIC as
-//! loss, and the run would measure congestion response instead of the profile.
+//! Every decision comes from [`Config::seed`], so a failing run's seed
+//! reproduces the same treatment. Kernel scheduling still varies delivery
+//! timing: the seed makes the decisions reproducible, not the clock.
 //!
-//! One generator per direction, seeded from the profile, makes the decisions reproducible.
-//! It does not make the kernel's delivery clock reproducible: a replayed run drops and
-//! reorders the same datagrams, but the wall time each one lands is still the host's.
+//! A profile that silently did nothing would turn an impaired run into an
+//! unimpaired pass, so [`Shaper::verify`] fails when an impairment the profile
+//! configures never acted and the traffic makes that silence implausible.
 
-mod profile;
-
-pub use profile::{Burst, ByteRate, Direction, Profile, Step};
-
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+	cmp::Reverse,
+	collections::{BinaryHeap, HashMap, hash_map},
+	fmt,
+	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+	sync::{
+		Arc, OnceLock,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::Duration,
+};
 
 use anyhow::Context;
-use rand::rngs::SmallRng;
-use rand::{RngExt, SeedableRng};
-use serde::{Deserialize, Serialize};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Notify;
-use tokio::task::JoinSet;
+use rand::{RngExt, SeedableRng, rngs::Xoshiro256PlusPlus};
+use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet, time::Instant};
 
-/// The largest datagram the shaper will carry, which is larger than any QUIC packet.
-const MAX_DATAGRAM: usize = 65535;
+/// How one direction of the path treats each datagram.
+///
+/// A datagram is first subject to `loss`, then waits for the `rate` limit, then
+/// takes `delay` plus or minus `jitter` to arrive, unless `reorder` sends it
+/// ahead of everything still in flight.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Profile {
+	/// The base one-way delay.
+	pub delay: Duration,
+	/// The most a datagram's delay varies from `delay`, uniformly either way.
+	pub jitter: Duration,
+	/// The probability that a datagram is dropped.
+	pub loss: f64,
+	/// The probability that a datagram skips the delay, overtaking those in flight.
+	pub reorder: f64,
+	/// The bottleneck, if any.
+	pub rate: Option<Rate>,
+}
 
-/// How long a client mapping survives without traffic. A QUIC connection that migrates
-/// just allocates a new one.
-const IDLE: Duration = Duration::from_secs(60);
+impl Profile {
+	fn validate(&self) -> anyhow::Result<()> {
+		anyhow::ensure!(
+			(0.0..=1.0).contains(&self.loss),
+			"loss {} is not a probability",
+			self.loss
+		);
+		anyhow::ensure!(
+			(0.0..=1.0).contains(&self.reorder),
+			"reorder {} is not a probability",
+			self.reorder
+		);
+		anyhow::ensure!(
+			self.reorder == 0.0 || !self.delay.is_zero(),
+			"reorder {} needs a delay to overtake",
+			self.reorder
+		);
+		anyhow::ensure!(
+			self.jitter <= self.delay,
+			"jitter {:?} exceeds delay {:?}, which would need a negative delay",
+			self.jitter,
+			self.delay
+		);
+		if let Some(rate) = &self.rate {
+			anyhow::ensure!(rate.bits_per_second > 0, "a rate limit of zero passes nothing");
+		}
+		Ok(())
+	}
+}
 
-/// Where the shaper listens, where it forwards, and how it treats the path between.
+/// Each impairment a profile draws for: its name, how likely it is to act on
+/// any one datagram (zero when unconfigured), and the count showing it did.
+///
+/// A rate limit is not here: it acts only on traffic that exceeds it, which no
+/// chance predicts, so its counts are reported but never required.
+type Impairment = (&'static str, fn(&Profile) -> f64, fn(&Counters) -> u64);
+const IMPAIRMENTS: [Impairment; 3] = [
+	("loss", |p| p.loss, |c| c.lost),
+	("reorder", |p| p.reorder, |c| c.reordered),
+	(
+		"delay",
+		|p| if p.delay.is_zero() { 0.0 } else { 1.0 - p.reorder },
+		|c| c.delayed,
+	),
+];
+
+/// How unlikely an impairment's silence has to be before [`Shaper::verify`]
+/// calls it unapplied. A short run can plausibly see no loss at 2%; a long one
+/// cannot, and that is when the silence means the profile is not in the path.
+const IMPLAUSIBLE: f64 = 1e-4;
+
+/// The impairments `config` configures that `stats` shows implausibly never acted.
+fn unapplied(config: &Config, stats: &Stats) -> Vec<&'static str> {
+	IMPAIRMENTS
+		.iter()
+		.filter(|(_, chance, acted)| {
+			let silence = (1.0 - chance(&config.up)).powf(stats.up.packets as f64)
+				* (1.0 - chance(&config.down)).powf(stats.down.packets as f64);
+			acted(&stats.up) + acted(&stats.down) == 0 && silence < IMPLAUSIBLE
+		})
+		.map(|(name, ..)| *name)
+		.collect()
+}
+
+/// A token-bucket rate limit with a bounded queue behind it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rate {
+	/// The sustained rate.
+	pub bits_per_second: u64,
+	/// How many bytes may go out ahead of the sustained rate after an idle spell.
+	pub burst: u64,
+	/// The longest a datagram waits for the bucket; one that would wait longer is dropped.
+	pub queue: Duration,
+}
+
+impl Rate {
+	/// How long `bytes` takes at this rate.
+	fn cost(&self, bytes: u64) -> Duration {
+		Duration::from_secs_f64(bytes as f64 * 8.0 / self.bits_per_second as f64)
+	}
+}
+
+/// Where the shaper listens, where it forwards, and how it treats each direction.
 #[derive(Clone, Debug)]
 pub struct Config {
-	/// The address clients connect to instead of the upstream.
-	pub listen: SocketAddr,
-
+	/// The address clients send to. Port 0 picks one; [`Shaper::addr`] reports it.
+	pub bind: SocketAddr,
 	/// The address every datagram is forwarded to.
-	pub upstream: SocketAddr,
-
-	/// The treatment applied in each direction.
-	pub profile: Profile,
-
-	/// Also proxy TCP on the listen port, unimpaired, so HTTP on that port still answers.
-	pub tcp_passthrough: bool,
-}
-
-/// What the shaper did to one direction's datagrams.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct Counters {
-	/// Datagrams forwarded to the far side.
-	pub delivered: u64,
-
-	/// Datagrams discarded, by the loss draw or by a failed send.
-	pub dropped: u64,
-
-	/// Datagrams released later than they arrived.
-	pub delayed: u64,
-
-	/// Datagrams pushed back by the extra reorder delay.
-	pub reordered: u64,
-
-	/// Datagrams the token bucket pushed back.
-	pub rate_limited: u64,
-
-	/// Datagrams discarded because the token bucket's queue was already full.
-	pub queue_dropped: u64,
-
-	/// The most datagrams waiting for release at once.
-	pub queue_max: usize,
-}
-
-/// A run's profile, seed, and per-direction counters.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct Report {
-	/// The profile that was active.
-	pub profile: String,
-
-	/// The profile seed both directions derived their own from.
+	pub target: SocketAddr,
+	/// Seeds every treatment decision.
 	pub seed: u64,
+	/// The treatment from a client toward the target.
+	pub up: Profile,
+	/// The treatment from the target back toward a client.
+	pub down: Profile,
+}
 
-	/// Counters for datagrams travelling from the client to the upstream.
+/// What one direction did, summed over every client.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+	/// Datagrams received.
+	pub packets: u64,
+	/// Datagrams dropped by `loss`.
+	pub lost: u64,
+	/// Datagrams dropped because the rate limit's queue was full.
+	pub overflowed: u64,
+	/// Datagrams that waited for the rate limit.
+	pub throttled: u64,
+	/// Datagrams given a nonzero delay.
+	pub delayed: u64,
+	/// Datagrams sent ahead of the delay, overtaking any still in flight.
+	pub reordered: u64,
+}
+
+impl fmt::Display for Counters {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"{} packets, {} lost, {} overflowed, {} throttled, {} delayed, {} reordered",
+			self.packets, self.lost, self.overflowed, self.throttled, self.delayed, self.reordered
+		)
+	}
+}
+
+/// What both directions did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+	/// From clients toward the target.
 	pub up: Counters,
-
-	/// Counters for datagrams travelling back from the upstream to the client.
+	/// From the target back toward clients.
 	pub down: Counters,
 }
 
-/// An impaired UDP path in front of an upstream address.
+impl fmt::Display for Stats {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "up: {}; down: {}", self.up, self.down)
+	}
+}
+
+/// A running shaper. Dropping it stops forwarding.
 pub struct Shaper {
-	inner: Arc<Inner>,
-	tcp: Option<TcpListener>,
-	local: SocketAddr,
-	profile: String,
-	seed: u64,
+	addr: SocketAddr,
+	config: Config,
+	tally: Arc<[Tally; 2]>,
+	/// Why forwarding stopped, if it did.
+	failed: Arc<OnceLock<String>>,
+	task: tokio::task::JoinHandle<()>,
 }
 
 impl Shaper {
-	/// Bind the listen sockets, so a caller knows the port before anything is forwarded.
+	/// Bind the listening socket and start forwarding.
 	pub async fn bind(config: Config) -> anyhow::Result<Self> {
-		let socket = UdpSocket::bind(config.listen)
+		config.up.validate().context("invalid up profile")?;
+		config.down.validate().context("invalid down profile")?;
+
+		let listen = UdpSocket::bind(config.bind)
 			.await
-			.with_context(|| format!("failed to bind {}", config.listen))?;
-		let local = socket.local_addr()?;
+			.with_context(|| format!("bind {}", config.bind))?;
+		let addr = listen.local_addr()?;
 
-		// The relay serves HTTP on the same port number as QUIC, so the passthrough has
-		// to land on the port the UDP socket actually got.
-		let tcp = match config.tcp_passthrough {
-			true => Some(
-				TcpListener::bind(local)
-					.await
-					.with_context(|| format!("failed to bind the TCP passthrough on {local}"))?,
-			),
-			false => None,
-		};
-
-		let state = State::new(&config.profile, Instant::now());
+		let tally = Arc::new([Tally::default(), Tally::default()]);
+		let failed = Arc::new(OnceLock::new());
+		let task = tokio::spawn({
+			let config = config.clone();
+			let tally = tally.clone();
+			let failed = failed.clone();
+			async move {
+				if let Err(err) = run(Arc::new(listen), config, tally).await {
+					let _ = failed.set(format!("{err:#}"));
+				}
+			}
+		});
 
 		Ok(Self {
-			inner: Arc::new(Inner {
-				socket: Arc::new(socket),
-				upstream: config.upstream,
-				state: Mutex::new(state),
-				wake: Notify::new(),
-			}),
-			tcp,
-			local,
-			profile: config.profile.name,
-			seed: config.profile.seed,
+			addr,
+			config,
+			tally,
+			failed,
+			task,
 		})
 	}
 
-	/// The address actually bound, which is what to hand a client when the port was 0.
-	pub fn local_addr(&self) -> SocketAddr {
-		self.local
+	/// The address clients send to.
+	pub fn addr(&self) -> SocketAddr {
+		self.addr
 	}
 
-	/// A snapshot of what the shaper has done so far, readable while it runs.
-	pub fn report(&self) -> Report {
-		let state = self.inner.state.lock().unwrap();
-		Report {
-			profile: self.profile.clone(),
-			seed: self.seed,
-			up: state.lanes[Dir::Up.index()].counters,
-			down: state.lanes[Dir::Down.index()].counters,
+	/// The configuration this shaper runs, including its seed.
+	pub fn config(&self) -> &Config {
+		&self.config
+	}
+
+	/// What the shaper has done so far.
+	pub fn stats(&self) -> Stats {
+		Stats {
+			up: self.tally[UP].snapshot(),
+			down: self.tally[DOWN].snapshot(),
 		}
 	}
 
-	/// Forward traffic until a socket fails or the returned future is dropped.
-	pub async fn run(&self) -> anyhow::Result<()> {
-		// Both live here rather than in `Inner` so dropping `run` drops the join set,
-		// which aborts every per-client task. An `Inner` holding them would be a cycle.
-		let clients = Mutex::new(HashMap::new());
-		let tasks = Mutex::new(JoinSet::new());
-
-		tokio::select! {
-			res = self.deliver() => res,
-			res = self.forward(&clients, &tasks) => res,
-			res = self.expire(&clients) => res,
-			res = self.passthrough(&tasks) => res,
+	/// Fail unless the shaper is still forwarding and every impairment the
+	/// profile configures acted on some datagram, in either direction.
+	///
+	/// An impairment is only held to that once the traffic makes its silence
+	/// implausible: a short run can see no loss, but never no delay.
+	pub fn verify(&self) -> anyhow::Result<Stats> {
+		let stats = self.stats();
+		if let Some(err) = self.failed.get() {
+			anyhow::bail!("the shaper stopped forwarding: {err} ({stats})");
 		}
-	}
 
-	/// Read from the listen socket, treating each datagram as headed upstream.
-	async fn forward(
-		&self,
-		clients: &Mutex<HashMap<SocketAddr, Client>>,
-		tasks: &Mutex<JoinSet<()>>,
-	) -> anyhow::Result<()> {
-		let mut buf = vec![0u8; MAX_DATAGRAM];
-
-		loop {
-			let (size, from) = self
-				.inner
-				.socket
-				.recv_from(&mut buf)
-				.await
-				.context("listen socket failed")?;
-			let now = Instant::now();
-
-			let known = {
-				let mut clients = clients.lock().unwrap();
-				clients.get_mut(&from).map(|client| {
-					client.seen = now;
-					client.socket.clone()
-				})
-			};
-
-			// A 4-tuple the shaper has not seen gets its own upstream socket, so the
-			// upstream sees one flow per client and a migration just allocates another.
-			let socket = match known {
-				Some(socket) => socket,
-				None => {
-					let socket = Arc::new(self.connect().await?);
-					let task = tasks
-						.lock()
-						.unwrap()
-						.spawn(backward(self.inner.clone(), socket.clone(), from));
-					let client = Client {
-						socket: socket.clone(),
-						seen: now,
-						task,
-					};
-					clients.lock().unwrap().insert(from, client);
-					tracing::debug!(%from, "mapped a client");
-					socket
-				}
-			};
-
-			self.inner.accept(Dir::Up, buf[..size].to_vec(), socket, None, now);
-		}
-	}
-
-	/// Pop each datagram at its release time and send it on.
-	async fn deliver(&self) -> anyhow::Result<()> {
-		loop {
-			let wake = self.inner.state.lock().unwrap().wake();
-			match wake {
-				Some(at) => {
-					let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(at));
-					tokio::select! {
-						_ = sleep => {},
-						_ = self.inner.wake.notified() => {},
-					}
-				}
-				None => self.inner.wake.notified().await,
-			}
-
-			let due = self.inner.state.lock().unwrap().due(Instant::now());
-			if due.is_empty() {
-				continue;
-			}
-
-			let mut sent = [0u64; 2];
-			let mut failed = [0u64; 2];
-
-			for entry in due {
-				let res = match entry.to {
-					Some(to) => entry.socket.send_to(&entry.payload, to).await,
-					None => entry.socket.send(&entry.payload).await,
-				};
-
-				match res {
-					Ok(_) => sent[entry.dir.index()] += 1,
-					// The far side being gone is its problem, not a reason to stop shaping.
-					Err(err) => {
-						tracing::debug!(?err, "failed to forward a datagram");
-						failed[entry.dir.index()] += 1;
-					}
-				}
-			}
-
-			let mut state = self.inner.state.lock().unwrap();
-			for (lane, (sent, failed)) in state.lanes.iter_mut().zip(sent.into_iter().zip(failed)) {
-				lane.counters.delivered += sent;
-				lane.counters.dropped += failed;
-			}
-		}
-	}
-
-	/// Drop client mappings that have gone quiet, along with their sockets and tasks.
-	async fn expire(&self, clients: &Mutex<HashMap<SocketAddr, Client>>) -> anyhow::Result<()> {
-		let mut interval = tokio::time::interval(IDLE / 6);
-
-		loop {
-			interval.tick().await;
-			let now = Instant::now();
-
-			clients.lock().unwrap().retain(|from, client| {
-				if now.duration_since(client.seen) < IDLE {
-					return true;
-				}
-				tracing::debug!(%from, "expired an idle client");
-				client.task.abort();
-				false
-			});
-		}
-	}
-
-	/// Pump TCP straight through, unimpaired: see the README for why.
-	async fn passthrough(&self, tasks: &Mutex<JoinSet<()>>) -> anyhow::Result<()> {
-		let Some(listener) = &self.tcp else {
-			return std::future::pending().await;
-		};
-
-		loop {
-			let (client, _) = listener.accept().await.context("TCP passthrough failed")?;
-			let upstream = self.inner.upstream;
-			tasks.lock().unwrap().spawn(async move {
-				if let Err(err) = pump(client, upstream).await {
-					tracing::debug!(?err, "TCP passthrough connection failed");
-				}
-			});
-		}
-	}
-
-	/// One upstream socket per client, connected so only the upstream can reply on it.
-	async fn connect(&self) -> anyhow::Result<UdpSocket> {
-		let any = match self.inner.upstream.ip() {
-			IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-			IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-		};
-
-		let socket = UdpSocket::bind(any)
-			.await
-			.context("failed to bind an upstream socket")?;
-		socket
-			.connect(self.inner.upstream)
-			.await
-			.with_context(|| format!("failed to connect to {}", self.inner.upstream))?;
-
-		Ok(socket)
+		let missing = unapplied(&self.config, &stats);
+		anyhow::ensure!(
+			missing.is_empty(),
+			"the profile never applied {} ({stats}), so this run was not impaired as configured",
+			missing.join(", ")
+		);
+		Ok(stats)
 	}
 }
 
-/// The pieces a per-client task needs, so those tasks never borrow the shaper.
-struct Inner {
-	socket: Arc<UdpSocket>,
-	upstream: SocketAddr,
-	state: Mutex<State>,
-	wake: Notify,
-}
-
-impl Inner {
-	fn accept(&self, dir: Dir, payload: Vec<u8>, socket: Arc<UdpSocket>, to: Option<SocketAddr>, now: Instant) {
-		self.state.lock().unwrap().accept(dir, payload, socket, to, now);
-		self.wake.notify_one();
+impl Drop for Shaper {
+	fn drop(&mut self) {
+		self.task.abort();
 	}
 }
 
-/// One mapped client 4-tuple.
-struct Client {
-	socket: Arc<UdpSocket>,
-	seen: Instant,
-	task: tokio::task::AbortHandle,
+const UP: usize = 0;
+const DOWN: usize = 1;
+
+#[derive(Default)]
+struct Tally {
+	packets: AtomicU64,
+	lost: AtomicU64,
+	overflowed: AtomicU64,
+	throttled: AtomicU64,
+	delayed: AtomicU64,
+	reordered: AtomicU64,
 }
 
-/// Read the upstream's replies for one client and treat them as headed downstream.
-async fn backward(inner: Arc<Inner>, upstream: Arc<UdpSocket>, client: SocketAddr) {
-	let mut buf = vec![0u8; MAX_DATAGRAM];
+impl Tally {
+	fn snapshot(&self) -> Counters {
+		Counters {
+			packets: self.packets.load(Ordering::Relaxed),
+			lost: self.lost.load(Ordering::Relaxed),
+			overflowed: self.overflowed.load(Ordering::Relaxed),
+			throttled: self.throttled.load(Ordering::Relaxed),
+			delayed: self.delayed.load(Ordering::Relaxed),
+			reordered: self.reordered.load(Ordering::Relaxed),
+		}
+	}
+}
+
+fn bump(counter: &AtomicU64) {
+	counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Accept datagrams from clients, giving each client its own flow.
+///
+/// A flow is a socket of its own toward the target, so the target sees one
+/// address per client just as it would without the shaper in the way.
+async fn run(listen: Arc<UdpSocket>, config: Config, tally: Arc<[Tally; 2]>) -> anyhow::Result<()> {
+	let mut flows = HashMap::<SocketAddr, Link>::new();
+	let mut tasks = JoinSet::new();
+	let mut buf = vec![0u8; u16::MAX as usize];
 
 	loop {
-		let size = match upstream.recv(&mut buf).await {
-			Ok(size) => size,
-			// A connected UDP socket reports the upstream's ICMP rejections here. The
-			// relay may simply not be listening yet, so keep the mapping.
-			Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => continue,
-			Err(err) => {
-				tracing::debug!(?err, %client, "upstream socket failed");
-				return;
+		let (size, from) = tokio::select! {
+			res = listen.recv_from(&mut buf) => res.context("receive from a client")?,
+			Some(res) = tasks.join_next() => {
+				res.context("flow task panicked")??;
+				continue;
 			}
 		};
-
 		let now = Instant::now();
-		inner.accept(Dir::Down, buf[..size].to_vec(), inner.socket.clone(), Some(client), now);
+
+		let stream = 2 * flows.len() as u64;
+		let link = match flows.entry(from) {
+			hash_map::Entry::Occupied(entry) => entry.into_mut(),
+			hash_map::Entry::Vacant(entry) => {
+				let upstream = Arc::new(bind_toward(config.target).await?);
+
+				let (up_tx, up_rx) = mpsc::unbounded_channel();
+				tasks.spawn(deliver(up_rx, upstream.clone(), config.target));
+
+				let (down_tx, down_rx) = mpsc::unbounded_channel();
+				tasks.spawn(deliver(down_rx, listen.clone(), from));
+
+				let down = Link::new(&config.down, config.seed, stream + 1, now, down_tx);
+				tasks.spawn(reply(upstream, config.target, down, tally.clone()));
+
+				entry.insert(Link::new(&config.up, config.seed, stream, now, up_tx))
+			}
+		};
+		link.push(now, buf[..size].to_vec(), &tally[UP]);
 	}
 }
 
-/// Copy bytes both ways between one accepted connection and the upstream.
-async fn pump(mut client: TcpStream, upstream: SocketAddr) -> anyhow::Result<()> {
-	let mut server = TcpStream::connect(upstream).await?;
-	tokio::io::copy_bidirectional(&mut client, &mut server).await?;
-	Ok(())
+/// A socket that can reach `target`: loopback for a loopback target, so the
+/// shaper never opens a port beyond the host when it does not need to.
+async fn bind_toward(target: SocketAddr) -> anyhow::Result<UdpSocket> {
+	let ip = match (target.ip().is_loopback(), target.is_ipv4()) {
+		(true, true) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+		(true, false) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+		(false, true) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+		(false, false) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+	};
+	UdpSocket::bind(SocketAddr::new(ip, 0))
+		.await
+		.with_context(|| format!("bind a socket toward {target}"))
 }
 
-/// Which way a datagram is going.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Dir {
-	Up,
-	Down,
-}
-
-impl Dir {
-	fn index(self) -> usize {
-		self as usize
+/// Feed what the target sends a flow into that flow's return link.
+async fn reply(
+	socket: Arc<UdpSocket>,
+	target: SocketAddr,
+	mut link: Link,
+	tally: Arc<[Tally; 2]>,
+) -> anyhow::Result<()> {
+	let mut buf = vec![0u8; u16::MAX as usize];
+	loop {
+		let (size, from) = socket.recv_from(&mut buf).await.context("receive from the target")?;
+		// Anything else reaching this ephemeral port is not part of the path.
+		if from != target {
+			continue;
+		}
+		link.push(Instant::now(), buf[..size].to_vec(), &tally[DOWN]);
 	}
 }
 
-/// Everything the treatment and the delivery timer share.
-struct State {
-	/// Every datagram waiting for its release time, earliest first.
-	queue: BinaryHeap<Entry>,
+/// Send each treated datagram at its departure time.
+async fn deliver(
+	mut queue: mpsc::UnboundedReceiver<(Instant, Vec<u8>)>,
+	socket: Arc<UdpSocket>,
+	dest: SocketAddr,
+) -> anyhow::Result<()> {
+	// Ordered by departure, then by arrival, so ties keep their order.
+	let mut pending = BinaryHeap::<Reverse<(Instant, u64)>>::new();
+	let mut datagrams = HashMap::<u64, Vec<u8>>::new();
+	let mut sequence = 0u64;
 
-	/// Breaks ties in arrival order, so a reorder is only ever a deliberate act.
-	seq: u64,
-
-	/// When the run started, which is what a profile's step counts from.
-	start: Instant,
-
-	lanes: [Lane; 2],
+	loop {
+		let next = pending.peek().map(|Reverse((at, _))| *at);
+		tokio::select! {
+			item = queue.recv() => {
+				// The link is gone, so the flow is too.
+				let Some((at, datagram)) = item else { return Ok(()) };
+				pending.push(Reverse((at, sequence)));
+				datagrams.insert(sequence, datagram);
+				sequence += 1;
+			}
+			_ = tokio::time::sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {
+				let now = Instant::now();
+				while let Some(&Reverse((at, id))) = pending.peek() {
+					if at > now {
+						break;
+					}
+					pending.pop();
+					let datagram = datagrams.remove(&id).expect("queued datagram");
+					// A send error is the path losing the datagram, the way a
+					// network does when the far end is gone (a killed relay, say),
+					// so it is not the shaper failing.
+					let _ = socket.send_to(&datagram, dest).await;
+				}
+			}
+		}
+	}
 }
 
-impl State {
-	fn new(profile: &Profile, start: Instant) -> Self {
+/// One direction of one flow: the decisions and the state they depend on.
+struct Link {
+	profile: Profile,
+	rng: Xoshiro256PlusPlus,
+	/// When the token bucket would be full again, as in GCRA.
+	full_at: Instant,
+	queue: mpsc::UnboundedSender<(Instant, Vec<u8>)>,
+}
+
+impl Link {
+	/// Each direction of each flow draws from its own stream of the one seed,
+	/// so a flow's decisions do not depend on how its datagrams interleave with
+	/// anyone else's. Flows are numbered in the order they first send, since a
+	/// client's ephemeral port is no identity across runs.
+	fn new(
+		profile: &Profile,
+		seed: u64,
+		stream: u64,
+		now: Instant,
+		queue: mpsc::UnboundedSender<(Instant, Vec<u8>)>,
+	) -> Self {
 		Self {
-			queue: BinaryHeap::new(),
-			seq: 0,
-			start,
-			// One seed per direction, or the two lanes draw the same sequence and a symmetric
-			// profile loses and reorders the same datagrams both ways. SmallRng runs the seed
-			// through SplitMix64, so adjacent values start it well apart and the run still
-			// replays from the profile's one seed.
-			lanes: [
-				Lane::new(profile.up.clone(), profile.seed, start),
-				Lane::new(profile.down.clone(), profile.seed.wrapping_add(1), start),
-			],
+			profile: profile.clone(),
+			rng: Xoshiro256PlusPlus::seed_from_u64(seed ^ stream.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+			// Not the moment the link is built, which is after `now`: that would
+			// make the first datagram queue behind a bucket still refilling.
+			full_at: now,
+			queue,
 		}
 	}
 
-	/// Treat one datagram and queue it for release.
-	fn accept(&mut self, dir: Dir, payload: Vec<u8>, socket: Arc<UdpSocket>, to: Option<SocketAddr>, now: Instant) {
-		let start = self.start;
-		let lane = &mut self.lanes[dir.index()];
-		lane.step(start, now);
+	fn push(&mut self, now: Instant, datagram: Vec<u8>, tally: &Tally) {
+		bump(&tally.packets);
 
-		// The treatment in force, copied out field by field so the lane stays free to count
-		// while it is read. Every one of these is `Copy`; the schedule behind them is not.
-		let Direction {
-			delay,
-			jitter,
-			burst,
-			loss: loss_rate,
-			reorder: reorder_rate,
-			reorder_delay,
-			rate,
-			..
-		} = lane.shape;
+		// Every draw happens for every datagram, whatever the profile, so one
+		// knob's outcome never shifts the stream another knob draws from.
+		let lose = self.rng.random::<f64>() < self.profile.loss;
+		let skip = self.rng.random::<f64>() < self.profile.reorder;
+		let spread = self.rng.random::<f64>() * 2.0 - 1.0;
 
-		// Fixed draw order, every datagram, whether or not the knob is on: that is what
-		// makes a seed replay the same decisions.
-		let loss: f64 = lane.rng.random();
-		let spread = gaussian(&mut lane.rng);
-		let reorder: f64 = lane.rng.random();
-
-		if loss < loss_rate {
-			lane.counters.dropped += 1;
+		if lose {
+			bump(&tally.lost);
 			return;
 		}
 
-		let wait = delay.as_secs_f64() + jitter.as_secs_f64() * spread;
-		let mut release = now + Duration::from_secs_f64(wait.max(0.0));
-
-		if let Some(rate) = rate {
-			lane.refill(now);
-			let owed = payload.len() as f64 - lane.tokens;
-
-			// Debt is the backlog: bytes already promised that the rate has yet to earn. A
-			// link with a finite queue tail-drops rather than growing that backlog forever,
-			// so a datagram that would not fit is discarded here and counted apart from the
-			// loss draw.
-			if let Some(queue_bytes) = rate.queue_bytes
-				&& owed > queue_bytes as f64
-			{
-				lane.counters.queue_dropped += 1;
+		let mut depart = now;
+		if let Some(rate) = &self.profile.rate {
+			// GCRA: a datagram may leave once the backlog, itself included, is
+			// within the burst allowance.
+			let full_at = self.full_at.max(now) + rate.cost(datagram.len() as u64);
+			let start = full_at
+				.checked_sub(rate.cost(rate.burst))
+				.map_or(now, |start| start.max(now));
+			if start - now > rate.queue {
+				bump(&tally.overflowed);
 				return;
 			}
-
-			lane.tokens -= payload.len() as f64;
-
-			// Debt is also how long the bucket has to refill before this datagram may leave.
-			if lane.tokens < 0.0 {
-				release = release.max(now + Duration::from_secs_f64(owed / rate.bytes_per_second as f64));
-				lane.counters.rate_limited += 1;
+			if start > now {
+				bump(&tally.throttled);
 			}
+			self.full_at = full_at;
+			depart = start;
 		}
 
-		// The lane is a queue, so a datagram leaves no earlier than the one in front of it:
-		// jitter varies the spacing, never the order. The front advances by this datagram's
-		// own release, before any reorder delay, so the datagram it is meant to fall behind
-		// is not dragged along with it.
-		release = release.max(lane.last_release);
-		lane.last_release = release;
-
-		if reorder < reorder_rate {
-			release += reorder_delay;
-			lane.counters.reordered += 1;
+		if skip {
+			bump(&tally.reordered);
+		} else if !self.profile.delay.is_zero() {
+			let jitter = self.profile.jitter.as_secs_f64() * spread;
+			depart += Duration::from_secs_f64(self.profile.delay.as_secs_f64() + jitter);
+			bump(&tally.delayed);
 		}
 
-		self.seq += 1;
-		let entry = Entry {
-			at: release,
-			arrived: now,
-			seq: self.seq,
-			dir,
-			socket,
-			to,
-			payload,
-		};
-
-		lane.queued += 1;
-		lane.counters.queue_max = lane.counters.queue_max.max(lane.queued);
-
-		match burst {
-			Some(burst) => {
-				if lane.held.is_empty() {
-					lane.deadline = Some(now + burst.window);
-				}
-				lane.held.push(entry);
-				if lane.held.len() >= burst.count {
-					lane.flush(&mut self.queue);
-				}
-			}
-			None => {
-				if release > now {
-					lane.counters.delayed += 1;
-				}
-				self.queue.push(entry);
-			}
-		}
+		// The delivery task only ends once this link is dropped.
+		let _ = self.queue.send((depart, datagram));
 	}
-
-	/// When the delivery timer next has something to do.
-	fn wake(&self) -> Option<Instant> {
-		let held = self.lanes.iter().filter_map(|lane| lane.deadline);
-		self.queue.peek().map(|entry| entry.at).into_iter().chain(held).min()
-	}
-
-	/// Every datagram whose release time has come, earliest first.
-	fn due(&mut self, now: Instant) -> Vec<Entry> {
-		for lane in &mut self.lanes {
-			if lane.deadline.is_some_and(|deadline| deadline <= now) {
-				lane.flush(&mut self.queue);
-			}
-		}
-
-		let mut due = Vec::new();
-		while self.queue.peek().is_some_and(|entry| entry.at <= now) {
-			let entry = self.queue.pop().expect("peeked");
-			self.lanes[entry.dir.index()].queued -= 1;
-			due.push(entry);
-		}
-
-		due
-	}
-}
-
-/// One direction's generator, token bucket, held batch, and counters.
-struct Lane {
-	/// The treatment in force, which each step revises part-way through the run.
-	shape: Direction,
-
-	/// The steps still pending, latest first, so the next one due is the last element.
-	steps: Vec<Step>,
-
-	rng: SmallRng,
-
-	/// Bytes the token bucket has available, negative while it owes.
-	tokens: f64,
-	refilled: Instant,
-
-	/// When the datagram in front of the queue leaves, which is the floor for the next one.
-	last_release: Instant,
-
-	/// The batch a burst profile is filling, and when it gives up waiting.
-	held: Vec<Entry>,
-	deadline: Option<Instant>,
-
-	/// Datagrams held or queued right now, which is what `queue_max` peaks at.
-	queued: usize,
-
-	counters: Counters,
-}
-
-impl Lane {
-	fn new(shape: Direction, seed: u64, start: Instant) -> Self {
-		let mut steps = shape.steps.clone();
-		steps.reverse();
-
-		Self {
-			steps,
-			tokens: shape.rate.map_or(0.0, |rate| rate.burst_bytes as f64),
-			shape,
-			rng: SmallRng::seed_from_u64(seed),
-			refilled: start,
-			last_release: start,
-			held: Vec::new(),
-			deadline: None,
-			queued: 0,
-			counters: Counters::default(),
-		}
-	}
-
-	/// Apply every step the run has reached, in order, each revising what it names.
-	fn step(&mut self, start: Instant, now: Instant) {
-		let elapsed = now.duration_since(start);
-
-		while self.steps.last().is_some_and(|step| step.at <= elapsed) {
-			let step = self.steps.pop().expect("peeked");
-
-			// Settle the bucket at the old rate before the new one takes over, or the time
-			// either side of the step refills at whichever rate happened to arrive last.
-			self.refill(now);
-
-			if let Some(delay) = step.delay {
-				self.shape.delay = delay;
-			}
-			if let Some(jitter) = step.jitter {
-				self.shape.jitter = jitter;
-			}
-			if let Some(loss) = step.loss {
-				self.shape.loss = loss;
-			}
-			if let Some(rate) = step.rate {
-				// A cap that was not there starts full, the way the run started. One that
-				// was keeps its credit, clipped to the new bucket.
-				self.tokens = match self.shape.rate {
-					Some(_) => self.tokens.min(rate.burst_bytes as f64),
-					None => rate.burst_bytes as f64,
-				};
-				self.shape.rate = Some(rate);
-			}
-		}
-	}
-
-	/// Credit the bucket for the time since it was last touched.
-	fn refill(&mut self, now: Instant) {
-		if let Some(rate) = self.shape.rate {
-			let refill = now.duration_since(self.refilled).as_secs_f64() * rate.bytes_per_second as f64;
-			self.tokens = (self.tokens + refill).min(rate.burst_bytes as f64);
-		}
-
-		self.refilled = now;
-	}
-
-	/// Release the held batch, every datagram at the same instant.
-	fn flush(&mut self, queue: &mut BinaryHeap<Entry>) {
-		self.deadline = None;
-
-		// The batch leaves no earlier than its latest member would have on its own.
-		let Some(at) = self.held.iter().map(|entry| entry.at).max() else {
-			return;
-		};
-
-		for mut entry in self.held.drain(..) {
-			if at > entry.arrived {
-				self.counters.delayed += 1;
-			}
-			entry.at = at;
-			queue.push(entry);
-		}
-	}
-}
-
-/// One datagram waiting for its release time.
-struct Entry {
-	at: Instant,
-	arrived: Instant,
-	seq: u64,
-	dir: Dir,
-	socket: Arc<UdpSocket>,
-	/// The destination, or `None` when the socket is already connected to it.
-	to: Option<SocketAddr>,
-	payload: Vec<u8>,
-}
-
-// `BinaryHeap` is a max-heap, so the ordering is reversed: earliest release first, and
-// arrival order within the same instant.
-impl Ord for Entry {
-	fn cmp(&self, other: &Self) -> Ordering {
-		other.at.cmp(&self.at).then_with(|| other.seq.cmp(&self.seq))
-	}
-}
-
-impl PartialOrd for Entry {
-	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-		Some(self.cmp(other))
-	}
-}
-
-impl PartialEq for Entry {
-	fn eq(&self, other: &Self) -> bool {
-		self.seq == other.seq
-	}
-}
-
-impl Eq for Entry {}
-
-/// A standard normal sample, Box-Muller, so the two draws per datagram are fixed.
-fn gaussian(rng: &mut SmallRng) -> f64 {
-	let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
-	let u2: f64 = rng.random();
-	(-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	/// A socket the queued entries can carry. These tests never send, so one is enough.
-	async fn socket() -> Arc<UdpSocket> {
-		Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())
-	}
+	const LOCALHOST: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
-	fn profile(up: Direction) -> Profile {
-		Profile {
-			name: "test".to_string(),
-			seed: 7,
+	/// An echo server, a shaper in front of it, and a client dialing the shaper.
+	async fn setup(seed: u64, up: Profile, down: Profile) -> (Shaper, UdpSocket) {
+		let echo = UdpSocket::bind(LOCALHOST).await.unwrap();
+		let target = echo.local_addr().unwrap();
+		tokio::spawn(async move {
+			let mut buf = vec![0u8; u16::MAX as usize];
+			loop {
+				let (size, from) = echo.recv_from(&mut buf).await.unwrap();
+				echo.send_to(&buf[..size], from).await.unwrap();
+			}
+		});
+
+		let shaper = Shaper::bind(Config {
+			bind: LOCALHOST,
+			target,
+			seed,
 			up,
-			down: Direction::default(),
-		}
+			down,
+		})
+		.await
+		.unwrap();
+
+		let client = UdpSocket::bind(LOCALHOST).await.unwrap();
+		client.connect(shaper.addr()).await.unwrap();
+		(shaper, client)
 	}
 
-	/// Feed `count` numbered datagrams `spacing` apart, the way a live stream arrives.
-	fn stream(state: &mut State, socket: &Arc<UdpSocket>, now: Instant, count: u32, spacing: Duration) {
-		for id in 0..count {
-			let at = now + spacing * id;
-			state.accept(Dir::Up, id.to_be_bytes().to_vec(), socket.clone(), None, at);
+	/// Send `count` numbered datagrams, then collect whatever echoes back.
+	async fn round_trip(client: &UdpSocket, count: u32) -> Vec<u32> {
+		for i in 0..count {
+			client.send(&i.to_be_bytes()).await.unwrap();
 		}
-	}
-
-	/// What the delivery loop would send by `until`, in the order it would send it.
-	fn delivered(state: &mut State, until: Instant) -> Vec<(u32, Instant)> {
-		state
-			.due(until)
-			.into_iter()
-			.map(|entry| {
-				let id = u32::from_be_bytes(entry.payload[..4].try_into().unwrap());
-				(id, entry.at)
-			})
-			.collect()
+		let mut got = Vec::new();
+		let mut buf = [0u8; 4];
+		while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(200), client.recv(&mut buf)).await {
+			got.push(u32::from_be_bytes(buf));
+		}
+		got
 	}
 
 	#[tokio::test]
-	async fn an_untreated_datagram_is_due_immediately() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let mut state = State::new(&profile(Direction::default()), now);
-		state.accept(Dir::Up, vec![0; 16], socket, None, now);
+	async fn forwards_both_ways_untouched() {
+		let (shaper, client) = setup(1, Profile::default(), Profile::default()).await;
+		let got = round_trip(&client, 50).await;
+		assert_eq!(got, (0..50).collect::<Vec<_>>());
 
-		assert_eq!(state.due(now).len(), 1);
-		assert_eq!(state.lanes[0].counters.delayed, 0);
-		assert_eq!(state.lanes[0].counters.queue_max, 1);
+		let stats = shaper.verify().expect("an empty profile has nothing to apply");
+		assert_eq!(stats.up.packets, 50);
+		assert_eq!(stats.down.packets, 50);
 	}
 
 	#[tokio::test]
-	async fn a_delayed_datagram_waits_for_its_release() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
+	async fn the_seed_reproduces_the_losses() {
+		let lossy = Profile {
+			loss: 0.3,
+			..Default::default()
+		};
+
+		let (first, client) = setup(7, lossy.clone(), Profile::default()).await;
+		let first_got = round_trip(&client, 200).await;
+		let (second, client) = setup(7, lossy.clone(), Profile::default()).await;
+		let second_got = round_trip(&client, 200).await;
+		let (_other, client) = setup(8, lossy, Profile::default()).await;
+		let other_got = round_trip(&client, 200).await;
+
+		assert_eq!(first_got, second_got, "the same seed dropped different datagrams");
+		assert_ne!(first_got, other_got, "a different seed dropped the same datagrams");
+		assert_eq!(first.verify().unwrap(), second.verify().unwrap());
+		assert_eq!(first_got.len() as u64, 200 - first.stats().up.lost);
+	}
+
+	#[tokio::test]
+	async fn reorder_and_jitter_overtake() {
+		let shuffled = Profile {
 			delay: Duration::from_millis(20),
+			jitter: Duration::from_millis(10),
+			reorder: 0.2,
 			..Default::default()
 		};
-		let mut state = State::new(&profile(shape), now);
-		state.accept(Dir::Up, vec![0; 16], socket, None, now);
+		let (shaper, client) = setup(3, shuffled, Profile::default()).await;
+		let got = round_trip(&client, 100).await;
 
-		assert!(state.due(now).is_empty());
-		assert_eq!(state.due(now + Duration::from_millis(20)).len(), 1);
-		assert_eq!(state.lanes[0].counters.delayed, 1);
+		let mut sorted = got.clone();
+		sorted.sort();
+		assert_eq!(sorted, (0..100).collect::<Vec<_>>(), "reordering lost datagrams");
+		assert_ne!(got, sorted, "nothing arrived out of order");
+
+		let stats = shaper.verify().unwrap();
+		assert!(stats.up.reordered > 0, "{stats}");
 	}
 
 	#[tokio::test]
-	async fn jitter_never_delivers_a_datagram_before_it_arrived() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			jitter: Duration::from_millis(50),
-			..Default::default()
-		};
-		let mut state = State::new(&profile(shape), now);
-
-		for _ in 0..1000 {
-			state.accept(Dir::Up, vec![0; 16], socket.clone(), None, now);
-		}
-
-		// A negative total would panic in `Duration::from_secs_f64`, so reaching here at
-		// all is half the assertion; the rest is that nothing leaves before it arrived.
-		for entry in state.queue.iter() {
-			assert!(entry.at >= entry.arrived);
-		}
-	}
-
-	#[tokio::test]
-	async fn jitter_alone_never_changes_the_order() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			delay: Duration::from_millis(5),
-			jitter: Duration::from_millis(50),
-			..Default::default()
-		};
-		let mut state = State::new(&profile(shape), now);
-
-		// Ten times the sigma of arrivals, so an independent draw per datagram would shuffle
-		// nearly all of them. QUIC reads that as loss, retransmits, and the profile stops
-		// measuring what it claims to.
-		stream(&mut state, &socket, now, 2000, Duration::from_millis(5));
-
-		let ids: Vec<u32> = delivered(&mut state, now + Duration::from_secs(60))
-			.into_iter()
-			.map(|(id, _)| id)
-			.collect();
-
-		assert_eq!(ids.len(), 2000);
-		assert!(ids.is_sorted(), "jitter delivered datagrams out of order");
-		assert_eq!(state.lanes[0].counters.reordered, 0, "nothing asked for a reorder");
-	}
-
-	#[tokio::test]
-	async fn the_reorder_draw_is_the_only_thing_that_overtakes() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			delay: Duration::from_millis(5),
-			jitter: Duration::from_millis(50),
-			reorder: 0.05,
-			reorder_delay: Duration::from_millis(40),
-			..Default::default()
-		};
-		let mut state = State::new(&profile(shape), now);
-
-		stream(&mut state, &socket, now, 2000, Duration::from_millis(5));
-
-		let ids: Vec<u32> = delivered(&mut state, now + Duration::from_secs(60))
-			.into_iter()
-			.map(|(id, _)| id)
-			.collect();
-
-		let overtaken = ids.windows(2).filter(|pair| pair[0] > pair[1]).count();
-		assert!(overtaken > 0, "the reorder draw delivered everything in order anyway");
-		assert!(state.lanes[0].counters.reordered > 0, "the reorder draw never fired");
-	}
-
-	#[tokio::test]
-	async fn fifo_jitter_still_varies_the_spacing() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let spacing = Duration::from_millis(20);
-		let shape = Direction {
-			delay: Duration::from_millis(5),
-			jitter: Duration::from_millis(5),
-			..Default::default()
-		};
-		let mut state = State::new(&profile(shape), now);
-
-		stream(&mut state, &socket, now, 2000, spacing);
-
-		let gaps: Vec<f64> = delivered(&mut state, now + Duration::from_secs(60))
-			.windows(2)
-			.map(|pair| pair[1].1.duration_since(pair[0].1).as_secs_f64())
-			.collect();
-
-		// Keeping the order is not the same as pacing the lane: a datagram that drew a
-		// larger delay than the one in front still falls further behind it, and one that
-		// drew a smaller delay closes up against it.
-		let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
-		let stddev = (gaps.iter().map(|gap| (gap - mean).powi(2)).sum::<f64>() / gaps.len() as f64).sqrt();
-		assert!(stddev > 0.0, "every datagram arrived exactly {mean}s after the last");
-
-		let spacing = spacing.as_secs_f64();
-		assert!(gaps.iter().any(|&gap| gap < spacing), "nothing closed up");
-		assert!(gaps.iter().any(|&gap| gap > spacing), "nothing fell behind");
-	}
-
-	#[tokio::test]
-	async fn each_delay_step_applies_at_its_own_time() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			delay: Duration::from_millis(5),
-			steps: vec![
-				Step {
-					at: Duration::from_millis(100),
-					delay: Some(Duration::from_millis(60)),
-					..Default::default()
-				},
-				Step {
-					at: Duration::from_millis(200),
-					delay: Some(Duration::from_millis(5)),
-					..Default::default()
-				},
-			],
-			..Default::default()
-		};
-		let mut state = State::new(&profile(shape), now);
-
-		// One datagram per stretch, each drained before the next, so the release time read
-		// off the queue is that datagram's own and not the one in front of it.
-		let release = |state: &mut State, at: Instant| {
-			state.accept(Dir::Up, vec![0; 16], socket.clone(), None, at);
-			let leaves = state.queue.peek().expect("queued").at;
-			state.due(leaves);
-			leaves
-		};
-
-		assert_eq!(release(&mut state, now), now + Duration::from_millis(5));
-
-		let during = now + Duration::from_millis(100);
-		assert_eq!(release(&mut state, during), during + Duration::from_millis(60));
-
-		// The step back restores the treatment the run opened with.
-		let after = now + Duration::from_millis(200);
-		assert_eq!(release(&mut state, after), after + Duration::from_millis(5));
-	}
-
-	#[tokio::test]
-	async fn a_loss_step_turns_the_loss_draw_on_and_off_again() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			steps: vec![
-				Step {
-					at: Duration::from_secs(30),
-					loss: Some(1.0),
-					..Default::default()
-				},
-				Step {
-					at: Duration::from_secs(60),
-					loss: Some(0.0),
-					..Default::default()
-				},
-			],
-			..Default::default()
-		};
-		let mut state = State::new(&profile(shape), now);
-
-		let stretch = |state: &mut State, at: Instant| {
-			let before = state.lanes[0].counters.dropped;
-			for _ in 0..100 {
-				state.accept(Dir::Up, vec![0; 16], socket.clone(), None, at);
-			}
-			state.due(at);
-			state.lanes[0].counters.dropped - before
-		};
-
-		assert_eq!(stretch(&mut state, now), 0, "the profile opens clean");
-		assert_eq!(
-			stretch(&mut state, now + Duration::from_secs(30)),
-			100,
-			"the step lost nothing"
-		);
-		assert_eq!(
-			stretch(&mut state, now + Duration::from_secs(60)),
-			0,
-			"the step back never cleared"
-		);
-	}
-
-	#[tokio::test]
-	async fn a_rate_step_narrows_the_bucket_and_widens_it_again() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let wide = ByteRate {
-			bytes_per_second: 4000,
-			burst_bytes: 100,
-			queue_bytes: None,
-		};
-		let narrow = ByteRate {
-			bytes_per_second: 1000,
-			burst_bytes: 100,
-			queue_bytes: None,
-		};
-		let shape = Direction {
-			rate: Some(wide),
-			steps: vec![
-				Step {
-					at: Duration::from_secs(30),
-					rate: Some(narrow),
-					..Default::default()
-				},
-				Step {
-					at: Duration::from_secs(60),
-					rate: Some(wide),
-					..Default::default()
-				},
-			],
-			..Default::default()
-		};
-		let mut state = State::new(&profile(shape), now);
-
-		// The bucket is full at each stretch, so the first 100 bytes are free and the next
-		// 100 owe exactly one bucket's worth of refill at whichever rate is in force.
-		let owed = |state: &mut State, at: Instant| {
-			state.accept(Dir::Up, vec![0; 100], socket.clone(), None, at);
-			state.accept(Dir::Up, vec![0; 100], socket.clone(), None, at);
-			let release = state.queue.iter().map(|entry| entry.at).max().expect("queued");
-			state.due(release);
-			release.duration_since(at)
-		};
-
-		assert_eq!(owed(&mut state, now), Duration::from_millis(25));
-		assert_eq!(
-			owed(&mut state, now + Duration::from_secs(30)),
-			Duration::from_millis(100)
-		);
-		assert_eq!(
-			owed(&mut state, now + Duration::from_secs(60)),
-			Duration::from_millis(25)
-		);
-	}
-
-	#[tokio::test]
-	async fn the_queue_cap_drops_what_will_not_fit_and_counts_it() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			rate: Some(ByteRate {
-				bytes_per_second: 1000,
-				burst_bytes: 100,
-				queue_bytes: Some(200),
+	async fn the_rate_limit_queues_then_drops() {
+		// 100 datagrams of 4 bytes is 3200 bits: at 8 kbit/s they need 400ms,
+		// and the queue only holds 100ms of it.
+		let narrow = Profile {
+			rate: Some(Rate {
+				bits_per_second: 8_000,
+				burst: 8,
+				queue: Duration::from_millis(100),
 			}),
 			..Default::default()
 		};
-		let mut state = State::new(&profile(shape), now);
+		let (shaper, client) = setup(5, Profile::default(), narrow).await;
+		let got = round_trip(&client, 100).await;
 
-		// The first 100 bytes are free, the next 200 fill the queue, and everything after
-		// that is tail-dropped until the bucket refills.
-		for _ in 0..8 {
-			state.accept(Dir::Up, vec![0; 100], socket.clone(), None, now);
-		}
-
-		let counters = state.lanes[0].counters;
-		assert_eq!(counters.queue_dropped, 5, "the queue cap held the wrong backlog");
-		assert_eq!(counters.rate_limited, 2, "only the queued datagrams owe the bucket");
-		assert_eq!(counters.dropped, 0, "a tail drop is not a loss draw");
-		assert_eq!(state.due(now + Duration::from_secs(1)).len(), 3);
-
-		// A queue that has drained takes datagrams again, so the cap sheds a burst rather
-		// than blackholing the lane.
-		let later = now + Duration::from_secs(1);
-		state.accept(Dir::Up, vec![0; 100], socket, None, later);
-		assert_eq!(state.lanes[0].counters.queue_dropped, 5);
-		assert_eq!(state.due(later).len(), 1);
+		let stats = shaper.verify().unwrap();
+		assert!(stats.down.throttled > 0, "{stats}");
+		assert!(stats.down.overflowed > 0, "{stats}");
+		assert_eq!(got.len() as u64, 100 - stats.down.overflowed);
+		// Queued, never reordered: the bottleneck is first in, first out.
+		assert!(got.windows(2).all(|pair| pair[0] < pair[1]), "{got:?}");
 	}
 
 	#[tokio::test]
-	async fn a_rate_without_a_queue_cap_never_drops() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			rate: Some(ByteRate {
-				bytes_per_second: 1000,
-				burst_bytes: 100,
-				queue_bytes: None,
+	async fn a_rate_limit_wider_than_the_traffic_passes_everything() {
+		let wide = Profile {
+			rate: Some(Rate {
+				bits_per_second: 1_000_000_000_000,
+				burst: 1 << 20,
+				queue: Duration::ZERO,
 			}),
 			..Default::default()
 		};
-		let mut state = State::new(&profile(shape), now);
+		let (shaper, client) = setup(9, wide.clone(), wide).await;
+		let got = round_trip(&client, 10).await;
 
-		for _ in 0..8 {
-			state.accept(Dir::Up, vec![0; 100], socket.clone(), None, now);
-		}
-
-		let counters = state.lanes[0].counters;
-		assert_eq!(counters.queue_dropped, 0, "an uncapped queue tail-dropped");
-		assert_eq!(counters.dropped, 0);
-		assert_eq!(
-			counters.rate_limited, 7,
-			"every datagram past the burst owes the bucket"
-		);
-		assert_eq!(
-			state.due(now + Duration::from_secs(1)).len(),
-			8,
-			"the lane held nothing back"
-		);
+		assert_eq!(got, (0..10).collect::<Vec<_>>());
+		assert_eq!(shaper.verify().unwrap().up.overflowed, 0);
 	}
 
 	#[tokio::test]
-	async fn a_burst_batch_releases_on_count_and_on_the_window() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			burst: Some(Burst {
-				count: 3,
-				window: Duration::from_millis(160),
+	async fn the_burst_counts_the_datagram_itself() {
+		// A burst of one datagram lets the first out at once and holds the second.
+		let one = Profile {
+			rate: Some(Rate {
+				bits_per_second: 8_000,
+				burst: 4,
+				queue: Duration::from_secs(1),
 			}),
 			..Default::default()
 		};
-		let mut state = State::new(&profile(shape), now);
+		let (shaper, client) = setup(11, one, Profile::default()).await;
+		let got = round_trip(&client, 2).await;
 
-		state.accept(Dir::Up, vec![0; 16], socket.clone(), None, now);
-		state.accept(Dir::Up, vec![0; 16], socket.clone(), None, now);
-		assert!(state.due(now).is_empty(), "a partial batch must not leak");
-
-		state.accept(Dir::Up, vec![0; 16], socket.clone(), None, now);
-		assert_eq!(state.due(now).len(), 3, "a full batch leaves together");
-
-		// The window closes a batch that never fills.
-		state.accept(Dir::Up, vec![0; 16], socket, None, now);
-		assert!(state.due(now + Duration::from_millis(159)).is_empty());
-		assert_eq!(state.due(now + Duration::from_millis(160)).len(), 1);
-		assert_eq!(state.lanes[0].counters.queue_max, 3);
+		assert_eq!(got, [0, 1]);
+		assert_eq!(shaper.stats().up.throttled, 1);
 	}
 
-	#[tokio::test]
-	async fn the_token_bucket_spaces_datagrams_past_its_burst() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			rate: Some(ByteRate {
-				bytes_per_second: 1000,
-				burst_bytes: 100,
-				queue_bytes: None,
-			}),
-			..Default::default()
+	#[test]
+	fn silence_is_only_a_failure_once_it_is_implausible() {
+		let config = Config {
+			bind: LOCALHOST,
+			target: LOCALHOST,
+			seed: 0,
+			up: Profile {
+				loss: 0.05,
+				..Default::default()
+			},
+			down: Profile::default(),
 		};
-		let mut state = State::new(&profile(shape), now);
+		let quiet = |packets| Stats {
+			up: Counters {
+				packets,
+				..Default::default()
+			},
+			down: Counters {
+				packets,
+				..Default::default()
+			},
+		};
 
-		// The first 100 bytes are free; the next 100 owe exactly 100ms of refill.
-		state.accept(Dir::Up, vec![0; 100], socket.clone(), None, now);
-		state.accept(Dir::Up, vec![0; 100], socket, None, now);
+		// 0.95^20 is about a third: a short run seeing no loss proves nothing.
+		assert!(unapplied(&config, &quiet(20)).is_empty());
+		// 0.95^1000 is about 5e-23: the loss is not in the path.
+		assert_eq!(unapplied(&config, &quiet(1000)), ["loss"]);
 
-		assert_eq!(state.due(now).len(), 1);
-		assert_eq!(state.lanes[0].counters.rate_limited, 1);
-		assert!(state.due(now + Duration::from_millis(99)).is_empty());
-		assert_eq!(state.due(now + Duration::from_millis(100)).len(), 1);
+		let mut lossy = quiet(1000);
+		lossy.up.lost = 1;
+		assert!(unapplied(&config, &lossy).is_empty());
+
+		// A delay acts on every datagram, so even one undelayed datagram is a
+		// shaper that is not in the path.
+		let config = Config {
+			down: Profile {
+				delay: Duration::from_millis(10),
+				..Default::default()
+			},
+			..config
+		};
+		assert_eq!(unapplied(&config, &quiet(1)), ["delay"]);
 	}
 
 	#[tokio::test]
-	async fn the_same_seed_makes_the_same_decisions() {
-		let socket = socket().await;
-		let shape = Direction {
+	async fn an_invalid_profile_is_refused() {
+		let refused = |bad: Profile, why: &'static str| async move {
+			let err = Shaper::bind(Config {
+				bind: LOCALHOST,
+				target: LOCALHOST,
+				seed: 0,
+				up: bad,
+				down: Profile::default(),
+			})
+			.await
+			.err()
+			.unwrap_or_else(|| panic!("accepted a profile where {why}"));
+			assert!(format!("{err:#}").contains(why), "{err:#}");
+		};
+
+		let jittery = Profile {
 			delay: Duration::from_millis(5),
-			jitter: Duration::from_millis(5),
-			loss: 0.05,
-			reorder: 0.05,
-			reorder_delay: Duration::from_millis(20),
+			jitter: Duration::from_millis(10),
 			..Default::default()
 		};
+		refused(jittery, "exceeds delay").await;
 
-		let decisions = |now| {
-			let mut state = State::new(&profile(shape.clone()), now);
-			for i in 0..1000u32 {
-				state.accept(Dir::Up, i.to_be_bytes().to_vec(), socket.clone(), None, now);
-			}
-			let queued: Vec<_> = state.queue.iter().map(|entry| (entry.seq, entry.at)).collect();
-			(state.lanes[0].counters, queued)
-		};
-
-		let now = Instant::now();
-		let (first, first_queue) = decisions(now);
-		let (second, second_queue) = decisions(now);
-
-		assert_eq!(first, second);
-		assert_eq!(first_queue, second_queue);
-		assert!(first.dropped > 0 && first.reordered > 0);
-	}
-
-	#[tokio::test]
-	async fn each_direction_draws_its_own_sequence() {
-		let socket = socket().await;
-		let now = Instant::now();
-		let shape = Direction {
-			loss: 0.5,
+		// With nothing in flight to overtake, a reorder would count without acting.
+		let undelayed = Profile {
+			reorder: 0.1,
 			..Default::default()
 		};
-		let profile = Profile {
-			name: "test".to_string(),
-			seed: 7,
-			up: shape.clone(),
-			down: shape,
-		};
-		let mut state = State::new(&profile, now);
-
-		// The same datagrams both ways through the same treatment, so the only thing that can
-		// tell the two lanes apart is the sequence each one draws. Recorded per datagram
-		// rather than as a total, because two independent lanes can still drop the same count.
-		let mut dropped = [Vec::new(), Vec::new()];
-		for id in 0..64u32 {
-			for dir in [Dir::Up, Dir::Down] {
-				let before = state.lanes[dir.index()].counters.dropped;
-				state.accept(dir, id.to_be_bytes().to_vec(), socket.clone(), None, now);
-				let after = state.lanes[dir.index()].counters.dropped;
-				dropped[dir.index()].push(after > before);
-			}
-		}
-
-		assert!(
-			dropped[0].iter().any(|&d| d),
-			"the up lane never dropped, so the test proves nothing"
-		);
-		assert_ne!(dropped[0], dropped[1], "both directions drew the same sequence");
+		refused(undelayed, "needs a delay").await;
 	}
 }

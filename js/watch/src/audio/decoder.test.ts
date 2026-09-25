@@ -535,7 +535,7 @@ test("a player put back on the page builds a context again", async () => {
 
 	// The page keeps its activation across the detach (Chromium's is sticky for the document's
 	// lifetime), so the replacement starts without asking the viewer to click again. Where it does
-	// not, unlockOnGesture is still armed and spends the next gesture on it.
+	// not, `Util.Gesture.unlock` is still armed and spends the next gesture on it.
 	MockContext.grace = true;
 	attached.set(true);
 	await flush();

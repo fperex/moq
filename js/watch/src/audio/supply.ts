@@ -523,7 +523,7 @@ export class Supply {
 				// Learn the packet duration before another input can hide a tune-in gap.
 				// Native decoders accumulate output timestamps across unreported gaps.
 				if (!primed) {
-					const flushed = await Promise.race([decoder.flush().then(() => true), effect.cancel]);
+					const flushed = await effect.race(decoder.flush().then(() => true));
 					if (!flushed) break;
 					anchor.restarted();
 				}
@@ -638,7 +638,7 @@ export class Supply {
 				);
 				// Establish the decoded packet duration before checking the next input gap.
 				if (!primed) {
-					const flushed = await Promise.race([decoder.flush().then(() => true), effect.cancel]);
+					const flushed = await effect.race(decoder.flush().then(() => true));
 					if (!flushed) break;
 					anchor.restarted();
 				}

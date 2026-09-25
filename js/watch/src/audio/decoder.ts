@@ -24,7 +24,6 @@ import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
 import { Supply } from "./supply";
 import { supported } from "./supported";
-import { unlockOnGesture } from "./unlock";
 import { type PageGraph, Remote } from "./worker/remote";
 
 export type DecoderInput = {
@@ -266,11 +265,27 @@ export class Decoder {
 		// There is no context until a user gesture builds one (see #buildContext). Armed for the
 		// decoder's lifetime rather than while audio is enabled: the click that unmutes a tile is the
 		// activation, and listeners armed as a consequence of it are armed one microtask too late to
-		// hear it. See unlockOnGesture. A player off the page builds nothing: the gesture belongs to
-		// whatever the viewer actually clicked.
-		unlockOnGesture(this.#signals, this.#out.context, () =>
-			this.in.attached.peek() ? (this.#context?.audio ?? this.#buildContext(this.#rate.peek())) : undefined,
-		);
+		// hear it. Built and resumed inside the handler, because an effect the gesture schedules runs
+		// a microtask later. A player off the page builds nothing: the gesture belongs to whatever the
+		// viewer actually clicked. Nothing to arm where there is no document (server rendering, a test
+		// runner). A mouse grants activation on `pointerdown`, touch and pen only on `pointerup`.
+		if (typeof document !== "undefined") {
+			const build = () => {
+				if (this.#context || !this.in.attached.peek()) return;
+				this.#buildContext(this.#rate.peek())
+					.resume()
+					.catch(() => {});
+			};
+			this.#signals.event(document, "pointerdown", build);
+			this.#signals.event(document, "pointerup", build);
+			this.#signals.event(document, "keydown", build);
+		}
+		// Whatever context there is, including one built outside a handler or rebuilt at a new rate,
+		// is started now if the browser allows it and on every gesture until it runs.
+		this.#signals.run((effect) => {
+			const context = effect.get(this.#out.context);
+			if (context) Util.Gesture.unlock(effect, context);
+		});
 		this.#signals.cleanup(() => this.#closeContext());
 
 		this.#signals.run(this.#runSupply.bind(this));
@@ -386,8 +401,8 @@ export class Decoder {
 	 * (a later catalog frame carrying the codec description, a channel count change) rebuilds the
 	 * worklet and ring *under* the context that is already playing, since replacing it would spend a
 	 * gesture that may never come again. The replacement here is built outside a handler, so it
-	 * starts only while the page's activation is still live; unlockOnGesture stays armed and spends
-	 * the next gesture on it otherwise.
+	 * starts only while the page's activation is still live; `Util.Gesture.unlock` stays armed and
+	 * spends the next gesture on it otherwise.
 	 *
 	 * A player taken off the page releases its context and pays for a new one if it comes back:
 	 * nothing can be heard out of it, and what it holds is a render thread and one of the handful of
@@ -405,7 +420,7 @@ export class Decoder {
 
 		const context = this.#context?.audio;
 		if (!context) {
-			// Audio is asked for, so build the graph and let unlockOnGesture try to start it: a
+			// Audio is asked for, so build the graph and let `Util.Gesture.unlock` try to start it: a
 			// permissive autoplay policy runs it with no gesture at all (the audio-quality lane
 			// launches Chromium that way and never clicks), a strict one leaves it suspended until the
 			// next gesture, and a tile unmuted by a click the listeners never saw is still inside that
@@ -491,10 +506,7 @@ export class Decoder {
 			// abandoned, so building against its name would throw. Gate on the race result, not
 			// `context.state`, because `AudioContext.close()` only flips `.state` to "closed" synchronously
 			// on Chrome (Firefox/Safari report "suspended").
-			const loaded = await Promise.race([
-				context.audioWorklet.addModule(RenderWorklet).then(() => true),
-				effect.cancel,
-			]);
+			const loaded = await effect.race(context.audioWorklet.addModule(RenderWorklet).then(() => true));
 			if (!loaded) return;
 
 			// Create the worklet node. outputChannelCount must be set explicitly

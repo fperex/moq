@@ -229,10 +229,6 @@ export class Sync {
 	// main-thread memory rather than reaching across to the worklet per frame.
 	#clock: Clock | undefined;
 
-	// A ghetto way to learn when the reference/buffer changes.
-	// There's probably a way to use Effect, but lets keep it simple for now.
-	#update: PromiseWithResolvers<void>;
-
 	// Per-label late-frame tracking: accumulate count and max lateness, flush on recovery.
 	#late = new Map<string, { count: number; maxMs: number }>();
 
@@ -257,8 +253,6 @@ export class Sync {
 			delay: getter(props?.delay ?? ("auto" as Delay)),
 			buffer: getter(props?.buffer ?? Time.Milli.zero),
 		};
-
-		this.#update = Promise.withResolvers();
 
 		this.#signals.run(this.#runJitter.bind(this));
 		this.#signals.run(this.#runDelay.bind(this));
@@ -372,13 +366,7 @@ export class Sync {
 	#runDelay(effect: Effect): void {
 		const mode = effect.get(this.in.delay);
 		const jitter = effect.get(this.#out.jitter);
-		// Read so a moved offset wakes everything parked in `wait()` too; it moves the playhead
-		// exactly as the delay does.
-		effect.get(this.#out.offset);
-
 		this.#out.delay.set(mode === "instant" ? Time.Milli.zero : jitter);
-
-		this.#wake();
 	}
 
 	/**
@@ -411,7 +399,7 @@ export class Sync {
 		if (!sample) return;
 
 		const now = Time.Milli.now();
-		this.#setReference(Time.Milli.sub(Time.Milli.sub(now, delay), extrapolate(sample, now)));
+		this.#out.reference.set(Time.Milli.sub(Time.Milli.sub(now, delay), extrapolate(sample, now)));
 	}
 
 	/**
@@ -537,7 +525,7 @@ export class Sync {
 
 		// First frame anchors the reference.
 		if (playhead === undefined) {
-			this.#setReference(Time.Milli.sub(now, timestamp));
+			this.#out.reference.set(Time.Milli.sub(now, timestamp));
 			return;
 		}
 
@@ -580,18 +568,7 @@ export class Sync {
 		if (sleep <= cap) return; // within budget: let the buffer grow instead of skipping ahead
 
 		// Over the cap: re-anchor down so the resulting lookahead is exactly the cap.
-		this.#setReference(Time.Milli.add(ref, Time.Milli.sub(cap, this.#trail())));
-	}
-
-	#setReference(ref: Time.Milli): void {
-		this.#out.reference.set(ref);
-		this.#wake();
-	}
-
-	// Wake everything parked in `wait()` so it re-reads the clock.
-	#wake(): void {
-		this.#update.resolve();
-		this.#update = Promise.withResolvers();
+		this.#out.reference.set(Time.Milli.add(ref, Time.Milli.sub(cap, this.#trail())));
 	}
 
 	// Re-anchor playback to the next frame received. Call this at an utterance boundary
@@ -610,7 +587,6 @@ export class Sync {
 		this.#arrivals.clear();
 		this.#stepped = undefined;
 		this.#out.offset.set(Time.Milli.zero);
-		this.#wake();
 	}
 
 	// The PTS that should be rendering right now, derived from the clock or the reference.
@@ -630,7 +606,7 @@ export class Sync {
 		}
 
 		for (;;) {
-			// Switching to "instant" resolves `#update`, so frames parked here wake and leave.
+			// Switching to "instant" wakes the sleep below, so frames parked here leave.
 			if (this.in.delay.peek() === "instant") return;
 
 			// Sleep until it's time to decode the next frame.
@@ -641,18 +617,32 @@ export class Sync {
 			const remaining = Time.Milli.sub(timestamp, playhead);
 			if (remaining <= 0) return;
 
+			// A parked playhead has no deadline to sleep towards, only a change to wait for.
 			const rate = this.#clock?.rate ?? 1;
-			if (rate <= 0) {
-				await this.#update.promise;
-				continue;
-			}
-			const sleep = remaining / rate;
-
-			const wait = Promise.withResolvers<void>();
-			const timer = setTimeout(wait.resolve, sleep);
-			await Promise.race([this.#update.promise, wait.promise]);
-			clearTimeout(timer);
+			await this.#sleep(rate > 0 ? remaining / rate : undefined);
 		}
+	}
+
+	// Sleeps for `ms`, or until woken when it is undefined, returning early once anything the sleep
+	// was computed from changes. The loop in `wait()` re-reads the playhead either way. Releases
+	// every listener either way: frames sleep once each, so a listener left on a signal that never
+	// changes would pile up for the life of the player.
+	#sleep(ms: number | undefined): Promise<void> {
+		return new Promise((resolve) => {
+			const wake = () => {
+				clearTimeout(timer);
+				for (const dispose of disposes) dispose();
+				resolve();
+			};
+			const timer = ms === undefined ? undefined : setTimeout(wake, ms);
+			const disposes = [
+				this.in.delay.changed(wake),
+				this.#out.delay.changed(wake),
+				this.#out.offset.changed(wake),
+				// A nominated clock re-derives the reference from every sample that moves the playhead.
+				this.#out.reference.changed(wake),
+			];
+		});
 	}
 
 	static #formatDuration(ms: number): string {

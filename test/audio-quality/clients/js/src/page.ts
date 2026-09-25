@@ -122,7 +122,7 @@ setInterval(() => {
 
 // Chromium runs with --autoplay-policy=no-user-gesture-required, but Safari and a human opening this
 // by hand both need a real gesture before an AudioContext will start. The button is that gesture;
-// `unlockOnGesture` inside the element is already listening for the pointerdown.
+// the element's audio decoder is already listening for the pointerdown.
 //
 // Pinned to the corner above everything, because a WebDriver Element Click refuses an element the
 // page has scrolled away or covered, and the player grows to fill the viewport the moment it has a
