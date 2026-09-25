@@ -132,6 +132,8 @@ class MockContext extends EventTarget {
 /** The worklet node: a real render worklet behind a real port, as the page's AudioWorkletNode has. */
 class Node {
 	static built: Node[] = [];
+	/** Whether the worklet of a node built now hears nothing on its port, so nothing sent to it arrives. */
+	static deaf = false;
 	readonly port: MessagePort;
 	readonly render: Processor;
 	/** The worklet's end of the node's port. */
@@ -140,7 +142,7 @@ class Node {
 	constructor() {
 		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
 		const { port1, port2 } = new MessageChannel();
-		nextPort = port2;
+		nextPort = Node.deaf ? new MessageChannel().port2 : port2;
 		this.render = new Render();
 		this.port = port1;
 		this.worklet = port2;
@@ -380,6 +382,7 @@ beforeEach(() => {
 	scope.AudioEncoder = class {};
 	scope.EncodedAudioChunk = FakeChunk;
 	Node.built = [];
+	Node.deaf = false;
 	InProcessWorker.created = [];
 	InProcessWorker.next = "serve";
 	FakeDecoder.refuse.clear();
@@ -1018,6 +1021,24 @@ describe("the deadline", () => {
 			reason: "the audio worker played nothing in 5 s: it never became ready",
 		});
 		await settle(() => t.page.live() === 1, "the page's own subscription");
+	});
+
+	it("says it was the worklet when it never reads the ring the worker writes", async () => {
+		jest.useFakeTimers();
+		const warned = fallbacks();
+		// Nothing reaches the worklet, so neither does the port the worker writes the ring over.
+		Node.deaf = true;
+		const t = tile({ offload: true });
+		await settle(handed(), "the graph handed over");
+
+		// Audio keeps reaching the worker, so the time counts, and the worklet never says a word.
+		for (let i = 0; t.decoder.out.thread.peek()?.kind === "worker" && i * TICK < 4 * AUDIO_DEADLINE; i++) {
+			t.write(i, i * 20_000);
+			await advance(TICK);
+		}
+		const reason = "the audio worker played nothing in 5 s: the worklet never read the ring the worker wrote";
+		expect(t.decoder.out.thread.peek()).toEqual({ kind: "main", reason });
+		expect(warned).toEqual([expect.stringContaining(reason)]);
 	});
 
 	describe.each(PAGES)("on %s page", (_page, isolated) => {

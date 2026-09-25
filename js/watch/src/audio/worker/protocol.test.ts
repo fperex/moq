@@ -391,6 +391,7 @@ describe("Deadline", () => {
 			["ready", "it never became ready"],
 			["connected", "its session to the relay never connected"],
 			["resolved", "its session never found the broadcast"],
+			["read", "the worklet never read the ring the worker wrote"],
 			["played", "the audio it read never played"],
 		];
 		for (const [stage, why] of cases) {

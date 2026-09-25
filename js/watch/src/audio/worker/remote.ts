@@ -364,7 +364,9 @@ export class Remote {
 		const report = this.#last;
 		if (report?.connection !== "connected") return "connected";
 		if (!report.resolved) return "resolved";
-		return this.#heard ? "played" : "audio";
+		if (!this.#heard) return "audio";
+		// The worklet reports on the ring the worker writes as soon as it reads it, playing or not.
+		return report.ring?.debug === undefined ? "read" : "played";
 	}
 
 	// Whether something on the page holds the audio up, which the worker is not to answer for.

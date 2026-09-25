@@ -318,15 +318,17 @@ export const TICK = Time.Milli(250);
  * Where a player's worker has got to on its way to playing audio: what it is waiting for.
  *
  * `audio` waits on the publisher rather than on the worker (nothing to play has reached it), so it never
- * counts; `played` counts only while audio keeps reaching it, for the same reason.
+ * counts; `read` (the worklet has said nothing about the ring the worker writes) and `played` count only
+ * while audio keeps reaching it, for the same reason.
  */
-export type Stage = "ready" | "connected" | "resolved" | "audio" | "played";
+export type Stage = "ready" | "connected" | "resolved" | "audio" | "read" | "played";
 
 // What the worker never managed, by the stage it stopped at.
 const STUCK: Record<Exclude<Stage, "audio">, string> = {
 	ready: "it never became ready",
 	connected: "its session to the relay never connected",
 	resolved: "its session never found the broadcast",
+	read: "the worklet never read the ring the worker wrote",
 	played: "the audio it read never played",
 };
 
