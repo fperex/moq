@@ -244,8 +244,12 @@ function videoProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
 		waiting = undefined;
 
 		if (at <= stamped) {
-			pull.reject(new Error(`video capture went backwards: ${at}ms after ${stamped}ms`));
-			return;
+			// A returning callback can carry a frame-start time just before the last worker tick.
+			if (stamped - at > 1000 / rate) {
+				pull.reject(new Error(`video capture went backwards: ${at}ms after ${stamped}ms`));
+				return;
+			}
+			at = Time.Milli(stamped + 0.001);
 		}
 
 		taken = video.currentTime;
