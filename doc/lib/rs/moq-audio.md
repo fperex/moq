@@ -30,7 +30,7 @@ policy. Decoding likewise separates low-level `decode::Config`, PCM
 Highlights:
 
 - **`encode::Publication`** advertises the track and opens the microphone only while someone listens. Stop, swap devices, and restart without changing the track subscribers know; read a level meter for the UI.
-- **A measured jitter buffer.** Set `decode::Options::delay` and `read()` hands back a fixed 10 ms block every call instead of whatever packet was decoded, so the speaker never waits on the network. How much it holds is measured from arrival timing rather than from a round trip ([Playout](/concept/playout)), and `delay` is only the floor under it. A gap is concealed rather than played as silence unless `conceal` is turned off.
+- **A measured jitter buffer.** Set `decode::Options::delay` and `read()` hands back a fixed 10 ms block every call instead of whatever packet was decoded, so the speaker never waits on the network. How much it holds is measured from arrival timing rather than from a round trip ([Playout](/concept/playout)), and `delay` is only the floor under it. A gap is concealed rather than played as silence unless `conceal` is turned off. A declared endpoint drains the held audio and parks on silence without counting underruns. A finite track drains its final partial block before `read()` returns `None`.
 - **A/V sync signal.** `Consumer::playhead()` reports the media the speaker has actually been handed, which is what a video clock steers by; without a jitter buffer, `Sink::buffered()` says how far ahead the speaker is.
 - **Activity per packet**, read off the Opus stream, so a call UI shows who is talking without a second voice detector.
 - **One Linux build dependency**: ALSA headers, and only when `capture` or `playback` is enabled.

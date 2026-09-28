@@ -151,6 +151,18 @@ impl Buffer {
 		ready
 	}
 
+	/// Frames held in all, including any past a hole.
+	pub(crate) fn held(&self) -> usize {
+		self.packets.iter().map(|packet| packet.pcm.len() / self.channels).sum()
+	}
+
+	/// Media time just past the newest sample held, or `None` when the buffer is empty.
+	pub(crate) fn end(&self) -> Option<Duration> {
+		self.packets
+			.back()
+			.map(|packet| packet.timestamp + self.duration(packet.pcm.len() / self.channels))
+	}
+
 	/// The contiguous run from the front, as media time.
 	pub(crate) fn buffered(&self) -> Duration {
 		self.duration(self.ready())

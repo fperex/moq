@@ -121,6 +121,10 @@ pub(crate) struct Engine {
 	/// concealment off hears instead.
 	silence: u32,
 
+	/// Whether the publisher declared its timeline finished here: once what is held has played,
+	/// the pause is silence on the wire rather than a gap, so there is nothing to conceal.
+	ended: bool,
+
 	/// Reused between blocks so a pull allocates nothing once it is warm.
 	scratch: Vec<f32>,
 	produced: Vec<f32>,
@@ -165,6 +169,7 @@ impl Engine {
 			segments: VecDeque::new(),
 			playhead: None,
 			silence: 0,
+			ended: false,
 			scratch: Vec::new(),
 			produced: Vec::new(),
 			concealed: Vec::new(),
@@ -204,6 +209,8 @@ impl Engine {
 		}
 
 		let count = pcm.len() / self.channels;
+		// Media is back, so the declared pause is over.
+		self.ended = false;
 		self.decision.arrived(count);
 		self.buffer.insert(timestamp, pcm);
 
@@ -225,9 +232,42 @@ impl Engine {
 		self.record_skip(dropped);
 	}
 
+	/// Whether media starting at `at` continues the timeline held here across a hole
+	/// no wider than `within`, rather than starting a new one.
+	///
+	/// Measured from the end of the newest audio held or already played, so a skipped
+	/// group reads as the hole it is and a publisher that restarted somewhere else,
+	/// earlier or far later, does not.
+	pub(crate) fn continues(&self, at: Duration, within: Duration) -> bool {
+		let reach = match (self.buffer.end(), self.played) {
+			(Some(end), Some(played)) => end.max(played),
+			(end, played) => match end.or(played) {
+				Some(reach) => reach,
+				None => return false,
+			},
+		};
+		at + self.buffer.duration(1) >= reach && at.saturating_sub(reach) <= within
+	}
+
+	/// A hole in the timeline rather than a new one: what is held still plays, and the
+	/// splice carries the playhead over the hole. Only the arrival reference starts
+	/// over, since a measurement across the jump would read the hole as delay.
+	pub(crate) fn jump(&mut self) {
+		self.jitter.reanchor();
+		self.observed = None;
+	}
+
+	/// The publisher declared its timeline finished: play out what is held, then silence, and
+	/// count none of it as an underrun. Whatever comes next arrives on the far side of the pause,
+	/// so the next insert or [`reanchor`](Self::reanchor) takes it back.
+	pub(crate) fn end(&mut self) {
+		self.ended = true;
+	}
+
 	/// A timeline discontinuity: everything held describes a timeline that no longer
 	/// exists.
 	pub(crate) fn reanchor(&mut self) {
+		self.ended = false;
 		self.jitter.reanchor();
 		self.buffer.clear();
 		self.sync.flush();
@@ -352,6 +392,25 @@ impl Engine {
 
 	// One turn of the decision loop, committing at least one block to the output.
 	fn produce(&mut self) {
+		let ready = self.buffer.ready();
+		// A hole cannot grow the preceding fragment into a block. Commit that audio
+		// before splicing the next run, even when it fills only part of this pull.
+		if ready > 0 && ready < self.block && self.buffer.held() > ready {
+			self.play(ready);
+			return;
+		}
+
+		// A declared endpoint cannot refill a stalled buffer. Drain every sample,
+		// pad the final block, then park without manufacturing an underrun.
+		if self.ended {
+			if ready > 0 {
+				self.play(self.block);
+			} else {
+				self.pause();
+			}
+			return;
+		}
+
 		let front = self.buffer.front();
 		let contiguous = match (self.played, front) {
 			(Some(played), Some(front)) => front <= played + self.buffer.duration(1),
@@ -389,8 +448,10 @@ impl Engine {
 		let at = start.expect("audio was taken");
 		self.played = Some(at + media);
 
-		let pcm = std::mem::take(&mut self.scratch);
+		let mut pcm = std::mem::take(&mut self.scratch);
 		self.noise.update(&pcm);
+		// Pad the last partial block at a declared endpoint.
+		pcm.resize(count * self.channels, 0.0);
 		self.commit(&pcm, media, 0, false);
 		self.scratch = pcm;
 	}
@@ -452,6 +513,18 @@ impl Engine {
 		self.commit(&produced, media, shift, false);
 		self.produced = produced;
 		self.scratch = input;
+	}
+
+	// One block of the silence a declared pause is. It carries no media, and it leaves concealment
+	// and the level filter nothing from this side of the pause to build on.
+	fn pause(&mut self) {
+		self.produced.clear();
+		let mut produced = std::mem::take(&mut self.produced);
+		produced.resize(self.block * self.channels, 0.0);
+		self.expand.reset();
+		self.commit(&produced, Duration::ZERO, 0, false);
+		self.decision.reset(0);
+		self.produced = produced;
 	}
 
 	// Nothing to play: invent a block, or ramp into silence if the caller asked for
@@ -578,7 +651,7 @@ impl Engine {
 	// stays on the media timeline rather than on the output one.
 	fn commit(&mut self, pcm: &[f32], media: Duration, shift: i64, concealed: bool) {
 		let count = pcm.len() / self.channels;
-		debug_assert!(count >= self.block, "a produced block has to fill a pull");
+		debug_assert!(count > 0, "a production step must advance the output");
 
 		self.sync.push(pcm);
 		self.segments.push_back(Segment { frames: count, media });
@@ -1027,6 +1100,68 @@ mod tests {
 		assert!(
 			after < produced,
 			"playout ran ahead of the media: {after:?} of {produced:?}"
+		);
+	}
+
+	#[test]
+	fn a_fragment_before_a_hole_keeps_every_sample() {
+		let mut engine = Engine::new(config(1, false)).unwrap();
+		engine.insert(Duration::ZERO, 0.0, &[0.25; 168]);
+		engine.insert(Duration::from_millis(20), 20.0, &[0.5; 960]);
+		let mut out = vec![0.0; engine.block()];
+		engine.pull(&mut out);
+		assert_eq!(&out[..168], &[0.25; 168]);
+		assert_eq!(engine.stats().skipped, 0);
+	}
+
+	/// What the Opus decoder hands playout: the first packet is short by the 312-frame
+	/// pre-skip, so every boundary after it sits 168 frames off the 480-frame block.
+	/// Returns packet `index`'s media time and samples.
+	fn opus_shaped(source: &[f32], index: usize) -> (Duration, Vec<f32>) {
+		const PRE_SKIP: usize = 312;
+		let packet = frames(RATE, PACKET);
+		let (start, count) = match index {
+			0 => (0, packet - PRE_SKIP),
+			_ => (packet - PRE_SKIP + (index - 1) * packet, packet),
+		};
+		(
+			Duration::from_secs_f64(start as f64 / f64::from(RATE)),
+			source[start..start + count].to_vec(),
+		)
+	}
+
+	/// N1: a run shorter than one block at the front of the buffer, with a hole behind
+	/// it, never grows into a block. Live pacing (one 20 ms packet per two pulls) keeps
+	/// the first fill under the trim, so the play cursor stays on multiples of 480 and
+	/// the run before the hole ends 168 frames short of a block. The audio behind the
+	/// hole has to be played anyway.
+	#[test]
+	fn a_fragment_before_a_hole_does_not_stall_playout() {
+		let mut engine = Engine::new(config(1, true)).unwrap();
+		let source = fixture::tone(RATE, 2.0, 997.0, 0.5, 1);
+		let mut out = vec![0.0; engine.block()];
+		let mut now = 0.0;
+
+		// Packet 12 never arrives.
+		const LOST: usize = 12;
+		const PACKETS: usize = 60;
+		for index in 0..PACKETS {
+			if index != LOST {
+				let (timestamp, pcm) = opus_shaped(&source, index);
+				engine.insert(timestamp, now, &pcm);
+			}
+			for _ in 0..2 {
+				engine.pull(&mut out);
+				now += BLOCK.as_secs_f64() * 1000.0;
+			}
+		}
+
+		let (behind, _) = opus_shaped(&source, 30);
+		let playhead = engine.playhead().expect("audio has played");
+		let stats = engine.stats();
+		assert!(
+			playhead >= behind,
+			"playout never reached the audio behind the hole: playhead {playhead:?}, {stats:?}"
 		);
 	}
 
