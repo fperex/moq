@@ -510,3 +510,87 @@ async fn spawn_auth_server(policy: moq_auth::serve::Policy) -> url::Url {
 	tokio::spawn(async move { server.serve(listener).await });
 	url
 }
+
+/// F4 (review 2026-09-27): a draining relay refuses a new session on the io_uring workers too,
+/// instead of admitting it and sending a GOAWAY on arrival, as `a_draining_relay_refuses_a_new_session`
+/// (tests/shutdown_signal.rs) checks for the tokio listeners.
+#[tokio::test]
+async fn a_draining_uring_relay_refuses_a_new_session() {
+	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+	if !supported() {
+		return;
+	}
+
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let port = free_udp_port();
+	let mut config = uring_config(&cert, &key, port);
+	config.drain_timeout = Duration::from_secs(5);
+
+	let relay = Relay::load(config).await.expect("load relay");
+	let origin = relay.cluster().origin.clone();
+	let trigger = relay.shutdown_trigger().clone();
+	let running = tokio::spawn(relay.run());
+
+	let broadcast = origin.create_broadcast("test").expect("create broadcast");
+	broadcast.announce(Default::default()).expect("announce");
+
+	// A session being served, so the drain finds one to GOAWAY.
+	let raw_url: url::Url = format!("moql://127.0.0.1:{port}/").parse().expect("parse url");
+	let wt_url: url::Url = format!("https://127.0.0.1:{port}/").parse().expect("parse url");
+	let subscriber = moq_tokio::origin::spawn();
+	let consumer = subscriber.consume();
+	let mut announced = consumer.announced();
+	let first = connect(client().with_subscriber(subscriber), raw_url.clone()).await;
+	let draining = first.draining().expect("connected");
+	let update = tokio::time::timeout(TIMEOUT, announced.next())
+		.await
+		.expect("announcement timed out")
+		.expect("origin closed");
+	assert!(update.kind.is_active(), "expected an announce, got a retraction");
+
+	trigger.start();
+	let goaway = tokio::time::timeout(TIMEOUT, draining.recv())
+		.await
+		.expect("no GOAWAY within the timeout of the trigger")
+		.expect("session closed without a GOAWAY");
+	assert_eq!(goaway.uri(), "", "expected a reconnect-to-me GOAWAY");
+
+	// Both peer flavors the workers serve: raw QUIC and WebTransport.
+	let mut outcomes = Vec::new();
+	for url in [&raw_url, &wt_url] {
+		let dialed = tokio::time::timeout(
+			TIMEOUT,
+			client().with_reconnect(false).connect(url.clone()).established(),
+		)
+		.await
+		.expect("the second dial never settled");
+		let outcome = match dialed {
+			Err(err) => format!("refused at dial: {err}"),
+			Ok(refused) => {
+				let drained = refused.draining();
+				let closed = tokio::time::timeout(Duration::from_secs(2), refused.closed())
+					.await
+					.is_ok();
+				let goaway = drained.and_then(|goaway| goaway.peek()).is_some();
+				match (closed, goaway) {
+					(true, false) => "closed on arrival without a GOAWAY".to_string(),
+					(_, true) => "admitted and sent a GOAWAY".to_string(),
+					(false, false) => "admitted and left open".to_string(),
+				}
+			}
+		};
+		outcomes.push(format!("{}: {outcome}", url.scheme()));
+	}
+
+	assert!(
+		outcomes.iter().all(|outcome| !outcome.contains("admitted")),
+		"a draining io_uring relay admitted a new session: {outcomes:?}"
+	);
+	assert!(!running.is_finished(), "relay exited inside the drain window");
+
+	drop(first);
+	drop(broadcast);
+	running.abort();
+	let _ = running.await;
+}
