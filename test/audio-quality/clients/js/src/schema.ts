@@ -24,6 +24,17 @@
 /** Milliseconds, as a float. The unit of every duration in this schema. */
 export type Ms = number;
 
+/** Sort media timestamps and return the smallest positive gap, rounded up to milliseconds. */
+export function frameFloor(media: number[]): Ms | undefined {
+	media.sort((a, b) => a - b);
+	let smallest = Number.POSITIVE_INFINITY;
+	for (let i = 1; i < media.length; i++) {
+		const gap = media[i] - media[i - 1];
+		if (gap > 0 && gap < smallest) smallest = gap;
+	}
+	return Number.isFinite(smallest) ? Math.ceil(smallest) : undefined;
+}
+
 /** A fraction of 1. The unit of every share in this schema. */
 export type Share = number;
 
