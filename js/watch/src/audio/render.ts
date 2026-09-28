@@ -4,7 +4,7 @@ import type { Snapshot } from "./playout";
 import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
 /** Everything a writer sends the render worklet: over the node's own port, or over one handed to it as a {@link Port}. */
-export type Message = InitShared | InitPost | Data | End | Latency | Reset | Stall | Truncate | Port;
+export type Message = InitShared | InitPost | Data | End | Latency | Reset | Stall | Truncate | Port | Close;
 /** Everything the render worklet sends back, to every port it holds. */
 export type ToMain = State | Unreadable;
 
@@ -72,6 +72,15 @@ export interface Stall {
  */
 export interface End {
 	type: "end";
+}
+
+/**
+ * The node is done with: the processor stops rendering and lets the browser collect it. A processor
+ * whose `process` keeps returning true keeps running after its node is disconnected, for as long as the
+ * context is open, and the decoder rebuilds nodes in a context that stays open.
+ */
+export interface Close {
+	type: "close";
 }
 
 /**

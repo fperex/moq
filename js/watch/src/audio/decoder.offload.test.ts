@@ -1153,6 +1153,26 @@ describe("one player's trouble", () => {
 	});
 });
 
+describe("a node the decoder replaces in the same context", () => {
+	it("lets its processor end", async () => {
+		tile({ offload: true });
+		await until(() => handed()(), "the graph handed over");
+		const [old] = Node.built;
+		const quantum = () => [new Float32Array(QUANTUM), new Float32Array(QUANTUM)];
+		expect(old.render.process([], [quantum()], {})).toBe(true);
+
+		// The page takes the audio back onto a fresh node of the same context.
+		fallbacks();
+		const [player] = worker().told("player");
+		worker().say({ type: "error", id: player.id, message: "TypeError: boom" });
+		await until(() => Node.built.length === 2, "the page's own node");
+		await sleep(20);
+
+		// The context is still open, so the old node's processor would run until it closes.
+		expect(old.render.process([], [quantum()], {})).toBe(false);
+	});
+});
+
 describe("the thread a player's audio runs on", () => {
 	it("is the page's, for no reason, when the player does not offload or has no relay to hand the worker", async () => {
 		const off = tile({ offload: false });

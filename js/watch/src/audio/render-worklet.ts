@@ -29,6 +29,8 @@ class Render extends AudioWorkletProcessor {
 	#ports: MessagePort[] = [];
 	// Whether a message has already failed to deserialize, which is said once. See #unreadable.
 	#unread = false;
+	// Whether the node is done with, so `process` ends the processor. See `Close`.
+	#closed = false;
 
 	constructor() {
 		super();
@@ -65,6 +67,17 @@ class Render extends AudioWorkletProcessor {
 			} else if (msg.type === "stall") {
 				// Only meaningful in post mode; shared mode stalls via the control array.
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.stall();
+			} else if (msg.type === "close") {
+				this.#closed = true;
+				this.#backend = undefined;
+				this.#engine = undefined;
+				this.#state = undefined;
+				for (const port of this.#ports) {
+					port.onmessage = null;
+					port.onmessageerror = null;
+					port.close();
+				}
+				this.#ports.length = 0;
 			} else if (msg.type === "end") {
 				// Only meaningful in post mode; shared mode ends via the control array.
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.end();
@@ -103,6 +116,7 @@ class Render extends AudioWorkletProcessor {
 	}
 
 	process(_inputs: Float32Array[][], outputs: Float32Array[][], _parameters: Record<string, Float32Array>) {
+		if (this.#closed) return false;
 		const output = outputs[0];
 		const backend = this.#backend;
 		const engine = this.#engine;

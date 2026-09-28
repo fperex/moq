@@ -169,4 +169,21 @@ describe("render worklet ports", () => {
 		node.port2.close();
 		extra.port2.close();
 	});
+
+	it("lets its processor end once the node is closed", async () => {
+		// A processor whose `process` keeps returning true keeps running after its node is disconnected
+		// and dropped, for as long as the context is open. The decoder rebuilds nodes in a context that
+		// stays open, so it says when a node is done with.
+		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
+		const node = new MessageChannel();
+		nextPort = node.port1;
+		const render = new Render();
+		expect(render.process([], [[new Float32Array(QUANTUM)]], {})).toBe(true);
+
+		node.port2.postMessage({ type: "close" });
+		await settle();
+		expect(render.process([], [[new Float32Array(QUANTUM)]], {})).toBe(false);
+
+		node.port2.close();
+	});
 });

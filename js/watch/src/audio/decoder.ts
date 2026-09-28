@@ -19,6 +19,7 @@ import type { Delay, Sync } from "../sync";
 import { reportTransport, supportsSharedArrayBuffer } from "./buffer";
 import { audioMaxAge, type DecoderConfig, decoderConfig } from "./config";
 import type * as Playout from "./playout";
+import type { Close } from "./render";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -517,7 +518,12 @@ export class Decoder {
 				channelCountMode: "explicit",
 				outputChannelCount: [channelCount],
 			});
-			effect.cleanup(() => worklet.disconnect());
+			effect.cleanup(() => {
+				// The context outlives this node, so the processor has to be told to end. See `Close`.
+				const close: Close = { type: "close" };
+				worklet.port.postMessage(close);
+				worklet.disconnect();
+			});
 
 			// Shared memory wherever the page can have it, for the page's own writes: the worker's ring is
 			// messages on any page (see `Player` in `worker/host.ts`), so only the page's is worth naming.
