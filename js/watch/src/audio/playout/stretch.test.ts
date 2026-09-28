@@ -213,6 +213,37 @@ describe("background noise", () => {
 		for (let i = 256; i <= sine.length; i += 256) held.update([sine.subarray(i - 256, i)], 256);
 		expect(held.initialised).toBe(false);
 	});
+
+	// One update per 20ms block, the way the engine feeds it: 960 frames at 48kHz, of which the
+	// estimator reads the 256 frame tail.
+	const feed = (room: Noise, pcm: Float32Array) => {
+		for (let i = 960; i <= pcm.length; i += 960) room.update([pcm.subarray(i - 960, i)], 960);
+	};
+
+	it("digital silence does not stall the estimate", () => {
+		const rate = 48000;
+		const room = new Noise(1);
+		feed(room, noise(rate, 2, 0.003)[0]);
+		expect(room.initialised).toBe(true);
+
+		// Half a second of exact zeros: a disabled mic, or a hole the ring filled.
+		feed(room, new Float32Array(rate / 2));
+
+		// The room comes back quieter. Two seconds is a hundred updates; a quiet window is accepted
+		// on sight, so the estimate should be on the new level well before that.
+		feed(room, noise(rate, 2, 0.001)[0]);
+		const expected = (0.001 * 0.001) / 3;
+		const db = 10 * Math.log10(room.energy(0) / expected);
+		expect(Math.abs(db)).toBeLessThan(3);
+	});
+
+	it("zeros before any training do not lock the estimate out", () => {
+		const rate = 48000;
+		const room = new Noise(1);
+		feed(room, new Float32Array(rate / 2));
+		feed(room, noise(rate, 1, 0.001)[0]);
+		expect(room.initialised).toBe(true);
+	});
 });
 
 describe("buffer level filter", () => {

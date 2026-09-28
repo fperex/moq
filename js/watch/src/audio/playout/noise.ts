@@ -97,6 +97,7 @@ class Channel {
 		// Indexed rather than for-of: V8 boxes every element a for-of over a typed array yields.
 		for (let i = 0; i < length; i++) energy += window[i] * window[i];
 		const r0 = energy;
+		if (r0 <= 0) return false;
 		energy /= length;
 
 		if (energy >= this.threshold) {
@@ -112,7 +113,6 @@ class Channel {
 		// Quiet window: the level is worth having whatever the spectrum turns out to be, so record
 		// it before the flatness test can reject the filter.
 		this.threshold = Math.max(energy, MIN_ENERGY);
-		if (r0 <= 0) return false;
 
 		let r1 = 0;
 		for (let i = 1; i < length; i++) r1 += window[i - 1] * window[i];
