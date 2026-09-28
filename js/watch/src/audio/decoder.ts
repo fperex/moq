@@ -197,6 +197,8 @@ export class Decoder {
 	// The rate the graph runs at: what the decoder turns out to emit, else what the catalog claims.
 	// Deduped, so a decoded rate confirming the catalog's does not count as a change.
 	readonly #rate: Computed<number | undefined>;
+	// A replacement supply has not decoded yet, but the context already knows the stream's rate.
+	#decodedRate?: number;
 
 	/**
 	 * The age budget for audio: `Sync.out.maxAge` plus what the ring can absorb past it.
@@ -240,7 +242,8 @@ export class Decoder {
 			if (!config) return undefined;
 			const active = effect.get(this.#active);
 			const decoded = active ? effect.get(active.supply.out.rate) : undefined;
-			return decoded ?? config.sampleRate;
+			if (decoded !== undefined) this.#decodedRate = decoded;
+			return this.#decodedRate ?? config.sampleRate;
 		});
 		this.#mode = this.#signals.computed((effect) => {
 			if (effect.get(this.#fallback) !== undefined) return "main";

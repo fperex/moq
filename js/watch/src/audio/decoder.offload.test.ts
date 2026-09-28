@@ -1173,6 +1173,47 @@ describe("a node the decoder replaces in the same context", () => {
 	});
 });
 
+describe("the decoded rate", () => {
+	it("survives a fallback: the context the worker's rate built is kept", async () => {
+		// The catalog says 44.1 kHz; the decoder emits 48 kHz, as Chrome and Firefox do for Opus.
+		const rates: number[] = [];
+		class Counting extends MockContext {
+			constructor(options?: { sampleRate?: number }) {
+				super(options);
+				rates.push(this.sampleRate);
+			}
+		}
+		scope.AudioContext = Counting;
+		fallbacks();
+		scope.crossOriginIsolated = true;
+		const t = tile({ offload: true });
+		t.catalog.set({
+			audio: {
+				renditions: {
+					audio: { codec: "opus", container: { kind: "legacy" }, sampleRate: 44_100, numberOfChannels: 2 },
+				},
+			},
+		} as unknown as Catalog.Root);
+		await until(() => handed()(), "the graph handed over");
+		for (let i = 0; i < 20; i++) t.write(i, i * 20_000);
+		await until(() => t.decoder.out.context.peek()?.sampleRate === RATE, "the context at the decoded rate");
+		await sleep(50);
+		const before = rates.length;
+
+		// The worker goes wrong for this player, and the page takes its audio back.
+		const [player] = worker().told("player");
+		worker().say({ type: "error", id: player.id, message: "TypeError: boom" });
+		await until(() => t.decoder.out.thread.peek()?.kind === "main", "the fallback");
+		await until(() => t.page.live() === 1, "the page's own subscription");
+		for (let i = 20; i < 40; i++) t.write(i, i * 20_000);
+		await sleep(150);
+
+		// The page's decoder emits 48 kHz too, which the context already runs at.
+		expect(t.decoder.out.context.peek()?.sampleRate).toBe(RATE);
+		expect(rates.slice(before)).toEqual([]);
+	});
+});
+
 describe("the thread a player's audio runs on", () => {
 	it("is the page's, for no reason, when the player does not offload or has no relay to hand the worker", async () => {
 		const off = tile({ offload: false });
