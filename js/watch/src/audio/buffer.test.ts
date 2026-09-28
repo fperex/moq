@@ -317,7 +317,11 @@ describe("AudioBuffer output clock, device starting", () => {
 			output.contextTime = 0;
 			output.performanceTime = 50_000;
 			worklet.deliver({ ...state(worklet, playhead(500, 1), false), contextTime: Time.Second(0.02) });
-			expect(buffer.clock.peek()).toEqual({ timestamp: Time.Micro(500_000), reference: Time.Milli(50_020), rate: 1 });
+			expect(buffer.clock.peek()).toEqual({
+				timestamp: Time.Micro(500_000),
+				reference: Time.Milli(50_020),
+				rate: 1,
+			});
 		} finally {
 			buffer.close();
 		}
@@ -463,7 +467,6 @@ describe("AudioBuffer output clock, shared ring", () => {
 	});
 });
 
-
 // --- review consumer-sync-video F15 ---
 
 describe("AudioBuffer, partial output timestamp", () => {
@@ -498,7 +501,10 @@ describe("AudioBuffer, partial output timestamp", () => {
 				thrown = err;
 			}
 			await Promise.resolve();
-			expect({ thrown: (thrown as Error | undefined)?.message, released }).toEqual({ thrown: undefined, released: true });
+			expect({ thrown: (thrown as Error | undefined)?.message, released }).toEqual({
+				thrown: undefined,
+				released: true,
+			});
 			await waiting;
 		} finally {
 			buffer.close();

@@ -233,7 +233,9 @@ export function supportsSharedArrayBuffer(): boolean {
 }
 
 /** Read the device clock once it has a complete timestamp. */
-export function outputTimestamp(context: Pick<AudioContext, "getOutputTimestamp">): Required<AudioTimestamp> | undefined {
+export function outputTimestamp(
+	context: Pick<AudioContext, "getOutputTimestamp">,
+): Required<AudioTimestamp> | undefined {
 	const { contextTime, performanceTime } = context.getOutputTimestamp?.() ?? {};
 	// Chromium can expose context time before the device has produced a performance timestamp.
 	if (contextTime === undefined || performanceTime === undefined || performanceTime === 0) return undefined;

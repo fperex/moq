@@ -1245,7 +1245,6 @@ describe("the thread a player's audio runs on", () => {
 	});
 });
 
-
 describe("the worker output clock after resume", () => {
 	it("rejects a missing device timestamp and refreshes it on the next worker report", async () => {
 		jest.useFakeTimers();

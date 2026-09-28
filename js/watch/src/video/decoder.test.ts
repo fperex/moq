@@ -560,7 +560,6 @@ test("a rendition that left the catalog is not a stall", async () => {
 	}
 });
 
-
 test("a pending rendition waits until its preview picture is due", async () => {
 	const fx = fixture();
 	const second = new Moq.Track.Producer("second").accept({});
@@ -612,7 +611,6 @@ test("a sparse rendition is not rebuilt at every healthy silence", async () => {
 		fx.close();
 	}
 });
-
 
 test("a new rendition does not inherit a sparse rendition's recovery window", async () => {
 	const fx = fixture();
