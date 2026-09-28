@@ -69,9 +69,13 @@ class Context extends EventTarget {
 }
 
 class Node {
-	readonly port = new MessageChannel().port1;
+	readonly #channel = new MessageChannel();
+	readonly port = this.#channel.port1;
 	connect(): void {}
-	disconnect(): void {}
+	disconnect(): void {
+		this.port.close();
+		this.#channel.port2.close();
+	}
 }
 
 const scope = globalThis as unknown as Record<string, unknown>;
@@ -223,7 +227,7 @@ it("costs the page the same per report however many players share the worker", a
 
 	const rows: Row[] = [];
 	for (const interval of [50, 20, 10]) {
-		for (const players of [1, 2, 4, 8, 16]) rows.push(await measure(players, interval));
+		for (const players of [1, 2, 4, 8, 16, 32, 64, 100]) rows.push(await measure(players, interval));
 	}
 
 	console.log("players  interval  per report  per second of reports");
@@ -236,11 +240,14 @@ it("costs the page the same per report however many players share the worker", a
 	for (const interval of [50, 20, 10]) {
 		const at = (players: number) => rows.find((row) => row.players === players && row.interval === interval);
 		const one = at(1);
-		const sixteen = at(16);
-		if (!one || !sixteen) throw new Error("missing a row");
+		if (!one) throw new Error("missing a row");
 		// No slope with the page's players: a report costs what it costs whoever else is on the worker. The
 		// ratio is loose because one player's timings are a handful of samples against a bun process's pauses.
-		expect(sixteen.perReport).toBeLessThan(3 * one.perReport + 20);
+		for (const players of [16, 32, 64, 100]) {
+			const many = at(players);
+			if (!many) throw new Error("missing a row");
+			expect(many.perReport).toBeLessThan(3 * one.perReport + 20);
+		}
 	}
 
 	// Sixteen players at the host's own cadence cost the page's main thread well under a twentieth of it.

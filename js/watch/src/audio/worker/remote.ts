@@ -25,7 +25,7 @@ import type { Port, ToMain } from "../render";
 import type { Source } from "../source";
 import type { Graph, RingState, SupplyOutput } from "../supply";
 import { type Lease, Pool } from "./pool";
-import { Deadline, type FromWorker, type Output, type Report, type Stage, TICK, type ToWorker } from "./protocol";
+import { Deadline, type FromWorker, type Report, type Stage, TICK, type ToWorker } from "./protocol";
 
 // How often the page samples its output clock for the worker. Device and system clocks drift apart by
 // tens of parts per million, so a sample a second old maps a playhead to well under a millisecond.
@@ -281,7 +281,11 @@ export class Remote {
 
 		// Only the page can read its output clock, which the postMessage ring maps its playhead through.
 		const output = () => {
-			const sampled = sample(graph.context);
+			const timestamp = outputTimestamp(graph.context);
+			const sampled = timestamp && {
+				contextTime: timestamp.contextTime,
+				at: performance.timeOrigin + timestamp.performanceTime,
+			};
 			this.#lease.post({ type: "output", id: this.#lease.id, output: sampled });
 			// The device clock can appear after statechange. Sample as the worker reports progress.
 			this.#sampleOutput = !sampled && graph.context.state === "running" ? output : undefined;
@@ -442,13 +446,4 @@ export class Remote {
 		this.#closed = true;
 		this.#signals.close();
 	}
-}
-
-/**
- * When the context's current sample leaves the output device, or undefined while the device has not
- * started, which `getOutputTimestamp` reads with a zero performance time.
- */
-function sample(context: Pick<AudioContext, "getOutputTimestamp">): Output | undefined {
-	const output = outputTimestamp(context);
-	return output && { contextTime: output.contextTime, at: performance.timeOrigin + output.performanceTime };
 }

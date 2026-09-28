@@ -839,8 +839,6 @@ describe("wait", () => {
 	});
 });
 
-// --- review consumer-sync-video F10: clock samples waking waiting frames ---
-
 describe("Sync wakes a waiting frame only when its deadline moves", () => {
 	// Counts the timers `wait()` arms while one frame waits and the audio clock republishes its
 	// playhead `count` times, 5ms apart, each sample off the ideal line by `jitter(i)` ms. Every timer

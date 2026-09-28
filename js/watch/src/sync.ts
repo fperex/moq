@@ -68,14 +68,7 @@ const OFFSET_WINDOW = Time.Milli(2_000);
 // that a track that has really gone stops holding the buffer open.
 const SPREAD_WINDOW = Time.Milli(2_000);
 
-// How far a new playhead sample has to move the derived reference before waiting frames are woken.
-//
-// Every sample re-derives the reference, and a real clock never lands on the extrapolated line to the
-// microsecond: the worklet's position and the time it is stamped with are read at different
-// instants. Republishing each sub-millisecond wobble woke every frame parked in `wait()` on every
-// sample (tens per second, times every frame in the trail) to recompute a deadline that had not
-// moved by anything a display can show. A frame waits on the latest sample either way, since
-// `#playhead` extrapolates from `#clock`, not from the reference.
+// Submillisecond clock noise does not move waiting frames' display deadlines.
 const REFERENCE_SLACK = Time.Milli(1);
 
 /**

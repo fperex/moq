@@ -200,23 +200,10 @@ export class Decoder {
 	// A replacement supply has not decoded yet, but the context already knows the stream's rate.
 	#decodedRate?: { config: string; rate: number };
 
-	/**
-	 * The age budget for audio: `Sync.out.maxAge` plus what the ring can absorb past it.
-	 *
-	 * See {@link audioMaxAge} for what it adds and why.
-	 *
-	 * Audio only, and deliberately not `Sync.out.maxAge` itself. That value is also the lookahead
-	 * cap in `Sync.received`, which bounds how far ahead of the playhead an *early* frame may be
-	 * held before playback skips forward. Widening it would let buffered playback drift a headroom
-	 * further from the live edge to solve a problem that only exists for late arrivals. Video is
-	 * untouched for the same reason: it drops a late frame at render rather than losing the group.
-	 *
-	 * It reads synchronously from the first peek, which is what `subscribeMedia` and
-	 * `Container.Consumer` need at construction.
-	 */
-	// The ring's depth: `sync.out.delay` plus `sync.out.offset`. See the constructor.
+	// The ring's depth: `sync.out.delay` plus `sync.out.offset`.
 	readonly #target: Derived<readonly [Getter<Time.Milli>, Getter<Time.Milli>], Time.Milli>;
 
+	// The subscription age budget includes what the audio ring can absorb; see audioMaxAge.
 	readonly #maxAge: Derived<
 		readonly [Getter<Time.Milli>, Getter<Delay>, Getter<Catalog.AudioConfig | undefined>],
 		Time.Milli
@@ -490,9 +477,6 @@ export class Decoder {
 		// It takes a second or so to initialize the AudioWorklet, so do it even if disabled. This is
 		// less efficient for video-only playback but makes muting/unmuting instant, since the first
 		// gesture on the page builds a context for every tile whether or not it is the one clicked.
-
-		//const enabled = effect.get(this.enabled);
-		//if (!enabled) return;
 
 		const config = effect.get(this.#config);
 		if (!config) return;

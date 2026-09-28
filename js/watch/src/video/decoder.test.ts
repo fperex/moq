@@ -31,11 +31,7 @@ const real = {
 beforeEach(() => {
 	built = [];
 
-	// The retry and recovery windows are seconds by design, so they run on bun's fake clock and only
-	// move when a test advances it. The old version scaled real timers 25x, which put BUFFERING at
-	// 20ms of wall time: a loaded machine let it fire between two statements and flaked the stall
-	// assertions. `flush` below still yields a real turn, so the signal graph and the track
-	// plumbing run as before; only deadlines are virtual.
+	// Only advance() moves decoder recovery deadlines.
 	jest.useFakeTimers();
 
 	class FakeVideoFrame {

@@ -430,8 +430,6 @@ describe("AudioBuffer, flushed", () => {
 	});
 });
 
-// --- review consumer-sync-video F9 ---
-
 describe("AudioBuffer output clock, shared ring", () => {
 	it("the shared ring's clock is anchored to when its samples leave the output device", async () => {
 		// The page polls at a fixed instant, 1000ms. The device is 40ms behind the render graph:
@@ -453,7 +451,6 @@ describe("AudioBuffer output clock, shared ring", () => {
 		});
 		try {
 			buffer.insert(3_000_000 as Time.Micro, [new Float32Array(4800)]);
-			// The shared ring is polled rather than pushed, so wait out a poll interval (real time).
 			jest.advanceTimersByTime(50);
 
 			const sampled = buffer.clock.peek();
@@ -466,8 +463,6 @@ describe("AudioBuffer output clock, shared ring", () => {
 		}
 	});
 });
-
-// --- review consumer-sync-video F15 ---
 
 describe("AudioBuffer, partial output timestamp", () => {
 	it("a partial output timestamp neither throws nor strands backpressure", async () => {
