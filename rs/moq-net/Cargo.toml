@@ -78,6 +78,10 @@ name = "track"
 harness = false
 
 [[bench]]
+name = "resume"
+harness = false
+
+[[bench]]
 name = "priority"
 harness = false
 

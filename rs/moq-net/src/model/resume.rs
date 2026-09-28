@@ -630,6 +630,7 @@ impl Consumer {
 			end_sequence: None,
 			outer: Anchor::default(),
 			drift_anchor: kio::Producer::new(Anchor::default()),
+			identity_anchor: false,
 		}
 	}
 
@@ -1495,8 +1496,10 @@ pub struct Subscriber {
 	outer: Anchor,
 	/// The logical drift anchor ([`Self::end_sequence`] and [`Self::outer`] combined,
 	/// with the newest edge across the segments), shared with groups that outlive this
-	/// cursor poll. Refreshed on every [`Self::poll_sync`].
+	/// cursor poll. Reconciled on each poll; a sole unbounded source uses its own edge.
 	drift_anchor: kio::Producer<Anchor>,
+	/// The sole unbounded segment's anchors are clear; its own track supplies expiry.
+	identity_anchor: bool,
 }
 
 impl Subscriber {
@@ -1602,6 +1605,7 @@ impl Subscriber {
 	/// Apply a producer snapshot: move boundaries on known segments and subscribe
 	/// to new ones.
 	fn apply(&mut self, snapshot: Snapshot) {
+		self.identity_anchor = false;
 		let Snapshot {
 			epoch,
 			finished,
@@ -1737,9 +1741,28 @@ impl Subscriber {
 	/// The cap is the tightest any reader of this subscriber imposes: its own
 	/// [`Self::end_at`] and whatever a wrapping splice pushed down. The edge is the
 	/// newest across the producer's segments within that cap, or a wrapping splice's if
-	/// newer. Resolved on every sync, since each segment is a separate track and the
-	/// logical edge moves whenever any of them grows.
+	/// newer. A sole unbounded segment uses its own track's edge; other shapes resolve
+	/// on every sync, since each segment can grow independently.
 	fn refresh_anchor(&mut self) {
+		if let [seg] = self.segments.as_mut_slice()
+			&& seg.start.is_none()
+			&& seg.end.is_none()
+			&& self.end_sequence.is_none()
+			&& self.outer == Anchor::default()
+		{
+			if !self.identity_anchor {
+				if let Ok(mut current) = self.drift_anchor.write() {
+					*current = Anchor::default();
+				}
+				seg.anchor = Anchor::default();
+				if let Some(sub) = seg.stale_sub_mut() {
+					sub.set_anchor(Anchor::default());
+				}
+				self.identity_anchor = true;
+			}
+			return;
+		}
+		self.identity_anchor = false;
 		let outer = self.outer.clone().capped(self.end_sequence);
 		let state = self.state.read();
 		let edge = state
@@ -1767,6 +1790,7 @@ impl Subscriber {
 	/// [`track::Subscriber::set_anchor`], for this subscriber nested as a segment of
 	/// another splice.
 	pub(crate) fn set_anchor(&mut self, anchor: Anchor) {
+		self.identity_anchor = false;
 		self.outer = anchor;
 		self.refresh_anchor();
 	}
@@ -2318,6 +2342,7 @@ impl Subscriber {
 	/// on the inner segment cursors, so a capped group parks here and a rising cap
 	/// re-offers it.
 	pub fn end_at(&mut self, end: impl Into<Cap>) {
+		self.identity_anchor = false;
 		self.end_sequence = end.into().exclusive();
 		// The cap bounds each segment's drift anchor as well as this reader's own
 		// delivery: a segment must not measure against groups this cap hides.
@@ -2430,6 +2455,77 @@ mod test {
 
 	fn recv_pending(sub: &mut Subscriber) {
 		assert!(sub.recv_group().now_or_never().is_none(), "should have blocked");
+	}
+
+	#[tokio::test]
+	async fn removing_an_outer_edge_keeps_a_held_group_within_its_own_budget() {
+		let (mut track, consumer) = track_pair("source");
+		let (mut outside, outside_consumer) = track_pair("outside");
+		let mut producer = Producer::new();
+		producer.switch(&consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_millis(100)));
+		let mut open = track.create_group(group::Info { sequence: 0 }).unwrap();
+		open.write_frame(Timestamp::ZERO, b"head".to_vec()).unwrap();
+		write_group_at(&mut track, 1, "next", Duration::from_millis(20));
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+
+		write_group_at(&mut outside, 10, "far ahead", Duration::from_secs(1));
+		sub.set_anchor(Anchor {
+			edge: outside_consumer.live_edge(None),
+			..Anchor::default()
+		});
+		sub.set_anchor(Anchor::default());
+		assert_eq!(read(&mut held), b"head");
+		assert!(held.read_frame().now_or_never().is_none());
+
+		// The held group follows a route change without polling the subscriber again.
+		let (mut next, next_consumer) = track_pair("replacement");
+		let mut continuation = next.create_group(group::Info { sequence: 0 }).unwrap();
+		continuation
+			.write_frame(Timestamp::ZERO, b"duplicate".to_vec())
+			.unwrap();
+		continuation
+			.write_frame(Timestamp::from_millis(10).unwrap(), b"tail".to_vec())
+			.unwrap();
+		write_group_at(&mut next, 1, "next", Duration::from_millis(20));
+		producer
+			.switch(&next_consumer, Position { group: 0, frame: 1 })
+			.unwrap();
+		assert_eq!(read(&mut held), b"tail");
+		assert!(held.read_frame().now_or_never().is_none());
+	}
+
+	#[tokio::test]
+	async fn removing_a_cap_restores_held_group_expiry() {
+		for outer in [false, true] {
+			let (mut track, consumer) = track_pair("source");
+			let mut producer = Producer::new();
+			producer.switch(&consumer, None).unwrap();
+			let mut sub = producer.consume().subscribe(None);
+			if outer {
+				sub.set_anchor(Anchor {
+					cap: Some(1),
+					..Anchor::default()
+				});
+			} else {
+				sub.end_at(..1);
+			}
+			let mut open = track.create_group(group::Info { sequence: 0 }).unwrap();
+			open.write_frame(Timestamp::ZERO, b"held".to_vec()).unwrap();
+			let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+			write_group_at(&mut track, 1, "next", Duration::from_secs(1));
+			write_group_at(&mut track, 2, "new", Duration::from_secs(2));
+			assert_eq!(read(&mut held), b"held");
+			assert!(held.read_frame().now_or_never().is_none());
+			if outer {
+				sub.set_anchor(Anchor::default());
+			} else {
+				sub.end_at(..);
+			}
+			assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
+		}
 	}
 
 	/// A waker that counts its wakes, for asserting a pending poll left a live

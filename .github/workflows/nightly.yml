@@ -96,6 +96,12 @@ jobs:
           nix develop --command cargo bench --locked -p moq-shaper --bench forward --
           --warm-up-time 1 --measurement-time 2 --sample-size 10
 
+      - name: Resumed track delivery benchmark
+        if: ${{ !cancelled() }}
+        run: >-
+          nix develop --command cargo bench --locked -p moq-net --bench resume --
+          --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot
+
       - name: Audio playout benchmark
         if: ${{ !cancelled() }}
         run: >-
