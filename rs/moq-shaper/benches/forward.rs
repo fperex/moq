@@ -56,21 +56,25 @@ fn forward(c: &mut Criterion) {
 			group.bench_function(BenchmarkId::new(clients.to_string(), steps), |b| {
 				b.iter(|| {
 					runtime.block_on(async {
-						let mut tasks = JoinSet::new();
-						for socket in &sockets {
-							let socket = socket.clone();
-							tasks.spawn(async move {
-								let mut packet = [0; 64];
-								for _ in 0..32 {
-									socket.send(&[7; 64]).await.unwrap();
-									assert_eq!(socket.recv(&mut packet).await.unwrap(), 64);
-									assert_eq!(packet, [7; 64]);
-								}
-							});
-						}
-						while let Some(result) = tasks.join_next().await {
-							result.unwrap();
-						}
+						tokio::time::timeout(Duration::from_secs(10), async {
+							let mut tasks = JoinSet::new();
+							for socket in &sockets {
+								let socket = socket.clone();
+								tasks.spawn(async move {
+									let mut packet = [0; 64];
+									for _ in 0..32 {
+										socket.send(&[7; 64]).await.unwrap();
+										assert_eq!(socket.recv(&mut packet).await.unwrap(), 64);
+										assert_eq!(packet, [7; 64]);
+									}
+								});
+							}
+							while let Some(result) = tasks.join_next().await {
+								result.unwrap();
+							}
+						})
+						.await
+						.expect("shaper round trips did not finish");
 					})
 				});
 			});
