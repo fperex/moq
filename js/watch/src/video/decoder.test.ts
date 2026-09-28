@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, jest, test } from "bun:test";
+import { afterEach, beforeEach, expect, jest, spyOn, test } from "bun:test";
 import { Container } from "@moq/hang";
 import * as Catalog from "@moq/hang/catalog";
 import * as Moq from "@moq/net";
@@ -15,6 +15,7 @@ import type { Source } from "./source";
 /** One `VideoDecoder` the code under test built, with the chunks it was handed. */
 type Built = {
 	chunks: string[];
+	timestamps: number[];
 	/** Emit a decoded picture, which is what keeps the tile out of the stalled state. */
 	emit(timestamp: number): void;
 	/** Raise a codec error, the way a decoder does when it cannot decode what it was fed. */
@@ -59,6 +60,7 @@ beforeEach(() => {
 		constructor(init: { output: (frame: unknown) => void; error: (error: Error) => void }) {
 			this.#entry = {
 				chunks: [],
+				timestamps: [],
 				emit: (timestamp: number) => init.output(new FakeVideoFrame(timestamp)),
 				fail: (error: Error) => init.error(error),
 			};
@@ -69,8 +71,9 @@ beforeEach(() => {
 			this.state = "configured";
 		}
 
-		decode(chunk: { type: string }): void {
+		decode(chunk: { type: string; timestamp: number }): void {
 			this.#entry.chunks.push(chunk.type);
+			this.#entry.timestamps.push(chunk.timestamp);
 		}
 
 		close(): void {
@@ -123,6 +126,62 @@ async function settle(rounds = 10): Promise<void> {
 const TRACK = "video";
 const payload = (n: number) => new Uint8Array(n).fill(1);
 
+const CMAF_CONFIG = (() => {
+	const base = Catalog.VideoConfigSchema.parse({
+		codec: "avc1.640028",
+		container: { kind: "legacy" },
+		description: "01640028",
+		codedWidth: 16,
+		codedHeight: 16,
+	});
+	const init = Container.Cmaf.createVideoInitSegment(base);
+	return Catalog.VideoConfigSchema.parse({
+		...base,
+		container: { kind: "cmaf", init: btoa(String.fromCharCode(...init)) },
+	});
+})();
+
+type TestContainer = "legacy" | "cmaf";
+
+function testConfig(container: TestContainer): Catalog.VideoConfig {
+	return container === "cmaf"
+		? CMAF_CONFIG
+		: Catalog.VideoConfigSchema.parse({ codec: "avc1.640028", container: { kind: "legacy" } });
+}
+
+function writeTestFrame(
+	container: TestContainer,
+	group: Moq.Group.Producer,
+	timestamp: Time.Micro,
+	keyframe: boolean,
+	sequence: number,
+): void {
+	let data: Uint8Array;
+	if (container === "cmaf") {
+		data = Container.Cmaf.encodeDataSegment({
+			kind: "video",
+			data: payload(1),
+			timestamp,
+			duration: 33_000,
+			keyframe,
+			sequence,
+		});
+	} else {
+		const header = Moq.Varint.encode(timestamp);
+		data = new Uint8Array(header.length + 1);
+		data.set(header);
+		data[header.length] = 1;
+	}
+	group.writeFrame({ payload: data, timestamp: Time.Timestamp.now() });
+}
+
+function finishTestGroup(container: TestContainer, group: Moq.Group.Producer, end: Time.Micro): void {
+	if (container === "legacy") {
+		group.writeFrame({ payload: Moq.Varint.encode(end), timestamp: Time.Timestamp.now() });
+	}
+	group.close();
+}
+
 /**
  * Keep the newest decoder producing pictures until the returned function is called.
  *
@@ -167,16 +226,14 @@ class ServedTrack extends Moq.Track.Producer {
 }
 
 /** A live broadcast, a `Decoder` reading it, and every subscription it has raised. */
-function fixture() {
+function fixture(config = testConfig("legacy")) {
 	const broadcast = new Moq.Broadcast.Producer();
 	const consumer = broadcast.consume();
 	const source = {
 		in: { broadcast: new Signal({ relativeBroadcast: () => consumer } as unknown as Broadcast) },
 		out: {
 			track: new Signal<string | undefined>(TRACK),
-			config: new Signal<Catalog.VideoConfig | undefined>(
-				Catalog.VideoConfigSchema.parse({ codec: "avc1.640028", container: { kind: "legacy" } }),
-			),
+			config: new Signal<Catalog.VideoConfig | undefined>(config),
 			catalog: new Signal<Catalog.VideoConfig | undefined>(undefined),
 		},
 	} as unknown as Source;
@@ -247,6 +304,110 @@ test("video advances to a buffered keyframe when the audio playhead reaches it",
 		expect(fx.decoder.out.timestamp.peek()).toBe(Time.Milli(2_000));
 	} finally {
 		fx.close();
+	}
+});
+
+for (const container of ["legacy", "cmaf"] as const) {
+	test(`${container} video never submits an older GOP after live media`, async () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const fx = fixture(testConfig(container));
+		const live = new Moq.Group.Producer(10);
+		const old = new Moq.Group.Producer(5);
+		const forward = new Moq.Group.Producer(11);
+		try {
+			expect(await fx.subscriptions(1)).toBe(1);
+			fx.sync.track("audio").clock.set({
+				timestamp: Time.Micro(10_000_000),
+				reference: Time.Milli.now(),
+				rate: 0,
+			});
+
+			fx.track.writeGroup(live);
+			writeTestFrame(container, live, Time.Micro(10_000_000), true, 0);
+			writeTestFrame(container, live, Time.Micro(10_033_000), false, 1);
+			await settle();
+
+			// Warm-cache groups can arrive below the group already submitted to WebCodecs.
+			fx.track.writeGroup(old);
+			writeTestFrame(container, old, Time.Micro(5_000_000), true, 2);
+			await settle();
+
+			old.close();
+			finishTestGroup(container, live, Time.Micro(10_066_000));
+
+			fx.track.writeGroup(forward);
+			writeTestFrame(container, forward, Time.Micro(10_066_000), true, 3);
+			writeTestFrame(container, forward, Time.Micro(10_099_000), false, 4);
+			forward.close();
+			await settle();
+
+			expect(built[0].timestamps).not.toContain(5_000_000);
+			expect(built[0].timestamps.slice(-2)).toEqual([10_066_000, 10_099_000]);
+			expect(built[0].chunks.slice(-2)).toEqual(["key", "delta"]);
+		} finally {
+			old.close();
+			live.close();
+			forward.close();
+			fx.close();
+			warn.mockRestore();
+		}
+	});
+}
+
+test("a declared marker still resets video when its group arrives behind live media", async () => {
+	const fx = fixture();
+	const live = new Moq.Group.Producer(10);
+	const marker = new Moq.Group.Producer(6);
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		fx.track.writeGroup(live);
+		writeTestFrame("legacy", live, Time.Micro(10_000_000), true, 0);
+		writeTestFrame("legacy", live, Time.Micro(10_033_000), false, 1);
+		await settle();
+		expect(fx.sync.out.reference.peek()).toBeDefined();
+
+		fx.track.writeGroup(marker);
+		marker.writeFrame({ payload: Moq.Varint.encode(Time.Micro(5_033_000)), timestamp: Time.Timestamp.now() });
+		marker.close();
+		await settle();
+
+		expect(fx.sync.out.reference.peek()).toBeUndefined();
+	} finally {
+		live.close();
+		marker.close();
+		fx.close();
+	}
+});
+
+test("a forward discontinuity waits for the next keyframe", async () => {
+	type Next = NonNullable<Awaited<ReturnType<Container.Consumer["next"]>>>;
+	const frame = (
+		group: number,
+		timestamp: number,
+		keyframe: boolean,
+		discontinuity: number,
+		continuous: boolean,
+	): Next => ({
+		group,
+		discontinuity,
+		continuous,
+		frame: { payload: payload(1), timestamp: Time.Micro(timestamp), keyframe },
+	});
+	const results: Next[] = [
+		frame(10, 10_000_000, true, 0, false),
+		frame(10, 10_033_000, false, 0, true),
+		frame(11, 10_066_000, false, 1, false),
+		frame(11, 10_099_000, true, 1, true),
+		frame(11, 10_132_000, false, 1, true),
+	];
+	const read = spyOn(Container.Consumer.prototype, "next").mockImplementation(async () => results.shift());
+	const fx = fixture();
+	try {
+		await settle();
+		expect(built[0].timestamps).toEqual([10_000_000, 10_033_000, 10_099_000, 10_132_000]);
+	} finally {
+		fx.close();
+		read.mockRestore();
 	}
 });
 

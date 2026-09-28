@@ -631,6 +631,7 @@ class DecoderTrack {
 		let previous: Time.Micro | undefined;
 		// Nothing has been decoded yet, so the first thing fed to the codec has to be a keyframe.
 		let keyframeNeeded = true;
+		let decodedGroup: number | undefined;
 
 		effect.spawn(async () => {
 			for (;;) {
@@ -645,6 +646,8 @@ class DecoderTrack {
 
 				const { frame } = next;
 				if (!frame) continue; // The group is done
+				// Groups can arrive newest-first, but a stateful video codec cannot rewind to an older GOP.
+				if (decodedGroup !== undefined && next.group < decodedGroup) continue;
 
 				if (!next.continuous) keyframeNeeded = true;
 				if (keyframeNeeded) {
@@ -688,6 +691,7 @@ class DecoderTrack {
 				previous = frame.timestamp;
 
 				decoder.decode(chunk);
+				decodedGroup = next.group;
 			}
 		});
 	}
@@ -725,6 +729,7 @@ class DecoderTrack {
 		let previous: Time.Micro | undefined;
 		// See `#runLegacy`: nothing has been decoded yet, so the codec needs a keyframe first.
 		let keyframeNeeded = true;
+		let decodedGroup: number | undefined;
 
 		effect.spawn(async () => {
 			for (;;) {
@@ -739,6 +744,7 @@ class DecoderTrack {
 
 				const { frame } = next;
 				if (!frame) continue;
+				if (decodedGroup !== undefined && next.group < decodedGroup) continue;
 
 				// A hole in delivery makes every following delta undecodable. See `#runLegacy`.
 				if (!next.continuous) keyframeNeeded = true;
@@ -776,6 +782,7 @@ class DecoderTrack {
 						timestamp: frame.timestamp,
 					}),
 				);
+				decodedGroup = next.group;
 			}
 		});
 	}
