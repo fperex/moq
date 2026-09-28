@@ -371,8 +371,22 @@ function graph(page: Page, id = 1, handed: Handed = direct()): { render: Process
 	const node = new MessageChannel();
 	nextPort = node.port1;
 	const render = new Render();
+	// Everything the worklet reports: every state goes to the port it is handed, and the node's own port
+	// hears the rest (`unreadable`, and once that the ring played).
 	const states: ToMain[] = [];
-	node.port2.onmessage = (event: MessageEvent<ToMain>) => states.push(event.data);
+	node.port2.onmessage = (event: MessageEvent<ToMain>) => {
+		if (event.data.type !== "state") states.push(event.data);
+	};
+	node.port1.addEventListener("message", (event: MessageEvent<Message>) => {
+		if (event.data.type !== "port") return;
+		const port = event.data.port;
+		const post = port.postMessage.bind(port);
+		port.postMessage = ((msg: ToMain, transfer?: Transferable[]) => {
+			// Copied as postMessage copies it: the worklet refills one state object for every report.
+			if (msg.type === "state") states.push(structuredClone(msg));
+			post(msg, transfer ?? []);
+		}) as MessagePort["postMessage"];
+	});
 	cleanup.push(() => node.port2.close());
 
 	// The worklet's own copy of the port it is handed, as its listener receives it.

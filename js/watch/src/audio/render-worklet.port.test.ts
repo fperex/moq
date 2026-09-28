@@ -112,13 +112,13 @@ describe("render worklet ports", () => {
 		expect(loudest).toBeGreaterThan(0.2);
 
 		await settle();
-		// A state message every five quanta, to the node's port as always and to the writer's.
-		expect(page.length).toBeGreaterThanOrEqual(7);
-		expect(writer.length).toBe(page.length);
+		// A state message every five quanta to the writer's port; the node's port hears once that it played.
+		expect(writer.length).toBeGreaterThanOrEqual(7);
 		const last = writer[writer.length - 1];
 		expect(last.type).toBe("state");
 		expect(last.debug.output).toBeGreaterThan(0);
-		expect(page[page.length - 1]).toEqual(last);
+		expect(page.length).toBe(1);
+		expect(page[0].debug.fresh).toBe(false);
 
 		node.port2.close();
 		extra.port2.close();
@@ -185,5 +185,53 @@ describe("render worklet ports", () => {
 		expect(render.process([], [[new Float32Array(QUANTUM)]], {})).toBe(false);
 
 		node.port2.close();
+	});
+
+	it("reports state only to a handed-over port, telling the node's own port once that the ring played", async () => {
+		// With a worker writing the ring, the page reads the node's port for two things only: that the
+		// ring played, and that a message was unreadable. Everything else is the worker's to hear, and a
+		// report every five quanta to a busy main thread is exactly what the offload is meant to spare it.
+		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
+		const node = new MessageChannel();
+		nextPort = node.port1;
+		const render = new Render();
+		const extra = new MessageChannel();
+		const handoff: Port = { type: "port", port: extra.port1 };
+		node.port2.postMessage(handoff, [extra.port1]);
+		await settle();
+
+		const page: ToMain[] = [];
+		const writer: ToMain[] = [];
+		node.port2.onmessage = (event: MessageEvent<ToMain>) => page.push(event.data);
+		extra.port2.onmessage = (event: MessageEvent<ToMain>) => writer.push(event.data);
+
+		const init: InitPost = {
+			type: "init-post",
+			channels: 1,
+			rate: RATE,
+			latency: Time.Milli(20),
+			buffered: false,
+			conceal: false,
+		};
+		extra.port2.postMessage(init);
+		const chunk = (RATE * 20) / 1000;
+		for (let i = 0; i < 20; i++) {
+			const samples = new Float32Array(chunk).fill(0.25);
+			const data: Data = { type: "data", data: [samples], timestamp: Time.Micro.fromMilli(Time.Milli(i * 20)) };
+			extra.port2.postMessage(data, [samples.buffer]);
+		}
+		await settle();
+
+		// 50 quanta, about 133 ms of playing: ten reports.
+		pull(render, 50);
+		await settle();
+		expect(writer.filter((msg) => msg.type === "state").length).toBe(10);
+		const told = page.filter((msg) => msg.type === "state");
+		expect(told.length).toBeLessThanOrEqual(1);
+		// And what it was told is that the ring played.
+		expect(told.every((msg) => msg.type === "state" && !msg.debug.fresh)).toBe(true);
+
+		node.port2.close();
+		extra.port2.close();
 	});
 });

@@ -31,6 +31,7 @@ class Render extends AudioWorkletProcessor {
 	#unread = false;
 	// Whether the node is done with, so `process` ends the processor. See `Close`.
 	#closed = false;
+	#played = false;
 
 	constructor() {
 		super();
@@ -167,7 +168,14 @@ class Render extends AudioWorkletProcessor {
 					this.#state.playhead = playhead;
 					this.#state.debug = debug;
 				}
-				for (const port of this.#ports) port.postMessage(this.#state);
+				for (const port of this.#ports) {
+					// The page only needs the first playback report when a worker owns the ring.
+					if (port === this.port && this.#ports.length > 1) {
+						if (this.#played || debug.fresh) continue;
+						this.#played = true;
+					}
+					port.postMessage(this.#state);
+				}
 			}
 		}
 

@@ -5,7 +5,7 @@ import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
 /** Everything a writer sends the render worklet: over the node's own port, or over one handed to it as a {@link Port}. */
 export type Message = InitShared | InitPost | Data | End | Latency | Reset | Stall | Truncate | Port | Close;
-/** Everything the render worklet sends back, to every port it holds. */
+/** Playback reports and errors sent by the render worklet. */
 export type ToMain = State | Unreadable;
 
 /**
@@ -23,7 +23,7 @@ export interface Unreadable {
  *
  * A writer that is not on the main thread (a dedicated worker) cannot reach the node's port, so the
  * page hands the worklet one end of a channel and the writer the other, and the ring's writes never
- * wait on the page's event loop. {@link State} goes to every port the worklet holds.
+ * wait on the page's event loop. The writer gets every {@link State}; the page gets the first playback report.
  */
 export interface Port {
 	type: "port";

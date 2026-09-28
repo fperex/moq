@@ -255,10 +255,7 @@ export class Remote {
 		const graph = effect.get(this.in.graph);
 		if (!graph) return;
 
-		// The worklet reports to every port it holds, the node's own included: read here, where the page
-		// sees the ring play, or hears that the worklet could not read what it was sent, without waiting
-		// on the worker, and read at all, since a port never started would queue every report for the
-		// node's life.
+		// The node reports its first playback and any unreadable message directly to the page.
 		const node = graph.target.port;
 		effect.event(node, "message", (event) => {
 			const msg = (event as MessageEvent<ToMain>).data;
