@@ -419,12 +419,7 @@ test("an uncommitted edit leaves the window unchanged", () => {
 	expect(encoder.window).toEqual([2, 3]);
 });
 
-// F7 (review 2026-09-27): the same max-age verdict, reset by a JS publisher and by a Rust one,
-// as the JS subscriber decodes each RESET_STREAM (js/net fromTransport). The Rust publisher sends
-// Old (0x34), which reads back as Stream(Old). The JS publisher sends the code of its `Expired`
-// verdict, which reads back as `Expired`. Both are a group the publisher gave up on, so both must
-// be a gap the window resyncs from, not a fatal error.
-test("F7: an expired group is a gap whichever publisher reset it", async () => {
+test("an expired group is a gap whichever publisher reset it", async () => {
 	for (const [publisher, error] of [
 		["rust (Error::Old, 0x34)", new NetError.Stream(StreamCode.Old)],
 		["js (Expired)", new NetError.Expired()],

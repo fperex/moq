@@ -316,11 +316,7 @@ describe("the event loop monitor", () => {
 	});
 });
 
-// review consumer-sync-video F12. A hidden tab rations the tick to one a second while an
-// audio-only track delivers a PES of several frames every 200ms: the loop is fine, the arrivals
-// are simply further apart than the gap threshold, and the tick is no longer there to vouch for
-// the loop in between. Flagging each of them drops the estimator's reference on every arrival,
-// so its target decays to one bucket; its own idle rule would wait 500ms for that.
+// Hidden tabs can throttle the timer below the cadence of healthy audio arrivals.
 it("a rationed tick does not flag arrivals spaced under the idle threshold", () => {
 	const timer = fake();
 	const stall = new Stall(timer);

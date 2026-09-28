@@ -52,22 +52,9 @@ bench-runtime $ROUNDS="3" $WORKERS="":
     #!/usr/bin/env bash
     exec just --justfile bench/justfile runtime "$ROUNDS" "$WORKERS"
 
-# A linked worktree's Git metadata does not live under its own root: the
-# per-worktree directory is `--git-dir` and everything shared (objects, remote
-# refs, the branch namespace) is under `--git-common-dir`, which for an agent
-# checkout is inside the main repository. Write access to the source tree
-# therefore says nothing about whether this checkout can fetch, branch, or
-# rebase; the answer is a property of those two directories, and finding out by
-# running `git fetch` and reading the error is the slow way.
-#
-# `check` reports; `setup` fetches, points the branch at its base, and records
-# the SHA it fetched under the per-worktree Git directory, where `check` reads it
-# back to say how stale the recorded base has become. Neither ever resets,
-# rebases, cleans, or checks anything out: a dirty tree is someone's work in
-# progress, and adopting a checkout must not be able to destroy it.
-#
-# BASE follows the same rule as the rest of the repo (see `_base`): `main`
-# unless the branch's upstream says otherwise.
+# `check` reports shared and per-worktree Git access. `setup` fetches the base,
+# records its commit, and sets the upstream without changing checked-out files.
+# BASE uses `_base`, which defaults to main unless the upstream selects another base.
 
 # Report a worktree's base, Git metadata access, and state; `setup` also fetches.
 worktree ACTION="check" $BASE="":
@@ -87,9 +74,7 @@ worktree ACTION="check" $BASE="":
     common_dir=$(cd "$(git rev-parse --git-common-dir)" && pwd)
     branch=$(git branch --show-current || true)
 
-    # A written probe rather than `[[ -w ]]`: the directory can be readable and
-    # nominally writable while the sandbox, a read-only mount, or an ACL refuses
-    # the create, and it is the create that fetch and branch creation need.
+    # A write probe catches sandbox and ACL restrictions that `[[ -w ]]` misses.
     access() {
     	local dir="$1" probe
     	[[ -d "$dir" ]] || { echo missing; return; }
@@ -103,8 +88,7 @@ worktree ACTION="check" $BASE="":
     	fi
     }
 
-    # A directory git will create on demand is only as writable as its nearest
-    # existing parent, so probe upward instead of reporting it missing.
+    # Git creates missing directories, so test their nearest existing parent.
     access_or_parent() {
     	local dir="$1" parent
     	while [[ ! -d "$dir" ]]; do
@@ -117,8 +101,7 @@ worktree ACTION="check" $BASE="":
 
     base=$(just _base "$BASE")
     stamp="$git_dir/moq-base"
-    # Whichever remote provides the base, not always origin. A base whose first
-    # segment names no remote (a local branch, a tag) leaves origin.
+    # Local refs have no remote prefix and use origin.
     remote="${base%%/*}"
     git remote | grep -qx "$remote" || remote=origin
 
@@ -126,16 +109,9 @@ worktree ACTION="check" $BASE="":
     heads=$(access "$common_dir/refs/heads")
     worktree_meta=$(access "$git_dir")
     worktree=$(access "$root")
-    # Tracking is `branch.<name>.remote`/`.merge` in the repository config, which
-    # lives in the common directory alongside the `config.lock` the write needs,
-    # not in the branch's ref. Probing refs/heads for it would refuse on a
-    # writable config and, worse, proceed on a read-only one.
+    # Setting the upstream needs config.lock in the shared Git directory.
     config=$(access "$common_dir")
-    # A fetch writes three places, not one: objects, the remote-tracking refs it
-    # updates, and FETCH_HEAD in the per-worktree directory. The refs are the
-    # narrow one: `refs/remotes/<remote>` is where `<branch>.lock` is created, so
-    # probing `refs/remotes` stops a directory short and passes a split that git
-    # then fails on.
+    # Probe the selected remote's directory, where fetch creates branch locks.
     tracking=$(access_or_parent "$common_dir/refs/remotes/$remote")
 
     echo "worktree:    $root"
@@ -164,20 +140,10 @@ worktree ACTION="check" $BASE="":
     		echo "       grant write access to the main repository's Git directory, not just this worktree" >&2
     		exit 1
     	fi
-    	# The remote resolved above, not always origin: recording a stamp against a
-    	# ref nobody refreshed is worse than recording none, and `just check` would
-    	# scope the branch against a base that has since moved.
     	git fetch --quiet "$remote"
-    	# Repointing an upstream someone chose would silently change what `just
-    	# check` scopes against, so only three cases write it: no upstream, an
-    	# upstream `_base` discards anyway (the branch's own remote copy, which
-    	# `git push -u` leaves behind and which says nothing about what the branch
-    	# merges into), and a base the caller named on the command line.
+        # Preserve an intentional upstream unless BASE overrides it. Tracking this
+        # branch's own remote copy does not identify a base for diff-scoped checks.
     	upstream=$(git rev-parse --abbrev-ref '@{upstream}' 2> /dev/null || true)
-    	# Two things stop the write, and they fail identically: a detached HEAD has
-    	# no branch to hang an upstream on, and the config it lands in may be
-    	# read-only. Skipping either silently would report a setup that recorded
-    	# the caller's base while `just check` still scoped against origin/main.
     	blocker=""
     	if [[ -z "$branch" ]]; then
     		blocker="HEAD is detached"
@@ -188,22 +154,15 @@ worktree ACTION="check" $BASE="":
     		if [[ -z "$blocker" ]]; then
     			git branch --set-upstream-to "$base" "$branch"
     		elif [[ "$base" == origin/main ]]; then
-    			# Nothing is lost: with no upstream `_base` falls back to
-    			# origin/main, which is what this would have written.
+                # `_base` already falls back to origin/main without an upstream.
     			echo "warning: cannot record the upstream; $blocker" >&2
     		else
-    			# The upstream is the only place this choice survives, so a setup
-    			# that could not write it did not do what it was asked.
     			echo "error: cannot set the upstream to $base; $blocker" >&2
     			echo "       the branch would keep scoping against origin/main" >&2
     			exit 1
     		fi
     	fi
-    	# Resolved, written, then renamed into place. A redirect straight into the
-    	# stamp truncates it before git runs, so a failure there would leave an
-    	# empty file that reads back as a recorded base that never existed. Each
-    	# setup needs its own temporary file so concurrent runs cannot rename or
-    	# overwrite each other's in-progress stamp.
+        # A unique temporary file keeps failed or concurrent writes from corrupting the stamp.
     	if [[ "$worktree_meta" == write ]]; then
     		stamp_tmp=$(mktemp "$git_dir/.moq-base.XXXXXXXX")
     		if ! git rev-parse "$base" > "$stamp_tmp"; then
@@ -227,9 +186,7 @@ worktree ACTION="check" $BASE="":
     recorded=""
     [[ -f "$stamp" ]] && recorded=$(cat "$stamp")
 
-    # A stamp that no longer names a commit is worse than none: reporting it would
-    # abort here on the `rev-parse --short` rather than say what to do about it.
-    # An interrupted setup, or a base garbage-collected out of the repository.
+    # A recorded commit may have been garbage-collected.
     if [[ -z "$recorded" ]]; then
     	echo "recorded:    (none; run 'just worktree setup')"
     elif ! git rev-parse --verify --quiet "$recorded^{commit}" > /dev/null; then

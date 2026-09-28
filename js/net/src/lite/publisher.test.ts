@@ -1509,11 +1509,8 @@ async function settleMicrotasks() {
 	for (let i = 0; i < 200; i++) await Promise.resolve();
 }
 
-// F6 (review 2026-09-27): every group waiting for its FIN acknowledgement holds one guard, and
-// each guard subscribes to the track's expiry signals. In a dev build @moq/signals throws at the
-// 100th subscriber of one signal ("may be leaking"). A publisher with 100+ groups in flight
-// (congestion, one group per audio frame) must not fail a group, or leave a promise unobserved,
-// because of that cap.
+// The development subscriber cap is 100. Pending FIN acknowledgements must not
+// retain expiry listeners after the group's data has been sent.
 test("120 groups waiting for their FIN do not trip the dev subscriber cap", async () => {
 	const N = 120;
 	const pair = createMockTransportPair(ALPN_05);
