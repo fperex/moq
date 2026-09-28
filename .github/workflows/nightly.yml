@@ -96,6 +96,12 @@ jobs:
           nix develop --command cargo bench --locked -p moq-shaper --bench forward --
           --warm-up-time 1 --measurement-time 2 --sample-size 10
 
+      - name: Audio playout benchmark
+        if: ${{ !cancelled() }}
+        run: >-
+          nix develop --command cargo bench --locked -p moq-audio --bench playout --
+          --warm-up-time 1 --measurement-time 2 --sample-size 30 --noplot
+
       # The OBS plugin and libmoq's C fixtures are the only things that link
       # libmoq.a from outside cargo, so a stale `rs/libmoq/native-libs/*.txt`
       # breaks them and nothing else. obs.yml lists the inputs that can do that,
