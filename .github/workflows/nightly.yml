@@ -102,6 +102,12 @@ jobs:
           nix develop --command cargo bench --locked -p moq-net --bench resume --
           --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot
 
+      - name: Track fanout benchmark
+        if: ${{ !cancelled() }}
+        run: >-
+          nix develop --command cargo bench --locked -p moq-net --bench track --
+          track_fanout_group --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot
+
       - name: Audio playout benchmark
         if: ${{ !cancelled() }}
         run: >-

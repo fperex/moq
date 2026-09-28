@@ -38,6 +38,16 @@ nix develop --command cargo bench --locked -p moq-net --bench resume
 
 The cases sweep 1, 10, and 100 cached groups per route and concurrent subscribers.
 Route setup and subscription creation are excluded from the delivery measurement.
+The warm-route cases drain a finished cached segment before measuring its live
+successor.
+
+Measure live group delivery to 1, 8, 64, and 512 subscribers:
+
+```bash
+nix develop --command cargo bench --locked -p moq-net --bench track -- track_fanout_group
+```
+
+Both resumed-track and live group delivery benchmarks run in Nightly.
 
 Compare one multi-threaded Tokio runtime with the same number of independent
 Tokio/epoll and io\_uring workers:
