@@ -511,9 +511,6 @@ async fn spawn_auth_server(policy: moq_auth::serve::Policy) -> url::Url {
 	url
 }
 
-/// F4 (review 2026-09-27): a draining relay refuses a new session on the io_uring workers too,
-/// instead of admitting it and sending a GOAWAY on arrival, as `a_draining_relay_refuses_a_new_session`
-/// (tests/shutdown_signal.rs) checks for the tokio listeners.
 #[tokio::test]
 async fn a_draining_uring_relay_refuses_a_new_session() {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

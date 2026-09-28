@@ -82,14 +82,14 @@ impl Noise {
 			return;
 		}
 
+		let mut window = [0.0; WINDOW];
 		for (index, channel) in self.channels.iter_mut().enumerate() {
-			let window: Vec<f32> = pcm[(total - take) * channels + index..]
-				.iter()
-				.step_by(channels)
-				.copied()
-				.collect();
+			let samples = pcm[(total - take) * channels + index..].iter().step_by(channels);
+			for (sample, value) in window[..take].iter_mut().zip(samples) {
+				*sample = *value;
+			}
 
-			if channel.update(&window) {
+			if channel.update(&window[..take]) {
 				self.initialised = true;
 			}
 		}
@@ -130,7 +130,8 @@ impl Channel {
 
 	/// Returns whether this window replaced the estimate.
 	fn update(&mut self, window: &[f32]) -> bool {
-		let energy = window.iter().map(|x| x * x).sum::<f32>() / window.len() as f32;
+		let r0: f32 = window.iter().map(|x| x * x).sum();
+		let energy = r0 / window.len() as f32;
 
 		if energy >= self.threshold {
 			// Loud window. Open the search up a little and remember the peak, so the
@@ -142,7 +143,6 @@ impl Channel {
 			return false;
 		}
 
-		let r0: f32 = window.iter().map(|x| x * x).sum();
 		// Digital silence carries no room level and must not lower the search threshold.
 		if r0 <= 0.0 {
 			return false;

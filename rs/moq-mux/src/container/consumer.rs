@@ -2775,11 +2775,6 @@ mod tests {
 		assert!(matches!(event, Some(Event::FrameEnd(end)) if end == ts(15_000)));
 	}
 
-	// review consumer-sync-video F16: the skip's log-only `open` field registers the read loop's
-	// waiter on the group it is about to drain. Counted as wake calls when that group's FIN lands
-	// afterwards. The same poll registers the waiter on group 0 twice elsewhere before it decides to
-	// skip, while group 0 is still what it waits on (two wakes with the log line's registration
-	// removed); a third is the log line's.
 	#[test]
 	fn a_skip_registers_no_extra_waker_on_the_group_it_drains() {
 		use std::sync::atomic::{AtomicUsize, Ordering};

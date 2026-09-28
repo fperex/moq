@@ -21,6 +21,15 @@ Compare the current tree with another revision:
 nix develop --command just bench origin/main
 ```
 
+Measure native audio noise updates and the check for audio held beyond a hole:
+
+```bash
+nix develop --command cargo bench --locked -p moq-audio --bench playout
+```
+
+The cases sweep 1, 2, and 6 channels and 1, 10, 100, and 1,000 queued packets.
+The benchmark also rejects heap allocation during a warmed noise update.
+
 Compare one multi-threaded Tokio runtime with the same number of independent
 Tokio/epoll and io\_uring workers:
 

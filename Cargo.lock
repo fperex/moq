@@ -4187,6 +4187,7 @@ dependencies = [
  "block2 0.6.2",
  "bytes",
  "cpal",
+ "criterion",
  "dispatch2",
  "fixed-resample",
  "hang",

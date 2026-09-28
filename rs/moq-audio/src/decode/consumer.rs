@@ -1668,7 +1668,7 @@ mod tests {
 		producer.cut(None).unwrap();
 	}
 
-	/// N1: a finite Opus track has to end. The pre-skip leaves every packet boundary 168
+	/// A finite Opus track has to end. The pre-skip leaves every packet boundary 168
 	/// frames off the 10 ms block, and live pacing (one packet per two pulls) keeps the
 	/// first fill under the trim that would realign it, so the last 168 frames are less
 	/// than a block. `read` returns `None` only once playout has drained.
@@ -1728,7 +1728,7 @@ mod tests {
 		panic!("a finished track waited for audio that cannot refill it");
 	}
 
-	/// N2: one skipped group is a hole in the timeline, not a new timeline. Eleven packets
+	/// A skipped group leaves the held audio on the same timeline. Eleven packets
 	/// (0 to 220 ms) arrive and playout starts on them; group 11 (220 ms) is never
 	/// published, and groups 12 onward arrive together, far enough past it that the
 	/// container gives up on 11 at once. The audio playout already held in front of the
@@ -1743,7 +1743,6 @@ mod tests {
 		}
 		let first = consumer.read().await.unwrap().expect("first block");
 		let held = consumer.playout.as_ref().unwrap().engine.stats();
-		let budget = consumer.playout.as_ref().unwrap().budget;
 
 		// Group 11 is lost. 12 to 22 land together (the burst after a stall), which puts the
 		// newest (440 ms) a budget past the hole, so the container gives up on 11 at once. It
@@ -1755,19 +1754,10 @@ mod tests {
 		}
 
 		let mut timestamps = vec![first.timestamp.as_micros()];
-		let mut silent = 0;
 		for _ in 0..30 {
 			let frame = consumer.read().await.unwrap().expect("a block");
-			let pcm = Format::F32.as_interleaved_f32(&frame.data, 1).unwrap();
-			if pcm.iter().all(|sample| *sample == 0.0) {
-				silent += 1;
-			}
 			timestamps.push(frame.timestamp.as_micros());
 		}
-		let stats = consumer.playout.as_ref().unwrap().engine.stats();
-		eprintln!("held before the hole: {held:?}, budget {budget:?}");
-		eprintln!("block timestamps (us): {timestamps:?}");
-		eprintln!("all-zero blocks: {silent}, stats after: {stats:?}");
 
 		// Opus pre-skip moves decoded audio 6.5 ms earlier, so the run before the hole
 		// ends at 213.5 ms. A block starting anywhere in its last 25 ms is that audio played.

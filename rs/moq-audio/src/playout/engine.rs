@@ -51,11 +51,8 @@ pub(crate) struct Config {
 	pub(crate) conceal: bool,
 }
 
-/// What the engine has been doing.
-///
-/// Counted always and read by the tests; what a player reports to a viewer, and
-/// through which type, is a decision for whoever builds that panel.
-#[allow(dead_code)]
+/// Playout counters used by the regression tests.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stats {
 	/// Blocks the engine had to invent because nothing was held.
@@ -130,6 +127,7 @@ pub(crate) struct Engine {
 	produced: Vec<f32>,
 	concealed: Vec<f32>,
 
+	#[cfg(test)]
 	stats: Stats,
 }
 
@@ -173,6 +171,7 @@ impl Engine {
 			scratch: Vec::new(),
 			produced: Vec::new(),
 			concealed: Vec::new(),
+			#[cfg(test)]
 			stats: Stats::default(),
 		})
 	}
@@ -218,7 +217,10 @@ impl Engine {
 		// ours to choose.
 		let trimmed = self.trim();
 		if trimmed > 0 {
-			self.stats.trimmed += trimmed as u64;
+			#[cfg(test)]
+			{
+				self.stats.trimmed += trimmed as u64;
+			}
 			// Playout has not begun, so the playhead is simply where it is going to begin.
 			self.playhead = self.buffer.front();
 		}
@@ -295,7 +297,10 @@ impl Engine {
 			// The loop above cannot leave the buffer short, so this is the counter
 			// that says so rather than a path with behaviour.
 			out.fill(0.0);
-			self.stats.short += 1;
+			#[cfg(test)]
+			{
+				self.stats.short += 1;
+			}
 			return;
 		}
 
@@ -402,7 +407,7 @@ impl Engine {
 
 		// A hole cannot extend its preceding fragment, and an endpoint cannot refill
 		// a stalled buffer. Drain those runs while preserving each splice's media time.
-		if self.ended || (ready > 0 && ready < self.block && self.buffer.held() > ready) {
+		if self.ended || (ready > 0 && ready < self.block && self.buffer.has_after(ready)) {
 			if ready == 0 {
 				self.pause();
 			} else if !contiguous {
@@ -466,7 +471,10 @@ impl Engine {
 
 		let shift = match self.stretch.accelerate(&input, &self.noise, fast, &mut produced) {
 			Stretched::Applied { frames, .. } => {
-				self.stats.accelerates += 1;
+				#[cfg(test)]
+				{
+					self.stats.accelerates += 1;
+				}
 				frames as i64
 			}
 			Stretched::Skipped => {
@@ -496,7 +504,10 @@ impl Engine {
 
 		let shift = match self.stretch.preemptive_expand(&input, 0, &self.noise, &mut produced) {
 			Stretched::Applied { frames, .. } => {
-				self.stats.accelerates += 1;
+				#[cfg(test)]
+				{
+					self.stats.accelerates += 1;
+				}
 				-(frames as i64)
 			}
 			Stretched::Skipped => {
@@ -524,8 +535,9 @@ impl Engine {
 
 	// Nothing to play: invent a block, or ramp into silence if the caller asked for
 	// concealment to stay off.
-	fn conceal(&mut self, underrun: bool) {
-		if underrun {
+	fn conceal(&mut self, _underrun: bool) {
+		#[cfg(test)]
+		if _underrun {
 			self.stats.underruns += 1;
 		}
 
@@ -543,7 +555,10 @@ impl Engine {
 			}
 		}
 
-		self.stats.expands += 1;
+		#[cfg(test)]
+		{
+			self.stats.expands += 1;
+		}
 		self.commit(&produced, Duration::ZERO, 0, true);
 		self.produced = produced;
 	}
@@ -677,13 +692,12 @@ impl Engine {
 		}
 	}
 
-	fn record_skip(&mut self, dropped: usize) {
-		if dropped == 0 {
-			return;
+	fn record_skip(&mut self, _dropped: usize) {
+		#[cfg(test)]
+		if _dropped > 0 {
+			self.stats.skips += 1;
+			self.stats.skipped += _dropped as u64;
 		}
-
-		self.stats.skips += 1;
-		self.stats.skipped += dropped as u64;
 	}
 }
 
@@ -1100,20 +1114,22 @@ mod tests {
 
 	#[test]
 	fn a_finished_run_keeps_the_playhead_across_a_hole() {
-		let mut engine = Engine::new(config(1, false)).unwrap();
-		engine.insert(Duration::ZERO, 0.0, &[0.25; 960]);
-		engine.insert(Duration::from_millis(40), 40.0, &[0.5; 960]);
-		engine.end();
-		let mut out = vec![0.0; engine.block()];
-		for _ in 0..10 {
-			if engine.drained() {
-				break;
+		for conceal in [false, true] {
+			let mut engine = Engine::new(config(1, conceal)).unwrap();
+			engine.insert(Duration::ZERO, 0.0, &[0.25; 960]);
+			engine.insert(Duration::from_millis(40), 40.0, &[0.5; 960]);
+			engine.end();
+			let mut out = vec![0.0; engine.block()];
+			for _ in 0..10 {
+				if engine.drained() {
+					break;
+				}
+				engine.pull(&mut out);
 			}
-			engine.pull(&mut out);
+			assert!(engine.drained());
+			assert_eq!(engine.playhead(), Some(Duration::from_millis(60)));
+			assert_eq!(engine.stats().underruns, 0);
 		}
-		assert!(engine.drained());
-		assert_eq!(engine.playhead(), Some(Duration::from_millis(60)));
-		assert_eq!(engine.stats().underruns, 0);
 	}
 
 	#[test]
@@ -1143,7 +1159,7 @@ mod tests {
 		)
 	}
 
-	/// N1: a run shorter than one block at the front of the buffer, with a hole behind
+	/// A run shorter than one block at the front of the buffer, with a hole behind
 	/// it, never grows into a block. Live pacing (one 20 ms packet per two pulls) keeps
 	/// the first fill under the trim, so the play cursor stays on multiples of 480 and
 	/// the run before the hole ends 168 frames short of a block. The audio behind the

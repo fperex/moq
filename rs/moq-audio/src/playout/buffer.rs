@@ -151,9 +151,12 @@ impl Buffer {
 		ready
 	}
 
-	/// Frames held in all, including any past a hole.
-	pub(crate) fn held(&self) -> usize {
-		self.packets.iter().map(|packet| packet.pcm.len() / self.channels).sum()
+	/// Whether any frames are held beyond `count`, including across a hole.
+	pub(crate) fn has_after(&self, count: usize) -> bool {
+		self.packets
+			.iter()
+			.try_fold(count, |left, packet| left.checked_sub(packet.pcm.len() / self.channels))
+			.is_none()
 	}
 
 	/// Media time just past the newest sample held, or `None` when the buffer is empty.
