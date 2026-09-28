@@ -18,6 +18,7 @@ import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import { type Computed, Effect, type Getter, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Clock, Sync } from "../../sync";
+import { outputTimestamp } from "../buffer";
 import type { Stats } from "../decoder";
 import type { Snapshot } from "../playout";
 import type { Port, ToMain } from "../render";
@@ -159,6 +160,7 @@ export class Remote {
 	// report, whether audio reached it since the last check, and whether the ring has ever played.
 	readonly #deadline = new Deadline();
 	#last?: Report;
+	#sampleOutput?: () => void;
 	#heard = false;
 	readonly #played = new Signal(false);
 
@@ -278,7 +280,15 @@ export class Remote {
 		effect.set(this.#out.ring, this.#ring, undefined);
 
 		// Only the page can read its output clock, which the postMessage ring maps its playhead through.
-		const output = () => this.#lease.post({ type: "output", id: this.#lease.id, output: sample(graph.context) });
+		const output = () => {
+			const sampled = sample(graph.context);
+			this.#lease.post({ type: "output", id: this.#lease.id, output: sampled });
+			// The device clock can appear after statechange. Sample as the worker reports progress.
+			this.#sampleOutput = !sampled && graph.context.state === "running" ? output : undefined;
+		};
+		effect.cleanup(() => {
+			this.#sampleOutput = undefined;
+		});
 		output();
 		effect.event(graph.context, "statechange", output);
 		effect.interval(output, OUTPUT_INTERVAL);
@@ -376,6 +386,7 @@ export class Remote {
 	}
 
 	#report(report: Report): void {
+		this.#sampleOutput?.();
 		// What the deadline goes on, whichever flush it was composed under.
 		this.#last = report;
 		if (report.arrivals.length > 0) this.#heard = true;
@@ -435,11 +446,9 @@ export class Remote {
 
 /**
  * When the context's current sample leaves the output device, or undefined while the device has not
- * started, which `getOutputTimestamp` reads as both zero.
+ * started, which `getOutputTimestamp` reads with a zero performance time.
  */
 function sample(context: Pick<AudioContext, "getOutputTimestamp">): Output | undefined {
-	const { contextTime, performanceTime } = context.getOutputTimestamp();
-	if (contextTime === undefined || performanceTime === undefined) return undefined;
-	if (contextTime === 0 && performanceTime === 0) return undefined;
-	return { contextTime, at: performance.timeOrigin + performanceTime };
+	const output = outputTimestamp(context);
+	return output && { contextTime: output.contextTime, at: performance.timeOrigin + output.performanceTime };
 }

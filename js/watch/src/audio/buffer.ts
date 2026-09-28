@@ -232,10 +232,18 @@ export function supportsSharedArrayBuffer(): boolean {
 	return true;
 }
 
+/** Read the device clock once it has a complete timestamp. */
+export function outputTimestamp(context: Pick<AudioContext, "getOutputTimestamp">): Required<AudioTimestamp> | undefined {
+	const { contextTime, performanceTime } = context.getOutputTimestamp?.() ?? {};
+	// Chromium can expose context time before the device has produced a performance timestamp.
+	if (contextTime === undefined || performanceTime === undefined || performanceTime === 0) return undefined;
+	return { contextTime, performanceTime };
+}
+
 /** How the ring behind the worklet is built. */
 export interface AudioBufferProps {
 	/** Maps render time to the audio device's output clock. */
-	context: Pick<AudioContext, "getOutputTimestamp">;
+	context: Pick<AudioContext, "getOutputTimestamp"> & Partial<Pick<AudioContext, "currentTime">>;
 	/** Channels of planar PCM the graph runs at. */
 	channels: number;
 	/** Samples per second per channel. */
@@ -358,7 +366,16 @@ class SharedAudioBuffer implements AudioBuffer {
 			this.#stalled.set(stalled);
 			this.#underruns.set(this.#ring.underruns);
 			this.#debug.set(this.#ring.debug());
-			this.#clock.set(this.#clockSource.sample(playhead));
+			const output = outputTimestamp(props.context);
+			const rendered = props.context.currentTime;
+			this.#clock.set(
+				output && rendered !== undefined
+					? this.#clockSource.sample(
+							playhead,
+							Time.Milli(output.performanceTime + (rendered - output.contextTime) * 1000),
+						)
+					: undefined,
+			);
 			// While stalled the playhead is parked, so release the decode loop to refill the floor;
 			// once playing, hold it to ~the floor ahead.
 			if (stalled || !playhead) this.#backpressure.flush();
@@ -494,17 +511,15 @@ class PostAudioBuffer implements AudioBuffer {
 				this.#stalled.set(data.debug.stalled);
 				this.#underruns.set(data.debug.underruns);
 				this.#debug.set(data.debug);
-				const { contextTime, performanceTime } = props.context.getOutputTimestamp();
-				if (contextTime === undefined || performanceTime === undefined) {
-					throw new Error("Audio output timestamp is missing");
-				}
+				const output = outputTimestamp(props.context);
 				// Message delivery varies with main-thread load. Anchor the playhead to when its
 				// samples reach the output device so that delivery jitter does not pace video.
-				const reference = Time.Milli(performanceTime + (data.contextTime - contextTime) * 1000);
 				this.#clock.set(
-					contextTime === 0 && performanceTime === 0
-						? undefined
-						: this.#clockSource.sample(data.playhead, reference),
+					output &&
+						this.#clockSource.sample(
+							data.playhead,
+							Time.Milli(output.performanceTime + (data.contextTime - output.contextTime) * 1000),
+						),
 				);
 				// While stalled the playhead is parked, so release the decode loop to refill the floor;
 				// once playing, hold it to ~the floor ahead.

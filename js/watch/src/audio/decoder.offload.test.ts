@@ -647,6 +647,7 @@ describe("what the page tells the worker", () => {
 
 	it("samples its output clock when it hands over the graph, when the context changes state, and every second", async () => {
 		jest.useFakeTimers();
+		jest.advanceTimersByTime(1);
 		scope.crossOriginIsolated = false;
 		const t = tile({ offload: true });
 		for (let i = 0; i < 200 && !InProcessWorker.created[0]?.told("graph").length; i++) await immediate();
@@ -1241,5 +1242,29 @@ describe("the thread a player's audio runs on", () => {
 			return thread?.kind === "worker" && thread.transport === "webtransport";
 		}, "the worker's transport");
 		expect(t.page.total()).toBe(0);
+	});
+});
+
+
+describe("the worker output clock after resume", () => {
+	it("rejects a missing device timestamp and refreshes it on the next worker report", async () => {
+		jest.useFakeTimers();
+		jest.advanceTimersByTime(50_000);
+		const t = tile({ offload: true });
+		for (let i = 0; i < 200 && !InProcessWorker.created[0]?.told("graph").length; i++) await immediate();
+		const context = t.decoder.out.context.peek();
+		if (!context) throw new Error("no audio context");
+		let output: AudioTimestamp = { contextTime: 0.971, performanceTime: 0 };
+		context.getOutputTimestamp = () => output;
+		context.dispatchEvent(new Event("statechange"));
+		expect(worker().told("output").at(-1)?.output).toBeUndefined();
+
+		output = { contextTime: 1.02, performanceTime: performance.now() };
+		jest.advanceTimersByTime(50);
+		for (let i = 0; i < 20; i++) await immediate();
+		expect(worker().told("output").at(-1)?.output).toEqual({
+			contextTime: 1.02,
+			at: performance.timeOrigin + (output.performanceTime ?? 0),
+		});
 	});
 });
