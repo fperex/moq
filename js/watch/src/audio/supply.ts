@@ -416,8 +416,6 @@ export class Supply {
 		this.#terminal.clear(preSkip);
 		const format =
 			config.container.kind === "loc" ? new Container.Loc.Format("audio") : new Container.Legacy.Format(config);
-		// Create consumer with slightly less latency than the render worklet to avoid underflowing.
-		// TODO include JITTER_UNDERHEAD
 		const consumer = new Container.Consumer(sub, {
 			format,
 			maxAge: this.in.maxAge,

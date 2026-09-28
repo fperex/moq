@@ -228,8 +228,6 @@ describe("Renderer", () => {
 	});
 });
 
-// --- review consumer-sync-video F11 ---
-
 describe("Renderer frame pairs", () => {
 	let callbacks: Map<number, FrameRequestCallback>;
 	let nextCallback: number;
