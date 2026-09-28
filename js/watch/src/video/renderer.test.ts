@@ -227,3 +227,123 @@ describe("Renderer", () => {
 		}
 	});
 });
+
+// --- review consumer-sync-video F11 ---
+
+describe("Renderer frame pairs", () => {
+	let callbacks: Map<number, FrameRequestCallback>;
+	let nextCallback: number;
+	let originalRequest: PropertyDescriptor | undefined;
+	let originalCancel: PropertyDescriptor | undefined;
+
+	beforeEach(() => {
+		callbacks = new Map();
+		nextCallback = 0;
+		originalRequest = Object.getOwnPropertyDescriptor(globalThis, "requestAnimationFrame");
+		originalCancel = Object.getOwnPropertyDescriptor(globalThis, "cancelAnimationFrame");
+		Object.defineProperty(globalThis, "requestAnimationFrame", {
+			configurable: true,
+			value: (callback: FrameRequestCallback) => {
+				const id = ++nextCallback;
+				callbacks.set(id, callback);
+				return id;
+			},
+		});
+		Object.defineProperty(globalThis, "cancelAnimationFrame", {
+			configurable: true,
+			value: (id: number) => callbacks.delete(id),
+		});
+	});
+
+	afterEach(() => {
+		if (originalRequest) Object.defineProperty(globalThis, "requestAnimationFrame", originalRequest);
+		else Reflect.deleteProperty(globalThis, "requestAnimationFrame");
+		if (originalCancel) Object.defineProperty(globalThis, "cancelAnimationFrame", originalCancel);
+		else Reflect.deleteProperty(globalThis, "cancelAnimationFrame");
+	});
+
+	// One display refresh at 60Hz: rAF hands the callbacks the refresh's timestamp.
+	let refreshAt = 0;
+	function paint(): void {
+		refreshAt += 1000 / 60;
+		const pending = [...callbacks.values()];
+		callbacks.clear();
+		for (const callback of pending) callback(refreshAt);
+	}
+
+	function setup(first: number) {
+		const drawn: number[] = [];
+		const frame = (timestamp: number) =>
+			({
+				timestamp,
+				clone() {
+					return this;
+				},
+				close() {},
+			}) as unknown as VideoFrame;
+		const context = {
+			canvas: { width: 640, height: 360 },
+			save() {},
+			restore() {},
+			fillRect() {},
+			drawImage(value: VideoFrame) {
+				drawn.push(value.timestamp);
+			},
+		};
+		const frames = new Signal<VideoFrame | undefined>(frame(first));
+		const decoder = {
+			in: { enabled: new Signal(true) },
+			out: { display: new Signal(undefined), frame: frames },
+			source: { out: { catalog: new Signal(undefined) } },
+		} as unknown as Decoder;
+		const renderer = new Renderer({
+			decoder,
+			canvas: { getContext: () => context } as unknown as HTMLCanvasElement,
+			visible: "never",
+		});
+		return { drawn, renderer, show: (timestamp: number) => frames.set(frame(timestamp)) };
+	}
+
+	it("presents both frames of a 30 fps pair released within one refresh", async () => {
+		const { drawn, renderer, show } = setup(-33_333);
+		try {
+			await settle();
+			paint();
+			// A late timer releases two adjacent 30fps frames inside one refresh.
+			show(0);
+			await settle();
+			show(33_333);
+			await settle();
+			paint();
+			paint();
+			expect(drawn.slice(1)).toEqual([0, 33_333]);
+		} finally {
+			renderer.close();
+		}
+	});
+
+	it("does not keep a standing one-refresh lag", async () => {
+		const { drawn, renderer, show } = setup(0);
+		try {
+			await settle();
+			paint();
+			// A 60fps pair lands inside one refresh, then one frame per refresh as usual.
+			show(16_667);
+			await settle();
+			show(33_333);
+			await settle();
+			paint();
+			let latest = 33_333;
+			for (let i = 0; i < 4; i++) {
+				latest += 16_667;
+				show(latest);
+				await settle();
+				paint();
+			}
+			// Within two refreshes of the pair the picture is back to the newest released frame.
+			expect(drawn.at(-1)).toBe(latest);
+		} finally {
+			renderer.close();
+		}
+	});
+});

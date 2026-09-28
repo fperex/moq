@@ -150,15 +150,31 @@ export class Renderer {
 		let dirty = false;
 		let source: VideoFrame | undefined;
 		const frames: VideoFrame[] = [];
+		// The display's refresh interval, measured from rAF timestamps (60Hz until measured), and
+		// whether the last refresh left a frame queued. A pair released inside one refresh is shown
+		// over two; a queue that is still non-empty a refresh later is a standing lag, so it drains.
+		let refresh = 1000 / 60;
+		let last: number | undefined;
+		let carried = false;
 		const clear = () => {
 			for (const frame of frames) frame.close();
 			frames.length = 0;
+			carried = false;
 		};
-		const render = () => {
+		const render = (now?: number) => {
 			animate = undefined;
+			if (now !== undefined && last !== undefined) {
+				const delta = now - last;
+				if (delta > 0 && delta < 100) refresh = delta;
+			}
+			if (now !== undefined) last = now;
+			if (carried && frames.length > 1) {
+				while (frames.length > 1) frames.shift()?.close();
+			}
 			if (dirty || frames.length) {
 				dirty = false;
 				const pending = frames.shift();
+				carried = frames.length > 0;
 				const frame = pending ?? (source ? this.#out.frame.peek() : undefined);
 				const video = this.decoder.source.out.catalog.peek();
 				try {
@@ -186,8 +202,11 @@ export class Renderer {
 			if (frame && (frame !== source || reset)) {
 				frames.push(frame.clone());
 				// Timers can release adjacent frames on opposite sides of a display refresh.
-				// Preserve that pair, but never turn it into a stale presentation backlog.
-				while (frames.length > 2 || (frames[0] && frame.timestamp - frames[0].timestamp > 20_000)) {
+				// Preserve that pair, but never turn it into a stale presentation backlog. Adjacent
+				// is sized from the display, not a fixed 20ms of media: two refreshes' worth keeps a
+				// 30fps pair on a 60Hz display.
+				const adjacent = Math.max(20_000, 2.1 * refresh * 1000);
+				while (frames.length > 2 || (frames[0] && frame.timestamp - frames[0].timestamp > adjacent)) {
 					frames.shift()?.close();
 				}
 			}
