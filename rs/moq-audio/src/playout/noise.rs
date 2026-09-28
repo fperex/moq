@@ -142,14 +142,14 @@ impl Channel {
 			return false;
 		}
 
-		// Quiet window: the level is worth having whatever the spectrum turns out to
-		// be, so record it before the flatness test can reject the filter.
-		self.threshold = energy.max(MIN_ENERGY);
-
 		let r0: f32 = window.iter().map(|x| x * x).sum();
+		// Digital silence carries no room level and must not lower the search threshold.
 		if r0 <= 0.0 {
 			return false;
 		}
+
+		// Keep the quiet level even when the flatness test rejects its spectrum.
+		self.threshold = energy.max(MIN_ENERGY);
 		let r1: f32 = window.windows(2).map(|w| w[0] * w[1]).sum();
 		let reflection = (r1 / r0).clamp(-0.99, 0.99);
 
@@ -237,5 +237,39 @@ mod tests {
 		// The fixture's noise is uniform on -level..level, so its mean energy is level^2 / 3.
 		let ratio = estimate.energy(0) / (level * level / 3.0);
 		assert!(ratio > 0.25 && ratio < 4.0, "estimated {}", estimate.energy(0));
+	}
+
+	/// One update per 20 ms block at 48 kHz, the way the engine feeds it.
+	fn feed(estimate: &mut Noise, pcm: &[f32]) {
+		for chunk in pcm.as_chunks::<960>().0 {
+			estimate.update(chunk);
+		}
+	}
+
+	#[test]
+	fn zeros_do_not_lock_out() {
+		// Trained on a room, then half a second of exact zeros (a disabled mic, or a hole the
+		// ring filled), then the room comes back quieter. A quiet window is accepted on sight,
+		// so two seconds (a hundred updates) is plenty to be on the new level.
+		let mut estimate = Noise::new(1);
+		feed(&mut estimate, &noise(48_000, 2.0, 0.003, 1));
+		assert!(estimate.initialised());
+		feed(&mut estimate, &vec![0.0; 24_000]);
+		feed(&mut estimate, &noise(48_000, 2.0, 0.001, 1));
+		let expected = 0.001f32 * 0.001 / 3.0;
+		let db = 10.0 * (estimate.energy(0) / expected).log10();
+		assert!(
+			db.abs() < 3.0,
+			"estimate is {db:.2} dB off the room after digital silence"
+		);
+	}
+
+	#[test]
+	fn zeros_before_training_do_not_lock_out() {
+		// Zeros before any training: the first room tone should still train it.
+		let mut fresh = Noise::new(1);
+		feed(&mut fresh, &vec![0.0; 24_000]);
+		feed(&mut fresh, &noise(48_000, 1.0, 0.001, 1));
+		assert!(fresh.initialised(), "a second of room tone after zeros should train it");
 	}
 }
