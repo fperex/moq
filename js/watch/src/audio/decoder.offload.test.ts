@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, jest, mock, spyOn } from "bun:test";
-import type * as Catalog from "@moq/hang/catalog";
+import * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
 import { Group, Origin, Path, Time, Varint } from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
@@ -1265,5 +1265,38 @@ describe("the worker output clock after resume", () => {
 			contextTime: 1.02,
 			at: performance.timeOrigin + (output.performanceTime ?? 0),
 		});
+	});
+});
+
+describe("the decoded rate's rendition", () => {
+	it("does not carry a learned rate into a different decoder configuration", async () => {
+		const rates: number[] = [];
+		scope.AudioContext = class extends MockContext {
+			constructor(options?: { sampleRate?: number }) {
+				super(options);
+				rates.push(this.sampleRate);
+			}
+		};
+		const t = tile({ offload: true });
+		const config = (sampleRate: number): Catalog.Root =>
+			Catalog.RootSchema.parse({
+				audio: {
+					renditions: {
+						audio: { codec: "opus", container: { kind: "legacy" }, sampleRate, numberOfChannels: 2 },
+					},
+				},
+			});
+		t.catalog.set(config(44_100));
+		await until(() => handed()(), "the graph handed over");
+		for (let i = 0; i < 20; i++) t.write(i, i * 20_000);
+		await until(() => t.decoder.out.context.peek()?.sampleRate === RATE, "the decoded rate");
+		t.attached.set(false);
+		await until(() => t.decoder.out.context.peek() === undefined, "the context closed");
+		t.catalog.set(config(32_000));
+		await sleep(25);
+		const before = rates.length;
+		t.attached.set(true);
+		await until(() => rates.length > before, "the replacement context");
+		expect(rates[before]).toBe(32_000);
 	});
 });
