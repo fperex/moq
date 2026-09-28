@@ -150,11 +150,9 @@ export class Decoder {
 	// set.
 	#recover = RECOVER;
 
-	// The longest wall-clock wait seen between two successive new pictures, and the last new one.
-	// A rendition that only sends a frame when its content changes (a static screen share) is
-	// healthy through silences longer than RECOVER; once one such gap has been seen, the recovery
-	// window stretches to cover it, so the watchdog stops rebuilding a subscription that is fine.
-	#cadence = Time.Milli.zero;
+	// Four intervals retain both long gaps of an alternating cadence; exclude the single longest
+	// when estimating recovery so an isolated outage does not teach a slower frame rate.
+	#intervals: Time.Milli[] = [];
 	#painted?: { at: Time.Milli; timestamp: number };
 	#cadenceSource?: { broadcast: Moq.Broadcast.Consumer; track: string };
 
@@ -332,7 +330,7 @@ export class Decoder {
 		effect.cleanup(() => active.close());
 		if (this.#cadenceSource?.broadcast !== active.broadcast || this.#cadenceSource.track !== active.track) {
 			this.#cadenceSource = { broadcast: active.broadcast, track: active.track };
-			this.#cadence = Time.Milli.zero;
+			this.#intervals.length = 0;
 			this.#painted = undefined;
 		}
 
@@ -399,7 +397,10 @@ export class Decoder {
 		const now = Time.Milli.now();
 		const painted = this.#painted;
 		if (!painted || frame.timestamp > painted.timestamp) {
-			if (painted) this.#cadence = Time.Milli.max(this.#cadence, Time.Milli.sub(now, painted.at));
+			if (painted) {
+				this.#intervals.push(Time.Milli.sub(now, painted.at));
+				if (this.#intervals.length > 4) this.#intervals.shift();
+			}
 			this.#painted = { at: now, timestamp: frame.timestamp };
 		}
 
@@ -417,9 +418,10 @@ export class Decoder {
 		if (!effect.get(this.#active)) return;
 		if (!effect.get(this.#out.stalled)) return;
 
-		// Twice the longest gap a healthy source has already shown, so a sparse rendition is not
-		// rebuilt at every silence; still bounded by the ceiling for a subscription that really died.
-		const after = Time.Milli(Math.min(RECOVER_MAX, Math.max(this.#recover, 2 * this.#cadence)));
+		// With only one interval, allow the first sparse gap before there is a cadence to compare.
+		const intervals = [...this.#intervals].sort((a, b) => b - a);
+		const cadence = intervals[1] ?? intervals[0] ?? Time.Milli.zero;
+		const after = Time.Milli(Math.min(RECOVER_MAX, Math.max(this.#recover, 2 * cadence)));
 		effect.timer(() => {
 			this.#recover = Time.Milli(Math.min(RECOVER_MAX, after * 2));
 			this.#rebuild(`no frame for ${after}ms`);

@@ -637,3 +637,73 @@ test("a new rendition does not inherit a sparse rendition's recovery window", as
 		fx.close();
 	}
 });
+
+for (const resumed of [1, 3]) {
+	test(`a recovered 30 fps source keeps its recovery window after ${resumed} frame(s) resume`, async () => {
+		const fx = fixture();
+		const paint = async (timestamp: number) => {
+			fx.sync.track("audio").clock.set({
+				timestamp: Time.Micro(timestamp),
+				reference: Time.Milli.now(),
+				rate: 0,
+			});
+			fx.served[0].encode(payload(16), Time.Micro(timestamp), true);
+			await settle();
+			built.at(-1)?.emit(timestamp);
+			await settle();
+		};
+		try {
+			expect(await fx.subscriptions(1)).toBe(1);
+			for (let i = 0; i < 3; i++) {
+				await paint(i * 33_333);
+				await advance(34);
+			}
+			await advance(30_000);
+			for (let i = 0; i < resumed; i++) {
+				await paint(30_100_000 + i * 33_333);
+				await advance(34);
+			}
+			expect(fx.decoder.out.frame.peek()?.timestamp).toBe(30_100_000 + (resumed - 1) * 33_333);
+			const before = built.length;
+			await advance(6_000);
+			expect(built).toHaveLength(before + 1);
+		} finally {
+			fx.close();
+		}
+	});
+}
+
+test("alternating sparse intervals stop rebuilding once both gaps repeat", async () => {
+	const fx = fixture();
+	let timestamp = 0;
+	const paint = async () => {
+		fx.sync.track("audio").clock.set({
+			timestamp: Time.Micro(timestamp),
+			reference: Time.Milli.now(),
+			rate: 0,
+		});
+		fx.served[0].encode(payload(16), Time.Micro(timestamp), true);
+		await settle();
+		built.at(-1)?.emit(timestamp);
+		await settle();
+	};
+	const cycle = async () => {
+		for (const interval of [2_000, 6_000]) {
+			await advance(interval);
+			timestamp += interval * 1_000;
+			await paint();
+		}
+	};
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		await paint();
+		await cycle();
+		await cycle();
+		const before = built.length;
+		for (let i = 0; i < 4; i++) await cycle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(48_000_000);
+		expect(built).toHaveLength(before);
+	} finally {
+		fx.close();
+	}
+});
