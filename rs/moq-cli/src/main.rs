@@ -472,9 +472,11 @@ async fn run_play(moq: MoqSide, args: play::Args, net: Net) -> anyhow::Result<()
 		..Default::default()
 	};
 	let client = net.client(moq.client.clone())?;
-	let (_, origin) = spawn_moq(&moq, &net, client, cluster, directions, &mut tasks).await?;
+	let (_, origin) = spawn_moq(&moq, &net, client.clone(), cluster, directions, &mut tasks).await?;
 
-	play::run(origin.consume(), name, args, tasks)
+	let result = play::run(origin.consume(), name, args, tasks);
+	client.close().await;
+	result
 }
 
 /// Run every stage over one Origin and one MoQ attachment.
@@ -822,6 +824,39 @@ mod tests {
 	use std::pin::Pin;
 
 	type Pipeline = Pin<Box<dyn Future<Output = anyhow::Result<()>>>>;
+
+	#[cfg(unix)]
+	async fn signal_exits(signal: &str) {
+		let mut waiting = std::pin::pin!(shutdown_signal());
+		std::future::poll_fn(|cx| {
+			assert!(waiting.as_mut().poll(cx).is_pending());
+			std::task::Poll::Ready(())
+		})
+		.await;
+		assert!(
+			std::process::Command::new("/bin/kill")
+				.args([signal, &std::process::id().to_string()])
+				.status()
+				.unwrap()
+				.success()
+		);
+		tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+			.await
+			.expect("shutdown signal was not handled")
+			.unwrap();
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn sigterm_stops_the_cli() {
+		signal_exits("-TERM").await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn sigint_stops_the_cli() {
+		signal_exits("-INT").await;
+	}
 
 	/// A local pipeline that dies takes the process with it, even while another one is
 	/// still running. Reporting completion from inside the task instead would miss
