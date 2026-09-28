@@ -10,6 +10,18 @@ use std::{
 };
 
 #[test]
+fn a_zero_report_interval_is_refused() {
+	let output = Command::new(env!("CARGO_BIN_EXE_moq-shaper"))
+		.args(["--listen", "127.0.0.1:0", "--target", "127.0.0.1:9"])
+		.args(["--report-interval", "0s"])
+		.output()
+		.unwrap();
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert_eq!(output.status.code(), Some(2), "{stderr}");
+	assert!(stderr.contains("must be greater than zero"), "{stderr}");
+}
+
+#[test]
 fn a_profile_run_reports_its_counters() {
 	// The target answers TCP on the port number it takes datagrams on, as a relay does.
 	let target = UdpSocket::bind("127.0.0.1:0").unwrap();

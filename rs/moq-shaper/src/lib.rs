@@ -247,13 +247,24 @@ const IMPAIRMENTS: [Impairment; 3] = [
 /// cannot, and that is when the silence means the profile is not in the path.
 const IMPLAUSIBLE: f64 = 1e-4;
 
-/// The impairments `config` configures that `stats` shows implausibly never acted.
-fn unapplied(config: &Config, stats: &Stats) -> Vec<&'static str> {
+/// Impairments that implausibly never acted on traffic under their configured profile.
+fn unapplied(setup: &Setup, stats: &Stats, segments: &[Vec<u64>; 2]) -> Vec<&'static str> {
 	IMPAIRMENTS
 		.iter()
 		.filter(|(_, chance, acted)| {
-			let silence = (1.0 - chance(&config.up)).powf(stats.up.packets as f64)
-				* (1.0 - chance(&config.down)).powf(stats.down.packets as f64);
+			let silence: f64 = [(&setup.config.up, &setup.up), (&setup.config.down, &setup.down)]
+				.into_iter()
+				.zip(segments)
+				.map(|((profile, options), packets)| {
+					let mut profile = profile.clone();
+					let mut silence = (1.0 - chance(&profile)).powf(packets[options.steps.len()] as f64);
+					for (step, &packets) in options.steps.iter().zip(packets.iter().rev().skip(1)) {
+						step.apply(&mut profile);
+						silence *= (1.0 - chance(&profile)).powf(packets as f64);
+					}
+					silence
+				})
+				.product();
 			acted(&stats.up) + acted(&stats.down) == 0 && silence < IMPLAUSIBLE
 		})
 		.map(|(name, ..)| *name)
@@ -422,7 +433,7 @@ impl Shaper {
 			false => None,
 		};
 
-		let tally = Arc::new([Tally::default(), Tally::default()]);
+		let tally = Arc::new([Tally::new(setup.up.steps.len()), Tally::new(setup.down.steps.len())]);
 		let failed = Arc::new(OnceLock::new());
 		let task = tokio::spawn({
 			let setup = setup.clone();
@@ -473,7 +484,14 @@ impl Shaper {
 			anyhow::bail!("the shaper stopped forwarding: {err} ({stats})");
 		}
 
-		let mut missing = unapplied(&self.setup.config, &stats);
+		let segments = self.tally.each_ref().map(|tally| {
+			tally
+				.packets
+				.iter()
+				.map(|packets| packets.load(Ordering::Relaxed))
+				.collect()
+		});
+		let mut missing = unapplied(&self.setup, &stats, &segments);
 		if unbatched(&self.setup, &stats) {
 			missing.push("batch");
 		}
@@ -495,9 +513,9 @@ impl Drop for Shaper {
 const UP: usize = 0;
 const DOWN: usize = 1;
 
-#[derive(Default)]
 struct Tally {
-	packets: AtomicU64,
+	/// Indexed by the number of profile steps still to come.
+	packets: Box<[AtomicU64]>,
 	lost: AtomicU64,
 	overflowed: AtomicU64,
 	throttled: AtomicU64,
@@ -505,10 +523,27 @@ struct Tally {
 	reordered: AtomicU64,
 }
 
+impl Default for Tally {
+	fn default() -> Self {
+		Self::new(0)
+	}
+}
+
 impl Tally {
+	fn new(steps: usize) -> Self {
+		Self {
+			packets: (0..=steps).map(|_| AtomicU64::new(0)).collect(),
+			lost: AtomicU64::new(0),
+			overflowed: AtomicU64::new(0),
+			throttled: AtomicU64::new(0),
+			delayed: AtomicU64::new(0),
+			reordered: AtomicU64::new(0),
+		}
+	}
+
 	fn snapshot(&self) -> Counters {
 		Counters {
-			packets: self.packets.load(Ordering::Relaxed),
+			packets: self.packets.iter().map(|packets| packets.load(Ordering::Relaxed)).sum(),
 			lost: self.lost.load(Ordering::Relaxed),
 			overflowed: self.overflowed.load(Ordering::Relaxed),
 			throttled: self.throttled.load(Ordering::Relaxed),
@@ -870,7 +905,7 @@ impl Link {
 	/// counted as delayed, or `None` when it is dropped.
 	fn treat(&mut self, now: Instant, size: usize, tally: &Tally) -> Option<(Instant, bool)> {
 		self.step(now);
-		bump(&tally.packets);
+		bump(&tally.packets[self.steps.len()]);
 
 		// Every draw happens for every datagram, whatever the profile, so one
 		// knob's outcome never shifts the stream another knob draws from.
@@ -1111,6 +1146,13 @@ mod tests {
 
 	#[test]
 	fn silence_is_only_a_failure_once_it_is_implausible() {
+		let unapplied = |config: &Config, stats: &Stats| {
+			unapplied(
+				&config.clone().into(),
+				stats,
+				&[vec![stats.up.packets], vec![stats.down.packets]],
+			)
+		};
 		let config = Config {
 			bind: LOCALHOST,
 			target: LOCALHOST,
@@ -1151,6 +1193,74 @@ mod tests {
 			..config
 		};
 		assert_eq!(unapplied(&config, &quiet(1)), ["delay"]);
+	}
+
+	#[tokio::test]
+	async fn verification_uses_the_profile_that_received_traffic() {
+		let echo = UdpSocket::bind(LOCALHOST).await.unwrap();
+		let target = echo.local_addr().unwrap();
+		let setup = Setup {
+			up: stepped(vec![Step {
+				at: Duration::ZERO,
+				loss: Some(0.0),
+				..Default::default()
+			}]),
+			..Config {
+				bind: LOCALHOST,
+				target,
+				seed: 1,
+				up: Profile {
+					loss: 1.0,
+					..Default::default()
+				},
+				down: Profile::default(),
+			}
+			.into()
+		};
+		let shaper = Shaper::bind(setup).await.unwrap();
+		let client = UdpSocket::bind(LOCALHOST).await.unwrap();
+		client.send_to(b"ping", shaper.addr()).await.unwrap();
+		let mut buf = [0; 4];
+		let (size, from) = echo.recv_from(&mut buf).await.unwrap();
+		assert_eq!(&buf[..size], b"ping");
+		echo.send_to(&buf[..size], from).await.unwrap();
+		let (size, _) = client.recv_from(&mut buf).await.unwrap();
+		assert_eq!(&buf[..size], b"ping");
+		let stats = shaper.verify().expect("loss ended before any traffic");
+		assert_eq!(stats.up.packets, 1);
+		assert_eq!(stats.down.packets, 1);
+		assert_eq!(stats.up.lost, 0);
+	}
+
+	#[test]
+	fn stepped_impairments_are_required_only_for_traffic_during_the_step() {
+		let setup = Setup {
+			up: stepped(vec![Step {
+				at: Duration::from_secs(1),
+				loss: Some(0.5),
+				..Default::default()
+			}]),
+			..Config {
+				bind: LOCALHOST,
+				target: LOCALHOST,
+				seed: 1,
+				up: Profile::default(),
+				down: Profile::default(),
+			}
+			.into()
+		};
+		let mut stats = Stats {
+			up: Counters {
+				packets: 1000,
+				..Default::default()
+			},
+			..Default::default()
+		};
+		assert!(unapplied(&setup, &stats, &[vec![0, 1000], vec![0]]).is_empty());
+		assert!(unapplied(&setup, &stats, &[vec![1, 999], vec![0]]).is_empty());
+		assert_eq!(unapplied(&setup, &stats, &[vec![1000, 0], vec![0]]), ["loss"]);
+		stats.up.lost = 1;
+		assert!(unapplied(&setup, &stats, &[vec![1000, 0], vec![0]]).is_empty());
 	}
 
 	#[tokio::test]
@@ -1710,7 +1820,7 @@ mod tests {
 
 	/// How long after `at` each of `sizes` leaves one link, fed at the same instant.
 	fn owed(link: &mut Link, at: Instant, sizes: &[usize]) -> Vec<Duration> {
-		let tally = Tally::default();
+		let tally = Tally::new(link.steps.len());
 		sizes
 			.iter()
 			.map(|&size| link.treat(at, size, &tally).expect("dropped").0 - at)
@@ -1771,7 +1881,7 @@ mod tests {
 		let (queue, _) = mpsc::unbounded_channel();
 		let start = Instant::now();
 		let mut link = Link::new(&Profile::default(), &options, 7, 0, start, queue);
-		let tally = Tally::default();
+		let tally = Tally::new(options.steps.len());
 		let mut lost = |at: Instant| (0..100).filter(|_| link.treat(at, 16, &tally).is_none()).count();
 
 		assert_eq!(lost(start), 0, "the profile opens clean");

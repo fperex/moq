@@ -4722,6 +4722,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "criterion",
  "humantime",
  "humantime-serde",
  "rand 0.10.3",

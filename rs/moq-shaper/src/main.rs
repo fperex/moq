@@ -71,9 +71,16 @@ struct Args {
 	/// Write the profile, seed and counters to this file as JSON at exit.
 	#[arg(long)]
 	report: Option<PathBuf>,
-	/// Print the same JSON as one line on stdout this often.
-	#[arg(long, value_parser = humantime::parse_duration)]
+	/// Print the same JSON as one line on stdout at this nonzero interval.
+	#[arg(long, value_parser = period)]
 	report_interval: Option<Duration>,
+}
+
+fn period(value: &str) -> Result<Duration, String> {
+	match humantime::parse_duration(value).map_err(|err| err.to_string())? {
+		Duration::ZERO => Err("must be greater than zero".to_string()),
+		period => Ok(period),
+	}
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

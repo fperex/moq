@@ -28,4 +28,9 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 toml = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "forward"
+harness = false
