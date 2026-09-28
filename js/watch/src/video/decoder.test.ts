@@ -354,10 +354,54 @@ for (const container of ["legacy", "cmaf"] as const) {
 	});
 }
 
+test("historical age loss does not erase the live GOP", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const fx = fixture();
+	const live = new Moq.Group.Producer(10);
+	const old = new Moq.Group.Producer(5);
+	const expired = new Moq.Group.Producer(4);
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		fx.sync.track("audio").clock.set({
+			timestamp: Time.Micro(10_000_000),
+			reference: Time.Milli.now(),
+			rate: 0,
+		});
+
+		fx.track.writeGroup(live);
+		writeTestFrame("legacy", live, Time.Micro(10_000_000), true, 0);
+		writeTestFrame("legacy", live, Time.Micro(10_033_000), false, 1);
+		await settle();
+
+		fx.track.writeGroup(old);
+		writeTestFrame("legacy", old, Time.Micro(5_000_000), true, 2);
+		await settle();
+		fx.track.writeGroup(expired);
+		writeTestFrame("legacy", expired, Time.Micro(4_000_000), true, 3);
+		await settle();
+		expired.close();
+		old.close();
+
+		writeTestFrame("legacy", live, Time.Micro(10_066_000), false, 4);
+		writeTestFrame("legacy", live, Time.Micro(10_100_000), false, 5);
+		await settle();
+
+		expect(built[0].timestamps).toEqual([10_000_000, 10_033_000, 10_066_000, 10_100_000]);
+		expect(built[0].chunks).toEqual(["key", "delta", "delta", "delta"]);
+	} finally {
+		expired.close();
+		old.close();
+		live.close();
+		fx.close();
+		warn.mockRestore();
+	}
+});
+
 test("a declared marker still resets video when its group arrives behind live media", async () => {
 	const fx = fixture();
 	const live = new Moq.Group.Producer(10);
 	const marker = new Moq.Group.Producer(6);
+	const old = new Moq.Group.Producer(5);
 	try {
 		expect(await fx.subscriptions(1)).toBe(1);
 		fx.track.writeGroup(live);
@@ -368,11 +412,17 @@ test("a declared marker still resets video when its group arrives behind live me
 
 		fx.track.writeGroup(marker);
 		marker.writeFrame({ payload: Moq.Varint.encode(Time.Micro(5_033_000)), timestamp: Time.Timestamp.now() });
+		await settle();
+		fx.track.writeGroup(old);
+		writeTestFrame("legacy", old, Time.Micro(5_000_000), true, 2);
+		old.close();
+		await settle();
 		marker.close();
 		await settle();
 
 		expect(fx.sync.out.reference.peek()).toBeUndefined();
 	} finally {
+		old.close();
 		live.close();
 		marker.close();
 		fx.close();
