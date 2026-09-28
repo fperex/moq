@@ -667,6 +667,29 @@ describe("timing", () => {
 		expect(read(1)).toEqual([Time.Milli(0), Time.Milli(20), Time.Milli(40)]);
 		expect(read(2)).toEqual([Time.Milli(40)]);
 	});
+
+	it("a graph before timing builds the ring in the mode timing asks for", async () => {
+		// The page sends timing before the graph today only because of the order its effects run in.
+		const { origin, dial } = relay();
+		publish(origin);
+		const page = new Page(dial, 50);
+		page.post({ type: "hello", transports: TRANSPORTS });
+		page.post(player(1));
+
+		// The worklet's end is this test: it records what the worker's ring tells it.
+		const { port1: worklet, port2: writer } = new MessageChannel();
+		const told: Message[] = [];
+		worklet.onmessage = (event: MessageEvent<Message>) => told.push(event.data);
+		cleanup.push(() => worklet.close());
+		page.post({ type: "graph", id: 1, ring: { port: writer, rate: RATE, channels: 2, conceal: false } }, [writer]);
+		await sleep(30);
+		page.post(timing(1, { buffer: Time.Milli(2_000), buffered: true }));
+		await sleep(100);
+
+		const inits = told.filter((msg) => msg.type === "init-post");
+		expect(inits.length).toBeGreaterThan(0);
+		expect(inits.at(-1)).toMatchObject({ type: "init-post", buffered: true });
+	});
 });
 
 describe("the worker's own flushes", () => {
