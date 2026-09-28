@@ -68,6 +68,16 @@ const OFFSET_WINDOW = Time.Milli(2_000);
 // that a track that has really gone stops holding the buffer open.
 const SPREAD_WINDOW = Time.Milli(2_000);
 
+// How far a new playhead sample has to move the derived reference before waiting frames are woken.
+//
+// Every sample re-derives the reference, and a real clock never lands on the extrapolated line to the
+// microsecond: the worklet's position and the time it is stamped with are read at different
+// instants. Republishing each sub-millisecond wobble woke every frame parked in `wait()` on every
+// sample (tens per second, times every frame in the trail) to recompute a deadline that had not
+// moved by anything a display can show. A frame waits on the latest sample either way, since
+// `#playhead` extrapolates from `#clock`, not from the reference.
+const REFERENCE_SLACK = Time.Milli(1);
+
 /**
  * One track's arrival floor, as two rotating windows.
  *
@@ -239,6 +249,9 @@ export class Sync {
 	// When the hold last moved, so it moves by one bucket at a time rather than in a burst.
 	#stepped: Time.Milli | undefined;
 
+	// The trail the published reference was derived with, so a new trail always republishes it.
+	#referenceTrail: Time.Milli | undefined;
+
 	// The last reading each track published, and when it stops counting once the track has stopped
 	// publishing it. See SPREAD_WINDOW.
 	#spreads = new Map<"audio" | "video" | "text", { spread: Time.Milli; until?: Time.Milli }>();
@@ -391,6 +404,7 @@ export class Sync {
 
 		const clock = audio ?? video;
 		const previous = this.#clock;
+		const was = this.#out.clock.peek();
 		this.#clock = clock;
 		this.#out.clock.set(source);
 
@@ -399,7 +413,22 @@ export class Sync {
 		if (!sample) return;
 
 		const now = Time.Milli.now();
-		this.#out.reference.set(Time.Milli.sub(Time.Milli.sub(now, delay), extrapolate(sample, now)));
+		const reference = Time.Milli.sub(Time.Milli.sub(now, delay), extrapolate(sample, now));
+		// A new sample from the same clock, at the same rate and trail, that lands where the last one
+		// already put playback is not news. Anything else (a handover, a park or resume, a new trail)
+		// is always published.
+		const current = this.#out.reference.peek();
+		const same =
+			current !== undefined &&
+			clock !== undefined &&
+			source === was &&
+			previous !== undefined &&
+			previous.rate === clock.rate &&
+			delay === this.#referenceTrail &&
+			Math.abs(reference - current) < REFERENCE_SLACK;
+		this.#referenceTrail = delay;
+		if (same) return;
+		this.#out.reference.set(reference);
 	}
 
 	/**
