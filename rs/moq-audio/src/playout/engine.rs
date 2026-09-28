@@ -390,33 +390,28 @@ impl Engine {
 		self.decision.target(self.target);
 	}
 
-	// One turn of the decision loop, committing at least one block to the output.
+	// Commit enough output for the next pull, possibly over multiple runs.
 	fn produce(&mut self) {
 		let ready = self.buffer.ready();
-		// A hole cannot grow the preceding fragment into a block. Commit that audio
-		// before splicing the next run, even when it fills only part of this pull.
-		if ready > 0 && ready < self.block && self.buffer.held() > ready {
-			self.play(ready);
-			return;
-		}
-
-		// A declared endpoint cannot refill a stalled buffer. Drain every sample,
-		// pad the final block, then park without manufacturing an underrun.
-		if self.ended {
-			if ready > 0 {
-				self.play(self.block);
-			} else {
-				self.pause();
-			}
-			return;
-		}
-
 		let front = self.buffer.front();
 		let contiguous = match (self.played, front) {
 			(Some(played), Some(front)) => front <= played + self.buffer.duration(1),
 			(None, Some(_)) => true,
 			_ => false,
 		};
+
+		// A hole cannot extend its preceding fragment, and an endpoint cannot refill
+		// a stalled buffer. Drain those runs while preserving each splice's media time.
+		if self.ended || (ready > 0 && ready < self.block && self.buffer.held() > ready) {
+			if ready == 0 {
+				self.pause();
+			} else if !contiguous {
+				self.splice();
+			} else {
+				self.play(if self.ended { self.block } else { ready });
+			}
+			return;
+		}
 
 		// Audio that has run too far ahead of the playhead is dropped back to the level
 		// playout holds: it is going to be late either way, and playing it is the delay
@@ -1101,6 +1096,24 @@ mod tests {
 			after < produced,
 			"playout ran ahead of the media: {after:?} of {produced:?}"
 		);
+	}
+
+	#[test]
+	fn a_finished_run_keeps_the_playhead_across_a_hole() {
+		let mut engine = Engine::new(config(1, false)).unwrap();
+		engine.insert(Duration::ZERO, 0.0, &[0.25; 960]);
+		engine.insert(Duration::from_millis(40), 40.0, &[0.5; 960]);
+		engine.end();
+		let mut out = vec![0.0; engine.block()];
+		for _ in 0..10 {
+			if engine.drained() {
+				break;
+			}
+			engine.pull(&mut out);
+		}
+		assert!(engine.drained());
+		assert_eq!(engine.playhead(), Some(Duration::from_millis(60)));
+		assert_eq!(engine.stats().underruns, 0);
 	}
 
 	#[test]
