@@ -12,7 +12,7 @@ set working-directory := '.'
 #
 # The playout corpus lives in rs/moq-audio because that crate has to include_str! it, but it is
 # generated and freshness-checked from js/hang, so editing it has to run these suites too.
-scope := '^(js/|doc/|drafts/|demo/(boy|web)/|test/interop/clients/js|test/wasm/|rs/moq-audio/tests/playout-01\.json$|package\.json$|bun\.lock(b)?$|biome\.jsonc$)'
+scope := '^(js/|doc/|drafts/|demo/(boy|web)/|test/interop/clients/js|test/audio-quality/|test/wasm/|rs/moq-audio/tests/playout-01\.json$|package\.json$|bun\.lock(b)?$|biome\.jsonc$)'
 
 # Run all checks by default.
 default:
@@ -57,6 +57,7 @@ check $FILES="":
     fi
     # doc/ is in this scope, so the binding pages are checked here.
     python3 ../rs/scripts/stats-docs.py
+    just _scope-test
     bun install --frozen-lockfile
     bun common/deps.ts
     if tty -s; then
@@ -66,6 +67,20 @@ check $FILES="":
     fi
     bun biome check
     just build
+
+# Every workspace must trigger the JavaScript gates.
+[private]
+_scope-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    missing=()
+    while IFS= read -r workspace; do
+    	grep -qE '{{ scope }}' <<< "$workspace/package.json" || missing+=("$workspace")
+    done < <(jq -r '.workspaces[]' ../package.json)
+    if ((${#missing[@]})); then
+    	echo "js: workspaces outside the JS scope: ${missing[*]}" >&2
+    	exit 1
+    fi
 
 # Auto-fix lint and formatting issues. Skips on the same terms as `check`.
 fix $FILES="":
