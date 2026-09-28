@@ -315,3 +315,48 @@ describe("the event loop monitor", () => {
 		restarted.close();
 	});
 });
+
+// review consumer-sync-video F12. A hidden tab rations the tick to one a second while an
+// audio-only track delivers a PES of several frames every 200ms: the loop is fine, the arrivals
+// are simply further apart than the gap threshold, and the tick is no longer there to vouch for
+// the loop in between. Flagging each of them drops the estimator's reference on every arrival,
+// so its target decays to one bucket; its own idle rule would wait 500ms for that.
+it("a rationed tick does not flag arrivals spaced under the idle threshold", () => {
+	const timer = fake();
+	const stall = new Stall(timer);
+
+	timer.throttle(1000);
+	// Long enough for the rationed tick to have run a few times.
+	timer.advance(3000);
+
+	const flags: boolean[] = [];
+	for (let i = 0; i < 25; i++) {
+		timer.advance(200);
+		flags.push(stall.blocked(timer.at()));
+	}
+
+	// The track's own cadence has to be seen before a gap can be told apart from a block, so the
+	// first two arrivals are allowed either answer. None after that is a block.
+	expect({ flagged: flags.slice(2).filter((f) => f).length, of: flags.length - 2 }).toEqual({ flagged: 0, of: 23 });
+
+	stall.close();
+});
+
+it("two blocks during a rationed tick do not become the arrival cadence", () => {
+	const timer = fake();
+	const stall = new Stall(timer);
+	try {
+		timer.throttle(1000);
+		timer.advance(3000);
+		for (let i = 0; i < 5; i++) {
+			timer.advance(20);
+			stall.blocked(timer.at());
+		}
+		for (let i = 0; i < 2; i++) {
+			timer.block(400);
+			expect(stall.blocked(timer.at())).toBe(true);
+		}
+	} finally {
+		stall.close();
+	}
+});

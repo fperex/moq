@@ -117,6 +117,10 @@ export class Stall {
 
 	// When the loop last came back from a block, if it ever has.
 	#ended?: number;
+	#ticked?: number;
+	#slowTicks = 0;
+	#queried?: number;
+	#spacing?: number;
 
 	#handle: unknown;
 	#holders = 1;
@@ -155,6 +159,12 @@ export class Stall {
 		// the probe wins the race out of a block, which nothing orders.
 		this.#see(now);
 		this.#arm(now);
+		if (this.#queried !== undefined && now > this.#queried) {
+			const spacing = now - this.#queried;
+			// A detected block must not become the cadence used to excuse the next block.
+			if (this.#spacing === undefined || spacing <= this.#spacing + THRESHOLD) this.#spacing = spacing;
+		}
+		if (this.#queried === undefined || now > this.#queried) this.#queried = now;
 
 		return this.#ended !== undefined && now - this.#ended <= TICK;
 	}
@@ -178,14 +188,14 @@ export class Stall {
 		const gap = now - this.#alive;
 		if (now > this.#alive) this.#alive = now;
 
-		// Two shapes of a receiver that is not keeping up, and a rationed timer is neither of them. No
-		// turn of the loop at all for longer than the threshold means it stopped; the tick is the
-		// witness between arrivals, until a hidden tab rations that too and a track whose arrivals are
-		// further apart than the threshold is left with none, which is the answer the estimator's own
-		// idle rule already gives such a track. Or the loop is running and the task it was handed
-		// before this turn is still waiting, which is how long it kept this arrival waiting too.
+		// A rationed timer cannot witness the healthy gaps between sparse arrivals.
+		const cadence =
+			this.#slowTicks >= 2 &&
+			this.#spacing !== undefined &&
+			this.#queried !== undefined &&
+			now - this.#queried <= this.#spacing + THRESHOLD;
 		const sent = this.#sent;
-		if (gap > THRESHOLD || (sent !== undefined && now - sent > THRESHOLD)) this.#ended = now;
+		if ((gap > THRESHOLD && !cadence) || (sent !== undefined && now - sent > THRESHOLD)) this.#ended = now;
 	}
 
 	// Hands the loop a task to be timed by, at most one a tick.
@@ -214,7 +224,11 @@ export class Stall {
 	#tick = (): void => {
 		// Being a turn of the loop is all this is for. How late it runs says nothing: a hidden tab
 		// rations it to one a second with the loop running fine underneath.
-		this.#see(this.#timer.now());
+		const now = this.#timer.now();
+		this.#slowTicks =
+			this.#ticked !== undefined && now - this.#ticked > 2 * TICK ? Math.min(2, this.#slowTicks + 1) : 0;
+		this.#ticked = now;
+		this.#see(now);
 		this.#handle = this.#timer.schedule(this.#tick, TICK);
 	};
 }

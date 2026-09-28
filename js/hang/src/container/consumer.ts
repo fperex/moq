@@ -111,6 +111,7 @@ export class Consumer {
 	#discontinuity = 0;
 	// A group below the live edge aborts the track.
 	#error?: Error;
+	#pulled?: Time.Milli;
 
 	// Wake up the consumer when a new frame is available.
 	#notify?: () => void;
@@ -385,6 +386,11 @@ export class Consumer {
 		let skipped = false;
 		let walked = false;
 		let hole = false;
+		const paused =
+			this.#maxAge.peek() > 0 &&
+			this.#pulled !== undefined &&
+			this.#notify === undefined &&
+			Moq.Time.Milli.now() - this.#pulled >= this.#maxAge.peek();
 
 		// Walk the delivery cursor forward while what the oldest group could still present has aged
 		// past the budget. This is also what ends the wait on a gap in group sequence numbers: if
@@ -395,7 +401,7 @@ export class Consumer {
 			const threshold = Moq.Time.Micro.fromMilli(this.#maxAge.peek());
 			const first = this.#groups[0];
 			// Where delivery stands, which decides what a verdict against the head means.
-			const cursor = this.#active;
+			const cursor: number | undefined = this.#active;
 
 			// A group is measured by how far it could still reach, not by how far behind it
 			// started: it cannot present past where the next group holding a frame begins, so
@@ -445,14 +451,26 @@ export class Consumer {
 			// contiguous successor one frame later is judged a hole, which re-anchors the reader.
 			// `rs/moq-mux`'s consumer cannot reach either verdict: its read arm returns a buffered
 			// frame, and closes out a spent group as `GroupEnd`, before the budget is consulted.
-			if (first.done && cursor !== undefined && first.consumer.sequence <= cursor) break;
+			if (first.done && first.frames.length === 0 && paused) {
+				this.#groups.shift();
+				if (first.consumer.sequence === cursor) {
+					this.#recordPresented(first);
+					this.#active = continues(first, this.#groups[0]) ? this.#groups[0].consumer.sequence : cursor + 1;
+				}
+				if (first.truncated) this.#gap = true;
+				if (!first.empty && !first.media) hole = true;
+				first.consumer.close();
+				walked = true;
+				continue;
+			}
+			if (first.done && !paused && cursor !== undefined && first.consumer.sequence <= cursor) break;
 
 			// Above the cursor the group it sits on never arrived, and now it never will. Give up
 			// on those sequences rather than on the media that did arrive: walk the cursor onto the
 			// head, the way the same consumer walks onto the first arrived group instead of
 			// dropping it. A head that finished holding nothing cannot be walked onto, so it is
 			// convicted below along with a head that is still downloading.
-			if (first.done && first.frames.length > 0) {
+			if (first.done && first.frames.length > 0 && !paused) {
 				// Whether that cost anything is the one thing the reader has to be told: a head
 				// that continues the timeline we left off at means the sequence numbers merely
 				// jumped, and a head that does not means a span of media is missing.
@@ -528,6 +546,7 @@ export class Consumer {
 		console.debug(`skipping covered group: ${active.consumer.sequence} -> ${next.consumer.sequence}`);
 		this.#recordPresented(active);
 		this.#active = next.consumer.sequence;
+		if (!active.empty && !active.media) this.#markPlayhead();
 
 		active.consumer.close();
 		active.frames.length = 0;
@@ -660,6 +679,7 @@ export class Consumer {
 							this.#liveEdge = { group: seq, timestamp: end };
 						}
 						this.#updateBuffered();
+						this.#pulled = Moq.Time.Milli.now();
 						return {
 							frame: undefined,
 							group: seq,
@@ -677,6 +697,7 @@ export class Consumer {
 						this.#liveEdge = { group: seq, timestamp: frame.timestamp };
 					}
 					this.#updateBuffered();
+					this.#pulled = Moq.Time.Milli.now();
 					return { frame, group: seq, discontinuity: this.#discontinuity, continuous };
 				}
 
@@ -707,6 +728,7 @@ export class Consumer {
 						// once every terminal packet behind the marker has been delivered.
 						if (!group.empty && !group.media) this.#markPlayhead();
 						this.#updateBuffered();
+						this.#pulled = Moq.Time.Milli.now();
 						return {
 							frame: undefined,
 							group: seq,
