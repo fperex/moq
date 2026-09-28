@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, jest, test } from "bun:test";
 import { Container } from "@moq/hang";
 import * as Catalog from "@moq/hang/catalog";
 import * as Moq from "@moq/net";
@@ -23,28 +23,20 @@ type Built = {
 
 let built: Built[] = [];
 
-// Wall time runs this many times faster inside a test, so BUFFERING lands at 20ms, RETRY at 40ms and
-// RECOVER at 200ms.
-const SPEEDUP = 25;
-
 const real = {
 	VideoDecoder: globalThis.VideoDecoder,
 	EncodedVideoChunk: globalThis.EncodedVideoChunk,
-	setTimeout: globalThis.setTimeout,
 };
 
 beforeEach(() => {
 	built = [];
 
-	// The retry and recovery windows are seconds by design, so the timers run on a compressed clock
-	// rather than being waited out. `Effect.timer` calls the global, so scaling it here is enough;
-	// microtasks and the signal graph stay real. Same shape as the `performance.now` stub in
-	// `sync.replay.test.ts`. Scaling rather than clamping keeps the order between the windows, which
-	// is what tells a rebuild driven by the codec error from one driven by the stall watchdog.
-	globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
-		const scaled = ms === undefined ? ms : Math.max(1, Math.round(ms / SPEEDUP));
-		return real.setTimeout(fn, scaled, ...rest);
-	}) as typeof setTimeout;
+	// The retry and recovery windows are seconds by design, so they run on bun's fake clock and only
+	// move when a test advances it. The old version scaled real timers 25x, which put BUFFERING at
+	// 20ms of wall time: a loaded machine let it fire between two statements and flaked the stall
+	// assertions. `flush` below still yields a real turn, so the signal graph and the track
+	// plumbing run as before; only deadlines are virtual.
+	jest.useFakeTimers();
 
 	class FakeVideoFrame {
 		readonly displayWidth = 16;
@@ -111,12 +103,22 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	jest.useRealTimers();
 	globalThis.VideoDecoder = real.VideoDecoder;
 	globalThis.EncodedVideoChunk = real.EncodedVideoChunk;
-	globalThis.setTimeout = real.setTimeout;
 });
 
-const flush = () => new Promise((resolve) => real.setTimeout(resolve, 0));
+// setImmediate, not setTimeout: bun's fake timers take over every setTimeout, including one captured
+// before they were installed, but leave setImmediate alone, so this still yields a real turn.
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+/** Move the fake clock forward in small steps, letting the signal graph and the plumbing react. */
+async function advance(ms: number, step = 25): Promise<void> {
+	for (let elapsed = 0; elapsed < ms; elapsed += step) {
+		jest.advanceTimersByTime(Math.min(step, ms - elapsed));
+		await flush();
+	}
+}
 
 async function settle(rounds = 10): Promise<void> {
 	for (let i = 0; i < rounds; i++) await flush();
@@ -205,9 +207,9 @@ function fixture() {
 			for (let i = 0; i < 400 && opened.length < count; i++) await flush();
 			return opened.length;
 		},
-		/** Wait until `count` codecs have been built, or give up. One per rebuilt track. */
-		async decoders(count: number): Promise<number> {
-			for (let i = 0; i < 400 && built.length < count; i++) await flush();
+		/** Advance the fake clock until `count` codecs have been built, or give up after `within` ms of it. */
+		async decoders(count: number, within = 10_000): Promise<number> {
+			for (let elapsed = 0; elapsed < within && built.length < count; elapsed += 25) await advance(25);
 			return built.length;
 		},
 		close(): void {
@@ -290,8 +292,9 @@ test("a codec error rebuilds the track instead of stranding the subscription", a
 			built[0].fail(new Error("DataError"));
 
 			// A replacement track, with its own subscription and its own codec, rather than a dead
-			// one left in place.
-			expect(await fx.decoders(2)).toBeGreaterThanOrEqual(2);
+			// one left in place. Within 2s: past RETRY, well short of the stall watchdog's
+			// BUFFERING + RECOVER, so only the codec error can have caused it.
+			expect(await fx.decoders(2, 2_000)).toBeGreaterThanOrEqual(2);
 
 			fx.served[0].encode(payload(16), Time.Micro(1_000_000), true);
 			await settle();
@@ -381,7 +384,7 @@ test("the arrival estimator survives the rendition leaving the catalog and comin
 		try {
 			fx.served[0].encode(payload(16), Time.Micro(0), true);
 			fx.served[0].encode(payload(16), Time.Micro(20_000), false);
-			await new Promise((resolve) => real.setTimeout(resolve, 600));
+			await advance(600);
 			fx.served[0].encode(payload(16), Time.Micro(40_000), false);
 			await settle();
 
@@ -541,13 +544,13 @@ test("a rendition that left the catalog is not a stall", async () => {
 
 		// The camera goes, and nothing arrives for several watchdog windows.
 		fx.config.set(undefined);
-		await new Promise((resolve) => real.setTimeout(resolve, 100));
+		await advance(2_500);
 		await settle();
 		expect(fx.decoder.out.stalled.peek()).toBe(false);
 
 		// It comes back, so a picture is due again and the watchdog arms with it.
 		fx.config.set(rendition);
-		await new Promise((resolve) => real.setTimeout(resolve, 60));
+		await advance(1_500);
 		await settle();
 		expect(fx.decoder.out.stalled.peek()).toBe(true);
 	} finally {
