@@ -226,44 +226,62 @@ export type Spawned = { handle: Handle } | { reason: string };
  * `blob:` workers makes Chromium throw, and the lazy chunk it comes in can fail to load), reports a
  * load failure (the same CSP reaches Firefox as an `error` event), or lacks what {@link decide} needs.
  */
-export async function spawn(create: () => Worker | Promise<Worker>, page: Transports = support()): Promise<Spawned> {
-	let worker: Worker;
-	try {
-		worker = await create();
-	} catch (err) {
-		return { reason: `the worker could not be created: ${explain(err)}` };
-	}
-
+export function spawn(create: () => Worker | Promise<Worker>, page: Transports = support()): Promise<Spawned> {
 	return new Promise<Spawned>((resolve) => {
+		let worker: Worker | undefined;
+		let settled = false;
 		const fail = (reason: string) => {
-			detach(worker);
-			worker.terminate();
+			if (settled) return;
+			settled = true;
+			clearTimeout(deadline);
+			if (worker) {
+				detach(worker);
+				worker.terminate();
+			}
 			resolve({ reason });
 		};
+		const deadline = setTimeout(
+			() => fail(`the audio worker played nothing in ${AUDIO_DEADLINE / 1000} s: ${STUCK.ready}`),
+			AUDIO_DEADLINE,
+		);
 
-		worker.onerror = (event: ErrorEvent) => {
-			// Before `ready` this can only be the script failing to load.
-			event.preventDefault();
-			fail(`the worker failed to load: ${event.message || "error event"}`);
-		};
-		worker.onmessageerror = () => fail("the worker's first message could not be deserialized");
-		worker.onmessage = (event: MessageEvent<FromWorker>) => {
-			const msg = event.data;
-			if (msg?.type !== "ready") {
-				fail(`the worker said ${JSON.stringify(msg?.type)} before it said ready`);
+		void (async () => {
+			let created: Worker;
+			try {
+				created = await create();
+			} catch (err) {
+				fail(`the worker could not be created: ${explain(err)}`);
 				return;
 			}
-
-			const reason = decide(msg.support, page);
-			if (reason !== undefined) {
-				fail(reason);
+			// A lazy import can complete after the startup deadline.
+			if (settled) {
+				created.terminate();
 				return;
 			}
-
-			const hello: ToWorker = { type: "hello", transports: page };
-			worker.postMessage(hello);
-			resolve({ handle: handle(worker, msg.support) });
-		};
+			worker = created;
+			created.onerror = (event: ErrorEvent) => {
+				event.preventDefault();
+				fail(`the worker failed to load: ${event.message || "error event"}`);
+			};
+			created.onmessageerror = () => fail("the worker's first message could not be deserialized");
+			created.onmessage = (event: MessageEvent<FromWorker>) => {
+				const msg = event.data;
+				if (msg?.type !== "ready") {
+					fail(`the worker said ${JSON.stringify(msg?.type)} before it said ready`);
+					return;
+				}
+				const reason = decide(msg.support, page);
+				if (reason !== undefined) {
+					fail(reason);
+					return;
+				}
+				const hello: ToWorker = { type: "hello", transports: page };
+				created.postMessage(hello);
+				settled = true;
+				clearTimeout(deadline);
+				resolve({ handle: handle(created, msg.support) });
+			};
+		})();
 	});
 }
 
