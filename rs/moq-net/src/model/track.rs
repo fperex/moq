@@ -488,11 +488,11 @@ impl TrackState {
 				}
 				// The map is ordered by sequence, so the first stamped group from the
 				// back is the newest content that exists.
-				let timestamp = slot.group.timestamp()?;
+				let timestamp = slot.group.latest()?;
 				Some(PresentationEdge {
 					sequence: slot.group.sequence,
 					stamp: slot.stamp,
-					timestamp: slot.group.latest().unwrap_or(timestamp),
+					timestamp,
 				})
 			})
 	}
@@ -3659,6 +3659,14 @@ impl Control {
 }
 
 impl Subscriber {
+	/// Whether handed-out groups or frames still use this cursor's expiry anchors.
+	pub(crate) fn has_expiry_readers(&self) -> bool {
+		match &self.inner {
+			SubscriberKind::Plain(plain) => plain.drift_anchor.is_used(),
+			SubscriberKind::Spliced(spliced) => spliced.has_expiry_readers(),
+		}
+	}
+
 	/// The track's [`Info`], resolved when the subscription was established.
 	///
 	/// Free, unlike [`Consumer::query`]: subscribing already waited for the info

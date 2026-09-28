@@ -1496,9 +1496,9 @@ pub struct Subscriber {
 	outer: Anchor,
 	/// The logical drift anchor ([`Self::end_sequence`] and [`Self::outer`] combined,
 	/// with the newest edge across the segments), shared with groups that outlive this
-	/// cursor poll. Reconciled on each poll; a sole unbounded source uses its own edge.
+	/// cursor poll. Reconciled on each poll while earlier segments still have readers.
 	drift_anchor: kio::Producer<Anchor>,
-	/// The sole unbounded segment's anchors are clear; its own track supplies expiry.
+	/// Only the newest segment can still hand out or expire content, using its own edge.
 	identity_anchor: bool,
 }
 
@@ -1741,28 +1741,33 @@ impl Subscriber {
 	/// The cap is the tightest any reader of this subscriber imposes: its own
 	/// [`Self::end_at`] and whatever a wrapping splice pushed down. The edge is the
 	/// newest across the producer's segments within that cap, or a wrapping splice's if
-	/// newer. A sole unbounded segment uses its own track's edge; other shapes resolve
-	/// on every sync, since each segment can grow independently.
+	/// newer. Once earlier segments and their handed-out groups and frames drain, the
+	/// newest segment's own edge suffices until the next route or bound change.
 	fn refresh_anchor(&mut self) {
-		if let [seg] = self.segments.as_mut_slice()
-			&& seg.start.is_none()
+		if self.identity_anchor {
+			return;
+		}
+		if let Some((seg, before)) = self.segments.split_last_mut()
 			&& seg.end.is_none()
 			&& self.end_sequence.is_none()
 			&& self.outer == Anchor::default()
-		{
-			if !self.identity_anchor {
-				if let Ok(mut current) = self.drift_anchor.write() {
-					*current = Anchor::default();
-				}
-				seg.anchor = Anchor::default();
-				if let Some(sub) = seg.stale_sub_mut() {
-					sub.set_anchor(Anchor::default());
-				}
-				self.identity_anchor = true;
+			&& ((before.is_empty() && seg.start.is_none())
+				|| (!self.drift_anchor.is_used()
+					&& before.iter().all(|old| {
+						matches!(old.sub, SubState::Done(_))
+							&& old.parked.is_empty()
+							&& old.terminal.as_ref().is_none_or(|sub| !sub.has_expiry_readers())
+					}))) {
+			if let Ok(mut current) = self.drift_anchor.write() {
+				*current = Anchor::default();
 			}
+			seg.anchor = Anchor::default();
+			if let Some(sub) = seg.stale_sub_mut() {
+				sub.set_anchor(Anchor::default());
+			}
+			self.identity_anchor = true;
 			return;
 		}
-		self.identity_anchor = false;
 		let outer = self.outer.clone().capped(self.end_sequence);
 		let state = self.state.read();
 		let edge = state
@@ -1784,6 +1789,15 @@ impl Subscriber {
 				sub.set_anchor(anchor);
 			}
 		}
+	}
+
+	/// Whether handed-out groups or frames still use this cursor's expiry anchors.
+	pub(crate) fn has_expiry_readers(&self) -> bool {
+		self.drift_anchor.is_used()
+			|| self.segments.iter().any(|seg| match &seg.sub {
+				SubState::Active(sub) => sub.has_expiry_readers(),
+				_ => seg.terminal.as_ref().is_some_and(track::Subscriber::has_expiry_readers),
+			})
 	}
 
 	/// Bound every segment's drift anchor from outside; the spliced arm of
@@ -2504,6 +2518,10 @@ mod test {
 			let mut producer = Producer::new();
 			producer.switch(&consumer, None).unwrap();
 			let mut sub = producer.consume().subscribe(None);
+			let mut open = track.create_group(group::Info { sequence: 0 }).unwrap();
+			open.write_frame(Timestamp::ZERO, b"held".to_vec()).unwrap();
+			let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+			assert_eq!(read(&mut held), b"held");
 			if outer {
 				sub.set_anchor(Anchor {
 					cap: Some(1),
@@ -2512,12 +2530,8 @@ mod test {
 			} else {
 				sub.end_at(..1);
 			}
-			let mut open = track.create_group(group::Info { sequence: 0 }).unwrap();
-			open.write_frame(Timestamp::ZERO, b"held".to_vec()).unwrap();
-			let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
 			write_group_at(&mut track, 1, "next", Duration::from_secs(1));
 			write_group_at(&mut track, 2, "new", Duration::from_secs(2));
-			assert_eq!(read(&mut held), b"held");
 			assert!(held.read_frame().now_or_never().is_none());
 			if outer {
 				sub.set_anchor(Anchor::default());
@@ -2526,6 +2540,123 @@ mod test {
 			}
 			assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
 		}
+	}
+
+	#[tokio::test]
+	async fn drained_predecessors_keep_detached_frames_on_the_logical_edge() {
+		for nested in [false, true] {
+			let (old, old_consumer) = track_pair("old");
+			let mut inner = Producer::new();
+			let old_consumer = if nested {
+				inner.switch(&old_consumer, None).unwrap();
+				track::Consumer::spliced("inner".into(), Arc::new(broadcast::Info::default()), inner.consume())
+			} else {
+				old_consumer
+			};
+			let (mut live, live_consumer) = track_pair("live");
+			let mut producer = Producer::new();
+			producer.switch(&old_consumer, None).unwrap();
+			let mut sub = producer
+				.consume()
+				.subscribe(Subscription::default().with_max_age(Duration::from_millis(100)));
+			let mut open = old.create_group(group::Info { sequence: 0 }).unwrap();
+			let mut writing = open
+				.create_frame(frame::Info {
+					size: 6,
+					timestamp: Timestamp::ZERO,
+				})
+				.unwrap();
+			writing.write(b"old".as_ref()).unwrap();
+			let mut group = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+			let mut frame = group.next_frame().now_or_never().unwrap().unwrap().unwrap();
+			assert_eq!(
+				frame.read_chunk().now_or_never().unwrap().unwrap().unwrap(),
+				b"old".as_ref()
+			);
+			drop(group);
+			old.finish().unwrap();
+			if nested {
+				inner.finish().unwrap();
+			}
+			producer.switch(&live_consumer, Position::group(1)).unwrap();
+			write_group_at(&mut live, 1, "next", Duration::from_secs(1));
+			assert_eq!(recv(&mut sub), 1);
+			assert!(frame.read_chunk().now_or_never().is_none());
+			write_group_at(&mut live, 2, "new", Duration::from_secs(2));
+			assert_eq!(recv(&mut sub), 2);
+			assert!(matches!(frame.read_chunk().now_or_never(), Some(Err(Error::Old))));
+			writing.abort(Error::Cancel).unwrap();
+		}
+	}
+
+	#[tokio::test]
+	async fn drained_predecessors_keep_a_held_continuation_on_the_logical_edge() {
+		let (first, first_consumer) = track_pair("first");
+		let (mut middle, middle_consumer) = track_pair("middle");
+		let (mut live, live_consumer) = track_pair("live");
+		let mut producer = Producer::new();
+		producer.switch(&first_consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_secs(2)));
+		let mut head = first.create_group(group::Info { sequence: 0 }).unwrap();
+		head.write_frame(Timestamp::ZERO, b"head".as_ref()).unwrap();
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut held), b"head");
+		first.finish().unwrap();
+		producer
+			.switch(&middle_consumer, Position { group: 0, frame: 1 })
+			.unwrap();
+		let mut tail = middle.create_group(group::Info { sequence: 0 }).unwrap();
+		tail.write_frame(Timestamp::ZERO, b"duplicate".as_ref()).unwrap();
+		tail.write_frame(Timestamp::from_millis(10).unwrap(), b"tail".as_ref())
+			.unwrap();
+		assert_eq!(read(&mut held), b"tail");
+		write_group_at(&mut middle, 1, "middle next", Duration::from_secs(1));
+		middle.finish().unwrap();
+		producer.switch(&live_consumer, Position::group(2)).unwrap();
+		write_group_at(&mut live, 2, "next", Duration::from_secs(2));
+		assert_eq!(recv(&mut sub), 1);
+		assert_eq!(recv(&mut sub), 2);
+		assert!(held.read_frame().now_or_never().is_none());
+		write_group_at(&mut live, 3, "new", Duration::from_secs(3));
+		assert_eq!(recv(&mut sub), 3);
+		assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
+	}
+
+	#[tokio::test]
+	async fn a_new_takeover_restores_expiry_after_predecessors_drain() {
+		let (mut first, first_consumer) = track_pair("first");
+		let (mut middle, middle_consumer) = track_pair("middle");
+		let (mut live, live_consumer) = track_pair("live");
+		let mut producer = Producer::new();
+		producer.switch(&first_consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_millis(100)));
+		write_group(&mut first, 0, "first");
+		assert_eq!(recv(&mut sub), 0);
+		first.finish().unwrap();
+		producer.switch(&middle_consumer, Position::group(1)).unwrap();
+		write_group_at(&mut middle, 1, "middle", Duration::from_secs(1));
+		assert_eq!(recv(&mut sub), 1);
+		recv_pending(&mut sub);
+		sub.start_at(0);
+		recv_pending(&mut sub);
+		sub.update(Subscription::default().with_max_age(Duration::from_millis(100)));
+		recv_pending(&mut sub);
+
+		let mut open = middle.create_group(group::Info { sequence: 2 }).unwrap();
+		open.write_frame(Timestamp::from_secs(2).unwrap(), b"held".as_ref())
+			.unwrap();
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut held), b"held");
+		write_group_at(&mut middle, 3, "middle next", Duration::from_secs(3));
+		producer.switch(&live_consumer, Position::group(4)).unwrap();
+		write_group_at(&mut live, 4, "next", Duration::from_secs(4));
+		write_group_at(&mut live, 5, "new", Duration::from_secs(5));
+		assert_eq!(recv(&mut sub), 4);
+		assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
 	}
 
 	/// A waker that counts its wakes, for asserting a pending poll left a live
