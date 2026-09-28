@@ -875,7 +875,6 @@ describe("Sync wakes a waiting frame only when its deadline moves", () => {
 	}
 
 	it("samples exactly on the extrapolated line do not wake it", async () => {
-		// The review's literal case: the playhead advances exactly as extrapolated.
 		expect(await timersWhileSampling(() => 0)).toBeLessThanOrEqual(2);
 	});
 

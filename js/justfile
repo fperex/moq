@@ -75,11 +75,11 @@ _scope-test:
     set -euo pipefail
     missing=()
     while IFS= read -r workspace; do
-    	grep -qE '{{ scope }}' <<< "$workspace/package.json" || missing+=("$workspace")
+        grep -qE '{{ scope }}' <<< "$workspace/package.json" || missing+=("$workspace")
     done < <(jq -r '.workspaces[]' ../package.json)
     if ((${#missing[@]})); then
-    	echo "js: workspaces outside the JS scope: ${missing[*]}" >&2
-    	exit 1
+        echo "js: workspaces outside the JS scope: ${missing[*]}" >&2
+        exit 1
     fi
 
 # Auto-fix lint and formatting issues. Skips on the same terms as `check`.
