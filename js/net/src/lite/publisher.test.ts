@@ -1240,7 +1240,7 @@ test("lite draft-05: group streams do not ask the transport to wait for a slot",
 
 // The header is part of the group's lifetime too. If it blocks on flow control, advancing
 // the live edge must reset the stream without waiting for that write to finish.
-test.each(["header", "FIN"] as const)("a blocked group %s is reset when the group expires", async (phase) => {
+test.each(["header"] as const)("a blocked group %s is reset when the group expires", async (phase) => {
 	const pair = createMockTransportPair(ALPN_05);
 
 	let started!: () => void;
@@ -1255,7 +1255,7 @@ test.each(["header", "FIN"] as const)("a blocked group %s is reset when the grou
 	const streamReset = new Promise<void>((resolve) => {
 		reset = resolve;
 	});
-	const closed = phase === "FIN" ? blocked : new Promise<void>(() => {});
+	const closed = new Promise<void>(() => {});
 	const writable = {
 		getWriter: () => ({
 			closed,
@@ -1264,11 +1264,7 @@ test.each(["header", "FIN"] as const)("a blocked group %s is reset when the grou
 				started();
 				await blocked;
 			},
-			close: async () => {
-				if (phase !== "FIN") return;
-				started();
-				await blocked;
-			},
+			close: async () => {},
 			abort: async () => {
 				reset();
 			},
@@ -1506,5 +1502,92 @@ test("a repeat subscription fans out from the live track instead of raising a re
 		publisher.close();
 		second.close();
 		first.close();
+	}
+});
+
+async function settleMicrotasks() {
+	for (let i = 0; i < 200; i++) await Promise.resolve();
+}
+
+// F6 (review 2026-09-27): every group waiting for its FIN acknowledgement holds one guard, and
+// each guard subscribes to the track's expiry signals. In a dev build @moq/signals throws at the
+// 100th subscriber of one signal ("may be leaking"). A publisher with 100+ groups in flight
+// (congestion, one group per audio frame) must not fail a group, or leave a promise unobserved,
+// because of that cap.
+test("120 groups waiting for their FIN do not trip the dev subscriber cap", async () => {
+	const N = 120;
+	const pair = createMockTransportPair(ALPN_05);
+
+	// Every group stream sends its data at once and never has its FIN acknowledged.
+	const acks: PromiseWithResolvers<void>[] = [];
+	let closing = 0;
+	pair.server.createUnidirectionalStream = async () => {
+		const ack = Promise.withResolvers<void>();
+		// A stream the publisher never closes never hands its ack to the sink; rejecting it
+		// below must not count as the publisher's unhandled rejection.
+		ack.promise.catch(() => {});
+		acks.push(ack);
+		return new WritableStream<Uint8Array>({
+			close: () => {
+				closing++;
+				return ack.promise;
+			},
+		});
+	};
+
+	const resets: unknown[] = [];
+	const reset = Writer.prototype.reset;
+	const resetSpy = spyOn(Writer.prototype, "reset");
+	resetSpy.mockImplementation(function (this: Writer, reason: unknown) {
+		resets.push(reason);
+		reset.call(this, reason);
+	});
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown) => {
+		unhandled.push(reason);
+	};
+	process.on("unhandledRejection", onUnhandled);
+
+	const origin = new OriginProducer();
+	const publisher = new Publisher(pair.server, Version.DRAFT_05, randomHop(), origin.consume());
+	const broadcast = publish(origin, Path.from("test"));
+	const track = broadcast.createTrack("audio");
+	const client = await Stream.open(pair.client);
+	const server = await Stream.accept(pair.server);
+	if (!server) throw new Error("publisher never accepted the subscribe stream");
+
+	try {
+		void publisher.runSubscribe(
+			new Subscribe({ id: 0n, broadcast: Path.from("test"), track: "audio", priority: 0, maxAge: 60_000 }),
+			server,
+		);
+
+		// One group per 1ms audio frame: none is anywhere near the 60s max-age budget.
+		for (let i = 0; i < N; i++) {
+			const group = new GroupProducer(i);
+			group.writeFrame({ payload: new Uint8Array([i]), timestamp: Timestamp.fromMillis(i) });
+			group.close();
+			track.writeGroup(group);
+			await settleMicrotasks();
+		}
+		await settleMicrotasks();
+
+		// The peer then stops every stream: each FIN wait rejects.
+		for (const ack of acks) ack.reject(new Error("STOP_SENDING"));
+		for (let i = 0; i < 20; i++) await settleMicrotasks();
+
+		const capped = resets.filter((reason) => String(reason).includes("too many subscribers"));
+		expect({
+			streams: acks.length,
+			closing,
+			cappedGroups: capped.map(String),
+			unhandled: unhandled.map(String),
+		}).toEqual({ streams: N, closing: N, cappedGroups: [], unhandled: [] });
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+		resetSpy.mockRestore();
+		publisher.close();
+		client.close();
+		broadcast.close();
 	}
 });

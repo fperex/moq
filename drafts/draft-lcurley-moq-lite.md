@@ -313,7 +313,7 @@ Sent when resetting a stream (RESET_STREAM), or when refusing to receive one (ST
 | ------- | ------------- | ----------- |
 |  0x33  | NOT_FOUND | The requested group, track, or broadcast is not here. |
 | ------- | ------------- | ----------- |
-|  0x34  | OLD | The group was superseded by a newer group and dropped. |
+|  0x34  | OLD | The group was superseded by a newer group and dropped, including when it exceeds the subscription max age. |
 | ------- | ------------- | ----------- |
 |  0x35  | EVICTED | The group was dropped under memory pressure. Unlike OLD it was still current, so it can be re-fetched. |
 | ------- | ------------- | ----------- |
@@ -1329,6 +1329,8 @@ The `Message Length` describes the payload size on the wire.
 # Appendix A: Changelog
 
 ## moq-lite-07
+
+- Clarified that a group reset for exceeding the subscription max age uses OLD.
 
 - Assigned `moq-lite-07` as this draft's protocol identifier.
 - Hid routes with a `.`-prefixed segment below the requested prefix from announce discovery, and added the ANNOUNCE_REQUEST `Hidden` field to opt in.

@@ -176,10 +176,13 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 
 	/** Calls `fn` every time the value changes. Returns a function to unsubscribe. */
 	subscribe(fn: Subscriber<T>): Dispose {
-		this.#subscribers.add(fn);
-		if (DEV && this.#subscribers.size >= 100 && Number.isInteger(Math.log10(this.#subscribers.size))) {
-			throw new Error("signal has too many subscribers; may be leaking");
+		if (DEV && !this.#subscribers.has(fn)) {
+			const size = this.#subscribers.size + 1;
+			if (size >= 100 && Number.isInteger(Math.log10(size))) {
+				throw new Error("signal has too many subscribers; may be leaking");
+			}
 		}
+		this.#subscribers.add(fn);
 		return () => this.#subscribers.delete(fn);
 	}
 

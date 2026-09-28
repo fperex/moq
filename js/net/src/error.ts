@@ -181,17 +181,16 @@ export class Stream extends Error {
 }
 
 /**
- * The content missed its delivery deadline, so what was still unread is gone.
+ * Newer content exceeded this group's age budget, so its unread content is gone.
  *
  * Raised locally when a subscription's max age budget gives up on a group that still held
- * content, and decoded from a moq-lite peer's `DELIVERY_TIMEOUT` reset, since a deadline the
- * sender gave up on truncates the reader the same way.
+ * content, and decoded from a moq-lite peer's `OLD` reset.
  *
  * @public
  */
 export class Expired extends Stream {
 	constructor(options?: { cause?: unknown }) {
-		super(StreamCode.DeliveryTimeout, {
+		super(StreamCode.Old, {
 			...options,
 			message: "expired: group exceeded the subscription max age budget",
 		});
@@ -377,7 +376,7 @@ export function fromTransport(err: unknown, options?: TransportErrorOptions): Er
 	if (options?.version !== undefined && !sharedStreamCode(code, options.version) && claimedLocally(code)) {
 		return new Stream(StreamCode.Internal, { cause: err, message: `remote error: ${code}` });
 	}
-	if (code === StreamCode.DeliveryTimeout) return new Expired({ cause: err });
+	if (code === StreamCode.Old) return new Expired({ cause: err });
 	if (code === StreamCode.TooFarBehind) return new TooFarBehind({ cause: err });
 	if (code === StreamCode.FrameTooLarge) return new FrameTooLarge({ cause: err });
 	if (code === StreamCode.GroupTooLarge) return new GroupTooLarge({ cause: err });

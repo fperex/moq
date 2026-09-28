@@ -1239,3 +1239,21 @@ describe("spawn retention", () => {
 		effect.close();
 	});
 });
+
+test("a rejected subscription does not retain its callback", async () => {
+	const signal = new Signal(0);
+	const listeners = Array.from({ length: 99 }, () => signal.subscribe(() => {}));
+	let notified = false;
+	try {
+		expect(() =>
+			signal.subscribe(() => {
+				notified = true;
+			}),
+		).toThrow("too many subscribers");
+		signal.set(1);
+		await settle();
+		expect(notified).toBe(false);
+	} finally {
+		for (const dispose of listeners) dispose();
+	}
+});

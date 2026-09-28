@@ -808,7 +808,7 @@ test("a handed-out frame cancels its in-flight operation when it expires", async
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation);
+	const guarded = hooks.guardGroup(group, () => operation);
 	producer.writeString("new");
 
 	await expect(guarded).rejects.toThrow("max age budget");
@@ -816,7 +816,7 @@ test("a handed-out frame cancels its in-flight operation when it expires", async
 });
 
 for (const alreadyExpired of [false, true]) {
-	test(`a guarded write handles its rejection when the group ${alreadyExpired ? "already expired" : "expires before guarding"}`, async () => {
+	test(`a guarded write never starts when the group ${alreadyExpired ? "already expired" : "expires before guarding"}`, async () => {
 		const producer = new TrackProducer("test").accept({ maxAge: Milli(5000) });
 		const track = producer.subscribe();
 		producer.writeString("old");
@@ -826,7 +826,7 @@ for (const alreadyExpired of [false, true]) {
 		producer.writeString("new");
 
 		if (alreadyExpired) {
-			await expect(hooks.guardGroup(group, Promise.resolve())).rejects.toBeInstanceOf(Expired);
+			await expect(hooks.guardGroup(group, () => Promise.resolve())).rejects.toBeInstanceOf(Expired);
 		}
 
 		const stream = new TransformStream<Uint8Array, Uint8Array>();
@@ -834,11 +834,16 @@ for (const alreadyExpired of [false, true]) {
 		const reader = stream.readable.getReader();
 		try {
 			// No reader drains the stream, so resetting it rejects the pending write.
-			const guarded = hooks.guardGroup(group, writer.write(enc.encode("old")));
+			let writes = 0;
+			const guarded = hooks.guardGroup(group, () => {
+				writes++;
+				return writer.write(enc.encode("old"));
+			});
 			const verdict = await guarded.catch((err: unknown) => err);
 			expect(verdict).toBeInstanceOf(Expired);
+			expect(writes).toBe(0);
 			writer.reset(verdict);
-			await expect(reader.read()).rejects.toMatchObject({ streamErrorCode: StreamCode.DeliveryTimeout });
+			await expect(reader.read()).rejects.toMatchObject({ streamErrorCode: StreamCode.Old });
 			await settle();
 
 			const next = await track.recvGroup();
@@ -867,7 +872,7 @@ test("a budget verdict on unread content is Expired, an eviction is TooFarBehind
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation);
+	const guarded = hooks.guardGroup(group, () => operation);
 	producer.writeString("new");
 
 	const expired = await guarded.then(
@@ -875,7 +880,7 @@ test("a budget verdict on unread content is Expired, an eviction is TooFarBehind
 		(err: unknown) => err,
 	);
 	expect(expired).toBeInstanceOf(Expired);
-	expect((expired as Expired).code).toBe(StreamCode.DeliveryTimeout);
+	expect((expired as Expired).code).toBe(StreamCode.Old);
 	release();
 
 	// Same shape of loss, different reason: retention drops the unread tail while the
@@ -924,7 +929,7 @@ test("a guarded write keeps the position of the frame removed from the buffer", 
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation);
+	const guarded = hooks.guardGroup(group, () => operation);
 
 	producer.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(1_000) });
 	// A group beyond the edge, so group 0's reach (1s) is provably behind it: a group is
@@ -953,7 +958,7 @@ test("clean source closure stays provisional while a frame write can expire", as
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation);
+	const guarded = hooks.guardGroup(group, () => operation);
 
 	const edge = producer.appendGroup();
 	edge.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(1_000) });
