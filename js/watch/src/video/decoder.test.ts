@@ -197,6 +197,8 @@ function fixture() {
 
 	return {
 		served,
+		broadcast,
+		rendition: source.out.track as Signal<string | undefined>,
 		decoder,
 		sync,
 		track,
@@ -553,6 +555,90 @@ test("a rendition that left the catalog is not a stall", async () => {
 		await advance(1_500);
 		await settle();
 		expect(fx.decoder.out.stalled.peek()).toBe(true);
+	} finally {
+		fx.close();
+	}
+});
+
+
+test("a pending rendition waits until its preview picture is due", async () => {
+	const fx = fixture();
+	const second = new Moq.Track.Producer("second").accept({});
+	fx.broadcast.insertTrack(second);
+	const encoded = new Container.Legacy.Producer(second, new Container.Legacy.Format("video"));
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		const audio = fx.sync.track("audio");
+		audio.clock.set({ timestamp: Time.Micro(1_000_000), reference: Time.Milli.now(), rate: 0 });
+		fx.served[0].encode(payload(16), Time.Micro(1_000_000), true);
+		await settle();
+		built[0].emit(1_000_000);
+		await settle();
+		expect(fx.decoder.out.timestamp.peek()).toBe(Time.Milli(1_000));
+
+		fx.rendition.set("second");
+		await settle();
+		expect(built).toHaveLength(2);
+		encoded.encode(payload(16), Time.Micro(1_150_000), true);
+		await settle();
+		built[1].emit(1_150_000);
+		await settle();
+		expect(fx.decoder.out.timestamp.peek()).toBe(Time.Milli(1_000));
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(1_000_000);
+
+		audio.clock.set({ timestamp: Time.Micro(1_150_000), reference: Time.Milli.now(), rate: 0 });
+		await settle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(1_150_000);
+	} finally {
+		fx.close();
+	}
+});
+
+test("a sparse rendition is not rebuilt at every healthy silence", async () => {
+	const fx = fixture();
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		for (let n = 0; n < 6; n++) {
+			const timestamp = Time.Micro(n * 6_000_000);
+			fx.served[0].encode(payload(16), timestamp, true);
+			await settle();
+			built.at(-1)?.emit(timestamp);
+			await settle();
+			await advance(6_000);
+		}
+		expect(await fx.subscriptions(2)).toBe(2);
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(30_000_000);
+	} finally {
+		fx.close();
+	}
+});
+
+
+test("a new rendition does not inherit a sparse rendition's recovery window", async () => {
+	const fx = fixture();
+	const second = new Moq.Track.Producer("second").accept({});
+	fx.broadcast.insertTrack(second);
+	const encoded = new Container.Legacy.Producer(second, new Container.Legacy.Format("video"));
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		for (let n = 0; n < 2; n++) {
+			const timestamp = Time.Micro(n * 6_000_000);
+			fx.served[0].encode(payload(16), timestamp, true);
+			await settle();
+			built.at(-1)?.emit(timestamp);
+			await settle();
+			await advance(6_000);
+		}
+		fx.rendition.set("second");
+		await settle();
+		encoded.encode(payload(16), Time.Micro(12_000_000), true);
+		await settle();
+		built.at(-1)?.emit(12_000_000);
+		await advance(100);
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(12_000_000);
+		const before = built.length;
+		await advance(6_000);
+		expect(built).toHaveLength(before + 1);
 	} finally {
 		fx.close();
 	}

@@ -150,6 +150,14 @@ export class Decoder {
 	// set.
 	#recover = RECOVER;
 
+	// The longest wall-clock wait seen between two successive new pictures, and the last new one.
+	// A rendition that only sends a frame when its content changes (a static screen share) is
+	// healthy through silences longer than RECOVER; once one such gap has been seen, the recovery
+	// window stretches to cover it, so the watchdog stops rebuilding a subscription that is fine.
+	#cadence = Time.Milli.zero;
+	#painted?: { at: Time.Milli; timestamp: number };
+	#cadenceSource?: { broadcast: Moq.Broadcast.Consumer; track: string };
+
 	#signals = new Effect();
 
 	#clearCurrentFrame(): void {
@@ -322,6 +330,11 @@ export class Decoder {
 		}
 
 		effect.cleanup(() => active.close());
+		if (this.#cadenceSource?.broadcast !== active.broadcast || this.#cadenceSource.track !== active.track) {
+			this.#cadenceSource = { broadcast: active.broadcast, track: active.track };
+			this.#cadence = Time.Milli.zero;
+			this.#painted = undefined;
+		}
 
 		// Clone the frame so we own it independently of the DecoderTrack.
 		// proxy() would share the same reference, allowing the source to close our frame.
@@ -381,6 +394,15 @@ export class Decoder {
 		// the full window again.
 		this.#recover = RECOVER;
 
+		// Only a newer picture says how long the source goes between frames: a rebuilt subscription
+		// repainting the picture already held says nothing about the cadence.
+		const now = Time.Milli.now();
+		const painted = this.#painted;
+		if (!painted || frame.timestamp > painted.timestamp) {
+			if (painted) this.#cadence = Time.Milli.max(this.#cadence, Time.Milli.sub(now, painted.at));
+			this.#painted = { at: now, timestamp: frame.timestamp };
+		}
+
 		effect.timer(() => {
 			this.#out.stalled.set(true);
 		}, BUFFERING);
@@ -395,7 +417,9 @@ export class Decoder {
 		if (!effect.get(this.#active)) return;
 		if (!effect.get(this.#out.stalled)) return;
 
-		const after = this.#recover;
+		// Twice the longest gap a healthy source has already shown, so a sparse rendition is not
+		// rebuilt at every silence; still bounded by the ceiling for a subscription that really died.
+		const after = Time.Milli(Math.min(RECOVER_MAX, Math.max(this.#recover, 2 * this.#cadence)));
 		effect.timer(() => {
 			this.#recover = Time.Milli(Math.min(RECOVER_MAX, after * 2));
 			this.#rebuild(`no frame for ${after}ms`);
@@ -457,6 +481,11 @@ class DecoderTrack {
 	// so in-flight decodes from before a rewind can be dropped on output.
 	#discontinuity = 0;
 
+	// The timestamp of the preview picture: the first decoded frame, shown before the shared clock
+	// reaches it. Older backlog is dropped against it, but it is not `timestamp`: that one says a
+	// picture is due, which is what the parent's promotion reads.
+	#preview?: Time.Milli;
+
 	#signals = new Effect();
 
 	constructor(props: DecoderTrackProps) {
@@ -488,7 +517,7 @@ class DecoderTrack {
 					const generation = this.#discontinuity;
 
 					const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
-					if (timestamp < (this.timestamp.peek() ?? 0)) {
+					if (timestamp < Math.max(this.timestamp.peek() ?? 0, this.#preview ?? 0)) {
 						// Late frame, don't render it.
 						return;
 					}
@@ -502,7 +531,7 @@ class DecoderTrack {
 					if (this.frame.peek() === undefined) {
 						// This preview is already visible. Older backlog must not replace it
 						// while its timestamp is still waiting for the shared clock.
-						this.timestamp.set(timestamp);
+						this.#preview = timestamp;
 						this.frame.set(frame.clone());
 					}
 
@@ -756,6 +785,7 @@ class DecoderTrack {
 		if (count === this.#discontinuity) return false;
 		this.#discontinuity = count;
 		this.timestamp.set(undefined);
+		this.#preview = undefined;
 		this.#buffered.set([]);
 		// A video delivery gap must not reset the audio track's running clock.
 		if (this.sync.out.clock.peek() !== "audio") this.sync.reset();
