@@ -361,12 +361,14 @@ export class Decoder {
 		// proxy() would share the same reference, allowing the source to close our frame.
 		effect.run((inner) => {
 			const frame = inner.get(active.frame);
-			if (frame) {
-				this.#shown = { timestamp: Time.Milli.fromMicro(frame.timestamp as Time.Micro), clock: active.clock };
-			}
+			// A track promoted with no picture of its own yet (a reopen, a rebuild) leaves the held one
+			// on screen until it paints, rather than a black tile while its first keyframe arrives.
+			// Going offline is what clears the picture.
+			if (!frame) return;
+			this.#shown = { timestamp: Time.Milli.fromMicro(frame.timestamp as Time.Micro), clock: active.clock };
 			this.#out.frame.update((prev) => {
 				prev?.close();
-				return frame?.clone();
+				return frame.clone();
 			});
 		});
 		effect.proxy(this.#out.timestamp, active.timestamp);

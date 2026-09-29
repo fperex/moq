@@ -10,8 +10,9 @@ import type { Source } from "./source";
 
 // What a track opened after a gap (a tab shown again, a tile scrolled back, a resume, a reattached
 // element) may put on screen. Its first group can start before the picture the tile is holding, and
-// nothing in that group older than the held picture is due. WebCodecs is not in bun, so a fake codec
-// records chunks and emits pictures on demand. Real timers throughout, each wait a poll bounded at 3 s.
+// nothing in that group older than the held picture is due; until it paints, the held picture stays.
+// WebCodecs is not in bun, so a fake codec records chunks and emits pictures on demand. Real timers
+// throughout, each wait a poll bounded at 3 s.
 
 type Codec = {
 	chunks: string[];
@@ -385,3 +386,37 @@ test("a republished broadcast without a clock still shows its pictures", async (
 		fx.close();
 	}
 });
+
+for (const [gap, during] of [
+	["reopened", undefined],
+	["reattached", (fx: ReturnType<typeof fixture>) => fx.reconnect()],
+] as const) {
+	test(`a ${gap} track keeps the held picture on screen until it paints its own`, async () => {
+		const fx = fixture();
+		// Every picture handed the renderer once the video is back, a cleared one included.
+		let changes: (number | undefined)[] | undefined;
+		const dispose = fx.decoder.out.frame.subscribe((frame) => changes?.push(frame?.timestamp));
+		try {
+			await holdThenReopen(fx, () => {
+				during?.(fx);
+				changes = [];
+			});
+
+			// The new track has its first group but has painted nothing yet.
+			await until(() => (codecs[1]?.chunks.length ?? 0) > 1);
+			expect(fx.decoder.out.frame.peek()?.timestamp).toBe(12_000_000);
+
+			fx.park(12_100_000);
+			write(fx.track.appendGroup(), 12_040_000);
+			await until(() => (codecs[1]?.chunks.length ?? 0) > 2);
+			codecs[1].emit(12_040_000);
+			await until(() => fx.decoder.out.frame.peek()?.timestamp === 12_040_000);
+
+			expect(changes).not.toContain(undefined);
+			expect(fx.decoder.out.frame.peek()?.timestamp).toBe(12_040_000);
+		} finally {
+			dispose();
+			fx.close();
+		}
+	});
+}

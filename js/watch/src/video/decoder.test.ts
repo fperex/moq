@@ -549,6 +549,33 @@ test("a picture frozen past the recovery window rebuilds the track", async () =>
 	}
 });
 
+test("a rebuilt track keeps the picture on screen until it paints its own", async () => {
+	const warn = console.warn;
+	console.warn = () => {};
+	const fx = fixture();
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		fx.served[0].encode(payload(16), Time.Micro(0), true);
+		await settle();
+		built[0].emit(0);
+		await settle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(0);
+
+		// Rebuilt for the frozen picture, the replacement has none of its own yet.
+		expect(await fx.decoders(2)).toBeGreaterThanOrEqual(2);
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(0);
+
+		fx.served[0].encode(payload(16), Time.Micro(2_000_000), true);
+		await settle();
+		built.at(-1)?.emit(2_000_000);
+		await settle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(2_000_000);
+	} finally {
+		fx.close();
+		console.warn = warn;
+	}
+});
+
 test("the arrival estimator survives a rebuild", async () => {
 	const warn = console.warn;
 	console.warn = () => {};

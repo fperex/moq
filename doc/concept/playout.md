@@ -442,7 +442,8 @@ of the group it joins, or groups a relay kept from before the gap), so the video
 decoder never shows a picture older than that one on the same clock, wherever
 the reset or a returning audio clock put the playhead. Without a shared clock it
 holds such a picture back only while the playhead is past the last one shown,
-which a rewind or a republish moves below it.
+which a rewind or a republish moves below it. Until the reopened track paints,
+the last picture stays on screen; only a broadcast going offline clears it.
 
 ## The "plus one frame" question
 
