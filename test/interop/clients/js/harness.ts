@@ -182,8 +182,11 @@ export async function open(
 	const page = await browser.newPage(options);
 	const errors: BrowserErrors = { page: [], console: [] };
 	page.on("console", (message) => {
-		console.error(`[${label}] ${message.text()}`);
-		if (message.type() === "error") errors.console.push(message.text());
+		const text = message.text();
+		const type = message.type();
+		void Promise.allSettled(message.args().map((argument) => argument.dispose()));
+		console.error(`[${label}] ${text}`);
+		if (type === "error") errors.console.push(text);
 	});
 	page.on("pageerror", (error) => {
 		console.error(`[${label} error] ${error.message}`);
