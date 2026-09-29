@@ -8,9 +8,6 @@
  *
  *     bun compare.ts --before <run dir> --after <run dir> [--out table.md]
  *
- * Adapted from `debug-findings/analysis/compare.mjs` on the reporter's fork (`fperex/moq`, branch
- * `debug/rt-audio`). See ../../README.md.
- *
  * @module
  */
 import { readdirSync, readFileSync } from "node:fs";

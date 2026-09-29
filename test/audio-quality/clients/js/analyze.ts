@@ -21,10 +21,6 @@
  *
  *     bun analyze.ts --run <run dir> --row <tag> [--warmup 5] [--media <file> --encode=<audio options>]
  *
- * Adapted from `debug-findings/analysis/analyze.mjs` on the reporter's fork (`fperex/moq`, branch
- * `debug/rt-audio`), whose per-preset markdown table and per-minute normalisation this keeps. The
- * event stream it read came from patched-in probes; this reads the public samples instead.
- *
  * @module
  */
 import { existsSync, readFileSync } from "node:fs";

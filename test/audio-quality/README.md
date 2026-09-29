@@ -415,8 +415,7 @@ audio worker's on one shared path, as they are on a real host.
 can pass while a fixed preset regresses, and a fixed preset is what a viewer lands on today.
 
 The source shape is a third axis that is not a profile. The AAC arm publishes MPEG-TS with ffmpeg's
-default PES packing, whose multi-frame bursts are the arrival shape the reporter measured against
-the public relay; `demo/pub` passes `-pes_payload_size 0` for the smooth variant. Both publishers pin
+default PES packing, whose multi-frame bursts are the arrival shape seen on the public relay; `demo/pub` passes `-pes_payload_size 0` for the smooth variant. Both publishers pin
 `-readrate_catchup 1`, so a publisher that was blocked (a `moq` slow to start, a stall in its import)
 resumes at real time instead of running five percent fast until it has made the time up; a fixed
 delay would otherwise throw that surplus away as skips that measure the source, not the player.
@@ -461,13 +460,7 @@ The harness this grew from is the reporter's, on their fork `fperex/moq`, branch
 the beacon sink, the trace analyzer, the black-box probe, and the before/after table were working
 there before any of this existed, against 130 raw ndjson traces published as release
 `rt-audio-traces-2026-09-06`. `sink.ts`, `compare.ts`, `src/probe.ts`, and `analyze.ts` are adapted
-from `debug-findings/analysis/{sink.ts,compare.mjs,blackbox.js,analyze.mjs}` and say so in their
-module comments.
-
-What changed in upstreaming: the CDP driver became Playwright, reusing the smoke harness; the
-analyzer's event stream came from probes patched into the player, and now comes from the public
-signals, which is what lets the same page measure a published build; and the arrival impairment came
-from a shell script driving the OS, and now comes from `moq-shaper` with a seed and its own counters.
+from `debug-findings/analysis/{sink.ts,compare.mjs,blackbox.js,analyze.mjs}`.
 
 ## Not covered here
 

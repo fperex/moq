@@ -421,7 +421,7 @@ WEB_PORT="$HARNESS_PORT"
 # Both ffmpeg invocations mirror demo/pub/justfile, with one deliberate difference each and one they
 # share. Opus is encoded rather than copied, because bbb.mp4 carries AAC. The TS arm leaves ffmpeg's
 # default PES packing alone (demo/pub passes `-pes_payload_size 0` for the smooth variant), because the
-# resulting multi-frame bursts are the arrival shape the reporter measured on the public relay.
+# resulting multi-frame bursts are the arrival shape seen on the public relay.
 #
 # Both pin `-readrate_catchup 1`, because a live source never runs fast. By default ffmpeg makes up
 # any time its output was blocked at 1.05x real time, for twenty times as long: a `moq` that starts

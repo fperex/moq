@@ -11,9 +11,6 @@
  * - `AudioContext.currentTime` against wall time, which is how a run that was throttled or never
  *   really rendered gets caught instead of being graded.
  *
- * Adapted from the black-box probe in `debug-findings/analysis/blackbox.js` on the reporter's fork
- * (`fperex/moq`, branch `debug/rt-audio`). See ../../README.md.
- *
  * @module
  */
 import type MoqWatch from "@moq/watch/element";
