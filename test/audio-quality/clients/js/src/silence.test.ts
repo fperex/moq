@@ -151,3 +151,18 @@ test("repeated stretches between reports widen the bracket instead of refusing i
 	expect(proof.reason).toBeUndefined();
 	expect(proof.proven).toBe(true);
 });
+
+test("a torn shared-ring read, an offset step with no stretch, is bracketed rather than learned from", () => {
+	const all = samples(film);
+	const window = graded(all);
+	// A quantum rendered between the poll's playhead and counter reads: `output` one quantum ahead.
+	const quiet = window.find((s) => (s.rms ?? 1) < 0.001);
+	const loud = window.find((s) => (s.rms ?? 0) > 0.01);
+	for (const torn of [quiet, loud])
+		if (torn?.playout) torn.playout = { ...torn.playout, output: torn.playout.output + 128 };
+
+	const proof = prove(all, window, reference(film));
+	expect(proof.reason).toBeUndefined();
+	expect(proof.proven).toBe(true);
+	expect(proof.alignment?.correlation).toBeGreaterThan(0.9999);
+});

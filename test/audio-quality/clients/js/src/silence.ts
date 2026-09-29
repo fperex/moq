@@ -112,9 +112,9 @@ type Bracket = { offsets: number[]; widen: number; clean: boolean } | { refused:
  * Bracket the window of `samples[index]` between the reports either side of it.
  *
  * The window ends at its own sample and starts well after the previous one, and the next report is
- * taken after it ends, so any stretch that moved it shows up across those three. One stretch moves
- * the offset monotonically from one bracketing value to another; each further one can overshoot by
- * at most one maximal stretch, so the bracket widens by that much per extra stretch.
+ * taken after it ends, so any stretch that moved it shows up across those three. Between two reports,
+ * one stretch moves the offset monotonically from one's value to the other's; each further stretch in
+ * that interval can overshoot by at most one maximal stretch, so the bracket widens by that much.
  */
 function bracket(samples: Sample[], index: number, maxStretch: number): Bracket {
 	const before = samples[index - 1];
@@ -143,14 +143,18 @@ function bracket(samples: Sample[], index: number, maxStretch: number): Bracket 
 	}
 	if (reports.some((r) => r?.stalled === true || r?.playout?.stalled === true)) return { refused: "stalled" };
 
-	const last = playouts.at(-1) ?? first;
-	const stretches = last.accelerates + last.expands - (first.accelerates + first.expands);
+	const stretched = playouts.map((p) => (p ? p.accelerates + p.expands : 0));
+	const overshoot = Math.max(0, ...stretched.slice(1).map((n, i) => n - (stretched[i] ?? n) - 1));
 	const offsets = timings.map((t) => t?.offset ?? 0);
 	// The final window has no later report to close its bracket, so one maximal stretch either side of
 	// its own offset stands in for one: whatever happened after its report is as unseen here as it is
 	// by every other counter in the row.
-	const widen = Math.max(0, stretches - 1) * maxStretch + (after ? 0 : maxStretch);
-	return { offsets, widen, clean: after !== undefined && stretches === 0 };
+	const widen = overshoot * maxStretch + (after ? 0 : maxStretch);
+	// The fit learns only from exact windows: no stretch, and one offset across all three reports. The
+	// shared ring's poll reads the playhead and its counters apart, so a quantum can land between them
+	// and step the offset with no stretch counted; the bracket covers that, but the fit should not use it.
+	const still = stretched.every((n) => n === stretched[0]) && Math.min(...offsets) === Math.max(...offsets);
+	return { offsets, widen, clean: after !== undefined && still };
 }
 
 /**

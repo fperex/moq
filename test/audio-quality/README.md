@@ -347,8 +347,8 @@ A window is placed with what the probe already records ([`src/silence.ts`](clien
 - `AudioContext.currentTime`, read with the RMS, ends the window.
 - The ring's playhead less its `output` counter, from one report, is the media frame paired with
   each output frame. Only a time stretch moves it while the ring plays, and the reports either side
-  bracket it across the window, widened by one maximal stretch for each further stretch between
-  them and for the final window, which has no later report.
+  bracket it across the window, widened by one maximal stretch for each further stretch between two
+  consecutive reports, and for the final window, which has no later report.
 - A concealment, underrun, short quantum, skip, jump, discard, trim, stall, new graph, or new
   timeline between those reports refuses the window rather than placing it.
 
