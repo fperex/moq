@@ -186,4 +186,55 @@ describe("render worklet ports", () => {
 
 		node.port2.close();
 	});
+
+	it("says on the node's own port that its processor stopped, in the quantum that stops it", async () => {
+		// Chromium keeps a closed context, and every node in it, for as long as one of its processors
+		// has not stopped, and a processor only stops in a quantum it renders. The page closes the
+		// context on this, not on the close it sent.
+		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
+		const node = new MessageChannel();
+		nextPort = node.port1;
+		const render = new Render();
+		const extra = new MessageChannel();
+		const handoff: Port = { type: "port", port: extra.port1 };
+		const page: ToMain[] = [];
+		const writer: ToMain[] = [];
+		try {
+			const receive = node.port1.onmessage;
+			if (!receive) throw new Error("render registered no message handler");
+			// Resolves once the processor has handled the close the page sent.
+			const handled = Promise.withResolvers<void>();
+			node.port1.onmessage = (event) => {
+				receive.call(node.port1, event);
+				if ((event.data as Message).type === "close") handled.resolve();
+			};
+			node.port2.postMessage(handoff, [extra.port1]);
+			extra.port2.onmessage = (event: MessageEvent<ToMain>) => writer.push(event.data);
+			node.port2.postMessage({ type: "close" });
+			await handled.promise;
+
+			// Nothing yet: a close is not a stop. A marker from the processor's end lands after anything
+			// the processor already said on it.
+			const marked = new Promise<void>((resolve) => {
+				node.port2.onmessage = (event: MessageEvent<ToMain | "marker">) => {
+					if (event.data === "marker") resolve();
+					else page.push(event.data);
+				};
+			});
+			node.port1.postMessage("marker");
+			await marked;
+			expect(page).toEqual([]);
+
+			const stopped = new Promise<ToMain>((resolve) => {
+				node.port2.onmessage = (event: MessageEvent<ToMain>) => resolve(event.data);
+			});
+			expect(render.process([], [[new Float32Array(QUANTUM)]], {})).toBe(false);
+			expect(await stopped).toEqual({ type: "stopped" });
+			// Only the page closes a context, so a writer's port hears nothing of it.
+			expect(writer).toEqual([]);
+		} finally {
+			node.port2.close();
+			extra.port2.close();
+		}
+	});
 });

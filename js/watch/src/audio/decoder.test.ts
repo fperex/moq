@@ -143,13 +143,52 @@ class MockAudioDecoder {
 	async flush(): Promise<void> {}
 }
 
-/** Enough of an AudioWorkletNode for the ring to be built against. */
-class MockWorkletNode {
+/**
+ * Enough of an AudioWorkletNode for the ring to be built against, behind a processor that stops the
+ * way the render worklet's does: in the next quantum its context renders after it is told to close,
+ * saying so on the node's port. A running context renders on its own; a suspended one never does.
+ */
+class MockWorkletNode extends EventTarget {
 	static built: MockContext[] = [];
+	static nodes: MockWorkletNode[] = [];
+	// Whether quanta are rendered only by `render`, so a case can hold a processor between its close
+	// and its stop.
+	static manual = false;
+
+	readonly context: MockContext;
+	/** Everything the page sent the processor, in order. */
+	readonly messages: unknown[] = [];
+	readonly port = Object.assign(new EventTarget(), {
+		postMessage: (message: unknown) => {
+			this.messages.push(message);
+			if ((message as { type?: string }).type !== "close") return;
+			this.#closed = true;
+			this.#tick();
+		},
+		start: () => {},
+	});
+	#closed = false;
+	#stopped = false;
+
 	constructor(context: MockContext) {
+		super();
+		this.context = context;
 		MockWorkletNode.built.push(context);
+		MockWorkletNode.nodes.push(this);
+		context.addEventListener("statechange", () => this.#tick());
 	}
-	readonly port = { postMessage: () => {}, onmessage: null, addEventListener: () => {}, start: () => {} };
+
+	#tick(): void {
+		if (this.#closed && !MockWorkletNode.manual) setTimeout(() => this.render(), 0);
+	}
+
+	/** Render one quantum, which a context only does while running. */
+	render(): void {
+		if (this.context.state !== "running" || !this.#closed || this.#stopped) return;
+		this.#stopped = true;
+		this.port.dispatchEvent(new MessageEvent("message", { data: { type: "stopped" } }));
+	}
+
 	connect(): void {}
 	disconnect(): void {}
 }
@@ -204,6 +243,8 @@ beforeEach(() => {
 	(globalThis as Record<string, unknown>).EncodedAudioChunk = MockEncodedChunk;
 	MockContext.built = [];
 	MockWorkletNode.built = [];
+	MockWorkletNode.nodes = [];
+	MockWorkletNode.manual = false;
 	MockContext.activation = false;
 	MockContext.grace = false;
 	MockContext.autoplay = false;
@@ -546,6 +587,121 @@ test("a player put back on the page builds a context again", async () => {
 	expect(second.state).toBe("running");
 	expect(built.out.root.peek()).toBeDefined();
 	expect(MockContext.live().length).toBe(1);
+
+	close();
+});
+
+test("a player taken off the page closes its context once the processor in it has stopped", async () => {
+	// Chromium keeps a closed context, and the worklet node in it, for as long as the node's processor
+	// has not stopped, and a processor only stops in a quantum its context renders. Closed straight
+	// after the close message, every detach leaves one of each in the page's heap for good.
+	MockWorkletNode.manual = true;
+	const { decoder: built, attached, close } = decoder(true);
+	await flush();
+	click();
+	await flush();
+	const context = built.out.context.peek() as unknown as MockContext;
+	const [node] = MockWorkletNode.nodes;
+	expect(context.state).toBe("running");
+
+	attached.set(false);
+	await flush();
+
+	// Told to stop, and gone from the outputs, but the context renders on until the processor says so.
+	expect(node.messages).toContainEqual({ type: "close" });
+	expect(built.out.context.peek()).toBeUndefined();
+	expect(context.state).toBe("running");
+
+	node.render();
+	await flush();
+	expect(context.state).toBe("closed");
+
+	close();
+});
+
+test("a player taken off the page closes a context that is not running at once", async () => {
+	// A suspended context renders no quantum, so its processor never stops and waiting would only hold
+	// the context open. Chromium keeps this pair: nothing short of rendering releases it.
+	MockWorkletNode.manual = true;
+	const { decoder: built, attached, close } = decoder(true);
+	await flush();
+	const context = built.out.context.peek() as unknown as MockContext;
+	expect(context.state).toBe("suspended");
+	expect(MockWorkletNode.nodes.length).toBe(1);
+
+	attached.set(false);
+	await flush();
+	expect(MockWorkletNode.nodes[0].messages).toContainEqual({ type: "close" });
+	expect(context.state).toBe("closed");
+
+	close();
+});
+
+test("a context that stops running while its processor stops is closed then", async () => {
+	// The browser suspends a context whose device fails, and interrupts one for a call: either way the
+	// quantum the processor would stop in never comes.
+	MockWorkletNode.manual = true;
+	const { decoder: built, attached, close } = decoder(true);
+	await flush();
+	click();
+	await flush();
+	const context = built.out.context.peek() as unknown as MockContext;
+
+	attached.set(false);
+	await flush();
+	expect(context.state).toBe("running");
+
+	context.state = "suspended";
+	context.dispatchEvent(new Event("statechange"));
+	await flush();
+	expect(context.state).toBe("closed");
+
+	close();
+});
+
+test("a processor that failed does not hold its context open", async () => {
+	// A processor that throws is stopped by the browser, which says so on the node rather than the port.
+	MockWorkletNode.manual = true;
+	const { decoder: built, attached, close } = decoder(true);
+	await flush();
+	click();
+	await flush();
+	const context = built.out.context.peek() as unknown as MockContext;
+	const [node] = MockWorkletNode.nodes;
+
+	attached.set(false);
+	await flush();
+	expect(context.state).toBe("running");
+
+	node.dispatchEvent(new Event("processorerror"));
+	await flush();
+	expect(context.state).toBe("closed");
+
+	close();
+});
+
+test("a rate change builds the new context at once and closes the old one once its processor stopped", async () => {
+	MockWorkletNode.manual = true;
+	const { decoder: built, catalog: root, close } = decoder(true);
+	await flush();
+	click();
+	await flush();
+	const first = built.out.context.peek() as unknown as MockContext;
+	const [node] = MockWorkletNode.nodes;
+
+	MockContext.grace = true;
+	root.set(catalog({ rate: 44100 }));
+	await flush();
+
+	const second = built.out.context.peek() as unknown as MockContext;
+	expect(second.sampleRate).toBe(44100);
+	expect(second.state).toBe("running");
+	expect(first.state).toBe("running");
+
+	node.render();
+	await flush();
+	expect(first.state).toBe("closed");
+	expect(MockContext.live()).toEqual([second]);
 
 	close();
 });

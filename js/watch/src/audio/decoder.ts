@@ -19,7 +19,7 @@ import type { Delay, Sync } from "../sync";
 import { reportTransport, supportsSharedArrayBuffer } from "./buffer";
 import { audioMaxAge, type DecoderConfig, decoderConfig } from "./config";
 import type * as Playout from "./playout";
-import type { Close } from "./render";
+import type { Close, ToMain } from "./render";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -176,7 +176,7 @@ export class Decoder {
 	// The AudioContext the graph runs in, owned here rather than by an effect: it is built by the
 	// gesture that starts it (see #buildContext) and outlives every other change to the graph short
 	// of the player leaving the page (see #runContext).
-	#context: { audio: AudioContext; effects: Effect } | undefined;
+	#context: { audio: AudioContext; effects: Effect; processors: Processors } | undefined;
 
 	// Everything that feeds the ring (the subscription, the estimator, the decoder and the writes) and the
 	// graph it writes into: on the page, or in the page's worker. See #runSupply.
@@ -448,12 +448,13 @@ export class Decoder {
 			...(rate !== undefined && { sampleRate: rate }),
 		});
 		const effects = new Effect();
-		this.#context = { audio: context, effects };
+		const processors = new Processors(context);
+		this.#context = { audio: context, effects, processors };
 
 		// Expose the rate the graph actually runs at.
 		this.#out.sampleRate.set(context.sampleRate);
 		this.#out.context.set(context);
-		effects.run((effect) => this.#runWorklet(effect, context));
+		effects.run((effect) => this.#runWorklet(effect, context, processors));
 
 		return context;
 	}
@@ -464,16 +465,16 @@ export class Decoder {
 		if (!context) return;
 
 		this.#context = undefined;
-		// Cancel module loads before close rejects them; signal propagation happens later.
+		// Cancel module loads before close rejects them; signal propagation happens later. This also
+		// tells the processor to stop, which the context is closed after.
 		context.effects.close();
 		this.#out.context.set(undefined);
 		this.#out.sampleRate.set(undefined);
 
-		// A context closed twice rejects, and there is nothing to do about a close that fails anyway.
-		context.audio.close().catch(() => {});
+		context.processors.close();
 	}
 
-	#runWorklet(effect: Effect, context: AudioContext): void {
+	#runWorklet(effect: Effect, context: AudioContext, processors: Processors): void {
 		// It takes a second or so to initialize the AudioWorklet, so do it even if disabled. This is
 		// less efficient for video-only playback but makes muting/unmuting instant, since the first
 		// gesture on the page builds a context for every tile whether or not it is the one clicked.
@@ -506,6 +507,7 @@ export class Decoder {
 				channelCountMode: "explicit",
 				outputChannelCount: [channelCount],
 			});
+			processors.add(worklet);
 			effect.cleanup(() => {
 				// The context outlives this node, so the processor has to be told to end. See `Close`.
 				const close: Close = { type: "close" };
@@ -603,4 +605,63 @@ export class Decoder {
 
 	// Whether the WebCodecs audio decoder can play this config.
 	static supported = supported;
+}
+
+/**
+ * The processors built in one AudioContext, which closes it once every one of them has stopped.
+ *
+ * Chromium keeps a closed context, and every node in it, for as long as one of its processors has not
+ * stopped, and a processor only stops in a quantum its context renders. So a running context is closed
+ * once each processor has said it stopped (see `Stopped`), and one that renders nothing (suspended for
+ * want of a gesture, interrupted, failed) is closed at once: its processors can never stop, and waiting
+ * would only hold it open.
+ */
+class Processors {
+	readonly #context: AudioContext;
+	// Every processor that has not said it stopped.
+	readonly #active = new Set<AudioWorkletNode>();
+	// Owns every listener, all released once the context is closed.
+	readonly #signals = new Effect();
+	#closing = false;
+
+	constructor(context: AudioContext) {
+		this.#context = context;
+	}
+
+	/** Follow the processor behind `node` until it says it stopped, or fails, which stops it too. */
+	add(node: AudioWorkletNode): void {
+		this.#active.add(node);
+		const dispose = this.#signals.run((effect) => {
+			const stop = () => {
+				dispose();
+				this.#active.delete(node);
+				if (this.#closing && this.#active.size === 0) this.#close();
+			};
+			effect.event(node.port, "message", (event) => {
+				if ((event as MessageEvent<ToMain>).data?.type === "stopped") stop();
+			});
+			effect.event(node, "processorerror", stop);
+			// A port only delivers to listeners added with addEventListener once it is started.
+			node.port.start();
+		});
+	}
+
+	/** Close the context once every processor in it has stopped, or now if it renders nothing. */
+	close(): void {
+		this.#closing = true;
+		if (this.#active.size === 0 || this.#context.state !== "running") {
+			this.#close();
+			return;
+		}
+		// A context that stops rendering never runs the quantum a processor would stop in.
+		this.#signals.event(this.#context, "statechange", () => {
+			if (this.#context.state !== "running") this.#close();
+		});
+	}
+
+	#close(): void {
+		this.#signals.close();
+		// A context closed twice rejects, and there is nothing to do about a close that fails anyway.
+		this.#context.close().catch(() => {});
+	}
 }
