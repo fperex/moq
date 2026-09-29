@@ -418,15 +418,20 @@ WEB_PORT="$HARNESS_PORT"
 # ingest too would mean grading the receiver on a stream that was already damaged before it was
 # published, and the publisher's own flush span is a separate stage of the ledger.
 #
-# Both ffmpeg invocations mirror demo/pub/justfile, with one deliberate difference each. Opus is
-# encoded rather than copied, because bbb.mp4 carries AAC. The TS arm leaves ffmpeg's default PES
-# packing alone (demo/pub passes `-pes_payload_size 0` for the smooth variant), because the resulting
-# multi-frame bursts are the arrival shape the reporter measured on the public relay.
+# Both ffmpeg invocations mirror demo/pub/justfile, with one deliberate difference each and one they
+# share. Opus is encoded rather than copied, because bbb.mp4 carries AAC. The TS arm leaves ffmpeg's
+# default PES packing alone (demo/pub passes `-pes_payload_size 0` for the smooth variant), because the
+# resulting multi-frame bursts are the arrival shape the reporter measured on the public relay.
+#
+# Both pin `-readrate_catchup 1`, because a live source never runs fast. By default ffmpeg makes up
+# any time its output was blocked at 1.05x real time, for twenty times as long: a `moq` that starts
+# reading seconds late (a freshly linked binary on macOS waits that long in dyld) would hand the first
+# rows a stream five percent fast, which a fixed delay can only throw away.
 # shellcheck disable=SC2329  # invoked indirectly via 'harness_spawn'
 publish_opus() {
     local audio
     read -ra audio <<<"$(audio_of opus)"
-    ffmpeg -hide_banner -v quiet -stream_loop -1 -re -i "$MEDIA" \
+    ffmpeg -hide_banner -v quiet -stream_loop -1 -re -readrate_catchup 1 -i "$MEDIA" \
         -c:v copy "${audio[@]}" \
         -f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer -frag_duration 1000 - |
         "$MOQ" --connect "$RELAY_URL" --broadcast "bbb-opus.hang" import fmp4
@@ -436,7 +441,7 @@ publish_opus() {
 publish_aac() {
     local audio
     read -ra audio <<<"$(audio_of aac)"
-    ffmpeg -hide_banner -v quiet -stream_loop -1 -re -i "$MEDIA" \
+    ffmpeg -hide_banner -v quiet -stream_loop -1 -re -readrate_catchup 1 -i "$MEDIA" \
         -c:v copy "${audio[@]}" \
         -f mpegts - |
         "$MOQ" --connect "$RELAY_URL" --broadcast "bbb-aac.hang" import ts

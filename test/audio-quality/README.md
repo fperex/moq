@@ -418,7 +418,10 @@ can pass while a fixed preset regresses, and a fixed preset is what a viewer lan
 
 The source shape is a third axis that is not a profile. The AAC arm publishes MPEG-TS with ffmpeg's
 default PES packing, whose multi-frame bursts are the arrival shape the reporter measured against
-the public relay; `demo/pub` passes `-pes_payload_size 0` for the smooth variant.
+the public relay; `demo/pub` passes `-pes_payload_size 0` for the smooth variant. Both publishers pin
+`-readrate_catchup 1`, so a publisher that was blocked (a `moq` slow to start, a stall in its import)
+resumes at real time instead of running five percent fast until it has made the time up; a fixed
+delay would otherwise throw that surplus away as skips that measure the source, not the player.
 
 ## Layout
 
