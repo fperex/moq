@@ -264,15 +264,13 @@ impl ResumeState {
 	/// The newest live edge across the segments below the exclusive `cap`, each clamped
 	/// to its own range: the edge the logical track measures drift against.
 	fn live_edge(&self, cap: Option<u64>) -> Option<LiveEdge> {
-		self.segments
-			.iter()
-			.filter_map(|segment| {
-				let edge = segment.track.live_edge(min_some(cap, last_group(segment.end)))?;
-				// Out-of-range content below the segment is not its to serve.
-				let start = segment.start.map_or(0, |start| start.group);
-				(edge.sequence >= start).then_some(edge)
-			})
-			.max_by_key(|edge| edge.sequence)
+		// Ranges ascend; the later segment wins when a boundary splits one group.
+		self.segments.iter().rev().find_map(|segment| {
+			let edge = segment.track.live_edge(min_some(cap, last_group(segment.end)))?;
+			// Out-of-range content below the segment is not its to serve.
+			let start = segment.start.map_or(0, |start| start.group);
+			(edge.sequence >= start).then_some(edge)
+		})
 	}
 
 	/// Where the logical track continues past the exclusive group `boundary` of segment
@@ -3297,6 +3295,120 @@ mod test {
 		sub.end_at(..);
 		assert_eq!(recv(&mut sub), 2, "the stale parked group is skipped after finish");
 		recv_pending(&mut sub);
+	}
+
+	#[tokio::test]
+	async fn a_raised_cap_rechecks_finished_segments_against_the_live_route() {
+		let retain = track::Info::default().with_max_age(Duration::from_secs(60));
+		let (mut old, old_consumer) = track_pair_with("old", retain.clone());
+		let (mut live, live_consumer) = track_pair_with("live", retain);
+		let mut producer = Producer::new();
+		producer.switch(&old_consumer, None).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+		sub.end_at(..1);
+		write_group_at(&mut old, 0, "old", Duration::ZERO);
+		assert_eq!(recv(&mut sub), 0);
+		write_group_at(&mut old, 1, "parked", Duration::from_secs(1));
+		write_group_at(&mut old, 2, "parked tail", Duration::from_secs(2));
+		old.finish().unwrap();
+		recv_pending(&mut sub);
+
+		producer.switch(&live_consumer, Position::group(3)).unwrap();
+		write_group_at(&mut live, 3, "next", Duration::from_secs(3));
+		write_group_at(&mut live, 4, "newest", Duration::from_secs(4));
+		recv_pending(&mut sub);
+		sub.end_at(..);
+		assert_eq!(recv(&mut sub), 4);
+		recv_pending(&mut sub);
+	}
+
+	#[tokio::test]
+	async fn live_edge_respects_segment_ranges_and_the_reader_cap() {
+		let retain = track::Info::default().with_max_age(Duration::from_secs(60));
+		let (mut old, old_consumer) = track_pair_with("old", retain.clone());
+		let (mut live, live_consumer) = track_pair_with("live", retain);
+		write_group_at(&mut old, 2, "old", Duration::from_secs(2));
+		write_group_at(&mut old, 8, "outside old range", Duration::from_secs(80));
+		write_group_at(&mut live, 1, "outside live range", Duration::from_secs(100));
+		let mut producer = Producer::new();
+		producer.switch(&old_consumer, None).unwrap();
+		producer.switch(&live_consumer, Position::group(3)).unwrap();
+		let consumer = producer.consume();
+		let edge = consumer.live_edge(None).unwrap();
+		assert_eq!(
+			(edge.sequence, edge.timestamp),
+			(2, Timestamp::from_millis(2000).unwrap())
+		);
+		write_group_at(&mut live, 3, "live", Duration::from_secs(3));
+		let edge = consumer.live_edge(None).unwrap();
+		assert_eq!(
+			(edge.sequence, edge.timestamp),
+			(3, Timestamp::from_millis(3000).unwrap())
+		);
+		let edge = consumer.live_edge(Some(3)).unwrap();
+		assert_eq!(
+			(edge.sequence, edge.timestamp),
+			(2, Timestamp::from_millis(2000).unwrap())
+		);
+		assert!(consumer.live_edge(Some(2)).is_none());
+	}
+
+	#[tokio::test]
+	async fn live_edge_uses_the_continuation_when_segments_share_a_group() {
+		let retain = track::Info::default().with_max_age(Duration::from_secs(60));
+		let (mut old, old_consumer) = track_pair_with("old", retain.clone());
+		let (live, live_consumer) = track_pair_with("live", retain);
+		write_group_at(&mut old, 0, "head", Duration::from_secs(10));
+		let mut continuation = live.create_group(group::Info { sequence: 0 }).unwrap();
+		continuation
+			.write_frame(Timestamp::ZERO, b"resent head".as_ref())
+			.unwrap();
+		continuation
+			.write_frame(Timestamp::from_millis(1000).unwrap(), b"continuation".as_ref())
+			.unwrap();
+		continuation.finish().unwrap();
+		let mut producer = Producer::new();
+		producer.switch(&old_consumer, None).unwrap();
+		producer
+			.switch(&live_consumer, Position { group: 0, frame: 1 })
+			.unwrap();
+		let edge = producer.consume().live_edge(None).unwrap();
+		assert_eq!(
+			(edge.sequence, edge.timestamp),
+			(0, Timestamp::from_millis(1000).unwrap())
+		);
+	}
+
+	#[tokio::test]
+	async fn live_edge_falls_back_while_the_newest_route_is_unstamped_or_aborted() {
+		let retain = track::Info::default().with_max_age(Duration::from_secs(60));
+		let (mut old, old_consumer) = track_pair_with("old", retain.clone());
+		let (live, live_consumer) = track_pair_with("live", retain);
+		write_group_at(&mut old, 0, "head", Duration::from_secs(10));
+		let mut producer = Producer::new();
+		producer.switch(&old_consumer, None).unwrap();
+		producer.switch(&live_consumer, Position::group(1)).unwrap();
+		let mut newest = live.create_group(group::Info { sequence: 1 }).unwrap();
+		let consumer = producer.consume();
+		let edge = consumer.live_edge(None).unwrap();
+		assert_eq!(
+			(edge.sequence, edge.timestamp),
+			(0, Timestamp::from_millis(10000).unwrap())
+		);
+		newest
+			.write_frame(Timestamp::from_millis(1000).unwrap(), b"new".as_ref())
+			.unwrap();
+		let edge = consumer.live_edge(None).unwrap();
+		assert_eq!(
+			(edge.sequence, edge.timestamp),
+			(1, Timestamp::from_millis(1000).unwrap())
+		);
+		newest.abort(Error::Cancel).unwrap();
+		let edge = consumer.live_edge(None).unwrap();
+		assert_eq!(
+			(edge.sequence, edge.timestamp),
+			(0, Timestamp::from_millis(10000).unwrap())
+		);
 	}
 
 	#[tokio::test]
