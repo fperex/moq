@@ -112,6 +112,37 @@ test("an overflow that invalidates a reader commit is counted only after media r
 	expect(ring.debug().jumped).toBe(152);
 });
 
+for (const incoming of [60, 200]) {
+	test(`overflow accounts for a concurrent reader before inserting ${incoming} samples`, () => {
+		const writer = new SharedRingBuffer(allocSharedRingBuffer(1, 128, 1000, true));
+		writer.setLatency(50);
+		for (const at of [0, 50]) writer.insert(Time.Micro(at * 1000), [new Float32Array(50).fill(0.5)]);
+		const reader = new SharedRingBuffer(writer.init);
+		expect(reader.read([new Float32Array(20)])).toBe(20);
+		const exchange = Atomics.compareExchange;
+		const atomics = Atomics as { compareExchange: unknown };
+		let raced = false;
+		atomics.compareExchange = (array: BigInt64Array, index: number, expected: bigint, next: bigint) => {
+			if (!raced && array.buffer === writer.init.state) {
+				raced = true;
+				const output = [new Float32Array(40)];
+				expect(reader.read(output)).toBe(40);
+				expect(output[0]).toEqual(new Float32Array(40).fill(0.5));
+			}
+			return exchange(array, index, expected, next);
+		};
+		try {
+			writer.insert(Time.Micro(100_000), [new Float32Array(incoming).fill(0.5)]);
+		} finally {
+			atomics.compareExchange = exchange;
+		}
+		expect(raced).toBe(true);
+		expect(writer.debug().discarded).toBe(incoming === 60 ? 0 : 112);
+		expect(reader.read([new Float32Array(20)])).toBe(20);
+		expect(writer.debug().jumped).toBe(incoming === 60 ? 0 : 112);
+	});
+}
+
 test("a handoff to a reset timeline does not observe the previous cursor as a jump", () => {
 	const source = new SharedRingBuffer(allocSharedRingBuffer(1, 128, 1000, true));
 	source.setLatency(50);

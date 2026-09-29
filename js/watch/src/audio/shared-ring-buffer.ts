@@ -316,13 +316,14 @@ export class SharedRingBuffer implements RingReader {
 	 * overflow path; the reader publishes with its own exchange so it can tell a rebase apart
 	 * from losing a race.
 	 */
-	#advance(candidate: number): void {
+	#advance(candidate: number): number {
 		for (;;) {
 			const state = Atomics.load(this.#state, 0);
-			if (((candidate - readOf(state)) | 0) <= 0) return;
+			const advanced = (candidate - readOf(state)) | 0;
+			if (advanced <= 0) return 0;
 
 			const next = pack(epochOf(state), candidate);
-			if (Atomics.compareExchange(this.#state, 0, state, next) === state) return;
+			if (Atomics.compareExchange(this.#state, 0, state, next) === state) return advanced;
 		}
 	}
 
@@ -443,8 +444,8 @@ export class SharedRingBuffer implements RingReader {
 		const bounded = readOf(Atomics.load(this.#state, 0));
 		if (((end - bounded) | 0) > this.capacity) {
 			const to = (end - this.capacity) | 0;
-			Atomics.add(this.#control, DISCARDED, (to - bounded) | 0);
-			this.#advance(to);
+			const discarded = this.#advance(to);
+			if (discarded > 0) Atomics.add(this.#control, DISCARDED, discarded);
 		}
 
 		// Write sample data
