@@ -101,8 +101,9 @@ const excuses = (proof: QuietProof | undefined, value: number | null): boolean =
 function proofLine(proof: QuietProof | undefined, value: number | null): string {
 	if (!proof) return "no quiet proof in this summary";
 	const counts = `${proof.matched}/${proof.quiet} quiet windows over quiet source`;
+	const segments = proof.segments.length > 1 ? `, ${proof.segments.length} analyser lag segments` : "";
 	const fit = proof.alignment
-		? ` (log RMS r ${proof.alignment.correlation.toFixed(5)}, level ${proof.alignment.gain.toFixed(3)}, ${proof.alignment.audible} audible windows)`
+		? ` (log RMS r ${proof.alignment.correlation.toFixed(5)}, level ${proof.alignment.gain.toFixed(3)}, ${proof.alignment.audible} audible windows${segments})`
 		: "";
 	if (!proof.proven) return `${counts}${fit}; ${proof.reason ?? "unproven"}`;
 	if (!excuses(proof, value))

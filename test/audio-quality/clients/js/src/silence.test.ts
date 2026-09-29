@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { graded, QUIET, RATE, reference, samples, share, source } from "./silence.fixture.ts";
+import { graded, QUIET, RATE, reference, rms, samples, share, source, windowStart } from "./silence.fixture.ts";
 import { locate, prove } from "./silence.ts";
 
 const film = source();
@@ -165,4 +165,59 @@ test("a torn shared-ring read, an offset step with no stretch, is bracketed rath
 	expect(proof.reason).toBeUndefined();
 	expect(proof.proven).toBe(true);
 	expect(proof.alignment?.correlation).toBeGreaterThan(0.9999);
+});
+
+test("a mid-row lag of one analyser window, proven by each segment's own audible windows, passes", () => {
+	// From 22 s of source on, the analyser's data runs 2048 frames behind the context clock.
+	const all = samples(film, { behindAt: 71 });
+	const window = graded(all);
+	expect(share(window)).toBeGreaterThan(0.191);
+
+	const proof = prove(all, window, reference(film));
+	expect(proof.reason).toBeUndefined();
+	expect(proof.proven).toBe(true);
+	expect(proof.segments.map((s) => [s.lag, s.proven])).toEqual([
+		[0, true],
+		[2048, true],
+	]);
+	for (const segment of proof.segments) expect(segment.alignment?.audible).toBeGreaterThanOrEqual(40);
+	// Every quiet window sits in the lagged segment, and is placed there only.
+	expect(proof.quietWindows.every((q) => q.lag === 2048 && q.refused === undefined)).toBe(true);
+});
+
+test("a lag change with too few audible windows after it to prove it keeps the failure", () => {
+	// A second quiet stretch at 66-70 s, after the analyser falls behind at 60 s; the row ends at 72 s,
+	// so the lagged segment has about 31 audible windows.
+	const film2 = source(85, [5.3, 1.7], [QUIET, [66, 70]]);
+	const all = samples(film2, { count: 271, behindAt: 223 });
+	const proof = prove(all, graded(all), reference(film2));
+	expect(proof.proven).toBe(false);
+	expect(proof.segments.map((s) => [s.lag, s.proven])).toEqual([
+		[0, true],
+		[2048, false],
+	]);
+	expect(proof.segments[1]?.reason).toContain(`fewer than 40`);
+	const late = proof.quietWindows.filter((q) => q.at >= (proof.segments[1]?.from ?? 0));
+	expect(late.length).toBeGreaterThan(0);
+	for (const q of late) expect(q.refused).toContain("audible windows prove its lag");
+	// The first segment's quiet windows are still placed, at its own lag.
+	expect(proof.quietWindows.filter((q) => q.refused === undefined).every((q) => q.lag === 0)).toBe(true);
+});
+
+test("a lag the audible windows do not show cannot hide a dropout", () => {
+	// The quiet stretch ends at 49.83 s. Sample 182's window starts at 49.803 s: over audible source
+	// where it is, and wholly inside the quiet stretch one analyser window earlier.
+	const film3 = source(85, [5.3, 1.7], [[30, 49.83]]);
+	const at = windowStart(182);
+	expect(rms(film3, at)).toBeGreaterThan(0.001);
+	expect(rms(film3, at - 2048)).toBeLessThan(0.001);
+
+	const all = samples(film3);
+	const dropout = all[182];
+	if (!dropout) throw new Error("the fixture is too short");
+	dropout.rms = 0.0002;
+	const proof = prove(all, graded(all), reference(film3));
+	expect(proof.proven).toBe(false);
+	expect(proof.segments.map((s) => [s.lag, s.proven])).toEqual([[0, true]]);
+	expect(proof.quietWindows.find((q) => q.at === dropout.at)).toMatchObject({ lag: 0, refused: "audible source" });
 });

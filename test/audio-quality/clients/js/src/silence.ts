@@ -22,6 +22,13 @@
  * with the reference, and the fit has to be tight, cover enough audio, and agree on level before any
  * quiet window is placed with it.
  *
+ * The AnalyserNode's data can also fall a whole window behind the context clock partway through a
+ * row, with nothing else in the page changing. So each exact audible window votes for the lag at
+ * which it matches the reference, the row splits into segments where that lag is constant, and every
+ * segment has to prove its own lag with its own audible windows, to the same bars. A quiet window is
+ * checked at its segment's proven lag only; one in an unproven segment, or between two segments where
+ * nothing says which lag it had, is refused. Lags are whole windows, at most one apart.
+ *
  * The reference is the audio the page decoded, not the film: the analyzer replays the publisher's own
  * encode of the looped file from the start of its stream, which reproduces the published packets byte
  * for byte, and decodes it the way the page does. Against the film itself, the codec's level change
@@ -37,6 +44,7 @@ import {
 	type QuietWindow,
 	RMS_FRAMES,
 	type Sample,
+	type Segment,
 	SILENCE_RMS,
 } from "./schema.ts";
 
@@ -57,6 +65,15 @@ const MAX_GAIN_ERROR = 0.05;
 
 /** Log RMS is taken above this, so digital silence has a logarithm. About -120 dBFS. */
 const FLOOR = 1e-6;
+
+/** Whole analyser windows the segments of one row may sit apart. */
+const MAX_BEHIND = 1;
+
+/** An exact window votes for a lag when its log RMS matches the reference there within this... */
+const MATCH = 0.02;
+
+/** ...and misses it at every other lag by at least this. */
+const MISS = 0.1;
 
 /** Counters that step the media against the output, or put audio in it that no media carried. */
 const DISCONTINUITIES = [
@@ -91,7 +108,7 @@ type Timing = {
 	/** The media frame the reader paired with output frame zero: playhead less `output`. */
 	offset: number;
 	/** Context frames the `output` counter trails the clock by: the short start plus the report's age. */
-	lag: number;
+	trail: number;
 };
 
 function timing(sample: Sample | undefined): Timing | undefined {
@@ -102,7 +119,7 @@ function timing(sample: Sample | undefined): Timing | undefined {
 	const { rate, output } = playout;
 	if (![sample.contextTime, sample.timestamp, rate, output].every(Number.isFinite) || rate <= 0) return undefined;
 	const frame = Math.round((sample.contextTime * rate) / 1000);
-	return { frame, offset: Math.round((sample.timestamp * rate) / 1000 - output), lag: frame - output };
+	return { frame, offset: Math.round((sample.timestamp * rate) / 1000 - output), trail: frame - output };
 }
 
 /** The offsets a window may have been played at, or why it cannot be placed. */
@@ -211,6 +228,7 @@ export function prove(samples: Sample[], graded: Sample[], reference: Reference 
 		quiet: quiet.length,
 		matched: 0,
 		alignment,
+		segments: [],
 		reference: typeof reference === "object" ? reference.provenance : null,
 		quietWindows: quiet.map((s) => ({ at: s.at, rms: s.rms ?? 0, source: null, reference: null, refused: why })),
 	});
@@ -244,72 +262,175 @@ export function prove(samples: Sample[], graded: Sample[], reference: Reference 
 			: Math.sqrt(Math.max(0, (energy[start + n] ?? 0) - (energy[start] ?? 0)) / n);
 
 	// The fit takes exact windows only: audible, with no stretch anywhere in their bracket.
-	const audible = placed.flatMap(({ sample, timing, bracket }) =>
+	const exact = placed.flatMap(({ sample, timing, bracket }, index) =>
 		timing && "clean" in bracket && bracket.clean && (sample.rms ?? 0) >= SILENCE_RMS
-			? [{ rms: sample.rms ?? 0, start: base(timing) }]
+			? [{ index, rms: sample.rms ?? 0, log: Math.log(Math.max(sample.rms ?? 0, FLOOR)), start: base(timing) }]
 			: [],
 	);
-	if (audible.length < MIN_AUDIBLE) {
-		return refuse(`alignment: ${audible.length} audible windows to fit on, fewer than ${MIN_AUDIBLE}`);
+	if (exact.length < MIN_AUDIBLE) {
+		return refuse(`alignment: ${exact.length} audible windows to fit on, fewer than ${MIN_AUDIBLE}`);
 	}
-	const lags = placed.flatMap(({ timing }) => (timing ? [timing.lag] : []));
+	type Exact = (typeof exact)[number];
+	const trails = placed.flatMap(({ timing }) => (timing ? [timing.trail] : []));
 	// Where the playhead's own media time puts the windows: each report, less the typical report age.
-	const nominal = -(median(lags) ?? 0);
-	const logs = audible.map((w) => Math.log(Math.max(w.rms, FLOOR)));
-	const score = (shift: number): number | undefined => {
+	const nominal = -(median(trails) ?? 0);
+
+	// Log RMS correlation and level of `windows`, each placed at `shift` less its lag in frames.
+	const measure = (windows: { window: Exact; lag: number }[], shift: number) => {
 		const refs: number[] = [];
-		for (const w of audible) {
-			const r = level(w.start + shift);
+		const ratios: number[] = [];
+		for (const { window, lag } of windows) {
+			const r = level(window.start + shift - lag);
 			if (r === undefined) return undefined;
 			refs.push(Math.log(Math.max(r, FLOOR)));
+			ratios.push(window.rms / Math.max(r, FLOOR));
 		}
-		return correlation(refs, logs);
+		return {
+			r: correlation(
+				refs,
+				windows.map((w) => w.window.log),
+			),
+			gain: median(ratios) ?? 0,
+		};
 	};
-	const search = (from: number, to: number, step: number, best?: { shift: number; r: number }) => {
-		let found = best;
-		for (let shift = from; shift <= to; shift += step) {
-			const r = score(shift);
-			if (r !== undefined && (found === undefined || r > found.r)) found = { shift, r };
+	// The shift that places most windows exactly, whatever the rest do: the least median absolute
+	// deviation of the log ratio, which a segment lagging behind the rest cannot pull off its mark the
+	// way it pulls a correlation, and which no level difference moves.
+	const deviation = (windows: { window: Exact; lag: number }[], shift: number) => {
+		const ratios: number[] = [];
+		for (const { window, lag } of windows) {
+			const r = level(window.start + shift - lag);
+			if (r === undefined) return undefined;
+			ratios.push(window.log - Math.log(Math.max(r, FLOOR)));
 		}
-		return found;
+		const center = median(ratios) ?? 0;
+		return median(ratios.map((d) => Math.abs(d - center)));
+	};
+	const seek = (windows: { window: Exact; lag: number }[], from: number, to: number, step: number) => {
+		let found: { shift: number; spread: number } | undefined;
+		for (let shift = from; shift <= to; shift += step) {
+			const spread = deviation(windows, shift);
+			if (spread !== undefined && (found === undefined || spread < found.spread)) found = { shift, spread };
+		}
+		return found?.shift;
 	};
 	const step = Math.max(1, Math.round(rate * STEP_S));
 	const span = Math.round(rate * SEARCH_S);
-	const coarse = search(nominal - span, nominal + span, step);
-	if (!coarse) {
+	const unlagged = exact.map((window) => ({ window, lag: 0 }));
+	const coarse = seek(unlagged, nominal - span, nominal + span, step);
+	if (coarse === undefined) {
 		return refuse(`alignment: no shift within ${SEARCH_S} s keeps every audible window inside the reference`);
 	}
-	const fit = search(coarse.shift - step, coarse.shift + step, 1, coarse) ?? coarse;
-	const gain = median(audible.map((w) => w.rms / Math.max(level(w.start + fit.shift) ?? 0, FLOOR))) ?? 0;
-	const alignment: Alignment = {
-		correlation: fit.r,
-		gain,
-		audible: audible.length,
-		shiftMs: ((fit.shift - nominal) * 1000) / rate,
-	};
-	if (fit.r < MIN_CORRELATION) {
-		return refuse(`alignment: log RMS correlation ${fit.r.toFixed(5)} is under ${MIN_CORRELATION}`, alignment);
-	}
-	if (Math.abs(gain - 1) > MAX_GAIN_ERROR) {
-		return refuse(`alignment: output runs at ${gain.toFixed(3)} of the source level`, alignment);
-	}
+	let shift = seek(unlagged, coarse - step, coarse + step, 1) ?? coarse;
 
-	const quietWindows = placed.flatMap(({ sample, timing, bracket }): QuietWindow[] => {
+	// Split the row where the analyser's lag changed: each exact window votes for the whole number of
+	// windows behind the clock at which it matches the reference, if it matches there and nowhere else.
+	type Run = { lag: number; first: number; last: number };
+	const split = (at: number): { runs: Run[]; shift: number } | string => {
+		const runs: Run[] = [];
+		for (const window of exact) {
+			const misses = [];
+			for (let k = -MAX_BEHIND; k <= MAX_BEHIND; k++) {
+				const r = level(window.start + at - k * n);
+				misses.push({
+					k,
+					miss:
+						r === undefined
+							? Number.POSITIVE_INFINITY
+							: Math.abs(window.log - Math.log(Math.max(r, FLOOR))),
+				});
+			}
+			misses.sort((a, b) => a.miss - b.miss);
+			const [best, next] = misses;
+			if (!best || !next || best.miss > MATCH || next.miss < MISS) continue;
+			const run = runs.at(-1);
+			if (run?.lag === best.k * n) run.last = window.index;
+			else runs.push({ lag: best.k * n, first: window.index, last: window.index });
+		}
+		if (runs.length === 0) return { runs: [{ lag: 0, first: 0, last: placed.length - 1 }], shift: at };
+		const least = Math.min(...runs.map((r) => r.lag));
+		if (Math.max(...runs.map((r) => r.lag)) - least > MAX_BEHIND * n) {
+			return `the analyser's lag moved by more than ${MAX_BEHIND} window`;
+		}
+		// Lags count from the least-behind run, whose placement the shift then describes: a window at
+		// `start + at - lag` sits at `start + (at - least) - (lag - least)`.
+		for (const run of runs) run.lag -= least;
+		// The first and last runs reach the row's ends; between two runs, nothing says which lag held.
+		const first = runs[0];
+		const last = runs.at(-1);
+		if (first) first.first = 0;
+		if (last) last.last = placed.length - 1;
+		return { runs, shift: at - least };
+	};
+	const members = (runs: Run[]) =>
+		runs.map((run) =>
+			exact
+				.filter((w) => w.index >= run.first && w.index <= run.last)
+				.map((window) => ({ window, lag: run.lag })),
+		);
+	let voted = split(shift);
+	for (let pass = 0; pass < 2 && typeof voted !== "string"; pass++) {
+		// Refit the row's shift with every exact window at its run's lag, then vote again from there.
+		const all = members(voted.runs).flat();
+		const refit = seek(all, voted.shift - 2 * step, voted.shift + 2 * step, 1) ?? voted.shift;
+		voted = split(refit);
+	}
+	if (typeof voted === "string") return refuse(`alignment: ${voted}`);
+	const runs = voted.runs;
+	shift = voted.shift;
+
+	// Each segment proves its own lag with its own exact windows, to the row's bars.
+	const own = members(runs);
+	const segments: Segment[] = runs.map((run, i) => {
+		const windows = own[i] ?? [];
+		const from = placed[run.first]?.sample.at ?? 0;
+		const to = placed[run.last]?.sample.at ?? 0;
+		const fit = windows.length > 0 ? measure(windows, shift) : undefined;
+		const alignment = fit
+			? {
+					correlation: fit.r,
+					gain: fit.gain,
+					audible: windows.length,
+					shiftMs: ((shift - run.lag - nominal) * 1000) / rate,
+				}
+			: null;
+		const reason =
+			windows.length < MIN_AUDIBLE
+				? `${windows.length} audible windows prove its lag, fewer than ${MIN_AUDIBLE}`
+				: !fit || fit.r < MIN_CORRELATION
+					? `log RMS correlation ${fit?.r.toFixed(5)} is under ${MIN_CORRELATION}`
+					: Math.abs(fit.gain - 1) > MAX_GAIN_ERROR
+						? `output runs at ${fit.gain.toFixed(3)} of the source level`
+						: undefined;
+		return { from, to, lag: run.lag, alignment, proven: reason === undefined, ...(reason && { reason }) };
+	});
+	const pooled = measure(own.flat(), shift);
+	const alignment: Alignment = {
+		correlation: pooled?.r ?? 0,
+		gain: pooled?.gain ?? 0,
+		audible: own.flat().length,
+		shiftMs: ((shift - nominal) * 1000) / rate,
+	};
+
+	const quietWindows = placed.flatMap(({ sample, timing, bracket }, index): QuietWindow[] => {
 		const rms = sample.rms ?? 0;
 		if (rms >= SILENCE_RMS) return [];
 		const window: QuietWindow = { at: sample.at, rms, source: null, reference: null };
+		const i = runs.findIndex((run) => index >= run.first && index <= run.last);
+		const segment = segments[i];
+		if (!segment) return [{ ...window, refused: "lag change" }];
+		if (!segment.proven) return [{ ...window, refused: `alignment: ${segment.reason}` }];
 		if ("refused" in bracket) return [{ ...window, refused: bracket.refused }];
 		if (!timing) return [{ ...window, refused: "timing" }];
-		const start = base(timing) + fit.shift;
+		const start = base(timing) + shift - segment.lag;
 		const lo = start + Math.min(...bracket.offsets) - timing.offset - bracket.widen;
 		const hi = start + Math.max(...bracket.offsets) - timing.offset + bracket.widen;
 		const source = reference.provenance.from + start / rate;
-		if (lo < 0 || hi + n > pcm.length) return [{ ...window, source, refused: "reference" }];
+		if (lo < 0 || hi + n > pcm.length) return [{ ...window, source, lag: segment.lag, refused: "reference" }];
 		let loudest = 0;
 		for (let at = lo; at <= hi; at++) loudest = Math.max(loudest, level(at) ?? Number.POSITIVE_INFINITY);
-		return [
-			{ ...window, source, reference: loudest, ...(loudest < SILENCE_RMS ? {} : { refused: "audible source" }) },
-		];
+		const refused = loudest < SILENCE_RMS ? {} : { refused: "audible source" };
+		return [{ ...window, source, reference: loudest, lag: segment.lag, ...refused }];
 	});
 
 	const refused = quietWindows.filter((q) => q.refused !== undefined);
@@ -323,6 +444,7 @@ export function prove(samples: Sample[], graded: Sample[], reference: Reference 
 		quiet: quiet.length,
 		matched: quiet.length - refused.length,
 		alignment,
+		segments,
 		reference: reference.provenance,
 		quietWindows,
 	};

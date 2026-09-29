@@ -352,9 +352,13 @@ A window is placed with what the probe already records ([`src/silence.ts`](clien
 - A concealment, underrun, short quantum, skip, jump, discard, trim, stall, new graph, or new
   timeline between those reports refuses the window rather than placing it.
 
-That leaves one constant per row, fitted by correlating log RMS over the audible windows with the
-reference. The fit needs 40 audible windows, a correlation of 0.999, and a level within 5% before
-any quiet window is placed with it; otherwise the row is unproven.
+That leaves one constant per row, fitted to the audible windows. Chromium's AnalyserNode can also
+fall a whole window behind the context clock partway through a row with nothing else changing, so
+each exact audible window votes for the lag, in whole windows, at which it matches the reference,
+and the row splits into segments where that lag holds, at most one window apart. Every segment has
+to prove its own lag with its own audible windows: 40 of them, a log RMS correlation of 0.999, and a
+level within 5%. A quiet window is checked at its segment's proven lag only; one in an unproven
+segment, or between two segments where nothing says which lag it had, keeps the failure.
 
 ### What the sampling grid can and cannot see
 

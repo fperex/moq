@@ -529,8 +529,28 @@ export type QuietWindow = {
 	source: number | null;
 	/** The loudest source RMS across its timing uncertainty, or null when it was not placed. */
 	reference: number | null;
+	/** Frames its segment's analyser data ran behind the context clock, when it was placed. */
+	lag?: number;
 	/** Why it is not proven, when it is not. */
 	refused?: string;
+};
+
+/**
+ * A run of a row over which the AnalyserNode's data sat a constant number of whole windows behind the
+ * context clock, and whether that run's own audible windows prove it.
+ */
+export type Segment = {
+	/** When its first and last windows were sampled, on the viewer clock. */
+	from: Ms;
+	to: Ms;
+	/** Frames its windows sit behind the context clock, relative to the row's least-behind segment. */
+	lag: number;
+	/** Its own exact audible windows' fit at that lag, or null when it has none to fit. */
+	alignment: Alignment | null;
+	/** Whether its own windows prove its lag; its quiet windows are refused otherwise. */
+	proven: boolean;
+	/** Why not, when not. */
+	reason?: string;
 };
 
 /** How a row's windows were lined up with the source before any quiet window was placed. */
@@ -579,8 +599,10 @@ export type QuietProof = {
 	quiet: number;
 	/** Quiet windows placed over quiet source. */
 	matched: number;
-	/** The row's alignment, or null when it never ran. */
+	/** The row's alignment over every segment's windows at its own lag, or null when it never ran. */
 	alignment: Alignment | null;
+	/** The row split where the analyser's lag changed, each run proven by its own windows or not. */
+	segments: Segment[];
 	/** The reference the windows were placed in, or null without one. */
 	reference: Provenance | null;
 	/** Every quiet window. */

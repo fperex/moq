@@ -661,6 +661,18 @@ if (quietProof) {
 			`reference: the publisher's encode of ${source.media} (sha256 ${source.sha256.slice(0, 16)}) replayed and decoded over ${source.from}-${source.from + source.seconds} s of its stream at ${source.rate} Hz, half of left plus right`,
 		);
 	}
+	if (quietProof.segments.length > 1) {
+		for (const segment of quietProof.segments) {
+			const fit = segment.alignment;
+			lines.push(
+				`- lag segment ${(segment.from / 1000).toFixed(2)}-${(segment.to / 1000).toFixed(2)} s, analyser ${segment.lag} frames behind: ` +
+					(segment.proven ? "proven" : `unproven, ${segment.reason}`) +
+					(fit
+						? ` (log RMS r ${fit.correlation.toFixed(5)}, level ${fit.gain.toFixed(3)}, ${fit.audible} audible windows)`
+						: ""),
+			);
+		}
+	}
 	for (const q of quietProof.quietWindows.filter((w) => w.refused !== undefined).slice(0, 10)) {
 		const where = q.source === null ? "" : ` at source ${q.source.toFixed(3)} s`;
 		const level = q.reference === null ? "" : ` (source rms ${q.reference.toExponential(2)})`;

@@ -26,9 +26,12 @@ const LAG = 6000;
 /** The media frame the ring's timeline is anchored at. */
 const ANCHOR = 200_000;
 
-/** The source's level at `t` seconds: two slow swells, or a faint bed through the quiet stretch. */
-function level(t: number, periods: readonly [number, number]): number {
-	if (t >= QUIET[0] && t < QUIET[1]) return 0.0004 * (1 + 0.5 * Math.sin((2 * Math.PI * t) / 3.1));
+/** Authored quiet stretches, in source seconds. */
+type Quiet = readonly (readonly [number, number])[];
+
+/** The source's level at `t` seconds: two slow swells, or a faint bed through a quiet stretch. */
+function level(t: number, periods: readonly [number, number], quiet: Quiet): number {
+	if (quiet.some(([from, to]) => t >= from && t < to)) return 0.0004 * (1 + 0.5 * Math.sin((2 * Math.PI * t) / 3.1));
 	return 0.05 * (1.2 + Math.sin((2 * Math.PI * t) / periods[0])) * (1.2 + Math.sin((2 * Math.PI * t) / periods[1]));
 }
 
@@ -47,8 +50,15 @@ function hits(seconds: number): number[] {
 	return onsets;
 }
 
-/** `seconds` of mono source: a 440 Hz tone under {@link level}, with hits outside the quiet stretch. Other `periods` make a different film. */
-export function source(seconds = 85, periods: readonly [number, number] = [5.3, 1.7]): Float32Array {
+/**
+ * `seconds` of mono source: a 440 Hz tone under {@link level}, with hits outside the `quiet` stretches.
+ * Other `periods` make a different film.
+ */
+export function source(
+	seconds = 85,
+	periods: readonly [number, number] = [5.3, 1.7],
+	quiet: Quiet = [QUIET],
+): Float32Array {
 	const pcm = new Float32Array(Math.round(seconds * RATE));
 	const onsets = hits(seconds);
 	let hit = 0;
@@ -56,9 +66,9 @@ export function source(seconds = 85, periods: readonly [number, number] = [5.3, 
 		const t = i / RATE;
 		while ((onsets[hit + 1] ?? Number.POSITIVE_INFINITY) <= t) hit++;
 		const onset = onsets[hit] ?? Number.NEGATIVE_INFINITY;
-		const quiet = t >= QUIET[0] && t < QUIET[1];
-		const lift = !quiet && t >= onset && t < onset + 0.012 ? 4 : 1;
-		pcm[i] = lift * level(t, periods) * Math.sin(2 * Math.PI * 440 * t);
+		const hushed = quiet.some(([from, to]) => t >= from && t < to);
+		const lift = !hushed && t >= onset && t < onset + 0.012 ? 4 : 1;
+		pcm[i] = lift * level(t, periods, quiet) * Math.sin(2 * Math.PI * 440 * t);
 	}
 	return pcm;
 }
@@ -117,18 +127,33 @@ const report: NonNullable<Sample["playout"]> = {
 	short: 0,
 };
 
+/** Where the window of sample `i` starts in the source, with the analyser keeping up. */
+export const windowStart = (i: number, stretched = 0): number =>
+	Math.round(((250 * (i + 1) + 1000) * RATE) / 1000) -
+	RMS_FRAMES -
+	LAG +
+	ANCHOR +
+	stretched -
+	Math.round(OFFSET_S * RATE);
+
 /**
  * The samples a page playing `pcm` records: `count` of them, 250 ms apart.
  *
  * Every window's RMS is the source's own at the media time the ring was playing, so the row is an
  * exact rendering. `expandAt` inserts `expanded` frames by time stretch just before that sample's
- * report, which moves every later window's media time the way a real expansion does.
+ * report, which moves every later window's media time the way a real expansion does. From `behindAt`
+ * on, the analyser's data runs one whole window behind the context clock, as Chromium's did once.
  */
 export function samples(
 	pcm: Float32Array,
-	options: { count?: number; expandAt?: number; expanded?: number } = {},
+	options: { count?: number; expandAt?: number; expanded?: number; behindAt?: number } = {},
 ): Sample[] {
-	const { count = 280, expandAt = Number.POSITIVE_INFINITY, expanded = 300 } = options;
+	const {
+		count = 280,
+		expandAt = Number.POSITIVE_INFINITY,
+		expanded = 300,
+		behindAt = Number.POSITIVE_INFINITY,
+	} = options;
 	return Array.from({ length: count }, (_, i) => {
 		const at = 250 * (i + 1);
 		const contextTime = at + 1000;
@@ -137,7 +162,7 @@ export function samples(
 		const output = frame - 128 * ((i * 7) % 12) - LAG;
 		const stretched = i >= expandAt ? -expanded : 0;
 		const playhead = ANCHOR + output + stretched;
-		const window = frame - RMS_FRAMES - LAG + ANCHOR + stretched;
+		const window = windowStart(i, stretched) - (i >= behindAt ? RMS_FRAMES : 0);
 		return {
 			at,
 			timestamp: (playhead * 1000) / RATE,
@@ -145,7 +170,7 @@ export function samples(
 			underruns: 0,
 			contextTime,
 			contextRate: RATE,
-			rms: rms(pcm, window - Math.round(OFFSET_S * RATE)),
+			rms: rms(pcm, window),
 			playout: { ...report, output, stretched, expands: i >= expandAt ? 1 : 0 },
 		};
 	});
