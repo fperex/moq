@@ -10,6 +10,7 @@ import { Consumer } from "./consumer.ts";
 import type { Format as ContainerFormat } from "./format.ts";
 import { Jitter, type JitterObservation } from "./jitter.ts";
 import { Format as LegacyFormat, Producer as LegacyProducer } from "./legacy.ts";
+import { Stall } from "./stall.ts";
 import type { Frame } from "./types.ts";
 
 // What `Jitter` reads before any arrival has been folded in.
@@ -894,16 +895,11 @@ function watchArrivals(): {
 	return { calls, restore: () => spy.mockRestore() };
 }
 
-/** Block this process's event loop for `ms`, the way a content process blocks its own. */
-function block(ms: number): void {
-	const until = performance.now() + ms;
-	while (performance.now() < until) {
-		// Nothing runs while this spins: no timer, no read loop, no arrival gets stamped.
-	}
-}
-
 test("Consumer tells the estimator its own event loop was blocked", async () => {
 	const { calls, restore } = watchArrivals();
+	// The monitor's verdict is pinned on a fake clock in `stall.test.ts`; this is its wiring.
+	let blocked = false;
+	const stall = spyOn(Stall.prototype, "blocked").mockImplementation(() => blocked);
 	try {
 		const track = new Track.Producer("test");
 		const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 500 as Time.Milli });
@@ -911,24 +907,21 @@ test("Consumer tells the estimator its own event loop was blocked", async () => 
 		writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro, 20_000 as Time.Micro]);
 		await settle(60);
 
-		// The media keeps landing while the loop is blocked, and every frame of the backlog is
-		// stamped with the clock after it. 200ms is well under the resample interval the spacing
-		// rule needs, which is the whole reason the consumer has to say so itself.
+		blocked = true;
 		writeGroupWithLegacyFrames(track, 1, [40_000 as Time.Micro, 60_000 as Time.Micro]);
-		block(200);
-		await settle(60);
 		track.close();
 		await drainFrames(consumer, 200);
 
-		const before = calls.filter((c) => c.timestamp < 40_000);
-		const after = calls.filter((c) => c.timestamp >= 40_000);
-		expect(before.length).toBeGreaterThan(0);
-		expect(after.length).toBeGreaterThan(0);
-		expect(before.every((c) => !c.stalled)).toBe(true);
-		expect(after.every((c) => c.stalled)).toBe(true);
+		expect(calls.map((c) => [c.timestamp, c.stalled])).toEqual([
+			[0, false],
+			[20_000, false],
+			[40_000, true],
+			[60_000, true],
+		]);
 
 		consumer.close();
 	} finally {
+		stall.mockRestore();
 		restore();
 	}
 });
