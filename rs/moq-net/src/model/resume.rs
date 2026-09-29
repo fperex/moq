@@ -687,6 +687,7 @@ impl Consumer {
 			end_sequence: None,
 			outer: Anchor::default(),
 			drift_anchor: kio::Producer::new(Anchor::default()),
+			retired_anchors: Vec::new(),
 			identity_anchor: false,
 		}
 	}
@@ -1572,9 +1573,16 @@ pub struct Subscriber {
 	/// hide a segment's completion from it.
 	outer: Anchor,
 	/// The logical drift anchor ([`Self::end_sequence`] and [`Self::outer`] combined,
-	/// with the newest edge across the segments), shared with groups that outlive this
-	/// cursor poll. Reconciled on each poll while earlier segments still have readers.
+	/// with the newest edge across the segments), shared with the groups handed out
+	/// since the newest segment arrived. Reconciled on each poll while earlier segments
+	/// still have readers.
 	drift_anchor: kio::Producer<Anchor>,
+	/// Earlier drift anchors still held by groups when a newer segment arrived, kept in
+	/// step with [`Self::drift_anchor`] until their last group drops. Only these keep the
+	/// logical edge in use: a copy resolved in a capped segment measures the logical edge
+	/// itself (see [`ExpiryBound`]), and one resolved in the newest segment measures an
+	/// edge that stays the logical one until a newer segment arrives.
+	retired_anchors: Vec<kio::Producer<Anchor>>,
 	/// Only the newest segment can still hand out or expire content, using its own edge.
 	identity_anchor: bool,
 }
@@ -1683,6 +1691,7 @@ impl Subscriber {
 	/// to new ones.
 	fn apply(&mut self, snapshot: Snapshot) {
 		self.identity_anchor = false;
+		let newest = self.segments.last().map(|seg| seg.id);
 		let Snapshot {
 			epoch,
 			finished,
@@ -1752,6 +1761,14 @@ impl Subscriber {
 				}
 			}
 		}
+
+		// Groups handed out so far may hold a copy whose segment is no longer the newest,
+		// so their anchor retires with them and later groups start a fresh one.
+		if self.segments.last().map(|seg| seg.id) != newest && self.drift_anchor.is_used() {
+			let fresh = kio::Producer::new(self.anchor());
+			self.retired_anchors
+				.push(std::mem::replace(&mut self.drift_anchor, fresh));
+		}
 	}
 
 	/// Wrap a group just received from a segment so the reader can follow it across
@@ -1818,25 +1835,28 @@ impl Subscriber {
 	/// The cap is the tightest any reader of this subscriber imposes: its own
 	/// [`Self::end_at`] and whatever a wrapping splice pushed down. The edge is the
 	/// newest across the producer's segments within that cap, or a wrapping splice's if
-	/// newer. Once earlier segments and their handed-out groups and frames drain, the
+	/// newer. Once earlier segments and the groups and frames they handed out drain, the
 	/// newest segment's own edge suffices until the next route or bound change.
 	fn refresh_anchor(&mut self) {
 		if self.identity_anchor {
 			return;
 		}
+		self.retired_anchors.retain(kio::Producer::is_used);
 		if let Some((seg, before)) = self.segments.split_last_mut()
 			&& seg.end.is_none()
 			&& self.end_sequence.is_none()
 			&& self.outer == Anchor::default()
 			&& ((before.is_empty() && seg.start.is_none())
-				|| (!self.drift_anchor.is_used()
+				|| (self.retired_anchors.is_empty()
 					&& before.iter().all(|old| {
 						matches!(old.sub, SubState::Done(_))
 							&& old.parked.is_empty()
 							&& old.terminal.as_ref().is_none_or(|sub| !sub.has_expiry_readers())
 					}))) {
-			if let Ok(mut current) = self.drift_anchor.write() {
-				*current = Anchor::default();
+			for channel in std::iter::once(&self.drift_anchor).chain(&self.retired_anchors) {
+				if let Ok(mut current) = channel.write() {
+					*current = Anchor::default();
+				}
 			}
 			seg.anchor = Anchor::default();
 			if let Some(sub) = seg.stale_sub_mut() {
@@ -1853,11 +1873,13 @@ impl Subscriber {
 			.chain(outer.edge.clone())
 			.max_by_key(|edge| edge.sequence);
 		let anchor = Anchor { edge, ..outer };
-		// Skip a no-op write: every handed-out group's expiry watches this channel.
-		if self.anchor() != anchor
-			&& let Ok(mut current) = self.drift_anchor.write()
-		{
-			*current = anchor.clone();
+		// Skip a no-op write: every handed-out group's expiry watches these channels.
+		for channel in std::iter::once(&self.drift_anchor).chain(&self.retired_anchors) {
+			if *channel.read() != anchor
+				&& let Ok(mut current) = channel.write()
+			{
+				*current = anchor.clone();
+			}
 		}
 		for seg in &mut self.segments {
 			let anchor = Self::segment_anchor(seg, anchor.clone(), &state);
@@ -1871,6 +1893,7 @@ impl Subscriber {
 	/// Whether handed-out groups or frames still use this cursor's expiry anchors.
 	pub(crate) fn has_expiry_readers(&self) -> bool {
 		self.drift_anchor.is_used()
+			|| self.retired_anchors.iter().any(kio::Producer::is_used)
 			|| self.segments.iter().any(|seg| match &seg.sub {
 				SubState::Active(sub) => sub.has_expiry_readers(),
 				_ => seg.terminal.as_ref().is_some_and(track::Subscriber::has_expiry_readers),
@@ -2734,6 +2757,99 @@ mod test {
 		write_group_at(&mut live, 5, "new", Duration::from_secs(5));
 		assert_eq!(recv(&mut sub), 4);
 		assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
+	}
+
+	/// A resumed track keeps the segment it resumed from, and a live reader always holds
+	/// the newest segment's open group. That group alone must not keep every poll
+	/// re-deriving the logical edge, yet a later takeover still reaches it.
+	#[tokio::test]
+	async fn a_group_held_from_the_newest_segment_leaves_the_anchor_idle() {
+		let (mut first, first_consumer) = track_pair("first");
+		let (live, live_consumer) = track_pair("live");
+		let (mut next, next_consumer) = track_pair("next");
+		let mut producer = Producer::new();
+		producer.switch(&first_consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_millis(100)));
+		write_group(&mut first, 0, "first");
+		assert_eq!(recv(&mut sub), 0);
+		producer.switch(&live_consumer, Position::group(1)).unwrap();
+		let mut open = live.create_group(group::Info { sequence: 1 }).unwrap();
+		open.write_frame(Timestamp::from_secs(1).unwrap(), b"held".as_ref())
+			.unwrap();
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut held), b"held");
+		first.finish().unwrap();
+		recv_pending(&mut sub);
+		recv_pending(&mut sub);
+		assert!(
+			sub.identity_anchor,
+			"the newest segment's own group kept the anchor refreshing"
+		);
+
+		producer.switch(&next_consumer, Position::group(2)).unwrap();
+		write_group_at(&mut next, 2, "next", Duration::from_secs(2));
+		write_group_at(&mut next, 3, "new", Duration::from_secs(3));
+		assert_eq!(recv(&mut sub), 2);
+		assert_eq!(recv(&mut sub), 3);
+		assert!(!sub.identity_anchor);
+		assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
+
+		drop((held, open));
+		live.finish().unwrap();
+		recv_pending(&mut sub);
+		recv_pending(&mut sub);
+		assert!(sub.identity_anchor, "drained predecessors left the anchor refreshing");
+	}
+
+	/// A frame read from a continuation while its segment was the newest keeps that
+	/// copy's expiry after the group is dropped. Once a newer segment arrives, only the
+	/// logical anchor that copy was guarded with carries the live edge to it.
+	#[tokio::test]
+	async fn a_detached_continuation_frame_stays_on_the_logical_edge() {
+		let (first, first_consumer) = track_pair("first");
+		let (mut middle, middle_consumer) = track_pair("middle");
+		let (mut live, live_consumer) = track_pair("live");
+		let mut producer = Producer::new();
+		producer.switch(&first_consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_secs(2)));
+		let mut head = first.create_group(group::Info { sequence: 0 }).unwrap();
+		head.write_frame(Timestamp::ZERO, b"head".as_ref()).unwrap();
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut held), b"head");
+		first.finish().unwrap();
+		producer
+			.switch(&middle_consumer, Position { group: 0, frame: 1 })
+			.unwrap();
+		let mut tail = middle.create_group(group::Info { sequence: 0 }).unwrap();
+		tail.write_frame(Timestamp::ZERO, b"duplicate".as_ref()).unwrap();
+		let mut writing = tail
+			.create_frame(frame::Info {
+				size: 8,
+				timestamp: Timestamp::from_millis(10).unwrap(),
+			})
+			.unwrap();
+		writing.write(b"tail".as_ref()).unwrap();
+		let mut frame = held.next_frame().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(
+			frame.read_chunk().now_or_never().unwrap().unwrap().unwrap(),
+			b"tail".as_ref()
+		);
+		drop(held);
+		write_group_at(&mut middle, 1, "middle next", Duration::from_secs(1));
+		middle.finish().unwrap();
+		producer.switch(&live_consumer, Position::group(2)).unwrap();
+		write_group_at(&mut live, 2, "next", Duration::from_secs(2));
+		assert_eq!(recv(&mut sub), 1);
+		assert_eq!(recv(&mut sub), 2);
+		assert!(frame.read_chunk().now_or_never().is_none());
+		write_group_at(&mut live, 3, "new", Duration::from_secs(3));
+		assert_eq!(recv(&mut sub), 3);
+		assert!(matches!(frame.read_chunk().now_or_never(), Some(Err(Error::Old))));
+		writing.abort(Error::Cancel).unwrap();
 	}
 
 	#[tokio::test]
