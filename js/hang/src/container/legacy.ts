@@ -59,6 +59,12 @@ export function encodeFrame(source: Uint8Array | Source, timestamp: Time.Micro):
 	return data;
 }
 
+/** Write the endpoint marker, one empty frame at `end`, as the whole of `group`, and close it. */
+export function writeMarker(group: Moq.Group.Producer, end: Time.Micro): void {
+	group.writeFrame({ payload: encodeFrame(new Uint8Array(), end), timestamp: Time.Timestamp.fromMicros(end) });
+	group.close();
+}
+
 /** Options for a legacy-container {@link Producer}. */
 export interface ProducerProps {
 	/**
@@ -151,11 +157,7 @@ export class Producer {
 		const group = this.#track.appendGroup();
 		this.#timeline?.record(group.sequence, timestamp, false);
 		this.#timeline?.end(timestamp);
-		group.writeFrame({
-			payload: encodeFrame(new Uint8Array(), timestamp),
-			timestamp: Time.Timestamp.fromMicros(timestamp),
-		});
-		group.close();
+		writeMarker(group, timestamp);
 		this.#track.breakAt(group.sequence);
 		this.#liveEdge = this.#liveEdge === undefined ? timestamp : (Math.max(this.#liveEdge, timestamp) as Time.Micro);
 		this.#marked = true;

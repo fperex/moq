@@ -298,11 +298,7 @@ export class Encoder {
 				if (end === undefined || track.closed.peek() !== undefined) return;
 				this.#floor = end;
 				const marker = track.appendGroup();
-				marker.writeFrame({
-					payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
-					timestamp: Time.Timestamp.fromMicros(end),
-				});
-				marker.close();
+				Container.Legacy.writeMarker(marker, end);
 				track.breakAt(marker.sequence);
 			});
 		});
@@ -502,11 +498,7 @@ export class Encoder {
 					if (!producer) return;
 
 					const marker = producer.appendGroup();
-					marker.writeFrame({
-						payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
-						timestamp: Time.Timestamp.fromMicros(end),
-					});
-					marker.close();
+					Container.Legacy.writeMarker(marker, end);
 					// A subscription made during the pause starts at the endpoint, not on media
 					// from before it.
 					producer.breakAt(marker.sequence);
