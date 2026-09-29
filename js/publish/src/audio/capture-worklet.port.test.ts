@@ -36,7 +36,12 @@ afterAll(() => {
 	}
 });
 
-test("lets its processor end once the capture node is closed", async () => {
+// Chromium keeps a closed context, and every node in it, for as long as one of its processors has not
+// stopped, so the page closes the context only once the processor says it has. A processor with a
+// connected input is not stopped by returning false: Chromium ends it at the next quantum after the
+// input is cut, without calling it again, so a processor that stopped while still fed would never
+// get to say so.
+test("ends its processor once the capture node is closed and cut from its input, and says so", async () => {
 	if (!Capture) throw new Error("capture-worklet.ts registered no 'capture' processor");
 
 	const node = new MessageChannel();
@@ -59,8 +64,18 @@ test("lets its processor end once the capture node is closed", async () => {
 		});
 		node.port2.postMessage({ type: "close" });
 		await closed;
+
+		// Closed but still fed: it runs on, capturing nothing.
+		const next = new Promise<unknown>((resolve) => {
+			node.port2.onmessage = (event: MessageEvent<unknown>) => resolve(event.data);
+		});
 		scope.currentFrame = QUANTUM;
-		expect(capture.process([[new Float32Array(QUANTUM)]])).toBe(false);
+		expect(capture.process([[new Float32Array(QUANTUM)]])).toBe(true);
+
+		// Cut from its input: it stops, and says so in the same quantum.
+		scope.currentFrame = 2 * QUANTUM;
+		expect(capture.process([[]])).toBe(false);
+		expect(await next).toEqual({ type: "stopped" });
 	} finally {
 		node.port1.close();
 		node.port2.close();
