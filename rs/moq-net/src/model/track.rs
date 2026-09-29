@@ -625,7 +625,7 @@ impl TrackState {
 		// (delivering) is right, since the next poll resolves fresh anchors.
 		let local = edge
 			.presentation
-			.filter(|live| self.holds(live.sequence, live.stamp))
+			.filter(|live| live.sequence > sequence && self.holds(live.sequence, live.stamp))
 			.map(|live| (live.sequence, live.timestamp));
 		// `outer` and `successor` were revalidated on their own tracks before this lock
 		// was taken ([`LiveEdge::is_live`], [`Successor::poll_start`]). There is no slot for
@@ -1675,6 +1675,7 @@ impl Producer {
 				parked: BTreeMap::new(),
 				stale_cap: None,
 				drift_anchor,
+				anchored: false,
 				stale: stats::Content::default(),
 				seek_pending: BTreeMap::new(),
 			}),
@@ -2872,6 +2873,7 @@ impl Subscribing {
 						parked: BTreeMap::new(),
 						stale_cap: None,
 						drift_anchor,
+						anchored: false,
 						stale: stats::Content::default(),
 						seek_pending: BTreeMap::new(),
 					}),
@@ -3450,6 +3452,10 @@ struct PlainSubscriber {
 	/// Shared effective anchor used by groups after this cursor hands them out. The
 	/// only copy of the outer edge a wrapping reader pushed (see [`Anchor::edge`]).
 	drift_anchor: kio::Producer<Anchor>,
+	/// Whether [`Self::drift_anchor`] holds an edge or successor pushed from outside.
+	/// Without one it is only this cursor's own caps, so a poll rebuilds it without
+	/// taking the channel's lock.
+	anchored: bool,
 	/// Groups the drift budget skipped since the count was last drained. Accumulated
 	/// here rather than metered in place because the handle that owns the stats scope
 	/// is the outer [`Subscriber`], which may be reading this cursor through a
@@ -3465,12 +3471,19 @@ impl PlainSubscriber {
 	/// The drift anchor for a read bounded by `end`. Every read folds `end_sequence`
 	/// into `end`, so capping the shared anchor (which already holds it) is exact.
 	fn anchor(&self, end: Option<u64>) -> Anchor {
+		if !self.anchored {
+			return Anchor {
+				cap: servable_cap(end, servable_cap(self.end_sequence, self.stale_cap)),
+				..Anchor::default()
+			};
+		}
 		self.drift_anchor.read().clone().capped(end)
 	}
 
 	/// Publish the `outer` anchor under this cursor's own cap.
 	fn update_drift_anchor(&mut self, outer: Anchor) {
 		let anchor = outer.capped(self.end_sequence);
+		self.anchored = anchor.edge.is_some() || anchor.successor.is_some();
 		// Skip a no-op write: every handed-out group's expiry watches this channel.
 		if *self.drift_anchor.read() != anchor
 			&& let Ok(mut current) = self.drift_anchor.write()
