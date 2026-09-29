@@ -1015,11 +1015,13 @@ async fn broadcast_rejoin_skips_a_stale_warm_cache() {
 		"moq-lite-05",
 	];
 	for version in moq_net::Version::names().filter(|version| !pre06.contains(version)) {
-		rejoin_skips_a_stale_warm_cache(version).await;
+		for open in [false, true] {
+			rejoin_skips_a_stale_warm_cache(version, open).await;
+		}
 	}
 }
 
-async fn rejoin_skips_a_stale_warm_cache(version: &str) {
+async fn rejoin_skips_a_stale_warm_cache(version: &str, open: bool) {
 	use moq_net::Timestamp;
 
 	let ms = |ms: u64| Timestamp::from_millis(ms).unwrap();
@@ -1036,8 +1038,18 @@ async fn rejoin_skips_a_stale_warm_cache(version: &str) {
 	broadcast.announce(Default::default()).expect("announce");
 	let track = broadcast.create_track("audio", None).expect("create track");
 	let live = track.clone();
-	for sequence in 0..4u64 {
+	for sequence in 0..3u64 {
 		write(&track, sequence, sequence * 20);
+	}
+	// The edge can be complete or still open when the front parks it. The latter is
+	// the stale owner that used to survive beside the replacement feed and hold an
+	// ordered consumer on a group no source would ever finish.
+	let mut edge = track
+		.create_group(moq_net::group::Info { sequence: 3 })
+		.expect("create edge group");
+	edge.write_frame(ms(60), b"edge".as_ref()).expect("write edge frame");
+	if !open {
+		edge.finish().expect("finish edge group");
 	}
 
 	let mut config = moq_tokio::listen::Config::default();
@@ -1079,13 +1091,12 @@ async fn rejoin_skips_a_stale_warm_cache(version: &str) {
 		.expect("request timeout")
 		.expect("broadcast resolves");
 	let budget = moq_net::track::Subscription::default().with_max_age(Duration::from_millis(100));
-	async fn recv(sub: &mut moq_net::track::Subscriber) -> u64 {
+	async fn recv(sub: &mut moq_net::track::Subscriber) -> moq_net::group::Consumer {
 		tokio::time::timeout(TIMEOUT, sub.recv_group())
 			.await
 			.expect("recv timeout")
 			.expect("recv failed")
 			.expect("track ended")
-			.sequence
 	}
 
 	let mut sub = remote
@@ -1094,7 +1105,19 @@ async fn rejoin_skips_a_stale_warm_cache(version: &str) {
 		.subscribe(budget.clone())
 		.await
 		.expect("subscribe");
-	recv(&mut sub).await;
+	loop {
+		let mut cached = recv(&mut sub).await;
+		if cached.sequence != 3 {
+			continue;
+		}
+		let frame = tokio::time::timeout(TIMEOUT, cached.read_frame())
+			.await
+			.expect("edge frame timeout")
+			.expect("edge frame failed")
+			.expect("edge group ended before its frame");
+		assert_eq!(&frame.payload[..], b"edge");
+		break;
+	}
 	drop(sub);
 
 	// The front parks the track and cancels upstream, while the publisher moves on.
@@ -1112,21 +1135,26 @@ async fn rejoin_skips_a_stale_warm_cache(version: &str) {
 		.subscribe(budget)
 		.await
 		.expect("resubscribe");
-	let first = recv(&mut sub).await;
+	let first = recv(&mut sub).await.sequence;
 	assert!(
 		first > 4,
-		"{version}: a rejoining reader was served the stale cache first: group {first}"
+		"{version} open={open}: a rejoining reader was served the stale cache first: group {first}"
 	);
 	let mut sequence = first;
 	while sequence < 20 {
-		sequence = recv(&mut sub).await;
+		sequence = recv(&mut sub).await.sequence;
 		assert!(
 			sequence >= 4,
-			"{version}: a rejoining reader was served stale group {sequence}"
+			"{version} open={open}: a rejoining reader was served stale group {sequence}"
 		);
 	}
 
 	drop(sub);
+	if open {
+		// The publisher retained this handle only to keep the original edge open while
+		// the relay exercised its own warm-copy ownership. It may already be stale.
+		let _ = edge.finish();
+	}
 	drop(session);
 	server.await.expect("server panicked").expect("server failed");
 }
