@@ -296,7 +296,9 @@ definition is a judgement call are:
 
 - **`silence_share`** is the share of sampled windows whose RMS at the graph output was below about
   -60 dBFS. It is the only metric read from the audio itself rather than from a counter: a counter
-  says the ring was fed, and only the PCM says the listener heard anything.
+  says the ring was fed, and only the PCM says the listener heard anything. The film has quiet
+  scenes of its own, so the same row reads 0.11 or 0.26 depending on which minute it plays; see
+  [the quiet proof](#the-quiet-proof) for how a share over its ceiling can still pass.
 
 - **`converge_s`** is measured backwards from the end of the run, to the last moment the resolved
   target was more than one bucket from its final value. A target that settles and then moves again
@@ -323,6 +325,36 @@ definition is a judgement call are:
 `short_quanta`, `discarded_samples`, `accelerates`, `expands`, and `stretched_samples` come from
 `audio.out.debug`. A build without the counters reports null. `silent_quanta` and `budget_aborts`
 remain unmeasured because neither lane has a counter that distinguishes those events.
+
+### The quiet proof
+
+The raw `silence_share` and its ceilings are graded exactly as before. A share over its ceiling
+passes only when every quiet window it counted lines up with a quiet window of the audio the page
+decoded, at the same media time. One quiet window over audible audio, one that cannot be placed, or
+a proof counting other windows than the share did, keeps the failure. A row within its ceiling keeps
+the verdict it had. The grade prints both: the raw share, and how many quiet windows were placed over
+quiet audio.
+
+The reference is rebuilt after the row, in `analyze.ts`, never in the page. It replays the
+publisher's own audio encode of the file it loops (`audio_of` in `run.sh`, with `-stream_loop -1`
+and without `-re`), which reproduces the published packets byte for byte on the same host, decodes
+it with the page's decoder (FFmpeg's AAC, libopus), and mixes it to mono as the AnalyserNode mixes
+its input. Against the film itself the codec's level change alone moves a window within a percent of
+the floor across it.
+
+A window is placed with what the probe already records ([`src/silence.ts`](clients/js/src/silence.ts)):
+
+- `AudioContext.currentTime`, read with the RMS, ends the window.
+- The ring's playhead less its `output` counter, from one report, is the media frame paired with
+  each output frame. Only a time stretch moves it while the ring plays, and the reports either side
+  bracket it across the window, widened by one maximal stretch for each further stretch between
+  them and for the final window, which has no later report.
+- A concealment, underrun, short quantum, skip, jump, discard, trim, stall, new graph, or new
+  timeline between those reports refuses the window rather than placing it.
+
+That leaves one constant per row, fitted by correlating log RMS over the audible windows with the
+reference. The fit needs 40 audible windows, a correlation of 0.999, and a level within 5% before
+any quiet window is placed with it; otherwise the row is unproven.
 
 ### What the sampling grid can and cannot see
 
@@ -395,13 +427,14 @@ clients/js/
   src/probe.ts              samples the element's public signals every 250ms
   src/beacon.ts             batches to the sink, sendBeacon on pagehide
   src/schema.ts             the metric contract
-  src/*.test.ts             the thread void rule and how the probe reads the thread, under `just test`
+  src/silence.ts            places each quiet window in the audio the page decoded
+  src/*.test.ts             the void rules, the probe, the analyzer, the grader and the quiet proof, under `just test`
   driver.ts                 one row in headless Chromium, and the void checks
   replay.ts                 the recorded traces, with no relay, shaper, or browser
   safari.ts                 one row in real Safari, and the void checks it needs instead
   webdriver.ts              a dependency-free W3C WebDriver client over safaridriver
   sink.ts                   one ndjson file per row
-  analyze.ts                ndjson to summary.json and summary.md
+  analyze.ts                ndjson to summary.json and summary.md, with the quiet proof
   grade.ts                  summaries against budgets.json
   compare.ts                a before/after table across two run directories
 ```

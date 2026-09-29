@@ -235,6 +235,16 @@ rate_of() {
     esac
 }
 
+# The audio encode each publisher runs, word for word. The analyzer replays it offline from the same
+# file to rebuild the exact audio a row decoded (see analyze.ts), so it is written once, here.
+audio_of() {
+    case "$1" in
+        opus) echo "-c:a libopus -ar 48000 -ac 2 -b:a 128k" ;;
+        aac) echo "-c:a aac -ar 44100 -ac 2 -b:a 128k" ;;
+        *) echo "error: no audio encode for codec '$1'" >&2 && exit 2 ;;
+    esac
+}
+
 # Every profile but the control adapts. The control runs the demo's fixed preset, which the element
 # requires a unit on: `delay=250` is rejected, `delay=250ms` is not.
 delay_of() {
@@ -414,16 +424,20 @@ WEB_PORT="$HARNESS_PORT"
 # multi-frame bursts are the arrival shape the reporter measured on the public relay.
 # shellcheck disable=SC2329  # invoked indirectly via 'harness_spawn'
 publish_opus() {
+    local audio
+    read -ra audio <<<"$(audio_of opus)"
     ffmpeg -hide_banner -v quiet -stream_loop -1 -re -i "$MEDIA" \
-        -c:v copy -c:a libopus -ar 48000 -ac 2 -b:a 128k \
+        -c:v copy "${audio[@]}" \
         -f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer -frag_duration 1000 - |
         "$MOQ" --connect "$RELAY_URL" --broadcast "bbb-opus.hang" import fmp4
 }
 
 # shellcheck disable=SC2329  # invoked indirectly via 'harness_spawn'
 publish_aac() {
+    local audio
+    read -ra audio <<<"$(audio_of aac)"
     ffmpeg -hide_banner -v quiet -stream_loop -1 -re -i "$MEDIA" \
-        -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 128k \
+        -c:v copy "${audio[@]}" \
         -f mpegts - |
         "$MOQ" --connect "$RELAY_URL" --broadcast "bbb-aac.hang" import ts
 }
@@ -514,7 +528,10 @@ for entry in "${ROWS[@]}"; do
         fi
     fi
 
-    bun "$CLIENT/analyze.ts" --run "$HARNESS_RUN" --row "$tag" >"$HARNESS_RUN/$tag.analyze.log" 2>&1 || {
+    # The analyzer rebuilds the audio this row decoded from the publisher's file and encode, and places
+    # each quiet window in it, so a share over its ceiling can be proven to be the film's own quiet.
+    bun "$CLIENT/analyze.ts" --run "$HARNESS_RUN" --row "$tag" --media "$MEDIA" --encode="$(audio_of "$codec")" \
+        >"$HARNESS_RUN/$tag.analyze.log" 2>&1 || {
         echo "analyze failed for $tag" >&2
         sed 's/^/  /' "$HARNESS_RUN/$tag.analyze.log" >&2 || true
         failed=1

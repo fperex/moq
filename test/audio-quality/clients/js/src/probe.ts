@@ -17,7 +17,7 @@
  * @module
  */
 import type MoqWatch from "@moq/watch/element";
-import { type Environment, SAMPLE_INTERVAL_MS, type Sample, type Thread } from "./schema.ts";
+import { type Environment, RMS_FRAMES, SAMPLE_INTERVAL_MS, type Sample, type Thread } from "./schema.ts";
 
 /** Anything with a `peek()`, which is every signal under an `out`. */
 type Peekable<T> = { peek(): T };
@@ -118,7 +118,7 @@ export function probe(watch: MoqWatch): Probe {
 		pcm = undefined;
 		if (!root) return;
 		try {
-			const node = new AnalyserNode(root.context, { fftSize: 2048 });
+			const node = new AnalyserNode(root.context, { fftSize: RMS_FRAMES });
 			root.connect(node);
 			analyser = node;
 			pcm = new Float32Array(node.fftSize);

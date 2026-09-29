@@ -14,8 +14,12 @@
  * - **converge_s** is the first moment after which the resolved target stayed within one bucket of
  *   its final value for the rest of the run. A target that settles and then moves again has not
  *   converged, so it is measured backwards from the end rather than forwards from the start.
+ * - **silence** is graded raw, and each quiet window is also placed in the audio the page decoded,
+ *   rebuilt here from the file the publisher loops (`--media`) and its audio options (`--encode=`)
+ *   rather than in the page, so the player does no extra work. The grader excuses a share over its
+ *   ceiling only when every quiet window lands on quiet source; see `src/silence.ts`.
  *
- *     bun analyze.ts --run <run dir> --row <tag> [--warmup 5]
+ *     bun analyze.ts --run <run dir> --row <tag> [--warmup 5] [--media <file> --encode=<audio options>]
  *
  * Adapted from `debug-findings/analysis/analyze.mjs` on the reporter's fork (`fperex/moq`, branch
  * `debug/rt-audio`), whose per-preset markdown table and per-minute normalisation this keeps. The
@@ -52,17 +56,22 @@ import {
 	stats,
 	type Void,
 } from "./src/schema.ts";
+import { locate, prove, type Reference } from "./src/silence.ts";
 
 const { values } = parseArgs({
 	options: {
 		run: { type: "string" },
 		row: { type: "string" },
 		warmup: { type: "string", default: "5" },
+		media: { type: "string" },
+		encode: { type: "string" },
 	},
 });
 
 if (!values.run || !values.row) {
-	console.error("usage: analyze.ts --run <run dir> --row <tag> [--warmup 5]");
+	console.error(
+		"usage: analyze.ts --run <run dir> --row <tag> [--warmup 5] [--media <file> --encode=<audio options>]",
+	);
 	process.exit(2);
 }
 
@@ -312,6 +321,76 @@ const convergeS = convergence(targetSeries, firstAudio?.at ?? 0, BUCKET_MS, t1);
 const rmsWindows = window.map((s) => s.rms).filter((x): x is number => typeof x === "number");
 const silenceShare =
 	rmsWindows.length > 0 ? rmsWindows.filter((r) => r < SILENCE_RMS).length / rmsWindows.length : null;
+
+/**
+ * The audio the quiet windows are placed in: the publisher's own encode of the file it loops,
+ * replayed from the start of its stream, which reproduces the published packets byte for byte, then
+ * decoded as the page decoded them over the span this row's playheads cover, and mixed to mono as
+ * the AnalyserNode mixes its input. Or why there is none.
+ */
+async function decode(media: string | undefined, encode: string | undefined): Promise<Reference | string> {
+	if (!media) return "no --media was given";
+	if (!existsSync(media)) return `${media} does not exist`;
+	if (!encode) return "no --encode was given, so the publisher's audio cannot be rebuilt";
+	const rate = window.find((s) => s.playout !== undefined)?.playout?.rate;
+	if (rate === undefined) return "no window reported the graph's rate";
+	const span = locate(window);
+	if ("reason" in span) return span.reason;
+
+	// The publisher's input and audio options, without its real-time pacing, which changes nothing
+	// the encoder sees. Its own stream selection picks the file's one audio stream, as this does.
+	const replay = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin", "-stream_loop", "-1", "-i", media];
+	replay.push(
+		"-map",
+		"0:a:0",
+		"-t",
+		String(span.from + span.seconds),
+		...encode.split(/\s+/),
+		"-f",
+		"matroska",
+		"pipe:1",
+	);
+	// The page decodes Opus with libopus, through WebCodecs, and AAC with FFmpeg's own decoder.
+	const decoder = row.codec === "opus" ? ["-c:a", "libopus"] : [];
+	const unpack = ["ffmpeg", "-hide_banner", "-v", "error", ...decoder, "-i", "pipe:0", "-ss", String(span.from)];
+	unpack.push("-ac", "2", "-ar", String(rate), "-f", "f32le", "pipe:1");
+
+	const encoder = Bun.spawn(replay, { stdout: "pipe", stderr: "pipe" });
+	const decoding = Bun.spawn(unpack, { stdin: encoder.stdout, stdout: "pipe", stderr: "pipe" });
+	const [bytes, encoded, decoded] = await Promise.all([
+		new Response(decoding.stdout).arrayBuffer(),
+		encoder.exited,
+		decoding.exited,
+	]);
+	if (encoded !== 0 || decoded !== 0) {
+		const why = `${await new Response(encoder.stderr).text()} ${await new Response(decoding.stderr).text()}`.trim();
+		return `ffmpeg could not rebuild the published audio: ${why.slice(0, 200) || `exit ${encoded}/${decoded}`}`;
+	}
+	// f32le is every supported host's own byte order.
+	const stereo = new Float32Array(bytes, 0, Math.floor(bytes.byteLength / 8) * 2);
+	const pcm = new Float32Array(stereo.length / 2);
+	for (let i = 0; i < pcm.length; i++) pcm[i] = 0.5 * ((stereo[2 * i] ?? 0) + (stereo[2 * i + 1] ?? 0));
+
+	const hasher = new Bun.CryptoHasher("sha256");
+	for await (const chunk of Bun.file(media).stream()) hasher.update(chunk);
+	return {
+		rate,
+		start: Math.round(span.from * rate),
+		pcm,
+		provenance: {
+			media,
+			sha256: hasher.digest("hex"),
+			encode: replay,
+			decode: unpack,
+			from: span.from,
+			seconds: span.seconds,
+			rate,
+		},
+	};
+}
+
+const quietProof =
+	rmsWindows.length > 0 ? prove(samples, window, await decode(values.media, values.encode)) : undefined;
 const loads = window.map((s) => s.renderLoad).filter((x): x is number => typeof x === "number");
 
 // What a hundred render quanta actually cost in wall time.
@@ -522,6 +601,7 @@ const summary: Summary = {
 	thread,
 	voids,
 	metrics,
+	silence: quietProof,
 	targetSeries,
 	episodes: episodes.map((e) => round1(e) ?? 0),
 	stages,
@@ -563,6 +643,28 @@ for (const [name, spec] of Object.entries(METRICS)) {
 		const shown =
 			value === null || value === undefined ? (spec.pending ? `n/a (${spec.pending})` : "n/a") : String(value);
 		lines.push(`| ${name} | ${spec.unit} | ${aggregation} | ${shown} |`);
+	}
+}
+if (quietProof) {
+	const fit = quietProof.alignment;
+	lines.push(
+		"",
+		`quiet proof: ${quietProof.proven ? "proven" : "unproven"}, ${quietProof.matched}/${quietProof.quiet} quiet windows over quiet source` +
+			(fit
+				? ` (log RMS r ${fit.correlation.toFixed(5)}, level ${fit.gain.toFixed(3)}, ${fit.audible} audible windows, shift ${round1(fit.shiftMs)} ms from the playhead)`
+				: "") +
+			(quietProof.reason ? `: ${quietProof.reason}` : ""),
+	);
+	const source = quietProof.reference;
+	if (source) {
+		lines.push(
+			`reference: the publisher's encode of ${source.media} (sha256 ${source.sha256.slice(0, 16)}) replayed and decoded over ${source.from}-${source.from + source.seconds} s of its stream at ${source.rate} Hz, half of left plus right`,
+		);
+	}
+	for (const q of quietProof.quietWindows.filter((w) => w.refused !== undefined).slice(0, 10)) {
+		const where = q.source === null ? "" : ` at source ${q.source.toFixed(3)} s`;
+		const level = q.reference === null ? "" : ` (source rms ${q.reference.toExponential(2)})`;
+		lines.push(`- ${(q.at / 1000).toFixed(2)} s, rms ${q.rms.toExponential(2)}${where}: ${q.refused}${level}`);
 	}
 }
 lines.push(

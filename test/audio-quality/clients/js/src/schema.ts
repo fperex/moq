@@ -232,6 +232,9 @@ export const METRICS: Record<string, MetricSpec> = {
 /** RMS below this at the graph output counts the window as silent. About -60 dBFS. */
 export const SILENCE_RMS = 0.001;
 
+/** Frames of graph output each RMS is taken over: the probe's AnalyserNode `fftSize`. */
+export const RMS_FRAMES = 2048;
+
 /** How often the page samples its signals. Every series in a {@link Summary} is on this grid. */
 export const SAMPLE_INTERVAL_MS = 250;
 
@@ -516,6 +519,74 @@ export function threadVoid(
 	return { assertion: "transport", detail };
 }
 
+/** One quiet window, placed in the source or refused. */
+export type QuietWindow = {
+	/** When the page sampled it, on the viewer clock. */
+	at: Ms;
+	/** Its RMS at the graph output. */
+	rms: number;
+	/** Seconds into the source file its first frame lines up with, or null when it was not placed. */
+	source: number | null;
+	/** The loudest source RMS across its timing uncertainty, or null when it was not placed. */
+	reference: number | null;
+	/** Why it is not proven, when it is not. */
+	refused?: string;
+};
+
+/** How a row's windows were lined up with the source before any quiet window was placed. */
+export type Alignment = {
+	/** Correlation of log RMS, output against source, over the audible windows the fit used. */
+	correlation: number;
+	/** Median output RMS over source RMS on those windows: 1 when both are measured alike. */
+	gain: number;
+	/** Audible windows the fit used. */
+	audible: number;
+	/** The fitted source position against the playhead's own media time, in ms. */
+	shiftMs: Ms;
+};
+
+/** Where a reference came from: enough to rebuild the same PCM. */
+export type Provenance = {
+	/** The file the publisher looped. */
+	media: string;
+	/** Its SHA-256. */
+	sha256: string;
+	/** The publisher's own audio encode of that file, replayed from the start of its stream. */
+	encode: string[];
+	/** The decode of that replay into PCM, with the decoder the page used. */
+	decode: string[];
+	/** Seconds into the publisher's stream the decoded span begins. */
+	from: number;
+	/** Seconds decoded. */
+	seconds: number;
+	/** Frames per second: the graph's rate. */
+	rate: number;
+};
+
+/**
+ * Whether every quiet window `silence_share` counted lines up with a quiet window of the source at
+ * the same media time. A raw share over its ceiling passes only when this is proven; see
+ * `silence.ts`.
+ */
+export type QuietProof = {
+	/** True only when the alignment held and every quiet window was placed over quiet source. */
+	proven: boolean;
+	/** Why the row is not proven, when it is not. */
+	reason?: string;
+	/** Windows the raw share counted. */
+	windows: number;
+	/** Of those, the quiet ones. */
+	quiet: number;
+	/** Quiet windows placed over quiet source. */
+	matched: number;
+	/** The row's alignment, or null when it never ran. */
+	alignment: Alignment | null;
+	/** The reference the windows were placed in, or null without one. */
+	reference: Provenance | null;
+	/** Every quiet window. */
+	quietWindows: QuietWindow[];
+};
+
 /** Everything one matrix row produced: the graded numbers plus what makes them trustworthy. */
 export type Summary = {
 	/** Schema version, bumped when a metric's meaning changes rather than when one is added. */
@@ -543,6 +614,12 @@ export type Summary = {
 
 	/** Every metric in {@link METRICS}, flattened to `<name>_<aggregation>` keys. */
 	metrics: Record<string, number | null>;
+	/**
+	 * The quiet windows behind `silence_share`, each placed in the source or refused. Absent from a
+	 * lane with no graph output to measure, and from a summary written before it existed; either
+	 * way a share over its ceiling stays a failure.
+	 */
+	silence?: QuietProof;
 	/** The resolved-target series, so a plateau can be looked at rather than inferred. */
 	targetSeries: { at: Ms; ms: Ms }[];
 	/** Underrun episode durations, in ms. */

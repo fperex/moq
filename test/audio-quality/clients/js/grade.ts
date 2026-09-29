@@ -11,6 +11,12 @@
  * fail the run: its ceilings are what a machine measured rather than what the player is required to
  * achieve. Every other row is enforced.
  *
+ * `silence_share` is graded raw against its ceiling like everything else, with one exception. A
+ * share over its ceiling passes when the analyzer proved that every quiet window it counted lines up
+ * with quiet source at the same media time (see `src/silence.ts`), and only then: a quiet window over
+ * audible source, one it could not place, or a proof counting other windows than the share did keeps
+ * the failure. Both the raw share and the proof are printed.
+ *
  * The table prints and the results are written either way; the exit status is zero unless
  * `--enforce` is passed, which the nightly job does. `budgets.json` says how each ceiling in it was
  * arrived at.
@@ -22,7 +28,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { type Budget, type Budgets, METRICS, type Row, rowKey, type Summary } from "./src/schema.ts";
+import { type Budget, type Budgets, METRICS, type QuietProof, type Row, rowKey, type Summary } from "./src/schema.ts";
 
 const { values } = parseArgs({
 	options: {
@@ -68,14 +74,44 @@ type Verdict = {
 	key: string;
 	value: number | null;
 	ceiling: number;
+	/** Whether the raw value is over its ceiling. */
 	over: boolean;
+	/** Whether a raw silence breach was proven to be the source's own quiet, which passes it. */
+	authored: boolean;
 	/** Whether the run produced no value for a metric this row budgets. */
 	missing: boolean;
 	/** Whether a breach fails the run, or is only reported. */
 	enforced: boolean;
 };
 
+/** The graded silence key, the one breach a quiet proof can excuse. */
+const SILENCE = "silence_share_share";
+
+/**
+ * Whether `proof` excuses a raw silence share of `value`: proven, and counting the very windows the
+ * share was taken over, rounded the way the analyzer rounds it.
+ */
+const excuses = (proof: QuietProof | undefined, value: number | null): boolean =>
+	proof?.proven === true &&
+	proof.windows > 0 &&
+	value !== null &&
+	Math.round((proof.quiet / proof.windows) * 1000) / 1000 === value;
+
+/** The quiet proof, as a breach line prints it. */
+function proofLine(proof: QuietProof | undefined, value: number | null): string {
+	if (!proof) return "no quiet proof in this summary";
+	const counts = `${proof.matched}/${proof.quiet} quiet windows over quiet source`;
+	const fit = proof.alignment
+		? ` (log RMS r ${proof.alignment.correlation.toFixed(5)}, level ${proof.alignment.gain.toFixed(3)}, ${proof.alignment.audible} audible windows)`
+		: "";
+	if (!proof.proven) return `${counts}${fit}; ${proof.reason ?? "unproven"}`;
+	if (!excuses(proof, value))
+		return `${counts}${fit}, but it counts ${proof.quiet} of ${proof.windows} windows, not this share`;
+	return `${counts}${fit}`;
+}
+
 const verdicts: Verdict[] = [];
+const proofs = new Map<string, QuietProof | undefined>();
 const voided: string[] = [];
 const reportedVoid: string[] = [];
 const unbudgeted: string[] = [];
@@ -96,16 +132,20 @@ for (const summary of summaries) {
 		else voided.push(reason);
 		continue;
 	}
+	proofs.set(key, summary.silence);
 	for (const metric of keys) {
 		const ceiling = budget[metric];
 		if (typeof ceiling !== "number") continue;
 		const value = summary.metrics[metric] ?? null;
+		const over = value !== null && value > ceiling;
 		verdicts.push({
 			row: key,
 			key: metric,
 			value,
 			ceiling,
-			over: value !== null && value > ceiling,
+			over,
+			// Only over the ceiling does the proof matter: within it, a row keeps the verdict it had.
+			authored: over && metric === SILENCE && excuses(summary.silence, value),
 			// A ceiling with nothing to compare it against is not a pass. The run was asked to
 			// measure this and did not, which is the same silent hole as a row with no budget.
 			missing: value === null,
@@ -118,25 +158,33 @@ for (const summary of summaries) {
 
 const lines: string[] = [];
 lines.push(
-	"| row | underrun ep/min | underrun ms/min | skips/min | skipped ms/min | groups/min | silence | stalled | target p95 | converge s | void |",
+	"| row | underrun ep/min | underrun ms/min | skips/min | skipped ms/min | groups/min | silence | quiet proven | stalled | target p95 | converge s | void |",
 );
-lines.push("|---|---|---|---|---|---|---|---|---|---|---|");
+lines.push("|---|---|---|---|---|---|---|---|---|---|---|---|");
 const cell = (x: number | null | undefined) => (x === null || x === undefined ? "n/a" : String(x));
+// Quiet windows placed over quiet source, of those counted, or why none could be.
+const quietCell = (proof: QuietProof | undefined) =>
+	proof === undefined ? "n/a" : `${proof.matched}/${proof.quiet}${proof.proven ? "" : " unproven"}`;
 for (const summary of summaries) {
 	const m = summary.metrics;
 	lines.push(
-		`| ${rowKey(summary.row)} | ${cell(m.underrun_episodes_per_min)} | ${cell(m.underrun_samples_per_min)} | ${cell(m.skip_aheads_per_min)} | ${cell(m.skipped_samples_per_min)} | ${cell(m.skipped_groups_per_min)} | ${cell(m.silence_share_share)} | ${cell(m.stalled_quanta_share)} | ${cell(m.target_ms_p95)} | ${cell(m.converge_s_seconds)} | ${summary.voids.map((v) => v.assertion).join(",") || "-"} |`,
+		`| ${rowKey(summary.row)} | ${cell(m.underrun_episodes_per_min)} | ${cell(m.underrun_samples_per_min)} | ${cell(m.skip_aheads_per_min)} | ${cell(m.skipped_samples_per_min)} | ${cell(m.skipped_groups_per_min)} | ${cell(m.silence_share_share)} | ${quietCell(summary.silence)} | ${cell(m.stalled_quanta_share)} | ${cell(m.target_ms_p95)} | ${cell(m.converge_s_seconds)} | ${summary.voids.map((v) => v.assertion).join(",") || "-"} |`,
 	);
 }
 
-const over = verdicts.filter((v) => v.over && v.enforced);
-const reported = verdicts.filter((v) => v.over && !v.enforced);
+/** A breach as a line: the raw value against its ceiling, and for silence the proof beside it. */
+const breach = (v: Verdict) =>
+	`- ${v.row} ${v.key}: ${v.value} > ${v.ceiling}${v.key === SILENCE ? `; ${proofLine(proofs.get(v.row), v.value)}` : ""}`;
+
+const over = verdicts.filter((v) => v.over && !v.authored && v.enforced);
+const reported = verdicts.filter((v) => v.over && !v.authored && !v.enforced);
+const authored = verdicts.filter((v) => v.authored);
 const missing = verdicts.filter((v) => v.missing && v.enforced);
 lines.push("");
 if (over.length > 0 || missing.length > 0) {
 	if (over.length > 0) {
 		lines.push("over budget:");
-		for (const v of over) lines.push(`- ${v.row} ${v.key}: ${v.value} > ${v.ceiling}`);
+		for (const v of over) lines.push(breach(v));
 	}
 	if (missing.length > 0) {
 		lines.push("budgeted but never measured:");
@@ -147,9 +195,13 @@ if (over.length > 0 || missing.length > 0) {
 		`within budget: ${verdicts.filter((v) => v.enforced).length} enforced checks across ${summaries.length - voided.length} rows`,
 	);
 }
+if (authored.length > 0) {
+	lines.push("", "over the raw silence ceiling, every quiet window proven over quiet source (passes):");
+	for (const v of authored) lines.push(breach(v));
+}
 if (reported.length > 0) {
 	lines.push("", "over a recorded ceiling (reported, not enforced):");
-	for (const v of reported) lines.push(`- ${v.row} ${v.key}: ${v.value} > ${v.ceiling}`);
+	for (const v of reported) lines.push(breach(v));
 }
 if (voided.length > 0) {
 	lines.push("", "void rows (not graded):");

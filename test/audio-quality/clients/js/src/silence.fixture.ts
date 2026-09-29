@@ -1,0 +1,140 @@
+/**
+ * A synthetic row for the quiet-window proof: a source with a moving level and an authored quiet
+ * stretch, and the samples a page playing it through the ring would have recorded.
+ *
+ * The ring's timing is modelled the way the probe sees it: each sample reads the context clock and
+ * the analyser together, and carries a ring report of some age whose playhead and `output` counter
+ * came from the same quantum. Nothing here is a test; see `silence.test.ts` and `grade.test.ts`.
+ *
+ * @module
+ */
+import { RMS_FRAMES, type Sample } from "./schema.ts";
+import type { Reference } from "./silence.ts";
+
+/** The graph's rate, which the fixture's source is already at. */
+export const RATE = 44100;
+
+/** Where the source is authored quiet, in source seconds. */
+export const QUIET = [30, 50] as const;
+
+/** Media time minus source time: the container's start offset the fit has to find. */
+const OFFSET_S = 1.3;
+
+/** Context frames the ring spent short before it first played, so `output` lags the context clock. */
+const LAG = 6000;
+
+/** The media frame the ring's timeline is anchored at. */
+const ANCHOR = 200_000;
+
+/** The source's level at `t` seconds: two slow swells, or a faint bed through the quiet stretch. */
+function level(t: number, periods: readonly [number, number]): number {
+	if (t >= QUIET[0] && t < QUIET[1]) return 0.0004 * (1 + 0.5 * Math.sin((2 * Math.PI * t) / 3.1));
+	return 0.05 * (1.2 + Math.sin((2 * Math.PI * t) / periods[0])) * (1.2 + Math.sin((2 * Math.PI * t) / periods[1]));
+}
+
+/** `seconds` of mono source: a 440 Hz tone under {@link level}. Other `periods` make a different film. */
+export function source(seconds = 85, periods: readonly [number, number] = [5.3, 1.7]): Float32Array {
+	const pcm = new Float32Array(Math.round(seconds * RATE));
+	for (let i = 0; i < pcm.length; i++) {
+		const t = i / RATE;
+		pcm[i] = level(t, periods) * Math.sin(2 * Math.PI * 440 * t);
+	}
+	return pcm;
+}
+
+/** The RMS of `pcm` over one analyser window starting at `start`. */
+export function rms(pcm: Float32Array, start: number): number {
+	let sum = 0;
+	for (let i = start; i < start + RMS_FRAMES; i++) sum += (pcm[i] ?? 0) ** 2;
+	return Math.sqrt(sum / RMS_FRAMES);
+}
+
+/** `pcm` as the analyzer would hand it over, nominally at media frame `start`. */
+export function reference(pcm: Float32Array, start = 0): Reference {
+	return {
+		rate: RATE,
+		start,
+		pcm,
+		provenance: {
+			media: "fixture",
+			sha256: "fixture",
+			encode: [],
+			decode: [],
+			from: start / RATE,
+			seconds: pcm.length / RATE,
+			rate: RATE,
+		},
+	};
+}
+
+/** A ring report with nothing unusual in it. */
+const report: NonNullable<Sample["playout"]> = {
+	backend: "message",
+	generation: 1,
+	rate: RATE,
+	anchor: ANCHOR,
+	jumps: 0,
+	jumped: 0,
+	skips: 0,
+	skipped: 0,
+	discarded: 0,
+	trimmed: 0,
+	buffered: 11025,
+	target: 11025,
+	chunk: 1024,
+	skip: 3308,
+	stalled: false,
+	fresh: false,
+	underruns: 0,
+	queued: 0,
+	stretched: 0,
+	output: 0,
+	concealed: 0,
+	accelerates: 0,
+	expands: 0,
+	merges: 0,
+	short: 0,
+};
+
+/**
+ * The samples a page playing `pcm` records: `count` of them, 250 ms apart.
+ *
+ * Every window's RMS is the source's own at the media time the ring was playing, so the row is an
+ * exact rendering. `expandAt` inserts `expanded` frames by time stretch just before that sample's
+ * report, which moves every later window's media time the way a real expansion does.
+ */
+export function samples(
+	pcm: Float32Array,
+	options: { count?: number; expandAt?: number; expanded?: number } = {},
+): Sample[] {
+	const { count = 280, expandAt = Number.POSITIVE_INFINITY, expanded = 300 } = options;
+	return Array.from({ length: count }, (_, i) => {
+		const at = 250 * (i + 1);
+		const contextTime = at + 1000;
+		const frame = Math.round((contextTime * RATE) / 1000);
+		// The report is up to eleven quanta old, as a relayed report is.
+		const output = frame - 128 * ((i * 7) % 12) - LAG;
+		const stretched = i >= expandAt ? -expanded : 0;
+		const playhead = ANCHOR + output + stretched;
+		const window = frame - RMS_FRAMES - LAG + ANCHOR + stretched;
+		return {
+			at,
+			timestamp: (playhead * 1000) / RATE,
+			stalled: false,
+			underruns: 0,
+			contextTime,
+			contextRate: RATE,
+			rms: rms(pcm, window - Math.round(OFFSET_S * RATE)),
+			playout: { ...report, output, stretched, expands: i >= expandAt ? 1 : 0 },
+		};
+	});
+}
+
+/** The graded window: everything after a five second warmup. */
+export const graded = (all: Sample[]): Sample[] => all.slice(20);
+
+/** The raw share the analyzer would report for `window`. */
+export function share(window: Sample[]): number {
+	const levels = window.flatMap((s) => (typeof s.rms === "number" ? [s.rms] : []));
+	return Math.round((levels.filter((r) => r < 0.001).length / levels.length) * 1000) / 1000;
+}
