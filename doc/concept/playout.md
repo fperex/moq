@@ -435,6 +435,15 @@ republish in place, rather than being rebuilt around it, treats the replacement
 broadcast as a tune-in and resets the ring and the clock there. A rendition swap
 is not one: it reopens a subscription on the timeline already playing.
 
+A reattached element reaches the same reset, since its new session hands it a
+new broadcast, but its catalog names the same broadcast clock. A track reopened
+after any gap can start on pictures older than the last one shown (the keyframe
+of the group it joins, or groups a relay kept from before the gap), so the video
+decoder never shows a picture older than that one on the same clock, wherever
+the reset or a returning audio clock put the playhead. Without a shared clock it
+holds such a picture back only while the playhead is past the last one shown,
+which a rewind or a republish moves below it.
+
 ## The "plus one frame" question
 
 The first attempt added a learned frame duration on top of the quantile. It

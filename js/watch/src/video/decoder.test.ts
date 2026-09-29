@@ -230,7 +230,12 @@ function fixture(config = testConfig("legacy")) {
 	const broadcast = new Moq.Broadcast.Producer();
 	const consumer = broadcast.consume();
 	const source = {
-		in: { broadcast: new Signal({ relativeBroadcast: () => consumer } as unknown as Broadcast) },
+		in: {
+			broadcast: new Signal({
+				relativeBroadcast: () => consumer,
+				out: { catalog: new Signal<Catalog.Root | undefined>(undefined) },
+			} as unknown as Broadcast),
+		},
 		out: {
 			track: new Signal<string | undefined>(TRACK),
 			config: new Signal<Catalog.VideoConfig | undefined>(config),
@@ -631,6 +636,7 @@ test("a replaced session re-subscribes to video", async () => {
 		in: {
 			broadcast: new Signal({
 				relativeBroadcast: (effect: Effect) => effect.get(handle),
+				out: { catalog: new Signal<Catalog.Root | undefined>(undefined) },
 			} as unknown as Broadcast),
 		},
 		out: {
@@ -688,6 +694,7 @@ test("a republished broadcast re-anchors the clock", async () => {
 		in: {
 			broadcast: new Signal({
 				relativeBroadcast: (effect: Effect) => effect.get(handle),
+				out: { catalog: new Signal<Catalog.Root | undefined>(undefined) },
 			} as unknown as Broadcast),
 		},
 		out: {

@@ -139,6 +139,11 @@ export class Decoder {
 	// publisher rather than a continuation. See `#runPending`.
 	#broadcast?: Moq.Broadcast.Consumer;
 
+	// The last picture handed to the renderer and the broadcast clock it was painted on. It outlives
+	// the picture itself (going offline clears that) so a track opened after a gap knows what the
+	// viewer last saw. See `#runPending`.
+	#shown?: { timestamp: Time.Milli; clock?: Catalog.Clock };
+
 	// Bumped to rebuild the track without anything else about the rendition changing: a codec that
 	// errored, or a picture that stayed frozen past RECOVER. `#runPending` reads it, so a bump tears
 	// the old subscription down and opens a new one at the live edge.
@@ -267,14 +272,32 @@ export class Decoder {
 		const spread = effect.get(this.#spread);
 		if (!spread) return;
 
+		// Peeked: a catalog update must not rebuild the track.
+		const clock = broadcast.out.catalog.peek()?.clock;
+
+		// A track opened after a gap (a hidden tab shown, a resume, a rebuild, a reattached element,
+		// a replaced session) is promoted at once, so it must not step back from what the viewer last
+		// saw.
+		const shown = this.#active.peek() ? undefined : this.#shown;
+		const held = shown && {
+			timestamp: shown.timestamp,
+			sameClock:
+				clock !== undefined &&
+				shown.clock !== undefined &&
+				clock.wall === shown.clock.wall &&
+				clock.timescale === shown.clock.timescale,
+		};
+
 		// Start a new pending effect.
 		let pending: DecoderTrack | undefined = new DecoderTrack({
 			sync: this.sync,
 			broadcast: active,
 			track,
 			config: identity.decoder,
+			clock,
 			stats: this.#out.stats,
 			spread,
+			held,
 		});
 		effect.set(this.#pendingJitter, pending.jitter);
 
@@ -338,6 +361,9 @@ export class Decoder {
 		// proxy() would share the same reference, allowing the source to close our frame.
 		effect.run((inner) => {
 			const frame = inner.get(active.frame);
+			if (frame) {
+				this.#shown = { timestamp: Time.Milli.fromMicro(frame.timestamp as Time.Micro), clock: active.clock };
+			}
 			this.#out.frame.update((prev) => {
 				prev?.close();
 				return frame?.clone();
@@ -448,6 +474,15 @@ interface DecoderTrackProps {
 
 	/** The rendition's arrival estimator, which outlives this subscription. */
 	spread: Container.Jitter;
+
+	/** The broadcast clock the catalog named when this track opened, if it named one. */
+	clock?: Catalog.Clock;
+
+	/**
+	 * The picture the viewer last saw when this track opened after a gap, and whether it was painted
+	 * on this track's broadcast clock, which puts both on one timeline.
+	 */
+	held?: { timestamp: Time.Milli; sameClock: boolean };
 }
 
 class DecoderTrack {
@@ -458,6 +493,7 @@ class DecoderTrack {
 	stats: Signal<Stats | undefined>;
 	spread: Container.Jitter;
 	jitter: Time.Milli | undefined;
+	clock: Catalog.Clock | undefined;
 
 	timestamp = new Signal<Time.Milli | undefined>(undefined);
 	frame = new Signal<VideoFrame | undefined>(undefined);
@@ -479,6 +515,11 @@ class DecoderTrack {
 	// Decoded frames waiting to be rendered.
 	#buffered = new Signal<Container.BufferedRanges>([]);
 
+	// See `DecoderTrackProps.held`. Kept across a discontinuity: a skipped group is not a new
+	// timeline. Only a publisher that names no clock can rewind, and a rewind re-anchors the
+	// playhead below the held picture, which the playhead check sees.
+	#held: { timestamp: Time.Milli; sameClock: boolean } | undefined;
+
 	// The last discontinuity count seen from the container consumer; doubles as a generation
 	// so in-flight decodes from before a rewind can be dropped on output.
 	#discontinuity = 0;
@@ -498,6 +539,8 @@ class DecoderTrack {
 		this.stats = props.stats;
 		this.spread = props.spread;
 		this.jitter = renditionJitter(props.config);
+		this.clock = props.clock;
+		this.#held = props.held;
 
 		this.#signals.run(this.#run.bind(this));
 	}
@@ -529,6 +572,21 @@ class DecoderTrack {
 					// received(), so it predates the current timeline. Drop it: painting it would
 					// set `timestamp` from the old timeline and late-reject the whole rewind.
 					if (this.sync.out.reference.peek() === undefined) return;
+
+					// The subscription starts at the keyframe of the group it joins, and a relay can
+					// hand a returning viewer the groups it kept from before the gap, so the first
+					// pictures can be older than the one last shown. On that picture's own broadcast
+					// clock such a picture is older content outright, however the playhead was
+					// re-anchored since (a new consumer resets it, and audio back first with media
+					// from before the gap parks it behind). Without a shared clock it is not due
+					// while the playhead is still past the held picture: only a rewind puts it below.
+					// Either way it would only step the picture back until the live one replaces it.
+					const held = this.#held;
+					if (held !== undefined && timestamp < held.timestamp) {
+						if (held.sameClock) return;
+						const playhead = this.sync.now();
+						if (playhead !== undefined && playhead >= held.timestamp) return;
+					}
 
 					if (this.frame.peek() === undefined) {
 						// This preview is already visible. Older backlog must not replace it
