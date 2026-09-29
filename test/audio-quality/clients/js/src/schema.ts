@@ -287,14 +287,14 @@ export type Drift = {
 
 // ── the row identity ────────────────────────────────────────────────────────
 
-/** Which ring the page actually ran, which is decided by whether the document is isolated. */
+/** Document isolation for browser rows, or shared/message ring selection for replay. */
 export type Ring = "isolated" | "plain";
 
 /**
  * One matrix cell.
  *
  * A budget is keyed by the whole thing. Keying by profile alone would grade one codec's floor
- * against another's, and the sample rate and the ring path each move it as much as the profile does.
+ * against another's, and preserves the isolation context in browser results.
  */
 export type Row = {
 	/** The runtime that played it. */
@@ -409,7 +409,7 @@ export type Sample = {
 
 /** What the page reports once, at the start, rather than every sample. */
 export type Environment = {
-	/** Whether the document is cross-origin isolated, and therefore which ring can run. */
+	/** Whether the document is cross-origin isolated, permitting shared memory. */
 	crossOriginIsolated: boolean;
 	/**
 	 * The transport the page's session negotiated. Anything but WebTransport bypasses the UDP shaper. The

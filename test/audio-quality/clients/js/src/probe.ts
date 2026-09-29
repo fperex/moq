@@ -1,11 +1,8 @@
 /**
  * Samples what a `<moq-watch>` will tell anyone who asks, every 250 ms.
  *
- * Public signals only. Nothing here reaches past the element's `out` surface, patches a module, or
- * knows which ring is running, so the same probe reads a build from the npm package and a build from
- * this checkout, and a number it reports is one a consumer could have read too. Where a counter does
- * not exist yet the sample carries `undefined` and the analyzer reports null, rather than this file
- * growing a private hook to fill the gap.
+ * Reads the element's output signals, including internal ring diagnostics when available.
+ * Missing counters remain undefined and the analyzer reports null.
  *
  * Two things are measured rather than read, because no signal carries them:
  *
