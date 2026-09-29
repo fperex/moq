@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Decision, type Demand } from "./decision";
-import { antiphase, buzz, dominant, energy, maxStep, noise, tone, zeroRun } from "./fixture";
+import { antiphase, buzz, dominant, energy, FixedRing, maxStep, noise, tone, zeroRun } from "./fixture";
 import {
 	CORRELATION,
 	CORRELATION_FAST,
@@ -11,6 +11,7 @@ import {
 	SEARCH,
 	STRETCH_BOUND,
 	Stretch,
+	Stretcher,
 } from "./index";
 import { Floor, Level } from "./level";
 import { Noise } from "./noise";
@@ -444,5 +445,28 @@ describe("the stretch bound", () => {
 	it("is what the cooldown and the maximum operation can close in half a second", () => {
 		// One 15ms pitch period per 100ms of output, five times over.
 		expect(STRETCH_BOUND).toBe(MAX_LAG * 5);
+	});
+});
+
+describe("the engine at a fixed level", () => {
+	/** Operations the engine runs over a minute against a ring stubbed at `depthMs`. */
+	function operations(depthMs: number, outage = 0, cycle = 0): number {
+		const ring = new FixedRing(48000, tone(48000, 2, 220, 0.5)[0], depthMs, outage, cycle);
+		const engine = new Stretcher(48000, 1);
+		const out = [new Float32Array(128)];
+		for (let frame = 0; frame < 48000 * 60; frame += 128) engine.render(ring, out, frame);
+		const { accelerates, expands, merges } = engine.counters();
+		return accelerates + expands + merges;
+	}
+
+	it("stretches once per cooldown past the band and never inside it", () => {
+		// 400ms against a 100ms target is past the upper limit however the filter smooths it.
+		expect(operations(400)).toBeGreaterThan(500);
+		expect(operations(120)).toBe(0);
+	});
+
+	it("conceals and splices back on at every outage", () => {
+		// Three blocks of concealment out of every four.
+		expect(operations(120, 3, 4)).toBeGreaterThan(500);
 	});
 });
