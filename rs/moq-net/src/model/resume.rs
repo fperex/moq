@@ -156,6 +156,20 @@ fn served_start(segments: &[Segment], from: u64, cap: Option<u64>) -> Option<Suc
 	})
 }
 
+fn poll_served_start(segments: &[Segment], from: u64, cap: Option<u64>, waiter: &kio::Waiter) -> Option<Successor> {
+	let mut successor = None;
+	for segment in segments {
+		let start = segment.start.map_or(0, |start| start.group).max(from);
+		let candidate = segment
+			.track
+			.poll_served_start(start, min_some(cap, last_group(segment.end)), waiter);
+		if successor.is_none() {
+			successor = candidate;
+		}
+	}
+	successor
+}
+
 /// How many segments a logical track keeps before pruning terminal ones from the
 /// front: the live segment plus a couple of predecessors still draining to slow
 /// readers. Without a bound, every failover leaves one dead segment (pinning a
@@ -249,8 +263,7 @@ impl ResumeState {
 	}
 
 	/// Where the logical track continues past the exclusive group `boundary` of segment
-	/// `id`, below the reader's `cap`: the start of the first group the later segments
-	/// serve there. `None` while none is cached, or it has no frame yet.
+	/// `id`, below the reader's `cap`: the first group the later segments serve there.
 	fn successor(&self, id: u64, boundary: u64, cap: Option<u64>) -> Option<Successor> {
 		let index = self.segments.iter().position(|segment| segment.id == id)?;
 		served_start(&self.segments[index + 1..], boundary, cap)
@@ -325,6 +338,38 @@ impl ResumeState {
 			self.pruned = self.pruned.max(Some(end));
 			self.segments.remove(0);
 		}
+	}
+}
+
+pub(super) struct ExpiryBound {
+	state: kio::ConsumerWeak<ResumeState>,
+	boundary: u64,
+}
+
+impl ExpiryBound {
+	fn new(state: kio::ConsumerWeak<ResumeState>, boundary: u64) -> Self {
+		Self { state, boundary }
+	}
+
+	pub(super) fn poll_anchor(&self, outer: Anchor, waiter: &kio::Waiter) -> Anchor {
+		let mut anchor = outer.clone().capped(Some(self.boundary));
+		let _ = self.state.poll(waiter, |state| {
+			let edge = state
+				.live_edge(outer.cap)
+				.into_iter()
+				.chain(outer.edge.clone())
+				.max_by_key(|edge| edge.sequence);
+			anchor = Anchor { edge, ..outer.clone() };
+			let cap = anchor.cap;
+			anchor = anchor.clone().capped(Some(self.boundary));
+			if anchor.cap != cap {
+				// Scan from the boundary rather than locating its original segment: a
+				// handed-out group may outlive that segment's producer-side prune.
+				anchor.successor = poll_served_start(&state.segments, self.boundary, cap, waiter);
+			}
+			Poll::<()>::Pending
+		});
+		anchor
 	}
 }
 
@@ -706,6 +751,15 @@ impl Consumer {
 	/// revalidate it; see [`track::Consumer::served_start`].
 	pub(crate) fn served_start(&self, from: u64, cap: Option<u64>) -> Option<Successor> {
 		served_start(&self.state.read().segments, from, cap)
+	}
+
+	pub(crate) fn poll_served_start(&self, from: u64, cap: Option<u64>, waiter: &kio::Waiter) -> Option<Successor> {
+		let mut successor = None;
+		let _ = self.state.poll(waiter, |state| {
+			successor = poll_served_start(&state.segments, from, cap, waiter);
+			Poll::<()>::Pending
+		});
+		successor
 	}
 
 	/// The newest cached group across every spliced segment; see
@@ -1185,7 +1239,8 @@ impl Group {
 			// `start_at` clamps up to the first frame the copy still holds, so landing
 			// higher than asked means this route can't cover the seam after all. Treat it
 			// like a dead copy and wait for one that can.
-			let mut group = track.guard_group(group, self.subscription.clone(), self.anchor.clone(), bound);
+			let expiry = bound.map(|boundary| ExpiryBound::new(self.state.weak(), boundary));
+			let mut group = track.guard_group(group, self.subscription.clone(), self.anchor.clone(), expiry);
 			group.set_stale_meter(self.stale_stats.clone());
 			group.start_at(self.index);
 			if group.index() != self.index {
@@ -1343,8 +1398,9 @@ impl Group {
 				// The continuation's copy declares the count: its own count
 				// already includes the frames it skipped.
 				Some(continuation) => {
+					let expiry = bound.map(|boundary| ExpiryBound::new(self.state.weak(), boundary));
 					let mut continuation =
-						track.guard_group(continuation, self.subscription.clone(), self.anchor.clone(), bound);
+						track.guard_group(continuation, self.subscription.clone(), self.anchor.clone(), expiry);
 					continuation.set_stale_meter(self.stale_stats.clone());
 					return continuation.poll_finished(waiter);
 				}
@@ -2656,6 +2712,143 @@ mod test {
 		write_group_at(&mut live, 4, "next", Duration::from_secs(4));
 		write_group_at(&mut live, 5, "new", Duration::from_secs(5));
 		assert_eq!(recv(&mut sub), 4);
+		assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
+	}
+
+	#[tokio::test]
+	async fn takeover_tail_uses_the_next_routes_successor() {
+		let (mut first, first_consumer) = track_pair("first");
+		let (mut middle, middle_consumer) = track_pair("middle");
+		let (mut live, live_consumer) = track_pair("live");
+		let mut producer = Producer::new();
+		producer.switch(&first_consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_millis(100)));
+		write_group(&mut first, 0, "first");
+		assert_eq!(recv(&mut sub), 0);
+		first.finish().unwrap();
+		producer.switch(&middle_consumer, Position::group(1)).unwrap();
+		write_group_at(&mut middle, 1, "middle", Duration::from_secs(1));
+		assert_eq!(recv(&mut sub), 1);
+
+		let mut open = middle.create_group(group::Info { sequence: 2 }).unwrap();
+		open.write_frame(Timestamp::from_secs(2).unwrap(), b"held".as_ref())
+			.unwrap();
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut held), b"held");
+		producer.switch(&live_consumer, Position::group(3)).unwrap();
+		write_group_at(&mut live, 3, "next", Duration::from_secs(3));
+		write_group_at(&mut live, 4, "new", Duration::from_secs(4));
+		assert_eq!(recv(&mut sub), 3);
+		// The handed-out group reads the final ResumeState after its producer closes.
+		drop(producer);
+		assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
+	}
+
+	#[tokio::test]
+	async fn takeover_tail_after_a_continuation_uses_the_next_routes_successor() {
+		let (first, first_consumer) = track_pair("first");
+		let (middle, middle_consumer) = track_pair("middle");
+		let (mut live, live_consumer) = track_pair("live");
+		let mut producer = Producer::new();
+		producer.switch(&first_consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_millis(100)));
+
+		let mut head = first.create_group(group::Info { sequence: 0 }).unwrap();
+		head.write_frame(Timestamp::ZERO, b"head".as_ref()).unwrap();
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut held), b"head");
+
+		producer
+			.switch(&middle_consumer, Position { group: 0, frame: 1 })
+			.unwrap();
+		let mut continuation = middle.create_group(group::Info { sequence: 0 }).unwrap();
+		continuation.start_at(1).unwrap();
+		continuation
+			.write_frame(Timestamp::from_millis(10).unwrap(), b"continuation".as_ref())
+			.unwrap();
+		assert_eq!(read(&mut held), b"continuation");
+
+		producer.switch(&live_consumer, Position::group(1)).unwrap();
+		write_group_at(&mut live, 1, "next", Duration::from_secs(1));
+		write_group_at(&mut live, 2, "new", Duration::from_secs(2));
+		assert_eq!(recv(&mut sub), 1);
+		assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
+	}
+
+	#[tokio::test]
+	async fn takeover_tail_wakes_when_an_unpolled_successor_gets_its_first_timestamp() {
+		use std::task::Context;
+
+		let (mut first, first_consumer) = track_pair("first");
+		let (mut middle, middle_consumer) = track_pair("middle");
+		let (mut live, live_consumer) = track_pair("live");
+		let mut producer = Producer::new();
+		producer.switch(&first_consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_millis(100)));
+		write_group(&mut first, 0, "first");
+		assert_eq!(recv(&mut sub), 0);
+		first.finish().unwrap();
+		producer.switch(&middle_consumer, Position::group(1)).unwrap();
+		write_group_at(&mut middle, 1, "middle", Duration::from_secs(1));
+		assert_eq!(recv(&mut sub), 1);
+
+		let mut open = middle.create_group(group::Info { sequence: 2 }).unwrap();
+		open.write_frame(Timestamp::from_secs(2).unwrap(), b"held".as_ref())
+			.unwrap();
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut held), b"held");
+
+		producer.switch(&live_consumer, Position::group(3)).unwrap();
+		let mut successor = live.create_group(group::Info { sequence: 3 }).unwrap();
+		write_group_at(&mut live, 4, "edge", Duration::from_secs(4));
+		let (counter, waker) = CountWaker::new();
+		let mut cx = Context::from_waker(&waker);
+		let mut pending = std::pin::pin!(held.read_frame());
+		assert!(pending.as_mut().poll(&mut cx).is_pending());
+		let before = counter.count();
+		successor
+			.write_frame(Timestamp::from_secs(3).unwrap(), b"successor".as_ref())
+			.unwrap();
+		assert!(counter.count() > before, "the successor timestamp wakes the held tail");
+		assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Ready(Ok(None))));
+	}
+
+	#[tokio::test]
+	async fn takeover_tail_keeps_a_successor_inside_the_budget() {
+		let (mut first, first_consumer) = track_pair("first");
+		let (mut middle, middle_consumer) = track_pair("middle");
+		let (mut live, live_consumer) = track_pair("live");
+		let mut producer = Producer::new();
+		producer.switch(&first_consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_millis(100)));
+		write_group(&mut first, 0, "first");
+		assert_eq!(recv(&mut sub), 0);
+		first.finish().unwrap();
+		producer.switch(&middle_consumer, Position::group(1)).unwrap();
+		write_group_at(&mut middle, 1, "middle", Duration::from_secs(1));
+		assert_eq!(recv(&mut sub), 1);
+
+		let mut open = middle.create_group(group::Info { sequence: 2 }).unwrap();
+		open.write_frame(Timestamp::from_secs(2).unwrap(), b"held".as_ref())
+			.unwrap();
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut held), b"held");
+
+		producer.switch(&live_consumer, Position::group(3)).unwrap();
+		write_group_at(&mut live, 3, "late tail", Duration::from_millis(9_990));
+		write_group_at(&mut live, 4, "edge", Duration::from_secs(10));
+		assert_eq!(recv(&mut sub), 3);
+		assert!(held.read_frame().now_or_never().is_none());
+
+		write_group_at(&mut live, 5, "new edge", Duration::from_millis(10_200));
 		assert!(matches!(held.read_frame().now_or_never(), Some(Ok(None))));
 	}
 
