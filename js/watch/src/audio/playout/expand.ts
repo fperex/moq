@@ -320,7 +320,7 @@ export class Expand {
 	 */
 	analyse(history: Float32Array[], length: number): void {
 		const reference = history[0];
-		this.#lag = peak(reference.subarray(0, length), this.rate, MAX_LAG, this.#scratch);
+		this.#lag = peak(reference, this.rate, MAX_LAG, this.#scratch, length);
 		this.#position = 0;
 		this.#concealed = 0;
 		this.#ready = true;

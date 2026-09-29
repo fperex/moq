@@ -71,22 +71,31 @@ export function fade(i: number, len: number): number {
 }
 
 /**
- * Resample `input` down to `out.length` samples.
+ * Resample `input[from..to)` down to the first `count` samples of `out`.
  *
  * NetEq keeps a 3 to 7 tap FIR per supported rate (`dsp_helper.cc`), all of them integer
  * decimations of 8, 16, 32, or 48kHz. We take 44.1kHz too, where the ratio is not an integer, so
  * this is a boxcar average over one decimation span instead: the same job, one tap count short of
  * the same stopband, and the coarse search that consumes it only needs the peak location.
+ *
+ * Bounds rather than views, because a `subarray` is an allocation on the audio thread.
  */
-export function decimate(input: Float32Array, out: Float32Array): void {
-	const step = input.length / out.length;
+export function decimate(
+	input: Float32Array,
+	out: Float32Array,
+	from = 0,
+	to = input.length,
+	count = out.length,
+): void {
+	const length = to - from;
+	const step = length / count;
 	const width = Math.max(1, Math.round(step));
 
-	for (let i = 0; i < out.length; i++) {
-		const start = Math.min(Math.round(i * step), input.length);
-		const end = Math.min(start + width, input.length);
+	for (let i = 0; i < count; i++) {
+		const start = Math.min(Math.round(i * step), length);
+		const end = Math.min(start + width, length);
 		let sum = 0;
-		for (let j = start; j < end; j++) sum += input[j];
+		for (let j = start; j < end; j++) sum += input[from + j];
 		out[i] = sum / Math.max(1, end - start);
 	}
 }
@@ -109,24 +118,30 @@ export interface Match {
 const LAGS = new Float64Array(frames(DECIMATED, MAX_LAG) - frames(DECIMATED, MIN_LAG));
 
 /**
- * The lag, in frames, whose autocorrelation against the last `window` milliseconds of `signal` is
- * strongest.
+ * The lag, in frames, whose autocorrelation against the last `window` milliseconds of the first
+ * `length` frames of `signal` is strongest.
  *
- * One channel, and `signal` must hold `window` plus 15ms. Mirrors `TimeStretch::AutoCorrelation`
+ * One channel, and `length` must hold `window` plus 15ms. Mirrors `TimeStretch::AutoCorrelation`
  * plus `DspHelper::PeakDetection`: the search itself runs on a 4kHz decimation, and a parabola
  * through the winning bin and its neighbours recovers most of what the decimation threw away.
  *
  * Pass `scratch` (sized `frames(DECIMATED, window + MAX_LAG)`) so the audio thread does not
  * allocate the decimation on every search.
  */
-export function peak(signal: Float32Array, rate: number, window: number, scratch?: Float32Array): number {
+export function peak(
+	signal: Float32Array,
+	rate: number,
+	window: number,
+	scratch?: Float32Array,
+	length = signal.length,
+): number {
 	const minLag = frames(rate, MIN_LAG);
 	const maxLag = frames(rate, MAX_LAG);
 	const span = frames(rate, window) + maxLag;
-	if (signal.length < span) throw new RangeError("pitch search needs the window plus one max lag");
+	if (length < span) throw new RangeError("pitch search needs the window plus one max lag");
 
 	const decimated = scratch ?? new Float32Array(frames(DECIMATED, window + MAX_LAG));
-	decimate(signal.subarray(signal.length - span), decimated);
+	decimate(signal, decimated, length - span, length);
 
 	const width = frames(DECIMATED, window);
 	const min = frames(DECIMATED, MIN_LAG);
@@ -223,7 +238,7 @@ export class Stretch {
 	analyse(input: Float32Array[], length: number, noise: Noise): Match {
 		const reference = input[0];
 		const lag = Math.min(
-			peak(reference.subarray(0, this.maxLag + this.window), this.rate, SEARCH, this.#scratch),
+			peak(reference, this.rate, SEARCH, this.#scratch, this.maxLag + this.window),
 			length - this.maxLag,
 		);
 
@@ -281,13 +296,13 @@ export class Stretch {
 		for (let channel = 0; channel < this.channels; channel++) {
 			const src = input[channel];
 			const dst = out[channel];
-			dst.set(src.subarray(0, this.maxLag));
+			for (let i = 0; i < this.maxLag; i++) dst[i] = src[i];
 			for (let i = 0; i < lag; i++) {
 				const weight = fade(i, lag);
 				const at = this.maxLag - lag + i;
 				dst[at] = dst[at] * weight + src[this.maxLag + i] * (1 - weight);
 			}
-			dst.set(src.subarray(this.maxLag + lag, length), this.maxLag);
+			for (let i = this.maxLag + lag; i < length; i++) dst[i - lag] = src[i];
 		}
 
 		return lag;
@@ -314,13 +329,13 @@ export class Stretch {
 		for (let channel = 0; channel < this.channels; channel++) {
 			const src = input[channel];
 			const dst = out[channel];
-			dst.set(src.subarray(0, unmodified + lag));
+			for (let i = 0; i < unmodified + lag; i++) dst[i] = src[i];
 			for (let i = 0; i < lag; i++) {
 				const weight = fade(i, lag);
 				const at = unmodified + i;
 				dst[at] = dst[at] * weight + src[unmodified - lag + i] * (1 - weight);
 			}
-			dst.set(src.subarray(unmodified, length), unmodified + lag);
+			for (let i = unmodified; i < length; i++) dst[i + lag] = src[i];
 		}
 
 		return lag;
