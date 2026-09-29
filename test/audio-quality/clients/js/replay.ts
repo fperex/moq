@@ -177,6 +177,8 @@ for (const { recording, row } of matrix) {
 	const underruns = rise((s) => s.debug.underruns);
 	const skips = rise((s) => s.debug.skips);
 	const skippedSamples = rise((s) => s.debug.skipped);
+	const observedJumps = rise((s) => s.debug.jumps);
+	const observedSkipped = rise((s) => s.debug.jumped);
 	const discarded = rise((s) => s.debug.discarded);
 	const accelerates = rise((s) => s.debug.accelerates);
 	const expands = rise((s) => s.debug.expands);
@@ -228,6 +230,10 @@ for (const { recording, row } of matrix) {
 			skip_aheads_per_min: round1(skips / minutes),
 			skipped_samples_total: round1(asMs(skippedSamples, recording.rate)),
 			skipped_samples_per_min: round1(asMs(skippedSamples, recording.rate) / minutes),
+			observed_jumps_total: observedJumps,
+			observed_jumps_per_min: round1(observedJumps / minutes),
+			observed_skipped_samples_total: round1(asMs(observedSkipped, recording.rate)),
+			observed_skipped_samples_per_min: round1(asMs(observedSkipped, recording.rate) / minutes),
 			accelerates_total: accelerates,
 			accelerates_per_min: round1(accelerates / minutes),
 			expands_total: expands,

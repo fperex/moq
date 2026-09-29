@@ -57,6 +57,9 @@ export class AudioRingBuffer implements RingReader {
 	#skips = 0;
 	#skipped = 0;
 	#discarded = 0;
+	#jumps = 0;
+	#jumpedSamples = 0;
+	#observedRead: number | undefined;
 	// Samples dropped off the front of the first fill on a timeline, which no listener waited on.
 	#trimmed = 0;
 	// Whether nothing on this timeline has been played yet, so what is buffered is still free to
@@ -97,6 +100,8 @@ export class AudioRingBuffer implements RingReader {
 	readonly #playhead: Playhead = { timestamp: Time.Micro.zero, rate: 0 };
 	readonly #snapshot: Snapshot = {
 		backend: "message",
+		jumps: 0,
+		jumped: 0,
 		queued: 0,
 		stretched: 0,
 		output: 0,
@@ -234,6 +239,8 @@ export class AudioRingBuffer implements RingReader {
 		snapshot.skips = this.#skips;
 		snapshot.skipped = this.#skipped;
 		snapshot.discarded = this.#discarded;
+		snapshot.jumps = this.#jumps;
+		snapshot.jumped = this.#jumpedSamples;
 		snapshot.trimmed = this.#trimmed;
 		// `#fresh` stands until the reader commits a sample from this timeline, which is exactly
 		// what "nothing has been played yet" means; an unanchored ring has no timeline at all.
@@ -293,20 +300,7 @@ export class AudioRingBuffer implements RingReader {
 		// Samples left behind are media the reader skips, which is a new timeline. A copy that kept
 		// them all, an empty ring included, is the one it was playing: a new generation there would
 		// make it forget what it learned about the stream on every step of the target.
-		if (dropped > 0) {
-			this.#generation++;
-			this.#drop(dropped);
-		}
-	}
-
-	#drop(samples: number): void {
-		if (samples === 0) return;
-		if (this.#fresh) {
-			this.#trimmed += samples;
-		} else {
-			this.#skips++;
-			this.#skipped += samples;
-		}
+		if (dropped > 0) this.#generation++;
 	}
 
 	write(timestamp: Time.Micro, data: Float32Array[]): void {
@@ -412,7 +406,7 @@ export class AudioRingBuffer implements RingReader {
 		if (surplus || depth > this.capacity) {
 			const to = end - (surplus ? Math.min(hold, this.capacity) : this.capacity);
 			const dropped = Math.max(0, to - this.#readIndex);
-			this.#drop(dropped);
+			this.#discarded += dropped;
 			this.#jumped += dropped;
 			this.#readIndex = to;
 		}
@@ -530,6 +524,7 @@ export class AudioRingBuffer implements RingReader {
 		this.#ended = false;
 		this.#anchored = false;
 		this.#fresh = true;
+		this.#observedRead = undefined;
 		this.#generation++;
 	}
 
@@ -577,7 +572,15 @@ export class AudioRingBuffer implements RingReader {
 	 * timeline part way through a read the way the shared transport's main thread can.
 	 */
 	commit(count: number): boolean {
+		if (count > 0 && this.#observedRead !== undefined) {
+			const jumped = this.#readIndex - this.#observedRead;
+			if (jumped > 0) {
+				this.#jumps++;
+				this.#jumpedSamples += jumped;
+			}
+		}
 		this.#readIndex += count;
+		if (count > 0) this.#observedRead = this.#readIndex;
 		this.#jumped = 0;
 		// Something of this timeline has now been heard, so the rest stops being free to drop.
 		if (count > 0) this.#fresh = false;

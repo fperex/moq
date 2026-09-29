@@ -138,12 +138,16 @@ export interface Snapshot extends Counters {
 	stalled: boolean;
 	/** Times the reader ran dry mid-playback. */
 	underruns: number;
-	/** Times playback jumped over media after the timeline started. */
+	/** Explicit skip operations, excluding writer capacity bounds. */
 	skips: number;
-	/** Media samples those jumps passed over. */
+	/** Media samples those skip operations requested. */
 	skipped: number;
-	/** Incoming samples the writer rejected because they were behind the playhead. */
+	/** Writer discards from late input or capacity bounds. */
 	discarded: number;
+	/** Forward discontinuities observed when the reader commits media after playback began. */
+	jumps: number;
+	/** Media samples those observed discontinuities passed over. */
+	jumped: number;
 	/**
 	 * Samples the writer dropped off the first fill on a timeline, before anything had been played.
 	 *

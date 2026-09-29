@@ -11,6 +11,8 @@ const diagnostic: NonNullable<Sample["playout"]> = {
 	generation: 1,
 	rate: 44100,
 	anchor: 44100,
+	jumps: 0,
+	jumped: 0,
 	skips: 0,
 	skipped: 0,
 	discarded: 0,
@@ -77,10 +79,12 @@ test("report age does not invent a playback skip", () => {
 test("a real ring skip remains visible despite delayed reports", () => {
 	const summary = analyze((sample) => ({
 		...sample,
-		playout: { ...diagnostic, skips: sample.at >= 20000 ? 1 : 0, skipped: sample.at >= 20000 ? 2646 : 0 },
+		playout: { ...diagnostic, jumps: sample.at >= 20000 ? 1 : 0, jumped: sample.at >= 20000 ? 2646 : 0 },
 	}));
 	expect(summary.metrics.skip_aheads_total).toBe(1);
 	expect(summary.metrics.skipped_samples_total).toBe(60);
+	expect(summary.metrics.observed_jumps_total).toBe(1);
+	expect(summary.metrics.observed_skipped_samples_total).toBe(60);
 });
 
 test("late writes and startup trim are separate from skipped playback", () => {

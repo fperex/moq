@@ -282,9 +282,17 @@ definition is a judgement call are:
 - **`stalled_quanta`** is the share of the run the ring spent re-stalled, refilling rather than
   playing. Graded separately from underruns: it is silence the player chose.
 
-- **`skip_aheads`** counts explicit ring jumps over media after playback starts. The accompanying
-  `skipped_samples` duration converts the ring's skipped frames at the graph's actual sample rate.
-  Late incoming duplicates are `discarded_samples`; initial fill trimming is not a playback skip.
+- **`observed_jumps`** counts forward discontinuities when the reader commits media after playback
+  starts. `observed_skipped_samples` measures the media passed over in milliseconds. Both lanes
+  publish these comparable observations; startup trimming and timeline resets are excluded.
+  They remain informational under the existing budgets.
+
+- **`skip_aheads`** and **`skipped_samples`** use those observations in browser rows. Replay retains
+  its original operational definitions: explicit latency or empty-ring skip requests, excluding
+  capacity bounds. Its `discarded_samples` counts writer discards from capacity bounds or late
+  input. Keeping these operational categories preserves the existing independent replay limits;
+  an allowance for writer discards does not permit additional explicit skip requests. No budget
+  values or keys changed. These replay fields must not be read as aggregate playback loss.
 
 - **`silence_share`** is the share of sampled windows whose RMS at the graph output was below about
   -60 dBFS. It is the only metric read from the audio itself rather than from a counter: a counter

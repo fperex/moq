@@ -153,6 +153,8 @@ function state(worklet: FakeWorklet, reader: Playhead | undefined, stalled: bool
 		playhead: reader,
 		debug: {
 			backend: "message",
+			jumps: 0,
+			jumped: 0,
 			buffered: 0,
 			target: 0,
 			chunk: 0,

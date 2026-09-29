@@ -236,7 +236,7 @@ if (
 			state.anchor !== firstPlayout?.anchor ||
 			state.rate !== firstPlayout?.rate ||
 			(previous !== undefined &&
-				(state.skips < previous.skips || state.skipped < previous.skipped || state.output < previous.output))
+				(state.jumps < previous.jumps || state.jumped < previous.jumped || state.output < previous.output))
 		);
 	}) ||
 	(playout.length > 0 && playout.length !== window.length)
@@ -247,14 +247,14 @@ if (
 	});
 }
 
-const counter = (key: "skips" | "skipped" | "discarded" | "short" | "accelerates" | "expands") =>
+const counter = (key: "jumps" | "jumped" | "discarded" | "short" | "accelerates" | "expands") =>
 	rise(window.map((sample) => sample.playout?.[key]));
-const duration = (key: "skipped" | "discarded") => {
+const duration = (key: "jumped" | "discarded") => {
 	const count = counter(key);
 	return count === null || firstPlayout === undefined ? null : (count * 1000) / firstPlayout.rate;
 };
-const skipAheads = counter("skips");
-const skippedMs = duration("skipped");
+const skipAheads = counter("jumps");
+const skippedMs = duration("jumped");
 const discardedMs = duration("discarded");
 const shortQuanta = counter("short");
 const accelerates = counter("accelerates");
@@ -479,6 +479,10 @@ const metrics: Record<string, number | null> = {
 	skip_aheads_per_min: skipAheads === null ? null : round1(skipAheads / minutes),
 	skipped_samples_total: round1(skippedMs),
 	skipped_samples_per_min: skippedMs === null ? null : round1(skippedMs / minutes),
+	observed_jumps_total: skipAheads,
+	observed_jumps_per_min: skipAheads === null ? null : round1(skipAheads / minutes),
+	observed_skipped_samples_total: round1(skippedMs),
+	observed_skipped_samples_per_min: skippedMs === null ? null : round1(skippedMs / minutes),
 	accelerates_total: accelerates,
 	accelerates_per_min: accelerates === null ? null : round1(accelerates / minutes),
 	expands_total: expands,
