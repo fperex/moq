@@ -497,15 +497,8 @@ export class Consumer {
 			const affectsPlayhead = marker || !historical;
 			this.#groups.shift();
 			if (!historical) this.#active = this.#groups[0]?.consumer.sequence;
-			// Everything the verdict was reached on, since the same line has to answer whether the
-			// group was actually late or merely long: what it still held, how much of that nobody
-			// had read, where delivery stood, whether more was coming, and the three numbers the
-			// budget was compared against. Timestamps in microseconds.
 			console.warn(
-				`skipping slow group: track=${this.#track.name} ${first.consumer.sequence} -> ${this.#active} ` +
-					`first=${first.frames.at(0)?.timestamp ?? first.start} last=${first.latest} ` +
-					`queued=${first.frames.length} cursor=${cursor} ${first.done ? "closed" : "open"} ` +
-					`reach=${reach} live=${live} budget=${threshold}`,
+				`skipping slow group: track=${this.#track.name} ${first.consumer.sequence} -> ${this.#active}`,
 			);
 
 			// Where the timeline picks up is where the next group holding a frame starts, the same
