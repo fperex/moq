@@ -170,6 +170,19 @@ fn poll_served_start(segments: &[Segment], from: u64, cap: Option<u64>, waiter: 
 	successor
 }
 
+fn poll_live_edge(segments: &[Segment], cap: Option<u64>, waiter: &kio::Waiter) -> Option<LiveEdge> {
+	segments
+		.iter()
+		.filter_map(|segment| {
+			let edge = segment
+				.track
+				.poll_live_edge(min_some(cap, last_group(segment.end)), waiter)?;
+			let start = segment.start.map_or(0, |start| start.group);
+			(edge.sequence >= start).then_some(edge)
+		})
+		.max_by_key(|edge| edge.sequence)
+}
+
 /// How many segments a logical track keeps before pruning terminal ones from the
 /// front: the live segment plus a couple of predecessors still draining to slow
 /// readers. Without a bound, every failover leaves one dead segment (pinning a
@@ -354,8 +367,7 @@ impl ExpiryBound {
 	pub(super) fn poll_anchor(&self, outer: Anchor, waiter: &kio::Waiter) -> Anchor {
 		let mut anchor = outer.clone().capped(Some(self.boundary));
 		let _ = self.state.poll(waiter, |state| {
-			let edge = state
-				.live_edge(outer.cap)
+			let edge = poll_live_edge(&state.segments, outer.cap, waiter)
 				.into_iter()
 				.chain(outer.edge.clone())
 				.max_by_key(|edge| edge.sequence);
@@ -745,6 +757,15 @@ impl Consumer {
 	/// The newest live edge across the segments; see [`track::Consumer::live_edge`].
 	pub(crate) fn live_edge(&self, cap: Option<u64>) -> Option<LiveEdge> {
 		self.state.read().live_edge(cap)
+	}
+
+	pub(crate) fn poll_live_edge(&self, cap: Option<u64>, waiter: &kio::Waiter) -> Option<LiveEdge> {
+		let mut edge = None;
+		let _ = self.state.poll(waiter, |state| {
+			edge = poll_live_edge(&state.segments, cap, waiter);
+			Poll::<()>::Pending
+		});
+		edge
 	}
 
 	/// Where the first servable group in `from..cap` starts, with the identity to
@@ -2816,6 +2837,58 @@ mod test {
 			.write_frame(Timestamp::from_secs(3).unwrap(), b"successor".as_ref())
 			.unwrap();
 		assert!(counter.count() > before, "the successor timestamp wakes the held tail");
+		assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Ready(Ok(None))));
+	}
+
+	#[tokio::test]
+	async fn takeover_tail_wakes_as_the_unpolled_edge_advances() {
+		use std::task::Context;
+
+		let (mut first, first_consumer) = track_pair("first");
+		let (mut middle, middle_consumer) = track_pair("middle");
+		let (mut live, live_consumer) = track_pair("live");
+		let mut producer = Producer::new();
+		producer.switch(&first_consumer, None).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_max_age(Duration::from_millis(100)));
+		write_group(&mut first, 0, "first");
+		assert_eq!(recv(&mut sub), 0);
+		first.finish().unwrap();
+		producer.switch(&middle_consumer, Position::group(1)).unwrap();
+		write_group_at(&mut middle, 1, "middle", Duration::from_secs(1));
+		assert_eq!(recv(&mut sub), 1);
+
+		let mut open = middle.create_group(group::Info { sequence: 2 }).unwrap();
+		open.write_frame(Timestamp::from_secs(2).unwrap(), b"held".as_ref())
+			.unwrap();
+		let mut held = sub.recv_group().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(read(&mut held), b"held");
+
+		producer.switch(&live_consumer, Position::group(3)).unwrap();
+		write_group_at(&mut live, 3, "successor", Duration::from_secs(3));
+		let mut edge = live.create_group(group::Info { sequence: 4 }).unwrap();
+		let (counter, waker) = CountWaker::new();
+		let mut cx = Context::from_waker(&waker);
+		let mut pending = std::pin::pin!(held.read_frame());
+		assert!(pending.as_mut().poll(&mut cx).is_pending());
+
+		let before = counter.count();
+		edge.write_frame(Timestamp::from_millis(3_050).unwrap(), b"edge".as_ref())
+			.unwrap();
+		assert!(
+			counter.count() > before,
+			"the edge's first timestamp wakes the held tail"
+		);
+		assert!(pending.as_mut().poll(&mut cx).is_pending());
+
+		let before = counter.count();
+		edge.write_frame(Timestamp::from_millis(3_200).unwrap(), b"new edge".as_ref())
+			.unwrap();
+		assert!(
+			counter.count() > before,
+			"the edge's newest timestamp wakes the held tail"
+		);
 		assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Ready(Ok(None))));
 	}
 

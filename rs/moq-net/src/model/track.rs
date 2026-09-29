@@ -497,6 +497,26 @@ impl TrackState {
 			})
 	}
 
+	/// The live edge plus the waits that can move it: every newer unstamped group and
+	/// the selected group's newest timestamp.
+	fn poll_live_edge(&self, cap: Option<u64>, waiter: &kio::Waiter) -> Option<PresentationEdge> {
+		self.lookup
+			.range(..)
+			.rev()
+			.filter(|(seq, _)| super::subscription::before_end(**seq, cap))
+			.find_map(|(_, slot)| {
+				if !slot.visible || slot.group.is_aborted() {
+					return None;
+				}
+				let timestamp = slot.group.poll_latest(waiter)?;
+				Some(PresentationEdge {
+					sequence: slot.group.sequence,
+					stamp: slot.stamp,
+					timestamp,
+				})
+			})
+	}
+
 	/// This track's own edge under the exclusive `cap`, for measuring drift. An outer
 	/// edge and a successor live on other tracks; the caller revalidates those before
 	/// taking this lock and passes them in, so the locks never nest.
@@ -2434,6 +2454,27 @@ impl Consumer {
 				})
 			}
 			ConsumerKind::Spliced(resume) => resume.live_edge(cap),
+		}
+	}
+
+	/// Resolve the live edge while registering for timestamp changes that can move it.
+	pub(crate) fn poll_live_edge(&self, cap: Option<u64>, waiter: &kio::Waiter) -> Option<LiveEdge> {
+		match &self.inner {
+			ConsumerKind::Plain(state) => {
+				let mut edge = None;
+				let track = state.weak();
+				let _ = state.poll(waiter, |state| {
+					edge = state.poll_live_edge(cap, waiter).map(|edge| LiveEdge {
+						sequence: edge.sequence,
+						timestamp: edge.timestamp,
+						stamp: edge.stamp,
+						track: track.clone(),
+					});
+					Poll::<()>::Pending
+				});
+				edge
+			}
+			ConsumerKind::Spliced(resume) => resume.poll_live_edge(cap, waiter),
 		}
 	}
 
