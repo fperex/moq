@@ -632,12 +632,7 @@ class DecoderTrack {
 			if (decoder.state !== "closed") decoder.close();
 		});
 
-		// Input processing - depends on container type
-		if (this.config.container.kind === "cmaf") {
-			this.#runCmaf(effect, sub, decoder);
-		} else {
-			this.#runLegacy(effect, sub, decoder);
-		}
+		this.#decode(effect, sub, decoder);
 	}
 
 	#consume(effect: Effect, sub: Moq.Track.Subscriber, format: Container.Format): Container.Consumer {
@@ -662,11 +657,23 @@ class DecoderTrack {
 		return consumer;
 	}
 
-	#runLegacy(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
-		const format =
-			this.config.container.kind === "loc"
-				? new Container.Loc.Format("video")
-				: new Container.Legacy.Format(this.config);
+	// Feed the subscription to the codec. The containers differ only in how a frame is framed and
+	// where the codec description comes from.
+	#decode(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
+		const { container } = this.config;
+		let description: Uint8Array | undefined = this.config.description
+			? Util.Hex.toBytes(this.config.description)
+			: undefined;
+		let format: Container.Format;
+		if (container.kind === "cmaf") {
+			const init = Container.Cmaf.decodeInitSegment(base64ToBytes(container.init));
+			description ??= init.description;
+			format = new Container.Cmaf.Format(init);
+		} else if (container.kind === "loc") {
+			format = new Container.Loc.Format("video");
+		} else {
+			format = new Container.Legacy.Format(this.config);
+		}
 		const consumer = this.#consume(effect, sub, format);
 
 		// Combine network jitter buffer with decode buffer
@@ -680,7 +687,7 @@ class DecoderTrack {
 
 		decoder.configure({
 			codec: this.config.codec,
-			description: this.config.description ? Util.Hex.toBytes(this.config.description) : undefined,
+			description,
 			displayAspectWidth: this.config.displayAspectWidth,
 			displayAspectHeight: this.config.displayAspectHeight,
 			optimizeForLatency: this.config.optimizeForLatency,
@@ -724,14 +731,7 @@ class DecoderTrack {
 				}
 
 				// Mark that we received this frame right now.
-				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
-				this.sync.received(timestamp, "video");
-
-				const chunk = new EncodedVideoChunk({
-					type: frame.keyframe ? "key" : "delta",
-					data: frame.payload,
-					timestamp: frame.timestamp,
-				});
+				this.sync.received(Time.Milli.fromMicro(frame.timestamp), "video");
 
 				// Track both frame count and bytes received for stats in the UI
 				this.stats.update((current) => ({
@@ -744,90 +744,6 @@ class DecoderTrack {
 				// can't answer that: they aren't required to be sequential (some encoders derive them
 				// from DTS), so adjacency neither proves continuity nor rules out a gap the consumer
 				// skipped, and reporting a skipped span as decoded overstates the buffer.
-				if (previous !== undefined && next.continuous) {
-					this.#addBuffered(Time.Milli.fromMicro(previous), Time.Milli.fromMicro(frame.timestamp));
-				}
-
-				previous = frame.timestamp;
-
-				decoder.decode(chunk);
-				decodedGroup = next.group;
-			}
-		});
-	}
-
-	#runCmaf(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
-		const container = this.config.container;
-		if (container.kind !== "cmaf") return;
-
-		const initSegment = base64ToBytes(container.init);
-		const init = Container.Cmaf.decodeInitSegment(initSegment);
-		const description = this.config.description ? Util.Hex.toBytes(this.config.description) : init.description;
-
-		const consumer = this.#consume(effect, sub, new Container.Cmaf.Format(init));
-
-		// Combine network jitter buffer with decode buffer
-		effect.run((inner) => {
-			const network = inner.get(consumer.buffered);
-			const decode = inner.get(this.#buffered);
-			this.buffered.update(() => Container.mergeBufferedRanges(network, decode));
-		});
-
-		accumulate(effect, this.skipped, consumer.skipped);
-
-		// Configure decoder with description from catalog
-		decoder.configure({
-			codec: this.config.codec,
-			description,
-			displayAspectWidth: this.config.displayAspectWidth,
-			displayAspectHeight: this.config.displayAspectHeight,
-			optimizeForLatency: this.config.optimizeForLatency,
-			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
-			flip: false,
-		});
-
-		let previous: Time.Micro | undefined;
-		// See `#runLegacy`: nothing has been decoded yet, so the codec needs a keyframe first.
-		let keyframeNeeded = true;
-		let decodedGroup: number | undefined;
-
-		effect.spawn(async () => {
-			for (;;) {
-				const next = await nextMedia(consumer);
-				if (!next) break;
-
-				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
-				if (this.#onDiscontinuity(next.discontinuity)) {
-					previous = undefined;
-					keyframeNeeded = true;
-				}
-
-				const { frame } = next;
-				if (!frame) continue;
-				if (decodedGroup !== undefined && next.group < decodedGroup) continue;
-
-				// A hole in delivery makes every following delta undecodable. See `#runLegacy`.
-				if (!next.continuous) keyframeNeeded = true;
-				if (keyframeNeeded) {
-					if (!frame.keyframe) {
-						previous = undefined;
-						continue;
-					}
-					keyframeNeeded = false;
-				}
-
-				// Mark that we received this frame right now.
-				const timestamp = Time.Milli.fromMicro(frame.timestamp);
-				this.sync.received(timestamp, "video");
-
-				// Track stats
-				this.stats.update((current) => ({
-					frameCount: (current?.frameCount ?? 0) + 1,
-					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
-				}));
-
-				// Track decode buffer (see #runLegacy: bridge on the consumer's continuity signal,
-				// never on group adjacency, which proves nothing about the timeline).
 				if (previous !== undefined && next.continuous) {
 					this.#addBuffered(Time.Milli.fromMicro(previous), Time.Milli.fromMicro(frame.timestamp));
 				}
@@ -921,7 +837,7 @@ async function supported(config: Catalog.VideoConfig): Promise<boolean> {
 			// A malformed init segment means we can't extract the codec
 			// description, so we can't probe support reliably. Reject the
 			// track rather than letting isConfigSupported pass on a
-			// description-less config and then having runCmaf fail later.
+			// description-less config and then having `#decode` fail later.
 			console.warn(`video: malformed CMAF init segment for codec ${config.codec}`, err);
 			return false;
 		}
