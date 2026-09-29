@@ -3,7 +3,7 @@ import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import { Fanout } from "../fanout";
-import type { Quantum } from "./capture-worklet";
+import type { Close, Quantum } from "./capture-worklet";
 import CaptureWorklet from "./capture-worklet.ts?worklet";
 import { isSampleSource, normalizeSource, type SampleSource, type Source, type SourceConfig } from "./types";
 
@@ -190,9 +190,12 @@ export class Capture {
 				// path on macOS. Only force it when we actually have a requested count to honor.
 				channelCountMode: requestedChannels !== undefined ? "explicit" : "max",
 			});
-			// The edge originates at root, so only root can remove it; the worklet has no outputs.
 			root.connect(worklet);
-			inner.cleanup(() => root.disconnect(worklet));
+			inner.cleanup(() => {
+				const close: Close = { type: "close" };
+				worklet.port.postMessage(close);
+				root.disconnect(worklet);
+			});
 
 			const fanout = new Fanout(this.#drain(worklet, context, inner), { queue: QUEUE });
 			inner.cleanup(() => fanout.close());

@@ -504,7 +504,11 @@ function installGatedWebAudio() {
 	}
 
 	class GatedWorklet {
-		port = Object.assign(new EventTarget(), { start: () => {} });
+		messages: unknown[] = [];
+		port = Object.assign(new EventTarget(), {
+			start: () => {},
+			postMessage: (message: unknown) => this.messages.push(message),
+		});
 		constructor(_context: unknown, _name: string) {
 			worklets.push(this);
 		}
@@ -622,6 +626,7 @@ test("closes an active capture without disconnecting an edge twice", async () =>
 		await settle();
 
 		expect(webaudio.roots[0].outputs.size).toBe(0);
+		expect(webaudio.worklets[0].messages).toEqual([{ type: "close" }]);
 		expect(capture.out.frames.peek()).toBeUndefined();
 		expect(capture.out.format.peek()).toBeUndefined();
 		expect(errors).not.toHaveBeenCalled();
@@ -649,6 +654,7 @@ test("drops the format while the context is interrupted", async () => {
 	expect(capture.out.frames.peek()).toBeUndefined();
 	// The retired worklet is cut from the source, or it keeps posting alongside its replacement.
 	expect(webaudio.roots[0].outputs.size).toBe(0);
+	expect(webaudio.worklets[0].messages).toEqual([{ type: "close" }]);
 
 	// Back to running rebuilds the worklet on a fresh anchor.
 	webaudio.contexts[0].transition("running");

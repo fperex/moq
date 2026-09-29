@@ -12,8 +12,26 @@ export interface Quantum {
 	channels: Float32Array[];
 }
 
+/** Stops a retired capture processor. */
+export interface Close {
+	type: "close";
+}
+
 class Capture extends AudioWorkletProcessor {
+	#closed = false;
+
+	constructor() {
+		super();
+		this.port.onmessage = (event: MessageEvent<Close>) => {
+			if (event.data.type !== "close") return;
+			this.#closed = true;
+			this.port.onmessage = null;
+			this.port.close();
+		};
+	}
+
 	process(input: Float32Array[][]) {
+		if (this.#closed) return false;
 		if (input.length > 1) throw new Error("only one input is supported.");
 
 		const channels = input[0];
