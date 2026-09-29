@@ -562,9 +562,21 @@ try {
 	// ── pause and resume ─────────────────────────────────────────────────────
 	if (wants("pause")) {
 		console.error("=== pause and resume ===");
+		// Keep the buffering indicator visible so hit testing covers an interrupted stream.
+		await player.locator(SELECTORS.ui).evaluate((element) => {
+			if (!element.shadowRoot) throw new Error("player UI has no shadow root");
+			const style = document.createElement("style");
+			style.dataset.interop = "buffering";
+			style.textContent = ".buffering { display: flex !important; }";
+			element.shadowRoot.append(style);
+		});
 		// The chrome auto-hides while playing; pointer activity reveals the real control.
 		await player.dispatchEvent(SELECTORS.ui, "pointermove");
 		await player.locator(SELECTORS.ui).locator(SELECTORS.pauseControl).click();
+		await player
+			.locator(SELECTORS.ui)
+			.locator('style[data-interop="buffering"]')
+			.evaluate((element) => element.remove());
 		await waitForState(player, playerErrors, {
 			deadline: Date.now() + SETTLE_MS,
 			assertion: "pause takes effect",
