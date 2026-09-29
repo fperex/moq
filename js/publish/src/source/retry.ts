@@ -1,5 +1,8 @@
 import { type Effect, Signal } from "@moq/signals";
 
+// A capture attempt: the stream the browser handed over, or why it would not.
+type Attempt = { stream: MediaStream; error?: undefined } | { stream?: undefined; error: unknown };
+
 /**
  * A budget for re-opening a `getUserMedia` capture that failed or died.
  *
@@ -53,6 +56,13 @@ export class Retry {
 	// How long the next attempt still owes the backoff, set by `failed` and paid by `begin`.
 	#wait: DOMHighResTimeStamp | undefined;
 
+	// The release of the capture the previous run held, awaited before the next attempt.
+	//
+	// A browser only starts handing the device back at `stop()`, and an effect's cleanup is not
+	// ordered against the next run's `getUserMedia` at all: hiding a source while an attempt is still
+	// in flight and showing it again asks for a device we have not released yet.
+	#released: Promise<void> = Promise.resolve();
+
 	/** Reports why the capture is not running into `error`, and clears it once it is. */
 	constructor(error: Signal<Error | undefined>) {
 		this.#error = error;
@@ -88,6 +98,42 @@ export class Retry {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Ask `getUserMedia` for `constraints` once the previous run's capture is released, and stop
+	 * whatever it hands over when this run ends.
+	 *
+	 * Resolves to undefined when the run was torn down first, or when the browser refused, which is
+	 * already reported: see {@link refused}.
+	 */
+	async open(effect: Effect, constraints: MediaStreamConstraints): Promise<MediaStream | undefined> {
+		// Let go of the last capture before asking for a device again: the browser is still
+		// holding it otherwise, and it answers that with a failure like any other.
+		await effect.race(this.#released);
+		if (effect.abort.aborted) return;
+
+		const media = navigator.mediaDevices
+			.getUserMedia(constraints)
+			.then((stream): Attempt => ({ stream }))
+			.catch((error: unknown): Attempt => ({ error }));
+
+		// If the effect is cancelled for any reason (ex. cancel), stop any media that we got,
+		// and keep the release for the next attempt to wait on.
+		effect.cleanup(() => {
+			this.#released = media.then(({ stream }) => {
+				stream?.getTracks().forEach((track) => {
+					track.stop();
+				});
+			});
+		});
+
+		const attempt = await effect.race(media);
+		if (effect.abort.aborted || !attempt) return;
+
+		// A refusal stands until something changes, unless the device was only busy.
+		if (!attempt.stream) this.refused(attempt.error);
+		return attempt.stream;
 	}
 
 	/**
