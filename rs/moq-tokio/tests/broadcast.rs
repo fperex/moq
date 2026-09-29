@@ -1041,9 +1041,6 @@ async fn rejoin_skips_a_stale_warm_cache(version: &str, open: bool) {
 	for sequence in 0..3u64 {
 		write(&track, sequence, sequence * 20);
 	}
-	// The edge can be complete or still open when the front parks it. The latter is
-	// the stale owner that used to survive beside the replacement feed and hold an
-	// ordered consumer on a group no source would ever finish.
 	let mut edge = track
 		.create_group(moq_net::group::Info { sequence: 3 })
 		.expect("create edge group");
@@ -1150,11 +1147,7 @@ async fn rejoin_skips_a_stale_warm_cache(version: &str, open: bool) {
 	}
 
 	drop(sub);
-	if open {
-		// The publisher retained this handle only to keep the original edge open while
-		// the relay exercised its own warm-copy ownership. It may already be stale.
-		let _ = edge.finish();
-	}
+	drop(edge);
 	drop(session);
 	server.await.expect("server panicked").expect("server failed");
 }
