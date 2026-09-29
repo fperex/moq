@@ -31,12 +31,9 @@ import type { Source } from "./source";
 // The amount of time to wait before considering the video to be buffering.
 const BUFFERING = Time.Milli(500);
 
-// How long the picture may sit frozen before the track is rebuilt from scratch.
-//
-// The 500ms watchdog above only labels the stall; nothing acts on it, so a subscription that stops
-// producing leaves the tile frozen for as long as the viewer is willing to look at it. Long enough
-// that an ordinary keyframe wait (a 2s GOP, plus the flush the publisher declares) never trips it,
-// short enough that a viewer does not sit through it twice.
+// How long the picture may sit frozen before the track is rebuilt from scratch. Long enough that an
+// ordinary keyframe wait (a 2s GOP, plus the flush the publisher declares) never trips it, short
+// enough that a viewer does not sit through it twice.
 const RECOVER = Time.Milli(5_000);
 
 // The ceiling the recovery window backs off to when rebuilding does not help.
@@ -213,14 +210,11 @@ export class Decoder {
 	/**
 	 * Measure how late frames arrive, for as long as the rendition lasts.
 	 *
-	 * One estimator per rendition rather than per subscription, the same rule the audio decoder
-	 * keeps (`#runSpread` in `audio/supply.ts`). A rebuild replaces the subscription, and every
-	 * reason to rebuild is a path that just proved it delivers late; starting the measurement
-	 * over at the publisher's declaration hands Sync a delay sized for a path nobody is on, so
-	 * the shared delay collapses to whatever audio measured and the replacement subscription is
-	 * convicted by a budget the picture could never meet. Cleared when the rendition goes, so a
-	 * departed track stops holding the buffer open, and picked up again where it left off when the
-	 * same rendition comes back: a camera hidden and shown is a gap in one rendition, not a new one.
+	 * One estimator per rendition rather than per subscription, as the audio decoder keeps: every
+	 * reason to rebuild is a path that just proved it delivers late, and starting over at the
+	 * publisher's declaration would size Sync's delay for a path nobody is on. Cleared when the
+	 * rendition goes, so a departed track stops holding the buffer open, and resumed when the same
+	 * rendition comes back: a camera hidden and shown is a gap in one rendition, not a new one.
 	 */
 	#runSpread(effect: Effect): void {
 		const identity = effect.get(this.#identity);
@@ -304,17 +298,14 @@ export class Decoder {
 		effect.cleanup(() => pending?.close());
 
 		// A codec error tears the track's own effect down, subscription included, and leaves
-		// `#active` pointing at the corpse, so nothing below ever rebuilds: the relay sees the
-		// subscription cancelled and never sees another, and the tile stalls for good while audio
-		// keeps playing. Watch the track for it here instead, through promotion (the reference
-		// outlives `pending`, which is cleared once it is promoted).
+		// `#active` pointing at the corpse, which nothing below would ever rebuild. Watch the track
+		// for it here, through promotion (the reference outlives `pending`, which is cleared once
+		// it is promoted).
 		const built = pending;
 		effect.run((inner) => {
 			const failed = inner.get(built.failed);
 			if (!failed) return;
 
-			// Rebuild after a beat: a config the hardware refuses fails again on configure, and an
-			// immediate retry would spin within the tick.
 			inner.timer(() => this.#rebuild(`decoder error: ${failed.message}`), RETRY);
 		});
 
@@ -400,10 +391,9 @@ export class Decoder {
 		if (!enabled) return;
 
 		// A rendition that is not in the catalog is not late: a publisher hiding its camera takes
-		// the picture away on purpose, and there is nothing on its way to wait for. The buffering
-		// overlay reads this flag, so labelling that gap a stall spun a spinner over the held
-		// picture for as long as the camera was away. The overlay gates its audio half the same
-		// way, on there being a ring to speak for.
+		// the picture away on purpose, and the buffering overlay reading this flag must not spin
+		// over the held picture meanwhile. The overlay gates its audio half the same way, on there
+		// being a ring to speak for.
 		if (!effect.get(this.source.out.config)) {
 			this.#out.stalled.set(false);
 			return;
@@ -416,8 +406,6 @@ export class Decoder {
 		}
 
 		this.#out.stalled.set(false);
-		// A picture landed, so whatever the last stall was, it is over and the next one starts from
-		// the full window again.
 		this.#recover = RECOVER;
 
 		// Only a newer picture says how long the source goes between frames: a rebuilt subscription
@@ -437,10 +425,9 @@ export class Decoder {
 		}, BUFFERING);
 	}
 
-	// Act on a stall that lasts. `#runBuffering` only labels one, which left a subscription that
-	// stopped producing frozen for as long as the viewer kept looking at it. Only a track we
-	// believe is playing is worth replacing: with nothing active there is no subscription to
-	// rebuild, and `#runPending` is already the thing waiting for the broadcast to come back.
+	// Act on a stall that lasts, which `#runBuffering` only labels. Only a track we believe is
+	// playing is worth replacing: with nothing active there is no subscription to rebuild, and
+	// `#runPending` is already the thing waiting for the broadcast to come back.
 	#runRecover(effect: Effect): void {
 		if (!effect.get(this.in.enabled)) return;
 		if (!effect.get(this.#active)) return;

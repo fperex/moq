@@ -206,8 +206,8 @@ function heartbeat(): () => void {
  * A track the test serves directly, recording every subscription the decoder opens on it.
  *
  * A broadcast answers a subscription from the tracks the application inserted, and a repeat
- * subscription fans out from the same producer, so the count of `subscribe` calls is what a
- * per-subscription request used to report.
+ * subscription fans out from the same producer, so each subscription the decoder opens is one
+ * `subscribe` call.
  */
 class ServedTrack extends Moq.Track.Producer {
 	#log: string[];
@@ -500,9 +500,7 @@ test("a codec error rebuilds the track instead of stranding the subscription", a
 			expect(built[0].chunks).toEqual(["key"]);
 			expect(fx.decoder.out.stalled.peek()).toBe(false);
 
-			// The codec gives up. This used to close the whole DecoderTrack effect, the subscription
-			// with it, while `#active` kept pointing at the corpse: the relay saw the subscription
-			// cancelled, never saw another, and the tile stalled for good while audio kept playing.
+			// The codec gives up, which ends the track's decode loop and its subscription.
 			built[0].fail(new Error("DataError"));
 
 			// A replacement track, with its own subscription and its own codec, rather than a dead
@@ -535,8 +533,7 @@ test("a picture frozen past the recovery window rebuilds the track", async () =>
 		await settle();
 		expect(built).toHaveLength(1);
 
-		// Nothing more arrives. The 500ms watchdog only ever labelled this a stall; now it is acted
-		// on, so the track is replaced rather than left frozen with the last picture.
+		// Nothing more arrives, so the track is replaced rather than left frozen.
 		expect(await fx.decoders(2)).toBeGreaterThanOrEqual(2);
 		expect(fx.decoder.out.stalled.peek()).toBe(true);
 
@@ -611,7 +608,7 @@ test("the arrival estimator survives the rendition leaving the catalog and comin
 	// the path and the publisher's claim about it are unchanged, so what was measured on it still
 	// holds. Building a fresh estimator there republishes the 80ms guess as though something had
 	// measured it, and Sync holds every track to the widest reading, so the audio ring is resized
-	// mid-playback and runs dry. Three of five watchers on the bench took an underrun from it.
+	// mid-playback and runs dry.
 	const warn = console.warn;
 	console.warn = () => {};
 	const fx = fixture();
@@ -771,9 +768,8 @@ test("a republished broadcast re-anchors the clock", async () => {
 
 test("a rendition that left the catalog is not a stall", async () => {
 	// A publisher hiding its camera takes the rendition out of the catalog and the tile keeps the
-	// picture it already has. The buffering overlay reads `stalled`, so the watchdog labelling that
-	// gap put a spinner over a still frame for as long as the camera was away: 4.6s of it on the
-	// bench's `hide-mute` row, with the ring full and audio never interrupted.
+	// picture it already has. The buffering overlay reads `stalled`, so labelling that gap a stall
+	// spins over a still frame for as long as the camera is away.
 	const fx = fixture();
 	const rendition = fx.config.peek();
 	try {

@@ -346,10 +346,9 @@ async function captureReader(capture: InstanceType<typeof Capture>, effect: Effe
 	return fanout.subscribe(effect).getReader();
 }
 
-// Regression: the worklet used to be handed `performance.now()` at construction and stamp sample 0
-// with it, although the device opens and the context starts rendering hundreds of milliseconds
-// later. Every audio timestamp was backdated by that delay while video was anchored on arrival, so
-// a browser publish shipped sound ahead of picture for every viewer.
+// The device opens and the context starts rendering hundreds of milliseconds after the node is
+// built, so stamping sample 0 with `performance.now()` at construction backdates every audio
+// timestamp by that delay, while video is anchored on arrival: sound ahead of picture.
 test("stamps a quantum where the context clock says it was captured, not where the node was built", async () => {
 	using webaudio = installRenderingWebAudio();
 	const effect = new Effect();
@@ -383,10 +382,10 @@ test("stamps a quantum where the context clock says it was captured, not where t
 	}
 });
 
-// The other half of the same defect, measured on a Chromium publisher: the graph renders a couple of
-// quanta as soon as it is built, then the context clock stops for a quarter of a second while the
-// microphone opens, then runs in real time. Pairing the two clocks once, on a quantum from before
-// that stall, anchors the whole capture 245ms before the audio it describes.
+// The other half of the same hazard: a Chromium graph renders a couple of quanta as soon as it is
+// built, then the context clock stops for a quarter of a second while the microphone opens, then
+// runs in real time. Pairing the two clocks once, on a quantum from before that stall, anchors the
+// whole capture 245ms before the audio it describes.
 test("re-anchors when the context clock stalls for the device to open", async () => {
 	using webaudio = installRenderingWebAudio();
 	const effect = new Effect();
