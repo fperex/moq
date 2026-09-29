@@ -34,8 +34,11 @@ on:
   workflow_call:
   workflow_dispatch:
 
+# A called workflow sees its caller's workflow and event, so the nightly run
+# (scheduled or dispatched) and this workflow's own dispatch never share a
+# group, while a repeat of the same kind still supersedes the last.
 concurrency:
-  group: audio-quality-${{ github.ref }}
+  group: audio-quality-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
