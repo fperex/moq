@@ -3516,7 +3516,7 @@ impl PlainSubscriber {
 	}
 
 	/// This subscriber's clamped drift budget and the live edge to measure against,
-	/// resolved once per poll.
+	/// resolved at most once per poll.
 	///
 	/// `cap` bounds the anchor: the caller passes the same window it reads from, so a
 	/// group is only ever judged against content that could actually be served in its
@@ -3532,18 +3532,20 @@ impl PlainSubscriber {
 			Poll::<()>::Pending
 		});
 		let cap = anchor.cap;
-		let outer = anchor.edge;
-		let successor = anchor.successor;
-		self.poll(waiter, |state| {
-			// Local edge only. The pushed edge and successor are revalidated in
-			// [`Self::poll_stale`], outside this lock.
-			Poll::Ready(Ok(Drift {
-				budget: clamp_max_age(max_age, state.max_age_bound()),
-				edge: state.drift_edge(cap, None, None),
-				outer: outer.clone(),
-				successor: successor.clone(),
-			}))
-		})
+		// Local edge only. The pushed edge and successor are revalidated in
+		// [`Self::poll_stale`], outside this lock.
+		let (budget, edge) = ready!(self.poll(waiter, |state| {
+			Poll::Ready(Ok((
+				clamp_max_age(max_age, state.max_age_bound()),
+				state.drift_edge(cap, None, None),
+			)))
+		}))?;
+		Poll::Ready(Ok(Drift {
+			budget,
+			edge,
+			outer: anchor.edge,
+			successor: anchor.successor,
+		}))
 	}
 
 	/// Whether the drift budget says to skip `group`, against a [`Drift`] already resolved
@@ -3606,8 +3608,9 @@ impl PlainSubscriber {
 		self.parked
 			.retain(|sequence, group| *sequence >= min_sequence && watch(group));
 
-		// One scan for the whole poll, so walking a backlog off stays linear in its size.
-		let drift = ready!(self.poll_drift(self.anchor(self.end_sequence), waiter))?;
+		// Resolved for the first group this poll judges and shared by the rest, so walking
+		// a backlog off stays linear in its size and a poll that finds nothing skips it.
+		let mut drift = None;
 
 		loop {
 			// Re-offer the lowest parked group back inside the cap once it rises,
@@ -3653,7 +3656,11 @@ impl PlainSubscriber {
 
 			// Drop a group the drift budget has given up on and keep scanning, so one
 			// poll walks a whole backlog off rather than handing it out group by group.
-			if ready!(self.poll_stale(&consumer, &drift, waiter))? {
+			let drift = match &drift {
+				Some(drift) => drift,
+				None => drift.insert(ready!(self.poll_drift(self.anchor(self.end_sequence), waiter))?),
+			};
+			if ready!(self.poll_stale(&consumer, drift, waiter))? {
 				self.stale.add(consumer.content());
 				continue;
 			}
