@@ -529,7 +529,9 @@ function installGatedWebAudio() {
 		}
 		disconnect(node?: unknown): void {
 			if (node === undefined) this.outputs.clear();
-			else this.outputs.delete(node);
+			else if (!this.outputs.delete(node)) {
+				throw new DOMException("The destination is not connected", "InvalidAccessError");
+			}
 		}
 	}
 
@@ -600,6 +602,32 @@ test("captures once a gesture resumes a context built before one", async () => {
 		await settle();
 	} finally {
 		effect.close();
+	}
+});
+
+test("closes an active capture without disconnecting an edge twice", async () => {
+	using webaudio = installGatedWebAudio();
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	const capture = new Capture({ enabled: true, source: new Signal(fakeSource()) as never });
+
+	try {
+		await settle();
+		webaudio.gesture();
+		await settle();
+		webaudio.worklets[0].render();
+		expect(capture.out.format.peek()).toEqual({ sampleRate: 48_000, channelCount: 1 });
+		expect(webaudio.roots[0].outputs.size).toBe(1);
+
+		capture.close();
+		await settle();
+
+		expect(webaudio.roots[0].outputs.size).toBe(0);
+		expect(capture.out.frames.peek()).toBeUndefined();
+		expect(capture.out.format.peek()).toBeUndefined();
+		expect(errors).not.toHaveBeenCalled();
+	} finally {
+		capture.close();
+		errors.mockRestore();
 	}
 });
 

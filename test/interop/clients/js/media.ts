@@ -672,6 +672,7 @@ try {
 		console.error("=== stop and republish ===");
 		const before = await readPlayerState(player);
 		await command(publisher, "stop");
+		throwPageErrors(publisherErrors);
 		await waitFrozen(
 			player,
 			playerErrors,
@@ -722,6 +723,8 @@ try {
 	}
 
 	if (wants("capture-denial")) await captureDenial(`${broadcast}-capture.hang`);
+	await command(publisher, "stop");
+	throwPageErrors(publisherErrors);
 } catch (err) {
 	failure = err instanceof Error ? err : new Error(String(err));
 }

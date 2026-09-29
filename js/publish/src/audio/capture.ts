@@ -160,7 +160,6 @@ export class Capture {
 		const root = new MediaStreamAudioSourceNode(context, {
 			mediaStream: new MediaStream([source.track]),
 		});
-		effect.cleanup(() => root.disconnect());
 
 		const loaded = new Signal(false);
 
