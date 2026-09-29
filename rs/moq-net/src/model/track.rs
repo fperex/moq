@@ -630,13 +630,11 @@ impl TrackState {
 		// `outer` and `successor` were revalidated on their own tracks before this lock
 		// was taken ([`LiveEdge::is_live`], [`Successor::poll_start`]). There is no slot for
 		// them here, and taking their locks here would nest.
-		let Some((_, timestamp)) = local
-			.into_iter()
-			.chain(edge.outer)
-			.filter(|(live, _)| *live > sequence)
-			.max_by_key(|(live, _)| *live)
-		else {
-			return false;
+		// The newest by sequence; a tie goes to the pushed edge.
+		let timestamp = match (local, edge.outer.filter(|(live, _)| *live > sequence)) {
+			(Some((local, timestamp)), Some((outer, _))) if local > outer => timestamp,
+			(_, Some((_, timestamp))) | (Some((_, timestamp)), None) => timestamp,
+			(None, None) => return false,
 		};
 		self.reach(sequence, edge.cap, edge.successor)
 			.is_some_and(|reach| matches!(timestamp.checked_sub(reach), Ok(age) if Duration::from(age) >= budget))
