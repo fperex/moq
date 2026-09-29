@@ -252,6 +252,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	// A case that held its processors renders the quantum they stop in now, as a running engine would,
+	// so no context it closed is left waiting on them.
+	for (const node of MockWorkletNode.nodes) node.render();
 	globalThis.document = originals.document;
 	(globalThis as Record<string, unknown>).AudioContext = originals.context;
 	(globalThis as Record<string, unknown>).AudioWorkletNode = originals.worklet;

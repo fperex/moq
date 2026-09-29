@@ -129,29 +129,58 @@ class MockContext extends EventTarget {
 	}
 }
 
-/** The worklet node: a real render worklet behind a real port, as the page's AudioWorkletNode has. */
+/**
+ * The worklet node: a real render worklet behind a real port, as the page's AudioWorkletNode has.
+ *
+ * Told to close, its processor stops in the next quantum its context renders, as an engine's does: a
+ * running context renders on its own, one that is not waits until it runs.
+ */
 class Node {
 	static built: Node[] = [];
-	/** Whether the worklet of a node built now hears nothing on its port, so nothing sent to it arrives. */
+	/**
+	 * Whether the worklet of a node built now hears nothing the page sends it but its close, so no ring
+	 * reaches it. A plain close on the node's own port is what every engine delivers.
+	 */
 	static deaf = false;
 	readonly port: MessagePort;
 	readonly render: Processor;
 	/** The worklet's end of the node's port. */
 	readonly worklet: MessagePort;
+	#closed = false;
+	#stopped = false;
 
-	constructor() {
+	constructor(context: MockContext) {
 		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
 		const { port1, port2 } = new MessageChannel();
-		nextPort = Node.deaf ? new MessageChannel().port2 : port2;
+		const deaf = Node.deaf ? new MessageChannel() : undefined;
+		nextPort = deaf?.port2 ?? port2;
 		this.render = new Render();
 		this.port = port1;
 		this.worklet = port2;
 		Node.built.push(this);
+
+		// Quanta rendered one per tick while the context runs, until the processor returns false.
+		const render = () => {
+			if (!this.#closed || this.#stopped || context.state !== "running") return;
+			if (this.render.process([], [stereo()], {})) setTimeout(render, 0);
+			else this.#stopped = true;
+		};
+		port2.addEventListener("message", (event: MessageEvent<{ type?: string }>) => {
+			if (event.data?.type !== "close") return;
+			this.#closed = true;
+			deaf?.port1.postMessage(event.data);
+			setTimeout(render, 0);
+		});
+		port2.start();
+		context.addEventListener("statechange", () => setTimeout(render, 0));
 	}
 
 	connect(): void {}
 	disconnect(): void {}
 }
+
+/** One quantum of stereo output to render into. */
+const stereo = () => [new Float32Array(QUANTUM), new Float32Array(QUANTUM)];
 
 /** Pull `quanta` render quanta of stereo out of `node` and return the left channel. */
 function pull(node: Node, quanta: number): Float32Array {

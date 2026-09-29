@@ -249,7 +249,11 @@ test("rejects the removed source prop instead of publishing nothing", async () =
 function installRenderingWebAudio() {
 	class FakePort extends EventTarget {
 		start(): void {}
-		postMessage(): void {}
+		postMessage(message: unknown): void {
+			// This context renders on, so a processor told to close stops in the next quantum and says so.
+			if ((message as { type?: string }).type !== "close") return;
+			setTimeout(() => this.dispatchEvent(new MessageEvent("message", { data: { type: "stopped" } })), 0);
+		}
 	}
 
 	class FakeAudioWorkletNode extends EventTarget {
@@ -473,6 +477,8 @@ test("fails the capture stream when the context clock is unusable", async () => 
 function installGatedWebAudio() {
 	const page = new EventTarget();
 	let activated = false;
+	// Whether stops wait for `stop()`, so a case can hold a processor between its close and its stop.
+	let held = false;
 	const contexts: GatedContext[] = [];
 	const worklets: GatedWorklet[] = [];
 	const roots: FakeGraphNode[] = [];
@@ -505,15 +511,24 @@ function installGatedWebAudio() {
 		}
 	}
 
+	// Told to close and cut from the microphone, its processor stops in the next quantum its context
+	// renders, as the capture worklet's does: at once while the context runs, once it runs otherwise.
 	class GatedWorklet extends EventTarget {
 		messages: unknown[] = [];
 		port = Object.assign(new EventTarget(), {
 			start: () => {},
-			postMessage: (message: unknown) => this.messages.push(message),
+			postMessage: (message: unknown) => {
+				this.messages.push(message);
+				if ((message as { type?: string }).type === "close") this.#tick();
+			},
 		});
-		constructor(_context: unknown, _name: string) {
+		readonly #context: GatedContext;
+		#stopped = false;
+		constructor(context: GatedContext, _name: string) {
 			super();
+			this.#context = context;
 			worklets.push(this);
+			context.addEventListener("statechange", () => this.#tick());
 		}
 		connect(): void {}
 		disconnect(): void {}
@@ -525,7 +540,17 @@ function installGatedWebAudio() {
 		}
 		// What a closed processor posts in the quantum it stops in.
 		stop(): void {
+			if (this.#stopped) return;
+			this.#stopped = true;
 			this.port.dispatchEvent(new MessageEvent("message", { data: { type: "stopped" } }));
+		}
+		#tick(): void {
+			if (held) return;
+			setTimeout(() => {
+				const closed = this.messages.some((message) => (message as { type?: string }).type === "close");
+				const fed = roots.some((root) => root.outputs.has(this));
+				if (closed && !fed && this.#context.state === "running") this.stop();
+			}, 0);
 		}
 	}
 
@@ -568,6 +593,10 @@ function installGatedWebAudio() {
 		gesture() {
 			activated = true;
 			page.dispatchEvent(new Event("pointerdown"));
+		},
+		// Hold every processor between its close and its stop until the case calls `stop()`.
+		hold() {
+			held = true;
 		},
 		[Symbol.dispose]() {
 			for (const [name, original] of originals) {
@@ -688,6 +717,7 @@ test("closes the context once the capture processor has stopped", async () => {
 	const [worklet] = webaudio.worklets;
 	expect(context.state).toBe("running");
 
+	webaudio.hold();
 	capture.close();
 	await settle();
 
@@ -727,6 +757,7 @@ test("closes the context when it stops running while the processor stops", async
 	await settle();
 	const [context] = webaudio.contexts;
 
+	webaudio.hold();
 	capture.close();
 	await settle();
 	expect(context.state).toBe("running");

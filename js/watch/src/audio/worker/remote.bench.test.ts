@@ -68,14 +68,28 @@ class Context extends EventTarget {
 	}
 }
 
+/**
+ * A render node whose processor does what the render worklet does with its ports: it stops in the
+ * quantum after the page says close, which a running context renders at once, says so on the node's
+ * port, and closes every port it holds.
+ */
 class Node {
 	readonly #channel = new MessageChannel();
 	readonly port = this.#channel.port1;
-	connect(): void {}
-	disconnect(): void {
-		this.port.close();
-		this.#channel.port2.close();
+
+	constructor() {
+		const processor = this.#channel.port2;
+		const ports: MessagePort[] = [processor];
+		processor.onmessage = (event: MessageEvent<{ type?: string; port?: MessagePort }>) => {
+			if (event.data?.type === "port" && event.data.port) ports.push(event.data.port);
+			if (event.data?.type !== "close") return;
+			processor.postMessage({ type: "stopped" });
+			for (const port of ports) port.close();
+		};
 	}
+
+	connect(): void {}
+	disconnect(): void {}
 }
 
 const scope = globalThis as unknown as Record<string, unknown>;
