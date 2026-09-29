@@ -1442,8 +1442,9 @@ struct SegmentSub {
 	ask: Option<Position>,
 	sub: SubState,
 	/// A completed segment's cursor, retained while parked groups may need their
-	/// max age budget re-evaluated after the outer cap rises.
-	terminal: Option<track::Subscriber>,
+	/// max age budget re-evaluated after the outer cap rises. It keeps the box of
+	/// [`SubState::Active`], so only a completed segment pays for a cursor.
+	terminal: Option<Box<track::Subscriber>>,
 	/// The drift anchor for this segment's cursor as of the last
 	/// [`Subscriber::refresh_anchor`], applied when a pending cursor activates.
 	anchor: Anchor,
@@ -1458,8 +1459,9 @@ struct SegmentSub {
 	/// the first) keeps in-range groups that arrive behind a capped one flowing.
 	parked: BTreeMap<u64, group::Consumer>,
 	/// Set while this is a warm segment (see [`Producer::park`]) that has not been
-	/// cleared for live reads: the copy spliced after it, once there is one.
-	warm: Option<Warm>,
+	/// cleared for live reads: the copy spliced after it, once there is one. Boxed,
+	/// since at most one segment of a track is ever warm.
+	warm: Option<Box<Warm>>,
 }
 
 /// A warm segment waiting on the copy spliced after it; see [`Subscriber::poll_activate`].
@@ -1475,7 +1477,7 @@ impl SegmentSub {
 	fn stale_sub_mut(&mut self) -> Option<&mut track::Subscriber> {
 		match &mut self.sub {
 			SubState::Active(sub) => Some(sub.as_mut()),
-			_ => self.terminal.as_mut(),
+			_ => self.terminal.as_deref_mut(),
 		}
 	}
 
@@ -1483,7 +1485,7 @@ impl SegmentSub {
 	fn complete(&mut self, count: Option<u64>) {
 		let previous = std::mem::replace(&mut self.sub, SubState::Done(count));
 		if let SubState::Active(sub) = previous {
-			self.terminal = Some(*sub);
+			self.terminal = Some(sub);
 		}
 	}
 
@@ -1753,9 +1755,11 @@ impl Subscriber {
 						anchor: Anchor::default(),
 						pruned: false,
 						parked: BTreeMap::new(),
-						warm: segment.warm.then(|| Warm {
-							edge: segment.track.latest(),
-							next,
+						warm: segment.warm.then(|| {
+							Box::new(Warm {
+								edge: segment.track.latest(),
+								next,
+							})
 						}),
 					});
 				}
@@ -1896,7 +1900,10 @@ impl Subscriber {
 			|| self.retired_anchors.iter().any(kio::Producer::is_used)
 			|| self.segments.iter().any(|seg| match &seg.sub {
 				SubState::Active(sub) => sub.has_expiry_readers(),
-				_ => seg.terminal.as_ref().is_some_and(track::Subscriber::has_expiry_readers),
+				_ => seg
+					.terminal
+					.as_deref()
+					.is_some_and(track::Subscriber::has_expiry_readers),
 			})
 	}
 

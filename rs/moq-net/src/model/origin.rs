@@ -2038,7 +2038,9 @@ async fn run_front(task: FrontTask) {
 	let mut next_source = 0u64;
 	// The in-flight upstream request: the route and its pending channel.
 	let mut upstream: Option<(u64, kio::Consumer<PendingBroadcast>)> = None;
-	let mut tracks: HashMap<Arc<str>, TrackIo> = HashMap::new();
+	// Boxed: a front usually serves one to three tracks, and the table allocates
+	// several slots up front, each as large as the entry.
+	let mut tracks: HashMap<Arc<str>, Box<TrackIo>> = HashMap::new();
 	let mut deadline = crate::runtime::Deadline::new(&timers);
 	// The watch generation the last selection saw.
 	let mut seen = 0;
@@ -2369,7 +2371,7 @@ async fn run_front(task: FrontTask) {
 			Step::Assigned(name, resume) => {
 				tracks.insert(
 					name.clone(),
-					TrackIo {
+					Box::new(TrackIo {
 						resume,
 						staged: None,
 						query: None,
@@ -2378,7 +2380,7 @@ async fn run_front(task: FrontTask) {
 						warm: None,
 						head: None,
 						used: false,
-					},
+					}),
 				);
 				Event::TrackAssigned { track: name }
 			}
