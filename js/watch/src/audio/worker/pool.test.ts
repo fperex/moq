@@ -1,53 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, jest, spyOn } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Time } from "@moq/net";
+import { FakeWorker } from "../fake";
 import { LINGER, LIVENESS, Liveness, Pool } from "./pool";
-import { AUDIO_DEADLINE, type FromWorker, type Report, type Support, support, TICK, type ToWorker } from "./protocol";
+import { AUDIO_DEADLINE, type FromWorker, type Report, type Support, support, TICK } from "./protocol";
 
 const FULL: Support = { audioDecoder: true, webTransport: true, webSocket: true };
 
-/** A Worker as the pool drives it, which says ready as soon as it is created unless told not to. */
-class FakeWorker {
-	static created: FakeWorker[] = [];
-	static support: Support | undefined = FULL;
-
-	onmessage: ((event: MessageEvent<FromWorker>) => void) | null = null;
-	onerror: ((event: ErrorEvent) => void) | null = null;
-	onmessageerror: (() => void) | null = null;
-	posted: ToWorker[] = [];
-	terminated = false;
-
-	constructor() {
-		FakeWorker.created.push(this);
-		// A task, as a real worker's first message is: never inside the tick that created it.
-		const support = FakeWorker.support;
-		if (support) setTimeout(() => this.say({ type: "ready", support }), 0);
-	}
-
-	postMessage(msg: ToWorker): void {
-		this.posted.push(msg);
-	}
-
-	terminate(): void {
-		this.terminated = true;
-	}
-
-	say(msg: FromWorker): void {
-		this.onmessage?.({ data: msg } as MessageEvent<FromWorker>);
-	}
-
-	fail(message: string): void {
-		this.onerror?.({ message, preventDefault() {} } as ErrorEvent);
-	}
-
-	/** What it was told, less the handshake. */
-	get told(): ToWorker[] {
-		return this.posted.filter((msg) => msg.type !== "hello");
-	}
-}
-
 function create(): Worker {
-	return new FakeWorker() as unknown as Worker;
+	return new FakeWorker().asWorker;
 }
 
 function report(id: number): Report {
@@ -116,7 +77,7 @@ describe("Pool", () => {
 		expect(FakeWorker.created.length).toBe(1);
 		expect(a.id).not.toBe(b.id);
 		const [worker] = FakeWorker.created;
-		expect(worker.posted).toEqual([{ type: "hello", transports: support() }]);
+		expect(worker.posted.map(({ msg }) => msg)).toEqual([{ type: "hello", transports: support() }]);
 
 		// A player's messages reach the one worker.
 		a.post({ type: "flush", id: a.id, epoch: 1 });
@@ -360,7 +321,7 @@ describe("suspend", () => {
 
 		const a = shared.acquire();
 		await a.ready;
-		expect(FakeWorker.created[0].posted).toEqual([
+		expect(FakeWorker.created[0].posted.map(({ msg }) => msg)).toEqual([
 			{ type: "hello", transports: support() },
 			{ type: "suspend", suspended: true },
 		]);

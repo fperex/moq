@@ -3,6 +3,7 @@ import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
 import { Signal } from "@moq/signals";
 import { type AudioBuffer, ClockSource, createAudioBuffer } from "./audio/buffer";
+import { fakeClock } from "./audio/fake";
 import lanBbb from "./audio/fixtures/lan-bbb.json" with { type: "json" };
 import { ringSamples } from "./audio/latency";
 import type { Message, State } from "./audio/render";
@@ -29,22 +30,7 @@ const FRAME = 1000 / 30;
 // Effects in @moq/signals flush on a microtask, so let pending updates drain before asserting.
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-// `Time.Milli.now()` reads `performance.now()` on every call, so stubbing it replays a twelve second
-// trace in a fraction of that. Timers and microtasks stay real.
-function fakeClock() {
-	const real = performance.now.bind(performance);
-	let at = 0;
-	performance.now = () => at;
-	return {
-		set(ms: number) {
-			at = ms;
-		},
-		restore() {
-			performance.now = real;
-		},
-	};
-}
-
+// A clock the test moves replays a twelve second trace in a fraction of that.
 let clock: ReturnType<typeof fakeClock> | undefined;
 afterEach(() => {
 	clock?.restore();
@@ -93,7 +79,7 @@ interface Result {
  * that arrivals set, which is what this quest replaced.
  */
 async function replay(nominate: boolean): Promise<Result> {
-	const time = fakeClock();
+	const time = fakeClock(0);
 	clock = time;
 
 	const sync = new Sync();
@@ -369,7 +355,7 @@ async function session({
 	port = false,
 	videoOffset = 0,
 } = {}): Promise<Session> {
-	const time = fakeClock();
+	const time = fakeClock(0);
 	clock = time;
 
 	const delay = new Signal<Delay>("auto");

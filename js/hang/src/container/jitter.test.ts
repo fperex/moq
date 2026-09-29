@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { Time } from "@moq/net";
+import { fakeTimer } from "./fake";
 import { Jitter, type JitterObservation } from "./jitter";
 import { load, replay } from "./jitter.vectors.ts";
-import { Stall, type StallTimer } from "./stall";
+import { Stall } from "./stall";
 
 const FRAME = 20;
 const START = 80;
@@ -34,75 +35,6 @@ function flush(
 	}
 
 	return start + frames * frame;
-}
-
-/**
- * The event loop monitor's own timer and probe, on a clock the test moves by hand.
- *
- * `advance` runs whatever was queued up to `to`, which is a loop that keeps running. `throttle`
- * holds every schedule to a minimum interval, which is what a hidden tab does to `setTimeout` while
- * its loop and its socket carry on as before. `busy` runs nothing at all while the test keeps
- * reading, which is a loop running flat out: the reads are served and everything queued behind them
- * waits.
- */
-function fakeTimer(): StallTimer & { advance(to: number): void; throttle(ms: number): void; busy(on: boolean): void } {
-	let now = 0;
-	let due: { at: number; fn: () => void } | undefined;
-	let floor = 0;
-	let stopped = false;
-	let handler: (() => void) | undefined;
-	let queued = 0;
-
-	return {
-		now: () => now,
-		schedule: (fn, ms) => {
-			due = { at: now + Math.max(ms, floor), fn };
-			return due;
-		},
-		clear: () => {
-			due = undefined;
-		},
-		probe: (fn) => {
-			handler = fn;
-			return {
-				post: () => {
-					queued++;
-				},
-				close: () => {},
-			};
-		},
-		advance(to: number) {
-			// One millisecond at a time, so a timer that reschedules itself fires as often as it would
-			// on a loop that was running.
-			while (now < to) {
-				now++;
-				if (stopped) continue;
-
-				for (;;) {
-					// A task the loop was handed goes before a timer: it is served as soon as whatever
-					// is in front of it is done.
-					if (queued > 0) {
-						queued--;
-						handler?.();
-						continue;
-					}
-					if (due !== undefined && due.at <= now) {
-						const fn = due.fn;
-						due = undefined;
-						fn();
-						continue;
-					}
-					break;
-				}
-			}
-		},
-		throttle(ms: number) {
-			floor = ms;
-		},
-		busy(on: boolean) {
-			stopped = on;
-		},
-	};
 }
 
 describe("tune-in", () => {
@@ -369,7 +301,7 @@ describe("the receiver's own reading gap", () => {
 				cursor = Math.max(cursor, media + 50 + (frame % 10 === 9 ? LATE : 0));
 				frame++;
 
-				timer.advance(cursor);
+				timer.advance(cursor - timer.at());
 				observe(jitter, media, cursor, { stalled: stall.blocked(cursor as Time.Milli) });
 			}
 		};
@@ -410,7 +342,7 @@ describe("the receiver's own reading gap", () => {
 			for (let ms = 1; ms <= SECONDS * 1000; ms++) {
 				const busy = bursts && ms % PERIOD < BURST;
 				timer.busy(busy);
-				timer.advance(ms);
+				timer.advance(1);
 
 				// The audio track is read throughout, whatever the loop is doing.
 				if (ms % AUDIO === 0) stall.blocked(ms as Time.Milli);

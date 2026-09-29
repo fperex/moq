@@ -6,8 +6,9 @@ import { Effect, Signal } from "@moq/signals";
 import type { Broadcast as BroadcastType } from "../broadcast";
 import type { Clock, Delay, Sync as SyncType } from "../sync";
 import type { Decoder as DecoderType } from "./decoder";
+import { FakeChunk, FakeDecoder, FakeSession } from "./fake";
 import type { Source as SourceType } from "./source";
-import type { Dial, Port as HostPort, Session } from "./worker/host";
+import type { Dial, Port as HostPort } from "./worker/host";
 import type { FromWorker, ToWorker, Transports } from "./worker/protocol";
 
 // The Decoder with its supply in the page's worker, end to end in one process: the real host behind
@@ -23,54 +24,6 @@ const RATE = 48_000;
 const QUANTUM = 128;
 const NAME = "room/alice";
 const URL_ = "https://relay.example/anon";
-
-// ── WebCodecs, enough of it ─────────────────────────────────────────────────
-
-class FakeChunk {
-	readonly timestamp: number;
-	constructor(init: { timestamp: number }) {
-		this.timestamp = init.timestamp;
-	}
-}
-
-/** One 20 ms stereo packet of a constant, stamped from the chunk that produced it. */
-class FakeAudioData {
-	readonly format = "f32-planar";
-	readonly sampleRate = RATE;
-	readonly numberOfFrames = 960;
-	readonly numberOfChannels = 2;
-	readonly timestamp: number;
-	constructor(timestamp: number) {
-		this.timestamp = timestamp;
-	}
-	copyTo(dst: Float32Array): void {
-		dst.fill(0.5);
-	}
-	close(): void {}
-}
-
-class FakeDecoder {
-	// The codecs the worker's decoder turns down. The page's probe is its own, and takes anything.
-	static refuse = new Set<string>();
-
-	state = "configured";
-	readonly #output: (data: FakeAudioData) => void;
-	constructor(init: { output: (data: FakeAudioData) => void }) {
-		this.#output = init.output;
-	}
-	static async isConfigSupported(config: { codec: string }): Promise<{ supported: boolean }> {
-		return { supported: !FakeDecoder.refuse.has(config.codec) };
-	}
-	configure(): void {}
-	decode(chunk: FakeChunk): void {
-		this.#output(new FakeAudioData(chunk.timestamp));
-	}
-	reset(): void {}
-	close(): void {
-		this.state = "closed";
-	}
-	async flush(): Promise<void> {}
-}
 
 // ── the page's graph ────────────────────────────────────────────────────────
 
@@ -198,25 +151,6 @@ const loudest = (samples: Float32Array) => samples.reduce((max, v) => Math.max(m
 
 // ── the relay, in memory ────────────────────────────────────────────────────
 
-/** A session as the host sees one, reading from an origin in this process. */
-class FakeSession implements Session {
-	readonly origin: Signal<Moq.Origin.Table | undefined>;
-	readonly status = new Signal<Moq.Connection.Status>("connected");
-	readonly transport = new Signal<Moq.Connection.Transport | undefined>("webtransport");
-	readonly enabled = new Signal(true);
-	readonly url: URL;
-	closed = false;
-
-	constructor(url: URL, origin: Moq.Origin.Table) {
-		this.url = url;
-		this.origin = new Signal<Moq.Origin.Table | undefined>(origin);
-	}
-
-	close(): void {
-		this.closed = true;
-	}
-}
-
 /** One broadcast with audio tracks, counting the subscriptions each track has and has had. */
 class Publisher {
 	readonly broadcast: Moq.Broadcast.Producer;
@@ -280,8 +214,8 @@ class Relay {
 	readonly sessions: FakeSession[] = [];
 	// Whether a session dialled now never gets through: connecting, with nothing to read.
 	stuck = false;
-	readonly dial: Dial = (url: URL, _transports: Transports) => {
-		const session = new FakeSession(url, this.origin);
+	readonly dial: Dial = (url: URL, transports: Transports) => {
+		const session = new FakeSession(url, transports, this.origin);
 		if (this.stuck) {
 			session.status.set("connecting");
 			session.transport.set(undefined);

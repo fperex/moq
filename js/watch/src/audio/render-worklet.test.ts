@@ -10,8 +10,7 @@ import {
 	Stretcher,
 } from "./playout";
 import { maxStep, speech, zeroRun } from "./playout/fixture";
-import { AudioRingBuffer } from "./ring-buffer";
-import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
+import { type Build, post, type Ring, rings, shared } from "./replay";
 
 // The worklet's produce/drain loop, driven over both ring transports on a simulated output clock.
 // Everything here is the real `Stretcher` against the real rings; only the AudioWorklet's `process`
@@ -27,52 +26,7 @@ function ms(value: number): number {
 	return frames(RATE, value);
 }
 
-/** One ring behind the surface the harness drives it through. */
-interface Harness {
-	readonly reader: RingReader;
-	insert(start: number, count: number): void;
-	setLatency(samples: number): void;
-	end(): void;
-	/** Flush the ring and re-stall it, which is what a mute does to the decoder's. */
-	reset(): void;
-	/** Where the reader is on the media timeline, in microseconds. */
-	timestamp(): number;
-	debug(): Snapshot;
-}
-
-function shared(targetMs: number, buffered = false): Harness {
-	const ring = new SharedRingBuffer(allocSharedRingBuffer(1, RATE * 2, RATE, buffered));
-	ring.setLatency(ms(targetMs));
-	return {
-		reader: ring,
-		insert: (start, count) => ring.insert(micro(start), [media(start, count)]),
-		setLatency: (samples) => ring.setLatency(samples),
-		end: () => ring.end(),
-		reset: () => ring.reset(),
-		timestamp: () => ring.timestamp,
-		debug: () => ring.debug(),
-	};
-}
-
-function post(targetMs: number, buffered = false): Harness {
-	const ring = new AudioRingBuffer({ rate: RATE, channels: 1, latency: targetMs as Time.Milli, buffered });
-	return {
-		reader: ring,
-		insert: (start, count) => ring.write(micro(start), [media(start, count)]),
-		setLatency: (samples) => ring.resize(((samples / RATE) * 1000) as Time.Milli),
-		end: () => ring.end(),
-		reset: () => ring.reset(),
-		timestamp: () => ring.timestamp,
-		// A copy, as the state message makes: the ring refills one object, and the cases keep reads
-		// to compare with later ones.
-		debug: () => ({ ...ring.debug() }),
-	};
-}
-
-const RINGS: Array<[string, (targetMs: number, buffered?: boolean) => Harness]> = [
-	["shared", shared],
-	["post", post],
-];
+const RINGS = rings(RATE);
 
 /**
  * A 200Hz tone that pauses, over a quiet room: a splice that is not seamless shows up as a step,
@@ -90,6 +44,11 @@ function media(start: number, count: number): Float32Array {
 
 function micro(samples: number): Time.Micro {
 	return Time.Micro.fromSecond((samples / RATE) as Time.Second);
+}
+
+/** Insert `count` samples of the fixture at sample `start`. */
+function insert(ring: Ring, start: number, count: number): void {
+	ring.insert(micro(start), [media(start, count)]);
 }
 
 interface Script {
@@ -151,7 +110,7 @@ interface Report extends Snapshot {
 	stepped: Snapshot[];
 }
 
-function run(build: (targetMs: number, buffered?: boolean) => Harness, script: Script): Report {
+function run(build: Build, script: Script): Report {
 	const harness = build(script.target);
 	const engine = new Stretcher(RATE, 1, script.conceal ?? true);
 	const out = [new Float32Array(QUANTUM)];
@@ -159,7 +118,7 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 	// Every timeline the engine was shown, noted on its own reads: the shared ring's `view` applies
 	// the skip-ahead, so reading it from here as well would change what the engine gets.
 	const generations = new Set<number>();
-	const ring = harness.reader;
+	const ring = harness.buffer;
 	const reader: RingReader = {
 		rate: ring.rate,
 		channels: ring.channels,
@@ -185,7 +144,7 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 	let written = 0;
 	let inserted = 0;
 	while (written < ms(script.prefill)) {
-		harness.insert(written, CHUNK);
+		insert(harness, written, CHUNK);
 		written += CHUNK;
 		inserted = written;
 	}
@@ -217,7 +176,7 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 		// The surplus lands once the reader has taken a block, which is what makes it a surplus.
 		if (q === 1 && script.burst) {
 			for (let sent = 0; sent < ms(script.burst); sent += CHUNK) {
-				harness.insert(written, CHUNK);
+				insert(harness, written, CHUNK);
 				written += CHUNK;
 				inserted = written;
 			}
@@ -231,7 +190,7 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 				// A declared pause says so once, as the publisher's encoder stops.
 				if (script.hole?.declared) {
 					if (!declared) {
-						harness.end();
+						harness.buffer.end();
 						declared = true;
 					}
 					paused += CHUNK;
@@ -239,16 +198,16 @@ function run(build: (targetMs: number, buffered?: boolean) => Harness, script: S
 			} else {
 				// The first media past a declared pause re-anchors the ring, leaving the pause behind.
 				if (declared) unsent = paused;
-				harness.insert(written, CHUNK);
+				insert(harness, written, CHUNK);
 				inserted = written + CHUNK;
 			}
 			written += CHUNK;
 			nextArrival += CHUNK / pace;
 		}
-		if (q === stallAt) harness.reader.starve();
+		if (q === stallAt) harness.buffer.starve();
 		for (const step of script.steps ?? []) {
 			if (q !== Math.floor(quanta * step.at)) continue;
-			harness.setLatency(ms(step.target));
+			harness.setLatency(step.target);
 			stepped.push(harness.debug());
 		}
 
@@ -477,12 +436,12 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 		const engine = new Stretcher(RATE, 1);
 		const out = [new Float32Array(QUANTUM)];
 
-		harness.insert(0, CHUNK);
-		harness.end();
+		insert(harness, 0, CHUNK);
+		harness.buffer.end();
 
 		let played = 0;
 		for (let q = 0; q < 100; q++) {
-			played += engine.render(harness.reader, out, q * QUANTUM);
+			played += engine.render(harness.buffer, out, q * QUANTUM);
 		}
 
 		expect(played).toBeGreaterThanOrEqual(CHUNK);
@@ -497,12 +456,12 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 		const engine = new Stretcher(RATE, 1);
 		const out = [new Float32Array(QUANTUM)];
 
-		for (let at = 0; at < ms(100); at += CHUNK) harness.insert(at, CHUNK);
-		harness.end();
+		for (let at = 0; at < ms(100); at += CHUNK) insert(harness, at, CHUNK);
+		harness.buffer.end();
 
 		let played = 0;
 		for (let q = 0; q < 200; q++) {
-			played += engine.render(harness.reader, out, q * QUANTUM);
+			played += engine.render(harness.buffer, out, q * QUANTUM);
 		}
 
 		// Everything buffered reached the device, and nothing beyond it was invented: the only
@@ -517,8 +476,8 @@ describe.each(RINGS)("%s ring worklet", (name, build) => {
 describe("both rings", () => {
 	it("count the same operations for the same script", () => {
 		const script: Script = { target: 100, prefill: 180, seconds: 6 };
-		const a = run(shared, script);
-		const b = run(post, script);
+		const a = run(shared(RATE), script);
+		const b = run(post(RATE), script);
 
 		expect({ accelerates: b.accelerates, expands: b.expands, skips: b.skips, underruns: b.underruns }).toEqual({
 			accelerates: a.accelerates,
@@ -548,8 +507,8 @@ describe("a target step", () => {
 				{ at: 0.625, target: 40 },
 			],
 		};
-		const a = run(shared, script);
-		const b = run(post, script);
+		const a = run(shared(RATE), script);
+		const b = run(post(RATE), script);
 
 		expect(b.expands).toBeGreaterThan(0);
 		// Nothing the reader held was dropped and nothing it learned was forgotten: the same audio,
@@ -576,8 +535,8 @@ describe("a target step", () => {
 			hole: { at: 0.4, ms: 100 },
 			steps: [{ at, target: 60 }],
 		};
-		const a = run(shared, script);
-		const b = run(post, script);
+		const a = run(shared(RATE), script);
+		const b = run(post(RATE), script);
 
 		expect(b.stepped[0].stalled).toBe(true);
 		expect(b.stepped[0].underruns).toBe(1);
@@ -668,17 +627,17 @@ describe.each(RINGS)("%s ring unmute", (name, build) => {
 		const play = (quanta: number, arriving: boolean) => {
 			for (let q = 0; q < quanta; q++) {
 				while (arriving && outputFrame >= nextArrival) {
-					harness.insert(written, CHUNK);
+					insert(harness, written, CHUNK);
 					written += CHUNK;
 					nextArrival += CHUNK;
 				}
-				engine.render(harness.reader, out, outputFrame);
+				engine.render(harness.buffer, out, outputFrame);
 				outputFrame += QUANTUM;
 			}
 		};
 
 		while (written < HOLD) {
-			harness.insert(written, CHUNK);
+			insert(harness, written, CHUNK);
 			written += CHUNK;
 			nextArrival = written;
 		}
@@ -689,14 +648,14 @@ describe.each(RINGS)("%s ring unmute", (name, build) => {
 
 		// The mute: the ring is flushed and nothing is downloaded for three seconds, but the publisher
 		// keeps producing, so the timeline moves on without us.
-		harness.reset();
+		harness.buffer.reset();
 		play(Math.floor((3 * RATE) / QUANTUM), false);
 		written += 3 * RATE;
 		nextArrival = outputFrame;
 
 		// The unmute: the backlog lands in one go, before the next block is pulled.
 		for (let sent = BACKLOG; sent > 0; sent -= CHUNK) {
-			harness.insert(written - sent, CHUNK);
+			insert(harness, written - sent, CHUNK);
 		}
 		nextArrival += CHUNK;
 
@@ -709,14 +668,14 @@ describe.each(RINGS)("%s ring unmute", (name, build) => {
 		let monotone = true;
 		for (let q = 0; q < Math.floor((3 * RATE) / QUANTUM); q++) {
 			while (outputFrame >= nextArrival) {
-				harness.insert(written, CHUNK);
+				insert(harness, written, CHUNK);
 				written += CHUNK;
 				nextArrival += CHUNK;
 			}
-			engine.render(harness.reader, out, outputFrame);
+			engine.render(harness.buffer, out, outputFrame);
 			outputFrame += QUANTUM;
 
-			const position = harness.timestamp();
+			const position = harness.buffer.timestamp;
 			if (position < playhead) monotone = false;
 			playhead = position;
 		}

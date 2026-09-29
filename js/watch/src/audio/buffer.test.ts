@@ -2,24 +2,9 @@ import { afterEach, describe, expect, it, jest } from "bun:test";
 import { Time } from "@moq/net";
 import { Effect } from "@moq/signals";
 import { type AudioBuffer, ClockSource, createAudioBuffer } from "./buffer";
+import { fakeClock } from "./fake";
 import type { Playhead } from "./playhead";
 import type { Message, State } from "./render";
-
-// `Time.Milli.now()` reads `performance.now()` on every call, so stubbing it puts the park timer
-// under the test's control.
-function fakeClock(start = 1000) {
-	const real = performance.now.bind(performance);
-	let at = start;
-	performance.now = () => at;
-	return {
-		advance(ms: number) {
-			at += ms;
-		},
-		restore() {
-			performance.now = real;
-		},
-	};
-}
 
 let clock: ReturnType<typeof fakeClock> | undefined;
 afterEach(() => {

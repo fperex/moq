@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Time } from "@moq/net";
+import { FakeWorker } from "../fake";
 import {
 	AUDIO_DEADLINE,
 	Deadline,
@@ -225,35 +226,6 @@ describe("messages", () => {
 
 // ── spawn ───────────────────────────────────────────────────────────────────
 
-/** A Worker as `spawn` drives it: the three handlers, `postMessage` and `terminate`. */
-class FakeWorker {
-	onmessage: ((event: MessageEvent<FromWorker>) => void) | null = null;
-	onerror: ((event: ErrorEvent) => void) | null = null;
-	onmessageerror: (() => void) | null = null;
-	posted: Array<{ msg: ToWorker; transfer: Transferable[] }> = [];
-	terminated = false;
-
-	postMessage(msg: ToWorker, transfer: Transferable[] = []): void {
-		this.posted.push({ msg, transfer });
-	}
-
-	terminate(): void {
-		this.terminated = true;
-	}
-
-	say(msg: FromWorker): void {
-		this.onmessage?.({ data: msg } as MessageEvent<FromWorker>);
-	}
-
-	fail(message: string): void {
-		this.onerror?.({ message, preventDefault() {} } as ErrorEvent);
-	}
-
-	get asWorker(): Worker {
-		return this as unknown as Worker;
-	}
-}
-
 /** What the page races in these cases: both transports. */
 const PAGE = { webTransport: true, webSocket: true };
 
@@ -261,6 +233,11 @@ const PAGE = { webTransport: true, webSocket: true };
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 describe("spawn", () => {
+	// Silent until the case says otherwise, so each one decides what the worker's first word is.
+	beforeEach(() => {
+		FakeWorker.support = undefined;
+	});
+
 	it("falls back when the worker cannot be created, as a CSP refusing blob: workers makes Chromium throw", async () => {
 		const thrown = await spawn(() => {
 			throw new DOMException("Access to the script at 'blob:...' is denied", "SecurityError");

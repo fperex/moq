@@ -3,29 +3,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
 import { Signal } from "@moq/signals";
+import { fakeClock } from "./audio/fake";
 import { type Clock, type Delay, Sync } from "./sync";
 
 // Effects in @moq/signals flush on a microtask, so let pending updates drain before asserting.
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-// `Time.Milli.now()` reads `performance.now()` on every call, so stubbing it runs playback on a
-// clock the test steps by hand. Everything else (timers, microtasks) stays real.
-function fakeClock(start = 1000) {
-	const real = performance.now.bind(performance);
-	let at = start;
-	performance.now = () => at;
-	return {
-		get at(): Time.Milli {
-			return at as Time.Milli;
-		},
-		advance(ms: number) {
-			at += ms;
-		},
-		restore() {
-			performance.now = real;
-		},
-	};
-}
 
 let clock: ReturnType<typeof fakeClock> | undefined;
 afterEach(() => {
