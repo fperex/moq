@@ -138,8 +138,10 @@ export class Decoder {
 
 	// The last picture handed to the renderer and the broadcast clock it was painted on. It outlives
 	// the picture itself (going offline clears that) so a track opened after a gap knows what the
-	// viewer last saw. See `#runPending`.
-	#shown?: { timestamp: Time.Milli; clock?: Catalog.Clock };
+	// viewer last saw. See `#runPending`. Two fields rather than one object, since every painted
+	// frame updates them.
+	#shownTimestamp?: Time.Milli;
+	#shownClock?: Catalog.Clock;
 
 	// Bumped to rebuild the track without anything else about the rendition changing: a codec that
 	// errored, or a picture that stayed frozen past RECOVER. `#runPending` reads it, so a bump tears
@@ -272,15 +274,18 @@ export class Decoder {
 		// A track opened after a gap (a hidden tab shown, a resume, a rebuild, a reattached element,
 		// a replaced session) is promoted at once, so it must not step back from what the viewer last
 		// saw.
-		const shown = this.#active.peek() ? undefined : this.#shown;
-		const held = shown && {
-			timestamp: shown.timestamp,
-			sameClock:
-				clock !== undefined &&
-				shown.clock !== undefined &&
-				clock.wall === shown.clock.wall &&
-				clock.timescale === shown.clock.timescale,
-		};
+		const shown = this.#active.peek() ? undefined : this.#shownTimestamp;
+		const held =
+			shown === undefined
+				? undefined
+				: {
+						timestamp: shown,
+						sameClock:
+							clock !== undefined &&
+							this.#shownClock !== undefined &&
+							clock.wall === this.#shownClock.wall &&
+							clock.timescale === this.#shownClock.timescale,
+					};
 
 		// Start a new pending effect.
 		let pending: DecoderTrack | undefined = new DecoderTrack({
@@ -356,7 +361,8 @@ export class Decoder {
 			// on screen until it paints, rather than a black tile while its first keyframe arrives.
 			// Going offline is what clears the picture.
 			if (!frame) return;
-			this.#shown = { timestamp: Time.Milli.fromMicro(frame.timestamp as Time.Micro), clock: active.clock };
+			this.#shownTimestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
+			this.#shownClock = active.clock;
 			this.#out.frame.update((prev) => {
 				prev?.close();
 				return frame.clone();
