@@ -300,3 +300,11 @@ async fn rejoin_skips_a_stale_cache_of_a_publisher_that_kept_producing() {
 async fn rejoin_over_ietf_skips_a_stale_cache_of_a_publisher_that_paused() {
 	every_case(Idle::Pauses, |version| matches!(version, moq_net::Version::Ietf(_))).await;
 }
+
+/// Lite resolves the returning subscription's start from the publisher's own budget, and a paused
+/// publisher's pre-gap group is not stale by it: the marker after it is stamped where the media
+/// stopped, so nothing newer exists until the resumed keyframe.
+#[tokio::test]
+async fn rejoin_over_lite_skips_a_stale_cache_of_a_publisher_that_paused() {
+	every_case(Idle::Pauses, |version| matches!(version, moq_net::Version::Lite(_))).await;
+}
