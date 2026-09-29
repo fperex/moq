@@ -1885,9 +1885,12 @@ impl Subscriber {
 		}
 		for seg in &mut self.segments {
 			let anchor = Self::segment_anchor(seg, anchor.clone(), &state);
-			seg.anchor = anchor.clone();
-			if let Some(sub) = seg.stale_sub_mut() {
-				sub.set_anchor(anchor);
+			// A cursor holds what was last pushed onto it, so an unchanged anchor needs no push.
+			if seg.anchor != anchor {
+				seg.anchor = anchor.clone();
+				if let Some(sub) = seg.stale_sub_mut() {
+					sub.set_anchor(anchor);
+				}
 			}
 		}
 	}

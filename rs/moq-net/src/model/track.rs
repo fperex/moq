@@ -4134,7 +4134,7 @@ impl Subscriber {
 			SubscriberKind::Plain(plain) => {
 				plain.end_sequence = end.exclusive();
 				// A successor dropped by a lower cap stays dropped until the wrapping
-				// reader pushes its anchor again, which it does on every poll.
+				// reader pushes a new anchor. A splice never caps its segments this way.
 				let outer = Anchor {
 					cap: plain.stale_cap,
 					..plain.drift_anchor.read().clone()
