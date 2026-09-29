@@ -124,6 +124,8 @@ export interface Counters {
  * the worklet's state message on the postMessage one.
  */
 export interface Snapshot extends Counters {
+	/** The ring implementation that produced this snapshot. */
+	backend: "shared" | "message";
 	/** Media samples the ring holds. */
 	buffered: number;
 	/** The playout target, in samples. */

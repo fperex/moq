@@ -143,6 +143,11 @@ jobs:
         run: nix develop --command just test audio-quality --enforce
         shell: bash -leo pipefail {0}
 
+      - name: Shared audio ring quality
+        if: ${{ !cancelled() }}
+        run: nix develop --command just test audio-quality --profiles fixed-250 --rings isolated --offload false --enforce
+        shell: bash -leo pipefail {0}
+
       # The run directory is the whole diagnosis: each process's log, the
       # shaper's counters, the raw ndjson, the per-row summaries, and a
       # Playwright trace of any page that failed. The harness keeps it on a

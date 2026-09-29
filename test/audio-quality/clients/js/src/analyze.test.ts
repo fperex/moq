@@ -6,7 +6,8 @@ import { join } from "node:path";
 import type { Sample, Summary } from "./schema.ts";
 
 const tag = "chromium-aac-44100-fixed-250-plain";
-const diagnostic = {
+const diagnostic: NonNullable<Sample["playout"]> = {
+	backend: "message",
 	generation: 1,
 	rate: 44100,
 	anchor: 44100,
@@ -29,7 +30,6 @@ const diagnostic = {
 	expands: 0,
 	merges: 0,
 	short: 0,
-	budget: 250,
 };
 
 function analyze(change: (sample: Sample) => Sample): Summary {

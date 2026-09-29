@@ -13,8 +13,8 @@
 #     WebSocket fallback is TCP and never touches the UDP shaper.
 #   - The audio came from the page's audio worker, the player's default, not its main thread; or,
 #     under `--offload false`, from the main thread the page was told to keep it on.
-#   - The ring that ran is the one the row asked for, which is decided by whether the document is
-#     cross-origin isolated, not by anything the page can assert about itself.
+#   - The document has the requested isolation and the ring identifies its implementation.
+#     The worker uses messages in both contexts; isolated --offload false uses shared memory.
 #
 # `--runtime` picks which of three lanes runs. `chromium` is the matrix above. `safari` is real
 # Safari through safaridriver, whose session is a WebSocket and therefore never traverses the UDP

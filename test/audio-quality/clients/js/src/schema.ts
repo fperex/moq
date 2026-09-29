@@ -305,7 +305,7 @@ export type Row = {
 	rate: number;
 	/** The shaper profile the path ran under. */
 	profile: string;
-	/** Which ring ran. */
+	/** Document isolation in browser rows; concrete ring selection in replay rows. */
 	ring: Ring;
 };
 
@@ -320,6 +320,16 @@ export const rowKey = (row: Row): string => `${row.runtime}-${row.codec}-${row.r
  * `pending` while the worker is starting.
  */
 export type Thread = { kind: "worker"; transport?: string } | { kind: "main"; reason?: string } | { kind: "pending" };
+
+/** The concrete ring reported by the running player. */
+export type Backend = NonNullable<ReturnType<MoqWatch["audio"]["out"]["debug"]["peek"]>>["backend"];
+
+/** Reject a row whose concrete ring differs from the requested execution path. */
+export function backendVoid(actual: Backend | undefined, expected: Backend): Void | undefined {
+	return actual === expected
+		? undefined
+		: { assertion: "backend", detail: `expected ${expected} ring, observed ${actual ?? "unknown"}` };
+}
 
 /** One 250 ms probe sample: everything public the page could read at that instant. */
 export type Sample = {

@@ -96,6 +96,7 @@ export class AudioRingBuffer implements RingReader {
 	};
 	readonly #playhead: Playhead = { timestamp: Time.Micro.zero, rate: 0 };
 	readonly #snapshot: Snapshot = {
+		backend: "message",
 		queued: 0,
 		stretched: 0,
 		output: 0,

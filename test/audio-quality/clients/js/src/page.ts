@@ -110,6 +110,7 @@ setInterval(() => {
 			// The audio's own path: the page's audio worker has a session of its own, which `transport`
 			// does not see.
 			thread: threadOf(watch),
+			backend: peek(() => watch.audio.out.debug.peek()?.backend),
 			timestamp: peek(() => watch.audio.out.timestamp.peek()),
 			stalled: peek(() => watch.audio.out.stalled.peek()),
 			underruns: peek(() => watch.audio.out.underruns.peek()),

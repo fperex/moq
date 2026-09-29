@@ -23,6 +23,7 @@ for (const shared of [false, true]) {
 			ring.read([new Float32Array(20)]);
 			for (let at = 150; at < 600; at += 50) write(ring, at);
 			const debug = ring.debug();
+			expect(debug.backend).toBe(shared ? "shared" : "message");
 			expect(debug.skips).toBeGreaterThan(0);
 			expect(debug.skipped).toBe(shared ? 68 : 380);
 			expect(debug.discarded).toBe(0);

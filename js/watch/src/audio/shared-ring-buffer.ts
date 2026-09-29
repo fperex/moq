@@ -956,6 +956,7 @@ export class SharedRingBuffer implements RingReader {
 	debug(): Snapshot {
 		const load = (index: number) => Atomics.load(this.#control, index);
 		return {
+			backend: "shared",
 			buffered: this.length,
 			target: load(LATENCY),
 			chunk: load(CHUNK),

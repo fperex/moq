@@ -16,7 +16,7 @@ just test audio-quality --runtime replay                   # the recorded traces
 just test audio-quality --offload false                    # the audio on the page's main thread
 ```
 
-The matrix is codec x jitter profile x ring path: 24 rows, about 30 minutes at the default 60
+The matrix is codec x jitter profile x document isolation: 24 rows, about 30 minutes at the default 60
 seconds a row. `--profiles`, `--rings`, and `--codecs` take comma-separated lists; `--seed` replays
 a given impairment; `--duration` shortens a row.
 
@@ -38,7 +38,7 @@ Three rows are enforced today:
 | Codec | Enforced |
 | --- | --- |
 | opus | `fixed-250` isolated |
-| aac | `fixed-250` both rings |
+| aac | `fixed-250` both isolation contexts |
 
 Twenty-one keep the marker, and the reason is the target rather than a fault in the measurement: an
 `auto` row's target follows the path for the whole window, so where inside sixty seconds the path's
@@ -77,6 +77,12 @@ native twin, or this harness: that lane takes seconds and cannot be unlucky.
 | `chromium` | Headless Chromium over WebTransport, the matrix above | yes | nightly, on demand, and locally |
 | `safari` | Real Safari over a WebSocket, the two control profiles | no | locally, on macOS |
 | `replay` | The recorded traces through the same player, on a simulated clock | no | pull requests, nightly, and anywhere else, in a second |
+
+The default audio worker uses the message ring in both document isolation contexts. These rows
+prove isolation handling, not SharedArrayBuffer playback. The nightly also runs
+`--profiles fixed-250 --rings isolated --offload false --enforce` for both codecs. Those rows keep
+audio on the page and require the concrete ring's debug snapshot to report `shared`. The default
+rows require `message`. Unknown or unexpected implementations void the row.
 
 ## How the browser reaches the relay
 
@@ -337,7 +343,8 @@ main thread with no reason: a reason is a fallback, meaning the page tried the w
 | `shaper` | An active profile's `delayed` counter is zero, so the impairment never applied and an impaired run became an unimpaired pass. `near-zero` and `fixed-250` are exempt: zero is the right answer for the control. |
 | `transport` | The page's session, or its audio worker's own, negotiated something other than WebTransport. A WebSocket fallback is TCP and never touches the UDP shaper. The page denies the fallback outright (below), for the worker too, so this is a backstop rather than the usual outcome. The Safari lane expects a WebSocket instead. |
 | `thread` | The audio did not come from the page's audio worker, the player's default: the page played it on its main thread (the detail says why), or the worker never started. Under `--offload false`, the audio did not stay on the main thread by choice: it played on the worker, or fell back with a reason. Checked once the audio plays and again at the end, since the page takes the audio back for good. A build that predates the worker cannot say, and is not voided for it. |
-| `ring` | The document's `crossOriginIsolated` does not match the ring the row asked for, so the other ring ran. |
+| `ring` | The document's `crossOriginIsolated` does not match the requested context. |
+| `backend` | The concrete ring's debug snapshot is absent or names a different implementation from the requested execution path. |
 | `playout` | The graph, timeline anchor, sample rate, or monotonic counters changed during the measured window. |
 | `clock` | `AudioContext.currentTime` drifted more than 1% from wall time over the first ten seconds, or was never readable. |
 | `window` | No samples survived the warmup. |
