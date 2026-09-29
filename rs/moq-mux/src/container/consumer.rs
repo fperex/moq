@@ -383,34 +383,13 @@ impl<F: Container> Consumer<F> {
 			{
 				let hole = !pts_contiguous(current_end.or(self.presented_end), next_start);
 				let had_marker = self.pending.iter().take(new_idx).any(GroupBuffer::marker);
-				// What the verdict was reached on, since the same line has to answer whether the
-				// oldest group was actually late or merely long: what it held, and whether more of
-				// it was still coming.
-				let (first, last, open) = match self.pending.front_mut() {
-					Some(front) => (
-						front.min_timestamp,
-						front.max_timestamp,
-						front.group.poll_finished(&kio::Waiter::noop()).is_pending(),
-					),
-					None => (None, None, false),
-				};
 				self.pending.drain(0..new_idx);
 				if hole || had_marker {
 					self.bump_playhead();
 				}
 				let new_current = self.pending.front().map(|g| g.sequence).unwrap();
 
-				tracing::debug!(
-					old = self.current,
-					new = new_current,
-					?first,
-					?last,
-					open,
-					reach = ?next_start,
-					live = ?max_timestamp,
-					budget = ?self.max_age,
-					"skipping slow groups"
-				);
+				tracing::debug!(old = self.current, new = new_current, "skipping slow groups");
 
 				self.current = new_current;
 				self.note_group_edge();
