@@ -9,8 +9,9 @@
 //!   `moq-tokio` cover without a relay;
 //! - one that stops on demand loss and marks the break, the way `@moq/publish` does: its
 //!   encoder only runs while a subscriber is attached, and when the last one leaves it
-//!   finishes the current group at its end and appends a marker group of one empty frame
-//!   there (`Container.Legacy.Producer.cut`). It resumes with a new keyframe group once a
+//!   finishes the current group at its end, appends a marker group of one empty frame
+//!   there, and declares the track's break at the marker (`Container.Legacy.Producer.cut`,
+//!   [`moq_net::track::Producer::break_at`]). It resumes with a new keyframe group once a
 //!   subscriber returns, some time after the subscription arrives.
 //!
 //! The assertion is the same for both: the returning subscriber's first group, and every
@@ -134,7 +135,7 @@ async fn rejoin(version: moq_net::Version, idle: Idle, open: bool) {
 	let publisher = moq_tokio::origin::spawn();
 	let broadcast = publisher.create_broadcast("live").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("announce");
-	let track = broadcast.create_track(TRACK, None).expect("create track");
+	let mut track = broadcast.create_track(TRACK, None).expect("create track");
 	for sequence in 0..3u64 {
 		write_group(&track, sequence, sequence * 100);
 	}
@@ -207,6 +208,7 @@ async fn rejoin(version: moq_net::Version, idle: Idle, open: bool) {
 				.expect("create marker group");
 			marker.write_frame(ms(last), b"".as_ref()).expect("write marker");
 			marker.finish().expect("finish marker group");
+			track.break_at(resumed).expect("declare the break at the marker");
 		}
 	}
 
@@ -246,9 +248,8 @@ async fn rejoin(version: moq_net::Version, idle: Idle, open: bool) {
 	relay.abort();
 }
 
-/// Every version whose relay resolves a rejoin against the publisher (lite-06 onward and IETF)
-/// that `wanted` keeps.
-fn versions(wanted: fn(&moq_net::Version) -> bool) -> impl Iterator<Item = moq_net::Version> {
+/// Every version whose relay resolves a rejoin against the publisher: lite-06 onward and IETF.
+fn versions() -> impl Iterator<Item = moq_net::Version> {
 	let pre06 = [
 		"moq-lite-01",
 		"moq-lite-02",
@@ -259,14 +260,13 @@ fn versions(wanted: fn(&moq_net::Version) -> bool) -> impl Iterator<Item = moq_n
 	moq_net::Version::names()
 		.filter(move |name| !pre06.contains(name))
 		.map(|name| name.parse().expect("version"))
-		.filter(wanted)
 }
 
-/// Run each version with the edge group open and finished, and report every case that fails.
-async fn every_case(idle: Idle, wanted: fn(&moq_net::Version) -> bool) {
+/// Run every version with the edge group open and finished, and report every case that fails.
+async fn every_case(idle: Idle) {
 	let mut failed = Vec::new();
 	let mut cases = 0;
-	for version in versions(wanted) {
+	for version in versions() {
 		for open in [false, true] {
 			cases += 1;
 			if let Err(err) = tokio::spawn(rejoin(version, idle, open)).await {
@@ -280,7 +280,6 @@ async fn every_case(idle: Idle, wanted: fn(&moq_net::Version) -> bool) {
 			}
 		}
 	}
-	assert!(cases > 0, "no version to run");
 	assert!(
 		failed.is_empty(),
 		"{} of {cases} cases failed:\n{}",
@@ -291,20 +290,13 @@ async fn every_case(idle: Idle, wanted: fn(&moq_net::Version) -> bool) {
 
 #[tokio::test]
 async fn rejoin_skips_a_stale_cache_of_a_publisher_that_kept_producing() {
-	every_case(Idle::Produces, |_| true).await;
+	every_case(Idle::Produces).await;
 }
 
-/// IETF learns the publisher's newest group from SUBSCRIBE_OK's Largest, and the break's marker
-/// group is past the cache.
+/// Lite resolves the returning subscription's start from the publisher's own budget, and until
+/// the resumed media exists nothing makes the pre-gap group stale by it: the break is what moves
+/// the start past the cache. IETF starts at SUBSCRIBE_OK's Largest, which is the marker.
 #[tokio::test]
-async fn rejoin_over_ietf_skips_a_stale_cache_of_a_publisher_that_paused() {
-	every_case(Idle::Pauses, |version| matches!(version, moq_net::Version::Ietf(_))).await;
-}
-
-/// Lite resolves the returning subscription's start from the publisher's own budget, and a paused
-/// publisher's pre-gap group is not stale by it: the marker after it is stamped where the media
-/// stopped, so nothing newer exists until the resumed keyframe.
-#[tokio::test]
-async fn rejoin_over_lite_skips_a_stale_cache_of_a_publisher_that_paused() {
-	every_case(Idle::Pauses, |version| matches!(version, moq_net::Version::Lite(_))).await;
+async fn rejoin_skips_a_stale_cache_of_a_publisher_that_paused() {
+	every_case(Idle::Pauses).await;
 }

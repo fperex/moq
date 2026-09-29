@@ -194,12 +194,18 @@ async function setup() {
 	const track = new Moq.Track.Producer("audio").accept();
 	const written: [number, number][] = [];
 	const writes = { onWrite: undefined as (() => void) | undefined };
-	const writeFrame = track.writeFrame.bind(track);
-	track.writeFrame = (frame) => {
-		const [timestamp, payload] = Moq.Varint.decode(frame.payload);
-		written.push([timestamp, payload.byteLength]);
-		writeFrame(frame);
-		writes.onWrite?.();
+	// Every group goes through here, the single-frame ones `writeFrame` opens included.
+	const appendGroup = track.appendGroup.bind(track);
+	track.appendGroup = () => {
+		const group = appendGroup();
+		const writeFrame = group.writeFrame.bind(group);
+		group.writeFrame = (frame) => {
+			const [timestamp, payload] = Moq.Varint.decode(frame.payload);
+			written.push([timestamp, payload.byteLength]);
+			writeFrame(frame);
+			writes.onWrite?.();
+		};
+		return group;
 	};
 
 	const rendition = {
@@ -310,14 +316,30 @@ async function settle() {
 describe("a rendition that stops encoding", () => {
 	// A stand-in for the track producer a subscription hands the rendition, recording what it is
 	// asked to publish.
-	function trackOf(written: Array<{ payload: Uint8Array }>) {
+	function trackOf(written: Array<{ payload: Uint8Array }>, breaks: number[] = []) {
+		let next = 0;
 		return {
-			writeFrame: (frame: { payload: Uint8Array }) => written.push(frame),
-			// An audio rendition writes one frame per group and nothing else. An empty group means
-			// nothing on the wire, so reaching for one is a bug rather than a declaration.
-			appendGroup: () => {
-				throw new Error("audio wrote a group of its own");
+			writeFrame: (frame: { payload: Uint8Array }) => {
+				written.push(frame);
+				next++;
 			},
+			// An audio rendition writes one frame per group, an endpoint marker included. An empty
+			// group means nothing on the wire, so closing one is a bug rather than a declaration.
+			appendGroup: () => {
+				const sequence = next++;
+				let frames = 0;
+				return {
+					sequence,
+					writeFrame: (frame: { payload: Uint8Array }) => {
+						written.push(frame);
+						frames++;
+					},
+					close: () => {
+						if (frames !== 1) throw new Error(`audio group ${sequence} held ${frames} frames`);
+					},
+				};
+			},
+			breakAt: (sequence: number) => breaks.push(sequence),
 			// Open throughout, as the broadcast keeps a rendition's track across demand gaps.
 			closed: { peek: () => undefined },
 		};
@@ -325,7 +347,8 @@ describe("a rendition that stops encoding", () => {
 
 	async function encoding() {
 		const written: Array<{ payload: Uint8Array }> = [];
-		const track = trackOf(written);
+		const breaks: number[] = [];
+		const track = trackOf(written, breaks);
 		const rendition = {
 			config: new Signal<Catalog.AudioConfig | undefined>(undefined),
 			track: new Signal<unknown>(track),
@@ -348,12 +371,12 @@ describe("a rendition that stops encoding", () => {
 		});
 
 		await settle();
-		return { encoder, enabled, capture, rendition, written, feed };
+		return { encoder, enabled, capture, rendition, written, breaks, feed };
 	}
 
 	test("declares where the timeline stops when it is muted", async () => {
 		using _codecs = installFakeAudioCodecs();
-		const { encoder, enabled, written } = await encoding();
+		const { encoder, enabled, written, breaks } = await encoding();
 
 		try {
 			// One 20ms frame reaches the wire, so the timeline runs to 20ms.
@@ -369,6 +392,8 @@ describe("a rendition that stops encoding", () => {
 			const [timestamp, payload] = Moq.Varint.decode(written[1].payload);
 			expect(timestamp).toBe(20_000);
 			expect(payload.byteLength).toBe(0);
+			// The endpoint is the second group, and a subscription made during the pause starts there.
+			expect(breaks).toEqual([1]);
 		} finally {
 			encoder.close();
 		}
@@ -832,6 +857,34 @@ test("a demand gap marks where submitted audio ends and drops the chunks held ac
 		[138_700, 1],
 		[158_700, 1],
 	]);
+});
+
+// Max Age measures a group against the newest one, and until audio resumes the newest is the marker,
+// stamped where the audio stopped: nothing says the audio before it is stale. A relay re-subscribing
+// at its cache's edge, or a viewer joining during the gap, would be served it without the break.
+test("a subscription made after a demand gap starts at its marker", async () => {
+	using _webcodecs = installFakeWebCodecs();
+	using env = await setup();
+	const { track, rendition, feed, writes } = env;
+
+	for (let index = 0; index < 4; index++) {
+		await feed.push({ timestamp: Time.Micro(18_699.6 + index * 20_000), channels: [new Float32Array(960)] });
+	}
+	await feed.drain();
+
+	const marked = new Promise<void>((resolve) => {
+		writes.onWrite = resolve;
+	});
+	rendition.track.set(undefined);
+	await marked;
+	writes.onWrite = undefined;
+
+	const later = track.subscribe({ maxAge: Time.Milli(30_000) });
+	const frame = await later.tryRecvGroup()?.readFrame();
+	if (!frame) throw new Error("expected the marker");
+	const [timestamp, payload] = Moq.Varint.decode(frame.payload);
+	expect([timestamp, payload.byteLength]).toEqual([98_700, 0]);
+	later.close();
 });
 
 // A push that completes several frames is still one continuous stream, so it must not restart the

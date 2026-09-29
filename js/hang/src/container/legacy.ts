@@ -132,11 +132,12 @@ export class Producer {
 	 *
 	 * `end` is where the content stops, estimated from the frame cadence when omitted. After closing
 	 * the group, this publishes a marker group of one empty frame at `end`, or at the live edge
-	 * without one. Without the marker, a group's reach runs to its successor's first frame, so the
-	 * group before a pause reads as live until whatever resumes it, and a subscriber joining
-	 * mid-break is handed that stale media. The marker bounds it, and it is the latest group a
-	 * joiner lands on. Data tracks only close the group, since an empty payload is data. No marker
-	 * is written until a frame follows the last one. Throws if `end` precedes the last video frame.
+	 * without one, and declares the track's break there. Without the marker, a group's reach runs to
+	 * its successor's first frame, so the group before a pause reads as live until whatever resumes
+	 * it. The marker bounds it, and the break makes it where a later subscription starts, since its
+	 * budget alone cannot tell the pause from the media until something newer exists. Data tracks
+	 * only close the group, since an empty payload is data. No marker is written until a frame
+	 * follows the last one. Throws if `end` precedes the last video frame.
 	 */
 	cut(end?: Time.Micro) {
 		this.#close(end);
@@ -155,6 +156,7 @@ export class Producer {
 			timestamp: Time.Timestamp.fromMicros(timestamp),
 		});
 		group.close();
+		this.#track.breakAt(group.sequence);
 		this.#liveEdge = this.#liveEdge === undefined ? timestamp : (Math.max(this.#liveEdge, timestamp) as Time.Micro);
 		this.#marked = true;
 	}

@@ -284,7 +284,8 @@ export class Encoder {
 
 		// When demand disappears, end the epoch with a discontinuity marker (see
 		// Container.Legacy.Producer.cut) so a later subscriber resumes on the same track without the
-		// pre-gap frames reading as live. Its empty payload marks where the submitted media ends.
+		// pre-gap frames reading as live. Its empty payload marks where the submitted media ends, and
+		// the track's break there is where a later subscription starts.
 		effect.run((effect) => {
 			const track = effect.get(rendition.track);
 			if (!track) return;
@@ -296,10 +297,13 @@ export class Encoder {
 				this.#end = undefined;
 				if (end === undefined || track.closed.peek() !== undefined) return;
 				this.#floor = end;
-				track.writeFrame({
+				const marker = track.appendGroup();
+				marker.writeFrame({
 					payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
 					timestamp: Time.Timestamp.fromMicros(end),
 				});
+				marker.close();
+				track.breakAt(marker.sequence);
 			});
 		});
 
@@ -505,10 +509,15 @@ export class Encoder {
 					const producer = track.peek();
 					if (!producer) return;
 
-					producer.writeFrame({
+					const marker = producer.appendGroup();
+					marker.writeFrame({
 						payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
 						timestamp: Time.Timestamp.fromMicros(end),
 					});
+					marker.close();
+					// A subscription made during the pause starts at the endpoint, not on media
+					// from before it.
+					producer.breakAt(marker.sequence);
 					// The same marker ends a demand gap that follows the pause, so the one #runRegister
 					// writes as demand leaves has nothing left to declare.
 					this.#end = undefined;
