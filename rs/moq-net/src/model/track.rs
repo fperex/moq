@@ -6596,6 +6596,33 @@ mod test {
 		open.finish().unwrap();
 	}
 
+	/// Delivery holds a pushed edge to the same standard: gone from its own track, it
+	/// skips nothing.
+	#[tokio::test]
+	async fn an_evicted_outer_edge_skips_nothing() {
+		let mut producer = track_producer("a", None);
+		let mut subscriber = producer.subscribe(Subscription::default().with_max_age(Duration::from_secs(1)));
+		append_at(&mut producer, 0);
+		// Bounds group 0's reach without being late against it.
+		append_at(&mut producer, 10);
+
+		let mut next = track_producer("b", None);
+		append_at(&mut next, 30_000);
+		append_at(&mut next, 30_010);
+		let edge = append_at(&mut next, 30_020);
+		subscriber.set_anchor(Anchor {
+			cap: None,
+			edge: next.consume().live_edge(None),
+			successor: None,
+		});
+
+		let slot = next.modify().unwrap().lookup.remove(&edge).unwrap();
+		let _ = slot.group.abort(Error::Evicted);
+
+		let group = subscriber.recv_group().await.unwrap().expect("group");
+		assert_eq!(group.sequence, 0, "a vanished outer edge is no reason to skip a group");
+	}
+
 	#[tokio::test]
 	async fn a_lower_sequence_is_never_the_live_edge() {
 		let producer = track_producer("test", None);
