@@ -179,12 +179,13 @@ type SyncOutput = {
 	// Which track's playhead the reference follows, or undefined while it follows the wall clock.
 	clock: Signal<"audio" | "video" | undefined>;
 
-	// The resolved delay from the live edge to the playhead. See `#runDelay` for how the terms combine.
+	// The resolved delay from the live edge to the playhead, which is the jitter and nothing else.
+	// The publisher's advertised flush span is the quantity the estimator measures, so it seeds the
+	// estimate (`Container.Consumer`'s `jitter` prop) rather than adding a second term here.
 	delay: Signal<Time.Milli>;
 
-	// The jitter component of `delay` (always numeric).
-	// In "auto" mode this follows the measured arrival spread, the largest across tracks.
-	// When the delay is a number, jitter equals that number.
+	// The jitter, always equal to `delay`: the widest measured arrival spread across tracks in
+	// "auto" mode, the configured number when fixed, zero when "instant".
 	jitter: Signal<Time.Milli>;
 
 	// How long the sound is held so a later picture lands with it: how much later the picture
@@ -261,7 +262,6 @@ export class Sync {
 		};
 
 		this.#signals.run(this.#runJitter.bind(this));
-		this.#signals.run(this.#runDelay.bind(this));
 		this.#signals.run(this.#runMaxAge.bind(this));
 		this.#signals.run(this.#runClock.bind(this));
 	}
@@ -313,12 +313,14 @@ export class Sync {
 		if (delay === "instant") {
 			// Holds nothing at all.
 			this.#out.jitter.set(Time.Milli.zero);
+			this.#out.delay.set(Time.Milli.zero);
 			return;
 		}
 
 		if (typeof delay === "number") {
 			// Fixed mode: the configured delay is the jitter.
 			this.#out.jitter.set(delay);
+			this.#out.delay.set(delay);
 			return;
 		}
 
@@ -360,19 +362,9 @@ export class Sync {
 
 		// The estimator drops anything past its histogram's range rather than clamping it, so a
 		// reading above the range is not a reading. Bound the buffer by it either way.
-		this.#out.jitter.set(Time.Milli.min(JITTER_CEILING, spread));
-	}
-
-	// The delay is the jitter and nothing else. The publisher's advertised flush span is not a second
-	// term: it is the same quantity the estimator measures, so it seeds the estimate (see
-	// `Container.Consumer`'s `jitter` prop) rather than flooring or adding to the result. Carrying it
-	// here too made a viewer asking for 100ms on a source declaring 300ms wait 400ms, and pinned a
-	// LAN viewer at whatever the publisher's flush span happened to be however well it delivered.
-	// "instant" holds nothing.
-	#runDelay(effect: Effect): void {
-		const mode = effect.get(this.in.delay);
-		const jitter = effect.get(this.#out.jitter);
-		this.#out.delay.set(mode === "instant" ? Time.Milli.zero : jitter);
+		const jitter = Time.Milli.min(JITTER_CEILING, spread);
+		this.#out.jitter.set(jitter);
+		this.#out.delay.set(jitter);
 	}
 
 	/**

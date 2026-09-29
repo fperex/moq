@@ -208,6 +208,26 @@ describe("auto delay", () => {
 		expect(sync.out.delay.peek()).toBe(0 as Time.Milli);
 		sync.close();
 	});
+
+	it("moves the delay with the jitter through every mode switch", async () => {
+		const delay = new Signal<Delay>("auto");
+		const sync = new Sync({ delay });
+		sync.track("audio").spread.set(120 as Time.Milli);
+		const steps = [
+			["auto", 120],
+			[300, 300],
+			["instant", 0],
+			["auto", 120],
+			[0, 0],
+		] as const;
+		for (const [mode, expected] of steps) {
+			delay.set(mode as Delay);
+			await flush();
+			expect(sync.out.jitter.peek()).toBe(Time.Milli(expected));
+			expect(sync.out.delay.peek()).toBe(Time.Milli(expected));
+		}
+		sync.close();
+	});
 });
 
 describe("clock", () => {
