@@ -791,10 +791,8 @@ export class SharedRingBuffer implements RingReader {
 	}
 
 	/**
-	 * Allocate a new ring with `newCapacity` samples and copy the unread window
-	 * [READ, WRITE) plus control state into it. Used when growing capacity so
-	 * we don't drop buffered audio. If `newCapacity` is smaller than the unread
-	 * span, the oldest samples are truncated.
+	 * Grow the ring to `newCapacity`, preserving unread samples and control state.
+	 * Shrinking is unsupported: the old reader keeps playing until the replacement arrives.
 	 *
 	 * Main thread only. `resize()` reads from the source `SharedRingBuffer` and
 	 * writes into a freshly allocated buffer from `allocSharedRingBuffer`, so it
@@ -803,6 +801,7 @@ export class SharedRingBuffer implements RingReader {
 	 * by READ/WRITE elsewhere.
 	 */
 	resize(newCapacity: number): SharedRingBuffer {
+		if (newCapacity < this.capacity) throw new Error("cannot shrink a shared audio ring");
 		const init = allocSharedRingBuffer(this.channels, newCapacity, this.rate, this.buffered);
 		const dst = new SharedRingBuffer(init);
 		dst.#anchored = this.#anchored;
@@ -815,7 +814,7 @@ export class SharedRingBuffer implements RingReader {
 		const stalled = Atomics.load(this.#control, STALLED);
 
 		const available = (write - read) | 0;
-		const copyCount = Math.max(0, Math.min(available, dst.capacity));
+		const copyCount = Math.max(0, available);
 		const copyStart = (write - copyCount) | 0;
 
 		for (let channel = 0; channel < this.channels; channel++) {
@@ -854,19 +853,8 @@ export class SharedRingBuffer implements RingReader {
 			Atomics.store(dst.#control, control, Atomics.load(this.#control, control));
 		}
 
-		const dropped = available - copyCount;
-		if (dropped > 0) {
-			if (this.#unplayed === read) {
-				Atomics.add(dst.#control, TRIMMED, dropped);
-			} else {
-				Atomics.add(dst.#control, SKIPS, 1);
-				Atomics.add(dst.#control, SKIPPED, dropped);
-			}
-		}
-
 		// Carry the unwrapped playhead over, rebased onto dst's READ. Fold the same `read`
-		// snapshot the copy used so both sides agree on one observation; `copyStart` is at or
-		// ahead of it whenever the copy dropped the oldest samples.
+		// snapshot the copy used so both sides agree on one observation.
 		dst.#position = this.#foldRead(read) + ((copyStart - read) | 0);
 		dst.#lastRead = copyStart;
 		dst.#lastMedia = this.#lastMedia;

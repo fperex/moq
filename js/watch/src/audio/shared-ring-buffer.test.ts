@@ -851,21 +851,18 @@ describe("SharedRingBuffer.resize", () => {
 		expect(dst.stalled).toBe(false);
 	});
 
-	it("truncates to the newest samples when shrinking below the unread span", () => {
-		const src = create({ rate: 1000, channels: 1, capacity: 64, latency: 64 });
-		// Fill [0, 48) with value 1, then [48, 64) with value 2.
-		insert(src, 0, 48, { channels: 1, value: 1.0 });
-		insert(src, 48, 16, { channels: 1, value: 2.0 });
+	for (const consumed of [0, 16]) {
+		it(`refuses shrinking without changing buffered media after ${consumed} samples`, () => {
+			const src = create({ rate: 1000, channels: 1, capacity: 64, latency: 32 });
+			fill(src, 0, 64, { value: 0.5 });
+			if (consumed) read(src, consumed, 1);
+			const before = src.debug();
 
-		const dst = src.resize(16);
-		expect(dst.capacity).toBe(16);
-
-		// Only the most recent 16 samples fit.
-		const out = read(dst, 16, 1);
-		for (let i = 0; i < 16; i++) {
-			expect(out[0][i]).toBe(2.0);
-		}
-	});
+			expect(() => src.resize(16)).toThrow("cannot shrink a shared audio ring");
+			expect(src.debug()).toEqual(before);
+			expect(read(src, 64 - consumed, 1)[0]).toEqual(new Float32Array(64 - consumed).fill(0.5));
+		});
+	}
 });
 
 describe("buffered mode", () => {

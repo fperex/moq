@@ -64,31 +64,10 @@ test("shrinking a playing message ring counts the dropped media", () => {
 	expect(ring.timestamp).toBe(Time.Micro(525_000));
 });
 
-test("shrinking a playing shared ring counts the dropped media", () => {
-	const ring = new SharedRingBuffer(allocSharedRingBuffer(1, 1024, 1000));
-	ring.setLatency(400);
-	for (let at = 0; at < 500; at += 100) ring.insert(Time.Micro(at * 1000), [new Float32Array(100).fill(0.5)]);
-	ring.read([new Float32Array(20)]);
-	for (let at = 500; at < 1000; at += 100) ring.insert(Time.Micro(at * 1000), [new Float32Array(100).fill(0.5)]);
-	const resized = ring.resize(275);
-	expect(resized.debug().skips).toBe(1);
-	expect(resized.debug().skipped).toBe(468);
-	expect(resized.timestamp).toBe(Time.Micro(488_000));
-});
-
-test("shrinking before playback trims instead of skipping either timeline", () => {
+test("shrinking a message ring before playback trims instead of skipping", () => {
 	const post = new AudioRingBuffer({ rate: 1000, channels: 1, latency: Time.Milli(400) });
 	for (let at = 0; at < 500; at += 100) post.write(Time.Micro(at * 1000), [new Float32Array(100).fill(0.5)]);
 	post.resize(Time.Milli(100));
 	expect(post.debug().trimmed).toBe(225);
 	expect(post.debug().skipped).toBe(0);
-	const shared = new SharedRingBuffer(allocSharedRingBuffer(1, 1024, 1000, true));
-	shared.setLatency(400);
-	for (let at = 0; at < 800; at += 100) shared.insert(Time.Micro(at * 1000), [new Float32Array(100).fill(0.5)]);
-	const resized = shared.resize(128);
-	expect(resized.debug().trimmed).toBe(672);
-	expect(resized.debug().skipped).toBe(0);
-	resized.insert(Time.Micro(800_000), [new Float32Array(100).fill(0.5)]);
-	expect(resized.debug().skipped).toBe(0);
-	expect(resized.debug().trimmed).toBe(772);
 });
