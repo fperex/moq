@@ -426,8 +426,8 @@ mod tests {
 	#[test]
 	fn plays_silence_from_the_ceiling_on() {
 		let rate = 48_000;
-		// Room tone under the signal, which is what the estimator used to hand back here: with
-		// comfort noise this block came back at the room's own level and never stopped.
+		// Room tone under the signal: with comfort noise this block would come back at the
+		// room's own level and never stop.
 		let mut history = tone(rate, 0.05, 997.0, 0.5, 1);
 		let room = white(rate, 0.05, 0.002, 1);
 		for (sample, noise) in history.iter_mut().zip(&room) {

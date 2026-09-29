@@ -183,8 +183,8 @@ async fn an_immediately_drained_replacement_keeps_the_serving_session() {
 	tokio::time::sleep(Duration::from_millis(150)).await;
 	first.drain().send(moq_net::goaway::Goaway::new()).expect("send goaway");
 
-	// The replacement is waved away before it serves anything, the way a draining
-	// relay used to answer a redial.
+	// The replacement is waved away before it serves anything, as a peer that
+	// accepts during its drain answers a redial.
 	let second = tokio::time::timeout(Duration::from_secs(10), sessions.recv())
 		.await
 		.expect("never redialed")
@@ -294,13 +294,12 @@ async fn a_peer_away_longer_than_a_relay_restart_is_reconnected_to() {
 	let url: url::Url = format!("tcp://127.0.0.1:{port}/").parse().expect("parse url");
 	let connection = client(backoff).connect(url);
 
-	// Twice the window this default used to carry, and past a relay's drain plus the
-	// time a process takes to come back. On the paused clock it costs nothing.
+	// Past a relay's drain plus the time a process takes to come back. On the paused
+	// clock it costs nothing.
 	tokio::time::sleep(Duration::from_secs(20)).await;
 
 	// Still retrying. The budget is measured on this same clock, so an outage the
-	// window covers cannot have ended the loop, however far any one dial got; the
-	// window this default used to carry would have ended it 10s ago.
+	// window covers cannot have ended the loop, however far any one dial got.
 	assert!(
 		tokio::time::timeout(Duration::ZERO, connection.closed()).await.is_err(),
 		"the client gave up on a peer that was away for 20s"

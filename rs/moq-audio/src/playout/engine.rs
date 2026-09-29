@@ -945,7 +945,7 @@ mod tests {
 		// The distance between a microphone on a local relay and a publisher that packs
 		// seven frames into one flush, which is a rendition switch or an estimate that
 		// has only now seen the wider path. The buffer is left below half the level it is
-		// asked to hold, which is the range the half gate used to leave alone.
+		// asked to hold.
 		let rise = Duration::from_millis(180);
 		assert!(
 			before.buffered * 2 < before.target + rise + PACKET,

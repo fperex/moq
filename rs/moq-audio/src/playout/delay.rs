@@ -8,14 +8,8 @@
 //! The design is WebRTC's NetEq (`modules/audio_coding/neteq/`:
 //! `underrun_optimizer.cc`, `packet_arrival_history.cc`, `histogram.cc`,
 //! `delay_manager.cc`, `delay_constraints.cc`), reimplemented in `f64` from the
-//! described algorithm rather than ported: the fixed point exists for 2010-era DSPs
-//! and is where a cross-language parity bug would live.
-//!
-//! Each frame is measured against the fastest recent arrival rather than against the
-//! previous one, so a path that slowly gets worse reads as a delay climbing to its
-//! real size instead of as a string of tiny inter-arrival deltas. Those delays feed a
-//! histogram read at a high quantile, because network delay is one-sided and
-//! heavy-tailed.
+//! described algorithm rather than ported: its fixed point is where a cross-language
+//! parity bug would live.
 
 use std::collections::VecDeque;
 use std::time::Duration;

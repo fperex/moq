@@ -47,19 +47,14 @@ pub struct Options {
 	/// slot: `Some` turns the jitter buffer on and [`Consumer`](super::Consumer)
 	/// hands back playout blocks instead of decoded packets.
 	///
-	/// A floor, not a target. The buffer is sized from what actually arrives
-	/// (`doc/concept/playout.md`), and this is the least it may size itself to, for
-	/// a caller who knows something the arrivals do not say. The estimator raises it
-	/// whenever the path asks for more.
+	/// A floor, not a target: the estimator sizes the buffer from what actually
+	/// arrives (`doc/concept/playout.md`) and never below this.
 	///
-	/// It has to fit under [`max_age`](Self::max_age), which is the ceiling on how
-	/// deep the buffer may grow rather than the budget in force: playout claims three
-	/// quarters of it, always leaves it the headroom it has to keep above the target
-	/// (a bucket, a block, and a time stretch, 105 ms), and never takes more than
-	/// [`DELAY_MAX`](Self::DELAY_MAX) whatever the budget says. A floor that does not
-	/// fit is refused rather than clamped, since clamping would leave playback
-	/// holding less than the caller asked for and say nothing. Leave room above the
-	/// floor, or the estimator has nowhere to raise the target to.
+	/// It has to fit under [`max_age`](Self::max_age): playout claims three quarters
+	/// of it, keeps 105 ms of headroom above the target (a bucket, a block, and a
+	/// time stretch), and never takes more than [`DELAY_MAX`](Self::DELAY_MAX). A
+	/// floor that does not fit is refused rather than clamped, and one with no room
+	/// above it leaves the estimator nowhere to raise the target to.
 	///
 	/// `None`, the default, decodes without buffering: each packet comes back as it
 	/// is decoded, which is what a recorder or an export wants.
