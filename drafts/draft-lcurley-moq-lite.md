@@ -999,6 +999,7 @@ The publisher SHOULD start at the oldest group at or above the floor that [Expir
 A `Subscriber Max Age` of 0 therefore starts at the latest group, since every older group is already stale.
 A subscriber that buffers is then handed the head of what it can still play instead of only the live edge, and is never sent history it would discard on arrival: the same bound decides what to start at and what to expire, so the two cannot disagree.
 A floor above the latest group simply waits there: that is a resumed subscription naming where it left off.
+A publisher whose media paused SHOULD NOT start a subscription made after the pause before the group that marks it: until the media resumes, no newer group exists for [Expiration](#expiration) to judge the older ones against.
 Reaching back is best-effort, not a guarantee that the groups still exist; see `Publisher Max Age` in [TRACK_INFO](#track-info).
 
 **Group End**:
@@ -1331,6 +1332,7 @@ The `Message Length` describes the payload size on the wire.
 ## moq-lite-07
 
 - Clarified that a group reset for exceeding the subscription max age uses OLD.
+- A subscription made after the publisher's media paused starts no earlier than the group marking the pause.
 
 - Assigned `moq-lite-07` as this draft's protocol identifier.
 - Hid routes with a `.`-prefixed segment below the requested prefix from announce discovery, and added the ANNOUNCE_REQUEST `Hidden` field to opt in.

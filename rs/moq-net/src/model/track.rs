@@ -229,6 +229,10 @@ pub(crate) struct TrackState {
 	// [`Consumer::poll_start`]) wait on it; everything else treats the floor as usual.
 	start_pending: bool,
 
+	// The break the publisher last declared (see [`Producer::break_at`]): a subscription
+	// made since starts there at the earliest. Only moves forward.
+	break_sequence: u64,
+
 	// Where production stopped, snapshotted when the cached groups are released (an
 	// abort, or the last producer dropping). Computed live from the cache otherwise;
 	// see [`Self::resume_position`].
@@ -1068,6 +1072,16 @@ impl TrackState {
 		self.start_pending = pending;
 	}
 
+	/// Record a break, refusing one that moves backward or past the next group.
+	fn set_break(&mut self, sequence: u64) -> Result<()> {
+		let next = self.max_sequence.map_or(0, |max| max.saturating_add(1));
+		if sequence < self.break_sequence || sequence > next {
+			return Err(Error::ProtocolViolation);
+		}
+		self.break_sequence = sequence;
+		Ok(())
+	}
+
 	/// Record the exclusive final sequence, rejecting a re-finish or a boundary that
 	/// would orphan already-produced groups.
 	fn set_final(&mut self, final_sequence: u64) -> Result<()> {
@@ -1463,6 +1477,19 @@ impl Producer {
 		Ok(())
 	}
 
+	/// Mark a break in the timeline at group `sequence`: a subscription made afterwards
+	/// starts there at the earliest, however far back its budget reaches, while a fetch
+	/// still reaches the groups before it.
+	///
+	/// For a publisher whose media stops and later resumes, such as an encoder paused for
+	/// lack of demand. Max Age measures a group against the newest one, so until the
+	/// resumed media arrives the last group before the pause still reads as live.
+	/// `sequence` may name the next group to be produced. A break only moves forward;
+	/// anything else is [`Error::ProtocolViolation`].
+	pub fn break_at(&mut self, sequence: u64) -> Result<()> {
+		self.modify()?.set_break(sequence)
+	}
+
 	/// Declare the floor a subscription asked for while the serving session has yet to
 	/// resolve its start: nothing below `sequence` arrives, exactly as [`Self::start_at`],
 	/// but [`Consumer::poll_start`] keeps waiting until a later [`Self::start_at`]
@@ -1610,7 +1637,8 @@ impl Producer {
 	/// The info is fixed at creation, so there's nothing to wait for (no
 	/// SUBSCRIBE_OK round trip). Pass `None` for [`Subscription::default`].
 	///
-	/// The read cursor starts at the group the subscription named (its floor), or 0.
+	/// The read cursor starts at the group the subscription named (its floor), or 0,
+	/// but never before the track's last break (see [`Producer::break_at`]).
 	/// [`Subscription::max_age`] is what asks for data: delivery skips everything above
 	/// the floor that the budget convicts, so the default budget of zero delivers only
 	/// the latest group and a larger one reaches back over what it can still use.
@@ -1622,7 +1650,8 @@ impl Producer {
 		// subscriber surfaces the close/abort on its first read; the preferences are
 		// simply never registered (nothing aggregates them anymore).
 		let info = self.info.clone();
-		let min_sequence = floor_of(&preferences);
+		let break_floor = self.state.read().break_sequence;
+		let min_sequence = floor_of(&preferences).max(break_floor);
 		let subscription = kio::Producer::new(preferences);
 		register_subscription(self.state.read(), &subscription);
 		let drift_anchor = kio::Producer::new(Anchor::default());
@@ -1638,6 +1667,7 @@ impl Producer {
 				state: self.state.consume(),
 				subscription,
 				min_sequence,
+				break_floor,
 				index: 0,
 				datagram_index: 0,
 				next_sequence: 0,
@@ -2378,7 +2408,8 @@ impl Consumer {
 	/// [`Subscriber`] once the track info is available, or the track's abort error (or
 	/// [`Error::Dropped`]) if it is already closed.
 	///
-	/// The read cursor starts at the group the subscription named (its floor), or 0.
+	/// The read cursor starts at the group the subscription named (its floor), or 0,
+	/// but never before the track's last break (see [`Producer::break_at`]).
 	/// [`Subscription::max_age`] is what asks for data: delivery skips everything above
 	/// the floor that the budget convicts, so the default budget of zero delivers only
 	/// the latest group and a larger one reaches back over what it can still use.
@@ -2823,7 +2854,8 @@ impl Subscribing {
 					.map_err(|e| e.abort.clone().unwrap_or(Error::Dropped))??;
 
 				let drift_anchor = kio::Producer::new(Anchor::default());
-				let min_sequence = floor_of(&self.subscription.read());
+				let break_floor = state.read().break_sequence;
+				let min_sequence = floor_of(&self.subscription.read()).max(break_floor);
 				Poll::Ready(Ok(Subscriber {
 					name: self.name.clone(),
 					broadcast: self.broadcast.clone(),
@@ -2832,6 +2864,7 @@ impl Subscribing {
 						state: state.clone(),
 						subscription: self.subscription.clone(),
 						min_sequence,
+						break_floor,
 						index: 0,
 						datagram_index: 0,
 						next_sequence: 0,
@@ -3393,6 +3426,9 @@ struct PlainSubscriber {
 	datagram_index: usize,
 	/// Minimum sequence to return from any `recv` method. Set by `start_at`.
 	min_sequence: u64,
+	/// The track's break when this subscription was made, which `start_at` never goes
+	/// below (see [`Producer::break_at`]).
+	break_floor: u64,
 	/// One past the highest sequence returned by `next_group`.
 	/// Used only by that method to skip late arrivals; does not affect `recv_group`.
 	next_sequence: u64,
@@ -4033,7 +4069,8 @@ impl Subscriber {
 		self.end_at(end.map_or(Bound::Unbounded, Bound::Excluded));
 	}
 
-	/// Start this subscriber's read cursor at the given sequence.
+	/// Start this subscriber's read cursor at the given sequence, but never before the
+	/// break the track had when this subscription was made.
 	///
 	/// A local filter, not a request: it doesn't tell the publisher anything, so the
 	/// skipped groups are still delivered and simply not returned. To ask the publisher
@@ -4041,7 +4078,7 @@ impl Subscriber {
 	/// See [Local cursor vs wire preference](Self#local-cursor-vs-wire-preference).
 	pub(crate) fn start_at(&mut self, sequence: u64) {
 		match &mut self.inner {
-			SubscriberKind::Plain(plain) => plain.min_sequence = sequence,
+			SubscriberKind::Plain(plain) => plain.min_sequence = sequence.max(plain.break_floor),
 			SubscriberKind::Spliced(spliced) => spliced.start_at(sequence),
 		}
 	}
@@ -6300,6 +6337,82 @@ mod test {
 
 		let mut subscriber = producer.subscribe(None);
 		assert_eq!(drain(&mut subscriber), vec![1]);
+	}
+
+	/// Media up to 200ms, then the marker a pausing publisher writes where it stopped, with the
+	/// break declared at it.
+	fn paused(producer: &mut Producer) -> u64 {
+		for millis in [0, 100, 200] {
+			append_at(producer, millis);
+		}
+		let marker = append_at(producer, 200);
+		producer.break_at(marker).unwrap();
+		marker
+	}
+
+	/// Max Age measures a group against the newest one, and the newest is the marker, stamped where
+	/// the media stopped: nothing yet says the media before it is stale. The break is what does, for
+	/// an in-process subscription and a served one alike.
+	#[test]
+	fn a_subscription_made_after_a_break_starts_there() {
+		let mut producer = track_producer("test", None);
+		let marker = paused(&mut producer);
+
+		let mut local = producer.subscribe(replay());
+		assert_eq!(drain(&mut local), vec![marker]);
+		let mut served = producer.consume().subscribe(replay()).now_or_never().unwrap().unwrap();
+		assert_eq!(drain(&mut served), vec![marker]);
+
+		// Resumed media follows as usual.
+		let resumed = append_at(&mut producer, 10_000);
+		assert_eq!(drain(&mut local), vec![resumed]);
+	}
+
+	#[test]
+	fn a_break_leaves_a_subscription_made_before_it_alone() {
+		let mut producer = track_producer("test", None);
+		let mut open = producer.subscribe(replay());
+		let marker = paused(&mut producer);
+		assert_eq!(drain(&mut open), vec![0, 1, 2, marker]);
+	}
+
+	/// A SUBSCRIBE_UPDATE can move a served start back, but not before the break the subscription
+	/// was made after.
+	#[test]
+	fn a_lowered_start_stays_at_the_break() {
+		let mut producer = track_producer("test", None);
+		let marker = paused(&mut producer);
+		let mut later = producer.subscribe(replay());
+		later.start_at(0);
+		assert_eq!(drain(&mut later), vec![marker]);
+	}
+
+	#[test]
+	fn a_fetch_still_reaches_a_group_before_the_break() {
+		let mut producer = track_producer("test", None);
+		paused(&mut producer);
+		let group = producer.consume().fetch_group(0, None).now_or_never().unwrap().unwrap();
+		assert_eq!(group.sequence, 0);
+	}
+
+	#[test]
+	fn a_break_only_moves_forward_to_the_next_group_at_most() {
+		let mut producer = track_producer("test", None);
+		assert!(matches!(producer.break_at(1), Err(Error::ProtocolViolation)));
+		producer.break_at(0).unwrap();
+		append_at(&mut producer, 0);
+		append_at(&mut producer, 100);
+
+		// The next group, twice: declaring the same break again changes nothing.
+		producer.break_at(2).unwrap();
+		producer.break_at(2).unwrap();
+		assert!(matches!(producer.break_at(1), Err(Error::ProtocolViolation)));
+		assert!(matches!(producer.break_at(3), Err(Error::ProtocolViolation)));
+
+		// A new track starts without one.
+		let mut fresh = track_producer("test", None);
+		let first = append_at(&mut fresh, 0);
+		assert_eq!(drain(&mut fresh.subscribe(replay())), vec![first]);
 	}
 
 	#[test]
