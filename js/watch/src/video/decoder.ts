@@ -686,20 +686,32 @@ class DecoderTrack {
 		// Nothing has been decoded yet, so the first thing fed to the codec has to be a keyframe.
 		let keyframeNeeded = true;
 		let decodedGroup: number | undefined;
+		// The groups of the last media frame and the last endpoint read. A group that ends with an
+		// endpoint and no media is a declared break, which the discontinuity count alone cannot
+		// tell apart from lost content.
+		let mediaGroup: number | undefined;
+		let endGroup: number | undefined;
 
 		effect.spawn(async () => {
 			for (;;) {
 				const next = await nextMedia(consumer);
 				if (!next) break;
 
-				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
+				const { frame } = next;
+				// Lost content or a declared break: flush queued/in-flight video and re-anchor before decoding.
 				if (this.#onDiscontinuity(next.discontinuity)) {
 					previous = undefined;
 					keyframeNeeded = true;
+					// A break ahead of everything decoded ends that timeline, and whatever resumes it
+					// (a new upstream behind a relay) may number its groups from anywhere. Lost content
+					// must not re-open an older GOP, and neither may a break arriving behind live media.
+					const declared = !frame && next.group === endGroup && next.group !== mediaGroup;
+					if (declared && decodedGroup !== undefined && next.group > decodedGroup) decodedGroup = undefined;
 				}
 
-				const { frame } = next;
+				if (next.end !== undefined) endGroup = next.group;
 				if (!frame) continue; // The group is done
+				mediaGroup = next.group;
 				// Groups can arrive newest-first, but a stateful video codec cannot rewind to an older GOP.
 				if (decodedGroup !== undefined && next.group < decodedGroup) continue;
 

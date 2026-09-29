@@ -434,6 +434,51 @@ test("a declared marker still resets video when its group arrives behind live me
 	}
 });
 
+test("a declared break lets a restarted group sequence decode", async () => {
+	const fx = fixture();
+	// Stamped with media time, as a publisher does, so the subscription's age budget reads the
+	// restarted groups as the live edge they are.
+	const write = (group: Moq.Group.Producer, timestamp: number) => {
+		const header = Moq.Varint.encode(timestamp);
+		const payload = new Uint8Array(header.length + 1);
+		payload.set(header);
+		payload[header.length] = 1;
+		group.writeFrame({ payload, timestamp: Time.Timestamp.fromMicros(Time.Micro(timestamp)) });
+	};
+	const live = new Moq.Group.Producer(10);
+	const marker = new Moq.Group.Producer(11);
+	const restarted = [new Moq.Group.Producer(0), new Moq.Group.Producer(1)];
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		fx.track.writeGroup(live);
+		write(live, 10_000_000);
+		write(live, 10_033_000);
+		live.close();
+		await settle();
+
+		// A new upstream behind the break numbers its groups from zero.
+		fx.track.writeGroup(marker);
+		Container.Legacy.writeMarker(marker, Time.Micro(10_066_000));
+		await settle();
+		for (const [i, group] of restarted.entries()) {
+			fx.track.writeGroup(group);
+			write(group, 12_000_000 + i * 2_000_000);
+			write(group, 12_033_000 + i * 2_000_000);
+			group.close();
+			await settle();
+		}
+
+		expect(built).toHaveLength(1);
+		expect(built[0].timestamps).toEqual([10_000_000, 10_033_000, 12_000_000, 12_033_000, 14_000_000, 14_033_000]);
+		expect(built[0].chunks).toEqual(["key", "delta", "key", "delta", "key", "delta"]);
+	} finally {
+		live.close();
+		marker.close();
+		for (const group of restarted) group.close();
+		fx.close();
+	}
+});
+
 test("a forward discontinuity waits for the next keyframe", async () => {
 	type Next = NonNullable<Awaited<ReturnType<Container.Consumer["next"]>>>;
 	const frame = (
@@ -460,6 +505,44 @@ test("a forward discontinuity waits for the next keyframe", async () => {
 	try {
 		await settle();
 		expect(built[0].timestamps).toEqual([10_000_000, 10_033_000, 10_099_000, 10_132_000]);
+	} finally {
+		fx.close();
+		read.mockRestore();
+	}
+});
+
+test("neither lost content nor a break behind live media re-opens an older GOP", async () => {
+	type Next = NonNullable<Awaited<ReturnType<Container.Consumer["next"]>>>;
+	const frame = (group: number, timestamp: number, discontinuity: number): Next => ({
+		group,
+		discontinuity,
+		continuous: false,
+		frame: { payload: payload(1), timestamp: Time.Micro(timestamp), keyframe: true },
+	});
+	const done = (group: number, discontinuity: number, end?: number): Next => ({
+		group,
+		discontinuity,
+		continuous: false,
+		frame: undefined,
+		end: end === undefined ? undefined : Time.Micro(end),
+	});
+	const results: Next[] = [
+		frame(10, 10_000_000, 0),
+		// A declared break arriving behind the live GOP.
+		done(6, 0, 5_033_000),
+		done(6, 1),
+		frame(5, 5_000_000, 1),
+		frame(11, 10_066_000, 1),
+		// Lost content, surfaced on a group that closes without media.
+		done(12, 2),
+		frame(7, 7_000_000, 2),
+		frame(13, 10_132_000, 2),
+	];
+	const read = spyOn(Container.Consumer.prototype, "next").mockImplementation(async () => results.shift());
+	const fx = fixture();
+	try {
+		await settle();
+		expect(built[0].timestamps).toEqual([10_000_000, 10_066_000, 10_132_000]);
 	} finally {
 		fx.close();
 		read.mockRestore();
