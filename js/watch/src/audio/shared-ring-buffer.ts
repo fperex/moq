@@ -776,10 +776,6 @@ export class SharedRingBuffer implements RingReader {
 	}
 
 	/**
-	 * Flush buffered samples and re-stall, ready to anchor the next utterance (buffered mode).
-	 * Main thread only. The worklet reader sees STALLED and stops until the next insert.
-	 */
-	/**
 	 * The publisher declared the timeline finished here: play out what is buffered, then silence.
 	 * Main thread only.
 	 *
@@ -796,6 +792,10 @@ export class SharedRingBuffer implements RingReader {
 		Atomics.store(this.#control, STALLED, 0);
 	}
 
+	/**
+	 * Flush buffered samples and re-stall, ready to anchor the next utterance (buffered mode).
+	 * Main thread only. The worklet reader sees STALLED and stops until the next insert.
+	 */
 	reset(): void {
 		this.#anchored = false;
 		this.#resumed = undefined;
