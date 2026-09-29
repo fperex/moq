@@ -80,3 +80,45 @@ test("the probe copies ring counters and identifies replacement graphs", () => {
 		jest.useRealTimers();
 	}
 });
+
+for (const failure of ["constructor", "connect"] as const) {
+	test(`a replacement analyser ${failure} failure cannot sample the previous graph`, () => {
+		jest.useFakeTimers();
+		const original = Object.getOwnPropertyDescriptor(globalThis, "AnalyserNode");
+		let replacing = false;
+		Object.defineProperty(globalThis, "AnalyserNode", {
+			configurable: true,
+			value: class {
+				fftSize = 2048;
+				constructor() {
+					if (replacing && failure === "constructor") throw new Error("constructor failed");
+				}
+				getFloatTimeDomainData(pcm: Float32Array) {
+					pcm.fill(0.5);
+				}
+			},
+		});
+		const node = () => ({
+			context: {},
+			connect() {
+				if (replacing && failure === "connect") throw new Error("connect failed");
+			},
+		});
+		let root = node();
+		const running = probe(watch({ root: { peek: () => root } }));
+		try {
+			jest.advanceTimersByTime(250);
+			expect(running.drain()[0].rms).toBe(0.5);
+			replacing = true;
+			root = node();
+			jest.advanceTimersByTime(500);
+			expect(running.drain().map((sample) => sample.rms)).toEqual([undefined, undefined]);
+			expect(running.notes()).toEqual([`analyser: ${failure} failed`]);
+		} finally {
+			running.stop();
+			if (original) Object.defineProperty(globalThis, "AnalyserNode", original);
+			else Reflect.deleteProperty(globalThis, "AnalyserNode");
+			jest.useRealTimers();
+		}
+	});
+}

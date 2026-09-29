@@ -114,19 +114,19 @@ export function probe(watch: MoqWatch): Probe {
 
 	const attach = () => {
 		const root = maybe(() => watch.audio.out.root.peek());
-		if (!root || root === attachedTo) return;
+		if (root === attachedTo) return;
+		attachedTo = root;
 		generation++;
+		analyser = undefined;
+		pcm = undefined;
+		if (!root) return;
 		try {
 			const node = new AnalyserNode(root.context, { fftSize: 2048 });
 			root.connect(node);
 			analyser = node;
 			pcm = new Float32Array(node.fftSize);
-			attachedTo = root;
 		} catch (err) {
 			notes.push(`analyser: ${err instanceof Error ? err.message : String(err)}`);
-			// Claim the root even though the analyser never attached, or every later sample retries
-			// the same failing construction and pushes the same note again.
-			attachedTo = root;
 		}
 
 		const context = maybe(() => watch.audio.out.context.peek());
