@@ -32,12 +32,33 @@ function level(t: number, periods: readonly [number, number]): number {
 	return 0.05 * (1.2 + Math.sin((2 * Math.PI * t) / periods[0])) * (1.2 + Math.sin((2 * Math.PI * t) / periods[1]));
 }
 
-/** `seconds` of mono source: a 440 Hz tone under {@link level}. Other `periods` make a different film. */
+/**
+ * Onsets of 12 ms hits at irregular gaps of 80 to 400 ms, from a fixed seed: the transients that
+ * make a window misplaced by a few milliseconds read differently, as they do in a film.
+ */
+function hits(seconds: number): number[] {
+	let seed = 0x5eed;
+	const next = () => {
+		seed = (seed * 1103515245 + 12345) % 2 ** 31;
+		return seed / 2 ** 31;
+	};
+	const onsets: number[] = [];
+	for (let t = 0.1; t < seconds; t += 0.08 + 0.32 * next()) onsets.push(t);
+	return onsets;
+}
+
+/** `seconds` of mono source: a 440 Hz tone under {@link level}, with hits outside the quiet stretch. Other `periods` make a different film. */
 export function source(seconds = 85, periods: readonly [number, number] = [5.3, 1.7]): Float32Array {
 	const pcm = new Float32Array(Math.round(seconds * RATE));
+	const onsets = hits(seconds);
+	let hit = 0;
 	for (let i = 0; i < pcm.length; i++) {
 		const t = i / RATE;
-		pcm[i] = level(t, periods) * Math.sin(2 * Math.PI * 440 * t);
+		while ((onsets[hit + 1] ?? Number.POSITIVE_INFINITY) <= t) hit++;
+		const onset = onsets[hit] ?? Number.NEGATIVE_INFINITY;
+		const quiet = t >= QUIET[0] && t < QUIET[1];
+		const lift = !quiet && t >= onset && t < onset + 0.012 ? 4 : 1;
+		pcm[i] = lift * level(t, periods) * Math.sin(2 * Math.PI * 440 * t);
 	}
 	return pcm;
 }

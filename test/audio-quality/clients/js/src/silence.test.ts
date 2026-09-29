@@ -131,3 +131,23 @@ test("the decoded span covers the search either side of the row's playheads", ()
 		reason: "no window has a playhead",
 	});
 });
+
+test("a quiet final window, with no later report to bracket it, is still placed", () => {
+	// The row ends forty seconds in, inside the authored quiet stretch.
+	const all = samples(film, { count: 160 });
+	const window = graded(all);
+	expect(window.at(-1)?.rms).toBeLessThan(0.001);
+
+	const proof = prove(all, window, reference(film));
+	expect(proof.reason).toBeUndefined();
+	expect(proof.quietWindows.at(-1)).toMatchObject({ at: window.at(-1)?.at, reference: expect.any(Number) });
+	expect(proof.quietWindows.at(-1)?.refused).toBeUndefined();
+});
+
+test("repeated stretches between reports widen the bracket instead of refusing it", () => {
+	const all = samples(film, { expandAt: 150 });
+	for (const s of all.slice(150)) if (s.playout) s.playout = { ...s.playout, expands: 3 };
+	const proof = prove(all, graded(all), reference(film));
+	expect(proof.reason).toBeUndefined();
+	expect(proof.proven).toBe(true);
+});
