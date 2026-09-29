@@ -145,13 +145,13 @@ export const METRICS: Record<string, MetricSpec> = {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Concealment decisions that generated audio to cover a gap.",
+		description: "Time-stretch decisions that lengthened buffered audio.",
 	},
 	stretched_samples: {
 		unit: "samples",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Samples whose duration was altered by stretching or concealment, reported in ms.",
+		description: "Magnitude of net compression minus expansion, in ms; a lower bound on altered duration.",
 	},
 	skipped_groups: {
 		unit: "count",

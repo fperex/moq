@@ -247,9 +247,9 @@ if (
 	});
 }
 
-const counter = (key: "skips" | "skipped" | "discarded" | "short" | "accelerates" | "expands" | "stretched") =>
+const counter = (key: "skips" | "skipped" | "discarded" | "short" | "accelerates" | "expands") =>
 	rise(window.map((sample) => sample.playout?.[key]));
-const duration = (key: "skipped" | "discarded" | "stretched") => {
+const duration = (key: "skipped" | "discarded") => {
 	const count = counter(key);
 	return count === null || firstPlayout === undefined ? null : (count * 1000) / firstPlayout.rate;
 };
@@ -259,7 +259,11 @@ const discardedMs = duration("discarded");
 const shortQuanta = counter("short");
 const accelerates = counter("accelerates");
 const expands = counter("expands");
-const stretchedMs = duration("stretched");
+const lastPlayout = playout.at(-1);
+const stretchedMs =
+	firstPlayout && lastPlayout
+		? (Math.abs(lastPlayout.stretched - firstPlayout.stretched) * 1000) / firstPlayout.rate
+		: null;
 
 const underrunCounts = window.map((s) => s.underruns);
 const hasCounter = underrunCounts.some((c) => typeof c === "number");

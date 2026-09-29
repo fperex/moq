@@ -93,6 +93,22 @@ test("late writes and startup trim are separate from skipped playback", () => {
 	expect(summary.metrics.discarded_samples_total).toBe(10);
 });
 
+test("expansion contributes to the magnitude of net time stretching", () => {
+	const summary = analyze((sample) => ({
+		...sample,
+		playout: { ...diagnostic, stretched: sample.at >= 20000 ? -2646 : 0 },
+	}));
+	expect(summary.metrics.stretched_samples_total).toBe(60);
+});
+
+test("opposite time stretches report their net, as the replay lane does", () => {
+	const summary = analyze((sample) => ({
+		...sample,
+		playout: { ...diagnostic, stretched: sample.at >= 20000 && sample.at < 30000 ? 2646 : 0 },
+	}));
+	expect(summary.metrics.stretched_samples_total).toBe(0);
+});
+
 test("a missing diagnostic counter remains unmeasured", () => {
 	const summary = analyze((sample) => ({ ...sample, playout: undefined }));
 	expect(summary.metrics.skip_aheads_total).toBeNull();
