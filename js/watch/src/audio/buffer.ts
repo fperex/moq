@@ -279,15 +279,9 @@ export function createAudioBuffer(worklet: RingTarget, props: AudioBufferProps):
 let reported = false;
 
 /**
- * Say which transport the page's own ring writes run on, once per document.
- *
- * Cross-origin isolation is a property of the page, so every player on it lands on the same
- * transport and each one saying so is the same line repeated. Neither answer is a fault: a page
- * that is not isolated cannot have shared memory and the postMessage ring is what it runs on, so
- * this is a note about the page rather than a warning about the player.
- *
- * The page's alone: the audio worker writes by message whatever the page is, so isolating the page
- * would change nothing for it, and advice to do so would be wrong.
+ * Say which transport the page's own ring writes run on, once per document: isolation is the page's,
+ * so every player lands on the same one. A note, not a warning, since neither answer is a fault. The
+ * audio worker writes by message whatever the page is, so this describes the page's own writes only.
  */
 export function reportTransport(shared: boolean): void {
 	if (reported) return;

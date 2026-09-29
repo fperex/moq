@@ -9,9 +9,8 @@ test("closing a producer whose track already closed does not throw", () => {
 	const producer = new Producer(track, new Format("video"));
 	producer.encode(payload(8), Time.Micro(0), true);
 
-	// The track can close under the producer: its last subscriber leaving now releases it, which is
-	// what makes the next subscription a real one. Flushing an endpoint into the group it tore down
-	// used to throw "group is closed" out of whatever was tidying up.
+	// The track can close under the producer: its last subscriber leaving releases it, which is what
+	// makes the next subscription a real one. There is no group left to flush an endpoint into.
 	track.close();
 	expect(() => producer.close()).not.toThrow();
 });

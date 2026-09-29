@@ -1,14 +1,9 @@
 /**
  * The messages between the page and its audio worker, and how the page starts one.
  *
- * One dedicated worker per document feeds the ring of every player that hands it its audio (see
- * `host.ts`): a session of its own to each relay, the subscription, the container consumer, the
- * arrival estimate, the decoder and the ring writes. The page keeps what only a document can have,
- * the AudioContext and the worklet node, and hands the worker one end of a channel whose other end
- * the worklet reads ring writes from (see `Port` in `../render.ts`). It also keeps the `Sync` every
- * track paces against and everything the UI reads, fed from the worker's reports.
- *
- * Free of anything only Vite can resolve, so it runs under `bun test` and in the worker alike.
+ * The worker does what a player's supply does (see `host.ts`); the page keeps the AudioContext, the
+ * worklet node, `Sync` and what the UI reads (see `remote.ts`). Free of anything only Vite can
+ * resolve, so it runs under `bun test` and in the worker alike.
  *
  * @module
  */

@@ -38,9 +38,8 @@ function flush(
 }
 
 describe("tune-in", () => {
-	// The regression that closed PR #3517. Its estimator learned a "frame duration" from the gap
-	// between consecutive timestamps, so the very first gap set it with nothing to validate against
-	// and a viewer read a 14.56s buffer. Written first, and it reads 14560 on that estimator.
+	// An estimator that learns a "frame duration" from the first gap between timestamps reads a
+	// 14.56s buffer here, with nothing to validate the gap against.
 	it("does not inflate from a stale frame followed by the live edge", () => {
 		const jitter = new Jitter();
 

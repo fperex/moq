@@ -27,14 +27,9 @@ export interface ConsumerProps {
 	 * Where {@link Consumer.spread} starts: the rendition's declared flush span, or an estimator
 	 * already measuring this rendition (default: neither, so the estimator's own guess).
 	 *
-	 * A duration is the publisher's catalog `jitter`, a prior the first measurement replaces. A
-	 * {@link Jitter} is a measurement already made: a receiver that stops and restarts reading the
-	 * same rendition hands its estimator to the replacement consumer rather than starting over at
-	 * the declaration, which is a guess it has already improved on. The consumer reanchors it,
-	 * since the arrival reference describes a stretch of timeline nobody was reading.
-	 *
-	 * A plain value, not a getter: a rendition that changes its declaration is a different
-	 * rendition and gets a new consumer.
+	 * Hand over the {@link Jitter} when reading the same rendition again, since it has already
+	 * improved on the declaration; the consumer reanchors it. A plain value, not a getter: a
+	 * rendition that changes its declaration is a different rendition and gets a new consumer.
 	 */
 	jitter?: Time.Milli | Jitter;
 }
@@ -410,24 +405,11 @@ export class Consumer {
 			// Where delivery stands, which decides what a verdict against the head means.
 			const cursor: number | undefined = this.#active;
 
-			// A group is measured by how far it could still reach, not by how far behind it
-			// started: it cannot present past where the next group holding a frame begins, so
-			// that bound is the freshest thing still worth waiting for, and the newest frame the
-			// track has reached is what it has aged against. This is the wire budget's rule
-			// verbatim (`Subscription::max_age`, `is_stale` in `rs/moq-net/src/model/track.rs`),
-			// which is the point: the two halves of one budget cannot be allowed to disagree.
-			//
-			// Measuring the head's own oldest undelivered frame instead makes the verdict a
-			// function of the group's length. Audio groups hold one frame, so it reads as
-			// lateness; a 2s video GOP whose tail is merely late is convicted the moment its
-			// successor opens, throwing away the rest of the GOP and leaving the picture frozen
-			// until the next keyframe, once per GOP for as long as the path stays slow.
-			//
-			// Stopping at the immediate successor instead is no bound at all when that successor
-			// holds nothing: a starved path opens groups it never fills, so the head is waited on
-			// forever while the groups behind those hold seconds of playable media. Only a group
-			// with a frame says where the timeline resumes, which is what `rs/moq-mux` measures
-			// against too.
+			// A group is measured by how far it could still reach, which the next group holding a
+			// frame bounds, against the newest frame the track has reached: the wire budget's rule
+			// (`is_stale` in `rs/moq-net/src/model/track.rs`), so the two halves of one budget
+			// agree. Measuring the head's own oldest frame would convict a long GOP whose tail is
+			// merely late, and an empty successor bounds nothing on a starved path.
 			let reach: Time.Micro | undefined;
 			for (let i = 1; i < this.#groups.length && reach === undefined; i++) {
 				reach = this.#groups[i].start;
@@ -447,17 +429,10 @@ export class Consumer {
 			// finish parsing buffered frames before deciding whether anything is missing.
 			if (!first.done && first.consumer.isClosed) break;
 
-			// The budget has run out, and what that costs depends on where the head sits.
-			//
-			// A finished group the cursor has reached belongs to next(), not to the budget: next()
-			// hands over whatever is still queued there and pops the group once it is spent, both
-			// within a microtask of being asked. Convicting one either throws away media sitting in
-			// memory ready to play, which is what a tune-in burst is, or reports a group the
-			// listener has already heard as lost. On legacy audio the second is not even quiet: a
-			// frame carries no duration, so a spent group's end reads as its last timestamp and the
-			// contiguous successor one frame later is judged a hole, which re-anchors the reader.
-			// `rs/moq-mux`'s consumer cannot reach either verdict: its read arm returns a buffered
-			// frame, and closes out a spent group as `GroupEnd`, before the budget is consulted.
+			// The budget has run out, and what that costs depends on where the head sits. A finished
+			// group the cursor has reached belongs to next(), which hands over what is queued there:
+			// convicting it would throw away media ready to play (a tune-in burst) or report a group
+			// already heard as lost, which on legacy audio also reads the next group as a hole.
 			if (first.done && first.frames.length === 0 && paused) {
 				const marker = !first.empty && !first.media;
 				const historical = this.#isHistorical(first);

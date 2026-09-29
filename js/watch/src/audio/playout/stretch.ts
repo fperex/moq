@@ -1,23 +1,13 @@
 import type { Noise } from "./noise";
 
 /**
- * Making a block of audio shorter or longer without changing its pitch.
+ * Making a block of audio shorter or longer without changing its pitch: find the pitch period, then
+ * drop or repeat one period by crossfading over it, the only length that keeps the waveform
+ * continuous. A coarse search over a 4kHz decimation picks the lag and one full-rate correlation
+ * decides whether to splice, except in a block barely above the room tone, where nobody can hear it.
  *
- * Mirrors `time_stretch.cc` and its two subclasses, `accelerate.cc` and `preemptive_expand.cc`,
- * and the Rust twin in `rs/moq-audio/src/playout/stretch.rs`. Both operations are the same splice:
- * find the pitch period, then either drop one period by crossfading over it (the buffer is too
- * full, so play the same audio in less time) or repeat one period the same way (the buffer is too
- * empty, so take longer over it). One period is the only length that leaves the waveform
- * continuous, which is why the whole thing hangs off a correlation search.
- *
- * The search runs twice. A coarse pass over a 4kHz decimation picks the lag out of 50 candidates
- * between 2.5 and 15ms, and one normalised correlation at full rate then says whether that lag is
- * good enough to splice on. A block that is barely above the room tone skips the second test
- * entirely: nobody can hear a splice in noise, and the correlation of noise is meaningless.
- *
- * PCM is planar here, one `Float32Array` per channel, because that is what the ring stores and
- * what the worklet renders. Every length derives from the sample rate, so 44.1kHz AAC works as
- * well as 48kHz Opus.
+ * Mirrors NetEq's `time_stretch.cc` (`accelerate.cc`, `preemptive_expand.cc`) and the Rust twin in
+ * `rs/moq-audio/src/playout/stretch.rs`. PCM is planar, and every length derives from the rate.
  */
 
 /** The crossfade a splice gets when the operation does not pick its own length, in milliseconds. */

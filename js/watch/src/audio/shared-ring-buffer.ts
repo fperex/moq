@@ -466,10 +466,8 @@ export class SharedRingBuffer implements RingReader {
 		// Advance WRITE (only forward)
 		Atomics.store(this.#control, WRITE, i32Max(Atomics.load(this.#control, WRITE), end));
 
-		// Un-stall once the ring holds the target and the chunk being played on top of it. The target
-		// counts the frame in play, the way NetEq's does (the `packet_buffer` span plus the sync
-		// buffer), so a ring holding the target alone holds nothing unplayed and runs dry on the first
-		// arrival that is a millisecond late. See CHUNK.
+		// Un-stall once the ring holds the target and the chunk being played on top of it: the target
+		// counts the frame in play, so the target alone runs dry on the first late arrival. See CHUNK.
 		const currentWrite = Atomics.load(this.#control, WRITE);
 		const latency = Atomics.load(this.#control, LATENCY);
 		const chunk = Atomics.load(this.#control, CHUNK);
@@ -489,23 +487,9 @@ export class SharedRingBuffer implements RingReader {
 	 * Start the playhead at the newest sample less `hold`, rather than at the oldest one.
 	 * Main thread only.
 	 *
-	 * Until the reader has taken a sample nothing on this timeline has been heard, so audio above the
-	 * level the ring holds is audio nobody is waiting on and dropping it is silent. Only once playback
-	 * has started does a surplus have to be closed by the reader's time stretch, which is seconds of
-	 * bent speech for the tens of milliseconds a resubscription admits past the hold: a fresh
-	 * subscription is served the live edge and then whatever the relay still had inside the age
-	 * budget, and all of it decodes before the first render quantum. NetEq reaches its target the same
-	 * way, by where playout starts rather than by accelerating into it, and does not adjust the buffer
-	 * at the start of a stream (`decision_logic.cc`, `delay_manager.cc`).
-	 *
-	 * The first fill only. A refill after an underrun resumes a timeline the listener is already
-	 * following, and there a publisher's flush burst is audio that will have drained again by the next
-	 * one, which is why the reader waits it out rather than dropping it.
-	 *
-	 * A whole chunk or more, because a fill lands a chunk at a time: a level that crossed the hold by
-	 * part of one is the ring sitting where it is meant to sit, and a trim that landed it anywhere but
-	 * on the hold would leave it on the very threshold the reader accelerates at. Buffered playback is
-	 * asked to hold a lookahead, so it keeps everything.
+	 * Nothing on a timeline nobody has heard yet is waited on, so dropping the surplus is silent where
+	 * stretching it away would bend seconds of speech. The first fill only, and only a whole chunk or
+	 * more; buffered playback keeps everything. See "Where playout starts" in `doc/concept/playout.md`.
 	 */
 	#trim(hold: number, chunk: number): void {
 		if (this.#resumed === undefined || this.buffered) return;
@@ -905,10 +889,9 @@ export class SharedRingBuffer implements RingReader {
 	 * READ less what the reader is still holding: a time stretch makes those two diverge, and it is
 	 * the media position, not the output frame count, that video has to be paced against.
 	 *
-	 * READ and QUEUED live in separate words, so a poll can land between the reader's two stores and
-	 * pair a fresh cursor with a stale queue. The error is bounded by one output block and only
-	 * happens at a commit, but a playhead that stepped backwards would make video wait for audio
-	 * that has already been heard, so this never reports less than it did last time.
+	 * READ and QUEUED live in separate words, so a poll can pair a fresh cursor with a stale queue.
+	 * The error is under one output block, but a playhead that stepped backwards would make video
+	 * wait for audio already heard, so this never reports less than it did last time.
 	 */
 	#media(): number {
 		const queued = Atomics.load(this.#control, QUEUED);
@@ -933,10 +916,9 @@ export class SharedRingBuffer implements RingReader {
 	 * Main thread only, and stateful for the same reason {@link timestamp} is: the rate is measured
 	 * between polls.
 	 *
-	 * The rate is the reader's own, `1 + (dSTRETCHED - dCONCEALED)/dOUTPUT`: it consumes a sample of
-	 * media per output frame while playing normally, a few percent more or less while a time stretch
-	 * converges on the target, and none at all while concealment covers a gap or while parked, so
-	 * whoever follows this playhead waits with the audio rather than running away from it.
+	 * The rate is the reader's own, `1 + (dSTRETCHED - dCONCEALED)/dOUTPUT`: one while playing, a few
+	 * percent off while a stretch converges, zero while concealing or parked, so whoever follows this
+	 * playhead waits with the audio rather than running away from it.
 	 */
 	get playhead(): Playhead | undefined {
 		if (!this.#anchored) return undefined;

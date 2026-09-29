@@ -30,9 +30,8 @@ import {
 // run the same harness, since the postMessage fallback is the path every page without cross-origin
 // isolation takes.
 //
-// The recorded fixtures are arrival timing only, trimmed from the traces attached to
-// moq-dev/moq#3477. Synthetic traces of the same shape come first because they say which property
-// broke; the recordings say whether it broke in the field.
+// The recorded fixtures are arrival timing only. Synthetic traces of the same shape come first
+// because they say which property broke; the recordings say whether it broke in the field.
 
 const RATE = 48000;
 const CHUNK = (RATE * CHUNK_MS) / 1000;

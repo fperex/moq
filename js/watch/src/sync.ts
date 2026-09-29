@@ -19,35 +19,18 @@ export type Delay = "instant" | "auto" | Time.Milli;
 // The widest measured jitter "auto" sizes a buffer from, which is the estimator's own ceiling.
 const JITTER_CEILING = Time.Milli(Container.Jitter.CEILING);
 
-// The lead a viewer does not notice, so the part of it the hold does not have to buy back.
-//
-// ITU-R BT.1359 puts the detectability window at about 45ms of sound-ahead and 125ms of
-// sound-behind. The hold only has to bring the lead inside that window, not to zero: every
-// millisecond past it is latency a conferencing player pays for nothing, and when low audio
-// latency and perfect sync disagree a call wants the latency.
+// The lead a viewer does not notice (ITU-R BT.1359: about 45ms of sound-ahead), so the part of it
+// the hold does not have to buy back: a call wants the latency more than perfect sync.
 const OFFSET_TOLERANCE = Time.Milli(45);
 
-// The most latency lip sync is worth.
-//
-// The term exists to bring the picture back inside the window a viewer notices (see
-// OFFSET_TOLERANCE), and past this a hold cannot buy that back: a picture that far behind is out
-// of sync whatever the sound does, and holding the sound with it just makes everything late. A
-// video call is the case this player is for, so the ceiling is what a call tolerates rather than
-// what a broadcast would: a self-publish measures its own camera pipeline, and the measured
-// browser publishers needed 55 to 70ms of it. Measured on an impaired path, an uncapped term
-// reached 2s during tune-in, where the video track is still replaying the backlog between the
-// last keyframe and the live edge and every arrival honestly looks that late.
+// The most latency lip sync is worth, which is what a call tolerates: a picture further behind is
+// out of sync whatever the sound does. It also bounds tune-in, where the video track replays the
+// backlog since its last keyframe and every arrival looks that late.
 const OFFSET_MAX = Time.Milli(100);
 
-// How long the hold holds a value before it may move another bucket.
-//
-// The hold is spent by the audio ring, which reaches a deeper one by parking and a shallower one
-// by time-compressing what it already holds; either is audible if it happens in a burst. It is
-// also at its least trustworthy exactly when it moves most: at tune-in the video floor is set by
-// the camera's warm-up frames, the slowest the track will ever be, and a hold derived from them
-// would sit at the cap until both windows have rotated past them. A bucket per second is one
-// stretch period per second, which speech carries, and it is slow enough that a transient rotates
-// out of the windows before the hold has grown into it.
+// How long the hold holds a value before it may move another bucket. The ring spends every move as
+// a park or a stretch, audible in a burst, and a transient such as the camera's warm-up frames
+// rotates out of the windows before the hold has grown into it.
 const OFFSET_STEP = Time.Milli(1_000);
 
 // How long one track's arrival floor stands before it stops counting.
@@ -57,15 +40,9 @@ const OFFSET_STEP = Time.Milli(1_000);
 // the rest of the session. Wide enough that an ordinary group cadence refreshes it many times over.
 const OFFSET_WINDOW = Time.Milli(2_000);
 
-// How long a track's reading stays in the comparison after the track stops publishing one.
-//
-// A rendition that leaves the catalog and comes back, which is what hiding a camera or a
-// microphone does, is away for a few hundred milliseconds. Dropping its reading the instant it
-// goes takes the shared delay down to whatever the remaining tracks measured and its return puts
-// it straight back, and the audio ring pays for both: it is resized down, then parked to refill it,
-// which is an underrun the listener hears. The same window the arrival floor above uses, for the
-// same reason: wide enough that an ordinary cadence refreshes it many times over, and narrow enough
-// that a track that has really gone stops holding the buffer open.
+// How long a track's reading stays in the comparison after the track stops publishing one. A
+// rendition that blinks (a hidden camera) would otherwise resize the ring down and straight back,
+// an underrun the listener hears; a track that has really gone still lets go.
 const SPREAD_WINDOW = Time.Milli(2_000);
 
 // Submillisecond clock noise does not move waiting frames' display deadlines.
@@ -432,22 +409,9 @@ export class Sync {
 	}
 
 	/**
-	 * Measure how much later one track arrives than the other for the same media timestamp.
-	 *
-	 * Sound and picture are meant to leave the device together. Each track's own spread is measured
-	 * against that track's fastest recent arrival, so a track that is uniformly later than the other
-	 * measures a spread of zero and nothing in the estimator can see it. This is that difference,
-	 * and it covers both halves of it at once: the path (one track's frames simply take longer) and
-	 * the publisher (an engine that stamps its video behind its audio, which is 22ms of the Firefox
-	 * case on its own). Both show up as the same quantity here because both move the frame's arrival
-	 * relative to its timestamp.
-	 *
-	 * Delaying the earlier track to match the later one is what WebRTC does in
-	 * `modules/video_coding/stream_synchronization.cc`, and for the same reason: the picture cannot
-	 * be pulled forward, so the sound has to wait.
-	 *
-	 * A whole bucket or nothing. Below the estimator's own resolution this is noise, and a term that
-	 * flickered by a millisecond would re-park the audio ring for nothing.
+	 * Measure how much later one track arrives than the other for the same media timestamp, which
+	 * neither track's own spread can see. See "Holding the sound for a later picture" in
+	 * `doc/concept/playout.md`.
 	 */
 	#observeArrival(name: "audio" | "video", timestamp: Time.Milli, now: Time.Milli): void {
 		const floor = Time.Milli.sub(now, timestamp);
@@ -456,14 +420,9 @@ export class Sync {
 		if (!entry) {
 			this.#arrivals.set(name, { current: floor, previous: Number.POSITIVE_INFINITY, opened: now });
 		} else if (Time.Milli.sub(now, entry.opened) >= 2 * OFFSET_WINDOW) {
-			// Gone for longer than the pair of windows: a mute, or a subscription rebuilt under it.
-			// What it measured carries across as the previous window rather than being thrown away,
-			// because a pause stops the download and not the path: the floor is the same one a
-			// moment later. Re-deriving the hold from a cold window instead is what moves it at the
-			// unmute, which the ring spends as a stall or a stretch just as the sound comes back.
-			// The estimator carries its own measurement across the same pause, for the same reason
-			// (`Supply.#runSpread`). The window is re-opened at `now` rather than walked forward,
-			// so one arrival costs one rotation however long the pause was.
+			// Gone past both windows (a mute): carry what it measured across as the previous window,
+			// since a pause stops the download and not the path, and a hold re-derived from a cold
+			// window would move at the unmute. Re-opened at `now`, so one arrival costs one rotation.
 			entry.previous = entry.current;
 			entry.current = floor;
 			entry.opened = now;
@@ -496,11 +455,8 @@ export class Sync {
 			return;
 		}
 
-		// Only the part of video's excess over audio that a viewer would notice, and only that
-		// excess, never the other way round. Audio is the clock and video is painted when the
-		// playhead reaches its timestamp, so a picture that arrives early is already held for free
-		// and one that arrives late is the only thing needing a term. Sound cannot be pulled
-		// forward either; the earlier track is the one that waits.
+		// Only the part of video's excess over audio a viewer would notice. An early picture is
+		// already held until the playhead reaches it, so only a late one needs the sound to wait.
 		const behind = Math.max(0, video - audio - OFFSET_TOLERANCE);
 		const bucket = Container.Jitter.BUCKET;
 		const quantised = behind < bucket ? 0 : Math.ceil(behind / bucket) * bucket;

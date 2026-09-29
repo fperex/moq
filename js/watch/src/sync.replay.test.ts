@@ -15,8 +15,7 @@ import { type Delay, Sync } from "./sync";
 // and the real estimator and watches where the two clocks end up relative to each other. The same
 // replay with the playhead withheld is the control: it is the wall-clock pacing this replaces.
 //
-// The trace is the LAN recording from `audio/replay.test.ts`: arrival timing only, trimmed from the
-// traces attached to moq-dev/moq#3477.
+// The trace is the LAN recording from `audio/replay.test.ts`: arrival timing only.
 
 const RATE = 48000;
 const QUANTUM = 128; // an AudioWorklet render quantum
@@ -76,7 +75,7 @@ interface Result {
  *
  * With `nominate`, the ring publishes its playhead the way `SharedAudioBuffer` and `Audio.Decoder`
  * do and video follows it. Without, nothing nominates and playback runs on the wall-clock anchor
- * that arrivals set, which is what this quest replaced.
+ * that arrivals set.
  */
 async function replay(nominate: boolean): Promise<Result> {
 	const time = fakeClock(0);
@@ -588,15 +587,12 @@ describe("mutes and latency presets keep video on the audio", () => {
 		expect(stale.ahead).toBeGreaterThan(500);
 	}, 120_000);
 
-	// What is left after the flush fix: the step the picture takes when the clock changes hands.
-	// While audio is the clock the picture is painted at the audio playhead, so a publisher whose
-	// two timelines disagree costs nothing visible. A mute takes the clock away and the video
-	// arrivals re-anchor playback to the live edge; the unmute hands it back and the picture returns
-	// to the playhead. The step between those two positions is the publisher's epoch offset, so a
-	// broadcast whose clocks agree returns within a frame and one whose clocks are 350ms apart takes
-	// 350ms to walk back. Measured on a browser publisher whose camera anchored 350 to 465ms ahead
-	// of its microphone: worst skew 332.9ms, 0.3s after the unmute, converging inside a frame in
-	// 0.8s, with no underruns.
+	// The step the picture takes when the clock changes hands. While audio is the clock the picture
+	// is painted at the audio playhead, so a publisher whose two timelines disagree costs nothing
+	// visible. A mute takes the clock away and the video arrivals re-anchor playback to the live
+	// edge; the unmute hands it back and the picture returns to the playhead. The step between those
+	// two positions is the publisher's epoch offset, so a broadcast whose clocks agree returns within
+	// a frame and one whose clocks are 350ms apart takes 350ms to walk back.
 	it("returns the picture to the playhead within a frame when the publisher's clocks agree", async () => {
 		const aligned = await session({ port: true, videoOffset: 0 });
 		clock?.restore();

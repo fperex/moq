@@ -127,7 +127,7 @@ describe("auto delay", () => {
 		// milliseconds. Dropping its reading the instant it goes takes the delay down to whatever
 		// the remaining tracks measured and its return puts it straight back, and the audio ring
 		// pays for both: resized down, then parked to refill, which is an underrun the listener
-		// hears. Three of five watchers on the bench took one from a 300ms camera hide.
+		// hears.
 		clock = fakeClock();
 		const sync = new Sync();
 		sync.track("audio").spread.set(40 as Time.Milli);
@@ -724,8 +724,8 @@ describe("the cross-track arrival offset", () => {
 			}
 			await flush();
 
-			// Never more than a step or two, where the uncapped term used to stand at the ceiling
-			// for as long as both windows remembered the warm-up.
+			// Never more than a step or two, where an uncapped term would stand at the ceiling for as
+			// long as both windows remembered the warm-up.
 			expect(Math.max(...held)).toBeLessThanOrEqual(Time.Milli(40));
 			// The steady cadence is inside the tolerance, so nothing is held at all.
 			expect(sync.out.offset.peek()).toBe(Time.Milli.zero);

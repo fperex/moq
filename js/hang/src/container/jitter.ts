@@ -75,27 +75,10 @@ export type JitterProps = {
 /**
  * How much buffer a receiver needs to play audio on time, measured from when frames arrive.
  *
- * Each frame is measured against the fastest recent arrival rather than against the previous one,
- * so a path that slowly gets worse reads as a delay climbing to its real size instead of as a
- * string of tiny inter-arrival deltas. Those delays feed a histogram that is read at a high
- * quantile, because network delay is one-sided and heavy-tailed and a mean plus deviations sizes
- * that tail wrong.
- *
- * The estimate rises the moment a late frame proves the buffer is too shallow and falls once a
- * second by a share of the distance left, so a refinement shrinks a viewer's buffer in steps it can
- * absorb. The fall limiter can keep the published target above the measured quantile while the
- * ring catches up. It carries no floor: the rendition's advertised jitter is the prior it starts from
- * ({@link JitterProps.start}), and the first measurement replaces it outright.
- *
- * Time the receiver spends not reading is not the path's fault, so a gap in the receiver's own
- * reading drops the arrival reference rather than reading as a delay the size of the gap. A caller
- * that can see the receiver was blocked says so with {@link JitterObservation.stalled}; the spacing
- * the estimator infers it from covers a caller that cannot.
- *
- * The algorithm is written down in `doc/concept/playout.md` and held to it by the conformance
- * corpus at `rs/moq-audio/tests/playout-01.json`. The design is WebRTC's NetEq
- * (`modules/audio_coding/neteq/`: `underrun_optimizer.cc`, `packet_arrival_history.cc`,
- * `histogram.cc`, `delay_manager.cc`), reimplemented in f64 rather than copied.
+ * Each frame's delay against the fastest recent arrival feeds a histogram read at a high quantile,
+ * and the target rises at once and falls once a second. `doc/concept/playout.md` specifies the
+ * algorithm and why, and the corpus at `rs/moq-audio/tests/playout-01.json` holds this to it. The
+ * design is WebRTC's NetEq (`modules/audio_coding/neteq/`), reimplemented in f64.
  */
 export class Jitter {
 	/**
@@ -182,20 +165,10 @@ export class Jitter {
 		}
 		this.#newest = ts;
 
-		// The arrival clock is sampled by the receiver's own read loop. When that loop does not run
-		// for a whole resample interval, the time it spent not running lands in the next arrival it
-		// stamps, and in every frame it then pulls out of the backlog, because all of them are
-		// measured against a reference taken before the gap. Drop the reference so they are measured
-		// against each other instead.
-		//
-		// The media term is what tells the receiver apart from the publisher. A track that genuinely
-		// sends one frame a second is idle for longer than the interval too, but its timeline
-		// advances by as much as the wall clock does; a receiver that was not reading comes back to
-		// a backlog, so its idle time exceeds the media it covered.
-		//
-		// A caller that watched the receiver knows this outright and says so, which is the only way
-		// to tell a block shorter than the interval from a path that flushes in bursts: the two have
-		// the same arrival spacing. The action is the same either way.
+		// A gap in the receiver's own reading lands in every frame of the backlog it then reads, so
+		// drop the reference and measure those against each other. Idle time past the media it
+		// covered is what separates that from a sparse track; `stalled` is a caller that watched the
+		// receiver saying so outright.
 		const previous = this.#previous;
 		this.#previous = { timestamp: ts, arrival };
 		if (stalled) {
@@ -299,12 +272,8 @@ export class Jitter {
 	#publish(now: number): void {
 		const optimal = this.#optimal;
 
-		// A seed is a prior, not an observation. It holds the target until the histogram has
-		// measured something, and the first measurement then replaces it outright however far below
-		// it that lands: there is no earlier measurement for the fall bound to protect, and walking
-		// down from a guess keeps a viewer above their real buffer for tens of seconds. NetEq does
-		// the same, replacing `kStartDelayMs` with the first optimal delay it gets rather than
-		// approaching it (`delay_manager.cc`).
+		// A seed is a prior, not an observation: the first measurement replaces it outright, since the
+		// fall bound only protects measurements. NetEq does the same with `kStartDelayMs`.
 		if (optimal === undefined) return;
 		if (!this.#measured) {
 			this.#measured = true;
@@ -332,10 +301,8 @@ export class Jitter {
 		if (steps <= 0) return;
 		this.#lowered += steps * LOWER_INTERVAL;
 
-		// Each step closes a share of the distance left, with one bucket as the floor. What a ring
-		// can refill scales with the buffer being shrunk, so a fixed step brakes hardest exactly
-		// when the target is furthest from what the histogram asks for: walking 1600ms back a bucket
-		// at a time takes longer than the histogram remembers why it went up.
+		// Each step closes a share of the distance left, with one bucket as the floor: what a ring
+		// can refill scales with the buffer being shrunk.
 		let target = current;
 		for (let i = 0; i < steps && target > optimal; i++) {
 			const share = Math.floor((target - optimal) / LOWER_DIVISOR / Jitter.BUCKET) * Jitter.BUCKET;
@@ -351,13 +318,8 @@ export class Jitter {
 	}
 }
 
-// Where the target sits until the first observation replaces it.
-//
-// A publisher's declared flush span is the best prior a receiver has: it is exactly the quantity
-// the estimator goes on to measure, published by the only party that already knows it. NetEq has to
-// guess 80ms because RTP carries nothing like it. Never below that guess, because a publisher can
-// declare a flush span the network then adds to, and rounded up to a whole bucket so a cold start
-// reads on the same grid every later target does.
+// Where the target sits until the first observation replaces it: the publisher's declared flush
+// span, never below NetEq's 80ms guess since the network adds to it, rounded up to a whole bucket.
 function startTarget(advertised: Time.Milli | undefined): number {
 	const ms = Math.max(START, advertised ?? 0);
 	return Math.min(Jitter.CEILING, Math.ceil(ms / Jitter.BUCKET) * Jitter.BUCKET);

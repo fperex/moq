@@ -1,28 +1,11 @@
 /**
- * Whether this receiver's own event loop is keeping frames waiting, which nothing about a frame can
- * show.
+ * Whether this receiver's own event loop kept frames waiting, which nothing about a frame can show.
  *
- * A browser content process stops reading its socket for bursts of a few hundred milliseconds,
- * whether because it was blocked outright by a long paint or because it is running flat out on a
- * keyframe. The frames that queued behind that are then read at once and stamped with the clock
- * afterwards, so they enter the estimator as late arrivals that the path never delayed. The
- * estimator infers this from arrival spacing, but a real bursty path has the same spacing, so
- * spacing alone cannot decide.
- *
- * What decides is how long a task waits in this loop. The monitor puts one on the queue, a
- * `MessageChannel` message rather than a timer, and reads back how long the loop took to get to it:
- * a loop running flat out holds it for as long as the work in front of it, and a hidden tab, which
- * rations timers and leaves ordinary tasks alone, does not hold it at all. A loop that stops dead
- * runs nothing to measure, so that is the second thing here: a stretch in which no turn of the loop
- * happened at all, neither the monitor's own tick nor an arrival being read.
- *
- * How late a timer runs measures neither of those. A hidden tab delivers one tick a second while
- * its loop runs and its socket is read as before, and a loop running flat out delivers its ticks
- * late while answering every read on time: the first reads as a block that is not there, the second
- * hides one that is.
- *
- * `PerformanceObserver` with `longtask` would report the same thing and is Chromium only, so this
- * measures the lag directly instead.
+ * A blocked or saturated loop reads the backlog behind it at once and stamps it late, which arrival
+ * spacing cannot tell from a bursty path. So the monitor times an ordinary task, a `MessageChannel`
+ * message, and notices a stretch with no turn of the loop at all. Not a timer: a hidden tab rations
+ * timers while its loop runs, and a saturated loop runs them late while answering every read on time.
+ * `longtask` observers would do this in Chromium only. See `doc/concept/playout.md`.
  *
  * @module
  */

@@ -642,10 +642,8 @@ test("Consumer plays every group under a zero budget when the reader keeps up", 
 	consumer.close();
 });
 
-// The subscription's age budget and the cache both end a group by resetting its stream, and the
-// consumer's group reader used to rethrow anything that was not a StreamError. A bare Error made
-// every abandoned group a red `spawn error` in the console with no counter and no record that
-// content had gone missing above the decoder.
+// The subscription's age budget and the cache both end a group by resetting its stream. That is a
+// delivery outcome to count, not a task failure to log as a `spawn error`.
 test("Consumer counts a group the budget abandoned instead of failing its task", async () => {
 	const errors = spyOn(console, "error").mockImplementation(() => {});
 	// `spyOn` hands back the mock already installed on a method rather than a fresh one, so this
@@ -723,10 +721,9 @@ test("Consumer counts every group the max age skips", async () => {
 });
 
 // A group the reader has played to the end sits in the list until the next next() pops it, which is
-// a microtask the caller spends decoding. An arrival landing in that window used to convict it: no
-// audio was lost, but the listener was told a group had been skipped, and because a Legacy frame
-// carries no duration the spent group's end read as its last timestamp, so the contiguous successor
-// one frame later was judged a hole and the reader re-anchored on it.
+// a microtask the caller spends decoding. An arrival landing in that window must not convict it:
+// nothing was lost, and because a Legacy frame carries no duration, the contiguous successor would
+// read as a hole and re-anchor the reader.
 test("a head the reader has played out is not convicted while next() has yet to pop it", async () => {
 	const track = new Track.Producer("test");
 	// Tight enough that one frame of successor puts the spent head over it.
@@ -775,9 +772,9 @@ test("a complete head delivered in a burst is played, not skipped", async () => 
 	consumer.close();
 });
 
-// The cold tune-in the bench measured: the delivery cursor sits on a sequence the relay expired and
-// never sent, while the burst behind it is already complete in memory. What the budget gives up on
-// there is the missing group, not the media that did arrive.
+// A cold tune-in: the delivery cursor sits on a sequence the relay expired and never sent, while the
+// burst behind it is already complete in memory. What the budget gives up on there is the missing
+// group, not the media that did arrive.
 test("a cold tune-in walks onto its first buffered group instead of skipping it", async () => {
 	const track = new Track.Producer("test");
 	const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 135 as Time.Milli });
@@ -1925,9 +1922,8 @@ test("Consumer delivers an endpoint, a break and the resumed media without a con
 	consumer.close();
 });
 
-// The race the old order lost: `media` was read as the marker was delivered, so a codec's terminal
-// packets still in flight behind it made the group look media-less and raised the playhead on a run
-// that had not ended.
+// A marker delivered with a codec's terminal packets still in flight behind it: read as the marker
+// arrives, the group looks media-less and would raise the playhead on a run that has not ended.
 test("Consumer does not raise the playhead for a marker whose group still receives media", async () => {
 	const track = new Track.Producer("test");
 	const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: 2_000 as Time.Milli });

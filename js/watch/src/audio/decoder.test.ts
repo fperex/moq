@@ -404,9 +404,8 @@ test("the first gesture builds and starts one context per tile", async () => {
 });
 
 test("a catalog frame that only adds the codec description keeps the running context", async () => {
-	// Measured on real Safari: the publisher's Opus rendition gains its `description` in a later
-	// catalog frame, which used to rebuild the whole graph. The replacement context was born
-	// suspended with the gesture already spent, so one run in eight played video in silence forever.
+	// Safari's publisher gains its Opus `description` in a later catalog frame. A rebuilt graph's
+	// context would be born suspended with the gesture already spent, silent for good.
 	const { decoder: built, catalog: root, close } = decoder(true);
 	await flush();
 

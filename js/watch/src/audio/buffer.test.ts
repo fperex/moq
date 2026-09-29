@@ -203,8 +203,7 @@ describe("AudioBuffer, transport", () => {
 
 	it("names the page's transport once per document, not once per player", async () => {
 		// Cross-origin isolation is a property of the page, so every player on it lands on the same
-		// transport. A page of tiles used to say so once per tile, at warning level, about the path
-		// a page that is not isolated is supposed to run on.
+		// transport, and a page that is not isolated is supposed to run on the fallback.
 		const { reportTransport } = await fresh("once");
 		const first = captured(() => reportTransport(false));
 		const second = captured(() => reportTransport(false));
