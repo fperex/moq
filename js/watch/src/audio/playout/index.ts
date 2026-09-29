@@ -136,11 +136,11 @@ export interface Snapshot extends Counters {
 	stalled: boolean;
 	/** Times the reader ran dry mid-playback. */
 	underruns: number;
-	/** Times the reader skipped ahead because the ring sat past the band. */
+	/** Times playback jumped over media after the timeline started. */
 	skips: number;
-	/** Samples those skips threw away. */
+	/** Media samples those jumps passed over. */
 	skipped: number;
-	/** Samples the writer dropped: too old for the playhead, or past the ring's capacity. */
+	/** Incoming samples the writer rejected because they were behind the playhead. */
 	discarded: number;
 	/**
 	 * Samples the writer dropped off the first fill on a timeline, before anything had been played.

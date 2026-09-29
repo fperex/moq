@@ -46,10 +46,10 @@ const OUTPUT = 9;
 const ACCELERATES = 10;
 const EXPANDS = 11;
 const SHORT = 12;
-// Skip-aheads, and the samples they threw away. Reader only.
+// Playback jumps and the media samples they passed over. Both ends increment atomically.
 const SKIPS = 13;
 const SKIPPED = 14;
-// Samples the writer dropped: too old for the playhead, or past the ring's capacity. Writer only.
+// Incoming samples already behind the playhead. Writer only.
 const DISCARDED = 15;
 // Frames of OUTPUT the reader synthesized to cover a gap, so they carried no media. Reader only.
 const CONCEALED = 16;
@@ -194,6 +194,9 @@ export class SharedRingBuffer implements RingReader {
 	// from it. While it stands, nothing on this timeline has been heard. Writer only: the reader's own
 	// advances are visible as READ moving past it. See {@link #trim}.
 	#resumed: number | undefined;
+	// Writer-only diagnostic cursor. Unlike #resumed, follows overflow too, so repeated drops
+	// before the first reader advance remain startup trims without changing playout's trim policy.
+	#unplayed: number | undefined;
 
 	// What the last `view` sampled: the packed word its exchange has to match, and the cursor the
 	// skip-ahead left it on. Reader thread only, since only the worklet reads.
@@ -302,13 +305,18 @@ export class SharedRingBuffer implements RingReader {
 	 * overflow path; the reader publishes with its own exchange so it can tell a rebase apart
 	 * from losing a race.
 	 */
-	#advance(candidate: number): void {
+	#advance(candidate: number): number {
 		for (;;) {
 			const state = Atomics.load(this.#state, 0);
-			if (((candidate - readOf(state)) | 0) <= 0) return;
+			if (this.#unplayed !== readOf(state)) this.#unplayed = undefined;
+			const advanced = (candidate - readOf(state)) | 0;
+			if (advanced <= 0) return 0;
 
 			const next = pack(epochOf(state), candidate);
-			if (Atomics.compareExchange(this.#state, 0, state, next) === state) return;
+			if (Atomics.compareExchange(this.#state, 0, state, next) === state) {
+				if (this.#unplayed !== undefined) this.#unplayed = candidate;
+				return advanced;
+			}
 		}
 	}
 
@@ -359,6 +367,7 @@ export class SharedRingBuffer implements RingReader {
 			this.#anchored = true;
 			// Nothing on this timeline has been played, so the fill is still free to trim.
 			this.#resumed = 0;
+			this.#unplayed = 0;
 			this.#position = 0;
 			this.#lastRead = 0;
 			this.#lastMedia = Number.NEGATIVE_INFINITY;
@@ -429,8 +438,15 @@ export class SharedRingBuffer implements RingReader {
 		const bounded = readOf(Atomics.load(this.#state, 0));
 		if (((end - bounded) | 0) > this.capacity) {
 			const to = (end - this.capacity) | 0;
-			Atomics.add(this.#control, DISCARDED, (to - bounded) | 0);
-			this.#advance(to);
+			const dropped = this.#advance(to);
+			if (dropped > 0) {
+				if (this.#unplayed !== undefined) {
+					Atomics.add(this.#control, TRIMMED, dropped);
+				} else {
+					Atomics.add(this.#control, SKIPS, 1);
+					Atomics.add(this.#control, SKIPPED, dropped);
+				}
+			}
 		}
 
 		// Write sample data
@@ -811,6 +827,7 @@ export class SharedRingBuffer implements RingReader {
 			}
 		}
 
+		dst.#unplayed = this.#unplayed === read ? copyStart : undefined;
 		Atomics.store(dst.#control, TIMELINE, Atomics.load(this.#control, TIMELINE));
 		Atomics.store(dst.#state, 0, pack(epochOf(state), copyStart));
 		Atomics.store(dst.#control, WRITE, write);
@@ -835,6 +852,16 @@ export class SharedRingBuffer implements RingReader {
 			ENDED,
 		]) {
 			Atomics.store(dst.#control, control, Atomics.load(this.#control, control));
+		}
+
+		const dropped = available - copyCount;
+		if (dropped > 0) {
+			if (this.#unplayed === read) {
+				Atomics.add(dst.#control, TRIMMED, dropped);
+			} else {
+				Atomics.add(dst.#control, SKIPS, 1);
+				Atomics.add(dst.#control, SKIPPED, dropped);
+			}
 		}
 
 		// Carry the unwrapped playhead over, rebased onto dst's READ. Fold the same `read`

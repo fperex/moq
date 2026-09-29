@@ -292,7 +292,20 @@ export class AudioRingBuffer implements RingReader {
 		// Samples left behind are media the reader skips, which is a new timeline. A copy that kept
 		// them all, an empty ring included, is the one it was playing: a new generation there would
 		// make it forget what it learned about the stream on every step of the target.
-		if (dropped > 0) this.#generation++;
+		if (dropped > 0) {
+			this.#generation++;
+			this.#drop(dropped);
+		}
+	}
+
+	#drop(samples: number): void {
+		if (samples === 0) return;
+		if (this.#fresh) {
+			this.#trimmed += samples;
+		} else {
+			this.#skips++;
+			this.#skipped += samples;
+		}
 	}
 
 	write(timestamp: Time.Micro, data: Float32Array[]): void {
@@ -398,7 +411,7 @@ export class AudioRingBuffer implements RingReader {
 		if (surplus || depth > this.capacity) {
 			const to = end - (surplus ? Math.min(hold, this.capacity) : this.capacity);
 			const dropped = Math.max(0, to - this.#readIndex);
-			this.#discarded += dropped;
+			this.#drop(dropped);
 			this.#jumped += dropped;
 			this.#readIndex = to;
 		}

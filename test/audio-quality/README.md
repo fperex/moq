@@ -219,9 +219,8 @@ that hears the pause as a gap grades it as thrown-away audio.
 
 What it cannot say is anything about the transport, the container consumer, the device, or the wall
 clock, because there is no session and no audio hardware. Those metrics report null. What it can say
-exactly, and the browser lanes cannot, is what the ring and the engine did: `short_quanta`,
-`discarded_samples`, `accelerates`, `expands` and `stretched_samples` are read straight off the
-counters rather than inferred from a 250 ms sampling grid.
+exactly is what the ring and the engine did. The browser probe reads the same counters through
+`audio.out.debug`; replay does not depend on asynchronous reports or device scheduling.
 
 ## The metric schema
 
@@ -277,8 +276,9 @@ definition is a judgement call are:
 - **`stalled_quanta`** is the share of the run the ring spent re-stalled, refilling rather than
   playing. Graded separately from underruns: it is silence the player chose.
 
-- **`skip_aheads`** is a step in the lag between wall time and the playhead, not a single large
-  advance. See "What the sampling grid can and cannot see" below.
+- **`skip_aheads`** counts explicit ring jumps over media after playback starts. The accompanying
+  `skipped_samples` duration converts the ring's skipped frames at the graph's actual sample rate.
+  Late incoming duplicates are `discarded_samples`; initial fill trimming is not a playback skip.
 
 - **`silence_share`** is the share of sampled windows whose RMS at the graph output was below about
   -60 dBFS. It is the only metric read from the audio itself rather than from a counter: a counter
@@ -306,27 +306,20 @@ definition is a judgement call are:
   playback, from `sync.out.clock`. A sample from a build without that signal is left out of the
   denominator rather than counted as a zero, so an older build reports `null`.
 
-`short_quanta`, `silent_quanta`, `discarded_samples`, `accelerates`, `expands`,
-`stretched_samples`, and `budget_aborts` are in the schema and report `null` in the browser lanes:
-the signals they need are not on the element's public surface yet. They are null rather than zero,
-and the summary says which change would fill each one in. The replay lane reads five of them
-straight off the ring, because there is no page between the counter and the summary.
+`short_quanta`, `discarded_samples`, `accelerates`, `expands`, and `stretched_samples` come from
+`audio.out.debug`. A build without the counters reports null. `silent_quanta` and `budget_aborts`
+remain unmeasured because neither lane has a counter that distinguishes those events.
 
 ### What the sampling grid can and cannot see
 
-The page samples every 250 ms, and the playhead it reads is quantized: it moves when the ring
-reports a new position, not continuously. Measured on a clean local path, consecutive samples show
-the playhead advancing anywhere from 240 to 296 ms with no net drift.
+The page samples every 250 ms. Worklet and worker reports arrive asynchronously, so a change
+in report age can move the sampled playhead by tens of milliseconds without skipping any audio.
+A continuous stream with a 60 ms report delay produces a false skip under timestamp inference.
+The analyzer therefore grades the ring's cumulative skip counters and reports media drift separately.
 
-Two derivations have to survive that, and both were wrong before they were measured:
-
-- A rule that calls a single sample's excess advance a skip reports about forty skips a minute on a
-  run with none. A skip-ahead is therefore a step in the de-trended lag, judged on the median of the
-  four samples either side of it, and has to exceed 40 ms: more than the quantization band, and more
-  than one estimator bucket plus a render quantum.
-- The lag also drifts when the media timeline does not advance at wall rate, which is a property of
-  the source or the publisher rather than of the player. It is fitted by least squares and removed
-  before skips are counted, and reported on its own as `media_drift`.
+A graph replacement, timeline re-anchor, or counter reset during the measured window voids the
+row. Its discontinuity cannot disappear into a counter delta of zero. A build that lacks these
+counters reports null instead of an estimated skip count.
 
 ### Void rules
 
@@ -345,6 +338,7 @@ main thread with no reason: a reason is a fallback, meaning the page tried the w
 | `transport` | The page's session, or its audio worker's own, negotiated something other than WebTransport. A WebSocket fallback is TCP and never touches the UDP shaper. The page denies the fallback outright (below), for the worker too, so this is a backstop rather than the usual outcome. The Safari lane expects a WebSocket instead. |
 | `thread` | The audio did not come from the page's audio worker, the player's default: the page played it on its main thread (the detail says why), or the worker never started. Under `--offload false`, the audio did not stay on the main thread by choice: it played on the worker, or fell back with a reason. Checked once the audio plays and again at the end, since the page takes the audio back for good. A build that predates the worker cannot say, and is not voided for it. |
 | `ring` | The document's `crossOriginIsolated` does not match the ring the row asked for, so the other ring ran. |
+| `playout` | The graph, timeline anchor, sample rate, or monotonic counters changed during the measured window. |
 | `clock` | `AudioContext.currentTime` drifted more than 1% from wall time over the first ten seconds, or was never readable. |
 | `window` | No samples survived the warmup. |
 | `driver` | The driver threw. A Playwright trace is saved into the run directory. |

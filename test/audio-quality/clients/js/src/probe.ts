@@ -104,6 +104,7 @@ export function probe(watch: MoqWatch): Probe {
 	// and would report a perfect run as a fully silent one.
 	let analyser: AnalyserNode | undefined;
 	let attachedTo: AudioNode | undefined;
+	let generation = 0;
 	let pcm: Float32Array<ArrayBuffer> | undefined;
 
 	// Render capacity arrives on its own event rather than on demand, so the latest reading is held
@@ -114,6 +115,7 @@ export function probe(watch: MoqWatch): Probe {
 	const attach = () => {
 		const root = maybe(() => watch.audio.out.root.peek());
 		if (!root || root === attachedTo) return;
+		generation++;
 		try {
 			const node = new AnalyserNode(root.context, { fftSize: 2048 });
 			root.connect(node);
@@ -163,6 +165,7 @@ export function probe(watch: MoqWatch): Probe {
 		const audio = watch.audio.out;
 		const sync = watch.sync.out;
 		const context = maybe(() => audio.context.peek());
+		const debug = maybe(() => audio.debug.peek());
 
 		// `buffered` is a list of ranges, not a depth. What the grader wants is how much audio is
 		// ready to play, so the ranges are summed; a gap in the middle is not playable time.
@@ -181,9 +184,7 @@ export function probe(watch: MoqWatch): Probe {
 			spread: num(audio.spread),
 			buffered: ranges.length > 0 ? buffered : undefined,
 			skipped: num(audio.skipped),
-			// `audio.out.debug` carries the ring's own short, discarded and stretch counters. This
-			// probe does not read it, so those metrics are null on the browser lanes and filled only
-			// by the replay lane, which drives the engine directly.
+			playout: debug && context ? { ...debug, generation, rate: context.sampleRate } : undefined,
 			stats: maybe(() => audio.stats.peek()) as Record<string, unknown> | undefined,
 			thread: threadOf(watch),
 

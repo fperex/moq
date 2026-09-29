@@ -21,6 +21,8 @@
  * @module
  */
 
+import type MoqWatch from "@moq/watch/element";
+
 /** Milliseconds, as a float. The unit of every duration in this schema. */
 export type Ms = number;
 
@@ -100,7 +102,6 @@ export const METRICS: Record<string, MetricSpec> = {
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Quanta delivered with fewer samples than the render quantum asked for.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	silent_quanta: {
 		unit: "count",
@@ -120,14 +121,13 @@ export const METRICS: Record<string, MetricSpec> = {
 		unit: "samples",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Buffered samples thrown away without being played, reported in ms.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
+		description: "Incoming samples rejected because they were behind the playhead, reported in ms.",
 	},
 	skip_aheads: {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Re-anchors that jumped the playhead forward, discarding buffered audio.",
+		description: "Playback jumps over media after the timeline started, counted by the ring.",
 	},
 	skipped_samples: {
 		unit: "samples",
@@ -140,21 +140,18 @@ export const METRICS: Record<string, MetricSpec> = {
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Time-stretch decisions that played the buffer down faster than real time.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	expands: {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Concealment decisions that generated audio to cover a gap.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	stretched_samples: {
 		unit: "samples",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Samples whose duration was altered by stretching or concealment, reported in ms.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	skipped_groups: {
 		unit: "count",
@@ -216,7 +213,7 @@ export const METRICS: Record<string, MetricSpec> = {
 		clock: "publisher",
 		aggregations: ["last"],
 		description:
-			"Rate at which the media timeline runs away from wall time, in ms per second. A property of the source or the publisher, not of the player, and removed before skip-aheads are counted.",
+			"Rate at which the media timeline runs away from wall time, in ms per second. Fitted independently of the ring counters, which count skip-aheads directly.",
 	},
 };
 
@@ -347,6 +344,11 @@ export type Sample = {
 	buffered?: Ms;
 	/** `audio.out.skipped`: cumulative groups the container consumer abandoned. */
 	skipped?: number;
+	/** Ring counters, with their graph identity and sample rate. Missing on older builds. */
+	playout?: Omit<NonNullable<ReturnType<MoqWatch["audio"]["out"]["debug"]["peek"]>>, "budget"> & {
+		generation: number;
+		rate: number;
+	};
 	/** `audio.out.stats`, passed through as-is: whatever the build publishes. */
 	stats?: Record<string, unknown>;
 	/**

@@ -52,3 +52,31 @@ test("the probe sums buffered ranges and tolerates builds without a range list",
 		jest.useRealTimers();
 	}
 });
+
+test("the probe copies ring counters and identifies replacement graphs", () => {
+	jest.useFakeTimers();
+	let root = {};
+	const debug = { anchor: 0, skips: 1, skipped: 1024 };
+	const running = probe(
+		watch({
+			root: { peek: () => root },
+			context: signal({ sampleRate: 44100 }),
+			debug: signal(debug),
+		}),
+	);
+	try {
+		jest.advanceTimersByTime(250);
+		const first = running.drain()[0];
+		debug.skips = 2;
+		root = {};
+		jest.advanceTimersByTime(250);
+		const next = running.drain()[0];
+		expect(first.playout?.skips).toBe(1);
+		expect(first.playout?.rate).toBe(44100);
+		expect(next.playout?.skips).toBe(2);
+		expect(next.playout?.generation).toBe((first.playout?.generation ?? 0) + 1);
+	} finally {
+		running.stop();
+		jest.useRealTimers();
+	}
+});

@@ -9,8 +9,8 @@
  *   conflating the two makes a player that re-buffers cleanly look like one that glitches. The
  *   `underruns` counter is reported next to the episodes rather than instead of them, because one
  *   long gap and forty scattered ones grade the same by quanta and sound nothing alike.
- * - A **skip-ahead** is a sample in which the playhead advanced by more than the wall time since the
- *   last sample, plus a tolerance. That is audio that was buffered and then discarded.
+ * - A **skip-ahead** is a jump the ring counted. Message delivery delay changes a sampled
+ *   playhead's apparent speed, so wall time cannot identify playback skips.
  * - **converge_s** is the first moment after which the resolved target stayed within one bucket of
  *   its final value for the rest of the run. A target that settles and then moves again has not
  *   converged, so it is measured backwards from the end rather than forwards from the start.
@@ -169,30 +169,11 @@ if (window.length === 0) {
 
 // ── playhead ────────────────────────────────────────────────────────────────
 //
-// The playhead a page can read is quantized: it moves when the ring reports a new position, not
-// continuously, and on the postMessage ring those reports arrive on their own cadence. Measured on a
-// clean local path, consecutive 250 ms samples show the playhead advancing anywhere from 240 to 296
-// ms with no net drift. Every derivation below has to survive that, because a rule that treats a
-// single sample's excess as a skip reports forty of them a minute on a run with none.
+// Playhead reports are asynchronous. Only explicit ring counters identify discrete skips;
+// delayed reports and time stretching can both change the apparent wall/media lag.
 
 /** A sample's playhead advanced by less than this counts as not having advanced at all. */
 const PLATEAU_MS = 1;
-/**
- * A net playhead advance beyond wall time larger than this is a skip.
- *
- * Larger than the observed quantization band, and larger than one estimator bucket plus a render
- * quantum, which is the least a re-anchor can discard and still have discarded anything.
- */
-const SKIP_MS = 40;
-/** Samples either side of a candidate that are reduced to a median before it is judged. */
-const SKIP_WINDOW = 4;
-
-const median = (values: number[]): number | undefined => {
-	if (values.length === 0) return undefined;
-	const sorted = [...values].sort((a, b) => a - b);
-	return sorted[Math.floor(sorted.length / 2)];
-};
-
 let stalledSamples = 0;
 for (const s of window) if (s.stalled) stalledSamples++;
 
@@ -212,9 +193,7 @@ function slope(xs: number[], ys: number[]): number | null {
 }
 
 // The lag between wall time and the playhead drifts when the media timeline does not advance at wall
-// rate, which is a property of the source or the publisher rather than of the player: a steady drift
-// is not the receiver discarding anything. Left in, it reads as a skip every few seconds, so it is
-// fitted and removed first, and reported on its own as `media_drift_ms_per_s`.
+// rate. Report the fitted drift separately from the ring's explicit playback counters.
 const rawLags = window.flatMap((s) =>
 	typeof s.timestamp === "number" && !s.stalled ? [{ at: s.at, lag: s.at - s.timestamp }] : [],
 );
@@ -222,32 +201,6 @@ const mediaDrift = slope(
 	rawLags.map((l) => l.at),
 	rawLags.map((l) => l.lag),
 );
-
-// A skip-ahead is a step in that de-trended lag, not a single large advance. Quantization makes the
-// lag oscillate inside a band; discarding buffered audio moves the band. So each candidate is judged
-// on the median lag either side of it, which neither the oscillation nor the drift can fake.
-const detrend = (at: number, lag: number) => lag - ((mediaDrift ?? 0) / 1000) * (at - (rawLags[0]?.at ?? 0));
-const lags = window.map((s) =>
-	typeof s.timestamp === "number"
-		? { at: s.at, lag: detrend(s.at, s.at - s.timestamp), stalled: s.stalled }
-		: undefined,
-);
-let skipAheads = 0;
-let skippedMs = 0;
-for (let i = SKIP_WINDOW; i < lags.length - SKIP_WINDOW; i++) {
-	const here = lags[i];
-	if (!here || here.stalled) continue;
-	const before = median(lags.slice(i - SKIP_WINDOW, i).flatMap((l) => (l && !l.stalled ? [l.lag] : [])));
-	const after = median(lags.slice(i + 1, i + 1 + SKIP_WINDOW).flatMap((l) => (l && !l.stalled ? [l.lag] : [])));
-	if (before === undefined || after === undefined) continue;
-	const jumped = before - after;
-	if (jumped > SKIP_MS) {
-		skipAheads++;
-		skippedMs += jumped;
-		// One step is one skip, and the trailing window still straddles it for several samples.
-		i += SKIP_WINDOW;
-	}
-}
 
 // The ring's own underrun counter is cumulative, and it is the authoritative count: it sees every
 // partly-filled quantum, including the ones that begin and end between two 250 ms samples.
@@ -272,6 +225,41 @@ function rise(counts: (number | undefined)[]): number | null {
 	}
 	return total;
 }
+
+const playout = window.flatMap((sample) => (sample.playout ? [sample.playout] : []));
+const firstPlayout = playout[0];
+if (
+	playout.some((state, i) => {
+		const previous = playout[i - 1];
+		return (
+			state.generation !== firstPlayout?.generation ||
+			state.anchor !== firstPlayout?.anchor ||
+			state.rate !== firstPlayout?.rate ||
+			(previous !== undefined &&
+				(state.skips < previous.skips || state.skipped < previous.skipped || state.output < previous.output))
+		);
+	}) ||
+	(playout.length > 0 && playout.length !== window.length)
+) {
+	voids.push({
+		assertion: "playout",
+		detail: "the audio graph, timeline, or counters changed during the measured window",
+	});
+}
+
+const counter = (key: "skips" | "skipped" | "discarded" | "short" | "accelerates" | "expands" | "stretched") =>
+	rise(window.map((sample) => sample.playout?.[key]));
+const duration = (key: "skipped" | "discarded" | "stretched") => {
+	const count = counter(key);
+	return count === null || firstPlayout === undefined ? null : (count * 1000) / firstPlayout.rate;
+};
+const skipAheads = counter("skips");
+const skippedMs = duration("skipped");
+const discardedMs = duration("discarded");
+const shortQuanta = counter("short");
+const accelerates = counter("accelerates");
+const expands = counter("expands");
+const stretchedMs = duration("stretched");
 
 const underrunCounts = window.map((s) => s.underruns);
 const hasCounter = underrunCounts.some((c) => typeof c === "number");
@@ -476,23 +464,23 @@ const metrics: Record<string, number | null> = {
 	underrun_episodes_max: round1(episodeStats.max),
 	underrun_samples_total: round1(underrunMs),
 	underrun_samples_per_min: round1(underrunMs / minutes),
-	short_quanta_total: null,
-	short_quanta_per_min: null,
+	short_quanta_total: shortQuanta,
+	short_quanta_per_min: shortQuanta === null ? null : round1(shortQuanta / minutes),
 	silent_quanta_total: null,
 	silent_quanta_per_min: null,
 	stalled_quanta_share: stalledShare === null ? null : Math.round(stalledShare * 1000) / 1000,
-	discarded_samples_total: null,
-	discarded_samples_per_min: null,
+	discarded_samples_total: round1(discardedMs),
+	discarded_samples_per_min: discardedMs === null ? null : round1(discardedMs / minutes),
 	skip_aheads_total: skipAheads,
-	skip_aheads_per_min: round1(skipAheads / minutes),
+	skip_aheads_per_min: skipAheads === null ? null : round1(skipAheads / minutes),
 	skipped_samples_total: round1(skippedMs),
-	skipped_samples_per_min: round1(skippedMs / minutes),
-	accelerates_total: null,
-	accelerates_per_min: null,
-	expands_total: null,
-	expands_per_min: null,
-	stretched_samples_total: null,
-	stretched_samples_per_min: null,
+	skipped_samples_per_min: skippedMs === null ? null : round1(skippedMs / minutes),
+	accelerates_total: accelerates,
+	accelerates_per_min: accelerates === null ? null : round1(accelerates / minutes),
+	expands_total: expands,
+	expands_per_min: expands === null ? null : round1(expands / minutes),
+	stretched_samples_total: round1(stretchedMs),
+	stretched_samples_per_min: stretchedMs === null ? null : round1(stretchedMs / minutes),
 	skipped_groups_total: skippedGroups,
 	skipped_groups_per_min: skippedGroups === null ? null : round1(skippedGroups / minutes),
 	budget_aborts_total: null,
