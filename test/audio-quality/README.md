@@ -57,7 +57,7 @@ A ceiling is clamped where the metric itself is bounded. A share cannot exceed 1
 time cannot exceed the row's own run, so the worst times 1.5 is capped at those: a ceiling a metric
 cannot reach is a check that can never fail, which reads as a cleared bar and is not one.
 
-The counters the engine has to keep at zero (underrun episodes, skip-aheads, budget aborts) are hard
+The counters the engine has to keep at zero (underrun episodes, skip-aheads) are hard
 zeros wherever both runs measured zero and carry a measured ceiling where they did not: those are
 the work that is left, not a bar that was cleared. A ceiling comes down as that work lands and never
 goes up without a reason in review.
@@ -307,8 +307,7 @@ definition is a judgement call are:
 - **`skipped_groups`** is the container consumer's own count of groups abandoned with content still
   unread, read through `audio.out.skipped`. A group the next one already covers is not counted,
   because nothing was lost there. It cannot say why one was abandoned: the local age budget skipping
-  a stale group and the transport giving up on a slow one land in the same counter, which is why
-  `budget_aborts` stays null rather than being read off this.
+  a stale group and the transport giving up on a slow one land in the same counter.
 
 - **`worklet_cadence`** is what a hundred render quanta actually cost in wall time, against the
   128/rate they are worth. It exists because `renderCapacity` is Chromium's alone, so a Safari row
@@ -323,8 +322,7 @@ definition is a judgement call are:
   denominator rather than counted as a zero, so an older build reports `null`.
 
 `short_quanta`, `discarded_samples`, `accelerates`, `expands`, and `stretched_samples` come from
-`audio.out.debug`. A build without the counters reports null. `silent_quanta` and `budget_aborts`
-remain unmeasured because neither lane has a counter that distinguishes those events.
+`audio.out.debug`. A build without the counters reports null.
 
 ### The quiet proof
 

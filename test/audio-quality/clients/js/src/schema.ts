@@ -66,8 +66,6 @@ export type MetricSpec = {
 	aggregations: Aggregation[];
 	/** One plain line saying what it measures. */
 	description: string;
-	/** True when this lane cannot measure it yet, so a null is expected rather than a failure. */
-	pending?: string;
 };
 
 /**
@@ -102,13 +100,6 @@ export const METRICS: Record<string, MetricSpec> = {
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Quanta delivered with fewer samples than the render quantum asked for.",
-	},
-	silent_quanta: {
-		unit: "count",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Quanta filled entirely with silence because nothing was buffered.",
-		pending: "no counter for it on either lane: the ring reports short quanta, not silent ones",
 	},
 	stalled_quanta: {
 		unit: "share",
@@ -171,14 +162,6 @@ export const METRICS: Record<string, MetricSpec> = {
 		aggregations: ["total", "per_min"],
 		description:
 			"Groups the container consumer abandoned with content still unread. A group the next one already covers is not one of these: nothing was lost there.",
-	},
-	budget_aborts: {
-		unit: "count",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Groups abandoned specifically because they exceeded the subscription's age budget.",
-		pending:
-			"skipped_groups counts the age budget and a transport give-up as one; separating them needs its own counter",
 	},
 	target_ms: {
 		unit: "ms",

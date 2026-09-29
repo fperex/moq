@@ -221,8 +221,6 @@ for (const { recording, row } of matrix) {
 			underrun_samples_per_min: null,
 			short_quanta_total: short,
 			short_quanta_per_min: round1(short / minutes),
-			silent_quanta_total: null,
-			silent_quanta_per_min: null,
 			stalled_quanta_share: stalled === null ? null : Math.round(stalled * 1000) / 1000,
 			discarded_samples_total: round1(asMs(discarded, recording.rate)),
 			discarded_samples_per_min: round1(asMs(discarded, recording.rate) / minutes),
@@ -244,8 +242,6 @@ for (const { recording, row } of matrix) {
 			// read them report null rather than a flattering zero.
 			skipped_groups_total: null,
 			skipped_groups_per_min: null,
-			budget_aborts_total: null,
-			budget_aborts_per_min: null,
 			target_ms_p50: round1(targetStats.p50),
 			target_ms_p95: round1(targetStats.p95),
 			target_ms_max: round1(targetStats.max),

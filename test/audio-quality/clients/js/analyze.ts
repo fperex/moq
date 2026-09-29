@@ -278,9 +278,7 @@ const underrunCounts = window.map((s) => s.underruns);
 const hasCounter = underrunCounts.some((c) => typeof c === "number");
 const underruns = rise(underrunCounts);
 
-// Groups that lost content above the decoder, from the container consumer's own counter. It cannot
-// say why: the local age budget skipping a group and the transport giving up on one land in the same
-// number, so `budget_aborts` stays null rather than being read off this.
+// Groups that lost content above the decoder, from the container consumer's own counter.
 const skippedGroups = rise(window.map((s) => s.skipped));
 
 // An episode is a maximal run of consecutive samples in which that counter was still rising: one
@@ -549,8 +547,6 @@ const metrics: Record<string, number | null> = {
 	underrun_samples_per_min: round1(underrunMs / minutes),
 	short_quanta_total: shortQuanta,
 	short_quanta_per_min: shortQuanta === null ? null : round1(shortQuanta / minutes),
-	silent_quanta_total: null,
-	silent_quanta_per_min: null,
 	stalled_quanta_share: stalledShare === null ? null : Math.round(stalledShare * 1000) / 1000,
 	discarded_samples_total: round1(discardedMs),
 	discarded_samples_per_min: discardedMs === null ? null : round1(discardedMs / minutes),
@@ -570,8 +566,6 @@ const metrics: Record<string, number | null> = {
 	stretched_samples_per_min: stretchedMs === null ? null : round1(stretchedMs / minutes),
 	skipped_groups_total: skippedGroups,
 	skipped_groups_per_min: skippedGroups === null ? null : round1(skippedGroups / minutes),
-	budget_aborts_total: null,
-	budget_aborts_per_min: null,
 	target_ms_p50: round1(targetStats.p50),
 	target_ms_p95: round1(targetStats.p95),
 	target_ms_max: round1(targetStats.max),
@@ -640,8 +634,7 @@ for (const [name, spec] of Object.entries(METRICS)) {
 	for (const aggregation of spec.aggregations) {
 		const key = `${name}_${aggregation}`;
 		const value = metrics[key];
-		const shown =
-			value === null || value === undefined ? (spec.pending ? `n/a (${spec.pending})` : "n/a") : String(value);
+		const shown = value === null || value === undefined ? "n/a" : String(value);
 		lines.push(`| ${name} | ${spec.unit} | ${aggregation} | ${shown} |`);
 	}
 }
