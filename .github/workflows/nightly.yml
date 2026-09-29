@@ -86,6 +86,14 @@ jobs:
           nix develop --command bun install --frozen-lockfile
           nix develop --command bun js/net/bench/broadcasts.ts
 
+      # Timing sweeps for the audio worklet's render quantum and the page's worker reports. They
+      # print tables and assert nothing about time; the unit tests hold the counts.
+      - name: JS audio benchmarks
+        if: ${{ !cancelled() }}
+        run: |
+          nix develop --command bun js/watch/src/audio/stretch.bench.ts
+          nix develop --command bun js/watch/src/audio/worker/remote.bench.ts
+
       - name: Audit
         if: ${{ !cancelled() }}
         run: nix develop --command just rs audit
