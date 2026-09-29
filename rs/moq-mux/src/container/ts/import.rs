@@ -5204,18 +5204,23 @@ mod test {
 		audio_pes_packet(pid, cc, pts, &payload)
 	}
 
-	/// Read every retained frame of `name`, with the count of timeline breaks the consumer
-	/// crossed reading them.
-	async fn read_breaks(consumer: &moq_net::broadcast::Consumer, name: &str) -> (Vec<crate::container::Frame>, u64) {
+	type Reader = crate::container::Consumer<crate::catalog::hang::Container>;
+
+	/// Subscribe to `name` as audio, reaching back to the first retained frame.
+	async fn subscribe_breaks(consumer: &moq_net::broadcast::Consumer, name: &str) -> Reader {
 		// A generous max age: the default of zero would shed every non-latest group, the
 		// declared breaks among them, and the subscribe start is resolved from it too, so
 		// it has to reach back past a 30 s leap to the first frame.
 		let subscription = moq_net::track::Subscription::default().with_max_age(std::time::Duration::from_secs(3600));
 		let track = consumer.track(name).unwrap().subscribe(subscription).await.unwrap();
-		let mut reader = crate::container::Consumer::new(
+		crate::container::Consumer::new(
 			track,
 			crate::catalog::hang::Container::Legacy(crate::container::Kind::Audio),
-		);
+		)
+	}
+
+	/// Every frame `reader` has left, with the count of timeline breaks it crossed reading them.
+	async fn drain_breaks(mut reader: Reader) -> (Vec<crate::container::Frame>, u64) {
 		let mut frames = Vec::new();
 		while let Ok(Ok(Some(frame))) = tokio::time::timeout(std::time::Duration::from_millis(50), reader.read()).await
 		{
@@ -5224,18 +5229,41 @@ mod test {
 		(frames, reader.discontinuity())
 	}
 
+	/// Read every retained frame of `name`, with the count of timeline breaks the consumer
+	/// crossed reading them.
+	async fn read_breaks(consumer: &moq_net::broadcast::Consumer, name: &str) -> (Vec<crate::container::Frame>, u64) {
+		drain_breaks(subscribe_breaks(consumer, name).await).await
+	}
+
+	/// Subscribe to both [`two_stream_import`] renditions, in catalog order.
+	async fn subscribe_all_breaks(
+		consumer: &moq_net::broadcast::Consumer,
+		catalog: &crate::catalog::Producer,
+	) -> Vec<Reader> {
+		let names: Vec<String> = catalog.snapshot().audio.renditions.keys().cloned().collect();
+		assert_eq!(names.len(), 2, "both renditions must exist");
+		let mut readers = Vec::new();
+		for name in names {
+			readers.push(subscribe_breaks(consumer, &name).await);
+		}
+		readers
+	}
+
+	/// Every frame and break count of each reader, in order.
+	async fn drain_all_breaks(readers: Vec<Reader>) -> Vec<(Vec<crate::container::Frame>, u64)> {
+		let mut out = Vec::new();
+		for reader in readers {
+			out.push(drain_breaks(reader).await);
+		}
+		out
+	}
+
 	/// Both [`two_stream_import`] renditions' frames and break counts, in catalog order.
 	async fn read_all_breaks(
 		consumer: &moq_net::broadcast::Consumer,
 		catalog: &crate::catalog::Producer,
 	) -> Vec<(Vec<crate::container::Frame>, u64)> {
-		let names: Vec<String> = catalog.snapshot().audio.renditions.keys().cloned().collect();
-		let mut out = Vec::new();
-		for name in names {
-			out.push(read_breaks(consumer, &name).await);
-		}
-		assert_eq!(out.len(), 2, "both renditions must exist");
-		out
+		drain_all_breaks(subscribe_all_breaks(consumer, catalog).await).await
 	}
 
 	/// Two MP2 renditions, the first of which the PMT designates as the PCR PID.
@@ -5371,9 +5399,12 @@ mod test {
 		for pid in [PCR_PID, PEER_PID] {
 			import.decode(mp2_pes(pid, 0, 90_000, [0xAA, 0xBB]).as_slice()).unwrap();
 		}
+		// Watching already, as a live viewer would be: a subscription made after the break
+		// starts at its marker, and this reads the media either side of it.
+		let readers = subscribe_all_breaks(&consumer, &catalog).await;
 		// The encoder restarts: the clock declares the break and the media resumes 20 s
-		// ahead. Under the track's 30 s retention window, so a subscribe still reaches
-		// back to the first frame; the exported-clock tests cover the 30 s leap itself.
+		// ahead. Under the track's 30 s retention window, so the reader still holds the first
+		// frame; the exported-clock tests cover the 30 s leap itself.
 		import.decode(clock_break_packet(PCR_PID).as_slice()).unwrap();
 		for pid in [PCR_PID, PEER_PID] {
 			import
@@ -5382,7 +5413,7 @@ mod test {
 		}
 		import.finish().unwrap();
 
-		for (frames, breaks) in read_all_breaks(&consumer, &catalog).await {
+		for (frames, breaks) in drain_all_breaks(readers).await {
 			assert_eq!(breaks, 1, "the timebase break did not reach this track");
 			let fills: Vec<u8> = frames.iter().map(|f| f.payload[4]).collect();
 			assert_eq!(fills, [0xAA, 0xBB, 0xCC, 0xDD], "media either side of the break");
@@ -5402,13 +5433,16 @@ mod test {
 				.decode(mp2_pes(pid, 0, 45 * 90_000, [0xAA, 0xBB]).as_slice())
 				.unwrap();
 		}
+		// Watching across the restart, as a live viewer would: one subscribing after it
+		// starts at the break's marker, past the old timeline this compares against.
+		let readers = subscribe_all_breaks(&consumer, &catalog).await;
 		import.decode(clock_break_packet(PCR_PID).as_slice()).unwrap();
 		for pid in [PCR_PID, PEER_PID] {
 			import.decode(mp2_pes(pid, 1, 90_000, [0xCC, 0xDD]).as_slice()).unwrap();
 		}
 		import.finish().unwrap();
 
-		for (frames, breaks) in read_all_breaks(&consumer, &catalog).await {
+		for (frames, breaks) in drain_all_breaks(readers).await {
 			// Backwards timestamps are a break a consumer can also derive for itself, so the
 			// marker need not be the only thing counted here. The exporter compares the
 			// counter across frames, so however many land between two frames are one reset.
@@ -5516,15 +5550,21 @@ mod test {
 		}
 	}
 
-	/// Read every retained frame of `name` as `kind`, skipping the empty break markers.
-	async fn read_track(
+	/// Subscribe to `name` as `kind`, reaching back over everything retained.
+	async fn subscribe_track(
 		consumer: &moq_net::broadcast::Consumer,
 		name: &str,
 		kind: crate::container::Kind,
-	) -> Vec<crate::container::Frame> {
+	) -> crate::container::Consumer<crate::catalog::hang::Container> {
 		let subscription = moq_net::track::Subscription::default().with_max_age(Duration::from_secs(3600));
 		let track = consumer.track(name).unwrap().subscribe(subscription).await.unwrap();
-		let mut reader = crate::container::Consumer::new(track, crate::catalog::hang::Container::Legacy(kind));
+		crate::container::Consumer::new(track, crate::catalog::hang::Container::Legacy(kind))
+	}
+
+	/// Every frame `reader` has left, skipping the empty break markers.
+	async fn drain_track(
+		mut reader: crate::container::Consumer<crate::catalog::hang::Container>,
+	) -> Vec<crate::container::Frame> {
 		let mut frames = Vec::new();
 		while let Ok(Ok(Some(frame))) = tokio::time::timeout(Duration::from_millis(50), reader.read()).await {
 			if !frame.payload.is_empty() {
@@ -5532,6 +5572,33 @@ mod test {
 			}
 		}
 		frames
+	}
+
+	/// Read every retained frame of `name` as `kind`, skipping the empty break markers.
+	async fn read_track(
+		consumer: &moq_net::broadcast::Consumer,
+		name: &str,
+		kind: crate::container::Kind,
+	) -> Vec<crate::container::Frame> {
+		drain_track(subscribe_track(consumer, name, kind).await).await
+	}
+
+	/// An importer with an `mpegts` catalog, and the consumer reading its broadcast.
+	#[allow(clippy::type_complexity)]
+	fn importer() -> (
+		moq_net::broadcast::Consumer,
+		crate::catalog::Producer<Ext>,
+		super::Import<Ext>,
+	) {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let catalog = crate::catalog::Producer::new(
+			&mut broadcast,
+			crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<Ext>::default()),
+		)
+		.unwrap();
+		let import = super::Import::new(broadcast, catalog.reserve());
+		(consumer, catalog, import)
 	}
 
 	/// Import `data` with an `mpegts` catalog, failing on any import error. The importer is
@@ -5544,14 +5611,7 @@ mod test {
 		crate::catalog::Producer<Ext>,
 		super::Import<Ext>,
 	)> {
-		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let consumer = broadcast.consume();
-		let catalog = crate::catalog::Producer::new(
-			&mut broadcast,
-			crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<Ext>::default()),
-		)
-		.unwrap();
-		let mut import = super::Import::new(broadcast, catalog.reserve());
+		let (consumer, catalog, mut import) = importer();
 		import.decode(data)?;
 		import.finish()?;
 		Ok((consumer, catalog, import))
@@ -5578,6 +5638,18 @@ mod test {
 		let (consumer, catalog, _import) = import_all(data).expect("the import must survive the step back");
 		let name = catalog.snapshot().video.renditions.keys().next().unwrap().clone();
 		read_track(&consumer, &name, crate::container::Kind::Video).await
+	}
+
+	/// [`video_frames`] read by a viewer already watching when `after` arrives, the way a live
+	/// one would be: a subscription made after a declared break starts at its marker.
+	async fn video_frames_across(before: &[u8], after: &[u8]) -> Vec<crate::container::Frame> {
+		let (consumer, catalog, mut import) = importer();
+		import.decode(before).unwrap();
+		let name = catalog.snapshot().video.renditions.keys().next().unwrap().clone();
+		let reader = subscribe_track(&consumer, &name, crate::container::Kind::Video).await;
+		import.decode(after).expect("the import must survive the step back");
+		import.finish().unwrap();
+		drain_track(reader).await
 	}
 
 	const VIDEO: u16 = 0x0050;
@@ -5607,9 +5679,10 @@ mod test {
 			..Default::default()
 		};
 		mux.gops(VIDEO, 45 * 90_000, 2);
+		let before = std::mem::take(&mut mux.out);
 		mux.out.extend_from_slice(&clock_break_packet(VIDEO));
 		mux.gops(VIDEO, 90_000, 2);
-		let frames = video_frames(&mux.out).await;
+		let frames = video_frames_across(&before, &mux.out).await;
 		assert_eq!(frames.len(), 16);
 		assert_forward(&frames);
 	}

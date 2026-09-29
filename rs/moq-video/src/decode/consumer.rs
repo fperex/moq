@@ -600,17 +600,8 @@ mod tests {
 				keyframe: true,
 			})
 			.unwrap();
-		producer.discontinuity().unwrap();
-		producer
-			.write(moq_mux::container::Frame {
-				timestamp: Timestamp::from_micros(200_000).unwrap(),
-				duration: None,
-				payload: Bytes::from_static(b"new access unit"),
-				keyframe: true,
-			})
-			.unwrap();
-		producer.finish().unwrap();
 
+		// Subscribed across the seam: one made after the break would start at its marker.
 		let catalog = VideoConfig::new(hang::catalog::H264 {
 			inline: true,
 			profile: 0x42,
@@ -632,6 +623,17 @@ mod tests {
 		)
 		.await
 		.unwrap();
+
+		producer.discontinuity().unwrap();
+		producer
+			.write(moq_mux::container::Frame {
+				timestamp: Timestamp::from_micros(200_000).unwrap(),
+				duration: None,
+				payload: Bytes::from_static(b"new access unit"),
+				keyframe: true,
+			})
+			.unwrap();
+		producer.finish().unwrap();
 
 		let mut timestamps = Vec::new();
 		while let Some(frame) = consumer.read().await.unwrap() {
