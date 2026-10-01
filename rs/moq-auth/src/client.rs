@@ -250,7 +250,7 @@ fn backoff(failures: u32, cadence: Duration) -> Duration {
 mod tests {
 	use super::*;
 	use moq_pattern::Patterns;
-	use std::sync::{Arc, Mutex};
+	use std::task::Poll;
 	use std::time::SystemTime;
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, Request as Received, ResponseTemplate};
@@ -267,21 +267,40 @@ mod tests {
 
 	/// Records every request body the server saw, in order.
 	#[derive(Clone, Default)]
-	struct Log(Arc<Mutex<Vec<Request>>>);
+	struct Log(kio::Shared<Vec<Request>>);
 
 	impl Log {
 		fn events(&self) -> Vec<Event> {
-			self.0.lock().unwrap().iter().map(|r| r.event.clone()).collect()
+			self.0.read().iter().map(|r| r.event.clone()).collect()
 		}
 
 		fn last(&self) -> Request {
-			self.0.lock().unwrap().last().cloned().unwrap()
+			self.0.read().last().cloned().unwrap()
+		}
+
+		async fn end(&self) -> Request {
+			let requests = tokio::time::timeout(
+				Duration::from_secs(3),
+				self.0.wait(|requests| {
+					if requests
+						.last()
+						.is_some_and(|request| matches!(request.event, Event::End { .. }))
+					{
+						Poll::Ready(())
+					} else {
+						Poll::Pending
+					}
+				}),
+			)
+			.await
+			.expect("the auth server receives an end event within 3 seconds");
+			requests.last().cloned().unwrap()
 		}
 	}
 
 	impl wiremock::Match for Log {
 		fn matches(&self, received: &Received) -> bool {
-			self.0.lock().unwrap().push(received.body_json().unwrap());
+			self.0.lock().push(received.body_json().unwrap());
 			true
 		}
 	}
@@ -327,9 +346,8 @@ mod tests {
 		assert_eq!(log.events(), [Event::Connect]);
 
 		consumer.close("disconnected", Bytes { sent: 7, received: 11 });
-		settle().await;
 
-		let end = log.last();
+		let end = log.end().await;
 		assert_eq!(end.id, "0123");
 		match end.event {
 			Event::End { reason, bytes, .. } => {
@@ -350,9 +368,8 @@ mod tests {
 
 		let consumer = client(&server).connect(request()).await.unwrap();
 		drop(consumer);
-		settle().await;
 
-		match log.last().event {
+		match log.end().await.event {
 			Event::End {
 				reason: Reason::Dropped,
 				bytes,
