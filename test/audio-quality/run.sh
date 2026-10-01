@@ -235,15 +235,8 @@ rate_of() {
     esac
 }
 
-# The audio encode each publisher runs, word for word. The analyzer replays it offline from the same
-# file to rebuild the exact audio a row decoded (see analyze.ts), so it is written once, here.
-audio_of() {
-    case "$1" in
-        opus) echo "-c:a libopus -ar 48000 -ac 2 -b:a 128k" ;;
-        aac) echo "-c:a aac -ar 44100 -ac 2 -b:a 128k" ;;
-        *) echo "error: no audio encode for codec '$1'" >&2 && exit 2 ;;
-    esac
-}
+# shellcheck source-path=SCRIPTDIR source=publish.sh
+source "$AQ_DIR/publish.sh"
 
 # Every profile but the control adapts. The control runs the demo's fixed preset, which the element
 # requires a unit on: `delay=250` is rejected, `delay=250ms` is not.
@@ -418,39 +411,15 @@ WEB_PORT="$HARNESS_PORT"
 # ingest too would mean grading the receiver on a stream that was already damaged before it was
 # published, and the publisher's own flush span is a separate stage of the ledger.
 #
-# Both ffmpeg invocations mirror demo/pub/justfile, with one deliberate difference each and one they
-# share. Opus is encoded rather than copied, because bbb.mp4 carries AAC. The TS arm leaves ffmpeg's
-# default PES packing alone (demo/pub passes `-pes_payload_size 0` for the smooth variant), because the
-# resulting multi-frame bursts are the arrival shape seen on the public relay.
+# Opus is encoded rather than copied, because bbb.mp4 carries AAC. Adaptive AAC rows keep the
+# default PES packing seen on the public relay. The fixed-250 control uses a separate, paced AAC
+# broadcast, since the default mux can hold 372 ms of quiet audio before emitting it.
 #
 # Both pin `-readrate_catchup 1`, because a live source never runs fast. By default ffmpeg makes up
 # any time its output was blocked at 1.05x real time, for twenty times as long: a `moq` that starts
 # reading seconds late (a freshly linked binary on macOS waits that long in dyld) would hand the first
 # rows a stream five percent fast, which a fixed delay can only throw away.
-# shellcheck disable=SC2329  # invoked indirectly via 'harness_spawn'
-publish_opus() {
-    local audio
-    read -ra audio <<<"$(audio_of opus)"
-    ffmpeg -hide_banner -v quiet -stream_loop -1 -re -readrate_catchup 1 -i "$MEDIA" \
-        -c:v copy "${audio[@]}" \
-        -f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer -frag_duration 1000 - |
-        "$MOQ" --connect "$RELAY_URL" --broadcast "bbb-opus.hang" import fmp4
-}
-
-# shellcheck disable=SC2329  # invoked indirectly via 'harness_spawn'
-publish_aac() {
-    local audio
-    read -ra audio <<<"$(audio_of aac)"
-    ffmpeg -hide_banner -v quiet -stream_loop -1 -re -readrate_catchup 1 -i "$MEDIA" \
-        -c:v copy "${audio[@]}" \
-        -f mpegts - |
-        "$MOQ" --connect "$RELAY_URL" --broadcast "bbb-aac.hang" import ts
-}
-
-for codec in "${CODECS[@]}"; do
-    echo "starting the $codec publisher..."
-    harness_spawn "pub-$codec" "$HARNESS_RUN/pub-$codec.log" "publish_$codec"
-done
+start_publishers
 # A publisher needs a moment to announce before the first page asks for it; the driver's own 30s wait
 # for a catalog covers the rest, and a publisher that died is reported by that wait rather than here.
 sleep 3
@@ -496,7 +465,7 @@ for entry in "${ROWS[@]}"; do
         # opens has to stay frontmost for the AudioContext to render.
         harness_spawn "safari-$tag" - bun "$CLIENT/safari.ts" \
             --url "$page_url" \
-            --broadcast "bbb-$codec.hang" \
+            --broadcast "$(broadcast_of "$codec" "$profile")" \
             --page "$CLIENT/dist" \
             --port "$WEB_PORT" \
             --driver-port "$DRIVER_PORT" \
@@ -508,7 +477,7 @@ for entry in "${ROWS[@]}"; do
     else
         harness_spawn "driver-$tag" - bun "$CLIENT/driver.ts" \
             --url "$page_url" \
-            --broadcast "bbb-$codec.hang" \
+            --broadcast "$(broadcast_of "$codec" "$profile")" \
             --page "$CLIENT/dist" \
             --port "$WEB_PORT" \
             --ring "$ring" \

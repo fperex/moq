@@ -334,7 +334,7 @@ the verdict it had. The grade prints both: the raw share, and how many quiet win
 quiet audio.
 
 The reference is rebuilt after the row, in `analyze.ts`, never in the page. It replays the
-publisher's own audio encode of the file it loops (`audio_of` in `run.sh`, with `-stream_loop -1`
+publisher's own audio encode of the file it loops (`audio_of` in `publish.sh`, with `-stream_loop -1`
 and without `-re`), which reproduces the published packets byte for byte on the same host, decodes
 it with the page's decoder (FFmpeg's AAC, libopus), and mixes it to mono as the AnalyserNode mixes
 its input. Against the film itself the codec's level change alone moves a window within a percent of
@@ -414,8 +414,14 @@ audio worker's on one shared path, as they are on a real host.
 `fixed-250` earns its place: every other row exercises adaptation, so without it the whole matrix
 can pass while a fixed preset regresses, and a fixed preset is what a viewer lands on today.
 
-The source shape is a third axis that is not a profile. The AAC arm publishes MPEG-TS with ffmpeg's
-default PES packing, whose multi-frame bursts are the arrival shape seen on the public relay; `demo/pub` passes `-pes_payload_size 0` for the smooth variant. Both publishers pin
+The adaptive AAC rows publish MPEG-TS with ffmpeg's default PES packing, whose multi-frame bursts
+are the arrival shape seen on the public relay. Two quiet passages in each loop pack 16 AAC frames
+into one PES, spanning 372 ms. The fixed 250 ms control uses a separate broadcast with
+`-max_delay 0`, which flushes one AAC frame per PES. Reducing `-pes_payload_size` alone still packs
+quiet frames into the mux's minimum payload size. Its encoder and silence reference are identical
+to the packed broadcast. The replay tests retain the 16-frame
+source bursts and prove that they underrun a 250 ms target even on a constant-delay path.
+Both publishers pin
 `-readrate_catchup 1`, so a publisher that was blocked (a `moq` slow to start, a stall in its import)
 resumes at real time instead of running five percent fast until it has made the time up; a fixed
 delay would otherwise throw that surplus away as skips that measure the source, not the player.
@@ -424,6 +430,7 @@ delay would otherwise throw that surplus away as skips that measure the source, 
 
 ```text
 run.sh                      builds, starts everything, runs each row, analyzes, grades
+publish.sh                  codec encode settings and the packed or paced publisher
 relay.toml                  anonymous relay, self-signed localhost cert
 budgets.json                a ceiling per metric per matrix row
 clients/js/
