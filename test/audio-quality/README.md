@@ -451,7 +451,9 @@ clients/js/
 ```
 
 A failing run keeps its directory, with each process's log, the shaper's counters, the raw ndjson,
-and a Playwright trace of the failing page. The path and the rerun command are printed.
+and a Playwright trace of each Chromium page. The driver saves the trace after closing the measured
+page and flushing its beacon, because grading happens after the driver exits. The path and the rerun
+command are printed.
 
 ## Comparing two runs
 

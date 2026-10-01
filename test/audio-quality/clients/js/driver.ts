@@ -18,7 +18,7 @@ import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { Page } from "playwright";
-import { Failure, launch, open, saveTrace, serve } from "../../../interop/clients/js/harness.ts";
+import { Failure, finishTraces, launch, open, serve } from "../../../interop/clients/js/harness.ts";
 import { type Backend, backendVoid, type Ring, type Thread, threadVoid, type Void } from "./src/schema.ts";
 
 const { values } = parseArgs({
@@ -140,7 +140,8 @@ const browser = await launch(["--autoplay-policy=no-user-gesture-required"]);
 let status = 0;
 let page: Page | undefined;
 try {
-	[page] = await open(browser, pageUrl, values.tag, true);
+	const context = await browser.newContext();
+	[page] = await open(context, pageUrl, values.tag, true);
 
 	// The catalog is what says the session is up; without it there is nothing to measure and the
 	// failure is the relay or the publisher, not the player.
@@ -213,10 +214,11 @@ try {
 } catch (err) {
 	const message = err instanceof Error ? err.message : String(err);
 	console.error(`FAIL ${values.tag}: ${message}`);
-	if (page) await saveTrace(page, join(out, `${values.tag}.trace.zip`));
 	note("driver", message);
 	status = 1;
 } finally {
+	// Grading happens after this process exits, so retain even a successfully closed page's trace.
+	await finishTraces(true);
 	await browser.close().catch(() => {});
 	server.stop();
 }
