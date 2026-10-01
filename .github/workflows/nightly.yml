@@ -66,10 +66,8 @@ jobs:
         with:
           determinate: false
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-        with:
-          cache-on-failure: true
+      - name: Rust cache
+        uses: ./.github/actions/rust-cache
 
       # Runs even if the audit fails: a fresh advisory shouldn't hide a
       # compile break in the feature permutations.

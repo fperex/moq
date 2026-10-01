@@ -70,9 +70,7 @@ jobs:
       # Reuse ~/.cargo + ./target across nightly runs so only changed crates
       # recompile (the relay, cli, moq-ffi, and libmoq all build from source).
       - name: Rust cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-        with:
-          cache-on-failure: true
+        uses: ./.github/actions/rust-cache
 
       # Playwright's Chromium isn't in the nix devShell. Install it plus its apt
       # runtime libs (`--with-deps` needs the host package manager) so the
