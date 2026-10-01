@@ -41,6 +41,7 @@ struct Script {
 	/// fetch without touching the sessions serving it.
 	revalidate_http: Arc<Mutex<Option<Answer>>>,
 	seen: Arc<Mutex<Vec<Request>>>,
+	changed: Arc<tokio::sync::Notify>,
 }
 
 impl Script {
@@ -50,6 +51,7 @@ impl Script {
 			revalidate: Arc::new(Mutex::new(Answer::Grant(grant))),
 			revalidate_http: Arc::new(Mutex::new(None)),
 			seen: Arc::new(Mutex::new(Vec::new())),
+			changed: Arc::new(tokio::sync::Notify::new()),
 		}
 	}
 
@@ -77,6 +79,7 @@ impl Script {
 
 	async fn handle(State(script): State<Script>, Json(request): Json<Request>) -> Response {
 		script.seen.lock().unwrap().push(request.clone());
+		script.changed.notify_one();
 		let answer = match request.event {
 			Event::Connect => script.connect.lock().unwrap().clone(),
 			Event::Revalidate if request.transport == moq_auth::Transport::Http => script
@@ -721,16 +724,16 @@ async fn http_routes_hold_a_lease() {
 
 /// An outage keeps the session until `expires`, then closes it as expired.
 ///
-/// Paused: the relay times the lease and its re-checks on tokio's clock, so the
-/// minutes below pass virtually. `expires` is wall-clock, so the relay's deadline
-/// comes early by the setup's real time, which the slack absorbs.
-#[tokio::test(start_paused = true)]
+/// Pause only to advance the lease deadline: automatic advancement can time out
+/// real socket I/O before it finishes. Network waits run with the clock resumed.
+#[tokio::test]
 async fn an_outage_keeps_the_session_until_expires() {
 	const EXPIRES: Duration = Duration::from_secs(120);
 	const SLACK: Duration = Duration::from_secs(30);
+	const REVALIDATE: Duration = Duration::from_secs(10);
 
 	let mut grant = grant(EXPIRES);
-	grant.revalidate = Some(Duration::from_secs(10));
+	grant.revalidate = Some(REVALIDATE);
 	let script = Script::new(grant);
 	// Down from the start: a re-check that succeeded would restart the deadline
 	// at whatever the virtual clock had reached.
@@ -738,16 +741,25 @@ async fn an_outage_keeps_the_session_until_expires() {
 	let (port, relay) = spawn_relay(build_auth(script.spawn().await)).await;
 	let (pub_session, sub_session) = connect_and_round_trip(&room_url("tcp", port)).await;
 
-	// Through every failed re-check up to just short of expires, the session is up...
-	tokio::time::sleep(EXPIRES - SLACK).await;
-	let outages = script
-		.seen
-		.lock()
-		.unwrap()
-		.iter()
-		.filter(|r| r.event == Event::Revalidate)
-		.count();
-	assert!(outages > 0, "no re-check reached the server during the outage");
+	tokio::time::pause();
+	tokio::time::advance(REVALIDATE).await;
+	tokio::time::resume();
+	tokio::time::timeout(TIMEOUT, async {
+		loop {
+			let changed = script.changed.notified();
+			if script.seen.lock().unwrap().iter().any(|r| r.event == Event::Revalidate) {
+				return;
+			}
+			changed.await;
+		}
+	})
+	.await
+	.expect("no re-check reached the server during the outage");
+
+	// The outage leaves the session up just short of expires...
+	tokio::time::pause();
+	tokio::time::advance(EXPIRES - SLACK - REVALIDATE).await;
+	tokio::time::resume();
 	assert!(
 		tokio::time::timeout(Duration::from_millis(100), pub_session.closed())
 			.await
@@ -756,16 +768,20 @@ async fn an_outage_keeps_the_session_until_expires() {
 	);
 
 	// ...and it closes once the grant expires, not later.
+	tokio::time::pause();
+	tokio::time::advance(SLACK).await;
+	tokio::time::resume();
 	assert_closed(pub_session, SLACK, "publisher").await;
 	assert_closed(sub_session, SLACK, "subscriber").await;
 
 	let ends = tokio::time::timeout(TIMEOUT, async {
 		loop {
+			let changed = script.changed.notified();
 			let ends = script.ends();
 			if ends.len() == 2 {
 				return ends;
 			}
-			tokio::time::sleep(Duration::from_millis(10)).await;
+			changed.await;
 		}
 	})
 	.await
