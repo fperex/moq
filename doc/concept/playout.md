@@ -165,8 +165,12 @@ took to get to it, and separately notices a stretch in which no turn of the loop
 happened at all. A task or an unexpected gap past 100 ms reports a block. When
 ticks are rationed, the monitor samples the expected gaps between source bursts
 at most once per 50 ms, even without a task probe. Frames delivered within that
-tick cannot replace that cadence with their much shorter spacing. How late a timer runs
-measures neither, because a hidden tab is rationed to one timer a second with
+tick cannot replace that cadence with their much shorter spacing. A gap shorter
+than the learned source cadence cannot by itself distinguish a quiet path from
+a blocked receiver. An unexpectedly wider source batch can also trigger the gap
+heuristic; an outstanding task probe directly measures how long the receiver
+kept it waiting. How late a timer runs measures neither, because a hidden tab is
+rationed to one timer a second with
 its loop running and its socket read as before, and a loop running flat out
 delivers its timers late while answering every read on time. The estimator
 itself stays free of timers and of any clock but the one an arrival is stamped
