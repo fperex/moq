@@ -887,10 +887,17 @@ mod tests {
 
 	/// `--video-name` and `--audio-name` are answered from the catalog of the
 	/// broadcast the stage names, which overrides the process-wide one.
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn a_stage_broadcast_picks_the_catalog_to_read() {
 		let _env = EnvGuard::clear(&["MOQ_CONNECT"]);
 		use hang::catalog::{AudioCodec, AudioConfig, H264, VideoConfig};
+		// Catalog selection must not depend on real socket work fitting the completion budget.
+		// A blocking task inhibits Tokio's automatic clock advance while that I/O runs.
+		let (clock, closed) = std::sync::mpsc::channel::<()>();
+		let clock_task = tokio::task::spawn_blocking(move || {
+			let _ = closed.recv();
+		});
+		let started = Instant::now();
 
 		let origin = moq_tokio::origin::spawn();
 
@@ -921,11 +928,33 @@ mod tests {
 
 		// The global names `other`; the stage overrides it, exactly as the invocation
 		// this line is on its way to becoming would.
-		let connect = relay(&origin);
-		let line = format!("moq {connect} --broadcast other export --broadcast wanted");
+		// TCP keeps the selection check independent of QUIC pacing timers.
+		let listener = moq_tokio::tcp::Listener::bind("127.0.0.1:0".parse().unwrap())
+			.await
+			.expect("TCP listener")
+			.with_protocols(moq_net::Versions::default().alpns());
+		let address = listener.local_addr().expect("TCP address");
+		let server = moq_net::Server::new().with_publisher(origin.consume());
+		let relay = tokio::spawn(async move {
+			for _ in 0..2 {
+				let accepted = listener.accept().await.expect("TCP connection").expect("TCP handshake");
+				let (session, driver) = server
+					.accept(Instant::now().into_std(), moq_tokio::transport::Session::new(accepted))
+					.await
+					.expect("MoQ handshake");
+				let driver = tokio::spawn(moq_net::time::run(driver));
+				session.closed().await;
+				driver.await.expect("session driver panicked");
+			}
+		});
+		let line = format!("moq --connect tcp://{address} --broadcast other export --broadcast wanted");
 
 		assert_eq!(complete(&format!("{line} --video-name ")).await, ["hd"]);
 		assert_eq!(complete(&format!("{line} --audio-name ")).await, ["stereo"]);
+		assert_eq!(started.elapsed(), Duration::ZERO);
+		relay.await.expect("relay panicked");
+		drop(clock);
+		clock_task.await.expect("clock holder panicked");
 	}
 
 	/// The `--catalog-format` on the line decides which catalog track is read.
