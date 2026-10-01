@@ -47,6 +47,7 @@ import {
 	waitForState,
 	waitForWatch,
 } from "./harness";
+import { closeBrowsers } from "./src/cleanup";
 import {
 	type AudioThread,
 	type CaptureState,
@@ -764,6 +765,12 @@ if (expectFail !== undefined) {
 }
 
 await finishTraces(code !== 0);
-for (const browser of browsers) await browser.close().catch(() => {});
-server.stop();
+try {
+	await closeBrowsers(browsers);
+} catch (error) {
+	console.error(`FAIL browser cleanup: ${error instanceof Error ? error.message : String(error)}`);
+	code = 1;
+} finally {
+	server.stop();
+}
 process.exit(code);
