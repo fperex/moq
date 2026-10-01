@@ -162,7 +162,10 @@ lives. In the browser `Container.Consumer` watches its own event loop
 (`js/hang/src/container/stall.ts`): it hands the loop an ordinary task, a
 `MessageChannel` message rather than a timer, and reads back how long the loop
 took to get to it, and separately notices a stretch in which no turn of the loop
-happened at all. Either one past 100 ms is a block. How late a timer runs
+happened at all. A task or an unexpected gap past 100 ms reports a block. When
+ticks are rationed, the monitor samples the expected gaps between source bursts
+at most once per 50 ms, even without a task probe. Frames delivered within that
+tick cannot replace that cadence with their much shorter spacing. How late a timer runs
 measures neither, because a hidden tab is rationed to one timer a second with
 its loop running and its socket read as before, and a loop running flat out
 delivers its timers late while answering every read on time. The estimator

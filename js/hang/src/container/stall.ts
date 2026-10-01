@@ -93,10 +93,10 @@ export class Stall {
 	// each of those is a turn of it.
 	#alive: number;
 
-	// When the probe still in flight was posted, cleared once it comes back, and when the last one
-	// was posted at all, so an arrival arms at most one a tick.
+	// When the probe still in flight was posted, cleared once it comes back, and when an arrival
+	// last sampled the cadence, so probes and cadence samples run at most once a tick.
 	#sent?: number;
-	#posted?: number;
+	#sampled?: number;
 
 	// When the loop last came back from a block, if it ever has.
 	#ended?: number;
@@ -142,11 +142,6 @@ export class Stall {
 		// the probe wins the race out of a block, which nothing orders.
 		this.#see(now);
 		this.#arm(now);
-		if (this.#queried !== undefined && now > this.#queried) {
-			const spacing = now - this.#queried;
-			// A detected block must not become the cadence used to excuse the next block.
-			if (this.#spacing === undefined || spacing <= this.#spacing + THRESHOLD) this.#spacing = spacing;
-		}
 		if (this.#queried === undefined || now > this.#queried) this.#queried = now;
 
 		return this.#ended !== undefined && now - this.#ended <= TICK;
@@ -183,15 +178,22 @@ export class Stall {
 
 	// Hands the loop a task to be timed by, at most one a tick.
 	#arm(now: number): void {
+		if (this.#sent !== undefined) return;
+		if (this.#sampled !== undefined && now - this.#sampled < TICK) return;
+		if (this.#queried !== undefined && now > this.#queried) {
+			const spacing = now - this.#queried;
+			// Sample once a tick so frames delivered together cannot replace their burst's cadence.
+			// A detected block must not become the cadence used to excuse the next block.
+			if (this.#spacing === undefined || spacing <= this.#spacing + THRESHOLD) this.#spacing = spacing;
+		}
+		this.#sampled = now;
 		const probe = this.#probe;
-		if (probe === undefined || this.#sent !== undefined) return;
-		if (this.#posted !== undefined && now - this.#posted < TICK) return;
+		if (probe === undefined) return;
 
 		// Arrivals are the only thing there is to protect, so arrivals are what arm this. Posting
 		// again from the handler would instead be a loop spinning on itself for as long as a consumer
 		// is alive, and posting from the tick would keep one spinning over an idle page.
 		this.#sent = now;
-		this.#posted = now;
 		probe.post();
 	}
 

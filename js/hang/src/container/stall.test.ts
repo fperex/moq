@@ -263,3 +263,68 @@ it("two blocks during a rationed tick do not become the arrival cadence", () => 
 		stall.close();
 	}
 });
+
+for (const withProbe of [true, false]) {
+	it(`a rationed tick does not flag healthy source bursts ${withProbe ? "with" : "without"} a probe`, () => {
+		const timer = fakeTimer();
+		const stall = new Stall(withProbe ? timer : { ...timer, probe: () => undefined });
+		try {
+			timer.throttle(1000);
+			timer.advance(3000);
+			const heads: boolean[] = [];
+			for (let burst = 0; burst < 25; burst++) {
+				timer.advance(162);
+				heads.push(stall.blocked(timer.at()));
+				// Each PES batch delivers seven frames. A running loop serves every probe between them.
+				for (let frame = 1; frame < 7; frame++) {
+					timer.advance(1);
+					stall.blocked(timer.at());
+				}
+			}
+			expect(heads.slice(2).filter(Boolean)).toEqual([]);
+		} finally {
+			stall.close();
+		}
+	});
+
+	it(`a rationed tick still reports an unexpected gap ${withProbe ? "with" : "without"} a probe`, () => {
+		const timer = fakeTimer();
+		const stall = new Stall(withProbe ? timer : { ...timer, probe: () => undefined });
+		try {
+			timer.throttle(1000);
+			for (let frame = 0; frame < 100; frame++) {
+				timer.advance(33);
+				expect(stall.blocked(timer.at())).toBe(false);
+			}
+			timer.block(150);
+			expect(stall.blocked(timer.at())).toBe(true);
+			timer.block(400);
+			expect(stall.blocked(timer.at())).toBe(true);
+		} finally {
+			stall.close();
+		}
+	});
+}
+
+it("a rationed tick still reports a queued probe behind a busy receiver", () => {
+	const timer = fakeTimer();
+	const stall = new Stall(timer);
+	try {
+		timer.throttle(1000);
+		// An ordinary frame cadence must not excuse a task that the receiver keeps waiting.
+		for (let frame = 0; frame < 100; frame++) {
+			timer.advance(33);
+			expect(stall.blocked(timer.at())).toBe(false);
+		}
+		timer.busy(true);
+		const flags: boolean[] = [];
+		for (let frame = 0; frame < 20; frame++) {
+			timer.advance(33);
+			flags.push(stall.blocked(timer.at()));
+		}
+		expect(flags.slice(-10)).toEqual(Array(10).fill(true));
+	} finally {
+		timer.busy(false);
+		stall.close();
+	}
+});
