@@ -4817,11 +4817,12 @@ mod tests {
 	}
 
 	/// A warm cache whose newest group finished still resumes when the source has
-	/// nothing newer: the re-splice asks for that group's tail, which a source that
+	/// nothing newer: the re-splice asks for that group, which a source that
 	/// resolves starts lazily (with its first served group) can answer at once. Asking
 	/// past it left a returning catalog reader waiting for the next catalog change.
 	#[tokio::test]
 	async fn returning_reader_replays_a_current_warm_cache() {
+		tokio::time::pause();
 		let (_server, _upstream, mut dynamic, resolved) = served_front().await;
 
 		let track = resolved.track("catalog").unwrap();
@@ -4852,7 +4853,7 @@ mod tests {
 		let mut source = request.resolving_start().accept(None);
 		let mut subscription = subscribing.await.unwrap().expect("resubscribe");
 
-		// The source still has group 0 as its newest: it serves the empty tail, and
+		// The source still has group 0 as its newest: it serves the snapshot, and
 		// that is when its start resolves.
 		let reading = tokio::spawn(async move {
 			let mut group = subscription.recv_group().await.unwrap().expect("the catalog");
@@ -4862,18 +4863,77 @@ mod tests {
 		tokio::task::yield_now().await;
 		assert_eq!(
 			source.subscription().and_then(|sub| sub.start),
-			Some(track::Position { group: 0, frame: 1 }),
+			Some(track::Position { group: 0, frame: 0 }),
 			"the re-splice asked past the cached catalog"
 		);
 		source.start_at(0).unwrap();
-		let mut tail = source.create_group(0u64.into()).unwrap();
-		tail.start_at(1).unwrap();
-		tail.finish().unwrap();
+		let mut snapshot = source.create_group(0u64.into()).unwrap();
+		snapshot
+			.write_frame(crate::Timestamp::ZERO, b"snapshot".as_ref())
+			.unwrap();
+		snapshot.finish().unwrap();
 		let payload = tokio::time::timeout(Duration::from_secs(1), reading)
 			.await
 			.expect("the returning reader never got the catalog")
 			.unwrap();
 		assert_eq!(&payload[..], b"snapshot");
+	}
+
+	#[tokio::test]
+	async fn another_front_replays_a_resumed_finished_catalog() {
+		tokio::time::pause();
+		let producer = origin(1).produce();
+		let server = producer
+			.dynamic("room/alice", Route::default().with_hops(hops(&[10])))
+			.unwrap();
+		let pending = producer.consume().excluding(origin(20)).request_broadcast("room/alice");
+		let upstream = broadcast::Info::new().produce();
+		let mut dynamic = upstream.dynamic();
+		queued(&server).await.accept(&upstream);
+		let resolved = pending.await.unwrap();
+
+		let track = resolved.track("catalog").unwrap();
+		let subscribing = tokio::spawn(async move { track.subscribe(None).await });
+		let source = dynamic.requested_track().await.unwrap().resolving_start().accept(None);
+		let mut group = source.create_group(10u64.into()).unwrap();
+		group.write_frame(crate::Timestamp::ZERO, b"snapshot".as_ref()).unwrap();
+		group.finish().unwrap();
+		let mut first = subscribing.await.unwrap().unwrap();
+		first.recv_group().await.unwrap().unwrap();
+		drop(first);
+		source.unused().await.unwrap();
+		drop(source);
+
+		let track = resolved.track("catalog").unwrap();
+		let subscribing = tokio::spawn(async move { track.subscribe(None).await });
+		let mut resumed = dynamic.requested_track().await.unwrap().resolving_start().accept(None);
+		resumed.start_at(10).unwrap();
+		let mut first = subscribing.await.unwrap().unwrap();
+		let mut group = first.recv_group().await.unwrap().unwrap();
+		assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], b"snapshot");
+		assert!(first.poll_recv_group(&kio::Waiter::noop()).is_pending());
+		settle(|| resumed.subscription().is_some()).await;
+		let start = resumed.subscription().unwrap().start.unwrap();
+		assert_eq!(start.group, 10);
+		let mut response = resumed.create_group(10u64.into()).unwrap();
+		response.start_at(start.frame).unwrap();
+		if start.frame == 0 {
+			response
+				.write_frame(crate::Timestamp::ZERO, b"snapshot".as_ref())
+				.unwrap();
+		}
+		response.finish().unwrap();
+
+		let resolved = producer
+			.consume()
+			.excluding(origin(30))
+			.request_broadcast("room/alice")
+			.await
+			.unwrap();
+		let mut second = resolved.track("catalog").unwrap().subscribe(None).await.unwrap();
+		let mut group = second.recv_group().await.unwrap().unwrap();
+		assert_eq!(group.sequence, 10);
+		assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], b"snapshot");
 	}
 
 	/// A group that stays open for good (a JSON log in group 0) survives a park: the

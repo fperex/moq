@@ -81,20 +81,24 @@ impl Segment {
 		})
 	}
 
-	/// Where a copy spliced after this warm cache is asked to start: the end of the
-	/// cache's newest group, even a finished one, rather than the head of the next.
+	/// Where a copy spliced after this warm cache is asked to start: the newest group's
+	/// head when finished, or its next frame while open.
 	///
 	/// A source only resolves a start once it has a group to serve, so asking past its
 	/// newest group would leave a returning reader waiting on the next one. Asking for the
-	/// newest group's tail lets a source that is still there answer at once, and one that
-	/// moved on answer past it. Only the ask moves: the boundary stays where the cache
-	/// stops, so whatever the source sends for a finished group's empty tail (a FIN, or a
-	/// reset from a publisher that refuses empty ranges) sits outside the new segment.
+	/// newest group lets a source that is still there answer at once, and one that moved
+	/// on answer past it. A finished group is requested whole because other fronts share
+	/// the source's cache without this warm head. Only the ask moves: the boundary stays
+	/// where the cache stops, so the repeated finished group sits outside the new segment.
 	fn warm_edge(&self) -> Option<Position> {
-		let group = self.track.peek_latest()?;
+		let mut group = self.track.peek_latest()?;
+		let frame = match group.poll_finished(&kio::Waiter::noop()) {
+			Poll::Ready(Ok(_)) => 0,
+			_ => group.frame_count() as u64,
+		};
 		Some(Position {
 			group: group.sequence,
-			frame: group.frame_count() as u64,
+			frame,
 		})
 	}
 
