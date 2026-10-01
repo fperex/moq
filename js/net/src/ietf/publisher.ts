@@ -476,7 +476,7 @@ export class Publisher {
 			});
 
 			try {
-				await hooks.guardGroup(group, header.encode(stream, this.#session.version));
+				await hooks.guardGroup(group, () => header.encode(stream, this.#session.version));
 				// The first written object goes on the wire as its absolute id, so a trimmed
 				// head shows the true numbering rather than a silently renumbered group.
 				let first = true;
@@ -505,8 +505,7 @@ export class Publisher {
 						const obj = new Frame({ payload: read.frame.payload, timestamp: read.frame.timestamp });
 						const delta = first ? read.sequence : 0;
 						first = false;
-						await hooks.guardGroup(
-							group,
+						await hooks.guardGroup(group, () =>
 							obj.encode(stream, header.flags, timescale, this.#session.version, delta),
 						);
 					} finally {
@@ -515,8 +514,6 @@ export class Publisher {
 				}
 
 				stream.close();
-				// The transport may still hold data after FIN is queued.
-				await hooks.guardGroup(group, stream.closed);
 			} catch (err: unknown) {
 				stream.reset(error(err));
 			}

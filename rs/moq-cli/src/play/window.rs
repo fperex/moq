@@ -78,9 +78,11 @@ pub fn run(
 	let signal = tokio::spawn({
 		let proxy = proxy.clone();
 		async move {
-			if tokio::signal::ctrl_c().await.is_ok() {
-				let _ = proxy.send_event(Event::Finished);
-			}
+			let event = match crate::shutdown_signal().await {
+				Ok(()) => Event::Finished,
+				Err(error) => Event::Failed(format!("shutdown listener failed: {error:#}")),
+			};
+			let _ = proxy.send_event(event);
 		}
 	});
 

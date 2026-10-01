@@ -939,6 +939,16 @@ impl Producer {
 		}
 	}
 
+	/// Read the newest frame timestamp and register for any change to it.
+	pub(crate) fn poll_latest(&self, waiter: &kio::Waiter) -> Option<Timestamp> {
+		let mut latest = None;
+		let _ = self.state.poll(waiter, |state| {
+			latest = state.latest;
+			Poll::<()>::Pending
+		});
+		latest
+	}
+
 	/// Block until the group is closed or aborted.
 	pub async fn closed(&self) -> Error {
 		kio::wait(|waiter| self.poll_closed(waiter)).await

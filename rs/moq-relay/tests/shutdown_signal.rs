@@ -14,7 +14,7 @@
 
 #![cfg(unix)]
 
-use std::{net::TcpListener, time::Duration};
+use std::{net::TcpListener, sync::Mutex, time::Duration};
 
 use moq_relay::{Config, Relay, auth};
 
@@ -23,8 +23,12 @@ use moq_relay::{Config, Relay, auth};
 /// one second before exiting.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+// SIGINT reaches every relay in the process when libtest runs these concurrently.
+static SIGNAL_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn sigint_drains_sessions_before_exiting() {
+	let _signal = SIGNAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 	// Same reason as the cluster tests: under `--all-features` a `Connection`
 	// carries every transport backend, and holding one across awaits overflows
 	// libtest's 2 MiB per-test stack in an unoptimized build.
@@ -116,6 +120,7 @@ async fn sigint_drains_sessions_before_exiting_inner() {
 /// the window, which is how a relay restart killed every native publisher on it.
 #[test]
 fn a_draining_relay_refuses_a_new_session() {
+	let _signal = SIGNAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 	// Same reason as above: a `Connection` carrying every transport backend
 	// overflows libtest's per-test stack in an unoptimized build.
 	std::thread::Builder::new()

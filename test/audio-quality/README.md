@@ -16,7 +16,7 @@ just test audio-quality --runtime replay                   # the recorded traces
 just test audio-quality --offload false                    # the audio on the page's main thread
 ```
 
-The matrix is codec x jitter profile x ring path: 24 rows, about 30 minutes at the default 60
+The matrix is codec x jitter profile x document isolation: 24 rows, about 30 minutes at the default 60
 seconds a row. `--profiles`, `--rings`, and `--codecs` take comma-separated lists; `--seed` replays
 a given impairment; `--duration` shortens a row.
 
@@ -38,7 +38,7 @@ Three rows are enforced today:
 | Codec | Enforced |
 | --- | --- |
 | opus | `fixed-250` isolated |
-| aac | `fixed-250` both rings |
+| aac | `fixed-250` both isolation contexts |
 
 Twenty-one keep the marker, and the reason is the target rather than a fault in the measurement: an
 `auto` row's target follows the path for the whole window, so where inside sixty seconds the path's
@@ -57,7 +57,7 @@ A ceiling is clamped where the metric itself is bounded. A share cannot exceed 1
 time cannot exceed the row's own run, so the worst times 1.5 is capped at those: a ceiling a metric
 cannot reach is a check that can never fail, which reads as a cleared bar and is not one.
 
-The counters the engine has to keep at zero (underrun episodes, skip-aheads, budget aborts) are hard
+The counters the engine has to keep at zero (underrun episodes, skip-aheads) are hard
 zeros wherever both runs measured zero and carry a measured ceiling where they did not: those are
 the work that is left, not a bar that was cleared. A ceiling comes down as that work lands and never
 goes up without a reason in review.
@@ -77,6 +77,12 @@ native twin, or this harness: that lane takes seconds and cannot be unlucky.
 | `chromium` | Headless Chromium over WebTransport, the matrix above | yes | nightly, on demand, and locally |
 | `safari` | Real Safari over a WebSocket, the two control profiles | no | locally, on macOS |
 | `replay` | The recorded traces through the same player, on a simulated clock | no | pull requests, nightly, and anywhere else, in a second |
+
+The default audio worker uses the message ring in both document isolation contexts. These rows
+prove isolation handling, not SharedArrayBuffer playback. The nightly also runs
+`--profiles fixed-250 --rings isolated --offload false --enforce` for both codecs. Those rows keep
+audio on the page and require the concrete ring's debug snapshot to report `shared`. The default
+rows require `message`. Unknown or unexpected implementations void the row.
 
 ## How the browser reaches the relay
 
@@ -219,9 +225,8 @@ that hears the pause as a gap grades it as thrown-away audio.
 
 What it cannot say is anything about the transport, the container consumer, the device, or the wall
 clock, because there is no session and no audio hardware. Those metrics report null. What it can say
-exactly, and the browser lanes cannot, is what the ring and the engine did: `short_quanta`,
-`discarded_samples`, `accelerates`, `expands` and `stretched_samples` are read straight off the
-counters rather than inferred from a 250 ms sampling grid.
+exactly is what the ring and the engine did. The browser probe reads the same counters through
+`audio.out.debug`; replay does not depend on asynchronous reports or device scheduling.
 
 ## The metric schema
 
@@ -277,12 +282,23 @@ definition is a judgement call are:
 - **`stalled_quanta`** is the share of the run the ring spent re-stalled, refilling rather than
   playing. Graded separately from underruns: it is silence the player chose.
 
-- **`skip_aheads`** is a step in the lag between wall time and the playhead, not a single large
-  advance. See "What the sampling grid can and cannot see" below.
+- **`observed_jumps`** counts forward discontinuities when the reader commits media after playback
+  starts. `observed_skipped_samples` measures the media passed over in milliseconds. Both lanes
+  publish these comparable observations; startup trimming and timeline resets are excluded.
+  They remain informational under the existing budgets.
+
+- **`skip_aheads`** and **`skipped_samples`** use those observations in browser rows. Replay retains
+  its original operational definitions: explicit latency or empty-ring skip requests, excluding
+  capacity bounds. Its `discarded_samples` counts writer discards from capacity bounds or late
+  input. Keeping these operational categories preserves the existing independent replay limits;
+  an allowance for writer discards does not permit additional explicit skip requests. No budget
+  values or keys changed. These replay fields must not be read as aggregate playback loss.
 
 - **`silence_share`** is the share of sampled windows whose RMS at the graph output was below about
   -60 dBFS. It is the only metric read from the audio itself rather than from a counter: a counter
-  says the ring was fed, and only the PCM says the listener heard anything.
+  says the ring was fed, and only the PCM says the listener heard anything. The film has quiet
+  scenes of its own, so the same row reads 0.11 or 0.26 depending on which minute it plays; see
+  [the quiet proof](#the-quiet-proof) for how a share over its ceiling can still pass.
 
 - **`converge_s`** is measured backwards from the end of the run, to the last moment the resolved
   target was more than one bucket from its final value. A target that settles and then moves again
@@ -291,8 +307,7 @@ definition is a judgement call are:
 - **`skipped_groups`** is the container consumer's own count of groups abandoned with content still
   unread, read through `audio.out.skipped`. A group the next one already covers is not counted,
   because nothing was lost there. It cannot say why one was abandoned: the local age budget skipping
-  a stale group and the transport giving up on a slow one land in the same counter, which is why
-  `budget_aborts` stays null rather than being read off this.
+  a stale group and the transport giving up on a slow one land in the same counter.
 
 - **`worklet_cadence`** is what a hundred render quanta actually cost in wall time, against the
   128/rate they are worth. It exists because `renderCapacity` is Chromium's alone, so a Safari row
@@ -306,27 +321,53 @@ definition is a judgement call are:
   playback, from `sync.out.clock`. A sample from a build without that signal is left out of the
   denominator rather than counted as a zero, so an older build reports `null`.
 
-`short_quanta`, `silent_quanta`, `discarded_samples`, `accelerates`, `expands`,
-`stretched_samples`, and `budget_aborts` are in the schema and report `null` in the browser lanes:
-the signals they need are not on the element's public surface yet. They are null rather than zero,
-and the summary says which change would fill each one in. The replay lane reads five of them
-straight off the ring, because there is no page between the counter and the summary.
+`short_quanta`, `discarded_samples`, `accelerates`, `expands`, and `stretched_samples` come from
+`audio.out.debug`. A build without the counters reports null.
+
+### The quiet proof
+
+The raw `silence_share` and its ceilings are graded exactly as before. A share over its ceiling
+passes only when every quiet window it counted lines up with a quiet window of the audio the page
+decoded, at the same media time. One quiet window over audible audio, one that cannot be placed, or
+a proof counting other windows than the share did, keeps the failure. A row within its ceiling keeps
+the verdict it had. The grade prints both: the raw share, and how many quiet windows were placed over
+quiet audio.
+
+The reference is rebuilt after the row, in `analyze.ts`, never in the page. It replays the
+publisher's own audio encode of the file it loops (`audio_of` in `publish.sh`, with `-stream_loop -1`
+and without `-re`), which reproduces the published packets byte for byte on the same host, decodes
+it with the page's decoder (FFmpeg's AAC, libopus), and mixes it to mono as the AnalyserNode mixes
+its input. Against the film itself the codec's level change alone moves a window within a percent of
+the floor across it.
+
+A window is placed with what the probe already records ([`src/silence.ts`](clients/js/src/silence.ts)):
+
+- `AudioContext.currentTime`, read with the RMS, ends the window.
+- The ring's playhead less its `output` counter, from one report, is the media frame paired with
+  each output frame. Only a time stretch moves it while the ring plays, and the reports either side
+  bracket it across the window, widened by one maximal stretch for each further stretch between two
+  consecutive reports, and for the final window, which has no later report.
+- A concealment, underrun, short quantum, skip, jump, discard, trim, stall, new graph, or new
+  timeline between those reports refuses the window rather than placing it.
+
+That leaves one constant per row, fitted to the audible windows. Chromium's AnalyserNode can also
+fall a whole window behind the context clock partway through a row with nothing else changing, so
+each exact audible window votes for the lag, in whole windows, at which it matches the reference,
+and the row splits into segments where that lag holds, at most one window apart. Every segment has
+to prove its own lag with its own audible windows: 40 of them, a log RMS correlation of 0.999, and a
+level within 5%. A quiet window is checked at its segment's proven lag only; one in an unproven
+segment, or between two segments where nothing says which lag it had, keeps the failure.
 
 ### What the sampling grid can and cannot see
 
-The page samples every 250 ms, and the playhead it reads is quantized: it moves when the ring
-reports a new position, not continuously. Measured on a clean local path, consecutive samples show
-the playhead advancing anywhere from 240 to 296 ms with no net drift.
+The page samples every 250 ms. Worklet and worker reports arrive asynchronously, so a change
+in report age can move the sampled playhead by tens of milliseconds without skipping any audio.
+A continuous stream with a 60 ms report delay produces a false skip under timestamp inference.
+The analyzer therefore grades the ring's cumulative skip counters and reports media drift separately.
 
-Two derivations have to survive that, and both were wrong before they were measured:
-
-- A rule that calls a single sample's excess advance a skip reports about forty skips a minute on a
-  run with none. A skip-ahead is therefore a step in the de-trended lag, judged on the median of the
-  four samples either side of it, and has to exceed 40 ms: more than the quantization band, and more
-  than one estimator bucket plus a render quantum.
-- The lag also drifts when the media timeline does not advance at wall rate, which is a property of
-  the source or the publisher rather than of the player. It is fitted by least squares and removed
-  before skips are counted, and reported on its own as `media_drift`.
+A graph replacement, timeline re-anchor, or counter reset during the measured window voids the
+row. Its discontinuity cannot disappear into a counter delta of zero. A build that lacks these
+counters reports null instead of an estimated skip count.
 
 ### Void rules
 
@@ -344,7 +385,9 @@ main thread with no reason: a reason is a fallback, meaning the page tried the w
 | `shaper` | An active profile's `delayed` counter is zero, so the impairment never applied and an impaired run became an unimpaired pass. `near-zero` and `fixed-250` are exempt: zero is the right answer for the control. |
 | `transport` | The page's session, or its audio worker's own, negotiated something other than WebTransport. A WebSocket fallback is TCP and never touches the UDP shaper. The page denies the fallback outright (below), for the worker too, so this is a backstop rather than the usual outcome. The Safari lane expects a WebSocket instead. |
 | `thread` | The audio did not come from the page's audio worker, the player's default: the page played it on its main thread (the detail says why), or the worker never started. Under `--offload false`, the audio did not stay on the main thread by choice: it played on the worker, or fell back with a reason. Checked once the audio plays and again at the end, since the page takes the audio back for good. A build that predates the worker cannot say, and is not voided for it. |
-| `ring` | The document's `crossOriginIsolated` does not match the ring the row asked for, so the other ring ran. |
+| `ring` | The document's `crossOriginIsolated` does not match the requested context. |
+| `backend` | The concrete ring's debug snapshot is absent or names a different implementation from the requested execution path. |
+| `playout` | The graph, timeline anchor, sample rate, or monotonic counters changed during the measured window. |
 | `clock` | `AudioContext.currentTime` drifted more than 1% from wall time over the first ten seconds, or was never readable. |
 | `window` | No samples survived the warmup. |
 | `driver` | The driver threw. A Playwright trace is saved into the run directory. |
@@ -371,14 +414,23 @@ audio worker's on one shared path, as they are on a real host.
 `fixed-250` earns its place: every other row exercises adaptation, so without it the whole matrix
 can pass while a fixed preset regresses, and a fixed preset is what a viewer lands on today.
 
-The source shape is a third axis that is not a profile. The AAC arm publishes MPEG-TS with ffmpeg's
-default PES packing, whose multi-frame bursts are the arrival shape the reporter measured against
-the public relay; `demo/pub` passes `-pes_payload_size 0` for the smooth variant.
+The adaptive AAC rows publish MPEG-TS with ffmpeg's default PES packing, whose multi-frame bursts
+are the arrival shape seen on the public relay. Two quiet passages in each loop pack 16 AAC frames
+into one PES, spanning 372 ms. The fixed 250 ms control uses a separate broadcast with
+`-max_delay 0`, which flushes one AAC frame per PES. Reducing `-pes_payload_size` alone still packs
+quiet frames into the mux's minimum payload size. Its encoder and silence reference are identical
+to the packed broadcast. The replay tests retain the 16-frame
+source bursts and prove that they underrun a 250 ms target even on a constant-delay path.
+Both publishers pin
+`-readrate_catchup 1`, so a publisher that was blocked (a `moq` slow to start, a stall in its import)
+resumes at real time instead of running five percent fast until it has made the time up; a fixed
+delay would otherwise throw that surplus away as skips that measure the source, not the player.
 
 ## Layout
 
 ```text
 run.sh                      builds, starts everything, runs each row, analyzes, grades
+publish.sh                  codec encode settings and the packed or paced publisher
 relay.toml                  anonymous relay, self-signed localhost cert
 budgets.json                a ceiling per metric per matrix row
 clients/js/
@@ -386,19 +438,22 @@ clients/js/
   src/probe.ts              samples the element's public signals every 250ms
   src/beacon.ts             batches to the sink, sendBeacon on pagehide
   src/schema.ts             the metric contract
-  src/*.test.ts             the thread void rule and how the probe reads the thread, under `just test`
+  src/silence.ts            places each quiet window in the audio the page decoded
+  src/*.test.ts             the void rules, the probe, the analyzer, the grader and the quiet proof, under `just test`
   driver.ts                 one row in headless Chromium, and the void checks
   replay.ts                 the recorded traces, with no relay, shaper, or browser
   safari.ts                 one row in real Safari, and the void checks it needs instead
   webdriver.ts              a dependency-free W3C WebDriver client over safaridriver
   sink.ts                   one ndjson file per row
-  analyze.ts                ndjson to summary.json and summary.md
+  analyze.ts                ndjson to summary.json and summary.md, with the quiet proof
   grade.ts                  summaries against budgets.json
   compare.ts                a before/after table across two run directories
 ```
 
 A failing run keeps its directory, with each process's log, the shaper's counters, the raw ndjson,
-and a Playwright trace of the failing page. The path and the rerun command are printed.
+and a Playwright trace of each Chromium page. The driver saves the trace after closing the measured
+page and flushing its beacon, because grading happens after the driver exits. The path and the rerun
+command are printed.
 
 ## Comparing two runs
 
@@ -414,13 +469,7 @@ The harness this grew from is the reporter's, on their fork `fperex/moq`, branch
 the beacon sink, the trace analyzer, the black-box probe, and the before/after table were working
 there before any of this existed, against 130 raw ndjson traces published as release
 `rt-audio-traces-2026-09-06`. `sink.ts`, `compare.ts`, `src/probe.ts`, and `analyze.ts` are adapted
-from `debug-findings/analysis/{sink.ts,compare.mjs,blackbox.js,analyze.mjs}` and say so in their
-module comments.
-
-What changed in upstreaming: the CDP driver became Playwright, reusing the smoke harness; the
-analyzer's event stream came from probes patched into the player, and now comes from the public
-signals, which is what lets the same page measure a published build; and the arrival impairment came
-from a shell script driving the OS, and now comes from `moq-shaper` with a seed and its own counters.
+from `debug-findings/analysis/{sink.ts,compare.mjs,blackbox.js,analyze.mjs}`.
 
 ## Not covered here
 

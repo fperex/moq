@@ -135,11 +135,15 @@ class FakeVideo {
 		this.#callbacks.delete(handle);
 	}
 
-	/** A new picture arrives. Returns the instant it was reported at, which is what stamps it. */
-	advance(metadata: { captureTime?: number } = {}): number {
+	/**
+	 * A new picture arrives. Returns the instant it was reported at, which is what stamps it. `at`
+	 * overrides that instant, for a callback whose timestamp is the frame's start (vsync) rather
+	 * than when it ran.
+	 */
+	advance(metadata: { captureTime?: number } = {}, at?: number): number {
 		this.currentTime += 1 / RATE;
 
-		const now = performance.now();
+		const now = at ?? performance.now();
 		if (this.suspended) return now;
 
 		// The real callback re-registers itself, so hand out the pending ones and start empty.
@@ -296,6 +300,9 @@ test("keeps capturing when the frame callback is suspended", async () => {
 	arrivalStep = 0;
 	spawned.length = 0;
 
+	const realNow = performance.now.bind(performance);
+	let clock = realNow();
+	performance.now = () => clock;
 	const dom = install();
 	try {
 		const track = new FakeTrack();
@@ -310,6 +317,7 @@ test("keeps capturing when the frame callback is suspended", async () => {
 		for (let i = 0; i < 3; i++) {
 			const read = reader.read();
 			await drain();
+			clock += 1000 / RATE;
 			const now = video.advance();
 			expect((await read).value?.timestamp).toBe(now * 1000);
 		}
@@ -326,18 +334,21 @@ test("keeps capturing when the frame callback is suspended", async () => {
 		// A tick inside the grace is normal jitter, not a suspended callback.
 		const early = reader.read();
 		await drain();
+		clock += 1000 / RATE;
 		video.advance();
 		ticker.tick();
 		expect(await pending(early)).toBe("pending");
 
 		// Past the grace the tick drives capture: one frame per picture, none of them repeats.
 		const stamps: number[] = [];
+		clock += 2000 / RATE;
 		ticker.tick();
 		stamps.push((await early).value?.timestamp ?? 0);
 
 		for (let i = 0; i < 9; i++) {
 			const read = reader.read();
 			await drain();
+			clock += 1000 / RATE;
 			video.advance();
 			ticker.tick();
 			const frame = await read;
@@ -353,6 +364,7 @@ test("keeps capturing when the frame callback is suspended", async () => {
 		await reader.cancel();
 		expect(ticker.terminated).toBe(true);
 	} finally {
+		performance.now = realNow;
 		dom.restore();
 	}
 });
@@ -431,6 +443,65 @@ test("stops rather than hand the encoder a timeline that goes backwards", async 
 		// A stream that errors is never cancelled, so it has to let go of both clocks itself.
 		expect((spawned.at(-1) as FakeWorker).terminated).toBe(true);
 	} finally {
+		dom.restore();
+	}
+});
+
+// N10: when a hidden window comes back, the worker tick has been capturing, stamped with
+// performance.now() when its message was handled. The first frame callback after that carries the
+// refresh tick's timestamp, taken when the frame began, which can sit just before the tick's stamp
+// if the tick ran between vsync and the callbacks. That is one new picture half a millisecond
+// "early", not a clock fault, and it must not tear the capture down.
+test("a callback stamped just before the last tick keeps the stream readable", async () => {
+	supported = false;
+	advance = 1000;
+	arrivalStep = 0;
+	spawned.length = 0;
+
+	const realNow = performance.now.bind(performance);
+	let clock = 1000;
+	performance.now = () => clock;
+	const dom = install();
+	try {
+		const track = new FakeTrack();
+		const stream = TrackProcessor(track as unknown as Parameters<typeof TrackProcessor>[0]);
+		const reader = stream.getReader();
+
+		await drain();
+		const video = dom.video();
+
+		// On screen, one picture through the callback.
+		const shown = reader.read();
+		await drain();
+		video.advance();
+		expect((await shown).value).toBeDefined();
+
+		// Hidden: past the grace, the tick takes the next picture and stamps it with its own clock.
+		video.suspended = true;
+		const ticker = spawned.at(-1) as FakeWorker;
+		const hidden = reader.read();
+		await drain();
+		expect(await pending(hidden)).toBe("pending");
+		clock += 2000 / RATE;
+		video.advance();
+		ticker.tick();
+		const stamped = ((await hidden).value?.timestamp ?? 0) / 1000;
+
+		// Visible again: the next new picture's callback reports the frame start, 0.5 ms before that.
+		video.suspended = false;
+		const next = reader.read();
+		await drain();
+		video.advance({}, stamped - 0.5);
+
+		const result = await next.then(
+			(read) => ({ readable: true, frame: read.value !== undefined }),
+			(err: Error) => ({ readable: false, error: err.message }),
+		);
+		expect(result).toEqual({ readable: true, frame: true });
+
+		await reader.cancel();
+	} finally {
+		performance.now = realNow;
 		dom.restore();
 	}
 });

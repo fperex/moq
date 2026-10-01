@@ -106,19 +106,19 @@ describe("render worklet ports", () => {
 		}
 		await settle();
 
-		// 40 quanta is about 107 ms: past the fill, well inside the 200 ms written.
-		const played = pull(render, 40);
+		// 50 quanta is about 133 ms: past the fill, well inside the 200 ms written.
+		const played = pull(render, 50);
 		const loudest = played.reduce((max, v) => Math.max(max, Math.abs(v)), 0);
 		expect(loudest).toBeGreaterThan(0.2);
 
 		await settle();
-		// A state message every five quanta, to the node's port as always and to the writer's.
-		expect(page.length).toBeGreaterThanOrEqual(7);
-		expect(writer.length).toBe(page.length);
+		// A state message every five quanta to the writer's port; the node's port hears once that it played.
+		expect(writer.length).toBe(10);
 		const last = writer[writer.length - 1];
 		expect(last.type).toBe("state");
 		expect(last.debug.output).toBeGreaterThan(0);
-		expect(page[page.length - 1]).toEqual(last);
+		expect(page.length).toBe(1);
+		expect(page[0].debug.fresh).toBe(false);
 
 		node.port2.close();
 		extra.port2.close();
@@ -168,5 +168,73 @@ describe("render worklet ports", () => {
 
 		node.port2.close();
 		extra.port2.close();
+	});
+
+	it("lets its processor end once the node is closed", async () => {
+		// A processor whose `process` keeps returning true keeps running after its node is disconnected
+		// and dropped, for as long as the context is open. The decoder rebuilds nodes in a context that
+		// stays open, so it says when a node is done with.
+		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
+		const node = new MessageChannel();
+		nextPort = node.port1;
+		const render = new Render();
+		expect(render.process([], [[new Float32Array(QUANTUM)]], {})).toBe(true);
+
+		node.port2.postMessage({ type: "close" });
+		await settle();
+		expect(render.process([], [[new Float32Array(QUANTUM)]], {})).toBe(false);
+
+		node.port2.close();
+	});
+
+	it("says on the node's own port that its processor stopped, in the quantum that stops it", async () => {
+		// Chromium keeps a closed context, and every node in it, for as long as one of its processors
+		// has not stopped, and a processor only stops in a quantum it renders. The page closes the
+		// context on this, not on the close it sent.
+		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
+		const node = new MessageChannel();
+		nextPort = node.port1;
+		const render = new Render();
+		const extra = new MessageChannel();
+		const handoff: Port = { type: "port", port: extra.port1 };
+		const page: ToMain[] = [];
+		const writer: ToMain[] = [];
+		try {
+			const receive = node.port1.onmessage;
+			if (!receive) throw new Error("render registered no message handler");
+			// Resolves once the processor has handled the close the page sent.
+			const handled = Promise.withResolvers<void>();
+			node.port1.onmessage = (event) => {
+				receive.call(node.port1, event);
+				if ((event.data as Message).type === "close") handled.resolve();
+			};
+			node.port2.postMessage(handoff, [extra.port1]);
+			extra.port2.onmessage = (event: MessageEvent<ToMain>) => writer.push(event.data);
+			node.port2.postMessage({ type: "close" });
+			await handled.promise;
+
+			// Nothing yet: a close is not a stop. A marker from the processor's end lands after anything
+			// the processor already said on it.
+			const marked = new Promise<void>((resolve) => {
+				node.port2.onmessage = (event: MessageEvent<ToMain | "marker">) => {
+					if (event.data === "marker") resolve();
+					else page.push(event.data);
+				};
+			});
+			node.port1.postMessage("marker");
+			await marked;
+			expect(page).toEqual([]);
+
+			const stopped = new Promise<ToMain>((resolve) => {
+				node.port2.onmessage = (event: MessageEvent<ToMain>) => resolve(event.data);
+			});
+			expect(render.process([], [[new Float32Array(QUANTUM)]], {})).toBe(false);
+			expect(await stopped).toEqual({ type: "stopped" });
+			// Only the page closes a context, so a writer's port hears nothing of it.
+			expect(writer).toEqual([]);
+		} finally {
+			node.port2.close();
+			extra.port2.close();
+		}
 	});
 });

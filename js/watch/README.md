@@ -150,6 +150,15 @@ The `<moq-watch-ui>` element automatically discovers the nested `<moq-watch>` el
 - **Quality selection**: Switch between available renditions
 - **Custom tracks**: Unknown catalog sections pass through, and `broadcast.out.active` subscribes your own tracks
 
+## Report benchmark
+
+Run `bun js/watch/src/audio/worker/remote.bench.ts` from the repository root.
+The benchmark measures main-thread report processing for 1 to 100 viewers at 10, 20,
+and 50 ms report intervals. It runs the real `Decoder`, `Remote`, and `Sync` with a
+mock worker and audio device, so it does not measure codec or relay throughput.
+It prints timings and asserts nothing about them. The nightly workflow runs it; the
+unit tests in CI hold the same property by counting the work each report does instead.
+
 ## License
 
 Licensed under either:

@@ -383,34 +383,13 @@ impl<F: Container> Consumer<F> {
 			{
 				let hole = !pts_contiguous(current_end.or(self.presented_end), next_start);
 				let had_marker = self.pending.iter().take(new_idx).any(GroupBuffer::marker);
-				// What the verdict was reached on, since the same line has to answer whether the
-				// oldest group was actually late or merely long: what it held, and whether more of
-				// it was still coming.
-				let (first, last, open) = match self.pending.front_mut() {
-					Some(front) => (
-						front.min_timestamp,
-						front.max_timestamp,
-						front.group.poll_finished(waiter).is_pending(),
-					),
-					None => (None, None, false),
-				};
 				self.pending.drain(0..new_idx);
 				if hole || had_marker {
 					self.bump_playhead();
 				}
 				let new_current = self.pending.front().map(|g| g.sequence).unwrap();
 
-				tracing::debug!(
-					old = self.current,
-					new = new_current,
-					?first,
-					?last,
-					open,
-					reach = ?next_start,
-					live = ?max_timestamp,
-					budget = ?self.max_age,
-					"skipping slow groups"
-				);
+				tracing::debug!(old = self.current, new = new_current, "skipping slow groups");
 
 				self.current = new_current;
 				self.note_group_edge();
@@ -2773,5 +2752,53 @@ mod tests {
 		write_marker(&mut group, ts(15_000));
 		let event = kio::wait(|waiter| consumer.poll_event(waiter)).await.unwrap();
 		assert!(matches!(event, Some(Event::FrameEnd(end)) if end == ts(15_000)));
+	}
+
+	#[test]
+	fn a_skip_registers_no_extra_waker_on_the_group_it_drains() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+
+		struct Count(AtomicUsize);
+		impl std::task::Wake for Count {
+			fn wake(self: std::sync::Arc<Self>) {
+				self.0.fetch_add(1, Ordering::SeqCst);
+			}
+			fn wake_by_ref(self: &std::sync::Arc<Self>) {
+				self.0.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.audio));
+		let mut consumer = Consumer::new(
+			track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_millis(100))),
+			Container::Legacy(crate::container::Kind::Data),
+		);
+
+		// Group 0 stays open after its one frame, which the reader takes.
+		let mut open = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		let frame = Frame {
+			timestamp: ts(0),
+			payload: Bytes::from_static(&[0xDE, 0xAD]),
+			keyframe: false,
+			duration: None,
+		};
+		Container::Legacy(crate::container::Kind::Data)
+			.write(&mut open, &[frame])
+			.unwrap();
+		let first = kio::Waiter::noop();
+		assert!(matches!(consumer.poll_read(&first), Poll::Ready(Ok(Some(f))) if f.timestamp == ts(0)));
+
+		// Group 1 lands 300ms later, past the 100ms budget, so the next poll skips group 0.
+		write_group(&mut track, 1, &[ts(300_000)]);
+		let count = std::sync::Arc::new(Count(AtomicUsize::new(0)));
+		let waiter = kio::Waiter::new(std::task::Waker::from(count.clone()));
+		assert!(matches!(consumer.poll_read(&waiter), Poll::Ready(Ok(Some(f))) if f.timestamp == ts(300_000)));
+
+		// The drained group's FIN arrives: nothing the reader is waiting for any more.
+		count.0.store(0, Ordering::SeqCst);
+		open.finish().unwrap();
+		let wakes = count.0.load(Ordering::SeqCst);
+		assert!(wakes <= 2, "the drained group woke the reader {wakes} times");
+		drop(waiter);
 	}
 }

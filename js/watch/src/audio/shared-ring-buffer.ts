@@ -46,7 +46,7 @@ const OUTPUT = 9;
 const ACCELERATES = 10;
 const EXPANDS = 11;
 const SHORT = 12;
-// Skip-aheads, and the samples they threw away. Reader only.
+// Explicit skip operations and their requested samples, excluding capacity bounds.
 const SKIPS = 13;
 const SKIPPED = 14;
 // Samples the writer dropped: too old for the playhead, or past the ring's capacity. Writer only.
@@ -70,7 +70,10 @@ const ENDED = 18;
  * to close: nothing had been played, so the playhead simply started further in. See `#trim`.
  */
 const TRIMMED = 19;
-const CONTROL_SLOTS = 20;
+// Discontinuities actually observed when the reader commits media. Reader only.
+const JUMPS = 20;
+const JUMPED = 21;
+const CONTROL_SLOTS = 22;
 
 /**
  * The playhead and its mutation epoch, packed into one 64-bit word: epoch in the high
@@ -222,6 +225,10 @@ export class SharedRingBuffer implements RingReader {
 	// is the writer having dropped the oldest samples out from under the reader, which the playout
 	// engine has to treat as a step rather than as the buffer draining.
 	#expected: number | undefined;
+	// The last positive reader commit, preserved across resize but not a new media timeline.
+	#observedRead: number | undefined;
+	#observedTimeline = 0;
+	#observedEpoch = 0;
 
 	// Absolute sample index of that first sample. READ/WRITE are stored relative to it, so
 	// `timestamp` adds it back to recover media time. Main-thread only: the worklet reads by
@@ -284,14 +291,21 @@ export class SharedRingBuffer implements RingReader {
 
 		const timeline = Atomics.load(source.#control, TIMELINE);
 		const from = Atomics.load(source.#state, 0);
+		for (const counter of [JUMPS, JUMPED]) {
+			Atomics.store(this.#control, counter, Atomics.load(source.#control, counter));
+		}
 
 		for (;;) {
 			const state = Atomics.load(this.#state, 0);
 			if (Atomics.load(this.#control, TIMELINE) !== timeline) return;
-			if (((readOf(from) - readOf(state)) | 0) <= 0) return;
+			if (((readOf(from) - readOf(state)) | 0) <= 0) break;
 
 			const next = pack(epochOf(state), readOf(from));
-			if (Atomics.compareExchange(this.#state, 0, state, next) === state) return;
+			if (Atomics.compareExchange(this.#state, 0, state, next) === state) break;
+		}
+		if (source.#observedTimeline === timeline) {
+			this.#observedRead = source.#observedRead;
+			this.#observedTimeline = timeline;
 		}
 	}
 
@@ -302,13 +316,14 @@ export class SharedRingBuffer implements RingReader {
 	 * overflow path; the reader publishes with its own exchange so it can tell a rebase apart
 	 * from losing a race.
 	 */
-	#advance(candidate: number): void {
+	#advance(candidate: number): number {
 		for (;;) {
 			const state = Atomics.load(this.#state, 0);
-			if (((candidate - readOf(state)) | 0) <= 0) return;
+			const advanced = (candidate - readOf(state)) | 0;
+			if (advanced <= 0) return 0;
 
 			const next = pack(epochOf(state), candidate);
-			if (Atomics.compareExchange(this.#state, 0, state, next) === state) return;
+			if (Atomics.compareExchange(this.#state, 0, state, next) === state) return advanced;
 		}
 	}
 
@@ -429,8 +444,8 @@ export class SharedRingBuffer implements RingReader {
 		const bounded = readOf(Atomics.load(this.#state, 0));
 		if (((end - bounded) | 0) > this.capacity) {
 			const to = (end - this.capacity) | 0;
-			Atomics.add(this.#control, DISCARDED, (to - bounded) | 0);
-			this.#advance(to);
+			const discarded = this.#advance(to);
+			if (discarded > 0) Atomics.add(this.#control, DISCARDED, discarded);
 		}
 
 		// Write sample data
@@ -451,10 +466,8 @@ export class SharedRingBuffer implements RingReader {
 		// Advance WRITE (only forward)
 		Atomics.store(this.#control, WRITE, i32Max(Atomics.load(this.#control, WRITE), end));
 
-		// Un-stall once the ring holds the target and the chunk being played on top of it. The target
-		// counts the frame in play, the way NetEq's does (the `packet_buffer` span plus the sync
-		// buffer), so a ring holding the target alone holds nothing unplayed and runs dry on the first
-		// arrival that is a millisecond late. See CHUNK.
+		// Un-stall once the ring holds the target and the chunk being played on top of it: the target
+		// counts the frame in play, so the target alone runs dry on the first late arrival. See CHUNK.
 		const currentWrite = Atomics.load(this.#control, WRITE);
 		const latency = Atomics.load(this.#control, LATENCY);
 		const chunk = Atomics.load(this.#control, CHUNK);
@@ -474,23 +487,9 @@ export class SharedRingBuffer implements RingReader {
 	 * Start the playhead at the newest sample less `hold`, rather than at the oldest one.
 	 * Main thread only.
 	 *
-	 * Until the reader has taken a sample nothing on this timeline has been heard, so audio above the
-	 * level the ring holds is audio nobody is waiting on and dropping it is silent. Only once playback
-	 * has started does a surplus have to be closed by the reader's time stretch, which is seconds of
-	 * bent speech for the tens of milliseconds a resubscription admits past the hold: a fresh
-	 * subscription is served the live edge and then whatever the relay still had inside the age
-	 * budget, and all of it decodes before the first render quantum. NetEq reaches its target the same
-	 * way, by where playout starts rather than by accelerating into it, and does not adjust the buffer
-	 * at the start of a stream (`decision_logic.cc`, `delay_manager.cc`).
-	 *
-	 * The first fill only. A refill after an underrun resumes a timeline the listener is already
-	 * following, and there a publisher's flush burst is audio that will have drained again by the next
-	 * one, which is why the reader waits it out rather than dropping it.
-	 *
-	 * A whole chunk or more, because a fill lands a chunk at a time: a level that crossed the hold by
-	 * part of one is the ring sitting where it is meant to sit, and a trim that landed it anywhere but
-	 * on the hold would leave it on the very threshold the reader accelerates at. Buffered playback is
-	 * asked to hold a lookahead, so it keeps everything.
+	 * Nothing on a timeline nobody has heard yet is waited on, so dropping the surplus is silent where
+	 * stretching it away would bend seconds of speech. The first fill only, and only a whole chunk or
+	 * more; buffered playback keeps everything. See "Where playout starts" in `doc/concept/playout.md`.
 	 */
 	#trim(hold: number, chunk: number): void {
 		if (this.#resumed === undefined || this.buffered) return;
@@ -523,6 +522,13 @@ export class SharedRingBuffer implements RingReader {
 	 */
 	view(): RingView {
 		const state = Atomics.load(this.#state, 0);
+		const epoch = epochOf(state);
+		if (epoch !== this.#observedEpoch) {
+			const timeline = Atomics.load(this.#control, TIMELINE);
+			if (timeline !== this.#observedTimeline) this.#observedRead = undefined;
+			this.#observedTimeline = timeline;
+			this.#observedEpoch = epoch;
+		}
 		this.#snapshot = state;
 
 		const stalled = Atomics.load(this.#control, STALLED) === 1;
@@ -571,7 +577,7 @@ export class SharedRingBuffer implements RingReader {
 		view.unstable = unstable;
 		view.converge = !this.buffered;
 		view.skipped = jumped + this.#pending;
-		view.generation = epochOf(state);
+		view.generation = epoch;
 		return view;
 	}
 
@@ -603,6 +609,16 @@ export class SharedRingBuffer implements RingReader {
 		const next = (this.#cursor + count) | 0;
 		if (((next - readOf(state)) | 0) !== 0) {
 			if (Atomics.compareExchange(this.#state, 0, state, pack(epochOf(state), next)) !== state) return false;
+		}
+		if (count > 0) {
+			if (this.#observedRead !== undefined) {
+				const jumped = (this.#cursor - this.#observedRead) | 0;
+				if (jumped > 0) {
+					Atomics.add(this.#control, JUMPS, 1);
+					Atomics.add(this.#control, JUMPED, jumped);
+				}
+			}
+			this.#observedRead = next;
 		}
 		if (this.#pending > 0) {
 			Atomics.add(this.#control, SKIPS, 1);
@@ -744,10 +760,6 @@ export class SharedRingBuffer implements RingReader {
 	}
 
 	/**
-	 * Flush buffered samples and re-stall, ready to anchor the next utterance (buffered mode).
-	 * Main thread only. The worklet reader sees STALLED and stops until the next insert.
-	 */
-	/**
 	 * The publisher declared the timeline finished here: play out what is buffered, then silence.
 	 * Main thread only.
 	 *
@@ -764,6 +776,10 @@ export class SharedRingBuffer implements RingReader {
 		Atomics.store(this.#control, STALLED, 0);
 	}
 
+	/**
+	 * Flush buffered samples and re-stall, ready to anchor the next utterance (buffered mode).
+	 * Main thread only. The worklet reader sees STALLED and stops until the next insert.
+	 */
 	reset(): void {
 		this.#anchored = false;
 		this.#resumed = undefined;
@@ -775,10 +791,8 @@ export class SharedRingBuffer implements RingReader {
 	}
 
 	/**
-	 * Allocate a new ring with `newCapacity` samples and copy the unread window
-	 * [READ, WRITE) plus control state into it. Used when growing capacity so
-	 * we don't drop buffered audio. If `newCapacity` is smaller than the unread
-	 * span, the oldest samples are truncated.
+	 * Grow the ring to `newCapacity`, preserving unread samples and control state.
+	 * Shrinking is unsupported: the old reader keeps playing until the replacement arrives.
 	 *
 	 * Main thread only. `resize()` reads from the source `SharedRingBuffer` and
 	 * writes into a freshly allocated buffer from `allocSharedRingBuffer`, so it
@@ -787,6 +801,7 @@ export class SharedRingBuffer implements RingReader {
 	 * by READ/WRITE elsewhere.
 	 */
 	resize(newCapacity: number): SharedRingBuffer {
+		if (newCapacity < this.capacity) throw new Error("cannot shrink a shared audio ring");
 		const init = allocSharedRingBuffer(this.channels, newCapacity, this.rate, this.buffered);
 		const dst = new SharedRingBuffer(init);
 		dst.#anchored = this.#anchored;
@@ -799,7 +814,7 @@ export class SharedRingBuffer implements RingReader {
 		const stalled = Atomics.load(this.#control, STALLED);
 
 		const available = (write - read) | 0;
-		const copyCount = Math.max(0, Math.min(available, dst.capacity));
+		const copyCount = Math.max(0, available);
 		const copyStart = (write - copyCount) | 0;
 
 		for (let channel = 0; channel < this.channels; channel++) {
@@ -811,6 +826,8 @@ export class SharedRingBuffer implements RingReader {
 			}
 		}
 
+		dst.#observedRead = this.#observedRead;
+		dst.#observedTimeline = this.#observedTimeline;
 		Atomics.store(dst.#control, TIMELINE, Atomics.load(this.#control, TIMELINE));
 		Atomics.store(dst.#state, 0, pack(epochOf(state), copyStart));
 		Atomics.store(dst.#control, WRITE, write);
@@ -832,14 +849,15 @@ export class SharedRingBuffer implements RingReader {
 			SKIPPED,
 			DISCARDED,
 			TRIMMED,
+			JUMPS,
+			JUMPED,
 			ENDED,
 		]) {
 			Atomics.store(dst.#control, control, Atomics.load(this.#control, control));
 		}
 
 		// Carry the unwrapped playhead over, rebased onto dst's READ. Fold the same `read`
-		// snapshot the copy used so both sides agree on one observation; `copyStart` is at or
-		// ahead of it whenever the copy dropped the oldest samples.
+		// snapshot the copy used so both sides agree on one observation.
 		dst.#position = this.#foldRead(read) + ((copyStart - read) | 0);
 		dst.#lastRead = copyStart;
 		dst.#lastMedia = this.#lastMedia;
@@ -871,10 +889,9 @@ export class SharedRingBuffer implements RingReader {
 	 * READ less what the reader is still holding: a time stretch makes those two diverge, and it is
 	 * the media position, not the output frame count, that video has to be paced against.
 	 *
-	 * READ and QUEUED live in separate words, so a poll can land between the reader's two stores and
-	 * pair a fresh cursor with a stale queue. The error is bounded by one output block and only
-	 * happens at a commit, but a playhead that stepped backwards would make video wait for audio
-	 * that has already been heard, so this never reports less than it did last time.
+	 * READ and QUEUED live in separate words, so a poll can pair a fresh cursor with a stale queue.
+	 * The error is under one output block, but a playhead that stepped backwards would make video
+	 * wait for audio already heard, so this never reports less than it did last time.
 	 */
 	#media(): number {
 		const queued = Atomics.load(this.#control, QUEUED);
@@ -899,10 +916,9 @@ export class SharedRingBuffer implements RingReader {
 	 * Main thread only, and stateful for the same reason {@link timestamp} is: the rate is measured
 	 * between polls.
 	 *
-	 * The rate is the reader's own, `1 + (dSTRETCHED - dCONCEALED)/dOUTPUT`: it consumes a sample of
-	 * media per output frame while playing normally, a few percent more or less while a time stretch
-	 * converges on the target, and none at all while concealment covers a gap or while parked, so
-	 * whoever follows this playhead waits with the audio rather than running away from it.
+	 * The rate is the reader's own, `1 + (dSTRETCHED - dCONCEALED)/dOUTPUT`: one while playing, a few
+	 * percent off while a stretch converges, zero while concealing or parked, so whoever follows this
+	 * playhead waits with the audio rather than running away from it.
 	 */
 	get playhead(): Playhead | undefined {
 		if (!this.#anchored) return undefined;
@@ -929,6 +945,7 @@ export class SharedRingBuffer implements RingReader {
 	debug(): Snapshot {
 		const load = (index: number) => Atomics.load(this.#control, index);
 		return {
+			backend: "shared",
 			buffered: this.length,
 			target: load(LATENCY),
 			chunk: load(CHUNK),
@@ -946,6 +963,8 @@ export class SharedRingBuffer implements RingReader {
 			skips: load(SKIPS),
 			skipped: load(SKIPPED),
 			discarded: load(DISCARDED),
+			jumps: load(JUMPS),
+			jumped: load(JUMPED),
 			trimmed: load(TRIMMED),
 			// Where the writer left READ, against where READ is now: the same question `#trim` asks,
 			// and asked here rather than read off `#resumed` because only an insert clears that, so

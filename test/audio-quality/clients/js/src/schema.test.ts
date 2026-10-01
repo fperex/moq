@@ -1,5 +1,15 @@
 import { expect, test } from "bun:test";
-import { threadVoid } from "./schema.ts";
+import { backendVoid, frameFloor, threadVoid } from "./schema.ts";
+
+test("the replay floor comes from distinct sorted media timestamps", () => {
+	expect(frameFloor([60.5, 0, 20.2, 20.2, 40.4])).toBe(21);
+	expect(frameFloor([12, 12])).toBeUndefined();
+	expect(frameFloor([])).toBeUndefined();
+});
+
+test("the replay floor accepts recordings too large for spread arguments", () => {
+	expect(frameFloor(Array.from({ length: 1_000_000 }, (_, i) => i * 20))).toBe(20);
+});
 
 test("audio fed by the page's worker over the lane's transport counts", () => {
 	expect(threadVoid({ kind: "worker", transport: "webtransport" }, "webtransport")).toBeUndefined();
@@ -45,4 +55,11 @@ test("a row that keeps its audio on the page counts only the main thread it chos
 		assertion: "thread",
 		detail: "the page fell back to the main thread rather than keeping the audio there: the worker failed to load",
 	});
+});
+
+test("backend coverage requires an observed concrete ring", () => {
+	expect(backendVoid("shared", "shared")).toBeUndefined();
+	expect(backendVoid("message", "message")).toBeUndefined();
+	expect(backendVoid("message", "shared")?.assertion).toBe("backend");
+	expect(backendVoid(undefined, "message")?.detail).toContain("observed unknown");
 });

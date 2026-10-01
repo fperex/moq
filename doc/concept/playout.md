@@ -44,7 +44,7 @@ constant offset between the two cancels.
 Branded time types are structurally plain numbers in TypeScript, so a media
 timestamp and a wall-clock instant type-check against each other. Convert both
 to unbranded milliseconds on entry and brand again only when the target is
-published. That is the shape of the bug the first attempt shipped.
+published.
 
 ## The observation point
 
@@ -162,8 +162,15 @@ lives. In the browser `Container.Consumer` watches its own event loop
 (`js/hang/src/container/stall.ts`): it hands the loop an ordinary task, a
 `MessageChannel` message rather than a timer, and reads back how long the loop
 took to get to it, and separately notices a stretch in which no turn of the loop
-happened at all. Either one past 100 ms is a block. How late a timer runs
-measures neither, because a hidden tab is rationed to one timer a second with
+happened at all. A task or an unexpected gap past 100 ms reports a block. When
+ticks are rationed, the monitor samples the expected gaps between source bursts
+at most once per 50 ms, even without a task probe. Frames delivered within that
+tick cannot replace that cadence with their much shorter spacing. A gap shorter
+than the learned source cadence cannot by itself distinguish a quiet path from
+a blocked receiver. An unexpectedly wider source batch can also trigger the gap
+heuristic; an outstanding task probe directly measures how long the receiver
+kept it waiting. How late a timer runs measures neither, because a hidden tab is
+rationed to one timer a second with
 its loop running and its socket read as before, and a loop running flat out
 delivers its timers late while answering every read on time. The estimator
 itself stays free of timers and of any clock but the one an arrival is stamped
@@ -206,9 +213,7 @@ Three details, in the order they bite:
 This is what makes the forget factor a wall-clock time constant instead of a
 per-frame one, and it decorrelates the observations that feed the histogram. A
 publisher sending 50 frames a second and one sending 1 frame a second then
-converge at the same speed. Applying the forget factor per arrival instead is
-the mistake the first attempt shipped, and it reads plausible either way, which
-is the kind that survives review.
+converge at the same speed.
 
 ## The histogram
 
@@ -329,9 +334,7 @@ microphone does, has not changed and keeps what it measured.
 A player that holds several tracks to one delay pays for a reseed twice over,
 because it has to hold the widest of them: a track that starts over is a track
 whose guess outranks every measurement beside it, so the audio ring is resized in
-the middle of playback and runs dry. Measured on the bench, a camera hidden and
-shown for 300 ms took the shared delay from 20 ms to the 80 ms guess and cost
-three of five watchers an underrun. For the same reason such a player holds a
+the middle of playback and runs dry. For the same reason such a player holds a
 departed track's last reading for a couple of seconds rather than dropping it
 where the track went: a rendition that blinks would otherwise take the delay down
 to what the tracks beside it measured and put it straight back, and the ring pays
@@ -350,13 +353,13 @@ target_level_ms_ = underrun_optimizer_.GetOptimalDelayMs().value_or(kStartDelayM
 none, and the first one it produces takes over whole. There is no fall bound in
 NetEq at all.
 
-Walking the seed down instead is what the first version did, and it costs a
-viewer the difference for as long as the walk takes: a 310 ms declaration
-coming down a sixth a second sits above a 20 ms path for tens of seconds, on
-every tune-in, while nothing that was measured asked for any of it. A receiver
-holding audio because of a declaration alone is holding it for no reason it can
-point at; what playback must never go below is the measured p95 plus the chunk
-the ring holds on top of it, which is a measurement, not a declaration.
+Walking the seed down instead would cost a viewer the difference for as long
+as the walk takes: a 310 ms declaration coming down a sixth a second sits above
+a 20 ms path for tens of seconds, on every tune-in, while nothing that was
+measured asked for any of it. A receiver holding audio because of a declaration
+alone is holding it for no reason it can point at; what playback must never go
+below is the measured p95 plus the chunk the ring holds on top of it, which is
+a measurement, not a declaration.
 
 So the seed is a start: not a floor under the target, and not a brake on how
 fast it leaves. From the first resampled observation half a second in, the
@@ -414,9 +417,9 @@ could not follow.
 rendition's advertised `jitter` reaches it as the cold-start prior above and
 nowhere else, so in `@moq/watch` an auto delay is the target and a fixed delay
 is the number the viewer asked for. Carrying the declaration a second time, as a floor
-under auto or a term added to a fixed delay, double-counted it: a viewer asking
-for 100 ms on a source declaring 300 waited 400, and a LAN viewer measuring
-20 ms was pinned at 300 for the length of the session.
+under auto or a term added to a fixed delay, would count it twice: a viewer
+asking for 100 ms on a source declaring 300 would wait 400, and a LAN viewer
+measuring 20 ms would be pinned at 300.
 
 ## Re-anchoring
 
@@ -435,19 +438,24 @@ republish in place, rather than being rebuilt around it, treats the replacement
 broadcast as a tune-in and resets the ring and the clock there. A rendition swap
 is not one: it reopens a subscription on the timeline already playing.
 
+A reattached element reaches the same reset, since its new session hands it a
+new broadcast, but its catalog names the same broadcast clock. A track reopened
+after any gap can start on pictures older than the last one shown (the keyframe
+of the group it joins, or groups a relay kept from before the gap), so the video
+decoder never shows a picture older than that one on the same clock, wherever
+the reset or a returning audio clock put the playhead. Without a shared clock it
+holds such a picture back only while the playhead is past the last one shown,
+which a rewind or a republish moves below it. Until the reopened track paints,
+the last picture stays on screen; only a broadcast going offline clears it.
+
 ## The "plus one frame" question
 
-The first attempt added a learned frame duration on top of the quantile. It
-learned that duration as the running minimum of positive gaps between observed
-timestamps, so the first gap set it with nothing to validate against. A tune-in
-that saw one frame of a stale group and then the live edge set it to the
-distance between them: 14.56 seconds, raised instantly and lowered 20 ms per
-second afterwards. The regression is in the corpus as `tune-in-stale`.
-
-The fix is structural rather than a better source for the frame duration. **The
-estimator does not add a frame at all.** The quantile already reports the
-bucket's upper edge, which is up to 20 ms above the delay actually observed, so
-the spread the extra term was standing in for is already there.
+**The estimator does not add a frame.** The quantile already reports the
+bucket's upper edge, which is up to 20 ms above the delay actually observed.
+A frame duration learned from timestamp arithmetic is also one a tune-in
+artifact can poison: the first gap between a stale group and the live edge
+would read as a frame seconds long. The `tune-in-stale` corpus case holds that
+line.
 
 The term itself is real, though, and it belongs to the ring rather than to the
 estimator. NetEq's target delay counts **the packet being played** as well as
@@ -459,13 +467,10 @@ one chunk less. So the level the ring holds is:
 hold = target + chunk
 ```
 
-where `chunk` is the size of the most recent insert, measured rather than
-learned. That is the difference from the first attempt: the frame duration is
-not derived from timestamp arithmetic that a tune-in artifact can poison, it is
-the length of the audio that just arrived, republished on every insert and
-forgotten on the next one.
+where `chunk` is the size of the most recent insert: the length of the audio
+that just arrived, republished on every insert and forgotten on the next one.
 
-It is one rule in four places, and all four have to move together or the ring
+It is one rule in five places, and all five have to move together or the ring
 sits at the bottom of its own band:
 
 - The ring un-stalls at `WRITE - READ >= hold`, and a refill after an underrun
@@ -512,10 +517,10 @@ page can call it, so it samples it for the worker once a second. Message
 delivery time varies with the receiving thread's load; using it as the playback
 timestamp would turn that scheduling jitter into uneven video frame releases.
 
-The renderer can retain two adjacent frames spanning at most 20 ms of media and
-paint them on separate display refreshes. Keeping that pair prevents an unpainted
-frame from being overwritten between refreshes. Larger backlogs are discarded
-so presentation catches up with the playhead.
+The renderer can retain two adjacent frames spanning at most the larger of 20 ms
+and 2.1 display refreshes of media, and paint them on separate refreshes. Keeping
+that pair prevents an unpainted frame from being overwritten between refreshes.
+Larger backlogs are discarded so presentation catches up with the playhead.
 
 ## Holding the sound for a later picture
 
@@ -526,12 +531,8 @@ see the difference between them.
 
 That difference is audible. The watcher paints a frame when the playhead reaches
 its timestamp, so a picture that has not arrived by then is painted as soon as
-it decodes, which is late. Measured on a browser matrix: a Firefox publisher put
-the picture 86 to 109 ms behind the sound at Chromium, Brave and Firefox
-watchers, where every Chromium publisher was inside a frame at every watcher.
-About 22 ms of that is the engine stamping its two timelines differently (a
-capture probe puts Firefox's video 10 ms behind its audio and Chromium's 12 ms
-ahead); the rest is the video path simply delivering later.
+it decodes, which is late. Part of it can be the publisher's engine stamping its
+two timelines differently; the rest is the video path simply delivering later.
 
 So there is a second quantity, measured across tracks rather than within one:
 
@@ -562,8 +563,7 @@ disagree.
 
 It is then capped at 100 ms, which is what a video call tolerates: past that the
 hold is worse than the desync it is buying off, since a picture that far behind
-is out of sync whatever the sound does. The measured browser publishers needed
-55 to 70 ms of it. Measured on an impaired path, an uncapped term reached 2 s
+is out of sync whatever the sound does. Uncapped, the term can reach seconds
 during tune-in, where the video track is still replaying the span between the
 last keyframe and the live edge and every arrival honestly looks that late.
 
@@ -574,9 +574,8 @@ lands in one step is audible either way, and the term is at its
 least trustworthy exactly when it moves most: at tune-in the video floor is set
 by the camera's warm-up frames, the slowest that track will ever be, and a hold
 derived from them would stand at the ceiling until both windows had rotated past
-them. That is the few seconds of held sound a publisher used to hear at the
-start of their own broadcast. A bucket per second is slow enough that such a
-transient rotates out of the windows before the hold has grown into it.
+them. A bucket per second is slow enough that such a transient rotates out of
+the windows before the hold has grown into it.
 
 It is deliberately one-directional. Audio is the clock and video is painted when
 the playhead reaches its timestamp, so a picture that arrives *early* is already
@@ -624,14 +623,10 @@ budget gave up on is the sequences below that never arrived, and that walk asks
 the reader to re-anchor only when the head does not continue the timeline. What
 is convicted is what is late in the sense the budget means: a group still
 arriving with nothing to hand over. So the skip counter reports media nobody
-could take, and at a zero budget a reader that keeps up reports nothing at all. Measured on a self-publish through the local relay, Chromium watcher,
-one unmute after a three second mute: the ring started playing 65 ms deep
-against a 40 ms hold, and the reader spent 8 accelerates and 50 ms of compressed
-speech closing that over the following seconds; five rapid mute and unmute pairs
-cost 15 and 144 ms. Starting the playhead 80 ms further in instead, the same two
-phases cost 0 accelerates and no compression at all. That is the fast-forward a
-listener hears after every unmute, and none of it was audio anyone was waiting
-for.
+could take, and at a zero budget a reader that keeps up reports nothing at all.
+Played from the oldest sample instead, that surplus is time-compressed over the
+following seconds, which a listener hears as a fast-forward after every unmute,
+and none of it was audio anyone was waiting for.
 
 ```
 while nothing has been played on this timeline:
@@ -690,8 +685,8 @@ being heard, one pitch period per 100 ms of output. The player sheds one bucket
 per second instead of the whole fall at once. The case this is for is the cold
 start of a self-publish: a browser publisher declares no flush span, so the
 estimator holds the 80 ms guess until its first measurement, which on a LAN
-replaces it with 20 ms. Spent in one step, the reader compressed six periods
-inside half a second, which is the fast-forward heard in the first seconds of
+replaces it with 20 ms. Spent in one step, the reader would compress six periods
+inside half a second, which is a fast-forward heard in the first seconds of
 one's own broadcast. NetEq lets the buffer drift towards a lower target rather
 than stretching straight after a start for the same reason
 (`delay_manager.cc`, and the accelerate decision in `decision_logic.cc`).

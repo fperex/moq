@@ -7,6 +7,8 @@
  * @internal Test support, not part of the engine.
  */
 
+import { type Counters, frames, type RingReader, type RingView, STRETCH_BOUND } from "./index";
+
 const TAU = Math.PI * 2;
 
 /** Planar samples of a sine, every channel in phase. */
@@ -140,4 +142,61 @@ export function zeroRun(pcm: Float32Array): number {
 		longest = Math.max(longest, run);
 	}
 	return longest;
+}
+
+/**
+ * A mono ring that always reports `depthMs` against a 100ms target, so the decision the engine takes
+ * is the caller's to choose. Empty for `outage` blocks out of every `cycle` when those are set, which
+ * forces a concealment run and the merge that ends it over and over.
+ */
+export class FixedRing implements RingReader {
+	readonly channels = 1;
+	readonly rate: number;
+	readonly #source: Float32Array;
+	readonly #depth: number;
+	readonly #outage: number;
+	readonly #cycle: number;
+	#at = 0;
+	// Blocks the engine has asked for, which the outage is counted in: it looks once per block.
+	#asked = 0;
+
+	constructor(rate: number, source: Float32Array, depthMs: number, outage = 0, cycle = 0) {
+		this.rate = rate;
+		this.#source = source;
+		this.#depth = frames(rate, depthMs);
+		this.#outage = outage;
+		this.#cycle = cycle;
+	}
+
+	view(): RingView {
+		const dry = this.#cycle > 0 && this.#asked % this.#cycle < this.#outage;
+		this.#asked++;
+
+		return {
+			buffered: dry ? 0 : this.#depth,
+			target: frames(this.rate, 100),
+			chunk: frames(this.rate, 20),
+			skip: frames(this.rate, STRETCH_BOUND),
+			stalled: false,
+			ended: false,
+			unstable: false,
+			converge: true,
+			skipped: 0,
+			generation: 1,
+		};
+	}
+
+	peek(dst: Float32Array[], count: number, offset = 0): void {
+		const start = this.#at % (this.#source.length - count);
+		dst[0].set(this.#source.subarray(start, start + count), offset);
+	}
+
+	commit(count: number): boolean {
+		this.#at += count;
+		return true;
+	}
+
+	starve(): void {}
+
+	report(_counters: Counters): void {}
 }

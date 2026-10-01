@@ -18,13 +18,14 @@ import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import { type Computed, Effect, type Getter, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Clock, Sync } from "../../sync";
+import { outputTimestamp } from "../buffer";
 import type { Stats } from "../decoder";
 import type { Snapshot } from "../playout";
 import type { Port, ToMain } from "../render";
 import type { Source } from "../source";
 import type { Graph, RingState, SupplyOutput } from "../supply";
 import { type Lease, Pool } from "./pool";
-import { Deadline, type FromWorker, type Output, type Report, type Stage, TICK, type ToWorker } from "./protocol";
+import { Deadline, type FromWorker, type Report, type Stage, TICK, type ToWorker } from "./protocol";
 
 // How often the page samples its output clock for the worker. Device and system clocks drift apart by
 // tens of parts per million, so a sample a second old maps a playhead to well under a millisecond.
@@ -159,6 +160,7 @@ export class Remote {
 	// report, whether audio reached it since the last check, and whether the ring has ever played.
 	readonly #deadline = new Deadline();
 	#last?: Report;
+	#sampleOutput?: () => void;
 	#heard = false;
 	readonly #played = new Signal(false);
 
@@ -255,10 +257,7 @@ export class Remote {
 		const graph = effect.get(this.in.graph);
 		if (!graph) return;
 
-		// The worklet reports to every port it holds, the node's own included: read here, where the page
-		// sees the ring play, or hears that the worklet could not read what it was sent, without waiting
-		// on the worker, and read at all, since a port never started would queue every report for the
-		// node's life.
+		// The node reports its first playback and any unreadable message directly to the page.
 		const node = graph.target.port;
 		effect.event(node, "message", (event) => {
 			const msg = (event as MessageEvent<ToMain>).data;
@@ -281,7 +280,19 @@ export class Remote {
 		effect.set(this.#out.ring, this.#ring, undefined);
 
 		// Only the page can read its output clock, which the postMessage ring maps its playhead through.
-		const output = () => this.#lease.post({ type: "output", id: this.#lease.id, output: sample(graph.context) });
+		const output = () => {
+			const timestamp = outputTimestamp(graph.context);
+			const sampled = timestamp && {
+				contextTime: timestamp.contextTime,
+				at: performance.timeOrigin + timestamp.performanceTime,
+			};
+			this.#lease.post({ type: "output", id: this.#lease.id, output: sampled });
+			// The device clock can appear after statechange. Sample as the worker reports progress.
+			this.#sampleOutput = !sampled && graph.context.state === "running" ? output : undefined;
+		};
+		effect.cleanup(() => {
+			this.#sampleOutput = undefined;
+		});
 		output();
 		effect.event(graph.context, "statechange", output);
 		effect.interval(output, OUTPUT_INTERVAL);
@@ -379,6 +390,7 @@ export class Remote {
 	}
 
 	#report(report: Report): void {
+		this.#sampleOutput?.();
 		// What the deadline goes on, whichever flush it was composed under.
 		this.#last = report;
 		if (report.arrivals.length > 0) this.#heard = true;
@@ -434,15 +446,4 @@ export class Remote {
 		this.#closed = true;
 		this.#signals.close();
 	}
-}
-
-/**
- * When the context's current sample leaves the output device, or undefined while the device has not
- * started, which `getOutputTimestamp` reads as both zero.
- */
-function sample(context: Pick<AudioContext, "getOutputTimestamp">): Output | undefined {
-	const { contextTime, performanceTime } = context.getOutputTimestamp();
-	if (contextTime === undefined || performanceTime === undefined) return undefined;
-	if (contextTime === 0 && performanceTime === 0) return undefined;
-	return { contextTime, at: performance.timeOrigin + performanceTime };
 }

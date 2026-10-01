@@ -151,6 +151,21 @@ impl Buffer {
 		ready
 	}
 
+	/// Whether any frames are held beyond `count`, including across a hole.
+	pub(crate) fn has_after(&self, count: usize) -> bool {
+		self.packets
+			.iter()
+			.try_fold(count, |left, packet| left.checked_sub(packet.pcm.len() / self.channels))
+			.is_none()
+	}
+
+	/// Media time just past the newest sample held, or `None` when the buffer is empty.
+	pub(crate) fn end(&self) -> Option<Duration> {
+		self.packets
+			.back()
+			.map(|packet| packet.timestamp + self.duration(packet.pcm.len() / self.channels))
+	}
+
 	/// The contiguous run from the front, as media time.
 	pub(crate) fn buffered(&self) -> Duration {
 		self.duration(self.ready())

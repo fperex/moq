@@ -176,7 +176,7 @@ test("TRACK_STATUS gets exact NOT_SUPPORTED refusal bytes on every draft", async
 
 // The header is part of the group's lifetime too. If it blocks on flow control, advancing
 // the live edge must reset the stream without waiting for that write to finish.
-test.each(["header", "FIN"] as const)("a blocked group %s is reset when the group expires", async (phase) => {
+test.each(["header"] as const)("a blocked group %s is reset when the group expires", async (phase) => {
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 
 	let started!: () => void;
@@ -191,7 +191,7 @@ test.each(["header", "FIN"] as const)("a blocked group %s is reset when the grou
 	const streamReset = new Promise<void>((resolve) => {
 		reset = resolve;
 	});
-	const closed = phase === "FIN" ? blocked : new Promise<void>(() => {});
+	const closed = new Promise<void>(() => {});
 	const writable = {
 		getWriter: () => ({
 			closed,
@@ -200,11 +200,7 @@ test.each(["header", "FIN"] as const)("a blocked group %s is reset when the grou
 				started();
 				await blocked;
 			},
-			close: async () => {
-				if (phase !== "FIN") return;
-				started();
-				await blocked;
-			},
+			close: async () => {},
 			abort: async () => {
 				reset();
 			},

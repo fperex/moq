@@ -1,104 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import type { Time } from "@moq/net";
-import { Stall, type StallTimer } from "./stall";
-
-/**
- * A clock the test moves by hand, with the monitor's timer and probe on it.
- *
- * `advance` moves time and runs whatever was queued, which is a loop that never blocks. `block`
- * moves time without running anything and then lets the queue catch up, which is a loop that did.
- * `busy` runs nothing while the test keeps querying, which is a loop running flat out: it answers
- * the reads and everything queued behind them waits. `throttle` holds every schedule to a minimum
- * interval, which is a hidden tab: the loop runs, only its timers are rationed.
- */
-function fake(): StallTimer & {
-	advance(ms: number): void;
-	block(ms: number): void;
-	busy(on: boolean): void;
-	throttle(ms: number): void;
-	posts(): number;
-	released(): boolean;
-	at(): Time.Milli;
-} {
-	let now = 0;
-	let due: { at: number; fn: () => void } | undefined;
-	let floor = 0;
-	let stopped = false;
-	let handler: (() => void) | undefined;
-	let queued = 0;
-	let posts = 0;
-	let released = false;
-
-	const run = () => {
-		if (stopped) return;
-
-		for (;;) {
-			// A task the loop was handed goes before a timer, which is what makes it the cheaper
-			// witness: it is served as soon as whatever is in front of it is done.
-			if (queued > 0) {
-				queued--;
-				handler?.();
-				continue;
-			}
-			if (due !== undefined && due.at <= now) {
-				const fn = due.fn;
-				due = undefined;
-				fn();
-				continue;
-			}
-			break;
-		}
-	};
-
-	return {
-		now: () => now,
-		schedule: (fn, ms) => {
-			due = { at: now + Math.max(ms, floor), fn };
-			return due;
-		},
-		clear: () => {
-			due = undefined;
-		},
-		probe: (fn) => {
-			handler = fn;
-			return {
-				post: () => {
-					posts++;
-					queued++;
-				},
-				close: () => {
-					released = true;
-				},
-			};
-		},
-		advance(ms: number) {
-			// One millisecond at a time, so a timer that reschedules itself fires as often as it
-			// would on a loop that was running.
-			for (let i = 0; i < ms; i++) {
-				now++;
-				run();
-			}
-		},
-		block(ms: number) {
-			// Nothing runs while the loop is blocked; the overdue timer fires the moment it is over.
-			now += ms;
-			run();
-		},
-		busy(on: boolean) {
-			stopped = on;
-		},
-		throttle(ms: number) {
-			floor = ms;
-		},
-		posts: () => posts,
-		released: () => released,
-		at: () => now as Time.Milli,
-	};
-}
+import { fakeTimer } from "./fake";
+import { Stall } from "./stall";
 
 describe("the event loop monitor", () => {
 	it("reports nothing on a loop that keeps running", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		timer.advance(1000);
@@ -108,7 +15,7 @@ describe("the event loop monitor", () => {
 	});
 
 	it("reports a block, and stops reporting it a tick later", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		timer.advance(500);
@@ -126,7 +33,7 @@ describe("the event loop monitor", () => {
 	});
 
 	it("reports each of two blocks back to back", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		timer.advance(200);
@@ -143,7 +50,7 @@ describe("the event loop monitor", () => {
 	});
 
 	it("ignores ordinary timer slack", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		// A busy page delivers its timers tens of milliseconds late without anything being wrong,
@@ -156,7 +63,7 @@ describe("the event loop monitor", () => {
 	});
 
 	it("a throttled timer on a running loop is not a block", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		// A hidden tab is rationed to one timer a second, and later to one a minute. Its loop keeps
@@ -187,7 +94,7 @@ describe("the event loop monitor", () => {
 	});
 
 	it("a block during a throttled interval is still reported", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		// A tab hidden for long enough is rationed to one timer a minute, so a block inside that
@@ -208,7 +115,7 @@ describe("the event loop monitor", () => {
 	});
 
 	it("a busy loop that keeps serving reads is still lagging", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		// Half a second of a loop with nothing wrong with it, read every 20ms.
@@ -246,7 +153,7 @@ describe("the event loop monitor", () => {
 	});
 
 	it("posts nothing over a loop nobody is reading, and about one probe a tick over one they are", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		// Ten seconds of a loop no track is arriving on. There is nothing to protect, and a probe
@@ -270,7 +177,7 @@ describe("the event loop monitor", () => {
 	});
 
 	it("answers for the arrival it is asked about, not for now", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		timer.advance(500);
@@ -286,7 +193,7 @@ describe("the event loop monitor", () => {
 	});
 
 	it("sees a block that is still being served, whatever ran first", () => {
-		const timer = fake();
+		const timer = fakeTimer();
 		const stall = new Stall(timer);
 
 		timer.advance(500);
@@ -314,4 +221,110 @@ describe("the event loop monitor", () => {
 		expect(restarted).not.toBe(first);
 		restarted.close();
 	});
+});
+
+// Hidden tabs can throttle the timer below the cadence of healthy audio arrivals.
+it("a rationed tick does not flag arrivals spaced under the idle threshold", () => {
+	const timer = fakeTimer();
+	const stall = new Stall(timer);
+
+	timer.throttle(1000);
+	// Long enough for the rationed tick to have run a few times.
+	timer.advance(3000);
+
+	const flags: boolean[] = [];
+	for (let i = 0; i < 25; i++) {
+		timer.advance(200);
+		flags.push(stall.blocked(timer.at()));
+	}
+
+	// The track's own cadence has to be seen before a gap can be told apart from a block, so the
+	// first two arrivals are allowed either answer. None after that is a block.
+	expect({ flagged: flags.slice(2).filter((f) => f).length, of: flags.length - 2 }).toEqual({ flagged: 0, of: 23 });
+
+	stall.close();
+});
+
+it("two blocks during a rationed tick do not become the arrival cadence", () => {
+	const timer = fakeTimer();
+	const stall = new Stall(timer);
+	try {
+		timer.throttle(1000);
+		timer.advance(3000);
+		for (let i = 0; i < 5; i++) {
+			timer.advance(20);
+			stall.blocked(timer.at());
+		}
+		for (let i = 0; i < 2; i++) {
+			timer.block(400);
+			expect(stall.blocked(timer.at())).toBe(true);
+		}
+	} finally {
+		stall.close();
+	}
+});
+
+for (const withProbe of [true, false]) {
+	it(`a rationed tick does not flag healthy source bursts ${withProbe ? "with" : "without"} a probe`, () => {
+		const timer = fakeTimer();
+		const stall = new Stall(withProbe ? timer : { ...timer, probe: () => undefined });
+		try {
+			timer.throttle(1000);
+			timer.advance(3000);
+			const heads: boolean[] = [];
+			for (let burst = 0; burst < 25; burst++) {
+				timer.advance(162);
+				heads.push(stall.blocked(timer.at()));
+				// Each PES batch delivers seven frames. A running loop serves every probe between them.
+				for (let frame = 1; frame < 7; frame++) {
+					timer.advance(1);
+					stall.blocked(timer.at());
+				}
+			}
+			expect(heads.slice(2).filter(Boolean)).toEqual([]);
+		} finally {
+			stall.close();
+		}
+	});
+
+	it(`a rationed tick still reports an unexpected gap ${withProbe ? "with" : "without"} a probe`, () => {
+		const timer = fakeTimer();
+		const stall = new Stall(withProbe ? timer : { ...timer, probe: () => undefined });
+		try {
+			timer.throttle(1000);
+			for (let frame = 0; frame < 100; frame++) {
+				timer.advance(33);
+				expect(stall.blocked(timer.at())).toBe(false);
+			}
+			timer.block(150);
+			expect(stall.blocked(timer.at())).toBe(true);
+			timer.block(400);
+			expect(stall.blocked(timer.at())).toBe(true);
+		} finally {
+			stall.close();
+		}
+	});
+}
+
+it("a rationed tick still reports a queued probe behind a busy receiver", () => {
+	const timer = fakeTimer();
+	const stall = new Stall(timer);
+	try {
+		timer.throttle(1000);
+		// An ordinary frame cadence must not excuse a task that the receiver keeps waiting.
+		for (let frame = 0; frame < 100; frame++) {
+			timer.advance(33);
+			expect(stall.blocked(timer.at())).toBe(false);
+		}
+		timer.busy(true);
+		const flags: boolean[] = [];
+		for (let frame = 0; frame < 20; frame++) {
+			timer.advance(33);
+			flags.push(stall.blocked(timer.at()));
+		}
+		expect(flags.slice(-10)).toEqual(Array(10).fill(true));
+	} finally {
+		timer.busy(false);
+		stall.close();
+	}
 });

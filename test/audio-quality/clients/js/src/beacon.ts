@@ -6,9 +6,6 @@
  * the network stack and survives the document. So the steady state is a batched POST and the final
  * flush is a beacon, and the sink appends either one the same way.
  *
- * Adapted from the beacon sink in `debug-findings/analysis/sink.ts` on the reporter's fork
- * (`fperex/moq`, branch `debug/rt-audio`). See ../../README.md.
- *
  * @module
  */
 import type { Beacon, Environment, Sample } from "./schema.ts";

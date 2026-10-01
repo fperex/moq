@@ -169,9 +169,15 @@ Use `specificity` to rank structural constraints when selecting rules, and
 A subscriber names a broadcast and track. Delivery starts at the oldest group
 it can still use, which at the default budget is the latest one, so every group
 must begin at a point a fresh subscriber can decode from (a keyframe, a full
-JSON snapshot). Groups can be fetched by sequence number too, optionally
-bounded to a range of frames, which is how the [HLS gateway](/bin/hls) and the
-relay's [HTTP fetch](/bin/relay/http) serve history.
+JSON snapshot). A publisher whose media paused (an encoder stopped for lack of
+demand) declares a break where it stopped, and a subscription made after it
+starts there: until the media resumes, nothing newer exists to make the groups
+before the pause look old. The break stays with the publisher: a relay already
+subscribed when it is declared does not learn it, so a viewer joining that relay
+mid-pause can still start on the group before it. Groups can be fetched by
+sequence number too, optionally bounded to a range of frames, which is how the
+[HLS gateway](/bin/hls) and the relay's [HTTP fetch](/bin/relay/http) serve
+history, breaks or not.
 
 Each subscription carries the knobs that decide behavior under congestion:
 

@@ -40,12 +40,13 @@ profile never acted.
 | `--profile` | A built-in profile's name, or a profile TOML file, in place of the flags that shape the path. See [Profiles](#profiles). |
 | `--tcp-passthrough` | Also pipe TCP on the listening port to the target, untouched. See [TCP](#tcp). |
 | `--report` | Write the profile, seed and counters to this file as JSON at exit. See [Report](#report). |
-| `--report-interval` | Print the same JSON as one line on stdout this often. |
+| `--report-interval` | Print the same JSON as one line on stdout at this nonzero interval. |
 
 As a library, `Shaper::bind` takes a `Config`: where to listen and forward, the seed, and a `Profile`
 per direction. It also takes a `Setup`, which is a `Config` plus the opt-in options below, each off by
 default. `Shaper::verify` fails when the shaper stopped forwarding, or when an impairment the profile
-configures never acted and the traffic makes that silence implausible. The relay's drills
+configures never acted and the traffic makes that silence implausible. Each step is judged against
+the traffic received while its profile was active. The relay's drills
 (`rs/moq-relay/tests/drills.rs`, described in `test/drill/README.md`) run every scenario through it.
 
 ## What a seed does and does not fix
@@ -177,3 +178,8 @@ A profile that silently did nothing turns an impaired run into an unimpaired pas
 for the shaper's own exit; a harness grading a run should also check the report, where `near-zero` is the
 only profile for which a `delayed` of zero is the right answer. Keep the name, the seed and the counters
 with the run's artifacts: the seed is what turns a failing run into one that can be looked at again.
+
+## Benchmark
+
+`cargo bench -p moq-shaper --bench forward` measures UDP round trips across 1, 10, and 100 clients,
+with 0, 4, and 64 scheduled profile steps. It checks packet contents and runs in nightly CI.

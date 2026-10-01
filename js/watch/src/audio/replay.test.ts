@@ -30,9 +30,8 @@ import {
 // run the same harness, since the postMessage fallback is the path every page without cross-origin
 // isolation takes.
 //
-// The recorded fixtures are arrival timing only, trimmed from the traces attached to
-// moq-dev/moq#3477. Synthetic traces of the same shape come first because they say which property
-// broke; the recordings say whether it broke in the field.
+// The recorded fixtures are arrival timing only. Synthetic traces of the same shape come first
+// because they say which property broke; the recordings say whether it broke in the field.
 
 const RATE = 48000;
 const CHUNK = (RATE * CHUNK_MS) / 1000;
@@ -58,6 +57,28 @@ function clean({ underruns, skipped }: Result): { underruns: number; skipped: nu
 }
 
 const RINGS = rings(RATE);
+
+describe.each(rings(44100))("%s ring, AAC source bursts", (_name, build) => {
+	it("separates a paced 250 ms control from the packed 16-frame source", () => {
+		const frameMs = 1024 / 44.1;
+		const packed: Arrival[] = [];
+		const paced: Arrival[] = [];
+		for (let first = 0; first < 2100; ) {
+			// The BBB fixture's quiet passage has two consecutive 16-frame PES packets. The
+			// ordinary seven-frame packing is already playing when that passage starts.
+			const count = first === 952 || first === 968 ? 16 : 7;
+			for (let frame = first; frame < first + count; frame++) {
+				const media = frame * frameMs;
+				packed.push({ media, arrival: (first + count) * frameMs + 50 });
+				paced.push({ media, arrival: media + frameMs + 50 });
+			}
+			first += count;
+		}
+		const options = { rate: 44100, floorMs: frameMs, warmupMs: 5000, fixed: 250 };
+		expect(clean(play(build, packed, options))).toEqual({ underruns: 1, skipped: 0 });
+		expect(clean(play(build, paced, options))).toEqual({ underruns: 0, skipped: 0 });
+	});
+});
 
 describe.each(RINGS)("%s ring replay", (_name, build) => {
 	// The target starts at the cold-start guess, is replaced by the first measurement half a second

@@ -47,19 +47,14 @@ pub struct Options {
 	/// slot: `Some` turns the jitter buffer on and [`Consumer`](super::Consumer)
 	/// hands back playout blocks instead of decoded packets.
 	///
-	/// A floor, not a target. The buffer is sized from what actually arrives
-	/// (`doc/concept/playout.md`), and this is the least it may size itself to, for
-	/// a caller who knows something the arrivals do not say. The estimator raises it
-	/// whenever the path asks for more.
+	/// A floor, not a target: the estimator sizes the buffer from what actually
+	/// arrives (`doc/concept/playout.md`) and never below this.
 	///
-	/// It has to fit under [`max_age`](Self::max_age), which is the ceiling on how
-	/// deep the buffer may grow rather than the budget in force: playout claims three
-	/// quarters of it, always leaves it the headroom it has to keep above the target
-	/// (a bucket, a block, and a time stretch, 105 ms), and never takes more than
-	/// [`DELAY_MAX`](Self::DELAY_MAX) whatever the budget says. A floor that does not
-	/// fit is refused rather than clamped, since clamping would leave playback
-	/// holding less than the caller asked for and say nothing. Leave room above the
-	/// floor, or the estimator has nowhere to raise the target to.
+	/// It has to fit under [`max_age`](Self::max_age): playout claims three quarters
+	/// of it, keeps 105 ms of headroom above the target (a bucket, a block, and a
+	/// time stretch), and never takes more than [`DELAY_MAX`](Self::DELAY_MAX). A
+	/// floor that does not fit is refused rather than clamped, and one with no room
+	/// above it leaves the estimator nowhere to raise the target to.
 	///
 	/// `None`, the default, decodes without buffering: each packet comes back as it
 	/// is decoded, which is what a recorder or an export wants.
@@ -360,7 +355,7 @@ impl Consumer {
 			if let Some(frame) = mux_frame.as_ref() {
 				self.observe(frame.timestamp);
 			}
-			self.apply_discontinuity()?;
+			self.apply_discontinuity(mux_frame.as_ref().map(|frame| frame.timestamp))?;
 			let Some(mux_frame) = mux_frame else {
 				return std::task::Poll::Ready(self.flush());
 			};
@@ -513,10 +508,20 @@ impl Consumer {
 			}
 		}
 
+		// A playhead event the container raised with nothing after it yet is a declared endpoint: the
+		// marker group closed and the publisher paused. A hole or a skip only moves the cursor onto a
+		// group that already holds a frame, so it always arrives with one, and that frame is what
+		// applies it. The engine plays out what it holds and then the silence the pause is; the
+		// frame that ends the pause applies the event as usual.
+		let paused = self.track.discontinuity() != self.discontinuity;
+
 		let channels = self.resolved_layout.channels();
 		let rate = self.resolved_sample_rate;
 		let format = self.options.output.format;
 		let playout = self.playout.as_mut().expect("playout is on");
+		if paused {
+			playout.engine.end();
+		}
 		if playout.ended && playout.engine.drained() {
 			return Ok(None);
 		}
@@ -543,6 +548,7 @@ impl Consumer {
 	fn end_playout(&mut self) {
 		if let Some(playout) = self.playout.as_mut() {
 			playout.ended = true;
+			playout.engine.end();
 		}
 	}
 
@@ -601,11 +607,16 @@ impl Consumer {
 	/// A playhead event re-applies startup delay and skip. The decoder is not reset:
 	/// the next group already starts on a keyframe, and pre-skip is a play-path concern.
 	///
-	/// A declared pause is heard differently here than in the browser. The marker never reaches
-	/// this consumer, so the engine keeps concealing until the resumed frame arrives and this
-	/// re-anchors on it, where the browser's ring is told the timeline ended and renders the pause
-	/// as the silence it is. Surfacing the marker and giving the engine an `end` is a follow-up.
-	fn apply_discontinuity(&mut self) -> Result<(), Error> {
+	/// Playout only starts over when `next`, the first frame after the event, does not
+	/// continue what it holds. A skipped group or a latency skip lands a hole no wider than
+	/// the budget on the wire, which is a hole the container could have waited out: the
+	/// audio held in front of it still plays and the splice carries the playhead across.
+	/// Wiping it would cut that audio and leave concealment nothing to study.
+	///
+	/// A declared pause reaches playout before this does: [`read_playout`](Self::read_playout) sees
+	/// the event raised with nothing after it and parks the engine on the endpoint, the way the
+	/// browser's ring is told the timeline ended. The frame that resumes applies the event here.
+	fn apply_discontinuity(&mut self, next: Option<moq_net::Timestamp>) -> Result<(), Error> {
 		let discontinuity = self.track.discontinuity();
 		if discontinuity == self.discontinuity {
 			return Ok(());
@@ -613,7 +624,10 @@ impl Consumer {
 
 		self.discontinuity = discontinuity;
 		if let Some(playout) = self.playout.as_mut() {
-			playout.engine.reanchor();
+			match next.is_some_and(|next| playout.engine.continues(next.into(), playout.budget)) {
+				true => playout.engine.jump(),
+				false => playout.engine.reanchor(),
+			}
 		}
 		self.next_start = None;
 		self.spans.clear();
@@ -1458,12 +1472,8 @@ mod tests {
 	/// media and nothing else. The endpoint bounds the run it ended, so what resumes has to play:
 	/// the marker group closing is the playhead event, and it clears the endpoint with it.
 	///
-	/// The resumed run does play. What fails is the pause itself: see the `ignore` reason and the
-	/// note on [`Consumer::apply_discontinuity`].
+	/// And the pause itself is silence, not concealment: nothing was lost, so nothing is an underrun.
 	#[tokio::test]
-	#[ignore = "the engine conceals a declared pause rather than parking on it: the marker never \
-	            reaches this consumer, so 50 pulls across the pause are 49 underruns (measured \
-	            2026-09-18). Surfacing the marker and an Engine::end() is the follow-up."]
 	async fn a_declared_endpoint_then_resumed_media_decodes() {
 		let input = Input {
 			format: Format::F32,
@@ -1549,10 +1559,24 @@ mod tests {
 			.unwrap();
 		producer.cut(Some(end)).unwrap();
 
-		// Half a second of the declared pause, pulled at the speaker's rate.
+		// Half a second of the declared pause, pulled at the speaker's rate. Past the tail of the run,
+		// it is silence, and the playhead parks on the endpoint rather than walking into the pause.
+		let mut silent = 0;
 		for _ in 0..per_second / 2 {
-			consumer.read().await.unwrap().expect("a block of the declared pause");
+			let block = consumer.read().await.unwrap().expect("a block of the declared pause");
+			let pcm = Format::F32.as_interleaved_f32(&block.data, 1).unwrap();
+			if pcm.iter().all(|sample| *sample == 0.0) {
+				silent += 1;
+			}
 		}
+		assert!(
+			silent >= per_second / 2 - 3,
+			"only {silent} of the pause blocks were silence"
+		);
+		assert!(
+			consumer.playhead().expect("audio has played") <= std::time::Duration::from(end),
+			"the playhead walked into the pause"
+		);
 
 		// Ten seconds later it unmutes. 48_000 samples per second, so 480_000 samples in.
 		let resumed = 480_000 / frame_size as u64;
@@ -1583,6 +1607,167 @@ mod tests {
 		);
 	}
 
+	/// An Opus consumer with playout on, and the producer that feeds it.
+	async fn opus_playout(
+		delay: std::time::Duration,
+	) -> (
+		Encoder,
+		moq_mux::container::Producer<moq_mux::catalog::hang::Container>,
+		Consumer,
+		moq_net::broadcast::Producer,
+	) {
+		let encoder = Encoder::new(&Settings::new(48_000, Layout::Mono)).unwrap();
+		let catalog = encoder.catalog();
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let subscriber = broadcast.consume();
+		let producer = moq_mux::container::Producer::new(
+			track,
+			moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Audio),
+		);
+		let consumer = Consumer::new(
+			&subscriber,
+			&catalog,
+			"audio",
+			Options {
+				max_age: std::time::Duration::from_secs(30),
+				delay: Some(delay),
+				..Options::new()
+			},
+		)
+		.await
+		.unwrap();
+		(encoder, producer, consumer, broadcast)
+	}
+
+	/// One 20 ms Opus packet at `packet * 20 ms`, alone in its group, the way the browser
+	/// publisher writes audio.
+	fn write_opus(
+		producer: &mut moq_mux::container::Producer<moq_mux::catalog::hang::Container>,
+		encoder: &mut Encoder,
+		packet: u64,
+	) {
+		let frame_size = encoder.frame_size();
+		let pcm = vec![0.25f32; frame_size];
+		let payload = encoder.encode(&pcm).unwrap().payload;
+		producer
+			.write(moq_mux::container::Frame {
+				timestamp: Timestamp::from_scale(packet * frame_size as u64, 48_000).unwrap(),
+				duration: None,
+				payload,
+				keyframe: true,
+			})
+			.unwrap();
+		producer.cut(None).unwrap();
+	}
+
+	/// A finite Opus track has to end. The pre-skip leaves every packet boundary 168
+	/// frames off the 10 ms block, and live pacing (one packet per two pulls) keeps the
+	/// first fill under the trim that would realign it, so the last 168 frames are less
+	/// than a block. `read` returns `None` only once playout has drained.
+	#[tokio::test]
+	async fn a_finite_opus_track_ends() {
+		let (mut encoder, mut producer, mut consumer, _broadcast) =
+			opus_playout(std::time::Duration::from_millis(120)).await;
+
+		write_opus(&mut producer, &mut encoder, 0);
+		consumer.read().await.unwrap().expect("first block");
+		consumer.read().await.unwrap().expect("second block");
+		for packet in 1..25 {
+			write_opus(&mut producer, &mut encoder, packet);
+			consumer.read().await.unwrap().expect("a block of the live run");
+			consumer.read().await.unwrap().expect("a block of the live run");
+		}
+		producer.finish().unwrap();
+
+		let mut reads = 0;
+		let mut ended = false;
+		while reads < 4_000 {
+			reads += 1;
+			if consumer.read().await.unwrap().is_none() {
+				ended = true;
+				break;
+			}
+		}
+
+		let stats = consumer.playout.as_ref().unwrap().engine.stats();
+		assert!(
+			ended,
+			"the track finished but read never returned None in {reads} reads: {stats:?}"
+		);
+		assert_eq!(
+			stats.buffered,
+			std::time::Duration::ZERO,
+			"media was left unplayed: {stats:?}"
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_finite_track_below_the_refill_target_drains() {
+		let (mut encoder, mut producer, mut consumer, _broadcast) =
+			opus_playout(std::time::Duration::from_millis(120)).await;
+		write_opus(&mut producer, &mut encoder, 0);
+		consumer.read().await.unwrap().expect("initial stalled block");
+		producer.finish().unwrap();
+		for _ in 0..10 {
+			if consumer.read().await.unwrap().is_none() {
+				assert_eq!(
+					consumer.playout.as_ref().unwrap().engine.stats().buffered,
+					std::time::Duration::ZERO
+				);
+				return;
+			}
+		}
+		panic!("a finished track waited for audio that cannot refill it");
+	}
+
+	/// A skipped group leaves the held audio on the same timeline. Eleven packets
+	/// (0 to 220 ms) arrive and playout starts on them; group 11 (220 ms) is never
+	/// published, and groups 12 onward arrive together, far enough past it that the
+	/// container gives up on 11 at once. The audio playout already held in front of the
+	/// hole still has to play before the audio behind it.
+	#[tokio::test]
+	async fn a_skipped_group_keeps_the_audio_already_held() {
+		let (mut encoder, mut producer, mut consumer, _broadcast) =
+			opus_playout(std::time::Duration::from_millis(60)).await;
+
+		for packet in 0..=10 {
+			write_opus(&mut producer, &mut encoder, packet);
+		}
+		let first = consumer.read().await.unwrap().expect("first block");
+		let held = consumer.playout.as_ref().unwrap().engine.stats();
+
+		// Group 11 is lost. 12 to 22 land together (the burst after a stall), which puts the
+		// newest (440 ms) a budget past the hole, so the container gives up on 11 at once. It
+		// also sheds 12, a budget behind the newest, and resumes at 260 ms: 46.5 ms after the
+		// held audio ends, well inside the 185 ms budget.
+		producer.seek(12).unwrap();
+		for packet in 12..=22 {
+			write_opus(&mut producer, &mut encoder, packet);
+		}
+
+		let mut timestamps = vec![first.timestamp.as_micros()];
+		for _ in 0..30 {
+			let frame = consumer.read().await.unwrap().expect("a block");
+			timestamps.push(frame.timestamp.as_micros());
+		}
+
+		// Opus pre-skip moves decoded audio 6.5 ms earlier, so the run before the hole
+		// ends at 213.5 ms. A block starting anywhere in its last 25 ms is that audio played.
+		let before_hole = timestamps
+			.iter()
+			.take_while(|at| **at < 240_000)
+			.copied()
+			.max()
+			.unwrap_or(0);
+		assert!(
+			before_hole >= 190_000,
+			"the audio held in front of the hole was thrown away: the last block before 240 ms \
+			 started at {before_hole} us (held {held:?})"
+		);
+	}
 	#[tokio::test]
 	async fn a_playhead_event_reapplies_opus_pre_skip() {
 		let input = Input {

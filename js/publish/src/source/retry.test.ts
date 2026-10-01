@@ -197,8 +197,7 @@ const SPENT_TIMEOUT = 30_000;
  * An upper bound on how long the whole budget takes to burn: the first attempt plus a full backoff
  * for each failure it tolerates.
  *
- * A device busy for this long outlives every attempt the budget pays for, which is what a camera
- * handed back to the OS looks like on the machine this was reported from.
+ * A device busy for this long outlives every attempt the budget pays for.
  */
 function budgetWindow(): number {
 	let delay = Retry.DELAY.initial;
@@ -533,7 +532,7 @@ for (const screenPixelRatio of [undefined, 2]) {
 // A capture that is busy is not a capture that is broken. The device is there and we are allowed to
 // use it: something else has it, very often the capture we ourselves just stopped, because a browser
 // finishes handing a device back well after `stop()` returns. Counting that window against the
-// budget is what left the user's preview black after hiding video and showing it again.
+// budget leaves the preview black after hiding video and showing it again.
 
 /** What a browser rejects with while a device is still held. */
 function busy(): DOMException {

@@ -1,28 +1,11 @@
 /**
- * Whether this receiver's own event loop is keeping frames waiting, which nothing about a frame can
- * show.
+ * Whether this receiver's own event loop kept frames waiting, which nothing about a frame can show.
  *
- * A browser content process stops reading its socket for bursts of a few hundred milliseconds,
- * whether because it was blocked outright by a long paint or because it is running flat out on a
- * keyframe. The frames that queued behind that are then read at once and stamped with the clock
- * afterwards, so they enter the estimator as late arrivals that the path never delayed. The
- * estimator infers this from arrival spacing, but a real bursty path has the same spacing, so
- * spacing alone cannot decide.
- *
- * What decides is how long a task waits in this loop. The monitor puts one on the queue, a
- * `MessageChannel` message rather than a timer, and reads back how long the loop took to get to it:
- * a loop running flat out holds it for as long as the work in front of it, and a hidden tab, which
- * rations timers and leaves ordinary tasks alone, does not hold it at all. A loop that stops dead
- * runs nothing to measure, so that is the second thing here: a stretch in which no turn of the loop
- * happened at all, neither the monitor's own tick nor an arrival being read.
- *
- * How late a timer runs measures neither of those. A hidden tab delivers one tick a second while
- * its loop runs and its socket is read as before, and a loop running flat out delivers its ticks
- * late while answering every read on time: the first reads as a block that is not there, the second
- * hides one that is.
- *
- * `PerformanceObserver` with `longtask` would report the same thing and is Chromium only, so this
- * measures the lag directly instead.
+ * A blocked or saturated loop reads the backlog behind it at once and stamps it late, which arrival
+ * spacing cannot tell from a bursty path. So the monitor times an ordinary task, a `MessageChannel`
+ * message, and notices a stretch with no turn of the loop at all. Not a timer: a hidden tab rations
+ * timers while its loop runs, and a saturated loop runs them late while answering every read on time.
+ * `longtask` observers would do this in Chromium only. See `doc/concept/playout.md`.
  *
  * @module
  */
@@ -110,13 +93,17 @@ export class Stall {
 	// each of those is a turn of it.
 	#alive: number;
 
-	// When the probe still in flight was posted, cleared once it comes back, and when the last one
-	// was posted at all, so an arrival arms at most one a tick.
+	// When the probe still in flight was posted, cleared once it comes back, and when an arrival
+	// last sampled the cadence, so probes and cadence samples run at most once a tick.
 	#sent?: number;
-	#posted?: number;
+	#sampled?: number;
 
 	// When the loop last came back from a block, if it ever has.
 	#ended?: number;
+	#ticked?: number;
+	#slowTicks = 0;
+	#queried?: number;
+	#spacing?: number;
 
 	#handle: unknown;
 	#holders = 1;
@@ -155,6 +142,7 @@ export class Stall {
 		// the probe wins the race out of a block, which nothing orders.
 		this.#see(now);
 		this.#arm(now);
+		if (this.#queried === undefined || now > this.#queried) this.#queried = now;
 
 		return this.#ended !== undefined && now - this.#ended <= TICK;
 	}
@@ -178,27 +166,34 @@ export class Stall {
 		const gap = now - this.#alive;
 		if (now > this.#alive) this.#alive = now;
 
-		// Two shapes of a receiver that is not keeping up, and a rationed timer is neither of them. No
-		// turn of the loop at all for longer than the threshold means it stopped; the tick is the
-		// witness between arrivals, until a hidden tab rations that too and a track whose arrivals are
-		// further apart than the threshold is left with none, which is the answer the estimator's own
-		// idle rule already gives such a track. Or the loop is running and the task it was handed
-		// before this turn is still waiting, which is how long it kept this arrival waiting too.
+		// A rationed timer cannot witness the healthy gaps between sparse arrivals.
+		const cadence =
+			this.#slowTicks >= 2 &&
+			this.#spacing !== undefined &&
+			this.#queried !== undefined &&
+			now - this.#queried <= this.#spacing + THRESHOLD;
 		const sent = this.#sent;
-		if (gap > THRESHOLD || (sent !== undefined && now - sent > THRESHOLD)) this.#ended = now;
+		if ((gap > THRESHOLD && !cadence) || (sent !== undefined && now - sent > THRESHOLD)) this.#ended = now;
 	}
 
 	// Hands the loop a task to be timed by, at most one a tick.
 	#arm(now: number): void {
+		if (this.#sent !== undefined) return;
+		if (this.#sampled !== undefined && now - this.#sampled < TICK) return;
+		if (this.#queried !== undefined && now > this.#queried) {
+			const spacing = now - this.#queried;
+			// Sample once a tick so frames delivered together cannot replace their burst's cadence.
+			// A detected block must not become the cadence used to excuse the next block.
+			if (this.#spacing === undefined || spacing <= this.#spacing + THRESHOLD) this.#spacing = spacing;
+		}
+		this.#sampled = now;
 		const probe = this.#probe;
-		if (probe === undefined || this.#sent !== undefined) return;
-		if (this.#posted !== undefined && now - this.#posted < TICK) return;
+		if (probe === undefined) return;
 
 		// Arrivals are the only thing there is to protect, so arrivals are what arm this. Posting
 		// again from the handler would instead be a loop spinning on itself for as long as a consumer
 		// is alive, and posting from the tick would keep one spinning over an idle page.
 		this.#sent = now;
-		this.#posted = now;
 		probe.post();
 	}
 
@@ -214,7 +209,11 @@ export class Stall {
 	#tick = (): void => {
 		// Being a turn of the loop is all this is for. How late it runs says nothing: a hidden tab
 		// rations it to one a second with the loop running fine underneath.
-		this.#see(this.#timer.now());
+		const now = this.#timer.now();
+		this.#slowTicks =
+			this.#ticked !== undefined && now - this.#ticked > 2 * TICK ? Math.min(2, this.#slowTicks + 1) : 0;
+		this.#ticked = now;
+		this.#see(now);
 		this.#handle = this.#timer.schedule(this.#tick, TICK);
 	};
 }

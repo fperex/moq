@@ -592,10 +592,10 @@ where
 	/// (moq-dev/moq.pro#814). Consecutive sequence numbers can't rule a pause out, so this
 	/// marker is the only thing that can say one happened.
 	///
-	/// It also fixes what a subscriber joining mid-break sees. A subscription starts at the
-	/// track's latest group, and creating this one advances that -- so a late joiner lands on
-	/// the marker and waits for real media, instead of being served the group from *before*
-	/// the break as though it were live.
+	/// It also fixes what a subscriber joining mid-break sees. The marker is declared the
+	/// track's break ([`moq_net::track::Producer::break_at`]), so a late joiner lands on it and
+	/// waits for real media, however far back its budget reaches, instead of being served the
+	/// group from *before* the break as though it were live.
 	///
 	/// Audio and video write one empty frame at the exclusive end of the previous epoch.
 	/// That object exists on moq-transport, so the live edge moves immediately; a consumer
@@ -640,6 +640,7 @@ where
 			}],
 		)?;
 		group.finish()?;
+		self.inner.break_at(group.sequence)?;
 		Ok(())
 	}
 
@@ -1059,6 +1060,30 @@ mod tests {
 
 		assert_ne!(edge, stale, "the marker group is the live edge now");
 		assert_eq!(edge, stale.map(|s| s + 1));
+	}
+
+	/// The marker is stamped where the media stopped, so until newer media exists the group
+	/// before it is still within a joiner's budget. The break is what starts the joiner at the
+	/// marker, however far back it asks to read.
+	#[tokio::test]
+	async fn discontinuity_starts_a_later_subscription_at_the_marker() {
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let mut producer = Producer::new(track, Container::Legacy(crate::container::Kind::Video));
+
+		producer.write(frame(0, true)).unwrap();
+		producer.write(frame(100_000, false)).unwrap();
+		producer.discontinuity().unwrap();
+		let marker = producer.track().latest().unwrap();
+
+		let mut consumer = producer.track().subscribe(replay());
+		producer.write(frame(10_000_000, true)).unwrap();
+		producer.finish().unwrap();
+
+		let mut sequences = Vec::new();
+		while let Some(group) = consumer.recv_group().await.unwrap() {
+			sequences.push(group.sequence);
+		}
+		assert_eq!(sequences, vec![marker, marker + 1]);
 	}
 
 	/// Explicit keyframe closes the current group and starts a new one.

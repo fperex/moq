@@ -13,8 +13,8 @@
 #     WebSocket fallback is TCP and never touches the UDP shaper.
 #   - The audio came from the page's audio worker, the player's default, not its main thread; or,
 #     under `--offload false`, from the main thread the page was told to keep it on.
-#   - The ring that ran is the one the row asked for, which is decided by whether the document is
-#     cross-origin isolated, not by anything the page can assert about itself.
+#   - The document has the requested isolation and the ring identifies its implementation.
+#     The worker uses messages in both contexts; isolated --offload false uses shared memory.
 #
 # `--runtime` picks which of three lanes runs. `chromium` is the matrix above. `safari` is real
 # Safari through safaridriver, whose session is a WebSocket and therefore never traverses the UDP
@@ -235,6 +235,9 @@ rate_of() {
     esac
 }
 
+# shellcheck source-path=SCRIPTDIR source=publish.sh
+source "$AQ_DIR/publish.sh"
+
 # Every profile but the control adapts. The control runs the demo's fixed preset, which the element
 # requires a unit on: `delay=250` is rejected, `delay=250ms` is not.
 delay_of() {
@@ -408,30 +411,15 @@ WEB_PORT="$HARNESS_PORT"
 # ingest too would mean grading the receiver on a stream that was already damaged before it was
 # published, and the publisher's own flush span is a separate stage of the ledger.
 #
-# Both ffmpeg invocations mirror demo/pub/justfile, with one deliberate difference each. Opus is
-# encoded rather than copied, because bbb.mp4 carries AAC. The TS arm leaves ffmpeg's default PES
-# packing alone (demo/pub passes `-pes_payload_size 0` for the smooth variant), because the resulting
-# multi-frame bursts are the arrival shape the reporter measured on the public relay.
-# shellcheck disable=SC2329  # invoked indirectly via 'harness_spawn'
-publish_opus() {
-    ffmpeg -hide_banner -v quiet -stream_loop -1 -re -i "$MEDIA" \
-        -c:v copy -c:a libopus -ar 48000 -ac 2 -b:a 128k \
-        -f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer -frag_duration 1000 - |
-        "$MOQ" --connect "$RELAY_URL" --broadcast "bbb-opus.hang" import fmp4
-}
-
-# shellcheck disable=SC2329  # invoked indirectly via 'harness_spawn'
-publish_aac() {
-    ffmpeg -hide_banner -v quiet -stream_loop -1 -re -i "$MEDIA" \
-        -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 128k \
-        -f mpegts - |
-        "$MOQ" --connect "$RELAY_URL" --broadcast "bbb-aac.hang" import ts
-}
-
-for codec in "${CODECS[@]}"; do
-    echo "starting the $codec publisher..."
-    harness_spawn "pub-$codec" "$HARNESS_RUN/pub-$codec.log" "publish_$codec"
-done
+# Opus is encoded rather than copied, because bbb.mp4 carries AAC. Adaptive AAC rows keep the
+# default PES packing seen on the public relay. The fixed-250 control uses a separate, paced AAC
+# broadcast, since the default mux can hold 372 ms of quiet audio before emitting it.
+#
+# Both pin `-readrate_catchup 1`, because a live source never runs fast. By default ffmpeg makes up
+# any time its output was blocked at 1.05x real time, for twenty times as long: a `moq` that starts
+# reading seconds late (a freshly linked binary on macOS waits that long in dyld) would hand the first
+# rows a stream five percent fast, which a fixed delay can only throw away.
+start_publishers
 # A publisher needs a moment to announce before the first page asks for it; the driver's own 30s wait
 # for a catalog covers the rest, and a publisher that died is reported by that wait rather than here.
 sleep 3
@@ -477,7 +465,7 @@ for entry in "${ROWS[@]}"; do
         # opens has to stay frontmost for the AudioContext to render.
         harness_spawn "safari-$tag" - bun "$CLIENT/safari.ts" \
             --url "$page_url" \
-            --broadcast "bbb-$codec.hang" \
+            --broadcast "$(broadcast_of "$codec" "$profile")" \
             --page "$CLIENT/dist" \
             --port "$WEB_PORT" \
             --driver-port "$DRIVER_PORT" \
@@ -489,7 +477,7 @@ for entry in "${ROWS[@]}"; do
     else
         harness_spawn "driver-$tag" - bun "$CLIENT/driver.ts" \
             --url "$page_url" \
-            --broadcast "bbb-$codec.hang" \
+            --broadcast "$(broadcast_of "$codec" "$profile")" \
             --page "$CLIENT/dist" \
             --port "$WEB_PORT" \
             --ring "$ring" \
@@ -514,7 +502,10 @@ for entry in "${ROWS[@]}"; do
         fi
     fi
 
-    bun "$CLIENT/analyze.ts" --run "$HARNESS_RUN" --row "$tag" >"$HARNESS_RUN/$tag.analyze.log" 2>&1 || {
+    # The analyzer rebuilds the audio this row decoded from the publisher's file and encode, and places
+    # each quiet window in it, so a share over its ceiling can be proven to be the film's own quiet.
+    bun "$CLIENT/analyze.ts" --run "$HARNESS_RUN" --row "$tag" --media "$MEDIA" --encode="$(audio_of "$codec")" \
+        >"$HARNESS_RUN/$tag.analyze.log" 2>&1 || {
         echo "analyze failed for $tag" >&2
         sed 's/^/  /' "$HARNESS_RUN/$tag.analyze.log" >&2 || true
         failed=1

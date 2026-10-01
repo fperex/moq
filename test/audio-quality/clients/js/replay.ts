@@ -32,6 +32,7 @@ import {
 	BUCKET_MS,
 	convergence,
 	episodes as episodesOf,
+	frameFloor,
 	type Point,
 	type Ring,
 	type Row,
@@ -136,20 +137,11 @@ for (const { recording, row } of matrix) {
 	const tag = rowKey(row);
 
 	const arrivals = recorded(recording.fixture);
-	// The catalog floor `Sync` holds the target above is the codec's frame duration, which is
-	// the trace's own nominal spacing. Reduced rather than spread, because a recording is tens of
-	// thousands of frames and `Math.min(...)` of that many arguments blows the stack.
-	const media = arrivals.map((a) => a.media).sort((a, b) => a - b);
-	let smallest = Number.POSITIVE_INFINITY;
-	for (let i = 1; i < media.length; i++) {
-		const gap = media[i] - media[i - 1];
-		if (gap > 0 && gap < smallest) smallest = gap;
-	}
-	if (!Number.isFinite(smallest)) {
+	const floorMs = frameFloor(arrivals.map((a) => a.media));
+	if (floorMs === undefined) {
 		console.error(`error: ${tag} has no two distinct media timestamps, so it has no frame duration`);
 		process.exit(2);
 	}
-	const floorMs = Math.ceil(smallest);
 
 	const build = row.ring === "isolated" ? shared(recording.rate) : post(recording.rate);
 	const result = replay(build, arrivals, {
@@ -185,6 +177,8 @@ for (const { recording, row } of matrix) {
 	const underruns = rise((s) => s.debug.underruns);
 	const skips = rise((s) => s.debug.skips);
 	const skippedSamples = rise((s) => s.debug.skipped);
+	const observedJumps = rise((s) => s.debug.jumps);
+	const observedSkipped = rise((s) => s.debug.jumped);
 	const discarded = rise((s) => s.debug.discarded);
 	const accelerates = rise((s) => s.debug.accelerates);
 	const expands = rise((s) => s.debug.expands);
@@ -227,8 +221,6 @@ for (const { recording, row } of matrix) {
 			underrun_samples_per_min: null,
 			short_quanta_total: short,
 			short_quanta_per_min: round1(short / minutes),
-			silent_quanta_total: null,
-			silent_quanta_per_min: null,
 			stalled_quanta_share: stalled === null ? null : Math.round(stalled * 1000) / 1000,
 			discarded_samples_total: round1(asMs(discarded, recording.rate)),
 			discarded_samples_per_min: round1(asMs(discarded, recording.rate) / minutes),
@@ -236,6 +228,10 @@ for (const { recording, row } of matrix) {
 			skip_aheads_per_min: round1(skips / minutes),
 			skipped_samples_total: round1(asMs(skippedSamples, recording.rate)),
 			skipped_samples_per_min: round1(asMs(skippedSamples, recording.rate) / minutes),
+			observed_jumps_total: observedJumps,
+			observed_jumps_per_min: round1(observedJumps / minutes),
+			observed_skipped_samples_total: round1(asMs(observedSkipped, recording.rate)),
+			observed_skipped_samples_per_min: round1(asMs(observedSkipped, recording.rate) / minutes),
 			accelerates_total: accelerates,
 			accelerates_per_min: round1(accelerates / minutes),
 			expands_total: expands,
@@ -246,8 +242,6 @@ for (const { recording, row } of matrix) {
 			// read them report null rather than a flattering zero.
 			skipped_groups_total: null,
 			skipped_groups_per_min: null,
-			budget_aborts_total: null,
-			budget_aborts_per_min: null,
 			target_ms_p50: round1(targetStats.p50),
 			target_ms_p95: round1(targetStats.p95),
 			target_ms_max: round1(targetStats.max),

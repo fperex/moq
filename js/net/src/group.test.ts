@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
+import { Signal } from "@moq/signals";
 import { FrameTooLarge, GroupTooLarge } from "./error.ts";
 import { MAX_GROUP_CACHE_BYTES, MAX_GROUP_FRAMES, Producer } from "./group.ts";
+import { hooks } from "./internal.ts";
 import { Timestamp } from "./time.ts";
 
 const dec = new TextDecoder();
@@ -225,4 +227,36 @@ test("a frame larger than the cache is rejected rather than silently dropped", (
 	const consumer = producer.consume();
 	producer.close();
 	expect(consumer.tryReadFrame()).toBeUndefined();
+});
+
+test("an expiry subscription failure starts no write and releases earlier subscriptions", async () => {
+	const group = new Producer(0).consume();
+	const changed = new Signal(0);
+	const crowded = new Signal(0);
+	const listeners = Array.from({ length: 99 }, () => crowded.subscribe(() => {}));
+	let checks = 0;
+	let writes = 0;
+	hooks.expireGroup(group, {
+		expired: () => {
+			checks++;
+			return false;
+		},
+		changed: [changed, crowded],
+	});
+	try {
+		await expect(
+			hooks.guardGroup(group, async () => {
+				writes++;
+			}),
+		).rejects.toThrow("too many subscribers");
+		const before = checks;
+		changed.set(1);
+		crowded.set(1);
+		await Promise.resolve();
+		expect(checks).toBe(before);
+		expect(writes).toBe(0);
+	} finally {
+		for (const dispose of listeners) dispose();
+		group.close();
+	}
 });

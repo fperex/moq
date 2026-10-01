@@ -233,6 +233,9 @@ prepare_js() {
         elif ! (cd "$CLIENTS/js" && bunx vite build) >"$HARNESS_RUN/js-vite.log" 2>&1; then
             mark_broken js "vite build failed"
             sed 's/^/        /' "$HARNESS_RUN/js-vite.log" >&2 || true
+        elif ! (cd "$CLIENTS/js" && bun trace-retention.ts) >"$HARNESS_RUN/js-trace-retention.log" 2>&1; then
+            mark_broken js "trace retention failed"
+            sed 's/^/        /' "$HARNESS_RUN/js-trace-retention.log" >&2 || true
         fi
     fi
     if needs js-native-node && ! have node; then

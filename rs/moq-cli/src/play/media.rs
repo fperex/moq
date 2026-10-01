@@ -24,30 +24,19 @@ const MAX_VIDEO_FRAMES: usize = 30;
 
 /// How much audio the speaker holds between the decode task and the device.
 ///
-/// Not the playout delay: the jitter buffer inside
-/// [`moq_audio::decode::Consumer`] holds that, sized from what actually arrives.
-/// This is only what the device needs to ride out the decode task being scheduled
-/// late, so it is as shallow as that allows and no shallower: a ring with no depth
-/// can never be read from.
-///
-/// The engine runs on the decode task, ahead of this ring, rather than inside the
-/// device callback. The callback mixes every sink on the device and may not
-/// allocate, lock, or log; the engine does all three (it grows its scratch buffers,
-/// and the container read it drains from takes locks), so putting it there would
-/// cost every other sink on the device a dropout whenever one stream had to
-/// conceal. A ring this shallow ahead of it is the price, and the device's own
-/// drain is what paces the pulls.
+/// Not the playout delay, which the jitter buffer inside
+/// [`moq_audio::decode::Consumer`] holds: only what the device needs to ride out
+/// the decode task being scheduled late. The engine runs on that task rather than
+/// in the device callback, which mixes every sink on the device and must not
+/// allocate, lock, or log, all of which the engine does.
 const AUDIO_DEVICE_CUSHION: Duration = Duration::from_millis(30);
 
 /// The deepest jitter buffer this player will let the measurement ask for.
 ///
-/// A ceiling, not the budget: the consumer keeps the age budget on the wire just
-/// above whatever it currently measures, so nothing is waited on for this long. It
-/// is here to give the estimator somewhere to rise to, since `--delay` is only the
-/// floor. Four thirds of the estimator's own range because playout claims three
-/// quarters of the budget, leaving the rest for the arrivals that land while the
-/// deepest audio is still playing.
-/// Rounded up, so the three quarters taken back off it still cover the range.
+/// A ceiling for the estimator to rise to, since `--delay` is only the floor; the
+/// consumer keeps the wire budget just above what it measures. Four thirds of the
+/// estimator's range, rounded up, because playout claims three quarters of the
+/// budget.
 const AUDIO_MAX_AGE: Duration =
 	Duration::from_nanos((moq_audio::decode::Options::DELAY_MAX.as_nanos() as u64 * 4).div_ceil(3));
 
@@ -448,7 +437,7 @@ mod tests {
 	}
 
 	/// The speaker holds only what the device needs, since the delay lives in the
-	/// jitter buffer now. A cushion as deep as the delay would add it twice.
+	/// jitter buffer. A cushion as deep as the delay would add it twice.
 	#[test]
 	fn the_device_cushion_is_not_the_delay() {
 		assert!(AUDIO_DEVICE_CUSHION < Duration::from_millis(50));

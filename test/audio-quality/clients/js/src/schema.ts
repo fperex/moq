@@ -21,8 +21,21 @@
  * @module
  */
 
+import type MoqWatch from "@moq/watch/element";
+
 /** Milliseconds, as a float. The unit of every duration in this schema. */
 export type Ms = number;
+
+/** Sort media timestamps and return the smallest positive gap, rounded up to milliseconds. */
+export function frameFloor(media: number[]): Ms | undefined {
+	media.sort((a, b) => a - b);
+	let smallest = Number.POSITIVE_INFINITY;
+	for (let i = 1; i < media.length; i++) {
+		const gap = media[i] - media[i - 1];
+		if (gap > 0 && gap < smallest) smallest = gap;
+	}
+	return Number.isFinite(smallest) ? Math.ceil(smallest) : undefined;
+}
 
 /** A fraction of 1. The unit of every share in this schema. */
 export type Share = number;
@@ -53,8 +66,6 @@ export type MetricSpec = {
 	aggregations: Aggregation[];
 	/** One plain line saying what it measures. */
 	description: string;
-	/** True when this lane cannot measure it yet, so a null is expected rather than a failure. */
-	pending?: string;
 };
 
 /**
@@ -89,14 +100,6 @@ export const METRICS: Record<string, MetricSpec> = {
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Quanta delivered with fewer samples than the render quantum asked for.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
-	},
-	silent_quanta: {
-		unit: "count",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Quanta filled entirely with silence because nothing was buffered.",
-		pending: "no counter for it on either lane: the ring reports short quanta, not silent ones",
 	},
 	stalled_quanta: {
 		unit: "share",
@@ -109,41 +112,49 @@ export const METRICS: Record<string, MetricSpec> = {
 		unit: "samples",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Buffered samples thrown away without being played, reported in ms.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
+		description: "Writer discard operations from late input or capacity bounds, reported in ms.",
 	},
 	skip_aheads: {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Re-anchors that jumped the playhead forward, discarding buffered audio.",
+		description: "Browser: observed playback jumps. Replay: explicit skip operations, excluding capacity bounds.",
 	},
 	skipped_samples: {
 		unit: "samples",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Media time the playhead jumped over, reported in ms.",
+		description: "Media time attributed to skip_aheads, reported in ms.",
+	},
+	observed_jumps: {
+		unit: "count",
+		clock: "viewer",
+		aggregations: ["total", "per_min"],
+		description: "Forward discontinuities observed when the reader commits media, excluding startup and resets.",
+	},
+	observed_skipped_samples: {
+		unit: "samples",
+		clock: "viewer",
+		aggregations: ["total", "per_min"],
+		description: "Media passed over by observed playback discontinuities, reported in ms.",
 	},
 	accelerates: {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
 		description: "Time-stretch decisions that played the buffer down faster than real time.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
 	},
 	expands: {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Concealment decisions that generated audio to cover a gap.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
+		description: "Time-stretch decisions that lengthened buffered audio.",
 	},
 	stretched_samples: {
 		unit: "samples",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Samples whose duration was altered by stretching or concealment, reported in ms.",
-		pending: "the browser probe does not read `audio.out.debug`; the replay lane reads it directly",
+		description: "Magnitude of net compression minus expansion, in ms; a lower bound on altered duration.",
 	},
 	skipped_groups: {
 		unit: "count",
@@ -151,14 +162,6 @@ export const METRICS: Record<string, MetricSpec> = {
 		aggregations: ["total", "per_min"],
 		description:
 			"Groups the container consumer abandoned with content still unread. A group the next one already covers is not one of these: nothing was lost there.",
-	},
-	budget_aborts: {
-		unit: "count",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Groups abandoned specifically because they exceeded the subscription's age budget.",
-		pending:
-			"skipped_groups counts the age budget and a transport give-up as one; separating them needs its own counter",
 	},
 	target_ms: {
 		unit: "ms",
@@ -205,12 +208,15 @@ export const METRICS: Record<string, MetricSpec> = {
 		clock: "publisher",
 		aggregations: ["last"],
 		description:
-			"Rate at which the media timeline runs away from wall time, in ms per second. A property of the source or the publisher, not of the player, and removed before skip-aheads are counted.",
+			"Rate at which the media timeline runs away from wall time, in ms per second. Fitted independently of the ring counters, which count skip-aheads directly.",
 	},
 };
 
 /** RMS below this at the graph output counts the window as silent. About -60 dBFS. */
 export const SILENCE_RMS = 0.001;
+
+/** Frames of graph output each RMS is taken over: the probe's AnalyserNode `fftSize`. */
+export const RMS_FRAMES = 2048;
 
 /** How often the page samples its signals. Every series in a {@link Summary} is on this grid. */
 export const SAMPLE_INTERVAL_MS = 250;
@@ -279,14 +285,14 @@ export type Drift = {
 
 // ── the row identity ────────────────────────────────────────────────────────
 
-/** Which ring the page actually ran, which is decided by whether the document is isolated. */
+/** Document isolation for browser rows, or shared/message ring selection for replay. */
 export type Ring = "isolated" | "plain";
 
 /**
  * One matrix cell.
  *
  * A budget is keyed by the whole thing. Keying by profile alone would grade one codec's floor
- * against another's, and the sample rate and the ring path each move it as much as the profile does.
+ * against another's, and preserves the isolation context in browser results.
  */
 export type Row = {
 	/** The runtime that played it. */
@@ -297,7 +303,7 @@ export type Row = {
 	rate: number;
 	/** The shaper profile the path ran under. */
 	profile: string;
-	/** Which ring ran. */
+	/** Document isolation in browser rows; concrete ring selection in replay rows. */
 	ring: Ring;
 };
 
@@ -312,6 +318,16 @@ export const rowKey = (row: Row): string => `${row.runtime}-${row.codec}-${row.r
  * `pending` while the worker is starting.
  */
 export type Thread = { kind: "worker"; transport?: string } | { kind: "main"; reason?: string } | { kind: "pending" };
+
+/** The concrete ring reported by the running player. */
+export type Backend = NonNullable<ReturnType<MoqWatch["audio"]["out"]["debug"]["peek"]>>["backend"];
+
+/** Reject a row whose concrete ring differs from the requested execution path. */
+export function backendVoid(actual: Backend | undefined, expected: Backend): Void | undefined {
+	return actual === expected
+		? undefined
+		: { assertion: "backend", detail: `expected ${expected} ring, observed ${actual ?? "unknown"}` };
+}
 
 /** One 250 ms probe sample: everything public the page could read at that instant. */
 export type Sample = {
@@ -336,6 +352,11 @@ export type Sample = {
 	buffered?: Ms;
 	/** `audio.out.skipped`: cumulative groups the container consumer abandoned. */
 	skipped?: number;
+	/** Ring counters, with their graph identity and sample rate. Missing on older builds. */
+	playout?: Omit<NonNullable<ReturnType<MoqWatch["audio"]["out"]["debug"]["peek"]>>, "budget"> & {
+		generation: number;
+		rate: number;
+	};
 	/** `audio.out.stats`, passed through as-is: whatever the build publishes. */
 	stats?: Record<string, unknown>;
 	/**
@@ -386,7 +407,7 @@ export type Sample = {
 
 /** What the page reports once, at the start, rather than every sample. */
 export type Environment = {
-	/** Whether the document is cross-origin isolated, and therefore which ring can run. */
+	/** Whether the document is cross-origin isolated, permitting shared memory. */
 	crossOriginIsolated: boolean;
 	/**
 	 * The transport the page's session negotiated. Anything but WebTransport bypasses the UDP shaper. The
@@ -481,6 +502,96 @@ export function threadVoid(
 	return { assertion: "transport", detail };
 }
 
+/** One quiet window, placed in the source or refused. */
+export type QuietWindow = {
+	/** When the page sampled it, on the viewer clock. */
+	at: Ms;
+	/** Its RMS at the graph output. */
+	rms: number;
+	/** Seconds into the source file its first frame lines up with, or null when it was not placed. */
+	source: number | null;
+	/** The loudest source RMS across its timing uncertainty, or null when it was not placed. */
+	reference: number | null;
+	/** Frames its segment's analyser data ran behind the context clock, when it was placed. */
+	lag?: number;
+	/** Why it is not proven, when it is not. */
+	refused?: string;
+};
+
+/**
+ * A run of a row over which the AnalyserNode's data sat a constant number of whole windows behind the
+ * context clock, and whether that run's own audible windows prove it.
+ */
+export type Segment = {
+	/** When its first and last windows were sampled, on the viewer clock. */
+	from: Ms;
+	to: Ms;
+	/** Frames its windows sit behind the context clock, relative to the row's least-behind segment. */
+	lag: number;
+	/** Its own exact audible windows' fit at that lag, or null when it has none to fit. */
+	alignment: Alignment | null;
+	/** Whether its own windows prove its lag; its quiet windows are refused otherwise. */
+	proven: boolean;
+	/** Why not, when not. */
+	reason?: string;
+};
+
+/** How a row's windows were lined up with the source before any quiet window was placed. */
+export type Alignment = {
+	/** Correlation of log RMS, output against source, over the audible windows the fit used. */
+	correlation: number;
+	/** Median output RMS over source RMS on those windows: 1 when both are measured alike. */
+	gain: number;
+	/** Audible windows the fit used. */
+	audible: number;
+	/** The fitted source position against the playhead's own media time, in ms. */
+	shiftMs: Ms;
+};
+
+/** Where a reference came from: enough to rebuild the same PCM. */
+export type Provenance = {
+	/** The file the publisher looped. */
+	media: string;
+	/** Its SHA-256. */
+	sha256: string;
+	/** The publisher's own audio encode of that file, replayed from the start of its stream. */
+	encode: string[];
+	/** The decode of that replay into PCM, with the decoder the page used. */
+	decode: string[];
+	/** Seconds into the publisher's stream the decoded span begins. */
+	from: number;
+	/** Seconds decoded. */
+	seconds: number;
+	/** Frames per second: the graph's rate. */
+	rate: number;
+};
+
+/**
+ * Whether every quiet window `silence_share` counted lines up with a quiet window of the source at
+ * the same media time. A raw share over its ceiling passes only when this is proven; see
+ * `silence.ts`.
+ */
+export type QuietProof = {
+	/** True only when the alignment held and every quiet window was placed over quiet source. */
+	proven: boolean;
+	/** Why the row is not proven, when it is not. */
+	reason?: string;
+	/** Windows the raw share counted. */
+	windows: number;
+	/** Of those, the quiet ones. */
+	quiet: number;
+	/** Quiet windows placed over quiet source. */
+	matched: number;
+	/** The row's alignment over every segment's windows at its own lag, or null when it never ran. */
+	alignment: Alignment | null;
+	/** The row split where the analyser's lag changed, each run proven by its own windows or not. */
+	segments: Segment[];
+	/** The reference the windows were placed in, or null without one. */
+	reference: Provenance | null;
+	/** Every quiet window. */
+	quietWindows: QuietWindow[];
+};
+
 /** Everything one matrix row produced: the graded numbers plus what makes them trustworthy. */
 export type Summary = {
 	/** Schema version, bumped when a metric's meaning changes rather than when one is added. */
@@ -508,6 +619,12 @@ export type Summary = {
 
 	/** Every metric in {@link METRICS}, flattened to `<name>_<aggregation>` keys. */
 	metrics: Record<string, number | null>;
+	/**
+	 * The quiet windows behind `silence_share`, each placed in the source or refused. Absent from a
+	 * lane with no graph output to measure, and from a summary written before it existed; either
+	 * way a share over its ceiling stays a failure.
+	 */
+	silence?: QuietProof;
 	/** The resolved-target series, so a plateau can be looked at rather than inferred. */
 	targetSeries: { at: Ms; ms: Ms }[];
 	/** Underrun episode durations, in ms. */

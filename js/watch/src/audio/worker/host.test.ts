@@ -1,10 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, jest, mock } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
-import type * as Moq from "@moq/net";
 import { Group, Origin, Path, Time, Varint } from "@moq/net";
-import { Signal } from "@moq/signals";
+import { FakeChunk, FakeDecoder, FakeSession } from "../fake";
 import type { Port as Handoff, Message, ToMain } from "../render";
-import { type Dial, type Port, restrict, type Session, serve } from "./host";
+import { type Dial, type Port, restrict, serve } from "./host";
 import type { FromWorker, Report, ToWorker, Transports } from "./protocol";
 
 // The worker's whole job in one process: an in-memory origin standing in for the relay, the real
@@ -34,54 +33,6 @@ mock.module("@kixelated/libavjs-webcodecs-polyfill", () => ({
 
 const RATE = 48_000;
 const QUANTUM = 128;
-
-// ── WebCodecs, enough of it ─────────────────────────────────────────────────
-
-class FakeChunk {
-	readonly timestamp: number;
-	constructor(init: { timestamp: number }) {
-		this.timestamp = init.timestamp;
-	}
-}
-
-/** One 20 ms stereo packet of a constant, stamped from the chunk that produced it. */
-class FakeAudioData {
-	readonly format = "f32-planar";
-	readonly sampleRate = RATE;
-	readonly numberOfFrames = 960;
-	readonly numberOfChannels = 2;
-	readonly timestamp: number;
-	constructor(timestamp: number) {
-		this.timestamp = timestamp;
-	}
-	copyTo(dst: Float32Array): void {
-		dst.fill(0.5);
-	}
-	close(): void {}
-}
-
-class FakeDecoder {
-	// Whether this realm's decoder says it can play a config.
-	static supported = true;
-
-	state = "configured";
-	readonly #output: (data: FakeAudioData) => void;
-	constructor(init: { output: (data: FakeAudioData) => void }) {
-		this.#output = init.output;
-	}
-	static async isConfigSupported(): Promise<{ supported: boolean }> {
-		return { supported: FakeDecoder.supported };
-	}
-	configure(): void {}
-	decode(chunk: FakeChunk): void {
-		this.#output(new FakeAudioData(chunk.timestamp));
-	}
-	reset(): void {}
-	close(): void {
-		this.state = "closed";
-	}
-	async flush(): Promise<void> {}
-}
 
 // ── the worklet, in a stand-in scope ────────────────────────────────────────
 
@@ -131,7 +82,7 @@ afterAll(() => {
 });
 
 beforeEach(() => {
-	FakeDecoder.supported = true;
+	FakeDecoder.refuse.clear();
 	scope.currentFrame = 0;
 	jest.useFakeTimers();
 });
@@ -146,27 +97,6 @@ afterEach(() => {
 const cleanup: Array<() => void> = [];
 
 // ── the relay, in memory ────────────────────────────────────────────────────
-
-/** A session as the host sees one, reading from an origin in this process. */
-class FakeSession implements Session {
-	readonly origin: Signal<Moq.Origin.Table | undefined>;
-	readonly status = new Signal<Moq.Connection.Status>("connected");
-	readonly transport = new Signal<Moq.Connection.Transport | undefined>("webtransport");
-	readonly enabled = new Signal(true);
-	readonly url: URL;
-	readonly transports: Transports;
-	closed = false;
-
-	constructor(url: URL, transports: Transports, origin: Moq.Origin.Table) {
-		this.url = url;
-		this.transports = transports;
-		this.origin = new Signal<Moq.Origin.Table | undefined>(origin);
-	}
-
-	close(): void {
-		this.closed = true;
-	}
-}
 
 interface Relay {
 	origin: Origin.Producer;
@@ -371,8 +301,22 @@ function graph(page: Page, id = 1, handed: Handed = direct()): { render: Process
 	const node = new MessageChannel();
 	nextPort = node.port1;
 	const render = new Render();
+	// Everything the worklet reports: every state goes to the port it is handed, and the node's own port
+	// hears the rest (`unreadable`, and once that the ring played).
 	const states: ToMain[] = [];
-	node.port2.onmessage = (event: MessageEvent<ToMain>) => states.push(event.data);
+	node.port2.onmessage = (event: MessageEvent<ToMain>) => {
+		if (event.data.type !== "state") states.push(event.data);
+	};
+	node.port1.addEventListener("message", (event: MessageEvent<Message>) => {
+		if (event.data.type !== "port") return;
+		const port = event.data.port;
+		const post = port.postMessage.bind(port);
+		port.postMessage = ((msg: ToMain, transfer?: Transferable[]) => {
+			// Copied as postMessage copies it: the worklet refills one state object for every report.
+			if (msg.type === "state") states.push(structuredClone(msg));
+			post(msg, transfer ?? []);
+		}) as MessagePort["postMessage"];
+	});
 	cleanup.push(() => node.port2.close());
 
 	// The worklet's own copy of the port it is handed, as its listener receives it.
@@ -667,6 +611,29 @@ describe("timing", () => {
 		expect(read(1)).toEqual([Time.Milli(0), Time.Milli(20), Time.Milli(40)]);
 		expect(read(2)).toEqual([Time.Milli(40)]);
 	});
+
+	it("a graph before timing builds the ring in the mode timing asks for", async () => {
+		// The page sends timing before the graph today only because of the order its effects run in.
+		const { origin, dial } = relay();
+		publish(origin);
+		const page = new Page(dial, 50);
+		page.post({ type: "hello", transports: TRANSPORTS });
+		page.post(player(1));
+
+		// The worklet's end is this test: it records what the worker's ring tells it.
+		const { port1: worklet, port2: writer } = new MessageChannel();
+		const told: Message[] = [];
+		worklet.onmessage = (event: MessageEvent<Message>) => told.push(event.data);
+		cleanup.push(() => worklet.close());
+		page.post({ type: "graph", id: 1, ring: { port: writer, rate: RATE, channels: 2, conceal: false } }, [writer]);
+		await sleep(30);
+		page.post(timing(1, { buffer: Time.Milli(2_000), buffered: true }));
+		await sleep(100);
+
+		const inits = told.filter((msg) => msg.type === "init-post");
+		expect(inits.length).toBeGreaterThan(0);
+		expect(inits.at(-1)).toMatchObject({ type: "init-post", buffered: true });
+	});
 });
 
 describe("the worker's own flushes", () => {
@@ -835,7 +802,7 @@ describe("the host", () => {
 	});
 
 	it("refuses a rendition this realm's decoder cannot play", async () => {
-		FakeDecoder.supported = false;
+		FakeDecoder.refuse.add("opus");
 		const { origin, dial } = relay();
 		publish(origin);
 		const page = new Page(dial, 10_000);

@@ -284,7 +284,8 @@ export class Encoder {
 
 		// When demand disappears, end the epoch with a discontinuity marker (see
 		// Container.Legacy.Producer.cut) so a later subscriber resumes on the same track without the
-		// pre-gap frames reading as live. Its empty payload marks where the submitted media ends.
+		// pre-gap frames reading as live. Its empty payload marks where the submitted media ends, and
+		// the track's break there is where a later subscription starts.
 		effect.run((effect) => {
 			const track = effect.get(rendition.track);
 			if (!track) return;
@@ -296,10 +297,9 @@ export class Encoder {
 				this.#end = undefined;
 				if (end === undefined || track.closed.peek() !== undefined) return;
 				this.#floor = end;
-				track.writeFrame({
-					payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
-					timestamp: Time.Timestamp.fromMicros(end),
-				});
+				const marker = track.appendGroup();
+				Container.Legacy.writeMarker(marker, end);
+				track.breakAt(marker.sequence);
 			});
 		});
 
@@ -340,14 +340,11 @@ export class Encoder {
 	// Derive the encoder config from the captured format and the codec. Re-runs whenever either changes, so a
 	// codec update (bitrate, frame duration) reconfigures without waiting for a channel-count change.
 	//
-	// Capture ending is a pause rather than an end while the rendition is disabled, so the entry it
-	// resolved stays in the catalog and only the endpoint marker on the wire says the audio stopped.
-	// Muting a microphone releases the device and takes the captured format with it, and a subscriber
-	// that answers that by dropping the rendition spends a catalog round trip, a resubscribe and a
-	// cold decoder on the way back, which is most of the speech an unmute loses. The hold outlives
-	// the enable: re-acquiring a device is the slow part, and dropping the entry for that window
-	// would cost exactly what holding it saved. Capture ending while enabled is the source going for
-	// good, so that entry leaves, and one that never had a format was never there to hold.
+	// Capture ending while the rendition is disabled (a muted microphone releases its device) is a
+	// pause: the entry stays in the catalog and the endpoint marker says the audio stopped, since a
+	// subscriber that drops the rendition pays a catalog round trip, a resubscribe and a cold
+	// decoder on unmute. The pause outlives the enable, because re-acquiring the device is the slow
+	// part. Capture ending while enabled is the source going for good, so that entry leaves.
 	#runConfig(effect: Effect): void {
 		const capture = effect.get(this.in.capture);
 		const captured = capture ? effect.get(capture.out.format) : undefined;
@@ -485,19 +482,14 @@ export class Encoder {
 				effect.cleanup(() => {
 					if (encoder.state !== "closed") encoder.close();
 
-					// Muting stops the encoder without closing the track, and a subscriber has no
-					// way to tell audio that stopped from audio that is late: it conceals the gap,
-					// and keeps concealing. Say where the timeline stops instead, with the empty
-					// frame hang already defines as an endpoint. Alone in its group it is also the
-					// discontinuity: it ends the run before it, and the next group opens a run it
-					// does not trim, so resuming writes media and nothing else. Closing discards
-					// whatever the codec still held, so the last chunk that reached the output
-					// callback is where it really stops. A reconfigure keeps encoding, so it
-					// declares nothing.
-					//
-					// Capture or its format going away stops the pipeline just as surely as muting
-					// does, and can happen while `enabled` stays true, so what decides this is
-					// whether anything is still feeding the encoder rather than the mute alone.
+					// Muting stops the encoder without closing the track, and a subscriber cannot
+					// tell audio that stopped from audio that is late, so it would conceal the gap
+					// for good. Declare where the timeline stops with hang's empty endpoint frame,
+					// alone in its group so the next group opens a fresh run. Closing discards what
+					// the codec still held, so the last chunk that reached the output callback is
+					// where it really stops. Capture or its format going away stops the pipeline
+					// just as surely, even while `enabled` stays true; a reconfigure keeps encoding
+					// and declares nothing.
 					const capture = this.in.capture.peek();
 					const stopped = !this.in.enabled.peek() || !capture || !capture.out.format.peek();
 					const end = this.#end;
@@ -505,10 +497,11 @@ export class Encoder {
 					const producer = track.peek();
 					if (!producer) return;
 
-					producer.writeFrame({
-						payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
-						timestamp: Time.Timestamp.fromMicros(end),
-					});
+					const marker = producer.appendGroup();
+					Container.Legacy.writeMarker(marker, end);
+					// A subscription made during the pause starts at the endpoint, not on media
+					// from before it.
+					producer.breakAt(marker.sequence);
 					// The same marker ends a demand gap that follows the pause, so the one #runRegister
 					// writes as demand leaves has nothing left to declare.
 					this.#end = undefined;

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Decision, type Demand } from "./decision";
-import { antiphase, buzz, dominant, energy, maxStep, noise, tone, zeroRun } from "./fixture";
+import { antiphase, buzz, dominant, energy, FixedRing, maxStep, noise, tone, zeroRun } from "./fixture";
 import {
 	CORRELATION,
 	CORRELATION_FAST,
@@ -11,6 +11,7 @@ import {
 	SEARCH,
 	STRETCH_BOUND,
 	Stretch,
+	Stretcher,
 } from "./index";
 import { Floor, Level } from "./level";
 import { Noise } from "./noise";
@@ -213,6 +214,37 @@ describe("background noise", () => {
 		for (let i = 256; i <= sine.length; i += 256) held.update([sine.subarray(i - 256, i)], 256);
 		expect(held.initialised).toBe(false);
 	});
+
+	// One update per 20ms block, the way the engine feeds it: 960 frames at 48kHz, of which the
+	// estimator reads the 256 frame tail.
+	const feed = (room: Noise, pcm: Float32Array) => {
+		for (let i = 960; i <= pcm.length; i += 960) room.update([pcm.subarray(i - 960, i)], 960);
+	};
+
+	it("digital silence does not stall the estimate", () => {
+		const rate = 48000;
+		const room = new Noise(1);
+		feed(room, noise(rate, 2, 0.003)[0]);
+		expect(room.initialised).toBe(true);
+
+		// Half a second of exact zeros: a disabled mic, or a hole the ring filled.
+		feed(room, new Float32Array(rate / 2));
+
+		// The room comes back quieter. Two seconds is a hundred updates; a quiet window is accepted
+		// on sight, so the estimate should be on the new level well before that.
+		feed(room, noise(rate, 2, 0.001)[0]);
+		const expected = (0.001 * 0.001) / 3;
+		const db = 10 * Math.log10(room.energy(0) / expected);
+		expect(Math.abs(db)).toBeLessThan(3);
+	});
+
+	it("zeros before any training do not lock the estimate out", () => {
+		const rate = 48000;
+		const room = new Noise(1);
+		feed(room, new Float32Array(rate / 2));
+		feed(room, noise(rate, 1, 0.001)[0]);
+		expect(room.initialised).toBe(true);
+	});
 });
 
 describe("buffer level filter", () => {
@@ -413,5 +445,28 @@ describe("the stretch bound", () => {
 	it("is what the cooldown and the maximum operation can close in half a second", () => {
 		// One 15ms pitch period per 100ms of output, five times over.
 		expect(STRETCH_BOUND).toBe(MAX_LAG * 5);
+	});
+});
+
+describe("the engine at a fixed level", () => {
+	/** Operations the engine runs over a minute against a ring stubbed at `depthMs`. */
+	function operations(depthMs: number, outage = 0, cycle = 0): number {
+		const ring = new FixedRing(48000, tone(48000, 2, 220, 0.5)[0], depthMs, outage, cycle);
+		const engine = new Stretcher(48000, 1);
+		const out = [new Float32Array(128)];
+		for (let frame = 0; frame < 48000 * 60; frame += 128) engine.render(ring, out, frame);
+		const { accelerates, expands, merges } = engine.counters();
+		return accelerates + expands + merges;
+	}
+
+	it("stretches once per cooldown past the band and never inside it", () => {
+		// 400ms against a 100ms target is past the upper limit however the filter smooths it.
+		expect(operations(400)).toBeGreaterThan(500);
+		expect(operations(120)).toBe(0);
+	});
+
+	it("conceals and splices back on at every outage", () => {
+		// Three blocks of concealment out of every four.
+		expect(operations(120, 3, 4)).toBeGreaterThan(500);
 	});
 });

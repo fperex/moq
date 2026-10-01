@@ -7,9 +7,6 @@
  *
  *     bun sink.ts --dir <run dir> [--port 0]
  *
- * Adapted from `debug-findings/analysis/sink.ts` on the reporter's fork (`fperex/moq`, branch
- * `debug/rt-audio`). See ../../README.md.
- *
  * @module
  */
 import { appendFileSync, mkdirSync } from "node:fs";

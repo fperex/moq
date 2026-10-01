@@ -92,11 +92,9 @@ export class Capture {
 		effect.run((inner) => this.#runStopped(inner, fanout, source));
 	}
 
-	// React to the pipeline ending. Nothing used to: the fanout closed, every reader's stream ended,
-	// and the signal kept pointing at the dead object, so the preview kept its last frame, the
-	// capture rate went to zero and the encoders went quiet while the element still announced a live
-	// broadcast. A track that is still live can be captured again, so rebuild on it; a track that
-	// ended is the application's to re-acquire, so say so loudly and stop pretending.
+	// React to the pipeline ending, which otherwise leaves the element announcing a live broadcast
+	// with a frozen preview. A track that is still live can be captured again, so rebuild on it; a
+	// track that ended is the application's to re-acquire, so say so loudly.
 	#runStopped(effect: Effect, fanout: Fanout<VideoFrame>, source: Source): void {
 		const ended = effect.get(fanout.ended);
 		if (ended === undefined) return;

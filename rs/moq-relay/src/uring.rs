@@ -660,6 +660,12 @@ async fn serve_connection(
 		.await
 		.context("moq handshake failed")?;
 
+	if serve.shutdown.draining() {
+		tracing::info!(id, "relay shutting down; refusing a new session");
+		request.close(moq_net::Error::App(503));
+		return Ok(());
+	}
+
 	// The path + `?jwt=` ride the URL for WebTransport and the SETUP for raw
 	// QUIC; either way the grant comes from the shared runtime, which owns the
 	// auth client.

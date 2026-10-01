@@ -10,7 +10,6 @@
 	z-index: 1;
 	background-color: var(--color-black-alpha-40);
 	backdrop-filter: blur(var(--spacing-2));
-	pointer-events: auto;
 }
 
 .buffering-spinner {

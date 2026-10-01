@@ -245,9 +245,8 @@ class Watcher {
 // Three watchers joining and leaving audio and video at staggered moments, against one browser-style
 // publisher. Everything a watcher does (mute, hide, close the tab) reaches the publisher as a
 // subscribe stream opening or resetting, and every watcher shares the one track producer per name,
-// so one watcher leaving must not end the track under the ones that stayed. That is the failure the
-// bench kept reproducing: a tile freezes, or audio restarts its timeline, because a producer was
-// released on the first watcher that left rather than the last.
+// so one watcher leaving must not end the track under the ones that stayed: a producer released on
+// the first watcher to leave rather than the last freezes a tile or restarts audio's timeline.
 //
 // A stability pin rather than a guard on one fix: the single-watcher regressions already have their
 // own tests (a rendition kept open across a hide, a catalog re-seeded for the next viewer), and what
@@ -438,7 +437,7 @@ test("several watchers joining and leaving audio and video keep both tracks live
 		expectLive("B left");
 
 		// And a watcher arriving after all of that is seeded with the catalog and served both tracks,
-		// which is the case that used to starve: the publisher had already served its first viewer.
+		// although the publisher has already served its first viewer.
 		const d = new Watcher("D", net);
 		watchers.push(d);
 		d.joinCatalog();

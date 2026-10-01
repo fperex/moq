@@ -3,6 +3,7 @@ import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
 import { Signal } from "@moq/signals";
 import { type AudioBuffer, ClockSource, createAudioBuffer } from "./audio/buffer";
+import { fakeClock } from "./audio/fake";
 import lanBbb from "./audio/fixtures/lan-bbb.json" with { type: "json" };
 import { ringSamples } from "./audio/latency";
 import type { Message, State } from "./audio/render";
@@ -14,8 +15,7 @@ import { type Delay, Sync } from "./sync";
 // and the real estimator and watches where the two clocks end up relative to each other. The same
 // replay with the playhead withheld is the control: it is the wall-clock pacing this replaces.
 //
-// The trace is the LAN recording from `audio/replay.test.ts`: arrival timing only, trimmed from the
-// traces attached to moq-dev/moq#3477.
+// The trace is the LAN recording from `audio/replay.test.ts`: arrival timing only.
 
 const RATE = 48000;
 const QUANTUM = 128; // an AudioWorklet render quantum
@@ -29,22 +29,7 @@ const FRAME = 1000 / 30;
 // Effects in @moq/signals flush on a microtask, so let pending updates drain before asserting.
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-// `Time.Milli.now()` reads `performance.now()` on every call, so stubbing it replays a twelve second
-// trace in a fraction of that. Timers and microtasks stay real.
-function fakeClock() {
-	const real = performance.now.bind(performance);
-	let at = 0;
-	performance.now = () => at;
-	return {
-		set(ms: number) {
-			at = ms;
-		},
-		restore() {
-			performance.now = real;
-		},
-	};
-}
-
+// A clock the test moves replays a twelve second trace in a fraction of that.
 let clock: ReturnType<typeof fakeClock> | undefined;
 afterEach(() => {
 	clock?.restore();
@@ -90,10 +75,10 @@ interface Result {
  *
  * With `nominate`, the ring publishes its playhead the way `SharedAudioBuffer` and `Audio.Decoder`
  * do and video follows it. Without, nothing nominates and playback runs on the wall-clock anchor
- * that arrivals set, which is what this quest replaced.
+ * that arrivals set.
  */
 async function replay(nominate: boolean): Promise<Result> {
-	const time = fakeClock();
+	const time = fakeClock(0);
 	clock = time;
 
 	const sync = new Sync();
@@ -369,7 +354,7 @@ async function session({
 	port = false,
 	videoOffset = 0,
 } = {}): Promise<Session> {
-	const time = fakeClock();
+	const time = fakeClock(0);
 	clock = time;
 
 	const delay = new Signal<Delay>("auto");
@@ -602,15 +587,12 @@ describe("mutes and latency presets keep video on the audio", () => {
 		expect(stale.ahead).toBeGreaterThan(500);
 	}, 120_000);
 
-	// What is left after the flush fix: the step the picture takes when the clock changes hands.
-	// While audio is the clock the picture is painted at the audio playhead, so a publisher whose
-	// two timelines disagree costs nothing visible. A mute takes the clock away and the video
-	// arrivals re-anchor playback to the live edge; the unmute hands it back and the picture returns
-	// to the playhead. The step between those two positions is the publisher's epoch offset, so a
-	// broadcast whose clocks agree returns within a frame and one whose clocks are 350ms apart takes
-	// 350ms to walk back. Measured on a browser publisher whose camera anchored 350 to 465ms ahead
-	// of its microphone: worst skew 332.9ms, 0.3s after the unmute, converging inside a frame in
-	// 0.8s, with no underruns.
+	// The step the picture takes when the clock changes hands. While audio is the clock the picture
+	// is painted at the audio playhead, so a publisher whose two timelines disagree costs nothing
+	// visible. A mute takes the clock away and the video arrivals re-anchor playback to the live
+	// edge; the unmute hands it back and the picture returns to the playhead. The step between those
+	// two positions is the publisher's epoch offset, so a broadcast whose clocks agree returns within
+	// a frame and one whose clocks are 350ms apart takes 350ms to walk back.
 	it("returns the picture to the playhead within a frame when the publisher's clocks agree", async () => {
 		const aligned = await session({ port: true, videoOffset: 0 });
 		clock?.restore();

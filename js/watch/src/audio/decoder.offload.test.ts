@@ -1,13 +1,14 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, jest, mock, spyOn } from "bun:test";
-import type * as Catalog from "@moq/hang/catalog";
+import * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
 import { Group, Origin, Path, Time, Varint } from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
 import type { Broadcast as BroadcastType } from "../broadcast";
 import type { Clock, Delay, Sync as SyncType } from "../sync";
 import type { Decoder as DecoderType } from "./decoder";
+import { FakeChunk, FakeDecoder, FakeSession } from "./fake";
 import type { Source as SourceType } from "./source";
-import type { Dial, Port as HostPort, Session } from "./worker/host";
+import type { Dial, Port as HostPort } from "./worker/host";
 import type { FromWorker, ToWorker, Transports } from "./worker/protocol";
 
 // The Decoder with its supply in the page's worker, end to end in one process: the real host behind
@@ -23,54 +24,6 @@ const RATE = 48_000;
 const QUANTUM = 128;
 const NAME = "room/alice";
 const URL_ = "https://relay.example/anon";
-
-// ── WebCodecs, enough of it ─────────────────────────────────────────────────
-
-class FakeChunk {
-	readonly timestamp: number;
-	constructor(init: { timestamp: number }) {
-		this.timestamp = init.timestamp;
-	}
-}
-
-/** One 20 ms stereo packet of a constant, stamped from the chunk that produced it. */
-class FakeAudioData {
-	readonly format = "f32-planar";
-	readonly sampleRate = RATE;
-	readonly numberOfFrames = 960;
-	readonly numberOfChannels = 2;
-	readonly timestamp: number;
-	constructor(timestamp: number) {
-		this.timestamp = timestamp;
-	}
-	copyTo(dst: Float32Array): void {
-		dst.fill(0.5);
-	}
-	close(): void {}
-}
-
-class FakeDecoder {
-	// The codecs the worker's decoder turns down. The page's probe is its own, and takes anything.
-	static refuse = new Set<string>();
-
-	state = "configured";
-	readonly #output: (data: FakeAudioData) => void;
-	constructor(init: { output: (data: FakeAudioData) => void }) {
-		this.#output = init.output;
-	}
-	static async isConfigSupported(config: { codec: string }): Promise<{ supported: boolean }> {
-		return { supported: !FakeDecoder.refuse.has(config.codec) };
-	}
-	configure(): void {}
-	decode(chunk: FakeChunk): void {
-		this.#output(new FakeAudioData(chunk.timestamp));
-	}
-	reset(): void {}
-	close(): void {
-		this.state = "closed";
-	}
-	async flush(): Promise<void> {}
-}
 
 // ── the page's graph ────────────────────────────────────────────────────────
 
@@ -129,29 +82,58 @@ class MockContext extends EventTarget {
 	}
 }
 
-/** The worklet node: a real render worklet behind a real port, as the page's AudioWorkletNode has. */
+/**
+ * The worklet node: a real render worklet behind a real port, as the page's AudioWorkletNode has.
+ *
+ * Told to close, its processor stops in the next quantum its context renders, as an engine's does: a
+ * running context renders on its own, one that is not waits until it runs.
+ */
 class Node {
 	static built: Node[] = [];
-	/** Whether the worklet of a node built now hears nothing on its port, so nothing sent to it arrives. */
+	/**
+	 * Whether the worklet of a node built now hears nothing the page sends it but its close, so no ring
+	 * reaches it. A plain close on the node's own port is what every engine delivers.
+	 */
 	static deaf = false;
 	readonly port: MessagePort;
 	readonly render: Processor;
 	/** The worklet's end of the node's port. */
 	readonly worklet: MessagePort;
+	#closed = false;
+	#stopped = false;
 
-	constructor() {
+	constructor(context: MockContext) {
 		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
 		const { port1, port2 } = new MessageChannel();
-		nextPort = Node.deaf ? new MessageChannel().port2 : port2;
+		const deaf = Node.deaf ? new MessageChannel() : undefined;
+		nextPort = deaf?.port2 ?? port2;
 		this.render = new Render();
 		this.port = port1;
 		this.worklet = port2;
 		Node.built.push(this);
+
+		// Quanta rendered one per tick while the context runs, until the processor returns false.
+		const render = () => {
+			if (!this.#closed || this.#stopped || context.state !== "running") return;
+			if (this.render.process([], [stereo()], {})) setTimeout(render, 0);
+			else this.#stopped = true;
+		};
+		port2.addEventListener("message", (event: MessageEvent<{ type?: string }>) => {
+			if (event.data?.type !== "close") return;
+			this.#closed = true;
+			deaf?.port1.postMessage(event.data);
+			setTimeout(render, 0);
+		});
+		port2.start();
+		context.addEventListener("statechange", () => setTimeout(render, 0));
 	}
 
 	connect(): void {}
 	disconnect(): void {}
 }
+
+/** One quantum of stereo output to render into. */
+const stereo = () => [new Float32Array(QUANTUM), new Float32Array(QUANTUM)];
 
 /** Pull `quanta` render quanta of stereo out of `node` and return the left channel. */
 function pull(node: Node, quanta: number): Float32Array {
@@ -168,25 +150,6 @@ function pull(node: Node, quanta: number): Float32Array {
 const loudest = (samples: Float32Array) => samples.reduce((max, v) => Math.max(max, Math.abs(v)), 0);
 
 // ── the relay, in memory ────────────────────────────────────────────────────
-
-/** A session as the host sees one, reading from an origin in this process. */
-class FakeSession implements Session {
-	readonly origin: Signal<Moq.Origin.Table | undefined>;
-	readonly status = new Signal<Moq.Connection.Status>("connected");
-	readonly transport = new Signal<Moq.Connection.Transport | undefined>("webtransport");
-	readonly enabled = new Signal(true);
-	readonly url: URL;
-	closed = false;
-
-	constructor(url: URL, origin: Moq.Origin.Table) {
-		this.url = url;
-		this.origin = new Signal<Moq.Origin.Table | undefined>(origin);
-	}
-
-	close(): void {
-		this.closed = true;
-	}
-}
 
 /** One broadcast with audio tracks, counting the subscriptions each track has and has had. */
 class Publisher {
@@ -251,8 +214,8 @@ class Relay {
 	readonly sessions: FakeSession[] = [];
 	// Whether a session dialled now never gets through: connecting, with nothing to read.
 	stuck = false;
-	readonly dial: Dial = (url: URL, _transports: Transports) => {
-		const session = new FakeSession(url, this.origin);
+	readonly dial: Dial = (url: URL, transports: Transports) => {
+		const session = new FakeSession(url, transports, this.origin);
 		if (this.stuck) {
 			session.status.set("connecting");
 			session.transport.set(undefined);
@@ -647,6 +610,7 @@ describe("what the page tells the worker", () => {
 
 	it("samples its output clock when it hands over the graph, when the context changes state, and every second", async () => {
 		jest.useFakeTimers();
+		jest.advanceTimersByTime(1);
 		scope.crossOriginIsolated = false;
 		const t = tile({ offload: true });
 		for (let i = 0; i < 200 && !InProcessWorker.created[0]?.told("graph").length; i++) await immediate();
@@ -1153,6 +1117,67 @@ describe("one player's trouble", () => {
 	});
 });
 
+describe("a node the decoder replaces in the same context", () => {
+	it("lets its processor end", async () => {
+		tile({ offload: true });
+		await until(() => handed()(), "the graph handed over");
+		const [old] = Node.built;
+		const quantum = () => [new Float32Array(QUANTUM), new Float32Array(QUANTUM)];
+		expect(old.render.process([], [quantum()], {})).toBe(true);
+
+		// The page takes the audio back onto a fresh node of the same context.
+		fallbacks();
+		const [player] = worker().told("player");
+		worker().say({ type: "error", id: player.id, message: "TypeError: boom" });
+		await until(() => Node.built.length === 2, "the page's own node");
+		await sleep(20);
+
+		// The context is still open, so the old node's processor would run until it closes.
+		expect(old.render.process([], [quantum()], {})).toBe(false);
+	});
+});
+
+describe("the decoded rate", () => {
+	it("survives a fallback: the context the worker's rate built is kept", async () => {
+		// The catalog says 44.1 kHz; the decoder emits 48 kHz, as Chrome and Firefox do for Opus.
+		const rates: number[] = [];
+		class Counting extends MockContext {
+			constructor(options?: { sampleRate?: number }) {
+				super(options);
+				rates.push(this.sampleRate);
+			}
+		}
+		scope.AudioContext = Counting;
+		fallbacks();
+		scope.crossOriginIsolated = true;
+		const t = tile({ offload: true });
+		t.catalog.set({
+			audio: {
+				renditions: {
+					audio: { codec: "opus", container: { kind: "legacy" }, sampleRate: 44_100, numberOfChannels: 2 },
+				},
+			},
+		} as unknown as Catalog.Root);
+		await until(() => handed()(), "the graph handed over");
+		for (let i = 0; i < 20; i++) t.write(i, i * 20_000);
+		await until(() => t.decoder.out.context.peek()?.sampleRate === RATE, "the context at the decoded rate");
+		await sleep(50);
+		const before = rates.length;
+
+		// The worker goes wrong for this player, and the page takes its audio back.
+		const [player] = worker().told("player");
+		worker().say({ type: "error", id: player.id, message: "TypeError: boom" });
+		await until(() => t.decoder.out.thread.peek()?.kind === "main", "the fallback");
+		await until(() => t.page.live() === 1, "the page's own subscription");
+		for (let i = 20; i < 40; i++) t.write(i, i * 20_000);
+		await sleep(150);
+
+		// The page's decoder emits 48 kHz too, which the context already runs at.
+		expect(t.decoder.out.context.peek()?.sampleRate).toBe(RATE);
+		expect(rates.slice(before)).toEqual([]);
+	});
+});
+
 describe("the thread a player's audio runs on", () => {
 	it("is the page's, for no reason, when the player does not offload or has no relay to hand the worker", async () => {
 		const off = tile({ offload: false });
@@ -1180,5 +1205,61 @@ describe("the thread a player's audio runs on", () => {
 			return thread?.kind === "worker" && thread.transport === "webtransport";
 		}, "the worker's transport");
 		expect(t.page.total()).toBe(0);
+	});
+});
+
+describe("the worker output clock after resume", () => {
+	it("rejects a missing device timestamp and refreshes it on the next worker report", async () => {
+		jest.useFakeTimers();
+		jest.advanceTimersByTime(50_000);
+		const t = tile({ offload: true });
+		for (let i = 0; i < 200 && !InProcessWorker.created[0]?.told("graph").length; i++) await immediate();
+		const context = t.decoder.out.context.peek();
+		if (!context) throw new Error("no audio context");
+		let output: AudioTimestamp = { contextTime: 0.971, performanceTime: 0 };
+		context.getOutputTimestamp = () => output;
+		context.dispatchEvent(new Event("statechange"));
+		expect(worker().told("output").at(-1)?.output).toBeUndefined();
+
+		output = { contextTime: 1.02, performanceTime: performance.now() };
+		jest.advanceTimersByTime(50);
+		for (let i = 0; i < 20; i++) await immediate();
+		expect(worker().told("output").at(-1)?.output).toEqual({
+			contextTime: 1.02,
+			at: performance.timeOrigin + (output.performanceTime ?? 0),
+		});
+	});
+});
+
+describe("the decoded rate's rendition", () => {
+	it("does not carry a learned rate into a different decoder configuration", async () => {
+		const rates: number[] = [];
+		scope.AudioContext = class extends MockContext {
+			constructor(options?: { sampleRate?: number }) {
+				super(options);
+				rates.push(this.sampleRate);
+			}
+		};
+		const t = tile({ offload: true });
+		const config = (sampleRate: number): Catalog.Root =>
+			Catalog.RootSchema.parse({
+				audio: {
+					renditions: {
+						audio: { codec: "opus", container: { kind: "legacy" }, sampleRate, numberOfChannels: 2 },
+					},
+				},
+			});
+		t.catalog.set(config(44_100));
+		await until(() => handed()(), "the graph handed over");
+		for (let i = 0; i < 20; i++) t.write(i, i * 20_000);
+		await until(() => t.decoder.out.context.peek()?.sampleRate === RATE, "the decoded rate");
+		t.attached.set(false);
+		await until(() => t.decoder.out.context.peek() === undefined, "the context closed");
+		t.catalog.set(config(32_000));
+		await sleep(25);
+		const before = rates.length;
+		t.attached.set(true);
+		await until(() => rates.length > before, "the replacement context");
+		expect(rates[before]).toBe(32_000);
 	});
 });

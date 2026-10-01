@@ -99,10 +99,9 @@ it("plays a steady stream without allocating", () => {
 	});
 });
 
-it("stretches and conceals without allocating objects or correlations", () => {
+it("stretches and conceals without allocating", () => {
 	// Three percent slow, so the engine expands on every cooldown, and 120ms lost every two seconds,
-	// which runs the ring dry, so it conceals and splices the media back on as well. The splice still
-	// copies through views, which this does not count.
+	// which runs the ring dry, so it conceals and splices the media back on as well.
 	const { run, engine } = worklet(0.97, 6);
 	run(WARMUP);
 
@@ -111,5 +110,9 @@ it("stretches and conceals without allocating objects or correlations", () => {
 	expect(engine.counters().expands).toBeGreaterThan(expands);
 	expect(engine.counters().merges).toBeGreaterThan(merges);
 
-	expect({ objects: grown.Object ?? 0, searches: grown.Float64Array ?? 0 }).toEqual({ objects: 0, searches: 0 });
+	expect({ objects: grown.Object ?? 0, views: grown.Float32Array ?? 0, searches: grown.Float64Array ?? 0 }).toEqual({
+		objects: 0,
+		views: 0,
+		searches: 0,
+	});
 });

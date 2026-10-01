@@ -29,9 +29,6 @@ type MicrophoneOutput = {
 	error: Signal<Error | undefined>;
 };
 
-// A capture attempt: the stream the browser handed over, or why it would not.
-type Attempt = { stream: MediaStream; error?: undefined } | { stream?: undefined; error: unknown };
-
 /** Captures audio from a microphone, tracking the available devices. */
 export class Microphone {
 	readonly in: Readonlys<MicrophoneInput>;
@@ -50,10 +47,6 @@ export class Microphone {
 
 	#signals = new Effect();
 	#retry = new Retry(this.#out.error);
-
-	// The release of the capture the previous run held, awaited before the next attempt. See
-	// `Camera` for why: a device we have not finished handing back rejects the next attempt.
-	#released: Promise<void> = Promise.resolve();
 
 	constructor(props?: MicrophoneProps) {
 		this.in = {
@@ -101,35 +94,12 @@ export class Microphone {
 		};
 
 		effect.spawn(async () => {
-			// Let go of the last capture before asking for a device again: the browser is still
-			// holding it otherwise, and it answers that with a failure like any other.
-			await effect.race(this.#released);
-			if (effect.abort.aborted) return;
-
-			const media = navigator.mediaDevices
-				.getUserMedia({ audio: finalConstraints })
-				.then((stream): Attempt => ({ stream }))
-				.catch((error: unknown): Attempt => ({ error }));
-
-			// If the effect is cancelled for any reason (ex. cancel), stop any media that we got,
-			// and keep the release for the next attempt to wait on.
-			effect.cleanup(() => {
-				this.#released = media.then(({ stream }) => {
-					stream?.getTracks().forEach((track) => {
-						track.stop();
-					});
-				});
-			});
-
-			const attempt = await effect.race(media);
+			const stream = await this.#retry.open(effect, { audio: finalConstraints });
 
 			// A torn-down run is not a failed attempt: whatever cancelled it reruns us.
-			if (effect.abort.aborted || !attempt) return;
+			if (effect.abort.aborted || !stream) return;
 
-			// A refusal stands until something changes, unless the device was only busy.
-			if (!attempt.stream) return this.#retry.refused(attempt.error);
-
-			const track = attempt.stream.getAudioTracks()[0] as Audio.StreamTrack | undefined;
+			const track = stream.getAudioTracks()[0] as Audio.StreamTrack | undefined;
 			const settings = track?.getSettings();
 
 			// getUserMedia resolved, so we have permission even if no track came back.

@@ -210,12 +210,10 @@ const GRACE = 2;
 function videoProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
 	console.warn("Using MediaStreamTrackProcessor polyfill; performance might suffer.");
 
-	// Firefox suspends requestVideoFrameCallback while the document is hidden: measured at 30/s on
-	// screen and 1/s hidden, while the camera keeps filling the element the whole time (its
-	// currentTime still advances at 1.0x and its picture still changes). The callback alone
-	// therefore froze a hidden publisher at 1 fps, which every watcher saw as multi-second stalls.
-	// A worker's timers are the one clock the browser does not throttle, so one captures whenever
-	// the callback goes quiet.
+	// Firefox throttles requestVideoFrameCallback to about 1/s while the document is hidden, though
+	// the camera keeps filling the element, so the callback alone freezes a hidden publisher. A
+	// worker's timers are the one clock the browser does not throttle, so one captures whenever the
+	// callback goes quiet.
 	//
 	// A source that reports no rate (a canvas capture track reports 0) is sampled at 30: the tick
 	// over-samples on purpose, and the media clock check drops whatever it repeats.
@@ -244,8 +242,12 @@ function videoProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
 		waiting = undefined;
 
 		if (at <= stamped) {
-			pull.reject(new Error(`video capture went backwards: ${at}ms after ${stamped}ms`));
-			return;
+			// A returning callback can carry a frame-start time just before the last worker tick.
+			if (stamped - at > 1000 / rate) {
+				pull.reject(new Error(`video capture went backwards: ${at}ms after ${stamped}ms`));
+				return;
+			}
+			at = Time.Milli(stamped + 0.001);
 		}
 
 		taken = video.currentTime;

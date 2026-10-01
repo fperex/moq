@@ -301,6 +301,8 @@ class TrackState {
 	/** Best-effort datagram channel, parallel to {@link groups}; a bounded send buffer per subscriber. */
 	datagrams = new Signal<Datagram[]>([]);
 	latest?: number;
+	/** The producer's break when this sink was made, which a live cursor never starts before. */
+	floor = 0;
 	/**
 	 * The exclusive final boundary, stamped when the producer closes cleanly: one past the
 	 * highest sequence produced. Groups and datagrams share the namespace, so this can
@@ -415,6 +417,9 @@ export class Producer {
 	// watches it to tear down an idle upstream, and a publisher can watch it for on-demand capture.
 	#used = new Signal<boolean>(false);
 
+	// The break last declared; see {@link breakAt}.
+	#break = 0;
+
 	constructor(name: string) {
 		this.name = name;
 	}
@@ -473,7 +478,8 @@ export class Producer {
 	/**
 	 * An independent {@link Subscriber} reading this track's groups.
 	 *
-	 * Its cursor starts at the group the subscription named (its floor), or 0.
+	 * Its cursor starts at the group the subscription named (its floor), or 0, but never
+	 * before the last {@link breakAt}.
 	 * {@link Subscription.maxAge} is what asks for data: delivery skips everything above
 	 * the floor that the budget convicts, so the default budget of zero delivers only the
 	 * latest group and a larger one reaches back over what it can still use.
@@ -495,6 +501,22 @@ export class Producer {
 		return this.#used;
 	}
 
+	/**
+	 * Mark a break in the timeline at group `sequence`: a subscription made afterwards starts there at
+	 * the earliest, however far back its budget reaches, while a fetch still reaches the groups before it.
+	 *
+	 * For a publisher whose media stops and later resumes, such as an encoder paused for lack of demand.
+	 * Max Age measures a group against the newest one, so until the resumed media arrives the last
+	 * group before the pause still reads as live. `sequence` may name the next group to be produced.
+	 * A break only moves forward; anything else throws. Mirrors the Rust `break_at`.
+	 */
+	breakAt(sequence: number): void {
+		if (!Number.isSafeInteger(sequence) || sequence < this.#break || sequence > this.#sequence.next) {
+			throw new RangeError(`a break moves forward to at most the next group, not to ${sequence}`);
+		}
+		this.#break = sequence;
+	}
+
 	/** Resolves once the track has no subscribers (or has closed). Await it to react to demand ending. */
 	async unused(): Promise<void> {
 		while (this.#used.peek() && this.#state.closed.peek() === undefined) {
@@ -507,6 +529,7 @@ export class Producer {
 	// track still drains the buffered groups before seeing the end.
 	#addSink(sink: TrackState): void {
 		sink.producer = this;
+		sink.floor = this.#break;
 		const info = this.#state.info.peek();
 		if (info) sink.info.set(info);
 
@@ -940,10 +963,18 @@ export class Subscriber {
 	private constructor(name: string, state: TrackState) {
 		this.name = name;
 		this.#state = state;
-		// The cursor's floor is the group the subscription named, or 0. A floor is the
-		// only thing a start contributes; {@link Subscription.maxAge} is what asks for
-		// data, and delivery skips everything above the floor that the budget convicts.
-		this.#cursor.set({ start: groupBounds(state.update.peek()?.groups ?? {}).start });
+		// The cursor's floor is the group the subscription named, or 0, but never before the
+		// producer's break. A floor is the only thing a start contributes;
+		// {@link Subscription.maxAge} is what asks for data, and delivery skips everything
+		// above the floor that the budget convicts.
+		this.#cursor.set({ start: Math.max(groupBounds(state.update.peek()?.groups ?? {}).start, state.floor) });
+	}
+
+	// A fetch or a fill reads history on purpose, so it starts where it asked rather than at the
+	// producer's break.
+	#ignoreBreak(): void {
+		const start = groupBounds(this.#state.update.peek()?.groups ?? {}).start;
+		this.#cursor.update((cursor) => ({ ...cursor, start }));
 	}
 
 	static {
@@ -952,6 +983,7 @@ export class Subscriber {
 		hooks.groupChanged = (subscriber, fn) => subscriber.#groupChanged(fn);
 		hooks.exemptFetch = (subscriber) => {
 			subscriber.#enforceLatency = false;
+			subscriber.#ignoreBreak();
 		};
 		hooks.replaceGroups = (subscriber, groups) => subscriber.#replaceGroups(groups);
 		// The sequence cursor lives here (it shares the buffer and the drift anchor with
@@ -1045,7 +1077,9 @@ export class Subscriber {
 	fork(options?: Subscription): Subscriber {
 		const producer = this.#state.producer;
 		if (!producer) throw new Error("track has no producer to fork from");
-		return producer.subscribe(options);
+		const fork = producer.subscribe(options);
+		fork.#ignoreBreak();
+		return fork;
 	}
 
 	/** Limit subsequent reads to these groups and return this reader for chaining. */
@@ -1065,11 +1099,12 @@ export class Subscriber {
 	}
 
 	// Serving counterpart of setGroups: a named start replaces the floor, matching
-	// Rust `start_at`. Local readers stay monotonic; only the wire publisher lowers.
+	// Rust `start_at`. Local readers stay monotonic; only the wire publisher lowers, and
+	// never before the producer's break.
 	#replaceGroups(groups: Groups): void {
 		const { start, end } = groupBounds(groups);
 		this.#cursor.update((cursor) => ({
-			start: groups.start === undefined ? cursor.start : start,
+			start: groups.start === undefined ? cursor.start : Math.max(start, this.#state.floor),
 			end,
 		}));
 	}

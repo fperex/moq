@@ -418,9 +418,11 @@ export class Consumer {
 		return true;
 	}
 
-	#guard<T>(operation: Promise<T>): Promise<T> {
+	#guard<T>(operation: () => Promise<T>): Promise<T> {
+		this.#expire(true);
+		if (this.#terminal) return Promise.reject(this.#terminal);
 		const expiry = this.#expiry;
-		if (!expiry && !this.#terminal) return operation;
+		if (!expiry) return operation();
 
 		return new Promise<T>((resolve, reject) => {
 			let settled = false;
@@ -439,14 +441,16 @@ export class Consumer {
 				}
 			};
 
-			for (const changed of expiry?.changed ?? []) disposes.push(changed.subscribe(check));
-			// The write has already started. Observe it before an expiry verdict can reset
-			// the stream and reject it, including when the group expired before this call.
-			operation.then(
-				(value) => finish(() => resolve(value)),
-				(error: unknown) => finish(() => reject(error)),
-			);
-			check();
+			try {
+				for (const changed of expiry.changed) disposes.push(changed.subscribe(check));
+				operation().then(
+					(value) => finish(() => resolve(value)),
+					(error: unknown) => finish(() => reject(error)),
+				);
+				check();
+			} catch (error) {
+				finish(() => reject(error));
+			}
 		});
 	}
 

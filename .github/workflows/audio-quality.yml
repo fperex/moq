@@ -8,9 +8,9 @@ name: Audio quality
 # playout engine on a simulated clock: seconds, no browser, and the same numbers
 # on every run, so its budgets are exact and a breach is always the change under
 # review. The Chromium matrix is half an hour of real-time playback whose every
-# number moves with the runner's load, which is why nightly.yml owns it; the
-# `workflow_dispatch` button runs the same job for a branch that wants its
-# answer before tomorrow.
+# number moves with the runner's load, which is why nightly.yml calls it rather
+# than a pull request; the `workflow_dispatch` button runs it for a branch that
+# wants its answer before tomorrow.
 #
 # The filter is the code the replay lane runs, the player (js/watch) and the
 # estimator it replays through (js/hang), plus the harness with its budgets and
@@ -31,10 +31,14 @@ on:
       - "rs/moq-audio/**"
       - "test/audio-quality/**"
       - ".github/workflows/audio-quality.yml"
+  workflow_call:
   workflow_dispatch:
 
+# A called workflow sees its caller's workflow and event, so the nightly run
+# (scheduled or dispatched) and this workflow's own dispatch never share a
+# group, while a repeat of the same kind still supersedes the last.
 concurrency:
-  group: audio-quality-${{ github.ref }}
+  group: audio-quality-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -88,13 +92,13 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # The nightly job, on demand: the replay lane, then the Chromium matrix over
-  # the seeded UDP shaper, graded against `test/audio-quality/budgets.json`.
-  # Keep the two in step.
+  # The replay lane, then the Chromium matrix over the seeded UDP shaper, graded
+  # against `test/audio-quality/budgets.json`. A called workflow sees its
+  # caller's event, so this runs for the nightly schedule too.
   matrix:
     name: Audio quality
-    if: github.event_name == 'workflow_dispatch'
-    # x64 for Playwright's Chromium, as in nightly.yml.
+    if: github.event_name != 'pull_request'
+    # x64 for Playwright's Chromium, as interop.yml and wasm.yml run theirs.
     runs-on: ubuntu-latest
     # Two dozen rows at a minute each is about half an hour on its own, and the
     # relay, the CLI, and the shaper build from source ahead of them.
@@ -141,6 +145,11 @@ jobs:
 
       - name: Audio quality
         run: nix develop --command just test audio-quality --enforce
+        shell: bash -leo pipefail {0}
+
+      - name: Shared audio ring quality
+        if: ${{ !cancelled() }}
+        run: nix develop --command just test audio-quality --profiles fixed-250 --rings isolated --offload false --enforce
         shell: bash -leo pipefail {0}
 
       # The run directory is the whole diagnosis: each process's log, the

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, jest, spyOn, test } from "bun:test";
 import { Container } from "@moq/hang";
 import * as Catalog from "@moq/hang/catalog";
 import * as Moq from "@moq/net";
@@ -15,6 +15,7 @@ import type { Source } from "./source";
 /** One `VideoDecoder` the code under test built, with the chunks it was handed. */
 type Built = {
 	chunks: string[];
+	timestamps: number[];
 	/** Emit a decoded picture, which is what keeps the tile out of the stalled state. */
 	emit(timestamp: number): void;
 	/** Raise a codec error, the way a decoder does when it cannot decode what it was fed. */
@@ -23,28 +24,16 @@ type Built = {
 
 let built: Built[] = [];
 
-// Wall time runs this many times faster inside a test, so BUFFERING lands at 20ms, RETRY at 40ms and
-// RECOVER at 200ms.
-const SPEEDUP = 25;
-
 const real = {
 	VideoDecoder: globalThis.VideoDecoder,
 	EncodedVideoChunk: globalThis.EncodedVideoChunk,
-	setTimeout: globalThis.setTimeout,
 };
 
 beforeEach(() => {
 	built = [];
 
-	// The retry and recovery windows are seconds by design, so the timers run on a compressed clock
-	// rather than being waited out. `Effect.timer` calls the global, so scaling it here is enough;
-	// microtasks and the signal graph stay real. Same shape as the `performance.now` stub in
-	// `sync.replay.test.ts`. Scaling rather than clamping keeps the order between the windows, which
-	// is what tells a rebuild driven by the codec error from one driven by the stall watchdog.
-	globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
-		const scaled = ms === undefined ? ms : Math.max(1, Math.round(ms / SPEEDUP));
-		return real.setTimeout(fn, scaled, ...rest);
-	}) as typeof setTimeout;
+	// Only advance() moves decoder recovery deadlines.
+	jest.useFakeTimers();
 
 	class FakeVideoFrame {
 		readonly displayWidth = 16;
@@ -71,6 +60,7 @@ beforeEach(() => {
 		constructor(init: { output: (frame: unknown) => void; error: (error: Error) => void }) {
 			this.#entry = {
 				chunks: [],
+				timestamps: [],
 				emit: (timestamp: number) => init.output(new FakeVideoFrame(timestamp)),
 				fail: (error: Error) => init.error(error),
 			};
@@ -81,8 +71,9 @@ beforeEach(() => {
 			this.state = "configured";
 		}
 
-		decode(chunk: { type: string }): void {
+		decode(chunk: { type: string; timestamp: number }): void {
 			this.#entry.chunks.push(chunk.type);
+			this.#entry.timestamps.push(chunk.timestamp);
 		}
 
 		close(): void {
@@ -111,12 +102,22 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	jest.useRealTimers();
 	globalThis.VideoDecoder = real.VideoDecoder;
 	globalThis.EncodedVideoChunk = real.EncodedVideoChunk;
-	globalThis.setTimeout = real.setTimeout;
 });
 
-const flush = () => new Promise((resolve) => real.setTimeout(resolve, 0));
+// setImmediate, not setTimeout: bun's fake timers take over every setTimeout, including one captured
+// before they were installed, but leave setImmediate alone, so this still yields a real turn.
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+/** Move the fake clock forward in small steps, letting the signal graph and the plumbing react. */
+async function advance(ms: number, step = 25): Promise<void> {
+	for (let elapsed = 0; elapsed < ms; elapsed += step) {
+		jest.advanceTimersByTime(Math.min(step, ms - elapsed));
+		await flush();
+	}
+}
 
 async function settle(rounds = 10): Promise<void> {
 	for (let i = 0; i < rounds; i++) await flush();
@@ -124,6 +125,62 @@ async function settle(rounds = 10): Promise<void> {
 
 const TRACK = "video";
 const payload = (n: number) => new Uint8Array(n).fill(1);
+
+const CMAF_CONFIG = (() => {
+	const base = Catalog.VideoConfigSchema.parse({
+		codec: "avc1.640028",
+		container: { kind: "legacy" },
+		description: "01640028",
+		codedWidth: 16,
+		codedHeight: 16,
+	});
+	const init = Container.Cmaf.createVideoInitSegment(base);
+	return Catalog.VideoConfigSchema.parse({
+		...base,
+		container: { kind: "cmaf", init: btoa(String.fromCharCode(...init)) },
+	});
+})();
+
+type TestContainer = "legacy" | "cmaf";
+
+function testConfig(container: TestContainer): Catalog.VideoConfig {
+	return container === "cmaf"
+		? CMAF_CONFIG
+		: Catalog.VideoConfigSchema.parse({ codec: "avc1.640028", container: { kind: "legacy" } });
+}
+
+function writeTestFrame(
+	container: TestContainer,
+	group: Moq.Group.Producer,
+	timestamp: Time.Micro,
+	keyframe: boolean,
+	sequence: number,
+): void {
+	let data: Uint8Array;
+	if (container === "cmaf") {
+		data = Container.Cmaf.encodeDataSegment({
+			kind: "video",
+			data: payload(1),
+			timestamp,
+			duration: 33_000,
+			keyframe,
+			sequence,
+		});
+	} else {
+		const header = Moq.Varint.encode(timestamp);
+		data = new Uint8Array(header.length + 1);
+		data.set(header);
+		data[header.length] = 1;
+	}
+	group.writeFrame({ payload: data, timestamp: Time.Timestamp.now() });
+}
+
+function finishTestGroup(container: TestContainer, group: Moq.Group.Producer, end: Time.Micro): void {
+	if (container === "legacy") {
+		group.writeFrame({ payload: Moq.Varint.encode(end), timestamp: Time.Timestamp.now() });
+	}
+	group.close();
+}
 
 /**
  * Keep the newest decoder producing pictures until the returned function is called.
@@ -149,8 +206,8 @@ function heartbeat(): () => void {
  * A track the test serves directly, recording every subscription the decoder opens on it.
  *
  * A broadcast answers a subscription from the tracks the application inserted, and a repeat
- * subscription fans out from the same producer, so the count of `subscribe` calls is what a
- * per-subscription request used to report.
+ * subscription fans out from the same producer, so each subscription the decoder opens is one
+ * `subscribe` call.
  */
 class ServedTrack extends Moq.Track.Producer {
 	#log: string[];
@@ -169,16 +226,19 @@ class ServedTrack extends Moq.Track.Producer {
 }
 
 /** A live broadcast, a `Decoder` reading it, and every subscription it has raised. */
-function fixture() {
+function fixture(config = testConfig("legacy")) {
 	const broadcast = new Moq.Broadcast.Producer();
 	const consumer = broadcast.consume();
 	const source = {
-		in: { broadcast: new Signal({ relativeBroadcast: () => consumer } as unknown as Broadcast) },
+		in: {
+			broadcast: new Signal({
+				relativeBroadcast: () => consumer,
+				out: { catalog: new Signal<Catalog.Root | undefined>(undefined) },
+			} as unknown as Broadcast),
+		},
 		out: {
 			track: new Signal<string | undefined>(TRACK),
-			config: new Signal<Catalog.VideoConfig | undefined>(
-				Catalog.VideoConfigSchema.parse({ codec: "avc1.640028", container: { kind: "legacy" } }),
-			),
+			config: new Signal<Catalog.VideoConfig | undefined>(config),
 			catalog: new Signal<Catalog.VideoConfig | undefined>(undefined),
 		},
 	} as unknown as Source;
@@ -195,6 +255,8 @@ function fixture() {
 
 	return {
 		served,
+		broadcast,
+		rendition: source.out.track as Signal<string | undefined>,
 		decoder,
 		sync,
 		track,
@@ -205,9 +267,9 @@ function fixture() {
 			for (let i = 0; i < 400 && opened.length < count; i++) await flush();
 			return opened.length;
 		},
-		/** Wait until `count` codecs have been built, or give up. One per rebuilt track. */
-		async decoders(count: number): Promise<number> {
-			for (let i = 0; i < 400 && built.length < count; i++) await flush();
+		/** Advance the fake clock until `count` codecs have been built, or give up after `within` ms of it. */
+		async decoders(count: number, within = 10_000): Promise<number> {
+			for (let elapsed = 0; elapsed < within && built.length < count; elapsed += 25) await advance(25);
 			return built.length;
 		},
 		close(): void {
@@ -250,6 +312,243 @@ test("video advances to a buffered keyframe when the audio playhead reaches it",
 	}
 });
 
+for (const container of ["legacy", "cmaf"] as const) {
+	test(`${container} video never submits an older GOP after live media`, async () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const fx = fixture(testConfig(container));
+		const live = new Moq.Group.Producer(10);
+		const old = new Moq.Group.Producer(5);
+		const forward = new Moq.Group.Producer(11);
+		try {
+			expect(await fx.subscriptions(1)).toBe(1);
+			fx.sync.track("audio").clock.set({
+				timestamp: Time.Micro(10_000_000),
+				reference: Time.Milli.now(),
+				rate: 0,
+			});
+
+			fx.track.writeGroup(live);
+			writeTestFrame(container, live, Time.Micro(10_000_000), true, 0);
+			writeTestFrame(container, live, Time.Micro(10_033_000), false, 1);
+			await settle();
+
+			// Warm-cache groups can arrive below the group already submitted to WebCodecs.
+			fx.track.writeGroup(old);
+			writeTestFrame(container, old, Time.Micro(5_000_000), true, 2);
+			await settle();
+
+			old.close();
+			finishTestGroup(container, live, Time.Micro(10_066_000));
+
+			fx.track.writeGroup(forward);
+			writeTestFrame(container, forward, Time.Micro(10_066_000), true, 3);
+			writeTestFrame(container, forward, Time.Micro(10_099_000), false, 4);
+			forward.close();
+			await settle();
+
+			expect(built[0].timestamps).not.toContain(5_000_000);
+			expect(built[0].timestamps.slice(-2)).toEqual([10_066_000, 10_099_000]);
+			expect(built[0].chunks.slice(-2)).toEqual(["key", "delta"]);
+		} finally {
+			old.close();
+			live.close();
+			forward.close();
+			fx.close();
+			warn.mockRestore();
+		}
+	});
+}
+
+test("historical age loss does not erase the live GOP", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const fx = fixture();
+	const live = new Moq.Group.Producer(10);
+	const old = new Moq.Group.Producer(5);
+	const expired = new Moq.Group.Producer(4);
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		fx.sync.track("audio").clock.set({
+			timestamp: Time.Micro(10_000_000),
+			reference: Time.Milli.now(),
+			rate: 0,
+		});
+
+		fx.track.writeGroup(live);
+		writeTestFrame("legacy", live, Time.Micro(10_000_000), true, 0);
+		writeTestFrame("legacy", live, Time.Micro(10_033_000), false, 1);
+		await settle();
+
+		fx.track.writeGroup(old);
+		writeTestFrame("legacy", old, Time.Micro(5_000_000), true, 2);
+		await settle();
+		fx.track.writeGroup(expired);
+		writeTestFrame("legacy", expired, Time.Micro(4_000_000), true, 3);
+		await settle();
+		expired.close();
+		old.close();
+
+		writeTestFrame("legacy", live, Time.Micro(10_066_000), false, 4);
+		writeTestFrame("legacy", live, Time.Micro(10_100_000), false, 5);
+		await settle();
+
+		expect(built[0].timestamps).toEqual([10_000_000, 10_033_000, 10_066_000, 10_100_000]);
+		expect(built[0].chunks).toEqual(["key", "delta", "delta", "delta"]);
+	} finally {
+		expired.close();
+		old.close();
+		live.close();
+		fx.close();
+		warn.mockRestore();
+	}
+});
+
+test("a declared marker still resets video when its group arrives behind live media", async () => {
+	const fx = fixture();
+	const live = new Moq.Group.Producer(10);
+	const marker = new Moq.Group.Producer(6);
+	const old = new Moq.Group.Producer(5);
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		fx.track.writeGroup(live);
+		writeTestFrame("legacy", live, Time.Micro(10_000_000), true, 0);
+		writeTestFrame("legacy", live, Time.Micro(10_033_000), false, 1);
+		await settle();
+		expect(fx.sync.out.reference.peek()).toBeDefined();
+
+		fx.track.writeGroup(marker);
+		marker.writeFrame({ payload: Moq.Varint.encode(Time.Micro(5_033_000)), timestamp: Time.Timestamp.now() });
+		await settle();
+		fx.track.writeGroup(old);
+		writeTestFrame("legacy", old, Time.Micro(5_000_000), true, 2);
+		old.close();
+		await settle();
+		marker.close();
+		await settle();
+
+		expect(fx.sync.out.reference.peek()).toBeUndefined();
+	} finally {
+		old.close();
+		live.close();
+		marker.close();
+		fx.close();
+	}
+});
+
+test("a declared break lets a restarted group sequence decode", async () => {
+	const fx = fixture();
+	// Stamped with media time, as a publisher does, so the subscription's age budget reads the
+	// restarted groups as the live edge they are.
+	const write = (group: Moq.Group.Producer, timestamp: number) => {
+		const header = Moq.Varint.encode(timestamp);
+		const payload = new Uint8Array(header.length + 1);
+		payload.set(header);
+		payload[header.length] = 1;
+		group.writeFrame({ payload, timestamp: Time.Timestamp.fromMicros(Time.Micro(timestamp)) });
+	};
+	const live = new Moq.Group.Producer(10);
+	const marker = new Moq.Group.Producer(11);
+	const restarted = [new Moq.Group.Producer(0), new Moq.Group.Producer(1)];
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		fx.track.writeGroup(live);
+		write(live, 10_000_000);
+		write(live, 10_033_000);
+		live.close();
+		await settle();
+
+		// A new upstream behind the break numbers its groups from zero.
+		fx.track.writeGroup(marker);
+		Container.Legacy.writeMarker(marker, Time.Micro(10_066_000));
+		await settle();
+		for (const [i, group] of restarted.entries()) {
+			fx.track.writeGroup(group);
+			write(group, 12_000_000 + i * 2_000_000);
+			write(group, 12_033_000 + i * 2_000_000);
+			group.close();
+			await settle();
+		}
+
+		expect(built).toHaveLength(1);
+		expect(built[0].timestamps).toEqual([10_000_000, 10_033_000, 12_000_000, 12_033_000, 14_000_000, 14_033_000]);
+		expect(built[0].chunks).toEqual(["key", "delta", "key", "delta", "key", "delta"]);
+	} finally {
+		live.close();
+		marker.close();
+		for (const group of restarted) group.close();
+		fx.close();
+	}
+});
+
+test("a forward discontinuity waits for the next keyframe", async () => {
+	type Next = NonNullable<Awaited<ReturnType<Container.Consumer["next"]>>>;
+	const frame = (
+		group: number,
+		timestamp: number,
+		keyframe: boolean,
+		discontinuity: number,
+		continuous: boolean,
+	): Next => ({
+		group,
+		discontinuity,
+		continuous,
+		frame: { payload: payload(1), timestamp: Time.Micro(timestamp), keyframe },
+	});
+	const results: Next[] = [
+		frame(10, 10_000_000, true, 0, false),
+		frame(10, 10_033_000, false, 0, true),
+		frame(11, 10_066_000, false, 1, false),
+		frame(11, 10_099_000, true, 1, true),
+		frame(11, 10_132_000, false, 1, true),
+	];
+	const read = spyOn(Container.Consumer.prototype, "next").mockImplementation(async () => results.shift());
+	const fx = fixture();
+	try {
+		await settle();
+		expect(built[0].timestamps).toEqual([10_000_000, 10_033_000, 10_099_000, 10_132_000]);
+	} finally {
+		fx.close();
+		read.mockRestore();
+	}
+});
+
+test("neither lost content nor a break behind live media re-opens an older GOP", async () => {
+	type Next = NonNullable<Awaited<ReturnType<Container.Consumer["next"]>>>;
+	const frame = (group: number, timestamp: number, discontinuity: number): Next => ({
+		group,
+		discontinuity,
+		continuous: false,
+		frame: { payload: payload(1), timestamp: Time.Micro(timestamp), keyframe: true },
+	});
+	const done = (group: number, discontinuity: number, end?: number): Next => ({
+		group,
+		discontinuity,
+		continuous: false,
+		frame: undefined,
+		end: end === undefined ? undefined : Time.Micro(end),
+	});
+	const results: Next[] = [
+		frame(10, 10_000_000, 0),
+		// A declared break arriving behind the live GOP.
+		done(6, 0, 5_033_000),
+		done(6, 1),
+		frame(5, 5_000_000, 1),
+		frame(11, 10_066_000, 1),
+		// Lost content, surfaced on a group that closes without media.
+		done(12, 2),
+		frame(7, 7_000_000, 2),
+		frame(13, 10_132_000, 2),
+	];
+	const read = spyOn(Container.Consumer.prototype, "next").mockImplementation(async () => results.shift());
+	const fx = fixture();
+	try {
+		await settle();
+		expect(built[0].timestamps).toEqual([10_000_000, 10_066_000, 10_132_000]);
+	} finally {
+		fx.close();
+		read.mockRestore();
+	}
+});
+
 test("late backlog cannot replace the picture shown before clock catch-up", async () => {
 	const fx = fixture();
 	try {
@@ -284,14 +583,13 @@ test("a codec error rebuilds the track instead of stranding the subscription", a
 			expect(built[0].chunks).toEqual(["key"]);
 			expect(fx.decoder.out.stalled.peek()).toBe(false);
 
-			// The codec gives up. This used to close the whole DecoderTrack effect, the subscription
-			// with it, while `#active` kept pointing at the corpse: the relay saw the subscription
-			// cancelled, never saw another, and the tile stalled for good while audio kept playing.
+			// The codec gives up, which ends the track's decode loop and its subscription.
 			built[0].fail(new Error("DataError"));
 
 			// A replacement track, with its own subscription and its own codec, rather than a dead
-			// one left in place.
-			expect(await fx.decoders(2)).toBeGreaterThanOrEqual(2);
+			// one left in place. Within 2s: past RETRY, well short of the stall watchdog's
+			// BUFFERING + RECOVER, so only the codec error can have caused it.
+			expect(await fx.decoders(2, 2_000)).toBeGreaterThanOrEqual(2);
 
 			fx.served[0].encode(payload(16), Time.Micro(1_000_000), true);
 			await settle();
@@ -318,14 +616,40 @@ test("a picture frozen past the recovery window rebuilds the track", async () =>
 		await settle();
 		expect(built).toHaveLength(1);
 
-		// Nothing more arrives. The 500ms watchdog only ever labelled this a stall; now it is acted
-		// on, so the track is replaced rather than left frozen with the last picture.
+		// Nothing more arrives, so the track is replaced rather than left frozen.
 		expect(await fx.decoders(2)).toBeGreaterThanOrEqual(2);
 		expect(fx.decoder.out.stalled.peek()).toBe(true);
 
 		fx.served[0].encode(payload(16), Time.Micro(2_000_000), true);
 		await settle();
 		expect(built.at(-1)?.chunks).toContain("key");
+	} finally {
+		fx.close();
+		console.warn = warn;
+	}
+});
+
+test("a rebuilt track keeps the picture on screen until it paints its own", async () => {
+	const warn = console.warn;
+	console.warn = () => {};
+	const fx = fixture();
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		fx.served[0].encode(payload(16), Time.Micro(0), true);
+		await settle();
+		built[0].emit(0);
+		await settle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(0);
+
+		// Rebuilt for the frozen picture, the replacement has none of its own yet.
+		expect(await fx.decoders(2)).toBeGreaterThanOrEqual(2);
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(0);
+
+		fx.served[0].encode(payload(16), Time.Micro(2_000_000), true);
+		await settle();
+		built.at(-1)?.emit(2_000_000);
+		await settle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(2_000_000);
 	} finally {
 		fx.close();
 		console.warn = warn;
@@ -367,7 +691,7 @@ test("the arrival estimator survives the rendition leaving the catalog and comin
 	// the path and the publisher's claim about it are unchanged, so what was measured on it still
 	// holds. Building a fresh estimator there republishes the 80ms guess as though something had
 	// measured it, and Sync holds every track to the widest reading, so the audio ring is resized
-	// mid-playback and runs dry. Three of five watchers on the bench took an underrun from it.
+	// mid-playback and runs dry.
 	const warn = console.warn;
 	console.warn = () => {};
 	const fx = fixture();
@@ -381,7 +705,7 @@ test("the arrival estimator survives the rendition leaving the catalog and comin
 		try {
 			fx.served[0].encode(payload(16), Time.Micro(0), true);
 			fx.served[0].encode(payload(16), Time.Micro(20_000), false);
-			await new Promise((resolve) => real.setTimeout(resolve, 600));
+			await advance(600);
 			fx.served[0].encode(payload(16), Time.Micro(40_000), false);
 			await settle();
 
@@ -419,6 +743,7 @@ test("a replaced session re-subscribes to video", async () => {
 		in: {
 			broadcast: new Signal({
 				relativeBroadcast: (effect: Effect) => effect.get(handle),
+				out: { catalog: new Signal<Catalog.Root | undefined>(undefined) },
 			} as unknown as Broadcast),
 		},
 		out: {
@@ -476,6 +801,7 @@ test("a republished broadcast re-anchors the clock", async () => {
 		in: {
 			broadcast: new Signal({
 				relativeBroadcast: (effect: Effect) => effect.get(handle),
+				out: { catalog: new Signal<Catalog.Root | undefined>(undefined) },
 			} as unknown as Broadcast),
 		},
 		out: {
@@ -525,9 +851,8 @@ test("a republished broadcast re-anchors the clock", async () => {
 
 test("a rendition that left the catalog is not a stall", async () => {
 	// A publisher hiding its camera takes the rendition out of the catalog and the tile keeps the
-	// picture it already has. The buffering overlay reads `stalled`, so the watchdog labelling that
-	// gap put a spinner over a still frame for as long as the camera was away: 4.6s of it on the
-	// bench's `hide-mute` row, with the ring full and audio never interrupted.
+	// picture it already has. The buffering overlay reads `stalled`, so labelling that gap a stall
+	// spins over a still frame for as long as the camera is away.
 	const fx = fixture();
 	const rendition = fx.config.peek();
 	try {
@@ -541,15 +866,167 @@ test("a rendition that left the catalog is not a stall", async () => {
 
 		// The camera goes, and nothing arrives for several watchdog windows.
 		fx.config.set(undefined);
-		await new Promise((resolve) => real.setTimeout(resolve, 100));
+		await advance(2_500);
 		await settle();
 		expect(fx.decoder.out.stalled.peek()).toBe(false);
 
 		// It comes back, so a picture is due again and the watchdog arms with it.
 		fx.config.set(rendition);
-		await new Promise((resolve) => real.setTimeout(resolve, 60));
+		await advance(1_500);
 		await settle();
 		expect(fx.decoder.out.stalled.peek()).toBe(true);
+	} finally {
+		fx.close();
+	}
+});
+
+test("a pending rendition waits until its preview picture is due", async () => {
+	const fx = fixture();
+	const second = new Moq.Track.Producer("second").accept({});
+	fx.broadcast.insertTrack(second);
+	const encoded = new Container.Legacy.Producer(second, new Container.Legacy.Format("video"));
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		const audio = fx.sync.track("audio");
+		audio.clock.set({ timestamp: Time.Micro(1_000_000), reference: Time.Milli.now(), rate: 0 });
+		fx.served[0].encode(payload(16), Time.Micro(1_000_000), true);
+		await settle();
+		built[0].emit(1_000_000);
+		await settle();
+		expect(fx.decoder.out.timestamp.peek()).toBe(Time.Milli(1_000));
+
+		fx.rendition.set("second");
+		await settle();
+		expect(built).toHaveLength(2);
+		encoded.encode(payload(16), Time.Micro(1_150_000), true);
+		await settle();
+		built[1].emit(1_150_000);
+		await settle();
+		expect(fx.decoder.out.timestamp.peek()).toBe(Time.Milli(1_000));
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(1_000_000);
+
+		audio.clock.set({ timestamp: Time.Micro(1_150_000), reference: Time.Milli.now(), rate: 0 });
+		await settle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(1_150_000);
+	} finally {
+		fx.close();
+	}
+});
+
+test("a sparse rendition is not rebuilt at every healthy silence", async () => {
+	const fx = fixture();
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		for (let n = 0; n < 6; n++) {
+			const timestamp = Time.Micro(n * 6_000_000);
+			fx.served[0].encode(payload(16), timestamp, true);
+			await settle();
+			built.at(-1)?.emit(timestamp);
+			await settle();
+			await advance(6_000);
+		}
+		expect(await fx.subscriptions(2)).toBe(2);
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(30_000_000);
+	} finally {
+		fx.close();
+	}
+});
+
+test("a new rendition does not inherit a sparse rendition's recovery window", async () => {
+	const fx = fixture();
+	const second = new Moq.Track.Producer("second").accept({});
+	fx.broadcast.insertTrack(second);
+	const encoded = new Container.Legacy.Producer(second, new Container.Legacy.Format("video"));
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		for (let n = 0; n < 2; n++) {
+			const timestamp = Time.Micro(n * 6_000_000);
+			fx.served[0].encode(payload(16), timestamp, true);
+			await settle();
+			built.at(-1)?.emit(timestamp);
+			await settle();
+			await advance(6_000);
+		}
+		fx.rendition.set("second");
+		await settle();
+		encoded.encode(payload(16), Time.Micro(12_000_000), true);
+		await settle();
+		built.at(-1)?.emit(12_000_000);
+		await advance(100);
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(12_000_000);
+		const before = built.length;
+		await advance(6_000);
+		expect(built).toHaveLength(before + 1);
+	} finally {
+		fx.close();
+	}
+});
+
+for (const resumed of [1, 3]) {
+	test(`a recovered 30 fps source keeps its recovery window after ${resumed} frame(s) resume`, async () => {
+		const fx = fixture();
+		const paint = async (timestamp: number) => {
+			fx.sync.track("audio").clock.set({
+				timestamp: Time.Micro(timestamp),
+				reference: Time.Milli.now(),
+				rate: 0,
+			});
+			fx.served[0].encode(payload(16), Time.Micro(timestamp), true);
+			await settle();
+			built.at(-1)?.emit(timestamp);
+			await settle();
+		};
+		try {
+			expect(await fx.subscriptions(1)).toBe(1);
+			for (let i = 0; i < 3; i++) {
+				await paint(i * 33_333);
+				await advance(34);
+			}
+			await advance(30_000);
+			for (let i = 0; i < resumed; i++) {
+				await paint(30_100_000 + i * 33_333);
+				await advance(34);
+			}
+			expect(fx.decoder.out.frame.peek()?.timestamp).toBe(30_100_000 + (resumed - 1) * 33_333);
+			const before = built.length;
+			await advance(6_000);
+			expect(built).toHaveLength(before + 1);
+		} finally {
+			fx.close();
+		}
+	});
+}
+
+test("alternating sparse intervals stop rebuilding once both gaps repeat", async () => {
+	const fx = fixture();
+	let timestamp = 0;
+	const paint = async () => {
+		fx.sync.track("audio").clock.set({
+			timestamp: Time.Micro(timestamp),
+			reference: Time.Milli.now(),
+			rate: 0,
+		});
+		fx.served[0].encode(payload(16), Time.Micro(timestamp), true);
+		await settle();
+		built.at(-1)?.emit(timestamp);
+		await settle();
+	};
+	const cycle = async () => {
+		for (const interval of [2_000, 6_000]) {
+			await advance(interval);
+			timestamp += interval * 1_000;
+			await paint();
+		}
+	};
+	try {
+		expect(await fx.subscriptions(1)).toBe(1);
+		await paint();
+		await cycle();
+		await cycle();
+		const before = built.length;
+		for (let i = 0; i < 4; i++) await cycle();
+		expect(fx.decoder.out.frame.peek()?.timestamp).toBe(48_000_000);
+		expect(built).toHaveLength(before);
 	} finally {
 		fx.close();
 	}

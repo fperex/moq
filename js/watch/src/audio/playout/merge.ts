@@ -61,7 +61,9 @@ export class Merge {
 	): number {
 		if (concealed === 0 || returning === 0) {
 			for (let channel = 0; channel < out.length; channel++) {
-				out[channel].set(input[Math.min(channel, input.length - 1)].subarray(0, returning));
+				const src = input[Math.min(channel, input.length - 1)];
+				const dst = out[channel];
+				for (let frame = 0; frame < returning; frame++) dst[frame] = src[frame];
 			}
 			return 0;
 		}
@@ -75,7 +77,7 @@ export class Merge {
 			const fresh = input[Math.min(channel, input.length - 1)];
 			const dst = out[channel];
 
-			dst.set(old.subarray(0, best));
+			for (let frame = 0; frame < best; frame++) dst[frame] = old[frame];
 			for (let frame = 0; frame < overlap; frame++) {
 				const weight = fade(frame, overlap);
 				// Back to full scale across the crossfade, so the media is never held down once the
@@ -83,7 +85,7 @@ export class Merge {
 				const unmute = gain + (1 - gain) * (frame / overlap);
 				dst[best + frame] = old[best + frame] * weight + fresh[frame] * unmute * (1 - weight);
 			}
-			dst.set(fresh.subarray(overlap, returning), best + overlap);
+			for (let frame = overlap; frame < returning; frame++) dst[best + frame] = fresh[frame];
 		}
 
 		return best;
@@ -101,10 +103,10 @@ export class Merge {
 		const span = Math.min(this.#search + width, Math.floor(concealed / ratio));
 		if (width === 0 || span <= width) return 0;
 
-		const fresh = this.#new.subarray(0, width);
-		const old = this.#old.subarray(0, span);
-		decimate(input[0].subarray(0, Math.floor(width * ratio)), fresh);
-		decimate(expanded[0].subarray(0, Math.floor(span * ratio)), old);
+		const fresh = this.#new;
+		const old = this.#old;
+		decimate(input[0], fresh, 0, Math.floor(width * ratio), width);
+		decimate(expanded[0], old, 0, Math.floor(span * ratio), span);
 
 		let best = 0;
 		let strongest = Number.NEGATIVE_INFINITY;

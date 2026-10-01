@@ -5,7 +5,7 @@
  * The driver's own job is small: stand the page up, wait for it to actually be playing, let it run,
  * and then decide whether what it measured is allowed to count. That last part is the point. A row
  * that ran on the WebSocket fallback never went through the UDP shaper, and a row whose document was
- * not isolated the way the matrix asked for ran the other ring; both would otherwise pass quietly
+ * not isolated the way the matrix asked for ran a different context; both would otherwise pass quietly
  * against a budget written for something else, which is worse than failing.
  *
  *     bun driver.ts --url http://127.0.0.1:4499 --broadcast bbb.hang --page dist \
@@ -18,8 +18,8 @@ import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { Page } from "playwright";
-import { Failure, launch, open, saveTrace, serve } from "../../../interop/clients/js/harness.ts";
-import { type Ring, type Thread, threadVoid, type Void } from "./src/schema.ts";
+import { Failure, finishTraces, launch, open, serve } from "../../../interop/clients/js/harness.ts";
+import { type Backend, backendVoid, type Ring, type Thread, threadVoid, type Void } from "./src/schema.ts";
 
 const { values } = parseArgs({
 	options: {
@@ -63,13 +63,8 @@ const expectThread = values.offload === "false" ? "main" : "worker";
 const out = resolve(values.out);
 mkdirSync(out, { recursive: true });
 
-/**
- * The two prefixes the same build is served under.
- *
- * Cross-origin isolation is a property of the document, not of the bundle, so one build served twice
- * is all it takes to run both rings. `/plain` is the production path: most viewers are not isolated,
- * and the postMessage ring is what they get.
- */
+// Isolation permits shared memory. The default worker still uses the message ring;
+// an isolated page runs the shared ring only when --offload false keeps audio on the page.
 const server = serve({
 	root: resolve(values.page),
 	port: Number.parseInt(values.port, 10),
@@ -101,6 +96,7 @@ type Status = {
 	crossOriginIsolated: boolean;
 	transport?: string;
 	thread?: Thread;
+	backend?: Backend;
 	timestamp?: number;
 	stalled?: boolean;
 	underruns?: number;
@@ -129,7 +125,9 @@ const note = (assertion: string, detail: string) => {
 // session is a second one, and takes it back for good when the worker cannot play it. So it is checked
 // once the audio plays and again at the end. A row run with `--offload false` expects the main thread.
 const checkThread = (status: Status | undefined) => {
-	const found = threadVoid(status?.thread, "webtransport", expectThread);
+	const found =
+		threadVoid(status?.thread, "webtransport", expectThread) ??
+		backendVoid(status?.backend, expectThread === "main" && ring === "isolated" ? "shared" : "message");
 	if (found && !voids.some((v) => v.assertion === found.assertion && v.detail === found.detail)) {
 		note(found.assertion, found.detail);
 	}
@@ -142,7 +140,8 @@ const browser = await launch(["--autoplay-policy=no-user-gesture-required"]);
 let status = 0;
 let page: Page | undefined;
 try {
-	[page] = await open(browser, pageUrl, values.tag, true);
+	const context = await browser.newContext();
+	[page] = await open(context, pageUrl, values.tag, true);
 
 	// The catalog is what says the session is up; without it there is nothing to measure and the
 	// failure is the relay or the publisher, not the player.
@@ -215,10 +214,11 @@ try {
 } catch (err) {
 	const message = err instanceof Error ? err.message : String(err);
 	console.error(`FAIL ${values.tag}: ${message}`);
-	if (page) await saveTrace(page, join(out, `${values.tag}.trace.zip`));
 	note("driver", message);
 	status = 1;
 } finally {
+	// Grading happens after this process exits, so retain even a successfully closed page's trace.
+	await finishTraces(true);
 	await browser.close().catch(() => {});
 	server.stop();
 }

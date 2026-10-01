@@ -136,14 +136,14 @@ export function launch(args: string[] = []): Promise<Browser> {
 	return chromium.launch({ channel: "chromium", headless: true, args });
 }
 
-/** Contexts tracing this process, saved by {@link finishTraces} when the run fails. */
+/** Contexts tracing this process, retained until {@link finishTraces}. */
 const traces: Array<{ context: BrowserContext; name: string }> = [];
 
 /**
  * Start a Playwright trace on the page's context, before it navigates.
  *
  * A no-op outside a harness run: without `MOQ_TEST_RUN` there is no directory to write to, and a
- * trace only survives a failure anyway. See {@link finishTraces}.
+ * caller chooses whether to keep it with {@link finishTraces}.
  */
 export async function startTrace(page: Page, name: string): Promise<void> {
 	if (!process.env.MOQ_TEST_RUN) return;
@@ -151,13 +151,13 @@ export async function startTrace(page: Page, name: string): Promise<void> {
 	traces.push({ context: page.context(), name: `${name}-${randomUUID()}` });
 }
 
-/** Save a trace per started context into the run directory when `failed`, and discard it otherwise. */
-export async function finishTraces(failed: boolean): Promise<void> {
+/** Save a trace per started context into the run directory when `keep`, and discard it otherwise. */
+export async function finishTraces(keep: boolean): Promise<void> {
 	const run = process.env.MOQ_TEST_RUN;
 	for (const { context, name } of traces) {
 		try {
 			// `path` is what writes the trace; without it, stop only frees the buffers.
-			if (run && failed) await context.tracing.stop({ path: join(run, `${name}.trace.zip`) });
+			if (run && keep) await context.tracing.stop({ path: join(run, `${name}.trace.zip`) });
 			else await context.tracing.stop();
 		} catch {
 			// A trace is evidence, never the verdict: a broken context must not mask the failure.
@@ -169,21 +169,41 @@ export async function finishTraces(failed: boolean): Promise<void> {
 /** Open a page and start collecting its errors, echoing everything it logs.
  *
  * `trace` starts a Playwright trace before the navigation, so a failed run can save it with
- * {@link finishTraces}. The caller decides which pages are worth tracing: a page that streams for
- * the whole run holds its trace in memory, so it is not one.
+ * {@link finishTraces}. Pass a context to retain its trace after the page closes. The caller decides
+ * which pages are worth tracing: a page that streams for the whole run holds its trace in memory,
+ * so it is not one.
  */
-export async function open(
+export function open(
 	browser: Browser,
+	url: string,
+	label?: string,
+	trace?: boolean,
+	options?: BrowserContextOptions,
+): Promise<[Page, BrowserErrors]>;
+export function open(
+	context: BrowserContext,
+	url: string,
+	label?: string,
+	trace?: boolean,
+): Promise<[Page, BrowserErrors]>;
+export async function open(
+	owner: Browser | BrowserContext,
 	url: string,
 	label = "page",
 	trace = false,
 	options?: BrowserContextOptions,
 ): Promise<[Page, BrowserErrors]> {
-	const page = await browser.newPage(options);
+	if (!("newContext" in owner) && options !== undefined) {
+		throw new Error("page options belong to browser.newContext when opening a context-owned page");
+	}
+	const page = "newContext" in owner ? await owner.newPage(options) : await owner.newPage();
 	const errors: BrowserErrors = { page: [], console: [] };
 	page.on("console", (message) => {
-		console.error(`[${label}] ${message.text()}`);
-		if (message.type() === "error") errors.console.push(message.text());
+		const text = message.text();
+		const type = message.type();
+		void Promise.allSettled(message.args().map((argument) => argument.dispose()));
+		console.error(`[${label}] ${text}`);
+		if (type === "error") errors.console.push(text);
 	});
 	page.on("pageerror", (error) => {
 		console.error(`[${label} error] ${error.message}`);
@@ -192,23 +212,6 @@ export async function open(
 	if (trace) await startTrace(page, label);
 	await page.goto(url, { waitUntil: "load" });
 	return [page, errors];
-}
-
-/**
- * Write the trace of a page opened with `trace` to `file`, and say where it went.
- *
- * For a driver that names its own trace rather than leaving it to {@link finishTraces}. Only worth
- * calling on the way out of a failure: a trace is large, and a passing run's is noise. Never throws,
- * because it runs from a failure path and the failure is the thing worth reporting.
- */
-export async function saveTrace(page: Page, file: string): Promise<void> {
-	try {
-		await page.context().tracing.stop({ path: file });
-		console.error(`trace: ${file}`);
-		console.error(`view it with: bunx playwright show-trace ${file}`);
-	} catch (err) {
-		console.error(`trace: not saved (${err instanceof Error ? err.message : String(err)})`);
-	}
 }
 
 /** Throw everything the page has reported so far, if anything. */

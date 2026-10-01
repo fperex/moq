@@ -1,53 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, jest, spyOn } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Time } from "@moq/net";
+import { FakeWorker } from "../fake";
 import { LINGER, LIVENESS, Liveness, Pool } from "./pool";
-import { type FromWorker, type Report, type Support, support, TICK, type ToWorker } from "./protocol";
+import { AUDIO_DEADLINE, type FromWorker, type Report, type Support, support, TICK } from "./protocol";
 
 const FULL: Support = { audioDecoder: true, webTransport: true, webSocket: true };
 
-/** A Worker as the pool drives it, which says ready as soon as it is created unless told not to. */
-class FakeWorker {
-	static created: FakeWorker[] = [];
-	static support: Support | undefined = FULL;
-
-	onmessage: ((event: MessageEvent<FromWorker>) => void) | null = null;
-	onerror: ((event: ErrorEvent) => void) | null = null;
-	onmessageerror: (() => void) | null = null;
-	posted: ToWorker[] = [];
-	terminated = false;
-
-	constructor() {
-		FakeWorker.created.push(this);
-		// A task, as a real worker's first message is: never inside the tick that created it.
-		const support = FakeWorker.support;
-		if (support) setTimeout(() => this.say({ type: "ready", support }), 0);
-	}
-
-	postMessage(msg: ToWorker): void {
-		this.posted.push(msg);
-	}
-
-	terminate(): void {
-		this.terminated = true;
-	}
-
-	say(msg: FromWorker): void {
-		this.onmessage?.({ data: msg } as MessageEvent<FromWorker>);
-	}
-
-	fail(message: string): void {
-		this.onerror?.({ message, preventDefault() {} } as ErrorEvent);
-	}
-
-	/** What it was told, less the handshake. */
-	get told(): ToWorker[] {
-		return this.posted.filter((msg) => msg.type !== "hello");
-	}
-}
-
 function create(): Worker {
-	return new FakeWorker() as unknown as Worker;
+	return new FakeWorker().asWorker;
 }
 
 function report(id: number): Report {
@@ -116,7 +77,7 @@ describe("Pool", () => {
 		expect(FakeWorker.created.length).toBe(1);
 		expect(a.id).not.toBe(b.id);
 		const [worker] = FakeWorker.created;
-		expect(worker.posted).toEqual([{ type: "hello", transports: support() }]);
+		expect(worker.posted.map(({ msg }) => msg)).toEqual([{ type: "hello", transports: support() }]);
 
 		// A player's messages reach the one worker.
 		a.post({ type: "flush", id: a.id, epoch: 1 });
@@ -239,6 +200,63 @@ describe("Pool", () => {
 		expect(FakeWorker.created.length).toBe(1);
 	});
 
+	it("refuses and terminates a worker that is silent past the deadline", async () => {
+		// The worker, or the lazy chunk it comes in, never says ready: a stalled import, a script that hangs.
+		jest.useFakeTimers();
+		FakeWorker.support = undefined;
+		const shared = pool();
+		const a = shared.acquire();
+		await ticks();
+
+		// Its player waits out its own deadline, falls back to the main thread and lets go.
+		jest.advanceTimersByTime(AUDIO_DEADLINE);
+		await ticks();
+		a.release();
+		jest.advanceTimersByTime(LINGER);
+		await ticks();
+
+		const [worker] = FakeWorker.created;
+		expect(worker.terminated).toBe(true);
+	});
+
+	it("does not make the next player wait on another worker after one was silent past the deadline", async () => {
+		jest.useFakeTimers();
+		FakeWorker.support = undefined;
+		const shared = pool();
+		const a = shared.acquire();
+		await ticks();
+		jest.advanceTimersByTime(AUDIO_DEADLINE);
+		await ticks();
+		a.release();
+		jest.advanceTimersByTime(LINGER);
+		await ticks();
+
+		// Whatever kept the first one from starting keeps the next one too, as a refusal does.
+		const b = shared.acquire();
+		const settled = await Promise.race([b.ready, ticks().then(() => "still waiting")]);
+		expect(settled).not.toBe("still waiting");
+		expect(settled).toBeDefined();
+		expect(FakeWorker.created.length).toBe(1);
+	});
+
+	it("refuses a stalled import and terminates a worker created after its deadline", async () => {
+		jest.useFakeTimers();
+		FakeWorker.support = undefined;
+		const loading = Promise.withResolvers<Worker>();
+		const shared = new Pool(() => loading.promise);
+		pools.push(shared);
+		const a = shared.acquire();
+		jest.advanceTimersByTime(AUDIO_DEADLINE);
+		await ticks();
+		const reason = await a.ready;
+		expect(reason).toContain("worker");
+		expect(await shared.acquire().ready).toBe(reason);
+		loading.resolve(create());
+		await ticks();
+		expect(FakeWorker.created).toHaveLength(1);
+		expect(FakeWorker.created[0].terminated).toBe(true);
+	});
+
 	it("refuses a message from a player before its worker is ready", async () => {
 		FakeWorker.support = undefined;
 		const shared = pool();
@@ -303,7 +321,7 @@ describe("suspend", () => {
 
 		const a = shared.acquire();
 		await a.ready;
-		expect(FakeWorker.created[0].posted).toEqual([
+		expect(FakeWorker.created[0].posted.map(({ msg }) => msg)).toEqual([
 			{ type: "hello", transports: support() },
 			{ type: "suspend", suspended: true },
 		]);

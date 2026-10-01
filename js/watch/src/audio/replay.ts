@@ -15,7 +15,7 @@
  */
 import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
-import { type RingReader, type Snapshot, Stretcher } from "./playout";
+import { type Snapshot, Stretcher } from "./playout";
 import { speech } from "./playout/fixture";
 import { AudioRingBuffer } from "./ring-buffer";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
@@ -117,15 +117,14 @@ export function target(t: Arrival[], floorMs: number): number {
 	return Math.max(floorMs, jitter.value.peek());
 }
 
-/** The two rings behind one interface, since the harness drives them identically. */
+/** Either ring, with the calls the two transports spell differently behind one name. */
 export interface Ring {
-	readonly reader: RingReader;
+	/** The ring itself, for everything both transports spell alike. */
+	readonly buffer: AudioRingBuffer | SharedRingBuffer;
 	insert(timestamp: Time.Micro, data: Float32Array[]): void;
-	/** The publisher declared the timeline finished: play out what is held, then silence. */
-	end(): void;
 	setLatency(ms: number): void;
+	/** Every counter, copied: the postMessage ring refills one object, as its state message copies it. */
 	debug(): Snapshot;
-	readonly length: number;
 }
 
 /** Build a ring at `rate` already sized for a starting target of `latencyMs`. */
@@ -138,17 +137,13 @@ export type Build = (latencyMs: number) => Ring;
 export function shared(rate: number): Build {
 	return (latencyMs: number) => {
 		const ceiling = Math.ceil((rate * Container.Jitter.CEILING) / 1000);
-		const ring = new SharedRingBuffer(allocSharedRingBuffer(1, ceiling, rate));
-		ring.setLatency(Math.ceil((rate * latencyMs) / 1000));
+		const buffer = new SharedRingBuffer(allocSharedRingBuffer(1, ceiling, rate));
+		buffer.setLatency(Math.ceil((rate * latencyMs) / 1000));
 		return {
-			reader: ring,
-			insert: (timestamp, data) => ring.insert(timestamp, data),
-			end: () => ring.end(),
-			setLatency: (ms) => ring.setLatency(Math.ceil((rate * ms) / 1000)),
-			debug: () => ring.debug(),
-			get length() {
-				return ring.length;
-			},
+			buffer,
+			insert: (timestamp, data) => buffer.insert(timestamp, data),
+			setLatency: (ms) => buffer.setLatency(Math.ceil((rate * ms) / 1000)),
+			debug: () => buffer.debug(),
 		};
 	};
 }
@@ -156,18 +151,12 @@ export function shared(rate: number): Build {
 /** The postMessage ring, which is the path every page without cross-origin isolation takes. */
 export function post(rate: number): Build {
 	return (latencyMs: number) => {
-		const ring = new AudioRingBuffer({ rate, channels: 1, latency: latencyMs as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate, channels: 1, latency: latencyMs as Time.Milli });
 		return {
-			reader: ring,
-			insert: (timestamp, data) => ring.write(timestamp, data),
-			end: () => ring.end(),
-			setLatency: (ms) => ring.resize(ms as Time.Milli),
-			// A copy, which is what the main thread gets from the state message: the ring refills
-			// one object, and a read kept for comparison with the next would otherwise be the next.
-			debug: () => ({ ...ring.debug() }),
-			get length() {
-				return ring.length;
-			},
+			buffer,
+			insert: (timestamp, data) => buffer.write(timestamp, data),
+			setLatency: (ms) => buffer.resize(ms as Time.Milli),
+			debug: () => ({ ...buffer.debug() }),
 		};
 	};
 }
@@ -315,7 +304,7 @@ export function replay(build: Build, t: Arrival[], options: Options): Result {
 			if (t[next].endpoint) {
 				// A declared pause carries no media: nothing to insert, and nothing to measure a
 				// path against. The ring plays out what it holds and renders silence after it.
-				ring.end();
+				ring.buffer.end();
 				next++;
 				continue;
 			}
@@ -331,7 +320,7 @@ export function replay(build: Build, t: Arrival[], options: Options): Result {
 			next++;
 		}
 
-		const count = engine.render(ring.reader, output, outputFrame);
+		const count = engine.render(ring.buffer, output, outputFrame);
 		outputFrame += QUANTUM;
 		quanta++;
 		if (started && count < QUANTUM) short++;

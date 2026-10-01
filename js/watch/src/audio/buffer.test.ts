@@ -1,30 +1,16 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, jest } from "bun:test";
 import { Time } from "@moq/net";
 import { Effect } from "@moq/signals";
 import { type AudioBuffer, ClockSource, createAudioBuffer } from "./buffer";
+import { fakeClock } from "./fake";
 import type { Playhead } from "./playhead";
 import type { Message, State } from "./render";
-
-// `Time.Milli.now()` reads `performance.now()` on every call, so stubbing it puts the park timer
-// under the test's control.
-function fakeClock(start = 1000) {
-	const real = performance.now.bind(performance);
-	let at = start;
-	performance.now = () => at;
-	return {
-		advance(ms: number) {
-			at += ms;
-		},
-		restore() {
-			performance.now = real;
-		},
-	};
-}
 
 let clock: ReturnType<typeof fakeClock> | undefined;
 afterEach(() => {
 	clock?.restore();
 	clock = undefined;
+	jest.useRealTimers();
 });
 
 function playhead(media: number, rate: number): Playhead {
@@ -151,6 +137,9 @@ function state(worklet: FakeWorklet, reader: Playhead | undefined, stalled: bool
 		timeline: worklet.timeline,
 		playhead: reader,
 		debug: {
+			backend: "message",
+			jumps: 0,
+			jumped: 0,
 			buffered: 0,
 			target: 0,
 			chunk: 0,
@@ -214,8 +203,7 @@ describe("AudioBuffer, transport", () => {
 
 	it("names the page's transport once per document, not once per player", async () => {
 		// Cross-origin isolation is a property of the page, so every player on it lands on the same
-		// transport. A page of tiles used to say so once per tile, at warning level, about the path
-		// a page that is not isolated is supposed to run on.
+		// transport, and a page that is not isolated is supposed to run on the fallback.
 		const { reportTransport } = await fresh("once");
 		const first = captured(() => reportTransport(false));
 		const second = captured(() => reportTransport(false));
@@ -284,6 +272,41 @@ describe("AudioBuffer output clock", () => {
 			expect(buffer.clock.peek()).toEqual({
 				timestamp: Time.Micro(530_000),
 				reference: Time.Milli(1030),
+				rate: 1,
+			});
+		} finally {
+			buffer.close();
+		}
+	});
+});
+
+describe("AudioBuffer output clock, device starting", () => {
+	// Chromium 153 answered the first getOutputTimestamp() of a fresh AudioContext (a <moq-watch>
+	// reattached after 5 s) with { contextTime: 0.00535, performanceTime: 0 }: a context time with no
+	// device time yet. Mapping through it anchors the playhead to performance time ~0, so `Sync` put
+	// the playhead as far ahead as the page was old (about 50 s) until the next sample.
+	it("publishes no clock while the output timestamp has no performance time", () => {
+		clock = fakeClock(50_000);
+		const worklet = new FakeWorklet();
+		const output = { contextTime: 0.00535, performanceTime: 0 };
+		const buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+			context: { getOutputTimestamp: () => output },
+			channels: 1,
+			rate: 48000,
+			latency: 4800,
+			buffered: false,
+			conceal: true,
+			shared: false,
+		});
+		try {
+			worklet.deliver({ ...state(worklet, playhead(500, 1), false), contextTime: Time.Second(0.02) });
+			expect(buffer.clock.peek()).toBeUndefined();
+			output.contextTime = 0;
+			output.performanceTime = 50_000;
+			worklet.deliver({ ...state(worklet, playhead(500, 1), false), contextTime: Time.Second(0.02) });
+			expect(buffer.clock.peek()).toEqual({
+				timestamp: Time.Micro(500_000),
+				reference: Time.Milli(50_020),
 				rate: 1,
 			});
 		} finally {
@@ -391,5 +414,82 @@ describe("AudioBuffer, flushed", () => {
 
 		effect.close();
 		buffer.close();
+	});
+});
+
+describe("AudioBuffer output clock, shared ring", () => {
+	it("the shared ring's clock is anchored to when its samples leave the output device", async () => {
+		// The page polls at a fixed instant, 1000ms. The device is 40ms behind the render graph:
+		// what was rendered up to context time 1.04s is only now (1000ms) at 1.00s on the output.
+		jest.useFakeTimers();
+		clock = fakeClock(1000);
+		const worklet = new FakeWorklet();
+		const buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+			context: {
+				getOutputTimestamp: () => ({ contextTime: 1, performanceTime: 1000 }),
+				currentTime: 1.04,
+			} as unknown as AudioContext,
+			channels: 1,
+			rate: 48000,
+			latency: 4800,
+			buffered: false,
+			conceal: true,
+			shared: true,
+		});
+		try {
+			buffer.insert(3_000_000 as Time.Micro, [new Float32Array(4800)]);
+			jest.advanceTimersByTime(50);
+
+			const sampled = buffer.clock.peek();
+			expect(sampled).toBeDefined();
+			// The post ring maps its playhead through getOutputTimestamp; the shared ring must too.
+			// Stamped at the poll instead, video leads the sound by the device's output latency.
+			expect(sampled?.reference).toBe(Time.Milli(1040));
+		} finally {
+			buffer.close();
+		}
+	});
+});
+
+describe("AudioBuffer, partial output timestamp", () => {
+	it("a partial output timestamp neither throws nor strands backpressure", async () => {
+		const worklet = new FakeWorklet();
+		let output: Partial<AudioTimestamp> = { contextTime: 1, performanceTime: 1000 };
+		const buffer = createAudioBuffer(worklet as unknown as AudioWorkletNode, {
+			context: { getOutputTimestamp: () => output as AudioTimestamp },
+			channels: 1,
+			rate: 48000,
+			latency: 4800,
+			buffered: true,
+			conceal: true,
+			shared: false,
+		});
+		try {
+			// Playing, 500ms in. A frame at 1s is more than the 100ms floor ahead, so it is held.
+			worklet.deliver(state(worklet, playhead(500, 1), false));
+			let released = false;
+			const waiting = buffer.wait(1_000_000 as Time.Micro).then(() => {
+				released = true;
+			});
+			await Promise.resolve();
+			expect(released).toBe(false);
+
+			// A runtime hands back only half of the output timestamp, and the playhead reaches the frame.
+			output = { performanceTime: 1000 };
+			let thrown: unknown;
+			try {
+				worklet.deliver(state(worklet, playhead(950, 1), false));
+			} catch (err) {
+				thrown = err;
+			}
+			await Promise.resolve();
+			expect({ thrown: (thrown as Error | undefined)?.message, released }).toEqual({
+				thrown: undefined,
+				released: true,
+			});
+			await waiting;
+		} finally {
+			buffer.close();
+		}
 	});
 });

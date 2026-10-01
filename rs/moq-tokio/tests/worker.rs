@@ -5,6 +5,7 @@
 //! the group.
 #![cfg(all(target_os = "linux", feature = "noq"))]
 
+use std::collections::BTreeSet;
 use std::net::{SocketAddr, UdpSocket};
 
 use moq_tokio::worker::{self, Workers};
@@ -408,29 +409,24 @@ async fn generated_certificates_are_refused() {
 	);
 }
 
-/// How many UDP sockets this process holds on `port`, via procfs.
-///
-/// The group retains every reuseport socket until serving has stopped, so
-/// dropping a server handle must not change this count while the group is
-/// alive: without the retainer the kernel would close the socket and renumber
-/// every member after it. A backend may own more than one descriptor per
-/// member, so the invariant is the stable count rather than its exact value.
-#[cfg(target_os = "linux")]
-fn udp_sockets_on(port: u16) -> usize {
-	let want = format!(":{port:04X}");
-	let mut count = 0;
-	if let Ok(table) = std::fs::read_to_string("/proc/net/udp") {
-		for line in table.lines().skip(1) {
-			let mut fields = line.split_whitespace();
-			// sl, local_address, rem_address, ...: the second field is the bind.
-			if let Some(local) = fields.nth(1)
-				&& local.to_ascii_uppercase().ends_with(&want)
-			{
-				count += 1;
-			}
+/// Socket identities owned by this process, without opening another owner.
+fn socket_inodes() -> BTreeSet<u64> {
+	let mut sockets = BTreeSet::new();
+	for entry in std::fs::read_dir("/proc/self/fd").expect("read process descriptors") {
+		let path = entry.expect("read descriptor entry").path();
+		let target = match std::fs::read_link(&path) {
+			Ok(target) => target,
+			// An unrelated descriptor may close between listing and reading it.
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+			Err(error) => panic!("read descriptor {}: {error}", path.display()),
+		};
+		if let Some(inode) = target.as_os_str().as_encoded_bytes().strip_prefix(b"socket:[") {
+			let inode = inode.strip_suffix(b"]").expect("socket target closes with ]");
+			let inode = std::str::from_utf8(inode).expect("socket inode is ASCII");
+			sockets.insert(inode.parse().expect("socket inode is numeric"));
 		}
 	}
-	count
+	sockets
 }
 
 /// Dropping a server handle cannot take its socket out of the reuseport group.
@@ -442,16 +438,41 @@ fn udp_sockets_on(port: u16) -> usize {
 /// worker that never failed.
 #[tokio::test]
 async fn dropping_a_server_keeps_its_socket() {
+	// Isolate the descriptor snapshot from libtest's other concurrent tests.
+	const CHILD: &str = "MOQ_WORKER_SOCKET_RETENTION_CHILD";
+	if std::env::var_os(CHILD).is_none() {
+		let dir = tempfile::tempdir().expect("child receipt directory");
+		let receipt = dir.path().join("completed");
+		let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+			.args([
+				"--exact",
+				"dropping_a_server_keeps_its_socket",
+				"--test-threads=1",
+				"--nocapture",
+			])
+			.env(CHILD, &receipt)
+			.status()
+			.expect("run isolated socket-retention test");
+		assert!(status.success(), "isolated socket-retention test failed: {status}");
+		// Libtest also succeeds when a stale exact filter matches no tests.
+		assert_eq!(
+			std::fs::read(receipt).expect("isolated test completed"),
+			b"sockets released"
+		);
+		return;
+	}
+
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
 	let dir = tempfile::tempdir().expect("tempdir");
 	let (cert, key) = certificate(dir.path());
 	let port = free_udp_port();
 
+	let before = socket_inodes();
 	let workers = bind_workers(listen_config(&cert, &key, port), Default::default(), config(2)).expect("bind workers");
 	let mut group = workers.split();
-	let sockets = udp_sockets_on(port);
-	assert!(sockets >= 2, "every member holds at least one socket");
+	let sockets: BTreeSet<_> = socket_inodes().difference(&before).copied().collect();
+	assert_eq!(sockets.len(), 2, "every member owns a distinct socket");
 	assert_eq!(group.local_addr().port(), port);
 
 	let mut members = group.members();
@@ -462,7 +483,7 @@ async fn dropping_a_server_keeps_its_socket() {
 	drop(dropped);
 
 	assert_eq!(
-		udp_sockets_on(port),
+		socket_inodes().difference(&before).copied().collect::<BTreeSet<_>>(),
 		sockets,
 		"dropping a server must not lose its socket while the group lives"
 	);
@@ -473,10 +494,29 @@ async fn dropping_a_server_keeps_its_socket() {
 	let member = members.pop().expect("one member");
 	assert_eq!(member.index(), 0);
 	drop(member);
-	assert_eq!(udp_sockets_on(port), sockets, "the retainer outlives both handles");
+	assert_eq!(
+		socket_inodes().difference(&before).copied().collect::<BTreeSet<_>>(),
+		sockets,
+		"the retainer outlives both handles"
+	);
+	assert_eq!(
+		UdpSocket::bind(group.local_addr())
+			.expect_err("the retained sockets hold the port")
+			.kind(),
+		std::io::ErrorKind::AddrInUse
+	);
 
 	group.shutdown().await;
-	assert_eq!(udp_sockets_on(port), 0, "stopping the group releases every socket");
+	assert!(
+		socket_inodes().is_disjoint(&sockets),
+		"stopping the group releases every socket"
+	);
+	UdpSocket::bind(("127.0.0.1", port)).expect("stopping the group releases the port");
+	std::fs::write(
+		std::env::var_os(CHILD).expect("child receipt path"),
+		b"sockets released",
+	)
+	.expect("write child completion receipt");
 }
 
 /// Completing one serving member ends serving for the whole group.

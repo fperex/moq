@@ -21,6 +21,34 @@ Compare the current tree with another revision:
 nix develop --command just bench origin/main
 ```
 
+Measure native audio noise updates and the check for audio held beyond a hole:
+
+```bash
+nix develop --command cargo bench --locked -p moq-audio --bench playout
+```
+
+The cases sweep 1, 2, and 6 channels and 1, 10, 100, and 1,000 queued packets.
+The benchmark also rejects heap allocation during a warmed noise update.
+
+Measure resumed-track delivery through 1, 2, and 3 retained routes:
+
+```bash
+nix develop --command cargo bench --locked -p moq-net --bench resume
+```
+
+The cases sweep 1, 10, and 100 cached groups per route and concurrent subscribers.
+Route setup and subscription creation are excluded from the delivery measurement.
+The warm-route cases drain a finished cached segment before measuring its live
+successor.
+
+Measure live group delivery to 1, 8, 64, and 512 subscribers:
+
+```bash
+nix develop --command cargo bench --locked -p moq-net --bench track -- track_fanout_group
+```
+
+Both resumed-track and live group delivery benchmarks run in Nightly.
+
 Compare one multi-threaded Tokio runtime with the same number of independent
 Tokio/epoll and io\_uring workers:
 

@@ -1,6 +1,6 @@
 import { Time } from "@moq/net";
 import { Stretcher } from "./playout";
-import type { Message, State, Unreadable } from "./render";
+import type { Message, State, Stopped, Unreadable } from "./render";
 import { AudioRingBuffer } from "./ring-buffer";
 import { SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -29,6 +29,9 @@ class Render extends AudioWorkletProcessor {
 	#ports: MessagePort[] = [];
 	// Whether a message has already failed to deserialize, which is said once. See #unreadable.
 	#unread = false;
+	// Whether the node is done with, so `process` ends the processor. See `Close`.
+	#closed = false;
+	#played = false;
 
 	constructor() {
 		super();
@@ -65,6 +68,18 @@ class Render extends AudioWorkletProcessor {
 			} else if (msg.type === "stall") {
 				// Only meaningful in post mode; shared mode stalls via the control array.
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.stall();
+			} else if (msg.type === "close") {
+				this.#closed = true;
+				this.#backend = undefined;
+				this.#engine = undefined;
+				this.#state = undefined;
+				for (const port of this.#ports) {
+					port.onmessage = null;
+					port.onmessageerror = null;
+					// The node's own port stays open to say when `process` has stopped.
+					if (port !== this.port) port.close();
+				}
+				this.#ports.length = 0;
 			} else if (msg.type === "end") {
 				// Only meaningful in post mode; shared mode ends via the control array.
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.end();
@@ -103,6 +118,13 @@ class Render extends AudioWorkletProcessor {
 	}
 
 	process(_inputs: Float32Array[][], outputs: Float32Array[][], _parameters: Record<string, Float32Array>) {
+		if (this.#closed) {
+			// Nothing feeds the node, so returning false ends the processor in this quantum.
+			const stopped: Stopped = { type: "stopped" };
+			this.port.postMessage(stopped);
+			this.port.close();
+			return false;
+		}
 		const output = outputs[0];
 		const backend = this.#backend;
 		const engine = this.#engine;
@@ -153,7 +175,14 @@ class Render extends AudioWorkletProcessor {
 					this.#state.playhead = playhead;
 					this.#state.debug = debug;
 				}
-				for (const port of this.#ports) port.postMessage(this.#state);
+				for (const port of this.#ports) {
+					// The page only needs the first playback report when a worker owns the ring.
+					if (port === this.port && this.#ports.length > 1) {
+						if (this.#played || debug.fresh) continue;
+						this.#played = true;
+					}
+					port.postMessage(this.#state);
+				}
 			}
 		}
 

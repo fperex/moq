@@ -73,11 +73,11 @@ afterEach(() => {
 });
 
 test("fromTransport: a stream reset keeps the peer's code verbatim", () => {
-	const src = fake("stream", 0x34);
+	const src = fake("stream", 0x35);
 	const err = fromTransport(src);
 	expect(err).toBeInstanceOf(StreamError);
-	expect((err as StreamError).code).toBe(StreamCode.Old);
-	expect(err.message).toBe("remote error: 52");
+	expect((err as StreamError).code).toBe(StreamCode.Evicted);
+	expect(err.message).toBe("remote error: 53");
 	// The original error stays reachable for logging.
 	expect(err.cause).toBe(src);
 });
@@ -303,7 +303,7 @@ test("toTransport: works with no WebTransportError global", () => {
 // lagging reader or an unknown broadcast reads as a crash on the sender's side.
 test("toStreamCode: a local condition maps to the code the peer can act on", () => {
 	expect(toStreamCode(new Lagged())).toBe(StreamCode.TooFarBehind);
-	expect(toStreamCode(new Expired())).toBe(StreamCode.DeliveryTimeout);
+	expect(toStreamCode(new Expired())).toBe(StreamCode.Old);
 	expect(toStreamCode(new FrameTooLarge())).toBe(StreamCode.FrameTooLarge);
 	expect(toStreamCode(new GroupTooLarge())).toBe(StreamCode.GroupTooLarge);
 	expect(toStreamCode(new NotFound("broadcast x"))).toBe(StreamCode.NotFound);
@@ -381,9 +381,9 @@ test("toStreamCode and fromTransport agree on what a code means", () => {
 	expect(new FrameTooLarge()).toBeInstanceOf(StreamError);
 	expect(fromTransport(toTransport(StreamCode.GroupTooLarge, "overflow"))).toBeInstanceOf(GroupTooLarge);
 	expect(new GroupTooLarge()).toBeInstanceOf(StreamError);
-	expect(fromTransport(toTransport(StreamCode.DeliveryTimeout, "too late"))).toBeInstanceOf(Expired);
+	expect(fromTransport(toTransport(StreamCode.Old, "superseded"))).toBeInstanceOf(Expired);
 	expect(new Expired()).toBeInstanceOf(StreamError);
-	expect(new Expired().code).toBe(StreamCode.DeliveryTimeout);
+	expect(new Expired().code).toBe(StreamCode.Old);
 
 	// The values the four codes were sent from before they were assigned stay reserved:
 	// a peer still emitting one is not read as anything.
@@ -406,4 +406,8 @@ test("toStreamCode: lite-only codes do not reach an IETF peer", () => {
 	]) {
 		expect(toStreamCode(new StreamError(code), { version: Version.DRAFT_20 })).toBe(StreamCode.Internal);
 	}
+});
+
+test("delivery timeout does not claim the subscription age verdict", () => {
+	expect(fromTransport(toTransport(StreamCode.DeliveryTimeout, "too late"))).not.toBeInstanceOf(Expired);
 });

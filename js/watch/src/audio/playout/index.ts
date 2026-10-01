@@ -124,6 +124,8 @@ export interface Counters {
  * the worklet's state message on the postMessage one.
  */
 export interface Snapshot extends Counters {
+	/** The ring implementation that produced this snapshot. */
+	backend: "shared" | "message";
 	/** Media samples the ring holds. */
 	buffered: number;
 	/** The playout target, in samples. */
@@ -136,12 +138,16 @@ export interface Snapshot extends Counters {
 	stalled: boolean;
 	/** Times the reader ran dry mid-playback. */
 	underruns: number;
-	/** Times the reader skipped ahead because the ring sat past the band. */
+	/** Explicit skip operations, excluding writer capacity bounds. */
 	skips: number;
-	/** Samples those skips threw away. */
+	/** Media samples those skip operations requested. */
 	skipped: number;
-	/** Samples the writer dropped: too old for the playhead, or past the ring's capacity. */
+	/** Writer discards from late input or capacity bounds. */
 	discarded: number;
+	/** Forward discontinuities observed when the reader commits media after playback began. */
+	jumps: number;
+	/** Media samples those observed discontinuities passed over. */
+	jumped: number;
 	/**
 	 * Samples the writer dropped off the first fill on a timeline, before anything had been played.
 	 *

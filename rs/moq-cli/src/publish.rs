@@ -342,47 +342,7 @@ impl Publish {
 	/// Drive the source until stdin EOF (or the capture devices stop).
 	pub async fn run(self) -> anyhow::Result<()> {
 		match self.source {
-			Source::Stream(mut decoder) => {
-				let mut stdin = tokio::io::stdin();
-				let mut buffer = bytes::BytesMut::new();
-
-				// Damage reported so far, so only the change is logged. A live feed is
-				// diagnosed by the rate at which these climb, and stdin may never end, so
-				// they have to surface as they accumulate rather than at exit.
-				let mut reported = decoder.stats();
-
-				// Run the read/decode loop so an error surfaces here rather than
-				// dropping the decoder (and its tracks) with a bare Error::Dropped.
-				let result: anyhow::Result<()> = async {
-					loop {
-						buffer.clear();
-						let n = tokio::io::AsyncReadExt::read_buf(&mut stdin, &mut buffer).await?;
-						if n == 0 {
-							return Ok(()); // EOF
-						}
-						decoder.decode_chunk(&buffer)?;
-
-						let latest = decoder.stats();
-						if latest != reported {
-							log_stats(latest.as_ref(), reported.as_ref());
-							reported = latest;
-						}
-					}
-				}
-				.await;
-
-				// Flush on a clean EOF; on any error (read, decode, or the flush
-				// itself) abort with the real cause so subscribers see it instead of
-				// a bare Error::Dropped.
-				let outcome = result.and_then(|()| decoder.finish());
-				// The drain at end of input can publish a frame nothing vouched for, so the
-				// final snapshot is only complete after `finish`.
-				log_stats(decoder.stats().as_ref(), reported.as_ref());
-				if let Err(err) = &outcome {
-					decoder.abort(moq_net::Error::Transport(err.to_string()));
-				}
-				outcome
-			}
+			Source::Stream(decoder) => decode(decoder, tokio::io::stdin()).await,
 			#[cfg(feature = "capture")]
 			Source::Capture { catalog, video, audio } => {
 				// Each enabled medium publishes its own track onto the shared
@@ -430,6 +390,55 @@ impl Publish {
 			}
 		}
 	}
+}
+
+/// The most one read of the input takes: the default Linux pipe capacity.
+///
+/// Each stdin read is a round trip through tokio's blocking pool, so a read has to take whatever the
+/// pipe holds. At the 64 bytes an empty buffer offers, a loaded host drains a keyframe slower than
+/// it arrives, and the audio muxed behind it reaches subscribers late.
+const READ_SIZE: usize = 64 * 1024;
+
+/// Decode `input` into the broadcast until EOF.
+async fn decode(mut decoder: PublishDecoder, mut input: impl tokio::io::AsyncRead + Unpin) -> anyhow::Result<()> {
+	let mut buffer = bytes::BytesMut::with_capacity(READ_SIZE);
+
+	// Damage reported so far, so only the change is logged. A live feed is
+	// diagnosed by the rate at which these climb, and stdin may never end, so
+	// they have to surface as they accumulate rather than at exit.
+	let mut reported = decoder.stats();
+
+	// Run the read/decode loop so an error surfaces here rather than
+	// dropping the decoder (and its tracks) with a bare Error::Dropped.
+	let result: anyhow::Result<()> = async {
+		loop {
+			buffer.clear();
+			let n = tokio::io::AsyncReadExt::read_buf(&mut input, &mut buffer).await?;
+			if n == 0 {
+				return Ok(()); // EOF
+			}
+			decoder.decode_chunk(&buffer)?;
+
+			let latest = decoder.stats();
+			if latest != reported {
+				log_stats(latest.as_ref(), reported.as_ref());
+				reported = latest;
+			}
+		}
+	}
+	.await;
+
+	// Flush on a clean EOF; on any error (read, decode, or the flush
+	// itself) abort with the real cause so subscribers see it instead of
+	// a bare Error::Dropped.
+	let outcome = result.and_then(|()| decoder.finish());
+	// The drain at end of input can publish a frame nothing vouched for, so the
+	// final snapshot is only complete after `finish`.
+	log_stats(decoder.stats().as_ref(), reported.as_ref());
+	if let Err(err) = &outcome {
+		decoder.abort(moq_net::Error::Transport(err.to_string()));
+	}
+	outcome
 }
 
 #[cfg(feature = "capture")]
@@ -755,6 +764,49 @@ mod tests {
 			PES_PAYLOAD,
 			"verbatim PES payload round-trips byte-for-byte"
 		);
+	}
+
+	/// A pipe already holding all of `data`, counting the reads that drain it.
+	struct Pipe {
+		data: bytes::Bytes,
+		reads: usize,
+	}
+
+	impl tokio::io::AsyncRead for Pipe {
+		fn poll_read(
+			mut self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+			buf: &mut tokio::io::ReadBuf<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			let n = self.data.len().min(buf.remaining());
+			let chunk = self.data.split_to(n);
+			buf.put_slice(&chunk);
+			self.reads += 1;
+			std::task::Poll::Ready(Ok(()))
+		}
+	}
+
+	/// Every stdin read is a round trip through tokio's blocking pool, so a burst the pipe already
+	/// holds has to drain in pipe-sized reads, not a few bytes at a time.
+	#[tokio::test]
+	async fn stdin_drains_in_pipe_sized_reads() {
+		const INPUT: &[u8] = include_bytes!("../../moq-mux/src/container/ts/test_data/bbb_cbr.ts");
+
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let publish = Publish::new(broadcast, &PublishFormat::Ts, Default::default()).unwrap();
+		#[allow(irrefutable_let_patterns)]
+		let Source::Stream(decoder) = publish.source else {
+			panic!("expected a stream source");
+		};
+
+		let mut pipe = Pipe {
+			data: bytes::Bytes::from_static(INPUT),
+			reads: 0,
+		};
+		decode(decoder, &mut pipe).await.unwrap();
+
+		// Full reads of a default Linux pipe, then the one that finds EOF.
+		assert_eq!(pipe.reads, INPUT.len().div_ceil(64 * 1024) + 1);
 	}
 
 	/// Read the first frame of a verbatim track back as raw bytes.

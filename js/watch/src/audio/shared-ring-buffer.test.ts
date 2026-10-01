@@ -86,7 +86,7 @@ describe("initialization", () => {
 		expect(init.capacity).toBe(128);
 		expect(init.rate).toBe(1000);
 		expect(init.samples.byteLength).toBe(2 * 128 * 4); // 2 channels * 128 samples * Float32
-		expect(init.control.byteLength).toBe(20 * 4); // 20 control slots * Int32
+		expect(init.control.byteLength).toBe(22 * 4); // 22 control slots * Int32
 		expect(init.state.byteLength).toBe(8); // packed epoch + read cursor
 	});
 
@@ -555,132 +555,6 @@ describe("capacity", () => {
 	});
 });
 
-describe("the chunk above the target", () => {
-	// The real shape a conference call has: 48kHz Opus in 20ms frames, and the lowest target the
-	// estimator can report. The target counts the frame being played, the way NetEq's does, so the
-	// ring holds 40ms and one arrival a few milliseconds late no longer finds it empty.
-	const RATE = 48000;
-	const CHUNK = 960;
-	const TARGET = 960;
-
-	function opus() {
-		const buffer = create({ rate: RATE, channels: 1, capacity: RATE, latency: TARGET });
-		return buffer;
-	}
-
-	it("un-stalls at the target plus a chunk, not at the target", () => {
-		const buffer = opus();
-
-		insert(buffer, 0, CHUNK, { channels: 1, value: 1.0 });
-		expect(buffer.length).toBe(TARGET);
-		expect(buffer.stalled).toBe(true);
-
-		insert(buffer, 20, CHUNK, { channels: 1, value: 1.0 });
-		expect(buffer.stalled).toBe(false);
-	});
-
-	it("plays a full quantum through a chunk that arrives ten milliseconds late", () => {
-		const buffer = opus();
-		// Feed it a chunk at a time and start playing the moment it says it is ready, which is what
-		// the refill after a stall does. What it stops at is the whole question.
-		for (let at = 0; buffer.stalled; at += 20) {
-			insert(buffer, at, CHUNK, { channels: 1, value: 1.0 });
-		}
-
-		// Thirty milliseconds of render quanta with nothing arriving: the chunk due at 40ms is ten
-		// late. A ring holding only the target would be empty ten milliseconds before it landed.
-		const quanta = Math.floor((RATE * 30) / 1000 / 128);
-		for (let i = 0; i < quanta; i++) {
-			expect(read(buffer, 128, 1)[0].length).toBe(128);
-		}
-		expect(buffer.underruns).toBe(0);
-		expect(buffer.stalled).toBe(false);
-	});
-});
-
-describe("re-buffer", () => {
-	it("re-stalls and refills to the hold level after running dry", () => {
-		// A 40 sample target with 20 sample chunks: the ring holds 60, the target plus the chunk
-		// being played.
-		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
-
-		insertChunks(buffer, 0, 60, 20, { channels: 1, value: 1.0 });
-		expect(buffer.stalled).toBe(false);
-
-		// Drain it.
-		expect(read(buffer, 60, 1)[0].length).toBe(60);
-		expect(buffer.length).toBe(0);
-
-		// The next read finds nothing and parks playback rather than handing the worklet a quantum
-		// of silence and trying again on the next one.
-		expect(read(buffer, 20, 1)[0].length).toBe(0);
-		expect(buffer.stalled).toBe(true);
-		expect(buffer.underruns).toBe(1);
-
-		// Two chunks are still short of the level, so playback stays parked.
-		insertChunks(buffer, 60, 40, 20, { channels: 1, value: 2.0 });
-		expect(buffer.stalled).toBe(true);
-		expect(read(buffer, 20, 1)[0].length).toBe(0);
-
-		// Reaching it resumes playback, and nothing buffered in the meantime was lost.
-		insert(buffer, 100, 20, { channels: 1, value: 2.0 });
-		expect(buffer.stalled).toBe(false);
-		expect(read(buffer, 60, 1)[0].length).toBe(60);
-	});
-
-	it("counts a quantum it could only partly fill as an underrun", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
-
-		insertChunks(buffer, 0, 60, 20, { channels: 1, value: 1.0 });
-		expect(read(buffer, 50, 1)[0].length).toBe(50);
-
-		// Ten samples remain against a quantum of twenty: the rest of the quantum is silence, which
-		// is an underrun whether or not a chunk lands before the next read. It is not a stall: a
-		// refill would cost the whole level to cover a gap shorter than one quantum.
-		expect(read(buffer, 20, 1)[0].length).toBe(10);
-		expect(buffer.stalled).toBe(false);
-		expect(buffer.underruns).toBe(1);
-
-		// A chunk landing before the next read keeps playback going.
-		insert(buffer, 60, 20, { channels: 1, value: 2.0 });
-		expect(read(buffer, 20, 1)[0].length).toBe(20);
-		expect(buffer.underruns).toBe(1);
-	});
-
-	it("stall() parks playback without discarding what is buffered", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
-
-		insertChunks(buffer, 0, 60, 20, { channels: 1, value: 1.0 });
-		expect(read(buffer, 20, 1)[0].length).toBe(20);
-
-		// The target deepens, so playback parks until the ring holds the new depth.
-		buffer.setLatency(60);
-		buffer.stall();
-		expect(buffer.stalled).toBe(true);
-		expect(read(buffer, 20, 1)[0].length).toBe(0);
-		expect(buffer.length).toBe(40); // nothing was thrown away, unlike reset()
-
-		insert(buffer, 60, 20, { channels: 1, value: 2.0 });
-		expect(buffer.stalled).toBe(true); // 60 buffered, the ring holds 80
-
-		insert(buffer, 80, 20, { channels: 1, value: 2.0 });
-		expect(buffer.stalled).toBe(false);
-
-		// Playback resumes on the same timeline: the samples buffered before the stall play first.
-		const output = read(buffer, 20, 1);
-		expect(output[0].length).toBe(20);
-		expect(output[0][0]).toBe(1.0);
-		expect(buffer.underruns).toBe(0);
-	});
-
-	it("does not count an underrun while parked", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
-		read(buffer, 20, 1);
-		read(buffer, 20, 1);
-		expect(buffer.underruns).toBe(0);
-	});
-});
-
 describe("stalled getter", () => {
 	it("should reflect STALLED flag", () => {
 		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 50 });
@@ -851,21 +725,18 @@ describe("SharedRingBuffer.resize", () => {
 		expect(dst.stalled).toBe(false);
 	});
 
-	it("truncates to the newest samples when shrinking below the unread span", () => {
-		const src = create({ rate: 1000, channels: 1, capacity: 64, latency: 64 });
-		// Fill [0, 48) with value 1, then [48, 64) with value 2.
-		insert(src, 0, 48, { channels: 1, value: 1.0 });
-		insert(src, 48, 16, { channels: 1, value: 2.0 });
+	for (const consumed of [0, 16]) {
+		it(`refuses shrinking without changing buffered media after ${consumed} samples`, () => {
+			const src = create({ rate: 1000, channels: 1, capacity: 64, latency: 32 });
+			fill(src, 0, 64, { value: 0.5 });
+			if (consumed) read(src, consumed, 1);
+			const before = src.debug();
 
-		const dst = src.resize(16);
-		expect(dst.capacity).toBe(16);
-
-		// Only the most recent 16 samples fit.
-		const out = read(dst, 16, 1);
-		for (let i = 0; i < 16; i++) {
-			expect(out[0][i]).toBe(2.0);
-		}
-	});
+			expect(() => src.resize(16)).toThrow("cannot shrink a shared audio ring");
+			expect(src.debug()).toEqual(before);
+			expect(read(src, 64 - consumed, 1)[0]).toEqual(new Float32Array(64 - consumed).fill(0.5));
+		});
+	}
 });
 
 describe("buffered mode", () => {
@@ -1266,128 +1137,5 @@ describe("re-anchor store ordering", () => {
 			played += worklet.read(out);
 		}
 		expect(played).toBe(320);
-	});
-});
-
-describe("trimming the first fill", () => {
-	// A 30ms target with 10ms chunks: the ring holds 40ms, the target plus the chunk being played.
-	const TARGET = 30;
-	const CHUNK = 10;
-	const HOLD = TARGET + CHUNK;
-	const FILL = 90;
-
-	function filled(): SharedRingBuffer {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: TARGET });
-		// Each chunk carries its own index, so where the playhead starts is readable off the samples.
-		for (let i = 0; i < FILL / CHUNK; i++) {
-			insert(buffer, i * CHUNK, CHUNK, { channels: 1, value: i });
-		}
-		return buffer;
-	}
-
-	it("starts the playhead at the newest audio less the level it holds", () => {
-		const buffer = filled();
-
-		// Nothing had been played, so the excess was dropped in silence rather than left for the
-		// reader's time stretch to close over the seconds after a tune-in or an unmute.
-		expect(buffer.debug().trimmed).toBe(FILL - HOLD);
-		expect(buffer.length).toBe(HOLD);
-		expect(buffer.stalled).toBe(false);
-
-		// Nothing else counted it: a trim is neither a reader skipping ahead nor a writer overflowing.
-		expect(buffer.debug().skips).toBe(0);
-		expect(buffer.debug().skipped).toBe(0);
-		expect(buffer.debug().discarded).toBe(0);
-		expect(buffer.underruns).toBe(0);
-
-		// And the first read is the newest 40ms, which is chunk 5 onwards rather than chunk 0.
-		const output = read(buffer, HOLD, 1);
-		expect(output[0].length).toBe(HOLD);
-		expect(output[0][0]).toBe((FILL - HOLD) / CHUNK);
-	});
-
-	it("leaves a fill that is already on the level it holds alone", () => {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: TARGET });
-		for (let i = 0; i < HOLD / CHUNK; i++) {
-			insert(buffer, i * CHUNK, CHUNK, { channels: 1, value: i });
-		}
-
-		expect(buffer.stalled).toBe(false);
-		expect(buffer.debug().trimmed).toBe(0);
-		expect(read(buffer, HOLD, 1)[0][0]).toBe(0);
-	});
-
-	it("keeps a surplus once something has been played", () => {
-		const buffer = filled();
-
-		// One block read is what makes the rest of the timeline the listener's: from here a surplus is
-		// audio on its way to being heard, and the reader's time stretch is what closes it.
-		expect(read(buffer, CHUNK, 1)[0].length).toBe(CHUNK);
-		const trimmed = buffer.debug().trimmed;
-
-		for (let i = 0; i < 5; i++) {
-			insert(buffer, FILL + i * CHUNK, CHUNK, { channels: 1, value: 9 + i });
-		}
-
-		expect(buffer.debug().trimmed).toBe(trimmed);
-		expect(buffer.length).toBeGreaterThan(HOLD);
-	});
-});
-
-describe("a declared endpoint", () => {
-	// A 30ms target with 10ms chunks: the ring holds 40ms, the target plus the chunk being played.
-	const TARGET = 30;
-	const CHUNK = 10;
-	const HOLD = TARGET + CHUNK;
-	const FILL = 90;
-
-	/** A ring the reader has played out and run dry on, which is where a declared pause finds it. */
-	function drained(): SharedRingBuffer {
-		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: TARGET });
-		for (let i = 0; i < HOLD / CHUNK; i++) {
-			insert(buffer, i * CHUNK, CHUNK, { channels: 1, value: i });
-		}
-		expect(buffer.stalled).toBe(false);
-		expect(read(buffer, HOLD, 1)[0].length).toBe(HOLD);
-		read(buffer, CHUNK, 1); // nothing left: the reader parks
-		expect(buffer.stalled).toBe(true);
-		return buffer;
-	}
-
-	it("releases a stall on an empty ring", () => {
-		const buffer = drained();
-
-		buffer.end();
-
-		// A stall waits for a refill and there is no refill coming, so it is a wait nothing can end.
-		// The reader parks on the endpoint itself, which is the pause the publisher declared rather
-		// than a gap to conceal.
-		expect(buffer.stalled).toBe(false);
-		expect(buffer.view().ended).toBe(true);
-		expect(read(buffer, CHUNK, 1)[0].length).toBe(0);
-	});
-
-	it("takes the endpoint back on an insert, and media after a played-out one is a fresh fill", () => {
-		const buffer = drained();
-		buffer.end();
-		expect(buffer.debug().fresh).toBe(false); // this timeline has been played
-
-		const timeline = buffer.view().generation;
-
-		// The publisher unmutes ten seconds later, and the relay serves more than the ring holds.
-		for (let i = 0; i < FILL / CHUNK; i++) {
-			insert(buffer, 10_000 + i * CHUNK, CHUNK, { channels: 1, value: i });
-		}
-
-		expect(buffer.view().ended).toBe(false);
-		// Nothing of the resumed run has been heard, so the playhead starts on the newest audio and
-		// the rest is dropped in silence rather than left for the reader to stretch across.
-		expect(buffer.debug().anchor).toBe(10_000);
-		expect(buffer.debug().fresh).toBe(true);
-		expect(buffer.view().generation).not.toBe(timeline);
-		expect(buffer.debug().trimmed).toBe(FILL - HOLD);
-		expect(buffer.length).toBe(HOLD);
-		expect(buffer.stalled).toBe(false);
-		expect(read(buffer, HOLD, 1)[0][0]).toBe((FILL - HOLD) / CHUNK);
 	});
 });

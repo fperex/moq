@@ -9,17 +9,17 @@
  *   conflating the two makes a player that re-buffers cleanly look like one that glitches. The
  *   `underruns` counter is reported next to the episodes rather than instead of them, because one
  *   long gap and forty scattered ones grade the same by quanta and sound nothing alike.
- * - A **skip-ahead** is a sample in which the playhead advanced by more than the wall time since the
- *   last sample, plus a tolerance. That is audio that was buffered and then discarded.
+ * - A **skip-ahead** is a jump the ring counted. Message delivery delay changes a sampled
+ *   playhead's apparent speed, so wall time cannot identify playback skips.
  * - **converge_s** is the first moment after which the resolved target stayed within one bucket of
  *   its final value for the rest of the run. A target that settles and then moves again has not
  *   converged, so it is measured backwards from the end rather than forwards from the start.
+ * - **silence** is graded raw, and each quiet window is also placed in the audio the page decoded,
+ *   rebuilt here from the file the publisher loops (`--media`) and its audio options (`--encode=`)
+ *   rather than in the page, so the player does no extra work. The grader excuses a share over its
+ *   ceiling only when every quiet window lands on quiet source; see `src/silence.ts`.
  *
- *     bun analyze.ts --run <run dir> --row <tag> [--warmup 5]
- *
- * Adapted from `debug-findings/analysis/analyze.mjs` on the reporter's fork (`fperex/moq`, branch
- * `debug/rt-audio`), whose per-preset markdown table and per-minute normalisation this keeps. The
- * event stream it read came from patched-in probes; this reads the public samples instead.
+ *     bun analyze.ts --run <run dir> --row <tag> [--warmup 5] [--media <file> --encode=<audio options>]
  *
  * @module
  */
@@ -52,17 +52,22 @@ import {
 	stats,
 	type Void,
 } from "./src/schema.ts";
+import { locate, prove, type Reference } from "./src/silence.ts";
 
 const { values } = parseArgs({
 	options: {
 		run: { type: "string" },
 		row: { type: "string" },
 		warmup: { type: "string", default: "5" },
+		media: { type: "string" },
+		encode: { type: "string" },
 	},
 });
 
 if (!values.run || !values.row) {
-	console.error("usage: analyze.ts --run <run dir> --row <tag> [--warmup 5]");
+	console.error(
+		"usage: analyze.ts --run <run dir> --row <tag> [--warmup 5] [--media <file> --encode=<audio options>]",
+	);
 	process.exit(2);
 }
 
@@ -169,30 +174,11 @@ if (window.length === 0) {
 
 // ── playhead ────────────────────────────────────────────────────────────────
 //
-// The playhead a page can read is quantized: it moves when the ring reports a new position, not
-// continuously, and on the postMessage ring those reports arrive on their own cadence. Measured on a
-// clean local path, consecutive 250 ms samples show the playhead advancing anywhere from 240 to 296
-// ms with no net drift. Every derivation below has to survive that, because a rule that treats a
-// single sample's excess as a skip reports forty of them a minute on a run with none.
+// Playhead reports are asynchronous. Only explicit ring counters identify discrete skips;
+// delayed reports and time stretching can both change the apparent wall/media lag.
 
 /** A sample's playhead advanced by less than this counts as not having advanced at all. */
 const PLATEAU_MS = 1;
-/**
- * A net playhead advance beyond wall time larger than this is a skip.
- *
- * Larger than the observed quantization band, and larger than one estimator bucket plus a render
- * quantum, which is the least a re-anchor can discard and still have discarded anything.
- */
-const SKIP_MS = 40;
-/** Samples either side of a candidate that are reduced to a median before it is judged. */
-const SKIP_WINDOW = 4;
-
-const median = (values: number[]): number | undefined => {
-	if (values.length === 0) return undefined;
-	const sorted = [...values].sort((a, b) => a - b);
-	return sorted[Math.floor(sorted.length / 2)];
-};
-
 let stalledSamples = 0;
 for (const s of window) if (s.stalled) stalledSamples++;
 
@@ -212,9 +198,7 @@ function slope(xs: number[], ys: number[]): number | null {
 }
 
 // The lag between wall time and the playhead drifts when the media timeline does not advance at wall
-// rate, which is a property of the source or the publisher rather than of the player: a steady drift
-// is not the receiver discarding anything. Left in, it reads as a skip every few seconds, so it is
-// fitted and removed first, and reported on its own as `media_drift_ms_per_s`.
+// rate. Report the fitted drift separately from the ring's explicit playback counters.
 const rawLags = window.flatMap((s) =>
 	typeof s.timestamp === "number" && !s.stalled ? [{ at: s.at, lag: s.at - s.timestamp }] : [],
 );
@@ -222,32 +206,6 @@ const mediaDrift = slope(
 	rawLags.map((l) => l.at),
 	rawLags.map((l) => l.lag),
 );
-
-// A skip-ahead is a step in that de-trended lag, not a single large advance. Quantization makes the
-// lag oscillate inside a band; discarding buffered audio moves the band. So each candidate is judged
-// on the median lag either side of it, which neither the oscillation nor the drift can fake.
-const detrend = (at: number, lag: number) => lag - ((mediaDrift ?? 0) / 1000) * (at - (rawLags[0]?.at ?? 0));
-const lags = window.map((s) =>
-	typeof s.timestamp === "number"
-		? { at: s.at, lag: detrend(s.at, s.at - s.timestamp), stalled: s.stalled }
-		: undefined,
-);
-let skipAheads = 0;
-let skippedMs = 0;
-for (let i = SKIP_WINDOW; i < lags.length - SKIP_WINDOW; i++) {
-	const here = lags[i];
-	if (!here || here.stalled) continue;
-	const before = median(lags.slice(i - SKIP_WINDOW, i).flatMap((l) => (l && !l.stalled ? [l.lag] : [])));
-	const after = median(lags.slice(i + 1, i + 1 + SKIP_WINDOW).flatMap((l) => (l && !l.stalled ? [l.lag] : [])));
-	if (before === undefined || after === undefined) continue;
-	const jumped = before - after;
-	if (jumped > SKIP_MS) {
-		skipAheads++;
-		skippedMs += jumped;
-		// One step is one skip, and the trailing window still straddles it for several samples.
-		i += SKIP_WINDOW;
-	}
-}
 
 // The ring's own underrun counter is cumulative, and it is the authoritative count: it sees every
 // partly-filled quantum, including the ones that begin and end between two 250 ms samples.
@@ -273,13 +231,50 @@ function rise(counts: (number | undefined)[]): number | null {
 	return total;
 }
 
+const playout = window.flatMap((sample) => (sample.playout ? [sample.playout] : []));
+const firstPlayout = playout[0];
+if (
+	playout.some((state, i) => {
+		const previous = playout[i - 1];
+		return (
+			state.generation !== firstPlayout?.generation ||
+			state.anchor !== firstPlayout?.anchor ||
+			state.rate !== firstPlayout?.rate ||
+			(previous !== undefined &&
+				(state.jumps < previous.jumps || state.jumped < previous.jumped || state.output < previous.output))
+		);
+	}) ||
+	(playout.length > 0 && playout.length !== window.length)
+) {
+	voids.push({
+		assertion: "playout",
+		detail: "the audio graph, timeline, or counters changed during the measured window",
+	});
+}
+
+const counter = (key: "jumps" | "jumped" | "discarded" | "short" | "accelerates" | "expands") =>
+	rise(window.map((sample) => sample.playout?.[key]));
+const duration = (key: "jumped" | "discarded") => {
+	const count = counter(key);
+	return count === null || firstPlayout === undefined ? null : (count * 1000) / firstPlayout.rate;
+};
+const skipAheads = counter("jumps");
+const skippedMs = duration("jumped");
+const discardedMs = duration("discarded");
+const shortQuanta = counter("short");
+const accelerates = counter("accelerates");
+const expands = counter("expands");
+const lastPlayout = playout.at(-1);
+const stretchedMs =
+	firstPlayout && lastPlayout
+		? (Math.abs(lastPlayout.stretched - firstPlayout.stretched) * 1000) / firstPlayout.rate
+		: null;
+
 const underrunCounts = window.map((s) => s.underruns);
 const hasCounter = underrunCounts.some((c) => typeof c === "number");
 const underruns = rise(underrunCounts);
 
-// Groups that lost content above the decoder, from the container consumer's own counter. It cannot
-// say why: the local age budget skipping a group and the transport giving up on one land in the same
-// number, so `budget_aborts` stays null rather than being read off this.
+// Groups that lost content above the decoder, from the container consumer's own counter.
 const skippedGroups = rise(window.map((s) => s.skipped));
 
 // An episode is a maximal run of consecutive samples in which that counter was still rising: one
@@ -320,6 +315,76 @@ const convergeS = convergence(targetSeries, firstAudio?.at ?? 0, BUCKET_MS, t1);
 const rmsWindows = window.map((s) => s.rms).filter((x): x is number => typeof x === "number");
 const silenceShare =
 	rmsWindows.length > 0 ? rmsWindows.filter((r) => r < SILENCE_RMS).length / rmsWindows.length : null;
+
+/**
+ * The audio the quiet windows are placed in: the publisher's own encode of the file it loops,
+ * replayed from the start of its stream, which reproduces the published packets byte for byte, then
+ * decoded as the page decoded them over the span this row's playheads cover, and mixed to mono as
+ * the AnalyserNode mixes its input. Or why there is none.
+ */
+async function decode(media: string | undefined, encode: string | undefined): Promise<Reference | string> {
+	if (!media) return "no --media was given";
+	if (!existsSync(media)) return `${media} does not exist`;
+	if (!encode) return "no --encode was given, so the publisher's audio cannot be rebuilt";
+	const rate = window.find((s) => s.playout !== undefined)?.playout?.rate;
+	if (rate === undefined) return "no window reported the graph's rate";
+	const span = locate(window);
+	if ("reason" in span) return span.reason;
+
+	// The publisher's input and audio options, without its real-time pacing, which changes nothing
+	// the encoder sees. Its own stream selection picks the file's one audio stream, as this does.
+	const replay = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin", "-stream_loop", "-1", "-i", media];
+	replay.push(
+		"-map",
+		"0:a:0",
+		"-t",
+		String(span.from + span.seconds),
+		...encode.split(/\s+/),
+		"-f",
+		"matroska",
+		"pipe:1",
+	);
+	// The page decodes Opus with libopus, through WebCodecs, and AAC with FFmpeg's own decoder.
+	const decoder = row.codec === "opus" ? ["-c:a", "libopus"] : [];
+	const unpack = ["ffmpeg", "-hide_banner", "-v", "error", ...decoder, "-i", "pipe:0", "-ss", String(span.from)];
+	unpack.push("-ac", "2", "-ar", String(rate), "-f", "f32le", "pipe:1");
+
+	const encoder = Bun.spawn(replay, { stdout: "pipe", stderr: "pipe" });
+	const decoding = Bun.spawn(unpack, { stdin: encoder.stdout, stdout: "pipe", stderr: "pipe" });
+	const [bytes, encoded, decoded] = await Promise.all([
+		new Response(decoding.stdout).arrayBuffer(),
+		encoder.exited,
+		decoding.exited,
+	]);
+	if (encoded !== 0 || decoded !== 0) {
+		const why = `${await new Response(encoder.stderr).text()} ${await new Response(decoding.stderr).text()}`.trim();
+		return `ffmpeg could not rebuild the published audio: ${why.slice(0, 200) || `exit ${encoded}/${decoded}`}`;
+	}
+	// f32le is every supported host's own byte order.
+	const stereo = new Float32Array(bytes, 0, Math.floor(bytes.byteLength / 8) * 2);
+	const pcm = new Float32Array(stereo.length / 2);
+	for (let i = 0; i < pcm.length; i++) pcm[i] = 0.5 * ((stereo[2 * i] ?? 0) + (stereo[2 * i + 1] ?? 0));
+
+	const hasher = new Bun.CryptoHasher("sha256");
+	for await (const chunk of Bun.file(media).stream()) hasher.update(chunk);
+	return {
+		rate,
+		start: Math.round(span.from * rate),
+		pcm,
+		provenance: {
+			media,
+			sha256: hasher.digest("hex"),
+			encode: replay,
+			decode: unpack,
+			from: span.from,
+			seconds: span.seconds,
+			rate,
+		},
+	};
+}
+
+const quietProof =
+	rmsWindows.length > 0 ? prove(samples, window, await decode(values.media, values.encode)) : undefined;
 const loads = window.map((s) => s.renderLoad).filter((x): x is number => typeof x === "number");
 
 // What a hundred render quanta actually cost in wall time.
@@ -476,27 +541,27 @@ const metrics: Record<string, number | null> = {
 	underrun_episodes_max: round1(episodeStats.max),
 	underrun_samples_total: round1(underrunMs),
 	underrun_samples_per_min: round1(underrunMs / minutes),
-	short_quanta_total: null,
-	short_quanta_per_min: null,
-	silent_quanta_total: null,
-	silent_quanta_per_min: null,
+	short_quanta_total: shortQuanta,
+	short_quanta_per_min: shortQuanta === null ? null : round1(shortQuanta / minutes),
 	stalled_quanta_share: stalledShare === null ? null : Math.round(stalledShare * 1000) / 1000,
-	discarded_samples_total: null,
-	discarded_samples_per_min: null,
+	discarded_samples_total: round1(discardedMs),
+	discarded_samples_per_min: discardedMs === null ? null : round1(discardedMs / minutes),
 	skip_aheads_total: skipAheads,
-	skip_aheads_per_min: round1(skipAheads / minutes),
+	skip_aheads_per_min: skipAheads === null ? null : round1(skipAheads / minutes),
 	skipped_samples_total: round1(skippedMs),
-	skipped_samples_per_min: round1(skippedMs / minutes),
-	accelerates_total: null,
-	accelerates_per_min: null,
-	expands_total: null,
-	expands_per_min: null,
-	stretched_samples_total: null,
-	stretched_samples_per_min: null,
+	skipped_samples_per_min: skippedMs === null ? null : round1(skippedMs / minutes),
+	observed_jumps_total: skipAheads,
+	observed_jumps_per_min: skipAheads === null ? null : round1(skipAheads / minutes),
+	observed_skipped_samples_total: round1(skippedMs),
+	observed_skipped_samples_per_min: skippedMs === null ? null : round1(skippedMs / minutes),
+	accelerates_total: accelerates,
+	accelerates_per_min: accelerates === null ? null : round1(accelerates / minutes),
+	expands_total: expands,
+	expands_per_min: expands === null ? null : round1(expands / minutes),
+	stretched_samples_total: round1(stretchedMs),
+	stretched_samples_per_min: stretchedMs === null ? null : round1(stretchedMs / minutes),
 	skipped_groups_total: skippedGroups,
 	skipped_groups_per_min: skippedGroups === null ? null : round1(skippedGroups / minutes),
-	budget_aborts_total: null,
-	budget_aborts_per_min: null,
 	target_ms_p50: round1(targetStats.p50),
 	target_ms_p95: round1(targetStats.p95),
 	target_ms_max: round1(targetStats.max),
@@ -526,6 +591,7 @@ const summary: Summary = {
 	thread,
 	voids,
 	metrics,
+	silence: quietProof,
 	targetSeries,
 	episodes: episodes.map((e) => round1(e) ?? 0),
 	stages,
@@ -564,9 +630,42 @@ for (const [name, spec] of Object.entries(METRICS)) {
 	for (const aggregation of spec.aggregations) {
 		const key = `${name}_${aggregation}`;
 		const value = metrics[key];
-		const shown =
-			value === null || value === undefined ? (spec.pending ? `n/a (${spec.pending})` : "n/a") : String(value);
+		const shown = value === null || value === undefined ? "n/a" : String(value);
 		lines.push(`| ${name} | ${spec.unit} | ${aggregation} | ${shown} |`);
+	}
+}
+if (quietProof) {
+	const fit = quietProof.alignment;
+	lines.push(
+		"",
+		`quiet proof: ${quietProof.proven ? "proven" : "unproven"}, ${quietProof.matched}/${quietProof.quiet} quiet windows over quiet source` +
+			(fit
+				? ` (log RMS r ${fit.correlation.toFixed(5)}, level ${fit.gain.toFixed(3)}, ${fit.audible} audible windows, shift ${round1(fit.shiftMs)} ms from the playhead)`
+				: "") +
+			(quietProof.reason ? `: ${quietProof.reason}` : ""),
+	);
+	const source = quietProof.reference;
+	if (source) {
+		lines.push(
+			`reference: the publisher's encode of ${source.media} (sha256 ${source.sha256.slice(0, 16)}) replayed and decoded over ${source.from}-${source.from + source.seconds} s of its stream at ${source.rate} Hz, half of left plus right`,
+		);
+	}
+	if (quietProof.segments.length > 1) {
+		for (const segment of quietProof.segments) {
+			const fit = segment.alignment;
+			lines.push(
+				`- lag segment ${(segment.from / 1000).toFixed(2)}-${(segment.to / 1000).toFixed(2)} s, analyser ${segment.lag} frames behind: ` +
+					(segment.proven ? "proven" : `unproven, ${segment.reason}`) +
+					(fit
+						? ` (log RMS r ${fit.correlation.toFixed(5)}, level ${fit.gain.toFixed(3)}, ${fit.audible} audible windows)`
+						: ""),
+			);
+		}
+	}
+	for (const q of quietProof.quietWindows.filter((w) => w.refused !== undefined).slice(0, 10)) {
+		const where = q.source === null ? "" : ` at source ${q.source.toFixed(3)} s`;
+		const level = q.reference === null ? "" : ` (source rms ${q.reference.toExponential(2)})`;
+		lines.push(`- ${(q.at / 1000).toFixed(2)} s, rms ${q.rms.toExponential(2)}${where}: ${q.refused}${level}`);
 	}
 }
 lines.push(

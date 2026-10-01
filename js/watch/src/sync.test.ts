@@ -3,29 +3,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
 import { Signal } from "@moq/signals";
+import { fakeClock } from "./audio/fake";
 import { type Clock, type Delay, Sync } from "./sync";
 
 // Effects in @moq/signals flush on a microtask, so let pending updates drain before asserting.
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-// `Time.Milli.now()` reads `performance.now()` on every call, so stubbing it runs playback on a
-// clock the test steps by hand. Everything else (timers, microtasks) stays real.
-function fakeClock(start = 1000) {
-	const real = performance.now.bind(performance);
-	let at = start;
-	performance.now = () => at;
-	return {
-		get at(): Time.Milli {
-			return at as Time.Milli;
-		},
-		advance(ms: number) {
-			at += ms;
-		},
-		restore() {
-			performance.now = real;
-		},
-	};
-}
 
 let clock: ReturnType<typeof fakeClock> | undefined;
 afterEach(() => {
@@ -145,7 +127,7 @@ describe("auto delay", () => {
 		// milliseconds. Dropping its reading the instant it goes takes the delay down to whatever
 		// the remaining tracks measured and its return puts it straight back, and the audio ring
 		// pays for both: resized down, then parked to refill, which is an underrun the listener
-		// hears. Three of five watchers on the bench took one from a 300ms camera hide.
+		// hears.
 		clock = fakeClock();
 		const sync = new Sync();
 		sync.track("audio").spread.set(40 as Time.Milli);
@@ -206,6 +188,26 @@ describe("auto delay", () => {
 		await flush();
 		expect(sync.out.jitter.peek()).toBe(0 as Time.Milli);
 		expect(sync.out.delay.peek()).toBe(0 as Time.Milli);
+		sync.close();
+	});
+
+	it("moves the delay with the jitter through every mode switch", async () => {
+		const delay = new Signal<Delay>("auto");
+		const sync = new Sync({ delay });
+		sync.track("audio").spread.set(120 as Time.Milli);
+		const steps = [
+			["auto", 120],
+			[300, 300],
+			["instant", 0],
+			["auto", 120],
+			[0, 0],
+		] as const;
+		for (const [mode, expected] of steps) {
+			delay.set(mode as Delay);
+			await flush();
+			expect(sync.out.jitter.peek()).toBe(Time.Milli(expected));
+			expect(sync.out.delay.peek()).toBe(Time.Milli(expected));
+		}
 		sync.close();
 	});
 });
@@ -722,8 +724,8 @@ describe("the cross-track arrival offset", () => {
 			}
 			await flush();
 
-			// Never more than a step or two, where the uncapped term used to stand at the ceiling
-			// for as long as both windows remembered the warm-up.
+			// Never more than a step or two, where an uncapped term would stand at the ceiling for as
+			// long as both windows remembered the warm-up.
 			expect(Math.max(...held)).toBeLessThanOrEqual(Time.Milli(40));
 			// The steady cadence is inside the tolerance, so nothing is held at all.
 			expect(sync.out.offset.peek()).toBe(Time.Milli.zero);
@@ -836,5 +838,52 @@ describe("wait", () => {
 		sync.reset();
 		await waiting;
 		sync.close();
+	});
+});
+
+describe("Sync wakes a waiting frame only when its deadline moves", () => {
+	// Counts the timers `wait()` arms while one frame waits and the audio clock republishes its
+	// playhead `count` times, 5ms apart, each sample off the ideal line by `jitter(i)` ms. Every timer
+	// after the first is a wake: the sleep was cut short, its listeners dropped and re-armed.
+	async function timersWhileSampling(jitter: (i: number) => number, count = 20): Promise<number> {
+		clock = fakeClock(1000);
+		const sync = new Sync({ delay: Time.Milli(100) });
+		const audio = sync.track("audio");
+		audio.clock.set(sample(500, clock.at));
+		await flush();
+
+		const real = globalThis.setTimeout;
+		let armed = 0;
+		globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+			// Only the sleep's own timer (a positive deadline), not the test's zero-delay flushes.
+			if (ms !== undefined && ms > 0) armed++;
+			return real(fn, ms, ...rest);
+		}) as typeof setTimeout;
+		try {
+			// A frame 200ms ahead of the playhead waits.
+			const waiting = sync.wait(Time.Milli(700));
+			await flush();
+			for (let i = 1; i <= count; i++) {
+				clock.advance(5);
+				audio.clock.set(sample(500 + 5 * i + jitter(i), clock.at));
+				await flush();
+			}
+			sync.close();
+			await waiting;
+		} finally {
+			globalThis.setTimeout = real;
+		}
+		return armed;
+	}
+
+	it("samples exactly on the extrapolated line do not wake it", async () => {
+		expect(await timersWhileSampling(() => 0)).toBeLessThanOrEqual(2);
+	});
+
+	it("samples within a millisecond of the extrapolated line do not wake it", async () => {
+		// What a real clock delivers: the worklet's playhead and the reference it is stamped with
+		// never line up to the microsecond, so each sample lands a fraction of a millisecond off.
+		const jitter = (i: number) => [0.25, -0.25, 0.1, -0.1][i % 4];
+		expect(await timersWhileSampling(jitter)).toBeLessThanOrEqual(2);
 	});
 });

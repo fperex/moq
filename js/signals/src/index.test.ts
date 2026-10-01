@@ -1,4 +1,4 @@
-import { heapStats } from "bun:jsc";
+import { gcAndSweep, heapStats, releaseWeakRefs } from "bun:jsc";
 import { describe, expect, spyOn, test } from "bun:test";
 import { Computed, type Dispose, Effect, type GetPromise, Once, race, Signal } from "./index.ts";
 
@@ -1203,17 +1203,33 @@ describe("effect.race", () => {
 
 describe("spawn retention", () => {
 	test("an effect that never reruns drops settled tasks", async () => {
-		const effect = new Effect();
-		const promises = () => {
-			Bun.gc(true);
-			return heapStats().objectTypeCounts.Promise ?? 0;
-		};
+		const tasks: WeakRef<Promise<unknown>>[] = [];
+		class Task extends Promise<undefined> {
+			static override get [Symbol.species](): PromiseConstructor {
+				return Promise;
+			}
 
-		const before = promises();
-		for (let i = 0; i < 10000; i++) effect.spawn(async () => {});
-		await settle();
-		expect(promises() - before).toBeLessThan(100);
-		effect.close();
+			override catch<T = never>(
+				onRejected?: ((reason: unknown) => T | PromiseLike<T>) | null,
+			): Promise<undefined | T> {
+				const task = super.catch(onRejected);
+				tasks.push(new WeakRef(task));
+				return task;
+			}
+		}
+
+		const effect = new Effect();
+		try {
+			for (let i = 0; i < 10000; i++) effect.spawn(() => new Task((resolve) => resolve(undefined)));
+			await settle();
+			// WeakRef keeps new targets alive for this job until they are explicitly released.
+			releaseWeakRefs();
+			gcAndSweep();
+			expect(tasks.length).toBe(10000);
+			expect(tasks.filter((task) => task.deref() !== undefined).length).toBeLessThan(100);
+		} finally {
+			effect.close();
+		}
 	});
 
 	test("a rerun still waits for a pending task", async () => {
@@ -1238,4 +1254,22 @@ describe("spawn retention", () => {
 		expect(runs).toBe(2);
 		effect.close();
 	});
+});
+
+test("a rejected subscription does not retain its callback", async () => {
+	const signal = new Signal(0);
+	const listeners = Array.from({ length: 99 }, () => signal.subscribe(() => {}));
+	let notified = false;
+	try {
+		expect(() =>
+			signal.subscribe(() => {
+				notified = true;
+			}),
+		).toThrow("too many subscribers");
+		signal.set(1);
+		await settle();
+		expect(notified).toBe(false);
+	} finally {
+		for (const dispose of listeners) dispose();
+	}
 });

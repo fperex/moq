@@ -271,7 +271,9 @@ class Player {
 			source: this.#source,
 			sync: this.#sync(),
 			enabled: new Derived([this.#enabled, this.#timed] as const, (enabled, timed) => enabled && timed),
-			graph: this.#graph,
+			// The ring reads its depth and its buffered mode off timing once, when it is built, so it is
+			// not built before timing has arrived, whichever of the two the page sent first.
+			graph: new Derived([this.#graph, this.#timed] as const, (graph, timed) => (timed ? graph : undefined)),
 			target: this.#target,
 			maxAge: this.#maxAge,
 		});

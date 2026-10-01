@@ -1,10 +1,12 @@
 import { expect, setSystemTime, test } from "bun:test";
+import { Producer as BroadcastProducer } from "./broadcast.ts";
 import { Expired, StreamCode, TooFarBehind } from "./error.ts";
 import { Producer as GroupProducer, MAX_GROUP_FRAMES } from "./group.ts";
 import { hooks } from "./internal.ts";
 import { Writer } from "./stream.ts";
 import { Milli, Timescale, Timestamp } from "./time.ts";
 import { infoDefaults, Producer as TrackProducer } from "./track.ts";
+import { wireOf } from "./wire.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -808,7 +810,7 @@ test("a handed-out frame cancels its in-flight operation when it expires", async
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation);
+	const guarded = hooks.guardGroup(group, () => operation);
 	producer.writeString("new");
 
 	await expect(guarded).rejects.toThrow("max age budget");
@@ -816,7 +818,7 @@ test("a handed-out frame cancels its in-flight operation when it expires", async
 });
 
 for (const alreadyExpired of [false, true]) {
-	test(`a guarded write handles its rejection when the group ${alreadyExpired ? "already expired" : "expires before guarding"}`, async () => {
+	test(`a guarded write never starts when the group ${alreadyExpired ? "already expired" : "expires before guarding"}`, async () => {
 		const producer = new TrackProducer("test").accept({ maxAge: Milli(5000) });
 		const track = producer.subscribe();
 		producer.writeString("old");
@@ -826,7 +828,7 @@ for (const alreadyExpired of [false, true]) {
 		producer.writeString("new");
 
 		if (alreadyExpired) {
-			await expect(hooks.guardGroup(group, Promise.resolve())).rejects.toBeInstanceOf(Expired);
+			await expect(hooks.guardGroup(group, () => Promise.resolve())).rejects.toBeInstanceOf(Expired);
 		}
 
 		const stream = new TransformStream<Uint8Array, Uint8Array>();
@@ -834,11 +836,16 @@ for (const alreadyExpired of [false, true]) {
 		const reader = stream.readable.getReader();
 		try {
 			// No reader drains the stream, so resetting it rejects the pending write.
-			const guarded = hooks.guardGroup(group, writer.write(enc.encode("old")));
+			let writes = 0;
+			const guarded = hooks.guardGroup(group, () => {
+				writes++;
+				return writer.write(enc.encode("old"));
+			});
 			const verdict = await guarded.catch((err: unknown) => err);
 			expect(verdict).toBeInstanceOf(Expired);
+			expect(writes).toBe(0);
 			writer.reset(verdict);
-			await expect(reader.read()).rejects.toMatchObject({ streamErrorCode: StreamCode.DeliveryTimeout });
+			await expect(reader.read()).rejects.toMatchObject({ streamErrorCode: StreamCode.Old });
 			await settle();
 
 			const next = await track.recvGroup();
@@ -867,7 +874,7 @@ test("a budget verdict on unread content is Expired, an eviction is TooFarBehind
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation);
+	const guarded = hooks.guardGroup(group, () => operation);
 	producer.writeString("new");
 
 	const expired = await guarded.then(
@@ -875,7 +882,7 @@ test("a budget verdict on unread content is Expired, an eviction is TooFarBehind
 		(err: unknown) => err,
 	);
 	expect(expired).toBeInstanceOf(Expired);
-	expect((expired as Expired).code).toBe(StreamCode.DeliveryTimeout);
+	expect((expired as Expired).code).toBe(StreamCode.Old);
 	release();
 
 	// Same shape of loss, different reason: retention drops the unread tail while the
@@ -924,7 +931,7 @@ test("a guarded write keeps the position of the frame removed from the buffer", 
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation);
+	const guarded = hooks.guardGroup(group, () => operation);
 
 	producer.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(1_000) });
 	// A group beyond the edge, so group 0's reach (1s) is provably behind it: a group is
@@ -953,7 +960,7 @@ test("clean source closure stays provisional while a frame write can expire", as
 	const operation = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const guarded = hooks.guardGroup(group, operation);
+	const guarded = hooks.guardGroup(group, () => operation);
 
 	const edge = producer.appendGroup();
 	edge.writeFrame({ payload: enc.encode("edge"), timestamp: Timestamp.fromMillis(1_000) });
@@ -1661,4 +1668,107 @@ test("malformed group bounds do not partially advance the cursor", () => {
 	expect(() => track.setGroups({ start: { included: 3 }, end: { excluded: -1 } })).toThrow();
 	expect(track.tryRecvGroup()?.sequence).toBe(0);
 	track.close();
+});
+
+/** Append a closed group whose one frame is stamped at `ms`, returning its sequence. */
+function appendAt(producer: TrackProducer, ms: number): number {
+	const group = producer.appendGroup();
+	group.writeFrame({ payload: enc.encode("x"), timestamp: Timestamp.fromMillis(ms) });
+	group.close();
+	return group.sequence;
+}
+
+/** Media up to 200ms, then the marker a pausing publisher writes where it stopped, with the break at it. */
+function paused(producer: TrackProducer): number {
+	for (const ms of [0, 100, 200]) appendAt(producer, ms);
+	const marker = appendAt(producer, 200);
+	producer.breakAt(marker);
+	return marker;
+}
+
+// Max Age measures a group against the newest one, and the newest is the marker, stamped where the
+// media stopped: nothing yet says the media before it is stale. The break is what does.
+test("a subscription made after a break starts there, whatever its budget reaches back to", () => {
+	const producer = new TrackProducer("test").accept();
+	const marker = paused(producer);
+
+	const later = producer.subscribe({ maxAge: Milli(30_000) });
+	expect(later.tryRecvGroup()?.sequence).toBe(marker);
+	expect(later.tryRecvGroup()).toBeUndefined();
+
+	// A resumed group follows as usual.
+	const resumed = appendAt(producer, 10_000);
+	expect(later.tryRecvGroup()?.sequence).toBe(resumed);
+	later.close();
+	producer.close();
+});
+
+test("a break leaves a subscription made before it alone", () => {
+	const producer = new TrackProducer("test").accept();
+	const open = producer.subscribe({ maxAge: Milli(30_000) });
+	const marker = paused(producer);
+
+	const read: number[] = [];
+	for (let group = open.tryRecvGroup(); group; group = open.tryRecvGroup()) read.push(group.sequence);
+	expect(read).toEqual([0, 1, 2, marker]);
+	open.close();
+	producer.close();
+});
+
+test("a serving update lowers a start no further than the break", () => {
+	const producer = new TrackProducer("test").accept();
+	const marker = paused(producer);
+
+	// A relay re-subscribing at its cache's edge, then updating that same start.
+	const later = producer.subscribe({ maxAge: Milli(30_000), groups: { start: { included: 2 } } });
+	hooks.replaceGroups(later, { start: { included: 0 } });
+	expect(later.tryRecvGroup()?.sequence).toBe(marker);
+	later.close();
+	producer.close();
+});
+
+test("a fetch and a fill still reach the groups before a break", async () => {
+	const broadcast = new BroadcastProducer();
+	const track = broadcast.createTrack("video");
+	paused(track);
+
+	const fetched = await wireOf(broadcast).fetchGroup("video", 0);
+	expect(fetched.sequence).toBe(0);
+
+	const live = track.subscribe({ maxAge: Milli(30_000) });
+	const fill = live.fork({ maxAge: Milli(30_000) });
+	expect(fill.tryRecvGroup()?.sequence).toBe(0);
+	fill.close();
+	live.close();
+	broadcast.close();
+});
+
+test("a break only moves forward, to the next group at most", () => {
+	const producer = new TrackProducer("test").accept();
+	expect(() => producer.breakAt(1)).toThrow(RangeError);
+	producer.breakAt(0);
+	appendAt(producer, 0);
+	appendAt(producer, 100);
+
+	// The next group, twice: declaring the same break again changes nothing.
+	producer.breakAt(2);
+	producer.breakAt(2);
+	expect(() => producer.breakAt(1)).toThrow(RangeError);
+	expect(() => producer.breakAt(3)).toThrow(RangeError);
+	expect(() => producer.breakAt(2.5)).toThrow(RangeError);
+	producer.close();
+});
+
+test("a republished track starts without the old one's break", () => {
+	const broadcast = new BroadcastProducer();
+	const old = broadcast.createTrack("video");
+	paused(old);
+	old.close();
+
+	const republished = broadcast.createTrack("video");
+	const first = appendAt(republished, 0);
+	const reader = republished.subscribe({ maxAge: Milli(30_000) });
+	expect(reader.tryRecvGroup()?.sequence).toBe(first);
+	reader.close();
+	broadcast.close();
 });

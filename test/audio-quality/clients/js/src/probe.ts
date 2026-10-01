@@ -1,11 +1,8 @@
 /**
  * Samples what a `<moq-watch>` will tell anyone who asks, every 250 ms.
  *
- * Public signals only. Nothing here reaches past the element's `out` surface, patches a module, or
- * knows which ring is running, so the same probe reads a build from the npm package and a build from
- * this checkout, and a number it reports is one a consumer could have read too. Where a counter does
- * not exist yet the sample carries `undefined` and the analyzer reports null, rather than this file
- * growing a private hook to fill the gap.
+ * Reads the element's output signals, including internal ring diagnostics when available.
+ * Missing counters remain undefined and the analyzer reports null.
  *
  * Two things are measured rather than read, because no signal carries them:
  *
@@ -14,13 +11,10 @@
  * - `AudioContext.currentTime` against wall time, which is how a run that was throttled or never
  *   really rendered gets caught instead of being graded.
  *
- * Adapted from the black-box probe in `debug-findings/analysis/blackbox.js` on the reporter's fork
- * (`fperex/moq`, branch `debug/rt-audio`). See ../../README.md.
- *
  * @module
  */
 import type MoqWatch from "@moq/watch/element";
-import { type Environment, SAMPLE_INTERVAL_MS, type Sample, type Thread } from "./schema.ts";
+import { type Environment, RMS_FRAMES, SAMPLE_INTERVAL_MS, type Sample, type Thread } from "./schema.ts";
 
 /** Anything with a `peek()`, which is every signal under an `out`. */
 type Peekable<T> = { peek(): T };
@@ -104,6 +98,7 @@ export function probe(watch: MoqWatch): Probe {
 	// and would report a perfect run as a fully silent one.
 	let analyser: AnalyserNode | undefined;
 	let attachedTo: AudioNode | undefined;
+	let generation = 0;
 	let pcm: Float32Array<ArrayBuffer> | undefined;
 
 	// Render capacity arrives on its own event rather than on demand, so the latest reading is held
@@ -113,18 +108,19 @@ export function probe(watch: MoqWatch): Probe {
 
 	const attach = () => {
 		const root = maybe(() => watch.audio.out.root.peek());
-		if (!root || root === attachedTo) return;
+		if (root === attachedTo) return;
+		attachedTo = root;
+		generation++;
+		analyser = undefined;
+		pcm = undefined;
+		if (!root) return;
 		try {
-			const node = new AnalyserNode(root.context, { fftSize: 2048 });
+			const node = new AnalyserNode(root.context, { fftSize: RMS_FRAMES });
 			root.connect(node);
 			analyser = node;
 			pcm = new Float32Array(node.fftSize);
-			attachedTo = root;
 		} catch (err) {
 			notes.push(`analyser: ${err instanceof Error ? err.message : String(err)}`);
-			// Claim the root even though the analyser never attached, or every later sample retries
-			// the same failing construction and pushes the same note again.
-			attachedTo = root;
 		}
 
 		const context = maybe(() => watch.audio.out.context.peek());
@@ -163,6 +159,7 @@ export function probe(watch: MoqWatch): Probe {
 		const audio = watch.audio.out;
 		const sync = watch.sync.out;
 		const context = maybe(() => audio.context.peek());
+		const debug = maybe(() => audio.debug.peek());
 
 		// `buffered` is a list of ranges, not a depth. What the grader wants is how much audio is
 		// ready to play, so the ranges are summed; a gap in the middle is not playable time.
@@ -181,9 +178,7 @@ export function probe(watch: MoqWatch): Probe {
 			spread: num(audio.spread),
 			buffered: ranges.length > 0 ? buffered : undefined,
 			skipped: num(audio.skipped),
-			// `audio.out.debug` carries the ring's own short, discarded and stretch counters. This
-			// probe does not read it, so those metrics are null on the browser lanes and filled only
-			// by the replay lane, which drives the engine directly.
+			playout: debug && context ? { ...debug, generation, rate: context.sampleRate } : undefined,
 			stats: maybe(() => audio.stats.peek()) as Record<string, unknown> | undefined,
 			thread: threadOf(watch),
 
