@@ -225,9 +225,39 @@ fn room_url(scheme: &str, port: u16) -> url::Url {
 		.expect("parse url")
 }
 
-/// Connect a publisher and a subscriber to `url` and prove one frame
-/// round-trips. Returns both sessions so the caller can watch them close.
-async fn connect_and_round_trip(url: &url::Url) -> (moq_tokio::Connection, moq_tokio::Connection) {
+/// The sessions and media handles behind a real frame round trip.
+struct RoundTrip {
+	pub_session: moq_tokio::Connection,
+	sub_session: moq_tokio::Connection,
+	_broadcast: moq_net::broadcast::Producer,
+	track: moq_net::track::Producer,
+	track_sub: moq_net::track::Subscriber,
+}
+
+impl RoundTrip {
+	/// Move another actual frame through both sessions before advancing their clocks again.
+	async fn round_trip(&mut self) {
+		let mut group = self.track.append_group().expect("append live group");
+		group
+			.write_frame(moq_net::Timestamp::ZERO, b"alive".as_ref())
+			.expect("write live frame");
+		group.finish().expect("finish live group");
+		let mut received = tokio::time::timeout(TIMEOUT, self.track_sub.recv_group())
+			.await
+			.expect("live group timeout")
+			.expect("live group failed")
+			.expect("live track closed prematurely");
+		let frame = tokio::time::timeout(TIMEOUT, received.read_frame())
+			.await
+			.expect("live frame timeout")
+			.expect("live frame failed")
+			.expect("live group closed prematurely");
+		assert_eq!(&frame.payload[..], b"alive");
+	}
+}
+
+/// Connect a publisher and a subscriber to `url` and prove one frame round-trips.
+async fn connect_and_round_trip(url: &url::Url) -> RoundTrip {
 	let pub_origin = moq_tokio::origin::spawn();
 	let broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
 	broadcast.announce(Default::default()).expect("create broadcast");
@@ -289,10 +319,13 @@ async fn connect_and_round_trip(url: &url::Url) -> (moq_tokio::Connection, moq_t
 		.expect("group closed prematurely");
 	assert_eq!(&frame.payload[..], b"hello");
 
-	drop(track);
-	drop(broadcast);
-
-	(pub_session, sub_session)
+	RoundTrip {
+		pub_session,
+		sub_session,
+		_broadcast: broadcast,
+		track,
+		track_sub,
+	}
 }
 
 /// A connect the server refuses, or cannot answer, never carries a session: the
@@ -358,7 +391,11 @@ async fn assert_closed(session: moq_tokio::Connection, within: Duration, what: &
 async fn admits_and_reports_the_session() {
 	let script = Script::new(grant(Duration::from_secs(3600)));
 	let (port, relay) = spawn_relay(build_auth(script.spawn().await)).await;
-	let (pub_session, sub_session) = connect_and_round_trip(&room_url("tcp", port)).await;
+	let RoundTrip {
+		pub_session,
+		sub_session,
+		..
+	} = connect_and_round_trip(&room_url("tcp", port)).await;
 
 	let seen = script.seen.lock().unwrap().clone();
 	let connect = seen.iter().find(|r| r.event == Event::Connect).expect("a connect");
@@ -541,7 +578,11 @@ async fn a_narrower_grant_closes_live_sessions() {
 			"tcp" => spawn_relay(auth).await,
 			_ => spawn_ws_relay(auth).await,
 		};
-		let (pub_session, sub_session) = connect_and_round_trip(&room_url(scheme, port)).await;
+		let RoundTrip {
+			pub_session,
+			sub_session,
+			..
+		} = connect_and_round_trip(&room_url(scheme, port)).await;
 
 		let mut narrow = grant(Duration::from_secs(3600));
 		narrow.publish = ["nobody/**".parse().unwrap()].into_iter().collect();
@@ -564,7 +605,11 @@ async fn a_refusal_closes_live_sessions() {
 	] {
 		let script = Script::new(grant(Duration::from_secs(3600)));
 		let (port, relay) = spawn_relay(build_auth(script.spawn().await)).await;
-		let (pub_session, sub_session) = connect_and_round_trip(&room_url("tcp", port)).await;
+		let RoundTrip {
+			pub_session,
+			sub_session,
+			..
+		} = connect_and_round_trip(&room_url("tcp", port)).await;
 
 		script.on_revalidate(answer);
 
@@ -724,8 +769,8 @@ async fn http_routes_hold_a_lease() {
 
 /// An outage keeps the session until `expires`, then closes it as expired.
 ///
-/// Pause only to advance the lease deadline: automatic advancement can time out
-/// real socket I/O before it finishes. Network waits run with the clock resumed.
+/// Advance virtual time between real media round trips. Resume for socket I/O so
+/// transport activity catches up; automatic advancement can time it out prematurely.
 #[tokio::test]
 async fn an_outage_keeps_the_session_until_expires() {
 	const EXPIRES: Duration = Duration::from_secs(120);
@@ -739,11 +784,16 @@ async fn an_outage_keeps_the_session_until_expires() {
 	// at whatever the virtual clock had reached.
 	script.on_revalidate(Answer::Status(503));
 	let (port, relay) = spawn_relay(build_auth(script.spawn().await)).await;
-	let (pub_session, sub_session) = connect_and_round_trip(&room_url("tcp", port)).await;
+	let mut trip = connect_and_round_trip(&room_url("tcp", port)).await;
 
-	tokio::time::pause();
-	tokio::time::advance(REVALIDATE).await;
-	tokio::time::resume();
+	// QMux expires an idle peer after 30s. Keep real media moving between clock steps
+	// so its keep-alive replies can arrive before the next deadline is advanced.
+	for _ in 0..(EXPIRES - SLACK).as_secs() / REVALIDATE.as_secs() {
+		tokio::time::pause();
+		tokio::time::advance(REVALIDATE).await;
+		tokio::time::resume();
+		trip.round_trip().await;
+	}
 	tokio::time::timeout(TIMEOUT, async {
 		loop {
 			let changed = script.changed.notified();
@@ -757,22 +807,25 @@ async fn an_outage_keeps_the_session_until_expires() {
 	.expect("no re-check reached the server during the outage");
 
 	// The outage leaves the session up just short of expires...
-	tokio::time::pause();
-	tokio::time::advance(EXPIRES - SLACK - REVALIDATE).await;
-	tokio::time::resume();
 	assert!(
-		tokio::time::timeout(Duration::from_millis(100), pub_session.closed())
+		tokio::time::timeout(Duration::from_millis(100), trip.pub_session.closed())
 			.await
 			.is_err(),
 		"an outage must not close the publisher before expires"
 	);
 
 	// ...and it closes once the grant expires, not later.
+	for _ in 0..(SLACK - REVALIDATE).as_secs() / REVALIDATE.as_secs() {
+		tokio::time::pause();
+		tokio::time::advance(REVALIDATE).await;
+		tokio::time::resume();
+		trip.round_trip().await;
+	}
 	tokio::time::pause();
-	tokio::time::advance(SLACK).await;
+	tokio::time::advance(REVALIDATE).await;
 	tokio::time::resume();
-	assert_closed(pub_session, SLACK, "publisher").await;
-	assert_closed(sub_session, SLACK, "subscriber").await;
+	assert_closed(trip.pub_session, SLACK, "publisher").await;
+	assert_closed(trip.sub_session, SLACK, "subscriber").await;
 
 	let ends = tokio::time::timeout(TIMEOUT, async {
 		loop {
@@ -804,7 +857,11 @@ async fn the_end_carries_duration_and_bytes() {
 	let url: url::Url = format!("moql://127.0.0.1:{}/room?jwt=token", addr.port())
 		.parse()
 		.unwrap();
-	let (pub_session, sub_session) = connect_and_round_trip(&url).await;
+	let RoundTrip {
+		pub_session,
+		sub_session,
+		..
+	} = connect_and_round_trip(&url).await;
 
 	tokio::time::sleep(Duration::from_millis(300)).await;
 	drop(pub_session);
@@ -968,7 +1025,11 @@ async fn an_embedded_decider_admits_and_revokes() {
 	let (auth, admissions) = moq_relay::auth::Auth::embedded("test-relay");
 	let decider = Decider::spawn(admissions, grant(Duration::from_secs(3600)));
 	let (port, relay) = spawn_relay(auth.clone()).await;
-	let (pub_session, sub_session) = connect_and_round_trip(&room_url("tcp", port)).await;
+	let RoundTrip {
+		pub_session,
+		sub_session,
+		..
+	} = connect_and_round_trip(&room_url("tcp", port)).await;
 
 	let seen = decider.seen.lock().unwrap().clone();
 	assert_eq!(seen.len(), 2, "one admission per session");
@@ -1026,7 +1087,11 @@ async fn a_fixed_lease_still_expires() {
 			"tcp" => spawn_relay(auth).await,
 			_ => spawn_ws_relay(auth).await,
 		};
-		let (pub_session, sub_session) = connect_and_round_trip(&room_url(scheme, port)).await;
+		let RoundTrip {
+			pub_session,
+			sub_session,
+			..
+		} = connect_and_round_trip(&room_url(scheme, port)).await;
 		assert_closed(pub_session, Duration::from_secs(5), &format!("{scheme} publisher")).await;
 		assert_closed(sub_session, Duration::from_secs(5), &format!("{scheme} subscriber")).await;
 		relay.abort();
@@ -1060,7 +1125,11 @@ async fn a_relay_without_an_auth_source_is_decided_by_the_embedder() {
 	let running = tokio::spawn(relay.run());
 	wait_for_listener(port).await;
 
-	let (pub_session, sub_session) = connect_and_round_trip(&room_url("tcp", port)).await;
+	let RoundTrip {
+		pub_session,
+		sub_session,
+		..
+	} = connect_and_round_trip(&room_url("tcp", port)).await;
 	assert_eq!(decider.seen.lock().unwrap().len(), 2, "one admission per session");
 	drop(pub_session);
 	drop(sub_session);
