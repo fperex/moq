@@ -199,6 +199,9 @@ Taking the audio back costs one gap about as long as tuning in. A worker that
 failed or never started keeps every later player on the page on the main thread
 too.
 
+The audio worklet also loads from a `blob:` URL. Playback requires the page's
+`script-src` policy to allow `blob:`, even when the audio runs on the main thread.
+
 Safari runs a worker's WebSocket through the page's main thread, and a Safari
 session is a WebSocket, so there a busy page can still hold up the audio's
 bytes on their way in. The decoding and the ring writes stay off it.
