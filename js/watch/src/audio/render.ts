@@ -1,4 +1,5 @@
 import type { Time } from "@moq/net";
+import type { Playhead } from "./playhead";
 import type { Snapshot } from "./playout";
 import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
@@ -30,6 +31,8 @@ export interface InitPost {
 /** Flush the buffer and re-stall (fallback path only; shared path resets via Atomics). */
 export interface Reset {
 	type: "reset";
+	/** Which timeline the flush starts. See {@link State.timeline}. */
+	timeline: number;
 }
 
 /**
@@ -58,6 +61,20 @@ export interface Latency {
 export interface State {
 	type: "state";
 	timestamp: Time.Micro;
+	/** Audio context time at the end of the rendered quantum. */
+	contextTime: Time.Second;
+	/**
+	 * Which timeline this describes: the {@link Reset.timeline} of the last flush the worklet applied.
+	 *
+	 * A state message is composed a port hop before the main thread reads it, so one sent while a
+	 * flush was in flight describes the ring the flush threw away. Carrying the timeline is what lets
+	 * the main thread drop it, rather than publishing a playhead from before the flush and pacing
+	 * video against a position the reader will never resume from.
+	 */
+	timeline: number;
+	// Where the reader is and how fast it is moving, or undefined until the first write anchors the
+	// ring. The main thread maps contextTime to the output clock and extrapolates from it.
+	playhead: Playhead | undefined;
 	stalled: boolean;
 	// How many times the ring has run dry mid-playback, cumulative.
 	underruns: number;

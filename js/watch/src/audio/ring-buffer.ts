@@ -1,4 +1,5 @@
 import { Time } from "@moq/net";
+import type { Playhead } from "./playhead";
 import { type Counters, Floor, frames, type RingReader, type RingView, type Snapshot, STRETCH_BOUND } from "./playout";
 
 export class AudioRingBuffer implements RingReader {
@@ -56,6 +57,9 @@ export class AudioRingBuffer implements RingReader {
 
 	// The depth the ring keeps between flushes, which is the one that says a surplus is real.
 	#floor = new Floor();
+	#lastOutput = 0;
+	#lastStretched = 0;
+	#lastConcealed = 0;
 
 	// What `view` and `debug` hand back, filled in place: both run on the audio thread, where an
 	// object per call is garbage for its collector. The main thread only ever sees the copy the
@@ -70,6 +74,7 @@ export class AudioRingBuffer implements RingReader {
 		skipped: 0,
 		generation: 0,
 	};
+	readonly #playhead: Playhead = { timestamp: Time.Micro.zero, rate: 0 };
 	readonly #snapshot: Snapshot = {
 		backend: "message",
 		queued: 0,
@@ -149,6 +154,29 @@ export class AudioRingBuffer implements RingReader {
 	 */
 	get timestamp(): Time.Micro {
 		return Time.Micro.fromSecond(((this.#readIndex - this.#counters.queued) / this.rate) as Time.Second);
+	}
+
+	/**
+	 * Where the reader is on the media timeline and how fast it is moving, or undefined until the
+	 * first write anchors the ring.
+	 *
+	 * Read in the worklet and posted to the main thread, which extrapolates between messages, so it
+	 * is stateful: the rate is measured between reads of this getter. The same object every read,
+	 * so copy it to keep it. The rate is the reader's own; see `SharedRingBuffer.playhead`.
+	 */
+	get playhead(): Playhead | undefined {
+		if (!this.#anchored) return undefined;
+
+		const elapsed = this.#counters.output - this.#lastOutput;
+		const moved = this.#counters.stretched - this.#lastStretched - (this.#counters.concealed - this.#lastConcealed);
+		this.#lastOutput = this.#counters.output;
+		this.#lastStretched = this.#counters.stretched;
+		this.#lastConcealed = this.#counters.concealed;
+
+		const playhead = this.#playhead;
+		playhead.timestamp = this.timestamp;
+		playhead.rate = elapsed > 0 ? 1 + moved / elapsed : 0;
+		return playhead;
 	}
 
 	/**

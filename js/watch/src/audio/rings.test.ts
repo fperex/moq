@@ -59,7 +59,7 @@ function take(ring: Ring, count: number): Float32Array {
 	return out[0];
 }
 
-const counters = (queued: number): Counters => ({
+const counters = (queued: number, rest: Partial<Counters> = {}): Counters => ({
 	queued,
 	stretched: 0,
 	output: 0,
@@ -68,6 +68,7 @@ const counters = (queued: number): Counters => ({
 	expands: 0,
 	merges: 0,
 	short: 0,
+	...rest,
 });
 
 describe.each(RINGS)("%s ring: the reader surface", (_, build) => {
@@ -158,6 +159,43 @@ describe.each(RINGS)("%s ring: the reader surface", (_, build) => {
 
 		ring.insert(0, 10);
 		expect(ring.buffer.debug().discarded).toBe(10);
+	});
+});
+
+describe.each(RINGS)("%s ring: the playhead", (_, build) => {
+	it("is undefined until the first insert anchors the ring", () => {
+		const ring = build(40);
+		expect(ring.buffer.playhead).toBeUndefined();
+
+		insertChunks(ring, 5000, 40, 10);
+		expect(ring.buffer.playhead).toBeDefined();
+
+		// And again from a flush until the next insert, so no one paces against the position the flush
+		// threw away.
+		ring.buffer.reset();
+		expect(ring.buffer.playhead).toBeUndefined();
+	});
+
+	it("moves at the rate the reader consumes media, which a stretch bends", () => {
+		const ring = build(40);
+		insertChunks(ring, 0, 40, 10);
+		const rate = () => ring.buffer.playhead?.rate;
+		expect(rate()).toBe(0); // nothing played yet
+
+		// Playing at wall speed.
+		ring.buffer.report(counters(0, { output: 1000 }));
+		expect(rate()).toBe(1);
+
+		// An accelerate removed 50 of the next 1000 frames: the playhead ran 5% fast.
+		ring.buffer.report(counters(0, { output: 2000, stretched: 50 }));
+		expect(rate()).toBeCloseTo(1.05, 10);
+
+		// A concealment made 200 of the next 1000 up, so the media held still for them.
+		ring.buffer.report(counters(0, { output: 3000, stretched: 50, concealed: 200 }));
+		expect(rate()).toBeCloseTo(0.8, 10);
+
+		// Parked: nothing was emitted since the last poll.
+		expect(rate()).toBe(0);
 	});
 });
 

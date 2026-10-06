@@ -101,6 +101,28 @@ faded to is brought in quietly and let back up over the crossfade.
 `conceal="false"` turns this off. A gap is then a ramp into silence and a ramp back out, which is the
 boundary the stretch was written to. Read when the audio graph is built.
 
+## Audio leads the clock
+
+The ring consumes media on the sound card's clock, and it stretches, parks and skips, so pacing
+video against the wall clock would let the two drift apart every time it did. The audio decoder
+publishes the ring's playhead to `Sync` instead, and every frame is held until that playhead reaches
+its timestamp.
+
+A playhead sample is where the reader is on the media timeline, when it was there, and the rate it is
+moving at. The rate is the reader's own: 1 while playing, a few percent off while a stretch
+converges, and 0 while it conceals or is parked. `Sync` extrapolates between samples, so a frame's
+wait reads main-thread memory and never crosses to the worklet.
+
+The time is the device's, not the page's: the worklet stamps each report with the context time at the
+end of its quantum, and the page maps it through `AudioContext.getOutputTimestamp()`. Message
+delivery varies with the main thread's load, and stamping a sample at its arrival would turn that
+jitter into uneven video frame releases.
+
+Dropping the clock (a mute, a track that ended) leaves playback running at wall speed from exactly
+where the playhead was, so video sees no jump. A playhead that has neither moved nor been written to
+for a second is not refilling either, and gives up the clock for the same reason: holding the
+picture against it would freeze it.
+
 ## What the player reports
 
 The worklet publishes cumulative counters, which `Decoder.out.debug` carries for the stats panel and

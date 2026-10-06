@@ -26,6 +26,10 @@ class FakeContext extends EventTarget {
 	state: AudioContextState = "running";
 	readonly sampleRate: number;
 	readonly audioWorklet = { addModule: () => moduleLoaded };
+	// A device 40ms behind the render graph: what was rendered up to context time 1.04s is only now
+	// at 1.00s on the output.
+	readonly currentTime = 1.04;
+	getOutputTimestamp = () => ({ contextTime: 1, performanceTime: performance.now() });
 	readonly calls = { suspend: 0, resume: 0, close: 0 };
 	constructor(options: AudioContextOptions) {
 		super();
@@ -184,7 +188,7 @@ function feed() {
 	};
 }
 
-async function play(initial: Delay, props?: { conceal?: boolean }) {
+async function play(initial: Delay, props?: { conceal?: boolean; enabled?: Signal<boolean> }) {
 	const push = feed();
 	const truncate = spyOn(SharedRingBuffer.prototype, "truncate");
 	const reset = spyOn(SharedRingBuffer.prototype, "reset");
@@ -208,7 +212,7 @@ async function play(initial: Delay, props?: { conceal?: boolean }) {
 	const delay = new Signal<Delay>(initial);
 	const source = new Source({ broadcast, supported: async () => true });
 	const sync = new Sync({ delay });
-	const decoder = new Decoder({ source, sync, conceal: props?.conceal });
+	const decoder = new Decoder({ source, sync, conceal: props?.conceal, enabled: props?.enabled });
 	await microtasks();
 
 	// Enough frames to get past the legacy decoder's warm-up, so a handover would truncate.
@@ -238,6 +242,7 @@ async function play(initial: Delay, props?: { conceal?: boolean }) {
 			consumer = producer.consume();
 			frameTimestamp = 0;
 		},
+		sync,
 		// The rings written to, and the timestamps of every frame that reached one.
 		rings: () => [...new Set(insert.mock.contexts)] as SharedRingBuffer[],
 		inserted: () => insert.mock.calls.map(([timestamp]) => timestamp as number),
@@ -255,6 +260,31 @@ async function play(initial: Delay, props?: { conceal?: boolean }) {
 		},
 	};
 }
+
+describe("Decoder clock", () => {
+	// The ring's playhead is published once a poll, so the page waits out one.
+	const poll = () => new Promise((resolve) => setTimeout(resolve, 120));
+
+	it("drives the shared clock from the ring while audio is on, and hands it back when it is not", async () => {
+		const enabled = new Signal(true);
+		const playback = await play(Time.Milli(100), { enabled });
+		try {
+			expect(playback.sync.out.clock.peek()).toBeUndefined();
+
+			await playback.play();
+			await poll();
+			expect(playback.sync.out.clock.peek()).toBe("audio");
+			expect(playback.sync.track("audio").clock.peek()?.rate).toBeGreaterThanOrEqual(0);
+
+			// A muted ring drains to a playhead that stopped meaning anything.
+			enabled.set(false);
+			await microtasks();
+			expect(playback.sync.out.clock.peek()).toBeUndefined();
+		} finally {
+			playback.close();
+		}
+	});
+});
 
 describe("Decoder concealment", () => {
 	const concealed = () =>

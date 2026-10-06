@@ -196,6 +196,7 @@ export class Decoder {
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
 		this.#signals.run(this.#runLatency.bind(this));
+		this.#signals.run(this.#runClock.bind(this));
 		this.#signals.run(this.#runDecoder.bind(this));
 	}
 
@@ -276,6 +277,7 @@ export class Decoder {
 
 			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
 			const ring = createAudioBuffer(worklet, {
+				context,
 				channels: channelCount,
 				rate: sampleRate,
 				latency: latencySamples,
@@ -340,6 +342,29 @@ export class Decoder {
 		// slack already covers costs no silence at all.
 		const delay = effect.get(this.sync.out.delay);
 		ring.setLatency(ringSamples(ring.rate, delay));
+	}
+
+	/**
+	 * Drive playback from the ring's playhead while audio is being played.
+	 *
+	 * The ring consumes media on a clock of its own (the AudioContext's), and it stretches, parks
+	 * and skips, so pacing video against a wall clock lets the two drift apart every time it does.
+	 * Publishing the playhead makes it the reference every other track is paced against instead.
+	 *
+	 * Gated on `enabled` rather than on the ring existing: the graph is built up front so unmuting
+	 * is instant, and a muted ring drains to a playhead that stopped meaning anything. `Sync` keeps
+	 * the last value it saw, so handing the clock back costs no jump.
+	 */
+	#runClock(effect: Effect): void {
+		if (!effect.get(this.in.enabled)) return;
+
+		// Gate on the ring so this effect re-runs once it is created.
+		const ring = effect.get(this.#ring);
+		if (!ring) return;
+
+		const track = this.sync.track("audio");
+		effect.run((inner) => track.clock.set(inner.get(ring.clock)));
+		effect.cleanup(() => track.clock.set(undefined));
 	}
 
 	#runDecoder(effect: Effect): void {

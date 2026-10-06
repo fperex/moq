@@ -1,4 +1,5 @@
 import { Time } from "@moq/net";
+import type { Playhead } from "./playhead";
 import { type Counters, Floor, frames, type RingReader, type RingView, type Snapshot, STRETCH_BOUND } from "./playout";
 
 // Control array slot indices. The playhead is not here: see `state`.
@@ -205,9 +206,12 @@ export class SharedRingBuffer implements RingReader {
 	#position = 0;
 	#lastRead = 0;
 
-	// The media playhead last reported. Main thread only, and stateful for the same reason
-	// `#position` is.
+	// The media playhead last reported, and the counters the rate was last measured against. Main
+	// thread only, and stateful for the same reason `#position` is.
 	#lastMedia = Number.NEGATIVE_INFINITY;
+	#lastOutput = 0;
+	#lastStretched = 0;
+	#lastConcealed = 0;
 
 	/**
 	 * Wrap the shared memory described by `init`.
@@ -719,6 +723,9 @@ export class SharedRingBuffer implements RingReader {
 		dst.#position = this.#foldRead(read) + ((copyStart - read) | 0);
 		dst.#lastRead = copyStart;
 		dst.#lastMedia = this.#lastMedia;
+		dst.#lastOutput = this.#lastOutput;
+		dst.#lastStretched = this.#lastStretched;
+		dst.#lastConcealed = this.#lastConcealed;
 
 		return dst;
 	}
@@ -762,6 +769,33 @@ export class SharedRingBuffer implements RingReader {
 	 */
 	get timestamp(): Time.Micro {
 		return Time.Micro.fromSecond(((this.#anchor + this.#media()) / this.rate) as Time.Second);
+	}
+
+	/**
+	 * Where the reader is on the media timeline and how fast it is moving, or undefined until the
+	 * first insert anchors the ring.
+	 *
+	 * Main thread only, and stateful for the same reason {@link timestamp} is: the rate is measured
+	 * between polls.
+	 *
+	 * The rate is the reader's own, `1 + (dSTRETCHED - dCONCEALED)/dOUTPUT`: one while playing, a few
+	 * percent off while a stretch converges, zero while concealing or parked, so whoever follows this
+	 * playhead waits with the audio rather than running away from it.
+	 */
+	get playhead(): Playhead | undefined {
+		if (!this.#anchored) return undefined;
+
+		const timestamp = this.timestamp;
+		const output = Atomics.load(this.#control, OUTPUT);
+		const stretched = Atomics.load(this.#control, STRETCHED);
+		const concealed = Atomics.load(this.#control, CONCEALED);
+		const elapsed = (output - this.#lastOutput) | 0;
+		const moved = ((stretched - this.#lastStretched) | 0) - ((concealed - this.#lastConcealed) | 0);
+		this.#lastOutput = output;
+		this.#lastStretched = stretched;
+		this.#lastConcealed = concealed;
+
+		return { timestamp, rate: elapsed > 0 ? 1 + moved / elapsed : 0 };
 	}
 
 	/**
