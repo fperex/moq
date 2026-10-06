@@ -460,6 +460,13 @@ impl Publish {
 	}
 }
 
+/// The most one read of the input takes: the default Linux pipe capacity.
+///
+/// Each stdin read is a round trip through tokio's blocking pool, so a read has to take whatever the
+/// pipe holds. At the 64 bytes an empty buffer offers, a loaded host drains a keyframe slower than
+/// it arrives, and the audio muxed behind it reaches subscribers late.
+const READ_SIZE: usize = 64 * 1024;
+
 /// Decode `input` into the broadcast until EOF.
 ///
 /// At EOF the media tracks finish, then the catalog does, while it still lists them: the
@@ -470,7 +477,7 @@ async fn decode(
 	mut catalog: PublishCatalog,
 	mut input: impl tokio::io::AsyncRead + Unpin,
 ) -> anyhow::Result<()> {
-	let mut buffer = bytes::BytesMut::new();
+	let mut buffer = bytes::BytesMut::with_capacity(READ_SIZE);
 
 	// Counters reported so far, so only the change is logged. A live feed is
 	// diagnosed by the rate at which these climb, and stdin may never end, so
@@ -917,6 +924,49 @@ mod tests {
 		let last = last.expect("a catalog");
 		assert_eq!(last.video.renditions.len(), 1, "the video rendition is still listed");
 		assert_eq!(last.audio.renditions.len(), 1, "the audio rendition is still listed");
+	}
+
+	/// A pipe already holding all of `data`, counting the reads that drain it.
+	struct Pipe {
+		data: bytes::Bytes,
+		reads: usize,
+	}
+
+	impl tokio::io::AsyncRead for Pipe {
+		fn poll_read(
+			mut self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+			buf: &mut tokio::io::ReadBuf<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			let n = self.data.len().min(buf.remaining());
+			let chunk = self.data.split_to(n);
+			buf.put_slice(&chunk);
+			self.reads += 1;
+			std::task::Poll::Ready(Ok(()))
+		}
+	}
+
+	/// Every stdin read is a round trip through tokio's blocking pool, so a burst the pipe already
+	/// holds has to drain in pipe-sized reads, not a few bytes at a time.
+	#[tokio::test(start_paused = true)]
+	async fn stdin_drains_in_pipe_sized_reads() {
+		const INPUT: &[u8] = include_bytes!("../../moq-mux/src/container/ts/test_data/bbb_cbr.ts");
+
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let publish = Publish::new(broadcast, &PublishFormat::Ts { program: None }, Default::default()).unwrap();
+		#[allow(irrefutable_let_patterns)]
+		let Source::Stream { decoder, catalog } = publish.source else {
+			panic!("expected a stream source");
+		};
+
+		let mut pipe = Pipe {
+			data: bytes::Bytes::from_static(INPUT),
+			reads: 0,
+		};
+		decode(decoder, catalog, &mut pipe).await.unwrap();
+
+		// Full reads of a default Linux pipe, then the one that finds EOF.
+		assert_eq!(pipe.reads, INPUT.len().div_ceil(64 * 1024) + 1);
 	}
 
 	/// A PAT listing two programs, then one MP2 PES of each: program 1 on PID `0x61` at 1 s
