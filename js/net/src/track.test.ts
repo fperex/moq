@@ -1,5 +1,5 @@
 import { expect, setSystemTime, spyOn, test } from "bun:test";
-import { TooFarBehind } from "./error.ts";
+import { StreamCode, StreamError, TooFarBehind } from "./error.ts";
 import { Producer as GroupProducer, MAX_GROUP_FRAMES } from "./group.ts";
 import { hooks } from "./internal.ts";
 import { Milli, Timescale, Timestamp } from "./time.ts";
@@ -870,6 +870,9 @@ test("a handed-out frame cancels its in-flight operation when it expires", async
 	producer.writeString("new");
 
 	await expect(guarded).rejects.toThrow("max age budget");
+	// The verdict is OLD, the code a peer's reset of the same group reads back as.
+	await expect(guarded).rejects.toBeInstanceOf(StreamError);
+	await expect(guarded).rejects.toMatchObject({ code: StreamCode.Old });
 	release();
 });
 

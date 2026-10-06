@@ -1,5 +1,6 @@
 import { expect, mock, spyOn, test } from "bun:test";
 import { Signal } from "@moq/signals";
+import { StreamCode } from "../error.ts";
 import { Producer as GroupProducer } from "../group.ts";
 import { randomHop } from "../hop.ts";
 import { hooks } from "../internal.ts";
@@ -1568,7 +1569,7 @@ test("a version without the latency field serves a non-dropping budget", async (
 // A group can go stale while its stream is still opening. Serving it must abandon the group
 // without starting a write: an abandoned write rejects once the stream resets, and nothing
 // would handle it (Node exits on the first unhandled rejection).
-test("lite draft-05: a group that goes stale while its stream opens writes nothing", async () => {
+test("lite draft-05: a group that goes stale while its stream opens writes nothing and resets with OLD", async () => {
 	const unhandled: unknown[] = [];
 	const onUnhandled = (reason: unknown) => unhandled.push(reason);
 
@@ -1630,7 +1631,11 @@ test("lite draft-05: a group that goes stale while its stream opens writes nothi
 		write(2, 20_000);
 		open();
 
-		expect(String(await streamReset)).toContain("max age budget");
+		const reason = await streamReset;
+		expect(String(reason)).toContain("max age budget");
+		// The Rust publisher abandons a group past its max age with OLD, so the subscriber reads a
+		// dropped group instead of an internal failure.
+		expect(reason).toMatchObject({ streamErrorCode: StreamCode.Old });
 		expect(writes).toBe(0);
 		await flush();
 		expect(unhandled).toEqual([]);
