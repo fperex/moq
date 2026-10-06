@@ -71,6 +71,9 @@ class LaggingAudioEncoder {
 	// Called on configure; the encoder publishes its pipeline synchronously right after.
 	static onConfigure: ((config: AudioEncoderConfig) => void) | undefined;
 
+	// The metadata attached to every chunk, such as the Opus description a decoder initializes from.
+	static metadata: EncodedAudioChunkMetadata | undefined;
+
 	state: CodecState = "unconfigured";
 	#output: EncodedAudioChunkOutputCallback;
 	#held: { timestamp: number; duration: number }[] = [];
@@ -100,7 +103,7 @@ class LaggingAudioEncoder {
 				byteLength: 1,
 				copyTo: (dest: Uint8Array) => dest.set([1]),
 			};
-			this.#output(chunk as unknown as EncodedAudioChunk);
+			this.#output(chunk as unknown as EncodedAudioChunk, LaggingAudioEncoder.metadata);
 		}
 	}
 
@@ -263,6 +266,52 @@ async function setup(baseline = new Baseline(), codec?: Codec) {
 		},
 	};
 }
+
+// A subscriber selects, decodes and measures a rendition by its catalog entry, so the entry a
+// muted rendition returns with is the one it left with, the Opus description included. The
+// description is keyed to the config object it was reported for, and a rebuilt encoder reports the
+// same bytes against a new object.
+test("an unmuted rendition republishes its decoder description", async () => {
+	using _webcodecs = installFakeWebCodecs();
+	LaggingAudioEncoder.metadata = {
+		decoderConfig: {
+			codec: "opus",
+			numberOfChannels: 1,
+			sampleRate: 48_000,
+			description: new Uint8Array([1, 2, 3]),
+		},
+	};
+	try {
+		using env = await setup();
+		const { enabled, feed, rendition } = env;
+
+		let index = 0;
+		const push = async (count: number) => {
+			for (let i = 0; i < count; i++, index++) {
+				await feed.push({ timestamp: Time.Micro(20_000 + index * 20_000), channels: [new Float32Array(960)] });
+			}
+			await feed.drain();
+		};
+
+		await push(3);
+		await settle();
+		const entry = rendition.config.peek() as { description?: string } | undefined;
+		expect(entry?.description).toBe("010203");
+
+		enabled.set(false);
+		await settle();
+
+		const resumed = configured();
+		enabled.set(true);
+		await resumed;
+		await push(3);
+		await settle();
+
+		expect(rendition.config.peek()).toEqual(entry as never);
+	} finally {
+		LaggingAudioEncoder.metadata = undefined;
+	}
+});
 
 // The encoder outlives a demand gap, so chunks it held when demand disappeared surface after the
 // resume. Written after the marker, they would put pre-gap media on the live edge, and a rounding
