@@ -108,14 +108,24 @@ async fn main() -> anyhow::Result<()> {
 
 	let drained = async { while tasks.join_next().await.is_some() {} };
 
-	tokio::select! {
-		_ = stop => tracing::info!("duration elapsed, stopping"),
-		_ = tokio::signal::ctrl_c() => tracing::info!("interrupted, stopping"),
-		_ = drained => anyhow::bail!("all benchmark connections ended"),
+	let stopped = tokio::select! {
+		_ = stop => {
+			tracing::info!("duration elapsed, stopping");
+			Ok(())
+		},
+		_ = tokio::signal::ctrl_c() => {
+			tracing::info!("interrupted, stopping");
+			Ok(())
+		},
+		_ = drained => Err(anyhow::anyhow!("all benchmark connections ended")),
 		// The reporter only returns on a stats-output failure; die loudly rather
 		// than exit green with a partial JSONL file.
-		res = &mut reporter => res??,
-	}
+		res = &mut reporter => res.map_err(anyhow::Error::from).flatten(),
+	};
+
+	tasks.shutdown().await;
+	client.close().await;
+	stopped?;
 
 	stats.ensure_delivery(config.expects_delivery())
 }
