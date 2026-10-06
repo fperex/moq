@@ -11,6 +11,10 @@ it locally. On macOS or Linux, install it with
 `curl -fsSL https://moq.sh | sh`, or use cargo, brew, apt, dnf, winget, or
 Docker; see [Install](/setup/install).
 
+`SIGINT` and, on Unix, `SIGTERM` stop the running stages or native player.
+The CLI sends the QUIC connection close before exiting, so the relay does not
+wait for an idle timeout to notice the disconnect.
+
 ## What it does
 
 | Verb | Endpoint | |

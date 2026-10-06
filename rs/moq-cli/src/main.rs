@@ -492,9 +492,28 @@ async fn run_play(moq: MoqSide, args: play::Args, net: Net) -> anyhow::Result<()
 		..Default::default()
 	};
 	let client = net.client(moq.client.clone())?;
-	let Attached { origin, .. } = spawn_moq(&moq, &net, client, cluster, directions, &mut tasks).await?;
+	let mut connection = None;
+	let result = async {
+		let Attached {
+			origin,
+			connection: attached,
+			..
+		} = spawn_moq(&moq, &net, client.clone(), cluster, directions, &mut tasks).await?;
+		connection = attached;
 
-	play::run(origin.consume(), name, args, tasks)
+		play::run(origin.consume(), name, args, tasks)
+	}
+	.await;
+
+	// The process exits next, even when the window never opened, so the relay only
+	// hears we left if the close goes out now. See `run_stages`.
+	if let Some(connection) = connection
+		&& let Err(err) = connection.close().await
+	{
+		tracing::warn!(%err, "closed before delivering everything");
+	}
+	client.close().await;
+	result
 }
 
 /// Run every stage over one Origin and one MoQ attachment.
@@ -864,6 +883,41 @@ mod tests {
 	use std::pin::Pin;
 
 	type Pipeline = Pin<Box<dyn Future<Output = anyhow::Result<()>>>>;
+
+	/// Deliver a real `signal` to this process once `shutdown_signal` is listening.
+	///
+	/// A signal can't be mocked and is process-wide, so these rely on nextest running
+	/// each test in its own process. Sent before the handler exists, it would take the
+	/// default action and kill the test binary.
+	#[cfg(unix)]
+	async fn signal_exits(signal: &str) {
+		let mut waiting = std::pin::pin!(shutdown_signal());
+		std::future::poll_fn(|cx| {
+			assert!(waiting.as_mut().poll(cx).is_pending());
+			std::task::Poll::Ready(())
+		})
+		.await;
+		assert!(
+			std::process::Command::new("/bin/kill")
+				.args([signal, &std::process::id().to_string()])
+				.status()
+				.unwrap()
+				.success()
+		);
+		waiting.await.unwrap();
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn sigterm_stops_the_cli() {
+		signal_exits("-TERM").await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn sigint_stops_the_cli() {
+		signal_exits("-INT").await;
+	}
 
 	/// A local pipeline that dies takes the process with it, even while another one is
 	/// still running. Reporting completion from inside the task instead would miss
