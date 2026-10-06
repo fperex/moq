@@ -18,6 +18,7 @@ import type { Sync } from "../sync";
 import { reportTransport, supportsSharedArrayBuffer } from "./buffer";
 import { AUTO_MAX_AGE, target } from "./latency";
 import type { Snapshot } from "./playout";
+import type { Close } from "./render";
 // A blob: URL, or a hosted file when assets() is set; see vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -260,7 +261,12 @@ export class Decoder {
 				channelCountMode: "explicit",
 				outputChannelCount: [channelCount],
 			});
-			effect.cleanup(() => worklet.disconnect());
+			effect.cleanup(() => {
+				// The context outlives this node, so the processor has to be told to end. See `Close`.
+				const close: Close = { type: "close" };
+				worklet.port.postMessage(close);
+				worklet.disconnect();
+			});
 
 			// Shared memory wherever the page can have it, for the page's own writes.
 			const shared = supportsSharedArrayBuffer();

@@ -1,6 +1,6 @@
 import { Time } from "@moq/net";
 import { Stretcher } from "./playout";
-import type { Message, State } from "./render";
+import type { Message, State, Unreadable } from "./render";
 import { AudioRingBuffer } from "./ring-buffer";
 import { SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -21,13 +21,32 @@ class Render extends AudioWorkletProcessor {
 	#timeline = 0;
 	// Whether the previous quantum ended short, so the next one fades back in.
 	#short = false;
+	// The state message, refilled for every post: `postMessage` copies it on the way out, so one
+	// object serves, rather than a fresh one for this thread's collector every few quanta.
+	#state?: State;
+	// Every port the ring is fed from: the node's own, plus any a writer off the main thread handed
+	// over. State reports go to all of them.
+	#ports: MessagePort[] = [];
+	// Whether a message has already failed to deserialize, which is said once. See #unreadable.
+	#unread = false;
+	// Whether the node is done with, so `process` ends the processor. See `Close`.
+	#closed = false;
+	// Whether the node's own port has been told the ring played, once a writer holds the others.
+	#played = false;
 
 	constructor() {
 		super();
+		this.#listen(this.port);
+	}
 
-		this.port.onmessage = (event: MessageEvent<Message>) => {
+	#listen(port: MessagePort): void {
+		this.#ports.push(port);
+		port.onmessageerror = () => this.#unreadable();
+		port.onmessage = (event: MessageEvent<Message>) => {
 			const msg = event.data;
-			if (msg.type === "init-shared") {
+			if (msg.type === "port") {
+				this.#listen(msg.port);
+			} else if (msg.type === "init-shared") {
 				console.log("[audio-worklet] init-shared: using SharedArrayBuffer path");
 				const previous = this.#backend instanceof SharedRingBuffer ? this.#backend : undefined;
 				this.#backend = new SharedRingBuffer(msg, previous);
@@ -49,8 +68,33 @@ class Render extends AudioWorkletProcessor {
 				// Only meaningful in post mode; shared mode resets via the control array.
 				this.#timeline = msg.timeline;
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.reset();
+			} else if (msg.type === "close") {
+				this.#closed = true;
+				this.#backend = undefined;
+				this.#engine = undefined;
+				this.#state = undefined;
+				for (const port of this.#ports) {
+					port.onmessage = null;
+					port.onmessageerror = null;
+					// The node's own port is the page's to close.
+					if (port !== this.port) port.close();
+				}
+				this.#ports.length = 0;
 			}
 		};
+	}
+
+	/**
+	 * Say once, on every port and in the console, that a message could not be deserialized (see
+	 * `Unreadable`). A page whose worker writes the ring takes the audio back on it; a page writing
+	 * the ring itself has nowhere else to play it, so the console is where it shows.
+	 */
+	#unreadable(): void {
+		if (this.#unread) return;
+		this.#unread = true;
+		console.error("[audio] the render worklet could not deserialize a message sent to it");
+		const msg: Unreadable = { type: "unreadable" };
+		for (const port of this.#ports) port.postMessage(msg);
 	}
 
 	/**
@@ -71,6 +115,9 @@ class Render extends AudioWorkletProcessor {
 	}
 
 	process(_inputs: Float32Array[][], outputs: Float32Array[][], _parameters: Record<string, Float32Array>) {
+		// Nothing feeds a node that is done with, so returning false ends the processor.
+		if (this.#closed) return false;
+
 		const output = outputs[0];
 		const backend = this.#backend;
 		const engine = this.#engine;
@@ -111,17 +158,38 @@ class Render extends AudioWorkletProcessor {
 			this.#stateCounter++;
 			if (this.#stateCounter >= 5) {
 				this.#stateCounter = 0;
-				const state: State = {
-					type: "state",
-					timestamp: backend.timestamp,
-					contextTime: Time.Second((currentFrame + output[0].length) / sampleRate),
-					timeline: this.#timeline,
-					playhead: backend.playhead,
-					stalled: backend.stalled,
-					underruns: backend.underruns,
-					debug: backend.debug(),
-				};
-				this.port.postMessage(state);
+				const contextTime = Time.Second((currentFrame + output[0].length) / sampleRate);
+				const playhead = backend.playhead;
+				const debug = backend.debug();
+				if (this.#state === undefined) {
+					this.#state = {
+						type: "state",
+						timestamp: backend.timestamp,
+						contextTime,
+						timeline: this.#timeline,
+						playhead,
+						stalled: backend.stalled,
+						underruns: backend.underruns,
+						debug,
+					};
+				} else {
+					this.#state.timestamp = backend.timestamp;
+					this.#state.contextTime = contextTime;
+					this.#state.timeline = this.#timeline;
+					this.#state.playhead = playhead;
+					this.#state.stalled = backend.stalled;
+					this.#state.underruns = backend.underruns;
+					this.#state.debug = debug;
+				}
+				for (const port of this.#ports) {
+					// The page only needs the first playback report when a writer off its thread owns the
+					// ring: it is how the page learns the worklet read what the writer sent.
+					if (port === this.port && this.#ports.length > 1) {
+						if (this.#played || debug.output === 0) continue;
+						this.#played = true;
+					}
+					port.postMessage(this.#state);
+				}
 			}
 		}
 

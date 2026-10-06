@@ -3,9 +3,41 @@ import type { Playhead } from "./playhead";
 import type { Snapshot } from "./playout";
 import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
-/** Everything the main thread sends the render worklet over its port. */
-export type Message = InitShared | InitPost | Data | Latency | Reset | Truncate;
-export type ToMain = State;
+/** Everything a writer sends the render worklet: over the node's own port, or over one handed to it as a {@link Port}. */
+export type Message = InitShared | InitPost | Data | Latency | Reset | Truncate | Port | Close;
+/** Playback reports and errors, sent by the render worklet. */
+export type ToMain = State | Unreadable;
+
+/**
+ * A message reached the worklet and could not be deserialized, so whatever it carried never arrived:
+ * a ring, samples, a flush. Sent once, the first time any port reports one.
+ *
+ * The ring cannot say so itself: it just plays silence.
+ */
+export interface Unreadable {
+	type: "unreadable";
+}
+
+/**
+ * Another port the worklet takes every other {@link Message} from, exactly as it takes them from its own.
+ *
+ * A writer that is not on the main thread (a dedicated worker) cannot reach the node's port, so the
+ * page hands the worklet one end of a channel and the writer the other, and the ring's writes never
+ * wait on the page's event loop. The writer gets every {@link State}; the page gets the first playback report.
+ */
+export interface Port {
+	type: "port";
+	port: MessagePort;
+}
+
+/**
+ * The node is done with: the processor stops rendering and lets the browser collect it. A processor
+ * whose `process` keeps returning true keeps running after its node is disconnected, for as long as the
+ * context is open, and the decoder rebuilds nodes in a context that stays open.
+ */
+export interface Close {
+	type: "close";
+}
 
 /** Init message when SharedArrayBuffer is available. */
 export interface InitShared extends SharedRingBufferInit {
