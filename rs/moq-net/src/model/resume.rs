@@ -1263,6 +1263,96 @@ mod test {
 		assert!(matches!(reading.read_frame().now_or_never(), Some(Err(Error::Old))));
 	}
 
+	/// A finished group of one frame at `ms`.
+	fn write_finished(track: &track::Producer, sequence: u64, ms: u64) {
+		let mut group = track.create_group(group::Info { sequence }).unwrap();
+		group.write_frame(ts(ms), b"x".as_ref()).unwrap();
+		group.finish().unwrap();
+	}
+
+	/// A reader holding an open group the route that served it never finishes, after the
+	/// front switched to a route that serves from a later group.
+	fn held_tail(
+		max_age: Duration,
+	) -> (
+		Producer,
+		track::Producer,
+		track::Subscriber,
+		group::Consumer,
+		group::Producer,
+	) {
+		let routes = Producer::new();
+		let logical = logical(&routes);
+		let a = copy();
+		routes.serve(a.consume());
+		let mut sub = subscribe(&logical, max_age);
+		write_finished(&a, 0, 0);
+		write_finished(&a, 1, 1000);
+		assert_eq!(recv(&mut sub).sequence, 0);
+		assert_eq!(recv(&mut sub).sequence, 1);
+
+		let mut open = a.create_group(group::Info { sequence: 2 }).unwrap();
+		open.write_frame(ts(2000), b"held".as_ref()).unwrap();
+		let mut held = recv(&mut sub);
+		assert_eq!(read(&mut held), Some(b"held".to_vec()));
+
+		let b = copy();
+		routes.serve(b.consume());
+		// The replaced route stays up but quiet: its group is never finished.
+		(routes, b, sub, held, open)
+	}
+
+	#[test]
+	fn a_held_tail_is_given_up_against_the_next_routes_successor() {
+		let (_routes, b, mut sub, mut held, _open) = held_tail(Duration::from_millis(100));
+		write_finished(&b, 3, 3000);
+		write_finished(&b, 4, 4000);
+		assert_eq!(recv(&mut sub).sequence, 3);
+		assert!(matches!(held.read_frame().now_or_never(), Some(Err(Error::Old))));
+	}
+
+	#[test]
+	fn a_held_tail_stays_while_its_successor_is_inside_the_budget() {
+		let (_routes, b, mut sub, mut held, _open) = held_tail(Duration::from_millis(100));
+		write_finished(&b, 3, 9_990);
+		write_finished(&b, 4, 10_000);
+		assert_eq!(recv(&mut sub).sequence, 3);
+		assert!(held.read_frame().now_or_never().is_none());
+
+		write_finished(&b, 5, 10_200);
+		assert!(matches!(held.read_frame().now_or_never(), Some(Err(Error::Old))));
+	}
+
+	#[test]
+	fn a_held_tail_after_a_continuation_is_given_up_against_the_next_route() {
+		let routes = Producer::new();
+		let logical = logical(&routes);
+		let a = copy();
+		routes.serve(a.consume());
+		let mut sub = subscribe(&logical, Duration::from_millis(100));
+
+		let mut head = a.create_group(group::Info { sequence: 0 }).unwrap();
+		head.write_frame(ts(0), b"head".as_ref()).unwrap();
+		let mut held = recv(&mut sub);
+		assert_eq!(read(&mut held), Some(b"head".to_vec()));
+
+		// The next route holds the same group with one more frame, which the held group continues into.
+		let b = copy();
+		let mut whole = b.create_group(group::Info { sequence: 0 }).unwrap();
+		whole.write_frame(ts(0), b"head".as_ref()).unwrap();
+		whole.write_frame(ts(10), b"continuation".as_ref()).unwrap();
+		routes.serve(b.consume());
+		assert_eq!(read(&mut held), Some(b"continuation".to_vec()));
+
+		// A third route serves only later groups, so nothing continues the open one.
+		let c = copy();
+		routes.serve(c.consume());
+		write_finished(&c, 1, 1000);
+		write_finished(&c, 2, 2000);
+		assert_eq!(recv(&mut sub).sequence, 1);
+		assert!(matches!(held.read_frame().now_or_never(), Some(Err(Error::Old))));
+	}
+
 	#[test]
 	fn datagrams_a_new_copy_replays_are_handed_out_once() {
 		let routes = Producer::new();
