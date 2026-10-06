@@ -43,10 +43,15 @@ type Arrival = { timestamp: number; arrival: number };
 /** What the caller already knows about one arrival, beyond the two clocks it carries. */
 export type JitterObservation = {
 	/**
-	 * The frame came out of order, whatever its timestamp says.
+	 * The frame is out of order for a reason that is not the path, so it says nothing about it.
 	 *
-	 * It is excluded from both the reference and the histogram: its arrival is early relative to its
-	 * timestamp, so counting it would add the media-time distance between the two to a delay.
+	 * An encoder reorders its own frames: a B frame is coded after the picture that follows it on
+	 * screen, so it arrives with a timestamp older than the frame before it however the path
+	 * behaves. Counting it would add the media-time distance between the two to a delay. It is
+	 * excluded from both the reference and the histogram.
+	 *
+	 * Without this, a frame whose timestamp is not newer than one already admitted is taken to have
+	 * been delivered late, and is measured as such.
 	 */
 	reordered?: boolean;
 
@@ -102,8 +107,12 @@ export class Jitter {
 	// the fastest recent arrival: the best-case path everything else is measured against.
 	#min: Arrival[] = [];
 
-	// The newest timestamp admitted so far. Anything not strictly newer is reordered.
+	// The newest timestamp admitted so far. Anything not strictly newer was overtaken on the way.
 	#newest?: number;
+
+	// The first timestamp admitted since the measurement began, which is where the media this
+	// estimate is about starts. Anything older belongs to a time before it.
+	#start?: number;
 
 	// The previous admitted arrival, on both axes, so a gap in the receiver's own reading is visible.
 	#previous?: Arrival;
@@ -158,12 +167,18 @@ export class Jitter {
 		const ts = timestamp / 1000;
 		const arrival = now as number;
 
-		if (reordered || (this.#newest !== undefined && ts <= this.#newest)) {
-			// Costing a reordered arrival as delay against loss is a separate step, not yet written.
+		if (reordered) {
+			this.#publish(arrival);
+			return;
+		}
+
+		if (this.#newest !== undefined && ts <= this.#newest) {
+			this.#overtaken(ts, arrival, stalled);
 			this.#publish(arrival);
 			return;
 		}
 		this.#newest = ts;
+		this.#start ??= ts;
 
 		// A gap in the receiver's own reading lands in every frame of the backlog it then reads, so
 		// drop the reference and measure those against each other. Idle time past the media it
@@ -208,9 +223,29 @@ export class Jitter {
 	reanchor(): void {
 		this.#min.length = 0;
 		this.#newest = undefined;
+		this.#start = undefined;
 		this.#previous = undefined;
 		this.#intervalStart = undefined;
 		this.#intervalMax = 0;
+	}
+
+	// A frame older than one already admitted: it left the sender first and got here after.
+	//
+	// Groups travel on streams of their own and a sender with several queued sends the newest first,
+	// so the frames of one flush reach the receiver newest first. The oldest is the frame the playhead
+	// needs first and the one that waited longest, which makes it the one the buffer is sized for:
+	// leaving it out leaves the estimate blind to exactly the flush it exists to measure. So it is
+	// measured against the reference like any other frame, but it can never be the reference, since
+	// a frame sent after it got here first.
+	#overtaken(ts: number, arrival: number, stalled: boolean): void {
+		// A blocked receiver's wait is not the path's. A frame from before the measurement began is
+		// the window a subscriber is served behind the live edge, which no depth of buffer makes
+		// playable.
+		if (stalled || this.#start === undefined || ts < this.#start) return;
+
+		// Admitted whenever a timestamp has been, so there is always a reference to measure against.
+		const ref = this.#min[0];
+		this.#resample(arrival, Math.max(0, arrival - ref.arrival - (ts - ref.timestamp)));
 	}
 
 	// Take at most one observation per RESAMPLE, the largest delay in the interval. That

@@ -873,6 +873,189 @@ test("Consumer continues an estimator it is handed rather than starting over", a
 	consumer.close();
 });
 
+// One AAC frame at 44.1kHz, in milliseconds of media.
+const AAC_FRAME = 1024 / 44.1;
+
+// What the audio ring adds to the estimate to get the age budget the consumer skips against: a
+// bucket, a frame and the reader's stretch band (`maxAgeHeadroom` in `@moq/watch`).
+const AAC_HEADROOM = 20 + 24 + 75;
+
+/** Let every consumer task that is ready run. A group is a stream of its own, so each arrives in a turn of its own. */
+async function ready(): Promise<void> {
+	for (let i = 0; i < 100; i++) await Promise.resolve();
+}
+
+/**
+ * An importer packing `size` AAC frames into each PES: a group per frame, all written the moment the
+ * PES completes, so the first frame of a flush is the one that waited longest. The relay serves the
+ * newest group first (`Priority` in `rs/moq-net/src/lite/priority.rs`), so `order: "newest"` is the
+ * order a flush reaches a receiver in when its groups are queued together.
+ *
+ * `headroom` closes the loop the player closes: the age budget is what the consumer measured plus
+ * that headroom, and the estimate starts at what the publisher declared.
+ */
+async function flushes(options: {
+	size: number;
+	count: number;
+	order: "oldest" | "newest";
+	headroom?: number;
+}): Promise<{ spread: Time.Milli; discontinuity: number; delivered: number[] }> {
+	const { size, count, order, headroom } = options;
+	let clock = 1000;
+	const now = spyOn(performance, "now").mockImplementation(() => clock);
+	// A blocked receiver is `stall.test.ts`'s business. Every arrival here is a healthy one.
+	const stall = spyOn(Stall.prototype, "blocked").mockImplementation(() => false);
+	const track = new Track.Producer("audio");
+	const maxAge = new Signal(Time.Milli(500));
+	const consumer = new Consumer(replay(track), {
+		format: new LegacyFormat("audio"),
+		maxAge,
+		jitter: Time.Milli(Math.ceil(size * AAC_FRAME)),
+	});
+
+	const delivered: number[] = [];
+	const reading = (async () => {
+		for (;;) {
+			const next = await consumer.next();
+			if (!next) return;
+			if (next.frame) delivered.push(next.frame.timestamp);
+		}
+	})();
+
+	try {
+		const budget = () => headroom !== undefined && maxAge.set(Time.Milli(consumer.spread.peek() + headroom));
+		budget();
+
+		for (let flush = 0; flush < count; flush++) {
+			const first = flush * size;
+			// The PES goes out when its last frame is complete.
+			clock = 1000 + (first + size) * AAC_FRAME;
+			const frames = Array.from({ length: size }, (_, i) => first + i);
+			if (order === "newest") frames.reverse();
+
+			for (const frame of frames) {
+				writeGroupWithLegacyFrames(track, frame, [Time.Micro(Math.round(frame * AAC_FRAME * 1000))]);
+				await ready();
+			}
+			budget();
+		}
+
+		return { spread: consumer.spread.peek(), discontinuity: consumer.discontinuity, delivered };
+	} finally {
+		consumer.close();
+		track.close();
+		await reading;
+		stall.mockRestore();
+		now.mockRestore();
+	}
+}
+
+// Groups travel on streams of their own, and a relay with several queued sends the newest first, so
+// a flush of audio frames reaches the receiver newest first. The oldest frame of a flush is the one
+// the playhead needs first and the one that waited longest, so it is the frame the estimate exists to
+// size for: reading the flush off the wire in either order has to give the same answer.
+test("Consumer measures a flush that reaches it newest first as the flush it is", async () => {
+	const oldest = await flushes({ size: 5, count: 30, order: "oldest" });
+	const newest = await flushes({ size: 5, count: 30, order: "newest" });
+
+	// Four frames of lead is 92.8ms, which the estimator reads as the 100ms bucket.
+	expect(oldest.spread).toBe(100 as Time.Milli);
+	expect(newest.spread).toBe(oldest.spread);
+});
+
+// What a measurement that cannot see the flush costs: the age budget follows it down below the span
+// of the flush, the head of the next one is convicted as a hole before the rest of it lands, and the
+// playhead is re-anchored on every flush.
+test("Consumer is not reset by a flush that reaches it newest first", async () => {
+	const result = await flushes({ size: 8, count: 30, order: "newest", headroom: AAC_HEADROOM });
+
+	expect(result.discontinuity).toBe(0);
+	// Seven frames of lead is 162.5ms, which is the 180ms bucket.
+	expect(result.spread).toBe(180 as Time.Milli);
+	// Delivery starts at the live edge, so the first flush comes out as it landed. Every later one is
+	// whole and in order.
+	const later = result.delivered.slice(8);
+	expect(result.delivered).toHaveLength(8 * 30);
+	expect(later).toEqual([...later].sort((a, b) => a - b));
+});
+
+// The encoder, not the path, reorders a group's own frames: a B frame is coded after the picture
+// that follows it on screen, so its timestamp is older than the frame that arrived before it.
+test("Consumer does not read an encoder's frame reordering as lateness", async () => {
+	let clock = 1000;
+	const now = spyOn(performance, "now").mockImplementation(() => clock);
+	const stall = spyOn(Stall.prototype, "blocked").mockImplementation(() => false);
+	const track = new Track.Producer("video");
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("video"), maxAge: Time.Milli(500) });
+
+	try {
+		const FRAME = 1000 / 24;
+		const group = new Group.Producer(0);
+		track.writeGroup(group);
+
+		// I P B B P B B, in the order they are coded: each P leaves the encoder when its own capture
+		// completes and the two B frames behind it follow at once.
+		let captured = 0;
+		for (let anchor = 0; anchor < 120; anchor += 3) {
+			for (const frame of anchor === 0 ? [0] : [anchor, anchor - 2, anchor - 1]) {
+				captured = Math.max(captured, frame);
+				clock = 1000 + captured * FRAME;
+				group.writeFrame({
+					payload: encodeLegacy(Time.Micro(Math.round(frame * FRAME * 1000))),
+					timestamp: Time.Timestamp.now(),
+				});
+				await ready();
+			}
+		}
+
+		// Two frames of reordering is 83ms; read as lateness it would put the estimate at 100ms.
+		expect(consumer.spread.peek()).toBeLessThanOrEqual(40 as Time.Milli);
+	} finally {
+		consumer.close();
+		track.close();
+		stall.mockRestore();
+		now.mockRestore();
+	}
+});
+
+// A subscriber is served the live edge and then the window behind it, newest first. That window is
+// media from before the subscription began, which no buffer depth makes playable, so it says nothing
+// about the path.
+test("Consumer does not read the window served behind the live edge as lateness", async () => {
+	let clock = 1000;
+	const now = spyOn(performance, "now").mockImplementation(() => clock);
+	const stall = spyOn(Stall.prototype, "blocked").mockImplementation(() => false);
+	const track = new Track.Producer("audio");
+	const consumer = new Consumer(replay(track), { format: new LegacyFormat("audio"), maxAge: Time.Milli(500) });
+
+	try {
+		const at = (frame: number) => Time.Micro(Math.round(frame * AAC_FRAME * 1000));
+		const LIVE = 100;
+
+		// The live edge first, then the eight frames before it, newest first.
+		writeGroupWithLegacyFrames(track, LIVE, [at(LIVE)]);
+		await ready();
+		for (let frame = LIVE - 1; frame >= LIVE - 8; frame--) {
+			writeGroupWithLegacyFrames(track, frame, [at(frame)]);
+			await ready();
+		}
+
+		// Then a perfectly paced publisher.
+		for (let frame = LIVE + 1; frame < LIVE + 130; frame++) {
+			clock = 1000 + (frame - LIVE) * AAC_FRAME;
+			writeGroupWithLegacyFrames(track, frame, [at(frame)]);
+			await ready();
+		}
+
+		expect(consumer.spread.peek()).toBeLessThanOrEqual(40 as Time.Milli);
+	} finally {
+		consumer.close();
+		track.close();
+		stall.mockRestore();
+		now.mockRestore();
+	}
+});
+
 // The arrival observation point is load-bearing enough to guard directly: a spy on the estimator
 // says exactly which frames were measured, at which arrival time, and what the consumer knew about
 // each of them.

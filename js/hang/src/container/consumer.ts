@@ -262,6 +262,11 @@ export class Consumer {
 						}
 					}
 
+					// An encoder reorders its own frames (a B frame is coded after the picture that follows
+					// it), so a frame older than one of its own group's is decode order, not the path. A
+					// frame older than one of another group's is the path: groups are streams of their own.
+					const reordered = !marker && group.latest !== undefined && frame.timestamp <= group.latest;
+
 					group.start ??= frame.timestamp;
 					group.frames.push(frame);
 
@@ -282,7 +287,7 @@ export class Consumer {
 					// the group: a reneged straggler is already gone, a rewound group has already
 					// aborted the track above, and a target derived from what survives the budget
 					// would only ever confirm the budget it was cut to.
-					if (!marker) this.#spread.observe(frame.timestamp, now, { stalled });
+					if (!marker) this.#spread.observe(frame.timestamp, now, { stalled, reordered });
 
 					let skipped = false;
 					if (group.consumer.sequence !== this.#active) {

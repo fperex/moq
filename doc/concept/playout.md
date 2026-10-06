@@ -86,27 +86,57 @@ slow build-up. A hundred frames each 2 ms late read as a hundred tiny
 observations. Here they read as a delay climbing to 200 ms, which is what the
 buffer actually has to absorb.
 
-## Reordered arrivals are excluded
+## Reordered arrivals
 
-A frame whose timestamp is not strictly newer than the newest admitted
-timestamp is reordered. There are no sequence numbers to unwrap, so the
-timestamp is the test.
+A frame whose timestamp is not strictly newer than the newest admitted timestamp
+arrived out of order. There are no sequence numbers to unwrap, so the timestamp is
+the test. It means one of two things, and the timing cannot say which.
 
-A reordered frame is excluded from both the reference deque and the histogram.
-Its arrival is early relative to its timestamp, so `arrival(p) - arrival(ref)`
-is positive while the timestamp difference is negative, and the media-time
-distance between the two frames is added straight into the delay. That is the
-same failure this whole page exists to prevent, a media-time distance leaking
-into a delay measurement, and it arrives through the front door:
-`Container.Consumer` takes groups off the wire in delivery order and sorts them
-afterwards, so out-of-order observation is ordinary input.
+**The path delivered it late.** Groups travel on streams of their own, and a
+sender with several queued sends the newest first (`Priority` in
+`rs/moq-net/src/lite/priority.rs`), so the frames of one flush reach the receiver
+newest first. The oldest frame of a flush is the one the playhead needs first and
+the one that waited longest, which makes it the frame the estimate exists to size
+for. Leaving it out blinds the estimator to exactly the flush it is measuring:
+every frame it keeps is the fastest of its flush, so the delays read zero and the
+target sits at its floor while every flush runs the ring dry. The age budget is
+derived from the target, so a flush wider than the budget is then read as a hole
+before the rest of it lands, and the playhead is re-anchored on every flush, which
+also drops the open resample interval and starves the estimator of the very
+observations that would raise it.
+
+So an overtaken frame is measured against the reference like any other, with the
+same formula, and counts toward its interval's maximum. It is never added to the
+reference deque, never moves the newest timestamp and never touches the reading
+gap: it left before a frame that got here first, so it cannot be the fastest
+arrival. The same flush reads the same whichever order it arrives in.
+
+**The sender reordered its own frames.** A B frame is coded after the picture that
+follows it on screen, so its timestamp is older than the frame before it however
+the path behaves, and the media-time distance between the two would be added
+straight into the delay. That is the failure this whole page exists to prevent,
+arriving through the front door. Only the caller can tell the two apart: `observe`
+takes `reordered` alongside `stalled`, and a frame carrying it is excluded from
+both the reference and the histogram. `Container.Consumer` sets it for a frame
+older than one from its own group, which is one stream in the encoder's order. A
+frame older than one from another group is the path's.
+
+Two more frames are excluded, because they say nothing about the path:
+
+- An overtaken frame older than the first one admitted since the measurement
+  began (`reanchor()` starts it over). A subscriber is served the live edge first
+  and the window behind it after, which is media from before the subscription that
+  no depth of buffer makes playable. The `tune-in-window` case holds that line.
+- An overtaken frame the receiver itself kept waiting (`stalled`), for the reason
+  in the next section.
 
 Everything else about the frame is unaffected: it is still published, still
 decoded, still played.
 
 Costing reordering explicitly as delay against loss, the way WebRTC's
-`ReorderOptimizer` does, is a later step. The target is the underrun estimate
-alone until then.
+`ReorderOptimizer` does, is a later step. Until then an overtaken frame counts in
+full toward its interval's maximum, and the 95th percentile of the histogram is
+what forgives the rare one.
 
 ## The receiver's own reading gap
 
@@ -424,8 +454,9 @@ measuring 20 ms would be pinned at 300.
 ## Re-anchoring
 
 A timeline discontinuity moves the media axis underneath the measurement.
-`reanchor()` clears the reference deque, the newest timestamp, the previous
-arrival and the open interval. It keeps the histogram.
+`reanchor()` clears the reference deque, the newest timestamp, where the
+measurement began, the previous arrival and the open interval. It keeps the
+histogram.
 
 The reasoning is that the histogram holds delays, and a jump in the timeline
 does not move a delay. The reference deque holds absolute pairs from a timeline
@@ -718,6 +749,11 @@ The same list, from the Rust side. Each of these reads correct and is not.
   observation a track slower than two frames a second makes.
 - The reading gap is measured against the previous **admitted** arrival, so a
   reordered frame does not reset it, and `reanchor()` clears it.
+- A frame not newer than the newest admitted is measured against the reference
+  but never joins it: not the deque, not the newest timestamp, not the reading
+  gap. Only the `reordered` flag excludes one outright.
+- "Older than where the measurement began" is strictly older than the first
+  admitted timestamp. A frame equal to it is measured.
 - The fall's share is `floor(distance / 6.0 / 20.0) * 20.0`: a division, floored
   to a whole bucket before the maximum with one bucket. Multiplying by an `f64`
   sixth instead can land the floor a bucket lower.
@@ -762,10 +798,10 @@ The schema:
 }
 ```
 
-An arrival may carry `reordered: true` to force the reordered path,
-`stalled: true` to declare that the receiver itself was blocked before it, or
-`reanchor_before: true` to call `reanchor()` first. A case may carry
-`start_ms`, the publisher's declared flush span the estimator starts from.
+An arrival may carry `reordered: true` to exclude it as out of order for a reason
+that is not the path, `stalled: true` to declare that the receiver itself was
+blocked before it, or `reanchor_before: true` to call `reanchor()` first. A case
+may carry `start_ms`, the publisher's declared flush span the estimator starts from.
 `target_ms[i]` is the target after arrival `i`. The declaration aside, there is
 no catalog input: the estimator sees arrival timing and nothing else.
 
@@ -779,8 +815,11 @@ The cases, and what each one holds:
 | `burst-7` | The 7-frame PES packing the public relay serves. |
 | `slow-buildup` | A path degrading 2 ms per frame, which an inter-arrival estimator cannot see. |
 | `step-change` | A one-off jump in path delay does not become permanent. |
-| `reordered` | Out-of-order arrivals move nothing. |
+| `reordered` | A swapped pair the caller flags as the encoder's own order moves nothing. |
+| `swapped` | The same pairs unflagged: the older frame counts as the delay it cost. |
+| `newest-first` | The 7-frame PES delivered newest first reads the same 140 ms as `burst-7`. |
 | `tune-in-stale` | A stale frame then the live edge never inflates the target. |
+| `tune-in-window` | The live edge then the window behind it, newest first, never inflates the target. |
 | `tune-in-stall` | A receiver whose read loop blocks for 1500 ms does not read its own block as path delay. |
 | `pause-10s` | A gap decays the histogram toward a reset. |
 | `pause-10min` | The 60-interval catch-up cap. |

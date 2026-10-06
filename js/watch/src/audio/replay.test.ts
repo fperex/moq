@@ -80,6 +80,32 @@ describe.each(rings(44100))("%s ring, AAC source bursts", (_name, build) => {
 	});
 });
 
+// A flush reaches the estimator in the order the transport delivered it, and groups travel on streams
+// of their own: a sender with several queued sends the newest first. The ring is fed by the container
+// consumer, which hands a frame over once everything older has landed, so it sees the flush in
+// timeline order whichever way the wire carried it. The estimate has to size the ring for the flush
+// it plays, not for the order it happened to arrive in.
+describe.each(rings(44100))("%s ring, AAC flushes that arrive newest first", (_name, build) => {
+	it("sizes the ring for the flush it plays", () => {
+		const frameMs = 1024 / 44.1;
+		const inOrder: Arrival[] = [];
+		const newestFirst: Arrival[] = [];
+		for (let first = 0; first < 1400; first += 5) {
+			// Five frames per PES, written when the last one is complete.
+			const arrival = (first + 5) * frameMs + 50;
+			const flush = Array.from({ length: 5 }, (_, i) => ({ media: (first + i) * frameMs, arrival }));
+			inOrder.push(...flush);
+			newestFirst.push(...[...flush].reverse());
+		}
+
+		const settled = targetOf(newestFirst, frameMs);
+		expect(settled).toBe(targetOf(inOrder, frameMs));
+
+		const options = { rate: 44100, floorMs: frameMs, warmupMs: 5000, fixed: settled };
+		expect(clean(play(build, inOrder, options))).toEqual({ underruns: 0, skipped: 0 });
+	});
+});
+
 describe.each(RINGS)("%s ring replay", (_name, build) => {
 	// The target starts at the cold-start guess, is replaced by the first measurement half a second
 	// in, and falls once a second from there; every fall costs the ring the bucket it lands on.

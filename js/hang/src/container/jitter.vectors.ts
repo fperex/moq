@@ -30,7 +30,7 @@ export type Arrival = {
 	timestamp_us: number;
 	/** When it arrived, milliseconds on the receiver's monotonic clock. */
 	arrival_ms: number;
-	/** Force the reordered path, for a trace whose delivery order the timestamps do not show. */
+	/** Out of order for a reason that is not the path, such as an encoder's own frame order. */
 	reordered?: boolean;
 	/** The receiver was blocked before this arrival, which its timing alone cannot show. */
 	stalled?: boolean;
@@ -159,6 +159,33 @@ function paced(
 	return arrivals;
 }
 
+// The paced trace with every tenth pair of frames delivered swapped. The older frame takes a
+// detour and loses the race; the newer one keeps its own arrival time, so nothing about the path has
+// changed but the delivery order. `flag` marks the older one, which is what a caller that knows the
+// reorder is not the path's does.
+function swapped(flag: boolean): Arrival[] {
+	const arrivals = paced({ frames: 300, base: 50, spread: 2, seed: 11 });
+	for (let i = 9; i + 1 < arrivals.length; i += 10) {
+		const older = arrivals[i];
+		const newer = arrivals[i + 1];
+		arrivals[i] = newer;
+		arrivals[i + 1] = { ...older, arrival_ms: grid(newer.arrival_ms + 1), ...(flag ? { reordered: true } : {}) };
+	}
+	return arrivals;
+}
+
+// Every flush of `burst` frames delivered newest first, which is the order a sender with several
+// groups queued sends them in. The arrivals keep their times and only the frames change places.
+function newestFirst(arrivals: Arrival[], burst: number): Arrival[] {
+	const out: Arrival[] = [];
+	for (let i = 0; i < arrivals.length; i += burst) {
+		const flush = arrivals.slice(i, i + burst);
+		const times = flush.map((a) => a.arrival_ms).sort((a, b) => a - b);
+		for (const [j, a] of flush.reverse().entries()) out.push({ ...a, arrival_ms: times[j] });
+	}
+	return out;
+}
+
 function shift(arrivals: Arrival[], ms: number): Arrival[] {
 	return arrivals.map((a) => ({ ...a, arrival_ms: grid(a.arrival_ms + ms) }));
 }
@@ -237,19 +264,20 @@ function cases(): { name: string; description: string; start_ms?: number; arriva
 		{
 			name: "reordered",
 			description:
-				"Every tenth pair of frames is delivered swapped. The older one is excluded from the reference and the histogram, so the target matches the steady trace.",
-			arrivals: (() => {
-				const arrivals = paced({ frames: 300, base: 50, spread: 2, seed: 11 });
-				for (let i = 9; i + 1 < arrivals.length; i += 10) {
-					const older = arrivals[i];
-					const newer = arrivals[i + 1];
-					// The older frame takes a detour and loses the race. The newer one keeps its own
-					// arrival time, so nothing about the path has changed; only the delivery order has.
-					arrivals[i] = newer;
-					arrivals[i + 1] = { ...older, arrival_ms: grid(newer.arrival_ms + 1) };
-				}
-				return arrivals;
-			})(),
+				"Every tenth pair of frames is delivered swapped and the older one is flagged `reordered`, which is what a caller does for an encoder's own frame order. A flagged frame is excluded from the reference and the histogram, so the target matches the steady trace.",
+			arrivals: swapped(true),
+		},
+		{
+			name: "swapped",
+			description:
+				"The same swapped pairs, unflagged. The older frame of each pair left first and got here a frame late, which is the delay it cost: every resample interval reads 21ms, so the target settles one bucket above the steady trace. A frame that was overtaken counts against the reference but never becomes it.",
+			arrivals: swapped(false),
+		},
+		{
+			name: "newest-first",
+			description:
+				"Seven AAC frames per PES, delivered newest first, which is the order a sender with several groups queued sends them in. The oldest frame of a flush is the one the playhead needs first, so it is the one that has to be measured: the target reads the same 140ms flush span as `burst-7`.",
+			arrivals: newestFirst(paced({ frames: 301, burst: 7, base: 50, spread: 1, seed: 29 }), 7),
 		},
 		{
 			name: "tune-in-stale",
@@ -261,6 +289,25 @@ function cases(): { name: string; description: string; start_ms?: number; arriva
 					{ timestamp_us: 14_560_000, arrival_ms: 5 },
 				];
 				for (const a of paced({ frames: 500, base: 5, spread: 1, seed: 41, start: 14_580 })) arrivals.push(a);
+				return arrivals;
+			})(),
+		},
+		{
+			name: "tune-in-window",
+			description:
+				"The live edge, then the eight frames before it newest first, then 10s of clean audio. The window is media from before the measurement began, which no buffer depth makes playable, so it never inflates the target.",
+			arrivals: (() => {
+				const live = 14_560;
+				const arrivals: Arrival[] = [{ timestamp_us: live * 1000, arrival_ms: live + 5 }];
+				for (let i = 1; i <= 8; i++) {
+					arrivals.push({
+						timestamp_us: (live - i * FRAME_MS) * 1000,
+						arrival_ms: grid(live + 5 + i * 0.25),
+					});
+				}
+				for (const a of paced({ frames: 500, base: 5, spread: 1, seed: 41, start: live + FRAME_MS })) {
+					arrivals.push(a);
+				}
 				return arrivals;
 			})(),
 		},

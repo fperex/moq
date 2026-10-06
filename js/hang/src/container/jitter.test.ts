@@ -21,20 +21,38 @@ function observe(jitter: Jitter, media: number, arrival: number, observation?: J
  */
 function flush(
 	jitter: Jitter,
-	options: { frames: number; burst?: number; base?: number; start?: number; frame?: number },
+	options: { frames: number; burst?: number; base?: number; start?: number; frame?: number; newest?: boolean },
 ): number {
-	const { frames, burst = 1, base = 50, start = 0, frame = FRAME } = options;
+	const { frames, burst = 1, base = 50, start = 0, frame = FRAME, newest = false } = options;
 	let held: number[] = [];
 
 	for (let i = 0; i < frames; i++) {
 		const media = start + i * frame;
 		held.push(media);
 		if (held.length < burst) continue;
-		for (const m of held) observe(jitter, m, media + base);
+		for (const m of newest ? held.reverse() : held) observe(jitter, m, media + base);
 		held = [];
 	}
 
 	return start + frames * frame;
+}
+
+/**
+ * The paced sender again, except that the older frame of every tenth pair loses a race with its
+ * successor. The successor keeps its own arrival time, so nothing about the path changed but the
+ * delivery order, and the older frame lands a frame later than it would have.
+ */
+function swap(jitter: Jitter, observation: JitterObservation): void {
+	for (let i = 0; i < 300; i++) {
+		const media = i * FRAME;
+		if (i % 10 === 9) continue;
+		if (i % 10 === 8) {
+			observe(jitter, media + FRAME, media + FRAME + 50);
+			observe(jitter, media, media + FRAME + 51, observation);
+			continue;
+		}
+		observe(jitter, media, media + 50);
+	}
 }
 
 describe("tune-in", () => {
@@ -147,25 +165,65 @@ describe("steady state", () => {
 });
 
 describe("reordering", () => {
-	it("excludes an arrival that is not strictly newer", () => {
+	// Groups travel on streams of their own and a sender with several queued sends the newest
+	// first, so a flush reaches the receiver newest first. Its oldest frame is the one the playhead
+	// needs first, so reading a flush in either order has to give the same answer.
+	it("reads a flush that arrives newest first as the flush it is", () => {
+		const oldest = new Jitter();
+		const newest = new Jitter();
+
+		flush(oldest, { frames: 300, burst: 7 });
+		flush(newest, { frames: 300, burst: 7, newest: true });
+
+		expect(oldest.value.peek()).toBe(140 as Time.Milli);
+		expect(newest.value.peek()).toBe(oldest.value.peek());
+	});
+
+	// A stall raises the target at once. What brings it back down is what the flush keeps asking for,
+	// so a flush the estimator cannot see leaves nothing to hold it up: the stall's rise decays to the
+	// floor and the ring runs dry again on every flush.
+	it("holds the flush span once a stall has raised the target", () => {
+		const jitter = new Jitter();
+		let next = flush(jitter, { frames: 210, burst: 7, newest: true });
+		expect(jitter.value.peek()).toBe(140 as Time.Milli);
+
+		// One flush arrives 120ms late.
+		next = flush(jitter, { frames: 7, burst: 7, base: 50 + 120, start: next, newest: true });
+
+		// Then a minute of the same flush, which is three times what the histogram remembers.
+		let highest = Time.Milli.zero;
+		let lowest = Time.Milli(Number.POSITIVE_INFINITY);
+		for (let i = 0; i < 60; i++) {
+			next = flush(jitter, { frames: 49, burst: 7, start: next, newest: true });
+			highest = Time.Milli.max(highest, jitter.value.peek());
+			lowest = Time.Milli.min(lowest, jitter.value.peek());
+		}
+
+		expect(highest).toBeGreaterThan(140 as Time.Milli);
+		expect(lowest).toBe(140 as Time.Milli);
+	});
+
+	// The path delivered it late, so that is what it costs: the swapped pair is the same path as the
+	// paced one, except that the older frame of each arrives a frame later than it would have.
+	it("counts a frame that was overtaken on the way as the delay it cost", () => {
 		const paced = new Jitter();
 		const swapped = new Jitter();
 
 		flush(paced, { frames: 300 });
+		swap(swapped, {});
 
-		// The same path, except every tenth frame loses a race with its successor. The successor
-		// keeps its own arrival time, so nothing about the path changed.
-		for (let i = 0; i < 300; i++) {
-			const media = i * FRAME;
-			if (i % 10 === 9) continue;
-			if (i % 10 === 8) {
-				observe(swapped, media + FRAME, media + FRAME + 50);
-				observe(swapped, media, media + FRAME + 51);
-				observe(swapped, media, media + 50);
-				continue;
-			}
-			observe(swapped, media, media + 50);
-		}
+		expect(paced.value.peek()).toBe(20 as Time.Milli);
+		expect(swapped.value.peek()).toBe(40 as Time.Milli);
+	});
+
+	// An encoder reorders its own frames, which says nothing about the path. Whoever knows that says
+	// so, and the frame moves nothing.
+	it("excludes a frame the caller says is not evidence", () => {
+		const paced = new Jitter();
+		const swapped = new Jitter();
+
+		flush(paced, { frames: 300 });
+		swap(swapped, { reordered: true });
 
 		expect(swapped.value.peek()).toBe(paced.value.peek());
 	});
@@ -175,9 +233,35 @@ describe("reordering", () => {
 		flush(jitter, { frames: 500 });
 		const settled = jitter.value.peek();
 
-		// A frame the caller already knows arrived out of order. Half a second late, so it would
-		// otherwise raise the target by a lot.
+		// A frame the caller already knows is not evidence. Half a second late, so it would otherwise
+		// raise the target by a lot.
 		observe(jitter, 500 * FRAME, 500 * FRAME + 550, { reordered: true });
+		expect(jitter.value.peek()).toBe(settled);
+	});
+
+	// A subscriber is served the live edge first and the window behind it after: media from before
+	// the measurement began, which no depth of buffer makes playable.
+	it("excludes a frame from before the measurement began", () => {
+		const jitter = new Jitter();
+		const live = 100 * FRAME;
+
+		observe(jitter, live, live + 50);
+		for (let i = 1; i <= 8; i++) observe(jitter, live - i * FRAME, live + 50 + i);
+		flush(jitter, { frames: 300, start: live + FRAME });
+
+		expect(jitter.value.peek()).toBe(20 as Time.Milli);
+	});
+
+	// A read loop that was blocked stamps the whole backlog behind it late, in whatever order the
+	// transport left it.
+	it("does not measure an overtaken frame the receiver kept waiting", () => {
+		const jitter = new Jitter();
+		flush(jitter, { frames: 200 });
+		const settled = jitter.value.peek();
+
+		// Half a second late, older than the newest frame, and flagged as having come out of a block.
+		observe(jitter, 199 * FRAME - 5 * FRAME, 199 * FRAME + 550, { stalled: true });
+		flush(jitter, { frames: 100, start: 200 * FRAME });
 		expect(jitter.value.peek()).toBe(settled);
 	});
 });

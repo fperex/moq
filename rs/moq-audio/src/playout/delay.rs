@@ -78,11 +78,17 @@ struct Arrival {
 /// What the caller already knows about one arrival, beyond the two clocks it carries.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Observation {
-	/// The frame came out of order, whatever its timestamp says.
+	/// The frame is out of order for a reason that is not the path, so it says
+	/// nothing about it.
 	///
-	/// It is excluded from both the reference and the histogram: its arrival is early
-	/// relative to its timestamp, so counting it would add the media-time distance
-	/// between the two into a delay measurement.
+	/// An encoder reorders its own frames: a B frame is coded after the picture that
+	/// follows it on screen, so it arrives with a timestamp older than the frame
+	/// before it however the path behaves. Counting it would add the media-time
+	/// distance between the two into a delay. It is excluded from both the reference
+	/// and the histogram.
+	///
+	/// Without this, a frame whose timestamp is not newer than one already admitted
+	/// is taken to have been delivered late, and is measured as such.
 	pub reordered: bool,
 
 	/// The receiver itself was blocked before this arrival, so the wait in it is not
@@ -101,9 +107,14 @@ pub(crate) struct Jitter {
 	/// `arrival - timestamp`, so the front is the fastest recent arrival.
 	min: VecDeque<Arrival>,
 
-	/// The newest timestamp admitted so far. Anything not strictly newer is
-	/// reordered.
+	/// The newest timestamp admitted so far. Anything not strictly newer was
+	/// overtaken on the way.
 	newest: Option<f64>,
+
+	/// The first timestamp admitted since the measurement began, which is where the
+	/// media this estimate is about starts. Anything older belongs to a time before
+	/// it.
+	start: Option<f64>,
 
 	/// The last arrival admitted, on both axes, so the next one can tell a gap in
 	/// this receiver's own reading from a gap on the path.
@@ -161,6 +172,7 @@ impl Jitter {
 		Self {
 			min: VecDeque::new(),
 			newest: None,
+			start: None,
 			previous: None,
 			buckets,
 			adds: 0,
@@ -178,22 +190,27 @@ impl Jitter {
 	/// it arrived, in milliseconds on a monotonic local clock.
 	///
 	/// What the caller knows and the two clocks do not show goes in `observation`:
-	/// that the frame came out of order, or that the receiver itself was blocked
-	/// before it landed. A frame whose timestamp is not strictly newer than the newest
-	/// admitted one is treated as reordered whatever the caller says.
+	/// that the frame is out of order for a reason that is not the path, or that the
+	/// receiver itself was blocked before it landed. A frame whose timestamp is not
+	/// strictly newer than the newest admitted one was overtaken on the way.
 	pub(crate) fn observe(&mut self, timestamp: Duration, now: f64, observation: Observation) {
 		// Milliseconds on both axes from here down, so the unit is visible in the
 		// arithmetic. The two clocks are never compared: every formula below is a
 		// difference of differences, so a constant offset between them cancels.
 		let ts = timestamp.as_secs_f64() * 1000.0;
 
-		if observation.reordered || self.newest.is_some_and(|newest| ts <= newest) {
-			// Costing a reordered arrival as delay against loss is a separate step,
-			// not yet written.
+		if observation.reordered {
+			self.publish(now);
+			return;
+		}
+
+		if self.newest.is_some_and(|newest| ts <= newest) {
+			self.overtaken(ts, now, observation.stalled);
 			self.publish(now);
 			return;
 		}
 		self.newest = Some(ts);
+		self.start.get_or_insert(ts);
 
 		// The arrival clock is sampled by whoever calls this, so time that caller
 		// spent not reading lands in the next arrival it stamps and looks exactly
@@ -261,9 +278,35 @@ impl Jitter {
 	pub(crate) fn reanchor(&mut self) {
 		self.min.clear();
 		self.newest = None;
+		self.start = None;
 		self.previous = None;
 		self.interval_start = None;
 		self.interval_max = 0.0;
+	}
+
+	// A frame older than one already admitted: it left the sender first and got
+	// here after.
+	//
+	// Groups travel on streams of their own and a sender with several queued sends
+	// the newest first, so the frames of one flush reach the receiver newest first.
+	// The oldest is the frame the playhead needs first and the one that waited
+	// longest, which makes it the one the buffer is sized for: leaving it out leaves
+	// the estimate blind to exactly the flush it exists to measure. So it is
+	// measured against the reference like any other frame, but it can never be the
+	// reference, since a frame sent after it got here first.
+	fn overtaken(&mut self, ts: f64, now: f64, stalled: bool) {
+		// A blocked receiver's wait is not the path's. A frame from before the
+		// measurement began is the window a subscriber is served behind the live
+		// edge, which no depth of buffer makes playable.
+		if stalled || self.start.is_none_or(|start| ts < start) {
+			return;
+		}
+
+		// Admitted whenever a timestamp has been, so there is always a reference to
+		// measure against.
+		let reference = self.min.front().copied().expect("a timestamp was admitted");
+		let delay = (now - reference.arrival - (ts - reference.timestamp)).max(0.0);
+		self.resample(now, delay);
 	}
 
 	/// The current target: enough buffer to play [`QUANTILE`] of arrivals on time.
@@ -608,15 +651,159 @@ mod tests {
 		assert_eq!(jitter.target(), settled);
 	}
 
+	/// Feed a paced sender with every tenth pair of frames swapped. The older frame
+	/// loses a race with its successor, which keeps its own arrival time, so nothing
+	/// about the path changed but the delivery order: the older frame lands a frame
+	/// later than it would have.
+	fn swapped(jitter: &mut Jitter, observation: Observation) {
+		for i in 0..300u64 {
+			let media = i * 20;
+			if i % 10 == 9 {
+				continue;
+			}
+			if i % 10 == 8 {
+				jitter.observe(
+					Duration::from_millis(media + 20),
+					(media + 20 + 50) as f64,
+					Observation::default(),
+				);
+				jitter.observe(Duration::from_millis(media), (media + 20 + 51) as f64, observation);
+				continue;
+			}
+			jitter.observe(
+				Duration::from_millis(media),
+				(media + 50) as f64,
+				Observation::default(),
+			);
+		}
+	}
+
+	/// Groups travel on streams of their own and a sender with several queued sends
+	/// the newest first, so a flush reaches the receiver newest first. Its oldest
+	/// frame is the one the playhead needs first, so reading a flush in either order
+	/// has to give the same answer.
 	#[test]
-	fn a_reordered_arrival_moves_nothing() {
+	fn a_flush_that_arrives_newest_first_reads_as_the_flush_it_is() {
+		let mut oldest = Jitter::new();
+		let mut newest = Jitter::new();
+
+		for first in (0..300u64).step_by(7) {
+			let flush = first + 6;
+			let frames = || first..(first + 7).min(300);
+			for i in frames() {
+				oldest.observe(
+					Duration::from_millis(i * 20),
+					(flush * 20 + 50) as f64,
+					Observation::default(),
+				);
+			}
+			for i in frames().rev() {
+				newest.observe(
+					Duration::from_millis(i * 20),
+					(flush * 20 + 50) as f64,
+					Observation::default(),
+				);
+			}
+		}
+
+		assert_eq!(oldest.target(), Duration::from_millis(140));
+		assert_eq!(newest.target(), oldest.target());
+	}
+
+	/// The path delivered it late, so that is what it costs.
+	#[test]
+	fn an_overtaken_frame_costs_the_delay_it_was_late_by() {
+		let mut paced = Jitter::new();
+		steady(&mut paced, 300, 20.0, 50.0, 0.0);
+
+		let mut swap = Jitter::new();
+		swapped(&mut swap, Observation::default());
+
+		assert_eq!(paced.target(), Duration::from_millis(20));
+		assert_eq!(swap.target(), Duration::from_millis(40));
+	}
+
+	/// An encoder reorders its own frames, which says nothing about the path. Whoever
+	/// knows that says so, and the frame moves nothing.
+	#[test]
+	fn a_frame_the_caller_flags_moves_nothing() {
+		let mut paced = Jitter::new();
+		steady(&mut paced, 300, 20.0, 50.0, 0.0);
+
+		let mut swap = Jitter::new();
+		swapped(
+			&mut swap,
+			Observation {
+				reordered: true,
+				..Default::default()
+			},
+		);
+
+		assert_eq!(swap.target(), paced.target());
+	}
+
+	/// A flagged frame is out whatever its timestamp says: here it is the newest yet,
+	/// and half a second late.
+	#[test]
+	fn an_explicit_reordered_flag_beats_a_newer_timestamp() {
 		let mut jitter = Jitter::new();
 		let now = steady(&mut jitter, 600, 20.0, 0.0, 0.0);
 		let settled = jitter.target();
 
-		// An old timestamp landing now would read as a delay the size of the gap
-		// between the two if it were admitted.
-		jitter.observe(Duration::from_millis(0), now + 10.0, Observation::default());
+		jitter.observe(
+			Duration::from_secs_f64(now / 1000.0 + 0.02),
+			now + 20.0 + 550.0,
+			Observation {
+				reordered: true,
+				..Default::default()
+			},
+		);
+		assert_eq!(jitter.target(), settled);
+	}
+
+	/// A subscriber is served the live edge first and the window behind it after:
+	/// media from before the measurement began, which no depth of buffer makes
+	/// playable.
+	#[test]
+	fn a_frame_from_before_the_measurement_began_moves_nothing() {
+		let mut jitter = Jitter::new();
+		let live = 100.0 * 20.0;
+
+		jitter.observe(
+			Duration::from_secs_f64(live / 1000.0),
+			live + 50.0,
+			Observation::default(),
+		);
+		for i in 1..=8 {
+			jitter.observe(
+				Duration::from_secs_f64((live - i as f64 * 20.0) / 1000.0),
+				live + 50.0 + i as f64,
+				Observation::default(),
+			);
+		}
+		steady(&mut jitter, 300, 20.0, 50.0, live + 20.0);
+
+		assert_eq!(jitter.target(), Duration::from_millis(20));
+	}
+
+	/// A read loop that was blocked stamps the whole backlog behind it late, in
+	/// whatever order the transport left it.
+	#[test]
+	fn an_overtaken_frame_the_receiver_kept_waiting_moves_nothing() {
+		let mut jitter = Jitter::new();
+		let now = steady(&mut jitter, 200, 20.0, 50.0, 0.0);
+		let settled = jitter.target();
+
+		// Half a second late, older than the newest frame, and out of a block.
+		jitter.observe(
+			Duration::from_millis(199 * 20 - 5 * 20),
+			now + 550.0,
+			Observation {
+				stalled: true,
+				..Default::default()
+			},
+		);
+		steady(&mut jitter, 100, 20.0, 50.0, 200.0 * 20.0);
 		assert_eq!(jitter.target(), settled);
 	}
 
