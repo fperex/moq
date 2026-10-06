@@ -754,6 +754,48 @@ test("tryOpen gives up when the peer never frees a slot", async () => {
 	await aborted;
 });
 
+// WebKit deadlocks a thread that starts a garbage collection inside `releaseLock()`, and every
+// session accepts a bidi stream right after it connects, so the reader is never handed back.
+test("accept reads a session's bidi streams through one reader it never releases", async () => {
+	let controller!: ReadableStreamDefaultController<WebTransportBidirectionalStream>;
+	const incoming = new ReadableStream<WebTransportBidirectionalStream>({
+		start(c) {
+			controller = c;
+		},
+	});
+	let readers = 0;
+	let releases = 0;
+	const getReader = incoming.getReader.bind(incoming);
+	Object.defineProperty(incoming, "getReader", {
+		value: () => {
+			readers++;
+			const reader = getReader();
+			const release = reader.releaseLock.bind(reader);
+			reader.releaseLock = () => {
+				releases++;
+				release();
+			};
+			return reader;
+		},
+	});
+	const quic = { incomingBidirectionalStreams: incoming } as unknown as WebTransport;
+	const bidi = () =>
+		({
+			readable: new ReadableStream<Uint8Array>(),
+			writable: new WritableStream<Uint8Array>(),
+		}) as WebTransportBidirectionalStream;
+
+	controller.enqueue(bidi());
+	controller.enqueue(bidi());
+	expect(await Stream.accept(quic, QUIC)).toBeInstanceOf(Stream);
+	expect(await Stream.accept(quic, QUIC)).toBeInstanceOf(Stream);
+	controller.close();
+	expect(await Stream.accept(quic, QUIC)).toBeUndefined();
+
+	expect(readers).toBe(1);
+	expect(releases).toBe(0);
+});
+
 test("tryOpen returns the stream when a slot is available", async () => {
 	const { quic, freeSlot } = stalledTransport();
 
