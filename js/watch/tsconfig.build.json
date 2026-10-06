@@ -3,5 +3,5 @@
 	// are neither published nor discovered by `bun test` at the package root.
 	// `tsc --noEmit` still uses tsconfig.json, so they stay type-checked.
 	"extends": "./tsconfig.json",
-	"exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/audio/playout/fixture.ts"]
+	"exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/audio/fake.ts", "src/audio/playout/fixture.ts"]
 }
