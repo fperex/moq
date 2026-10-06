@@ -186,7 +186,10 @@ export class Capture {
 			latencyHint: "interactive",
 			sampleRate,
 		});
-		effect.cleanup(() => context.close());
+		// Closes the context once every processor built below has stopped, which the graph tells them to
+		// later in this same teardown.
+		const processors = new Processors(context);
+		effect.cleanup(() => processors.close());
 
 		// Nothing guarantees a gesture has happened yet: a pre-granted microphone reaches here on page
 		// load. A context built then starts suspended and renders nothing until one arrives.
@@ -247,9 +250,16 @@ export class Capture {
 					// tracks share an epoch and stay in sync.
 					processorOptions: { zero: performance.now() * 1000 },
 				});
+				processors.add(worklet);
 				// The edge originates at root, so only root can remove it; the worklet has no outputs.
 				root.connect(worklet);
-				inner.cleanup(() => root.disconnect(worklet));
+				inner.cleanup(() => {
+					// The processor answers "stopped" once it has (see capture-worklet.ts). The messages are
+					// not shared as types: that file is built for the audio thread, and importing it here
+					// pulls its globals into every package that typechecks this one.
+					worklet.port.postMessage({ type: "close" });
+					root.disconnect(worklet);
+				});
 
 				const fanout = new Fanout(this.#drain(worklet, context.sampleRate, inner), { queue: QUEUE });
 				inner.cleanup(() => fanout.close());
@@ -291,6 +301,65 @@ export class Capture {
 	/** Stop capturing and release the graph. */
 	close(): void {
 		this.#signals.close();
+	}
+}
+
+/**
+ * The processors built in one AudioContext, which closes it once every one of them has stopped.
+ *
+ * Chromium keeps a closed context, and every node in it, for as long as one of its processors has not
+ * stopped, and a processor only stops in a quantum its context renders. So a running context is closed
+ * once each processor has said it stopped (see capture-worklet.ts), and one that renders nothing (suspended for
+ * want of a gesture, interrupted, failed) is closed at once: its processors can never stop, and waiting
+ * would only hold it open.
+ */
+class Processors {
+	readonly #context: AudioContext;
+	// Every processor that has not said it stopped.
+	readonly #active = new Set<AudioWorkletNode>();
+	// Owns every listener, all released once the context is closed.
+	readonly #signals = new Effect();
+	#closing = false;
+
+	constructor(context: AudioContext) {
+		this.#context = context;
+	}
+
+	/** Follow the processor behind `node` until it says it stopped, or fails, which stops it too. */
+	add(node: AudioWorkletNode): void {
+		this.#active.add(node);
+		const dispose = this.#signals.run((effect) => {
+			const stop = () => {
+				dispose();
+				this.#active.delete(node);
+				if (this.#closing && this.#active.size === 0) this.#close();
+			};
+			effect.event(node.port, "message", (event) => {
+				if ((event as MessageEvent<{ type?: string }>).data?.type === "stopped") stop();
+			});
+			effect.event(node, "processorerror", stop);
+			// A port only delivers to listeners added with addEventListener once it is started.
+			node.port.start();
+		});
+	}
+
+	/** Close the context once every processor in it has stopped, or now if it renders nothing. */
+	close(): void {
+		this.#closing = true;
+		if (this.#active.size === 0 || this.#context.state !== "running") {
+			this.#close();
+			return;
+		}
+		// A context that stops rendering never runs the quantum a processor would stop in.
+		this.#signals.event(this.#context, "statechange", () => {
+			if (this.#context.state !== "running") this.#close();
+		});
+	}
+
+	#close(): void {
+		this.#signals.close();
+		// There is nothing to do about a close that fails.
+		this.#context.close().catch(() => {});
 	}
 }
 
