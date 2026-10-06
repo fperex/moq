@@ -1,5 +1,6 @@
 import { Time } from "@moq/net";
 import { Effect, type Getter, Signal } from "@moq/signals";
+import type { Snapshot } from "./playout";
 import type { Data, InitPost, InitShared, Latency, Reset, State, Truncate } from "./render";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -109,6 +110,14 @@ export interface AudioBuffer {
 	/** How many times the ring has run dry mid-playback, cumulative. */
 	readonly underruns: Getter<number>;
 
+	/**
+	 * Every control slot at once: what the ring holds, what the playout engine did with it, and what
+	 * either end threw away. Undefined until the ring has reported once.
+	 *
+	 * @internal
+	 */
+	readonly debug: Getter<Snapshot | undefined>;
+
 	/** Release any resources (event listeners, intervals, etc.). */
 	close(): void;
 }
@@ -122,26 +131,34 @@ export function supportsSharedArrayBuffer(): boolean {
 	return true;
 }
 
+/** How the ring behind the worklet is built. */
+export interface AudioBufferProps {
+	/** Channels of planar PCM the graph runs at. */
+	channels: number;
+	/** Samples per second per channel. */
+	rate: number;
+	/** The initial playout target, in samples. */
+	latency: number;
+	/** Buffered mode: play through the whole lookahead instead of converging on the target. */
+	buffered: boolean;
+	/** Whether the reader conceals a gap with synthesized audio or plays it as a ramp into silence. */
+	conceal: boolean;
+}
+
 /**
  * Create the best audio buffer implementation for the current environment.
  * Picks `SharedAudioBuffer` when possible, falling back to `PostAudioBuffer`.
  */
-export function createAudioBuffer(
-	worklet: AudioWorkletNode,
-	channels: number,
-	rate: number,
-	latencySamples: number,
-	buffered = false,
-): AudioBuffer {
+export function createAudioBuffer(worklet: AudioWorkletNode, props: AudioBufferProps): AudioBuffer {
 	if (supportsSharedArrayBuffer()) {
 		console.log("[audio] using SharedArrayBuffer audio buffer");
-		return new SharedAudioBuffer(worklet, channels, rate, latencySamples, buffered);
+		return new SharedAudioBuffer(worklet, props);
 	}
 	console.warn(
 		"[audio] SharedArrayBuffer unavailable, falling back to the higher latency postMessage audio buffer. " +
 			"Serve the page cross-origin isolated (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp) to avoid this.",
 	);
-	return new PostAudioBuffer(worklet, channels, rate, latencySamples, buffered);
+	return new PostAudioBuffer(worklet, props);
 }
 
 /** SharedArrayBuffer-backed implementation. Writes go directly into shared memory. */
@@ -160,14 +177,21 @@ class SharedAudioBuffer implements AudioBuffer {
 	readonly #underruns = new Signal<number>(0);
 	readonly underruns: Getter<number> = this.#underruns;
 
+	readonly #debug = new Signal<Snapshot | undefined>(undefined);
+	readonly debug: Getter<Snapshot | undefined> = this.#debug;
+
 	#backpressure: Backpressure;
+	// Carried so a resize hands the replacement ring the same answer.
+	readonly #conceal: boolean;
 
 	#signals = new Effect();
 
-	constructor(worklet: AudioWorkletNode, channels: number, rate: number, latencySamples: number, buffered: boolean) {
+	constructor(worklet: AudioWorkletNode, props: AudioBufferProps) {
+		const { channels, rate, buffered, latency: latencySamples } = props;
 		this.#worklet = worklet;
 		this.channels = channels;
 		this.rate = rate;
+		this.#conceal = props.conceal;
 
 		// The ring holds the latency floor as decoded PCM (headroom above it for overflow). In
 		// buffered mode the lookahead above the floor stays encoded upstream, held back by `wait()`.
@@ -178,7 +202,7 @@ class SharedAudioBuffer implements AudioBuffer {
 		this.#ring = new SharedRingBuffer(init);
 		this.#ring.setLatency(latencySamples);
 
-		const msg: InitShared = { type: "init-shared", ...init };
+		const msg: InitShared = { type: "init-shared", ...init, conceal: this.#conceal };
 		worklet.port.postMessage(msg);
 
 		// Poll the shared control array and reflect it into signals.
@@ -187,6 +211,7 @@ class SharedAudioBuffer implements AudioBuffer {
 			this.#timestamp.set(this.#ring.timestamp);
 			this.#stalled.set(stalled);
 			this.#underruns.set(this.#ring.underruns);
+			this.#debug.set(this.#ring.debug());
 			// While stalled the playhead is parked, so release the decode loop to refill the floor;
 			// once playing, hold it to ~the floor ahead.
 			if (stalled) this.#backpressure.flush();
@@ -210,7 +235,7 @@ class SharedAudioBuffer implements AudioBuffer {
 			const newCapacity = Math.max(this.rate, samples * 2);
 			this.#ring = this.#ring.resize(newCapacity);
 
-			const msg: InitShared = { type: "init-shared", ...this.#ring.init };
+			const msg: InitShared = { type: "init-shared", ...this.#ring.init, conceal: this.#conceal };
 			this.#worklet.port.postMessage(msg);
 		}
 	}
@@ -254,12 +279,16 @@ class PostAudioBuffer implements AudioBuffer {
 	readonly #underruns = new Signal<number>(0);
 	readonly underruns: Getter<number> = this.#underruns;
 
+	readonly #debug = new Signal<Snapshot | undefined>(undefined);
+	readonly debug: Getter<Snapshot | undefined> = this.#debug;
+
 	// Backpressure runs off the playhead the worklet reports in its state messages.
 	#backpressure: Backpressure;
 
 	#signals = new Effect();
 
-	constructor(worklet: AudioWorkletNode, channels: number, rate: number, latencySamples: number, buffered: boolean) {
+	constructor(worklet: AudioWorkletNode, props: AudioBufferProps) {
+		const { channels, rate, buffered, conceal, latency: latencySamples } = props;
 		this.#worklet = worklet;
 		this.channels = channels;
 		this.rate = rate;
@@ -267,7 +296,7 @@ class PostAudioBuffer implements AudioBuffer {
 		this.#backpressure = new Backpressure(buffered, samplesToMicro(latencySamples, rate));
 
 		const latency = Time.Milli.fromSecond((latencySamples / rate) as Time.Second);
-		const msg: InitPost = { type: "init-post", channels, rate, latency, buffered };
+		const msg: InitPost = { type: "init-post", channels, rate, latency, buffered, conceal };
 		worklet.port.postMessage(msg);
 
 		// Listen for state updates from the worklet.
@@ -277,6 +306,7 @@ class PostAudioBuffer implements AudioBuffer {
 				this.#timestamp.set(data.timestamp);
 				this.#stalled.set(data.stalled);
 				this.#underruns.set(data.underruns);
+				this.#debug.set(data.debug);
 				// While stalled the playhead is parked, so release the decode loop to refill the floor;
 				// once playing, hold it to ~the floor ahead.
 				if (data.stalled) this.#backpressure.flush();

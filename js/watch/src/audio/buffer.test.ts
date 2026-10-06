@@ -10,7 +10,13 @@ describe("SharedAudioBuffer", () => {
 	it("parks the ring the worklet still reads when a rise grows it", () => {
 		const sent: InitShared[] = [];
 		const worklet = { port: { postMessage: (msg: InitShared) => sent.push(msg) } } as unknown as AudioWorkletNode;
-		const buffer = createAudioBuffer(worklet, 1, 1000, 100);
+		const buffer = createAudioBuffer(worklet, {
+			channels: 1,
+			rate: 1000,
+			latency: 100,
+			buffered: false,
+			conceal: true,
+		});
 		try {
 			const old = new SharedRingBuffer(sent[0]);
 			buffer.insert(0 as Time.Micro, [new Float32Array(100).fill(1.0)]);
@@ -30,7 +36,13 @@ describe("SharedAudioBuffer", () => {
 	// closed buffer, so a gated wait would never settle and would hold the decoder effect's rerun.
 	it("does not gate a wait on a closed buffer", async () => {
 		const worklet = { port: { postMessage: () => {} } } as unknown as AudioWorkletNode;
-		const buffer = createAudioBuffer(worklet, 1, 1000, 100, true);
+		const buffer = createAudioBuffer(worklet, {
+			channels: 1,
+			rate: 1000,
+			latency: 100,
+			buffered: true,
+			conceal: true,
+		});
 		buffer.insert(0 as Time.Micro, [new Float32Array(200)]);
 		const settles = (wait: Promise<void>) =>
 			Promise.race([

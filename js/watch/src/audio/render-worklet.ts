@@ -1,3 +1,4 @@
+import { Stretcher } from "./playout";
 import type { Message, State } from "./render";
 import { AudioRingBuffer } from "./ring-buffer";
 import { SharedRingBuffer } from "./shared-ring-buffer";
@@ -9,6 +10,9 @@ const RAMP = 64;
 class Render extends AudioWorkletProcessor {
 	// Set after init, depending on which path the main thread chose.
 	#backend?: SharedRingBuffer | AudioRingBuffer;
+	// The playout engine that decides what to do with the media the ring hands over. Outlives a
+	// shared-ring handover, because the counters it publishes describe the reader, not the ring.
+	#engine?: Stretcher;
 	#underflow = 0;
 	#stateCounter = 0;
 	// Whether the previous quantum ended short, so the next one fades back in.
@@ -23,13 +27,11 @@ class Render extends AudioWorkletProcessor {
 				console.log("[audio-worklet] init-shared: using SharedArrayBuffer path");
 				const previous = this.#backend instanceof SharedRingBuffer ? this.#backend : undefined;
 				this.#backend = new SharedRingBuffer(msg, previous);
-				this.#underflow = 0;
-				this.#short = false;
+				this.#reset(msg.rate, msg.channels, msg.conceal);
 			} else if (msg.type === "init-post") {
 				console.log("[audio-worklet] init-post: using postMessage path");
 				this.#backend = new AudioRingBuffer(msg);
-				this.#underflow = 0;
-				this.#short = false;
+				this.#reset(msg.rate, msg.channels, msg.conceal);
 			} else if (msg.type === "data") {
 				// Only meaningful in post mode.
 				if (this.#backend instanceof AudioRingBuffer) this.#backend.write(msg.timestamp, msg.data);
@@ -46,10 +48,29 @@ class Render extends AudioWorkletProcessor {
 		};
 	}
 
+	/**
+	 * Point the engine at a replacement ring.
+	 *
+	 * A resize hands over a ring on the same timeline, so the engine keeps its counters and only
+	 * drops the block it was holding; a different rate, channel count, or concealment setting is a
+	 * different reader and needs a different engine.
+	 */
+	#reset(rate: number, channels: number, conceal: boolean): void {
+		if (this.#engine?.rate !== rate || this.#engine.channels !== channels || this.#engine.conceal !== conceal) {
+			this.#engine = new Stretcher(rate, channels, conceal);
+		} else {
+			this.#engine.discontinuity();
+		}
+		this.#underflow = 0;
+		this.#short = false;
+	}
+
 	process(_inputs: Float32Array[][], outputs: Float32Array[][], _parameters: Record<string, Float32Array>) {
 		const output = outputs[0];
 		const backend = this.#backend;
-		const samplesRead = backend?.read(output) ?? 0;
+		const engine = this.#engine;
+		// `currentFrame` is the output clock the cooldown and the measured rate are counted in.
+		const samplesRead = backend && engine ? engine.render(backend, output, currentFrame) : 0;
 
 		if (samplesRead < output[0].length) {
 			// Fade the tail of what we did read down to the silence that follows it.
@@ -90,6 +111,7 @@ class Render extends AudioWorkletProcessor {
 					timestamp: backend.timestamp,
 					stalled: backend.stalled,
 					underruns: backend.underruns,
+					debug: backend.debug(),
 				};
 				this.port.postMessage(state);
 			}

@@ -50,8 +50,16 @@ class FakeContext extends EventTarget {
 	};
 }
 
+// What the page sent every render worklet it built.
+let posted: unknown[] = [];
+
 class FakeWorklet {
-	readonly port = Object.assign(new EventTarget(), { postMessage() {}, start() {} });
+	readonly port = Object.assign(new EventTarget(), {
+		postMessage(message: unknown) {
+			posted.push(message);
+		},
+		start() {},
+	});
 	disconnect() {}
 }
 
@@ -95,6 +103,7 @@ beforeEach(() => {
 	frameTimestamp = 0;
 	codecs = 0;
 	contexts = [];
+	posted = [];
 	moduleLoaded = Promise.resolve();
 	for (const name of globals) originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
 
@@ -175,7 +184,7 @@ function feed() {
 	};
 }
 
-async function play(initial: Delay) {
+async function play(initial: Delay, props?: { conceal?: boolean }) {
 	const push = feed();
 	const truncate = spyOn(SharedRingBuffer.prototype, "truncate");
 	const reset = spyOn(SharedRingBuffer.prototype, "reset");
@@ -199,7 +208,7 @@ async function play(initial: Delay) {
 	const delay = new Signal<Delay>(initial);
 	const source = new Source({ broadcast, supported: async () => true });
 	const sync = new Sync({ delay });
-	const decoder = new Decoder({ source, sync });
+	const decoder = new Decoder({ source, sync, conceal: props?.conceal });
 	await microtasks();
 
 	// Enough frames to get past the legacy decoder's warm-up, so a handover would truncate.
@@ -246,6 +255,29 @@ async function play(initial: Delay) {
 		},
 	};
 }
+
+describe("Decoder concealment", () => {
+	const concealed = () =>
+		posted.map((message) => (message as { conceal?: boolean }).conceal).filter((c) => c !== undefined);
+
+	it("asks the render worklet to conceal gaps by default", async () => {
+		const playback = await play(Time.Milli(100));
+		try {
+			expect(concealed()).toEqual([true]);
+		} finally {
+			playback.close();
+		}
+	});
+
+	it("leaves a gap audible as a gap when asked to", async () => {
+		const playback = await play(Time.Milli(100), { conceal: false });
+		try {
+			expect(concealed()).toEqual([false]);
+		} finally {
+			playback.close();
+		}
+	});
+});
 
 describe("Decoder across a delay change", () => {
 	for (const initial of [Time.Milli(100), "auto"] as const) {

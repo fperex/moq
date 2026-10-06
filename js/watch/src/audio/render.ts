@@ -1,4 +1,5 @@
 import type { Time } from "@moq/net";
+import type { Snapshot } from "./playout";
 import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
 /** Everything the main thread sends the render worklet over its port. */
@@ -8,6 +9,9 @@ export type ToMain = State;
 /** Init message when SharedArrayBuffer is available. */
 export interface InitShared extends SharedRingBufferInit {
 	type: "init-shared";
+	// Whether a gap is concealed with synthesized audio or played as a ramp into silence. A property
+	// of the reader rather than of the ring, so a resize hands the replacement the same answer.
+	conceal: boolean;
 }
 
 /** Init message for the postMessage fallback path. */
@@ -19,6 +23,8 @@ export interface InitPost {
 	// Buffered mode: anchor to the first frame and play through; the ring is sized to the floor and
 	// the lookahead above it is held back upstream (the main thread applies the backpressure).
 	buffered: boolean;
+	// Whether a gap is concealed with synthesized audio or played as a ramp into silence.
+	conceal: boolean;
 }
 
 /** Flush the buffer and re-stall (fallback path only; shared path resets via Atomics). */
@@ -55,4 +61,7 @@ export interface State {
 	stalled: boolean;
 	// How many times the ring has run dry mid-playback, cumulative.
 	underruns: number;
+	// Every counter the shared transport keeps in its control array, since the main thread cannot
+	// read this ring's memory directly.
+	debug: Snapshot;
 }

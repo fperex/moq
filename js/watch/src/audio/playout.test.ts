@@ -227,8 +227,10 @@ describe.each(RINGS)("%s ring replay", (_name, build) => {
 
 	it("underruns constantly when the target ignores the arrival spread", () => {
 		// 46ms is what the round-trip formula produced on the connection this was measured on: it
-		// describes the network and says nothing about a sender that flushes five frames at once.
-		const t = trace(600, 5, 5);
+		// describes the network and says nothing about a sender that flushes ten frames at once. A
+		// five frame flush is inside the stretch band above the target, which the reader closes by
+		// time stretch instead of dropping it, so the control needs a flush wider than the band.
+		const t = trace(600, 10, 5);
 		const result = replay(build(46), t, 2000);
 		expect(result.underruns).toBeGreaterThan(100);
 		expect(result.skipped).toBeGreaterThan(10 * CHUNK);

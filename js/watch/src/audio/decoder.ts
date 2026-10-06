@@ -22,6 +22,7 @@ import { type AudioBuffer, createAudioBuffer } from "./buffer";
 import { type DecoderConfig, frameDuration, type PlaybackIdentity, packetDuration, playbackIdentity } from "./config";
 import { Handover } from "./handover";
 import { AUTO_MAX_AGE, ringSamples, target } from "./latency";
+import type { Snapshot } from "./playout";
 // A blob: URL, or a hosted file when assets() is set; see vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -33,6 +34,19 @@ const LEGACY_WARMUP_CALLBACKS = 3;
 export type DecoderInput = {
 	// Whether to download the audio track. Defaults to true.
 	enabled: Getter<boolean>;
+
+	/**
+	 * Whether a gap in the audio is concealed with synthesized audio rather than played as a ramp
+	 * into silence. Defaults to true.
+	 *
+	 * Concealment repeats the pitch period of the last real audio, fades it out over a long outage
+	 * and ends in digital silence, and splices the media back on where it lines up. Turning it off
+	 * leaves a gap audible as a gap, which is what a listener who would rather hear the loss than
+	 * hear invented audio wants.
+	 *
+	 * Read when the audio graph is built, since it belongs to the reader running inside the worklet.
+	 */
+	conceal: Getter<boolean>;
 };
 
 /** Constructor properties for {@link Decoder}. */
@@ -64,6 +78,14 @@ type DecoderOutput = {
 
 	// Combined buffered ranges (network jitter + decode buffer)
 	buffered: Signal<Container.BufferedRanges>;
+
+	/**
+	 * Every audio ring counter at once: what it holds, what the playout engine did with it, and what
+	 * either end threw away. Undefined until the graph is built and the ring has reported.
+	 *
+	 * @internal
+	 */
+	debug: Signal<Snapshot | undefined>;
 };
 
 // What the audio graph is built for. `catalog` is the advertised rate and `sampleRate` the rate the
@@ -100,6 +122,7 @@ export class Decoder {
 		stalled: new Signal<boolean>(true),
 		underruns: new Signal<number>(0),
 		buffered: new Signal<Container.BufferedRanges>([]),
+		debug: new Signal<Snapshot | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -142,6 +165,7 @@ export class Decoder {
 	constructor(props: DecoderProps) {
 		this.in = {
 			enabled: getter(props?.enabled ?? true),
+			conceal: getter(props?.conceal ?? true),
 		};
 
 		this.source = props.source;
@@ -251,7 +275,13 @@ export class Decoder {
 			const buffered = this.sync.out.buffered.peek();
 
 			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
-			const ring = createAudioBuffer(worklet, channelCount, sampleRate, latencySamples, buffered);
+			const ring = createAudioBuffer(worklet, {
+				channels: channelCount,
+				rate: sampleRate,
+				latency: latencySamples,
+				buffered,
+				conceal: this.in.conceal.peek(),
+			});
 			effect.cleanup(() => ring.close());
 			effect.set(this.#ring, ring);
 
@@ -266,6 +296,9 @@ export class Decoder {
 			});
 			effect.run((inner) => {
 				this.#out.underruns.set(inner.get(ring.underruns));
+			});
+			effect.run((inner) => {
+				this.#out.debug.set(inner.get(ring.debug));
 			});
 
 			effect.set(this.#out.root, worklet);

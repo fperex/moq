@@ -92,6 +92,7 @@ export default defineConfig({
 						{ text: "moq-lite", link: "/concept/moq-lite" },
 						{ text: "hang", link: "/concept/hang" },
 						{ text: "Audio jitter", link: "/concept/audio-jitter" },
+						{ text: "Playout", link: "/concept/playout" },
 						{ text: "Stats", link: "/concept/stats" },
 						{ text: "Standards", link: "/concept/standard" },
 						{
