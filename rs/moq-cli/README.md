@@ -6,6 +6,10 @@ It works with FFmpeg for encoding and decoding.
 ## Install
 
 ```bash
+# macOS and Linux
+curl -fsSL https://moq.sh | sh
+
+# Or from source
 cargo install moq-cli
 ```
 
@@ -19,7 +23,7 @@ Multi-arch images (`linux/amd64` and `linux/arm64`) are published to [Docker Hub
 
 ## Usage
 
-`moq-cli` routes endpoints onto a shared MoQ Origin: `moq <MoQ side> <import|export> <endpoint>`. The MoQ side (before the verb) dials with `--connect <url>`, self-hosts QUIC/WebTransport with `--listen <addr>`, or self-hosts raw qmux with `--listen-tcp-bind <addr>` / `--listen-unix-bind <path>` (Unix only). `import` moves media into MoQ, `export` moves it out. The endpoint is a container format (`fmp4`, `ts`, `flv`, ... read from stdin / written to stdout), or a gateway (`hls`, `rtmp`, `srt`, `rtc`). A build with the `play` feature can also render a broadcast locally with `moq <MoQ side> play`.
+`moq-cli` routes endpoints onto a shared MoQ Origin: `moq <MoQ side> <import|export> <endpoint>`. The MoQ side (before the verb) dials with `--connect <url>`, self-hosts QUIC/WebTransport with `--listen <addr>`, or self-hosts raw qmux with `--listen-tcp-bind <addr>` / `--listen-unix-bind <path>` (Unix only). `import` moves media into MoQ, `export` moves it out. The endpoint is a container format (`fmp4`, `ts`, `flv`, ... read from stdin / written to stdout), or a gateway (`hls`, `rtmp`, `srt`, `rtc`, `archive`). A build with the `play` feature can also render a broadcast locally with `moq <MoQ side> play`.
 
 Separate additional stages with `--` to bridge several broadcasts (or both directions) over one connection, each naming its own `--broadcast`:
 
@@ -32,7 +36,7 @@ moq --connect https://relay.example.com/anon \
 ### Publish to a remote relay
 
 ```bash
-ffmpeg -i input.mp4 -c copy -f mpegts -pes_payload_size 0 - | \
+ffmpeg -i input.mp4 -c copy -f mpegts -pes_payload_size 0 -muxdelay 0 - | \
     moq --connect https://relay.example.com --broadcast my-stream.hang import ts
 ```
 
@@ -54,8 +58,8 @@ moq --connect https://relay.example.com --broadcast my-stream.hang play
 Hosts a MoQ server and publishes a single broadcast read from stdin into it. Useful for local testing without a separate relay process.
 
 ```bash
-ffmpeg -i input.mp4 -c copy -f mpegts -pes_payload_size 0 - | \
-    moq --listen '[::]:4443' --listen-tls-generate localhost --broadcast my-stream.hang import ts
+ffmpeg -i input.mp4 -c copy -f mpegts -pes_payload_size 0 -muxdelay 0 - | \
+    moq --listen '[::]:4443' --listen-tls-generate localhost --auth-public '**' --broadcast my-stream.hang import ts
 ```
 
 ### Self-host: subscribe to an inbound broadcast
@@ -63,7 +67,7 @@ ffmpeg -i input.mp4 -c copy -f mpegts -pes_payload_size 0 - | \
 Hosts a MoQ server and writes an incoming broadcast's media to stdout. The inverse of the above.
 
 ```bash
-moq --listen '[::]:4443' --listen-tls-generate localhost --broadcast my-stream.hang export ts | ffplay -
+moq --listen '[::]:4443' --listen-tls-generate localhost --auth-public '**' --broadcast my-stream.hang export ts | ffplay -
 ```
 
 ### Import formats

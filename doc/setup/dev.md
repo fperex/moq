@@ -7,7 +7,8 @@ description: Build, test, and debug the MoQ repository
 
 The repository uses [Just](https://github.com/casey/just) as its command
 runner. Run commands inside the Nix dev shell (`nix develop`) so your tools
-match CI.
+match CI. `just check` and `just fix` refuse to run outside it; set
+`MOQ_ALLOW_HOST=1` to use the host toolchain anyway.
 
 | Command | Purpose |
 | --- | --- |
@@ -25,6 +26,17 @@ Recipes default to the local relay at `http://localhost:4443`. Pass
 `https://cdn.moq.dev/anon` to use the public relay instead. The default BBB/TOS
 publishers and `just pub serve` use MPEG-TS, with one audio frame per PES to
 avoid batching latency. Use `just pub cmaf` only when testing fMP4/CMAF.
+
+BBB publishes the original 720p video and a pre-encoded 360p rendition at
+about 600 kbps. The player can switch between them as bandwidth or viewport
+size changes, without encoding while publishing. Consumers that only support
+one rendition get the 720p track.
+
+To reproduce the hosted SD asset, run `just pub encode-bbb-sd`, then
+`just pub upload bbb-sd.mp4` with access to the video bucket. The encode keeps
+the source frame timestamps and keyframes, and holds the final SD frame long
+enough to match the source audio's loop period. `just pub check-bbb` verifies
+both assets across three loops. Remove the local SD file before re-encoding.
 
 ## Debugging
 
@@ -60,6 +72,11 @@ taskkill /IM moq.exe /F
 just fix
 just check
 ```
+
+These diff the branch against its upstream (or `origin/main`) and run only the
+modules the diff reaches. The map from paths to modules lives in
+`sh/dispatch.sh`. Recipes stay thin: any logic (conditionals, loops, traps)
+lives in a script under `sh/`.
 
 See [CONTRIBUTING.md](https://github.com/moq-dev/moq/blob/main/CONTRIBUTING.md)
 for branch targeting, commit messages, and reviews, and [Agent setup](/setup/agent)

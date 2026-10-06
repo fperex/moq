@@ -108,7 +108,7 @@ impl KeySet {
 
 	/// Verify a token with the key matching its `kid` header, returning its claims.
 	///
-	/// A token without a `kid` is accepted only when the set holds exactly one key.
+	/// A token without a `kid` is accepted only when the set holds exactly one key and that key has no `kid`.
 	pub fn verify(&self, token: &str) -> crate::Result<Claims> {
 		let header = jsonwebtoken::decode_header(token)?;
 
@@ -147,6 +147,7 @@ mod tests {
 			subscribe: patterns(&["test-sub/**"]),
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
+			not_before: None,
 		}
 	}
 

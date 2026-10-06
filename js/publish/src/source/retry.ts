@@ -1,19 +1,17 @@
 import { type Effect, Signal } from "@moq/signals";
 
-// A capture attempt: the stream the browser handed over, or why it would not.
-type Attempt = { stream: MediaStream; error?: undefined } | { stream?: undefined; error: unknown };
-
 /**
  * A budget for re-opening a `getUserMedia` capture that failed or died.
  *
  * A `MediaStreamTrack` ends when the device disappears, the OS revokes it, or another application
- * takes an exclusive device, and the reopen that follows can itself fail. Both spend budget, so a
- * device that never works stops being asked, and a refusal stops it at once: see {@link refused}. A
- * device that is merely busy is not one of those: see {@link BUSY}.
+ * takes an exclusive device, and the reopen that follows can itself fail. Transient open failures
+ * and ended tracks spend budget; other open failures are terminal immediately.
  *
  * Every outcome reruns the owning effect, including running out of budget. That rerun is what clears
  * `out.source` and stops the stream, via the cleanup the previous run registered, so no caller has to
- * remember to. Screen capture cannot use this: `getDisplayMedia` needs a user gesture to reopen.
+ * remember to. The same rerun is when {@link spent} holds the last error; the caller assigns it to
+ * `out.error`. A backoff rerun leaves it empty, so a retry stays quiet. Screen capture cannot use
+ * this: `getDisplayMedia` needs a user gesture to reopen.
  */
 export class Retry {
 	/** Consecutive failures tolerated before the capture is left alone. */
@@ -31,22 +29,7 @@ export class Retry {
 	 */
 	static readonly DELAY = { initial: 250, multiplier: 2, max: 1000 };
 
-	/**
-	 * The `getUserMedia` failures that mean "not right now" rather than "no".
-	 *
-	 * The device is there and we are allowed to use it, something else is holding it: another
-	 * application, or the capture we ourselves just stopped, since a browser hands the device back
-	 * to the OS some time after `stop()` returns. Spending budget on that window is how hiding
-	 * video and showing it again leaves the camera dark for good, so these wait out the backoff
-	 * without spending any. The wait is bounded by the caller's intent: switching the source off
-	 * ends it.
-	 */
-	static readonly BUSY = ["NotReadableError", "AbortError"];
-
 	readonly #rerun = new Signal(0);
-
-	// Where to report why the capture is not running, so the owner can publish it as its own output.
-	readonly #error: Signal<Error | undefined>;
 
 	// Deliberately plain fields: effect reruns must not unwind them, or the budget never runs out.
 	#failures = 0;
@@ -56,17 +39,8 @@ export class Retry {
 	// How long the next attempt still owes the backoff, set by `failed` and paid by `begin`.
 	#wait: DOMHighResTimeStamp | undefined;
 
-	// The release of the capture the previous run held, awaited before the next attempt.
-	//
-	// A browser only starts handing the device back at `stop()`, and an effect's cleanup is not
-	// ordered against the next run's `getUserMedia` at all: hiding a source while an attempt is still
-	// in flight and showing it again asks for a device we have not released yet.
-	#released: Promise<void> = Promise.resolve();
-
-	/** Reports why the capture is not running into `error`, and clears it once it is. */
-	constructor(error: Signal<Error | undefined>) {
-		this.#error = error;
-	}
+	// The cause of the latest failure. Only surfaced once the budget is spent, so a retry stays quiet.
+	#error: Error | undefined;
 
 	/**
 	 * Subscribe the capture effect and report whether an attempt is worth making right now.
@@ -100,63 +74,46 @@ export class Retry {
 		return true;
 	}
 
-	/**
-	 * Ask `getUserMedia` for `constraints` once the previous run's capture is released, and stop
-	 * whatever it hands over when this run ends.
-	 *
-	 * Resolves to undefined when the run was torn down first, or when the browser refused, which is
-	 * already reported: see {@link refused}.
-	 */
-	async open(effect: Effect, constraints: MediaStreamConstraints): Promise<MediaStream | undefined> {
-		// Let go of the last capture before asking for a device again: the browser is still
-		// holding it otherwise, and it answers that with a failure like any other.
-		await effect.race(this.#released);
-		if (effect.abort.aborted) return;
-
-		const media = navigator.mediaDevices
-			.getUserMedia(constraints)
-			.then((stream): Attempt => ({ stream }))
-			.catch((error: unknown): Attempt => ({ error }));
-
-		// If the effect is cancelled for any reason (ex. cancel), stop any media that we got,
-		// and keep the release for the next attempt to wait on.
-		effect.cleanup(() => {
-			this.#released = media.then(({ stream }) => {
-				stream?.getTracks().forEach((track) => {
-					track.stop();
-				});
-			});
-		});
-
-		const attempt = await effect.race(media);
-		if (effect.abort.aborted || !attempt) return;
-
-		// A refusal stands until something changes, unless the device was only busy.
-		if (!attempt.stream) this.refused(attempt.error);
-		return attempt.stream;
+	/** Spends budget and reruns the effect, returning whether another attempt is allowed. */
+	failed(error: Error): boolean {
+		this.#error = error;
+		this.#failures += 1;
+		const retry = this.#failures <= Retry.LIMIT;
+		// Equal jitter, so a page with several captures doesn't reopen them all on the same tick.
+		this.#wait = retry ? this.#delay * (0.5 + Math.random() / 2) : undefined;
+		this.#delay = Math.min(this.#delay * Retry.DELAY.multiplier, Retry.DELAY.max);
+		this.#rerun.update((rerun) => rerun + 1);
+		return retry;
 	}
 
 	/**
-	 * The attempt produced no usable track. Reruns the effect, spending budget unless the device was
-	 * merely {@link BUSY}.
-	 *
-	 * `reason` is what the browser said, kept so the capture can report why it is dark instead of
-	 * leaving a black canvas to speak for it.
+	 * The error from the attempt that spent the budget.
+	 * Undefined while another attempt is allowed, including during backoff.
 	 */
-	failed(reason?: unknown): void {
-		const error = asError(reason);
+	spent(): Error | undefined {
+		if (this.#failures <= Retry.LIMIT) return undefined;
+		return this.#error;
+	}
 
-		// The same refusal repeating is one refusal. A busy device says it once a second for as
-		// long as it is busy, and every consumer would relight on each one.
-		if (this.#error.peek()?.message !== error.message) this.#error.set(error);
+	/** Spend budget because the track ended. Reported via {@link spent} once nothing remains. */
+	ended(): boolean {
+		return this.failed(new DOMException("The media track ended", "AbortError"));
+	}
 
-		if (!Retry.BUSY.includes(error.name)) this.#failures += 1;
-
-		// Unlimited budget, so there is always a next delay.
-		// Equal jitter, so a page with several captures doesn't reopen them all on the same tick.
-		this.#wait = this.#delay * (0.5 + Math.random() / 2);
-		this.#delay = Math.min(this.#delay * Retry.DELAY.multiplier, Retry.DELAY.max);
-		this.#rerun.update((rerun) => rerun + 1);
+	/**
+	 * Classify a `getUserMedia` rejection, returning whether another attempt is allowed.
+	 *
+	 * Only a busy device (`NotReadableError`) or an aborted request (`AbortError`) spends budget;
+	 * anything else, including bad constraints, is terminal at once.
+	 */
+	rejected(error: unknown): boolean {
+		const cause = error instanceof Error ? error : new Error(String(error));
+		if (cause.name === "NotReadableError" || cause.name === "AbortError") {
+			return this.failed(cause);
+		}
+		this.#error = cause;
+		this.terminal();
+		return false;
 	}
 
 	/** Stop attempting this capture until its settings, device list, or permission changes. */
@@ -166,31 +123,13 @@ export class Retry {
 		this.#rerun.update((rerun) => rerun + 1);
 	}
 
-	/**
-	 * `getUserMedia` refused. A device that is merely {@link BUSY} is tried again like any other
-	 * failure; any other refusal is reported into `error` and is {@link terminal}, since asking again
-	 * with nothing changed only earns the same answer.
-	 */
-	refused(reason: unknown): void {
-		const error = asError(reason);
-		if (Retry.BUSY.includes(error.name)) {
-			this.failed(error);
-			return;
-		}
-
-		this.#error.set(error);
-		this.terminal();
-	}
-
 	/** The attempt produced a live track. Reruns the effect if it dies. */
 	succeeded(effect: Effect, track: MediaStreamTrack): void {
-		this.#error.set(undefined);
-
 		effect.timer(() => {
 			this.#clear();
 		}, Retry.SETTLED);
 
-		effect.event(track, "ended", () => this.failed(new Error("the capture device stopped")));
+		effect.event(track, "ended", () => this.ended());
 	}
 
 	/** Refund the budget, because something changed that makes another attempt worth trying. */
@@ -206,20 +145,6 @@ export class Retry {
 		this.#failures = 0;
 		this.#wait = undefined;
 		this.#delay = Retry.DELAY.initial;
-		this.#error.set(undefined);
+		this.#error = undefined;
 	}
-}
-
-// What a capture rejected with, as an Error carrying the browser's name for it.
-//
-// getUserMedia rejects with a DOMException, which is not an Error everywhere, and with a plain
-// OverconstrainedError object in Firefox, so the name is read off the value rather than its type.
-function asError(reason: unknown): Error {
-	if (reason instanceof Error) return reason;
-	if (typeof reason !== "object" || reason === null) return new Error("the capture produced no track");
-
-	const named = reason as { name?: unknown; message?: unknown };
-	const error = new Error(typeof named.message === "string" ? named.message : String(reason));
-	if (typeof named.name === "string") error.name = named.name;
-	return error;
 }

@@ -1,259 +1,174 @@
 /**
- * Samples what a `<moq-watch>` will tell anyone who asks, every 250 ms.
+ * Samples a `<moq-watch>` every 250 ms, from its public signals and a tap on its output.
  *
- * Reads the element's output signals, including internal ring diagnostics when available.
- * Missing counters remain undefined and the analyzer reports null.
+ * Nothing here patches the player or reaches past its `out` surface, so a number it reports is one
+ * any consumer could read. What the player does not publish (how full each render quantum was) is
+ * read off its output by the tap in `tap.ts`, every quantum rather than a sample of them.
  *
- * Two things are measured rather than read, because no signal carries them:
- *
- * - The silence share, from an `AnalyserNode` fanned out from `audio.out.root`. A counter says the
- *   ring was fed; only the PCM says the listener heard anything.
- * - `AudioContext.currentTime` against wall time, which is how a run that was throttled or never
- *   really rendered gets caught instead of being graded.
+ * Adapted from the black-box probe in `debug-findings/analysis/blackbox.js` on the reporter's fork
+ * (`fperex/moq`, branch `debug/rt-audio`). See ../../../README.md.
  *
  * @module
  */
 import type MoqWatch from "@moq/watch/element";
-import { type Environment, RMS_FRAMES, SAMPLE_INTERVAL_MS, type Sample, type Thread } from "./schema.ts";
+import { Capture } from "./capture.ts";
+import { type Arrival, type Environment, SAMPLE_INTERVAL_MS, type Sample, SILENCE_RMS, type Stall } from "./schema.ts";
+import { type Tap, tap } from "./tap.ts";
 
-/** Anything with a `peek()`, which is every signal under an `out`. */
-type Peekable<T> = { peek(): T };
-
-/** Read a signal that may not exist on this build, as a plain number. */
-function num<T>(signal: Peekable<T> | undefined): number | undefined {
-	const value = signal?.peek();
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-/**
- * Read something that may not be there on the build under test, without taking the probe down.
- *
- * The point of reading only public signals is that the same page can measure an older build, and an
- * older build is exactly where a signal is missing. Optional chaining covers a missing leaf; this
- * covers a missing branch, where the parent object is undefined and reaching through it throws. One
- * absent counter must leave every other number in the sample intact.
- */
-function maybe<T>(read: () => T): T | undefined {
-	try {
-		return read();
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Which thread feeds the ring, from `audio.out.thread`, or undefined on a build without the signal.
- *
- * A build that predates the audio worker cannot say, which is a different answer from a worker still
- * starting (`pending`), the way `clock` below tells a missing signal from the wall clock. Copied field by
- * field, so the sample carries plain data.
- */
-export function threadOf(watch: MoqWatch): Thread | undefined {
-	const out = maybe(() => watch.audio.out);
-	if (!out || !("thread" in out)) return undefined;
-	const thread = maybe(() => out.thread.peek());
-	if (!thread) return { kind: "pending" };
-	if (thread.kind === "worker") return { kind: "worker", transport: thread.transport };
-	return { kind: "main", reason: thread.reason };
-}
-
-/**
- * Chromium's render capacity surface, which is not in lib.dom yet.
- *
- * `averageLoad` is the share of each render quantum's budget the graph used. Absent in Safari, which
- * is why `render_load` is a chromium-only metric in the schema.
- */
+/** Chromium's render capacity surface, which is not in lib.dom. */
 type RenderCapacity = {
 	start(options: { updateInterval: number }): void;
-	stop(): void;
-	addEventListener(type: "update", listener: (event: RenderCapacityEvent) => void): void;
+	addEventListener(type: "update", listener: (event: { averageLoad: number }) => void): void;
+	removeEventListener(type: "update", listener: (event: { averageLoad: number }) => void): void;
 };
-type RenderCapacityEvent = { averageLoad: number; peakLoad: number; underrunRatio: number };
 
-/** What the probe collects, until someone drains it. */
+/** What the probe has collected, until someone drains it. */
 export type Probe = {
 	/** Samples taken since the last drain. */
 	drain(): Sample[];
-	/** What the page is, reported once it can be. Null until the session is up. */
-	environment(): Environment | null;
-	/** Console warnings and errors seen so far. */
+	/** Arrivals on the same session, before the container orders them, when capture is enabled. */
+	arrivals(): Arrival[];
+	/** The failure that stopped arrival capture, if any. */
+	error(): string | undefined;
+	/** End the measurement: take one last sample, with any gap still open closed into it. */
+	finish(): Promise<void>;
+	/** What the page is, once the catalog says the session is up. */
+	environment(): Environment | undefined;
+	/** Console warnings and errors so far. */
 	notes(): string[];
-	/** Stop sampling. */
-	stop(): void;
+	/** Whether the ring has a playhead and is not stalled. */
+	playing(): boolean;
 };
 
-/**
- * Start sampling `watch`.
- *
- * Sampling begins immediately and keeps going through the element's own startup, so the run records
- * how long it took to produce audio at all rather than starting the clock once it already had.
- */
-export function probe(watch: MoqWatch): Probe {
-	const started = performance.now();
+/** Start sampling `watch`, from before it has produced anything, so startup is on the record too. */
+export function probe(watch: MoqWatch, capture = false): Probe {
 	const samples: Sample[] = [];
 	const notes: string[] = [];
-
-	// The analyser is fanned out from whatever `root` currently is, and re-attached when it changes:
-	// the node is rebuilt when the ring is, and an analyser left on the old one reads silence forever
-	// and would report a perfect run as a fully silent one.
-	let analyser: AnalyserNode | undefined;
-	let attachedTo: AudioNode | undefined;
-	let generation = 0;
-	let pcm: Float32Array<ArrayBuffer> | undefined;
-
-	// Render capacity arrives on its own event rather than on demand, so the latest reading is held
-	// here and sampled with everything else.
-	let renderLoad: number | undefined;
-	let capacityStarted: AudioContext | undefined;
-
-	const attach = () => {
-		const root = maybe(() => watch.audio.out.root.peek());
-		if (root === attachedTo) return;
-		attachedTo = root;
-		generation++;
-		analyser = undefined;
-		pcm = undefined;
-		if (!root) return;
-		try {
-			const node = new AnalyserNode(root.context, { fftSize: RMS_FRAMES });
-			root.connect(node);
-			analyser = node;
-			pcm = new Float32Array(node.fftSize);
-		} catch (err) {
-			notes.push(`analyser: ${err instanceof Error ? err.message : String(err)}`);
-		}
-
-		const context = maybe(() => watch.audio.out.context.peek());
-		if (context && capacityStarted !== context) {
-			capacityStarted = context;
-			const capacity = (context as unknown as { renderCapacity?: RenderCapacity }).renderCapacity;
-			if (!capacity) {
-				// Safari has no render capacity surface at all, and a Chromium without it is worth
-				// knowing about rather than reading as a graph that never did any work.
-				notes.push("renderCapacity: unavailable, render_load will be null");
-			} else {
-				try {
-					capacity.addEventListener("update", (event) => {
-						renderLoad = event.averageLoad;
-					});
-					// Seconds, and a full second rather than the sample interval: the shorter ones are
-					// rejected outright by some builds, and the load is a smooth quantity anyway.
-					capacity.start({ updateInterval: 1 });
-				} catch (err) {
-					notes.push(`renderCapacity: ${err instanceof Error ? err.message : String(err)}`);
-				}
-			}
-		}
+	const note = (line: string) => {
+		if (notes.length < 200) notes.push(line.slice(0, 200));
 	};
 
-	const rms = (): number | undefined => {
-		if (!analyser || !pcm) return undefined;
-		analyser.getFloatTimeDomainData(pcm);
-		let sum = 0;
-		for (const value of pcm) sum += value * value;
-		return Math.sqrt(sum / pcm.length);
+	const { audio, sync, broadcast } = watch.player;
+	const recording = capture
+		? new Capture({
+				broadcast: audio.source.in.broadcast,
+				track: audio.source.out.track,
+				config: audio.source.out.config,
+				maxAge: sync.out.maxAge,
+			})
+		: undefined;
+
+	// Stall changes are taken as they happen: a re-stall shorter than the sample grid is exactly the
+	// one a 250 ms read would miss, and it is what tells a stall from an underrun.
+	let stalls: Stall[] = [];
+	audio.out.stalled.subscribe((stalled) => {
+		const context = audio.out.context.peek();
+		if (context) stalls.push({ at: context.currentTime * 1000, stalled });
+	});
+
+	// The tap follows the output node, which the player rebuilds with its graph. A tap left on the old
+	// node would report a perfect run as one long silence.
+	let tapped: AudioNode | undefined;
+	let current: Tap | undefined;
+	let renderLoad: number | undefined;
+	let unlisten: (() => void) | undefined;
+	const attach = () => {
+		const root = audio.out.root.peek();
+		if (!root || root === tapped) return;
+		tapped = root;
+		current?.close();
+		current = undefined;
+
+		tap(root, { floor: SILENCE_RMS }).then(
+			(t) => {
+				if (tapped === root) current = t;
+				else t.close();
+			},
+			(err: unknown) => note(`tap: ${err instanceof Error ? err.message : String(err)}`),
+		);
+
+		// The previous root's context stops reporting into this one's reading.
+		unlisten?.();
+		unlisten = undefined;
+		const capacity = (root.context as unknown as { renderCapacity?: RenderCapacity }).renderCapacity;
+		if (!capacity) {
+			note("renderCapacity: unavailable, render_load will be null");
+			return;
+		}
+		const update = (event: { averageLoad: number }) => {
+			renderLoad = event.averageLoad;
+		};
+		capacity.addEventListener("update", update);
+		unlisten = () => capacity.removeEventListener("update", update);
+		// A whole second: shorter intervals are refused by some builds, and load is smooth anyway.
+		capacity.start({ updateInterval: 1 });
 	};
 
 	const sample = (): Sample => {
 		attach();
-		const audio = watch.audio.out;
-		const sync = watch.sync.out;
-		const context = maybe(() => audio.context.peek());
-		const debug = maybe(() => audio.debug.peek());
-
-		// `buffered` is a list of ranges, not a depth. What the grader wants is how much audio is
-		// ready to play, so the ranges are summed; a gap in the middle is not playable time.
-		// A build whose `buffered` is not a range list reads as nothing buffered rather than throwing
-		// out of the sample: this probe is pointed at whatever build the page happens to be running.
-		const peeked = maybe(() => audio.buffered.peek());
-		const ranges = Array.isArray(peeked) ? peeked : [];
-		const buffered = ranges.reduce((total, range) => total + (Number(range.end) - Number(range.start)), 0);
-
+		const context = audio.out.context.peek();
+		const counts = current?.counts();
+		const gaps = current?.take() ?? [];
+		const taken = stalls;
+		stalls = [];
 		return {
-			at: performance.now() - started,
-
-			timestamp: num(audio.timestamp),
-			stalled: maybe(() => audio.stalled.peek()),
-			underruns: num(audio.underruns),
-			spread: num(audio.spread),
-			buffered: ranges.length > 0 ? buffered : undefined,
-			skipped: num(audio.skipped),
-			playout: debug && context ? { ...debug, generation, rate: context.sampleRate } : undefined,
-			stats: maybe(() => audio.stats.peek()) as Record<string, unknown> | undefined,
-			thread: threadOf(watch),
-
-			delay: num(sync.delay),
-			jitter: num(sync.jitter),
-			maxAge: num(sync.maxAge),
-			reference: num(sync.reference),
-			syncTimestamp: num(sync.timestamp),
-			// The clock's source, where an absent signal and an absent source are different answers:
-			// on a build without `sync.out.clock` the field is missing from the sample, and on one
-			// with it an undefined value means playback ran on the wall clock. `maybe` collapses both
-			// to undefined, so the branch is checked once here rather than guessed at in the analyzer.
-			clock: "clock" in sync ? ((maybe(() => sync.clock.peek()) ?? "none") as Sample["clock"]) : undefined,
-
-			rms: rms(),
-			renderLoad,
+			// Read back to back, so the pair calibrates the render clock against the viewer's.
+			at: performance.now(),
+			render: context ? context.currentTime * 1000 : undefined,
+			timestamp: audio.out.timestamp.peek(),
+			stalled: audio.out.stalled.peek(),
+			delay: sync.out.delay.peek(),
+			rtt: watch.player.in.probe.peek()?.rtt,
+			networkJitter: sync.out.jitter.peek(),
+			jitter: audio.source.out.config.peek()?.jitter,
+			renditionDelay: audio.source.out.config.peek()?.delay,
 			outputLatency: context ? context.outputLatency * 1000 : undefined,
 			baseLatency: context ? context.baseLatency * 1000 : undefined,
-			contextTime: context ? context.currentTime * 1000 : undefined,
-			contextRate: context?.sampleRate,
+			renderLoad,
+			quanta: counts?.quanta,
+			quiet: counts?.quiet,
+			gaps: gaps.length > 0 ? gaps : undefined,
+			stalls: taken.length > 0 ? taken : undefined,
 		};
 	};
 
-	// Console output is part of the evidence: a censored group or a decoder reset shows up here long
-	// before it shows up in a counter, and a run that filled the log is worth knowing about even when
-	// every number passed.
-	const original = { warn: console.warn, error: console.error };
-	const capture = (level: string, fn: (...args: unknown[]) => void) => {
-		return (...args: unknown[]) => {
-			if (notes.length < 200) notes.push(`${level}: ${args.map(String).join(" ").slice(0, 200)}`);
-			fn(...args);
+	// Console output is evidence: a decoder reset shows up here before it shows up in a count.
+	for (const level of ["warn", "error"] as const) {
+		const original = console[level];
+		console[level] = (...args: unknown[]) => {
+			note(`${level}: ${args.map(String).join(" ")}`);
+			original(...args);
 		};
-	};
-	console.warn = capture("warn", original.warn);
-	console.error = capture("error", original.error);
+	}
 
-	const timer = setInterval(() => samples.push(sample()), SAMPLE_INTERVAL_MS);
+	setInterval(() => samples.push(sample()), SAMPLE_INTERVAL_MS);
 
 	return {
-		drain() {
-			return samples.splice(0, samples.length);
+		drain: () => samples.splice(0, samples.length),
+		arrivals: () => recording?.drain() ?? [],
+		error: () => recording?.error(),
+		async finish() {
+			attach();
+			await current?.finish();
+			samples.push(sample());
+			await recording?.close();
 		},
 		environment() {
-			const catalog = maybe(() => watch.broadcast.out.catalog.peek());
-			// The catalog is what says the session got far enough to be measuring anything.
-			if (!catalog) return null;
-			const renditions = catalog.audio?.renditions ?? {};
-			// `audio.source` is one of the signals an older build may not have, and the rendition it
-			// names only picks between several. Falling back to the first one loses nothing on a
-			// single-rendition broadcast, which is every broadcast this harness publishes.
-			const track = maybe(() => watch.audio.source.out.track.peek());
-			const config = (typeof track === "string" ? renditions[track] : undefined) ?? Object.values(renditions)[0];
+			const catalog = broadcast.out.catalog.peek();
+			if (!catalog) return undefined;
+			// One rendition is published per broadcast here, so the first is the one playing.
+			const config = Object.values(catalog.audio?.renditions ?? {})[0];
 			return {
 				crossOriginIsolated: globalThis.crossOriginIsolated === true,
-				transport: maybe(() => watch.connection.transport.peek()),
-				rtt: rttOf(watch),
-				catalogCodec: config?.codec,
-				catalogRate: config?.sampleRate,
-				catalogJitter: config?.jitter,
-				timeOrigin: performance.timeOrigin,
+				transport: watch.connection.transport.peek(),
+				codec: config?.codec,
+				rate: config?.sampleRate,
+				jitter: config?.jitter,
+				config,
+				contextRate: audio.out.context.peek()?.sampleRate,
 			};
 		},
-		notes() {
-			return notes.slice();
-		},
-		stop() {
-			clearInterval(timer);
-			console.warn = original.warn;
-			console.error = original.error;
-		},
+		notes: () => notes.slice(),
+		playing: () => audio.out.timestamp.peek() !== undefined && !audio.out.stalled.peek(),
 	};
-}
-
-/** The connection's reported round-trip time, which is an object rather than a number. */
-function rttOf(watch: MoqWatch): number | undefined {
-	const rtt = maybe(() => watch.connection.probe.peek()?.rtt);
-	return typeof rtt === "number" && Number.isFinite(rtt) ? rtt : undefined;
 }

@@ -72,8 +72,6 @@ The simplest way to watch a stream:
 | `announced`      | boolean                    | true          | Wait for (re)announcement before subscribing. Ignored when the relay does not support broadcast discovery. |
 | `delay`          | `auto`, duration, `instant` | `auto`       | Distance from the live edge. `instant` paints frames as they decode and disables audio. |
 | `buffer`         | duration                   | `0ms`         | Future-dated media held before playback skips ahead. |
-| `conceal`        | boolean                    | true          | Cover an audio gap with synthesized audio; `false` leaves the gap audible. |
-| `offload`        | boolean                    | true          | Feed the audio from a worker, off the page's main thread; `false` keeps it on the page. |
 | `captions`       | string                     | off           | Text rendition to render. |
 | `catalog-format` | hang, hangz, msf, manual   | auto-detected | The catalog format; detected from the name suffix unless set. `hangz` (compressed) is opt-in. |
 
@@ -107,8 +105,6 @@ const muted = new Signal(false);
 const player = new Watch.Player({
     origin: connection.origin,
     probe: connection.probe,
-    // The relay the audio worker dials; without it the audio stays on the main thread.
-    url: connection.url,
     name: Watch.Net.Path.from("room/alice.hang"),
     canvas,
     muted,
@@ -149,15 +145,6 @@ The `<moq-watch-ui>` element automatically discovers the nested `<moq-watch>` el
 - **Latency control**: A delay target plus optional buffering for future-dated frames
 - **Quality selection**: Switch between available renditions
 - **Custom tracks**: Unknown catalog sections pass through, and `broadcast.out.active` subscribes your own tracks
-
-## Report benchmark
-
-Run `bun js/watch/src/audio/worker/remote.bench.ts` from the repository root.
-The benchmark measures main-thread report processing for 1 to 100 viewers at 10, 20,
-and 50 ms report intervals. It runs the real `Decoder`, `Remote`, and `Sync` with a
-mock worker and audio device, so it does not measure codec or relay throughput.
-It prints timings and asserts nothing about them. The nightly workflow runs it; the
-unit tests in CI hold the same property by counting the work each report does instead.
 
 ## License
 

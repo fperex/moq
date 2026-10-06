@@ -11,14 +11,15 @@ use crate::media::{MoqAudioInit, MoqContainerFormat, MoqContainerInit, MoqFrame,
 /// Publisher-side track properties, mirroring [`moq_net::track::Info`].
 ///
 /// Construct with the fields you care about; the rest use raw-track defaults
-/// (priority 0, the publisher's default max age, microsecond timescale).
+/// (priority 127, no publisher age limit, microsecond timescale).
 #[derive(Clone, uniffi::Record)]
 pub struct MoqTrackInfo {
 	/// Priority, used only to break ties between subscriptions of equal subscriber priority.
-	#[uniffi(default = 0)]
+	/// Higher is more urgent; the default 127 is the midpoint.
+	#[uniffi(default = 127)]
 	pub priority: u8,
 	/// Maximum age of a non-latest group before the publisher evicts it, in
-	/// microseconds. Null uses the default. This is the publisher-side half of
+	/// microseconds. Null imposes no publisher age limit. This is the publisher-side half of
 	/// [`MoqSubscription::max_age_us`](crate::consumer::MoqSubscription::max_age_us).
 	#[uniffi(default = None)]
 	pub max_age_us: Option<u64>,
@@ -56,11 +57,14 @@ impl TryFrom<&moq_net::track::Info> for MoqTrackInfo {
 	type Error = MoqError;
 
 	fn try_from(info: &moq_net::track::Info) -> Result<Self, MoqError> {
-		let max_age_us = u64::try_from(info.max_age.as_micros())
+		let max_age_us = info
+			.max_age
+			.map(|age| u64::try_from(age.as_micros()))
+			.transpose()
 			.map_err(|_| MoqError::Codec("track max_age duration overflow".into()))?;
 		Ok(Self {
 			priority: info.priority,
-			max_age_us: Some(max_age_us),
+			max_age_us,
 			timescale: Some(info.timescale.as_u64()),
 		})
 	}
@@ -170,7 +174,7 @@ impl MoqBroadcastProducer {
 	}
 
 	/// Run `f` against the open broadcast and catalog. Errors with
-	/// [`MoqError::Closed`] if `finish()` has already run. Used by
+	/// [`MoqError::Closed`] if `close()` has already run. Used by
 	/// sibling modules (e.g. `audio`) that need joint access.
 	pub(crate) fn with_state<R>(
 		&self,
@@ -253,8 +257,8 @@ impl MoqBroadcastProducer {
 	/// Retract this broadcast's exact-path advertisement, if any.
 	///
 	/// Local consumers and peers alike stop discovering and requesting it;
-	/// tracks already in flight carry on. Announcing again brings it back. Errors
-	/// with `Closed` on a standalone broadcast (no origin to announce on).
+	/// tracks already in flight carry on. Announcing again brings it back. A no-op
+	/// on a standalone broadcast.
 	pub fn unannounce(&self) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
 		self.with_state(|state| {
@@ -470,15 +474,19 @@ impl MoqBroadcastProducer {
 		}))
 	}
 
-	/// Finish this publisher, finalizing the catalog stream and cleanly closing the
-	/// broadcast so subscribers see a normal end rather than `Error::Dropped`.
-	pub fn finish(&self) -> Result<(), MoqError> {
+	/// End the broadcast for good: retract it, serve no new tracks, and finalize the catalog.
+	///
+	/// Tracks already subscribed carry on to their own end. Every later call on this
+	/// producer fails with `Closed`; closing again is a no-op.
+	pub fn close(&self) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
+		// Hold the lock through shutdown so a concurrent close() returns only once it is done.
 		let mut guard = self.state.lock().unwrap();
-		let mut state = guard.take().ok_or(MoqError::Closed)?;
-		// Finish the broadcast first so the clean end reaches subscribers even if
-		// finalizing the catalog fails.
-		state.broadcast.finish();
+		let Some(mut state) = guard.take() else {
+			return Ok(());
+		};
+		// Close the broadcast first so it ends even if finalizing the catalog fails.
+		state.broadcast.close();
 		state.catalog.finish()?;
 		Ok(())
 	}
@@ -701,7 +709,7 @@ impl MoqTrackProducer {
 	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn used(&self) -> Result<(), MoqError> {
 		let track = self.inner.lock().unwrap().as_ref().ok_or(MoqError::Closed)?.clone();
-		crate::ffi::detached(async move { track.used().await }).await
+		crate::ffi::detached(async move { track.demand().used().await }).await
 	}
 
 	/// Wait until this track has no active consumers.
@@ -709,7 +717,7 @@ impl MoqTrackProducer {
 	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn unused(&self) -> Result<(), MoqError> {
 		let track = self.inner.lock().unwrap().as_ref().ok_or(MoqError::Closed)?.clone();
-		crate::ffi::detached(async move { track.unused().await }).await
+		crate::ffi::detached(async move { track.demand().unused().await }).await
 	}
 
 	/// Create a consumer that reads from this producer's track.
@@ -873,7 +881,7 @@ impl MoqGroupProducer {
 	/// Wait until a consumer has this group.
 	pub(crate) async fn used(&self) -> Result<(), MoqError> {
 		let producer = self.inner.lock().unwrap().as_ref().ok_or(MoqError::Closed)?.clone();
-		Ok(producer.used().await?)
+		Ok(producer.demand().used().await?)
 	}
 }
 
@@ -968,6 +976,18 @@ impl MoqMediaProducer {
 		let mut guard = self.inner.lock().unwrap();
 		let media = guard.as_mut().ok_or(MoqError::Closed)?;
 		media.import.flush(timestamp, std::time::Instant::now())?;
+		Ok(())
+	}
+
+	/// Mark a timeline break and restart handoff measurement without lowering advertised jitter.
+	///
+	/// Publishes a discontinuity marker; resumed frames must continue the broadcast media clock,
+	/// and video must resume on a keyframe.
+	pub fn discontinuity(&self) -> Result<(), MoqError> {
+		let _guard = crate::ffi::enter();
+		let mut guard = self.inner.lock().unwrap();
+		let media = guard.as_mut().ok_or(MoqError::Closed)?;
+		media.import.discontinuity()?;
 		Ok(())
 	}
 
@@ -1143,4 +1163,23 @@ fn reserve_track(
 	broadcast
 		.reserve_track(name)
 		.map_err(|err| MoqError::Codec(format!("init failed: {err}")))
+}
+
+#[cfg(test)]
+mod metadata_tests {
+	use super::*;
+
+	#[test]
+	fn optional_retention_survives_binding_conversion() {
+		for max_age_us in [None, Some(0), Some(30_000_000)] {
+			let info = MoqTrackInfo {
+				priority: 0,
+				max_age_us,
+				timescale: None,
+			};
+			let model = moq_net::track::Info::try_from(info).unwrap();
+			assert_eq!(model.max_age, max_age_us.map(std::time::Duration::from_micros));
+			assert_eq!(MoqTrackInfo::try_from(&model).unwrap().max_age_us, max_age_us);
+		}
+	}
 }

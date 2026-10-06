@@ -1,382 +1,299 @@
 /**
- * Replay an arrival trace through the real estimator, the real rings, and the real playout engine.
+ * Replay a recorded arrival trace through the player's consumer and rings on a simulated clock.
  *
- * One simulated clock drives everything: frames are inserted at the wall time the trace recorded,
- * and one render quantum is pulled every quantum's worth of that same clock, which is what the
- * AudioWorklet does. Nothing here approximates a component. `Container.Jitter` resolves the target,
- * both rings are the ones a page runs, and `Stretcher` is the engine the worklet owns, so a change
- * that moves any of them moves these numbers.
+ * Every frame is written into its group at the instant the trace says it arrived, and the player's
+ * real `Container.Consumer` decides what to deliver, wait for, and skip, at the max age the delay
+ * sets. Delivered frames go into the real ring, and a discontinuity resets it, the way the decoder
+ * does. One render quantum is read every quantum's worth of that same clock, which is what the
+ * AudioWorklet does. A real {@link Sync} resolves the delay from the playout target the decoder
+ * registers, measured by that same consumer from the recorded catalog config, and the ring follows
+ * it the way the decoder resizes it, so a change to any of them moves what a replay hears. Decoding
+ * is taken as instant and sample exact.
  *
- * Shared by `replay.test.ts`, which grades it against fixed budgets, and by the audio quality
- * harness's replay lane (`test/audio-quality/clients/js/replay.ts`), which grades it against
- * `budgets.json`. One implementation, so the two can never drift into measuring different things.
+ * Deterministic, so the audio quality harness grades its output with no headroom, and a unit test
+ * can assert exact counts.
  *
  * @internal Test support, not part of the player.
  */
+import type * as Catalog from "@moq/hang/catalog";
 import * as Container from "@moq/hang/container";
-import { Time } from "@moq/net";
-import { type Snapshot, Stretcher } from "./playout";
-import { speech } from "./playout/fixture";
+import { Group, Time, Track } from "@moq/net";
+import { Effect } from "@moq/signals";
+import { type Delay, Sync } from "../sync";
+import { frameDuration } from "./config";
+import { ringSamples, target } from "./latency";
 import { AudioRingBuffer } from "./ring-buffer";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
+import { Terminal } from "./terminal";
 
 /** An AudioWorklet render quantum, in frames. */
-const QUANTUM = 128;
+export const QUANTUM = 128;
 
-/** One Opus frame, which is the chunk a synthetic trace is built from. */
-export const CHUNK_MS = 20;
+/**
+ * The replay's own subscription passes every recorded group through: the recorder's relay already
+ * applied a wire max age, so only the consumer's decisions are made again.
+ */
+const WIRE_MAX_AGE = Time.Milli(Number.MAX_SAFE_INTEGER);
 
-/** One frame of a trace: when it was captured, and the wall time it reached us. */
+/** Any non-empty payload: an empty one is the legacy container's end marker. */
+const PAYLOAD = new Uint8Array(1);
+
+/** One frame reaching the container consumer. */
 export interface Arrival {
-	/** Media timestamp, in ms. */
-	media: number;
-	/** Wall time the frame arrived, in ms from the start of the trace. */
-	arrival: number;
-	/** The recorder's own event loop was blocked before this frame was read. */
-	stalled?: boolean;
-	/**
-	 * The publisher declared its timeline finished here rather than sending a frame.
-	 *
-	 * Carries no media, so it is neither inserted nor observed: a declared pause says nothing about
-	 * how late the path is running. The ring is told, and what it holds plays out into silence.
-	 */
-	endpoint?: boolean;
-}
-
-/** A recorded trace, as trimmed into `./fixtures`. */
-export interface Fixture {
-	/** Where the recording came from. */
-	source: string;
-	/** What it is, and what makes it worth keeping. */
-	description: string;
-	/**
-	 * Arrival timing only: no payload, no codec, nothing identifying.
-	 *
-	 * `stalled` is the recording's own answer to a question the timing cannot settle: whether the
-	 * receiver was blocked before it read this frame, which the estimator discounts rather than
-	 * measuring. A recording that never watched its loop simply omits it.
-	 */
-	arrivals: { timestamp_us: number; arrival_ms: number; stalled?: boolean; endpoint?: boolean }[];
-}
-
-/** A fixture's arrivals in the units this module works in. */
-export function recorded(fixture: Fixture): Arrival[] {
-	return fixture.arrivals.map(({ timestamp_us, arrival_ms, stalled, endpoint }) => ({
-		media: timestamp_us / 1000,
-		arrival: arrival_ms,
-		stalled,
-		endpoint,
-	}));
-}
-
-/** Deterministic PRNG, so a synthetic trace is the same on every machine. */
-function rng(seed: number): () => number {
-	let a = seed >>> 0;
-	return () => {
-		a = (a + 0x6d2b79f5) >>> 0;
-		let t = Math.imul(a ^ (a >>> 15), 1 | a);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
-/**
- * A sender emitting a frame every {@link CHUNK_MS}, holding `burst - 1` of them back and flushing
- * the run at once, plus `spread` ms of per-flush network jitter.
- *
- * `burst` of 1 is an evenly paced sender; anything above it is the PES packing an importer produces.
- */
-export function trace(frames: number, burst: number, spread: number, seed = 7): Arrival[] {
-	const rand = rng(seed);
-	const out: Arrival[] = [];
-	let held: number[] = [];
-	for (let i = 0; i < frames; i++) {
-		const media = i * CHUNK_MS;
-		held.push(media);
-		if (held.length < burst) continue;
-		// Every frame keeps its own capture time; the whole run shares one arrival.
-		const arrival = media + 50 + rand() * spread;
-		for (const m of held) out.push({ media: m, arrival });
-		held = [];
-	}
-	return out;
-}
-
-/**
- * The target the estimator settles on for a trace: the real `Jitter`, fed the same arrivals, held
- * above `floorMs`.
- *
- * Also the whole point of the exercise. Nothing here approximates the estimator, so a change that
- * moves it moves what these rings are sized to.
- */
-export function target(t: Arrival[], floorMs: number): number {
-	const jitter = new Container.Jitter();
-	for (const { media, arrival, stalled } of t) {
-		jitter.observe(Time.Micro.fromMilli(media as Time.Milli), arrival as Time.Milli, { stalled });
-	}
-	return Math.max(floorMs, jitter.value.peek());
-}
-
-/** Either ring, with the calls the two transports spell differently behind one name. */
-export interface Ring {
-	/** The ring itself, for everything both transports spell alike. */
-	readonly buffer: AudioRingBuffer | SharedRingBuffer;
-	insert(timestamp: Time.Micro, data: Float32Array[]): void;
-	setLatency(ms: number): void;
-	/** Every counter, copied: the postMessage ring refills one object, as its state message copies it. */
-	debug(): Snapshot;
-}
-
-/** Build a ring at `rate` already sized for a starting target of `latencyMs`. */
-export type Build = (latencyMs: number) => Ring;
-
-/**
- * The shared-memory ring, sized for the estimator's ceiling up front the way `SharedAudioBuffer`
- * does, so a rising target never reallocates.
- */
-export function shared(rate: number): Build {
-	return (latencyMs: number) => {
-		const ceiling = Math.ceil((rate * Container.Jitter.CEILING) / 1000);
-		const buffer = new SharedRingBuffer(allocSharedRingBuffer(1, ceiling, rate));
-		buffer.setLatency(Math.ceil((rate * latencyMs) / 1000));
-		return {
-			buffer,
-			insert: (timestamp, data) => buffer.insert(timestamp, data),
-			setLatency: (ms) => buffer.setLatency(Math.ceil((rate * ms) / 1000)),
-			debug: () => buffer.debug(),
-		};
-	};
-}
-
-/** The postMessage ring, which is the path every page without cross-origin isolation takes. */
-export function post(rate: number): Build {
-	return (latencyMs: number) => {
-		const buffer = new AudioRingBuffer({ rate, channels: 1, latency: latencyMs as Time.Milli });
-		return {
-			buffer,
-			insert: (timestamp, data) => buffer.write(timestamp, data),
-			setLatency: (ms) => buffer.resize(ms as Time.Milli),
-			debug: () => ({ ...buffer.debug() }),
-		};
-	};
-}
-
-/** Both rings at `rate`, named, for a parametrised suite or a matrix row. */
-export function rings(rate: number): Array<[string, Build]> {
-	return [
-		["shared", shared(rate)],
-		["post", post(rate)],
-	];
-}
-
-/** What a replay heard, counted after the warmup. */
-export interface Result {
-	/** Times the reader ran dry mid-playback. */
-	underruns: number;
-	/** Samples thrown away: the reader skipped them, or the writer dropped or trimmed them. */
-	skipped: number;
-	/** Quanta rendered, so `underruns` can be read as a rate. */
-	quanta: number;
-	/** Quanta that came back short of a full block. */
-	short: number;
-	/** Blocks the time stretch shortened and lengthened. */
-	accelerates: number;
-	expands: number;
-	/** Samples synthesized to cover a gap, and the splices that ended them. */
-	concealed: number;
-	merges: number;
-	/**
-	 * Everything the engine emitted after the warmup, so silence can be looked for in it.
-	 *
-	 * Empty unless {@link Options.capture} asked for it, because a recording's worth of PCM is
-	 * megabytes a run that only grades counters should not pay for.
-	 */
-	played: Float32Array;
-	/** The target the estimator had resolved when the trace ended, in ms. */
-	target: number;
-	/** Wall time the replay covered, in ms, which is the trace's own span. */
-	elapsedMs: number;
-	/** The progress series, empty unless {@link Options.sampleMs} asked for one. */
-	samples: Progress[];
-}
-
-/** The whole state of a replay at one instant, on the simulated clock. */
-export interface Progress {
-	/** Simulated wall time since the trace started, in ms. */
+	/** When it arrived, on the viewer's monotonic clock, in ms. */
 	at: number;
-	/** The target the estimator had resolved by then, in ms. */
-	target: number;
-	/** Every ring and engine counter, cumulative. */
-	debug: Snapshot;
+	/** Its media timestamp, in ms. */
+	timestamp: number;
+	/** The group that carried it. */
+	group: number;
 }
 
-/**
- * How many samples each frame carries, taken from the distance to the next frame on the media
- * timeline.
- *
- * A recorded AAC trace is 23.22ms per frame, not the 20ms a synthetic Opus trace uses, and inserting
- * the wrong count leaves the ring gap-filling silence between every pair of frames.
- */
-function frameSamples(t: Arrival[], rate: number): number[] {
-	const sorted = [...t].sort((a, b) => a.media - b.media);
-	const spacing = new Map<number, number>();
-
-	for (let i = 0; i < sorted.length - 1; i++) {
-		const gap = sorted[i + 1].media - sorted[i].media;
-		// A gap far past one frame is missing media, not a long frame: keep the frame its own size
-		// and let the ring fill the hole.
-		spacing.set(sorted[i].media, gap > 0 && gap < 100 ? gap : 0);
-	}
-
-	const nominal = Math.max(...spacing.values().filter((v) => v > 0));
-	return t.map(({ media }) => Math.round((rate * (spacing.get(media) || nominal)) / 1000));
-}
-
-/** What one replay is asked to do. */
+/** What a replay plays through. */
 export interface Options {
-	/** Sample rate the ring and the engine run at, in Hz. */
+	/** `shared` is the SharedArrayBuffer ring a cross-origin isolated page runs; `post` is the rest. */
+	ring: "shared" | "post";
+	/** The sample rate, in Hz. */
 	rate: number;
-	/** A floor under the measured target, in ms: the recording's own frame duration. */
-	floorMs: number;
-	/** Wall time to play before counting starts, in ms: the target is still converging before it. */
-	warmupMs: number;
-	/** A fixed target instead of the measured one, in ms. The control the estimator is graded against. */
-	fixed?: number;
+	/** The configured delay, as the element takes it. "instant" plays no audio, so it has no replay. */
+	delay: Exclude<Delay, "instant">;
+	/** The rendition as the catalog described it: its advertised jitter, delay, and codec. */
+	config: Catalog.AudioConfig;
 	/**
-	 * Whether a gap is concealed with synthesized audio rather than played as a ramp into silence.
-	 *
-	 * On by default, which is what a page runs. Off is the control a concealment test grades against.
+	 * How long the trace observed, from its first arrival, in ms. Rendering runs to here, so an
+	 * outage after the last arrival is heard rather than cut off.
 	 */
-	conceal?: boolean;
-	/** Keep everything rendered after the warmup in {@link Result.played}. Off by default. */
-	capture?: boolean;
-	/**
-	 * Record a {@link Progress} every this many ms of simulated time.
-	 *
-	 * Off by default, because a suite that only grades totals should not pay for the series. The
-	 * harness asks for one on the page's 250 ms grid, so a replay row and a browser row are reduced
-	 * the same way.
-	 */
-	sampleMs?: number;
+	duration: number;
+}
+
+/** One render quantum, as the worklet produced it. */
+export interface Quantum {
+	/** When it finished rendering, on the trace's clock, in ms. */
+	at: number;
+	/** The quantum: what the ring supplied at the front, zeros after it. Reused between yields. */
+	output: Float32Array;
+	/** Whether the ring was stalled after this quantum. */
+	stalled: boolean;
+	/** The playhead after this quantum, on the media clock, in ms. */
+	timestamp: number;
+	/** The delay `Sync` resolved as of this quantum, in ms: what sizes the ring. */
+	delay: number;
+}
+
+/** The two rings behind the calls the decoder and the worklet make on them. */
+interface Ring {
+	insert(timestamp: Time.Micro, data: Float32Array[]): void;
+	read(output: Float32Array[]): number;
+	reset(): void;
+	setLatency(samples: number): void;
+	readonly stalled: boolean;
+	readonly timestamp: Time.Micro;
+}
+
+/** The shared ring, sized and grown the way `SharedAudioBuffer` sizes and grows it. */
+function shared(rate: number, latency: number): Ring {
+	let ring = new SharedRingBuffer(allocSharedRingBuffer(1, Math.max(rate, latency * 2), rate));
+	ring.setLatency(latency);
+	return {
+		insert: (timestamp, data) => ring.insert(timestamp, data),
+		read: (output) => ring.read(output),
+		reset: () => ring.reset(),
+		setLatency: (samples) => {
+			ring.setLatency(samples);
+			if (ring.capacity < samples * 1.5) ring = ring.resize(Math.max(rate, samples * 2));
+		},
+		get stalled() {
+			return ring.stalled;
+		},
+		get timestamp() {
+			return ring.timestamp;
+		},
+	};
+}
+
+/** Samples as the milliseconds `PostAudioBuffer` posts to the worklet. */
+const millis = (rate: number, samples: number) => Time.Milli.fromSecond((samples / rate) as Time.Second);
+
+/** The postMessage ring, sized the way `PostAudioBuffer` asks the worklet to size it. */
+function post(rate: number, latency: number): Ring {
+	const ring = new AudioRingBuffer({ rate, channels: 1, latency: millis(rate, latency) });
+	return {
+		insert: (timestamp, data) => ring.write(timestamp, data),
+		read: (output) => ring.read(output),
+		reset: () => ring.reset(),
+		setLatency: (samples) => ring.resize(millis(rate, samples)),
+		get stalled() {
+			return ring.stalled;
+		},
+		get timestamp() {
+			return ring.timestamp;
+		},
+	};
+}
+
+/** A trace's media timestamp as the container carries it. */
+const micros = (ms: number) => Math.round(ms * 1000) as Time.Micro;
+
+/**
+ * Samples each frame carries, by its timestamp: the trace's typical frame, the median spacing.
+ *
+ * A frame within half a frame of that runs up to where the next one starts instead, so consecutive
+ * frames tile the timeline exactly despite rounding. Any wider spacing is a frame that never
+ * arrived, which stays missing audio rather than stretching the frame before it.
+ */
+function frameSamples(trace: Arrival[], rate: number): { spans: Map<Time.Micro, number>; typical: number } {
+	const starts = [...new Set(trace.map((a) => a.timestamp))].sort((a, b) => a - b);
+	const sample = (ms: number) => Math.round((ms * rate) / 1000);
+	const gaps = starts.slice(1).map((next, i) => sample(next) - sample(starts[i]));
+	const typical = [...gaps].sort((a, b) => a - b)[Math.floor(gaps.length / 2)];
+	if (typical === undefined) throw new Error("a trace needs two frames");
+
+	const spans = new Map<Time.Micro, number>();
+	starts.forEach((start, i) => {
+		const gap = gaps[i];
+		const tiles = gap !== undefined && Math.abs(gap - typical) * 2 <= typical;
+		spans.set(micros(start), tiles ? gap : typical);
+	});
+	return { spans, typical };
 }
 
 /**
- * Play `t` through `build` in simulated real time: insert every frame the moment it arrives, and
- * pull one render quantum every quantum's worth of wall time through the real playout engine.
+ * Run every microtask already queued, and every one those queue, before returning.
  *
- * The estimator runs live, exactly as `Container.Consumer` drives it: observe at arrival, and let
- * the new target reach the ring the way `Sync` and `Supply.#runLatency` push it there. A settled
- * number measured up front would hide the thing the design turns on, which is that the target rises
- * the moment an arrival proves the buffer too shallow.
+ * A macrotask starts only once the microtask queue is empty, and nothing between a group write and
+ * the ring arms a timer, so this orders the replay behind the consumer rather than waiting on time.
  */
-export function replay(build: Build, t: Arrival[], options: Options): Result {
-	const { rate, floorMs, warmupMs, fixed, sampleMs, conceal = true, capture = false } = options;
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/**
+ * Play `trace` in simulated real time, yielding every render quantum from the first arrival to the
+ * end of the observation.
+ *
+ * A group's stream finishes with its last recorded frame. The audio is a constant, never zero, so
+ * what the ring did not supply is exactly the zeros at the end of a quantum, which is how the
+ * harness's output tap reads a real page.
+ */
+export async function* replay(trace: Arrival[], options: Options): AsyncGenerator<Quantum> {
+	const first = trace[0];
+	const last = trace.at(-1);
+	if (!first || !last) return;
+	const end = first.at + options.duration;
+	if (end < last.at) throw new Error(`an arrival at ${last.at} ms is past the ${options.duration} ms observed`);
+
+	const { rate, config } = options;
+	const { spans: samples, typical } = frameSamples(trace, rate);
+
+	// Where each group's stream finishes.
+	const ends = new Map<number, number>();
+	trace.forEach((arrival, i) => {
+		ends.set(arrival.group, i);
+	});
+
+	const sync = new Sync({ delay: options.delay });
+	const track = new Track.Producer("audio");
+	const consumer = new Container.Consumer(track.subscribe({ maxAge: WIRE_MAX_AGE }), {
+		format: new Container.Legacy.Format("audio"),
+		maxAge: sync.out.maxAge,
+	});
+
+	// The decoder's "auto" target. A recorded frame has no payload to read an Opus duration from,
+	// so a codec without a constant one takes the trace's typical spacing.
+	const signals = new Effect();
+	const frame = frameDuration(config) ?? Time.Milli((typical * 1000) / rate);
+	const playout = signals.computed((effect) =>
+		target({
+			measured: effect.get(consumer.spread),
+			advertised: config.jitter !== undefined ? Time.Milli(config.jitter) : undefined,
+			frame,
+			delay: config.delay !== undefined ? Time.Milli(config.delay) : undefined,
+		}),
+	);
+	signals.cleanup(sync.register(playout));
+	await settle();
+
+	let delay = sync.out.delay.peek();
+	const ring = (options.ring === "shared" ? shared : post)(rate, ringSamples(rate, delay));
+
+	// The decoder's read loop, with the codec taken out. A failure is rethrown at the next quantum.
+	const terminal = new Terminal();
+	let failure: { error: unknown } | undefined;
+	const decode = (async () => {
+		for (;;) {
+			const next = await consumer.next();
+			if (!next) return;
+			if (terminal.update(next)) ring.reset();
+			if (next.end !== undefined || !next.frame) continue;
+
+			const { timestamp } = next.frame;
+			const length = samples.get(timestamp);
+			if (length === undefined) throw new Error(`the consumer delivered an unrecorded frame at ${timestamp} us`);
+			ring.insert(timestamp, [new Float32Array(length).fill(0.5)]);
+		}
+	})().catch((error: unknown) => {
+		failure = { error };
+	});
+
+	const groups = new Map<number, Group.Producer>();
 	const step = (QUANTUM / rate) * 1000;
-	const output = [new Float32Array(QUANTUM)];
-	const end = t[t.length - 1].arrival;
-	const samples = frameSamples(t, rate);
-
-	const jitter = new Container.Jitter();
-	const latency = () => fixed ?? Math.max(floorMs, jitter.value.peek());
-
-	const ring = build(latency());
-	const engine = new Stretcher(rate, 1, conceal);
-	// The tone restarts with every replay, so a row is the same whether it ran alone or after five
-	// others: the splice the correlation search picks depends on the phase it is handed.
-	voiceAt = 0;
-
+	const output = new Float32Array(QUANTUM);
 	let next = 0;
-	let outputFrame = 0;
-	let started = false;
-	let quanta = 0;
-	let short = 0;
-	let mark: { quanta: number; short: number; debug: Snapshot } | undefined;
-	const progress: Progress[] = [];
-	let nextSample = 0;
 
-	// Everything rendered after the warmup, so a gap can be looked for as silence rather than only
-	// counted as a short quantum.
-	const played = new Float32Array(capture ? Math.ceil(((end + step) * rate) / 1000) : 0);
-	let length = 0;
+	// The consumer stamps each arrival on the monotonic clock, which the estimator measures, so it
+	// reads the trace's clock instead until the replay finishes.
+	let clock = first.at;
+	const monotonic = performance.now;
+	performance.now = () => clock;
 
-	for (let now = 0; now < end; now += step) {
-		while (next < t.length && t[next].arrival <= now) {
-			if (t[next].endpoint) {
-				// A declared pause carries no media: nothing to insert, and nothing to measure a
-				// path against. The ring plays out what it holds and renders silence after it.
-				ring.buffer.end();
+	try {
+		for (let n = 1; first.at + (n - 1) * step <= end; n++) {
+			// The quantum ending at `now` renders once everything that arrived by then is delivered.
+			const now = first.at + n * step;
+			let stamped = next;
+			while (next < trace.length && trace[next].at <= now) {
+				const arrival = trace[next];
+				// The consumer stamps a frame as it reads it, so the clock moves on only once
+				// everything that arrived at the previous instant has been read.
+				if (arrival.at !== clock) {
+					if (next > stamped) await settle();
+					stamped = next;
+					clock = arrival.at;
+				}
+				let group = groups.get(arrival.group);
+				if (!group) {
+					group = new Group.Producer(arrival.group);
+					groups.set(arrival.group, group);
+					track.writeGroup(group);
+				}
+				const timestamp = micros(arrival.timestamp);
+				group.writeFrame({
+					payload: Container.Legacy.encodeFrame(PAYLOAD, timestamp),
+					timestamp: Time.Timestamp.fromMicros(timestamp),
+				});
+				if (ends.get(arrival.group) === next) {
+					group.close();
+					groups.delete(arrival.group);
+				}
 				next++;
-				continue;
+			}
+			if (next > stamped) await settle();
+			if (failure) throw failure.error;
+
+			// The decoder resizes the ring as the resolved delay moves, which only an arrival does.
+			const resolved = sync.out.delay.peek();
+			if (resolved !== delay) {
+				delay = resolved;
+				ring.setLatency(ringSamples(rate, delay));
 			}
 
-			const count = samples[next];
-			jitter.observe(Time.Micro.fromMilli(t[next].media as Time.Milli), now as Time.Milli, {
-				stalled: t[next].stalled,
-			});
-			ring.setLatency(latency());
-			// A 200Hz tone rather than a constant: a splice on a constant is seamless whatever the
-			// correlation search decides, which would hide a kernel that picked the wrong lag.
-			ring.insert(Time.Micro.fromMilli(t[next].media as Time.Milli), [voice(rate, count)]);
-			next++;
+			output.fill(0);
+			ring.read([output]);
+			yield { at: now, output, stalled: ring.stalled, timestamp: Time.Milli.fromMicro(ring.timestamp), delay };
 		}
-
-		const count = engine.render(ring.buffer, output, outputFrame);
-		outputFrame += QUANTUM;
-		quanta++;
-		if (started && count < QUANTUM) short++;
-		if (count > 0) started = true;
-		if (mark && length + count <= played.length) {
-			played.set(output[0].subarray(0, count), length);
-			length += count;
-		}
-
-		if (now >= warmupMs && !mark) mark = { quanta, short, debug: ring.debug() };
-
-		if (sampleMs !== undefined && now >= nextSample) {
-			progress.push({ at: now, target: latency(), debug: ring.debug() });
-			nextSample = now + sampleMs;
-		}
+	} finally {
+		consumer.close();
+		track.close();
+		await decode;
+		signals.close();
+		sync.close();
+		performance.now = monotonic;
 	}
-
-	const debug = ring.debug();
-	const from = mark ?? { quanta, short, debug };
-	return {
-		underruns: debug.underruns - from.debug.underruns,
-		skipped:
-			debug.skipped -
-			from.debug.skipped +
-			(debug.discarded - from.debug.discarded) +
-			(debug.trimmed - from.debug.trimmed),
-		quanta: quanta - from.quanta,
-		short: short - from.short,
-		accelerates: debug.accelerates - from.debug.accelerates,
-		expands: debug.expands - from.debug.expands,
-		concealed: debug.concealed - from.debug.concealed,
-		merges: debug.merges - from.debug.merges,
-		played: played.subarray(0, length),
-		target: latency(),
-		elapsedMs: end,
-		samples: progress,
-	};
-}
-
-/**
- * A 200Hz tone the correlation search can find a period in, pausing over a quiet room so the
- * background estimate has something to learn from, two seconds of it per rate.
- *
- * A pure sine trains nothing, and concealment built on one fades into digital silence rather than
- * into the room.
- */
-const TONES = new Map<number, Float32Array>();
-let voiceAt = 0;
-
-function voice(rate: number, count: number): Float32Array {
-	let tone = TONES.get(rate);
-	if (!tone) {
-		tone = speech(rate, 2, 200, 0.5, 0.002)[0];
-		TONES.set(rate, tone);
-	}
-	const start = voiceAt % (tone.length - count);
-	voiceAt += count;
-	return tone.slice(start, start + count);
 }

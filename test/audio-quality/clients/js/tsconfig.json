@@ -1,17 +1,14 @@
 {
 	"extends": "../../../../js/tsconfig.json",
 	"compilerOptions": {
-		"types": ["bun", "vite/client"]
+		"types": ["audioworklet", "bun", "vite/client"]
 	},
 	"include": [
 		"analyze.ts",
-		"compare.ts",
 		"driver.ts",
 		"grade.ts",
+		"record.ts",
 		"replay.ts",
-		"safari.ts",
-		"sink.ts",
-		"webdriver.ts",
 		"src",
 		"vite.config.ts",
 		"../../../../js/common/worklet.d.ts"

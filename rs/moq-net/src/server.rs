@@ -7,8 +7,8 @@ use crate::origin;
 use crate::time::{Clock, Instant};
 use crate::{
 	ALPN_14, ALPN_15, ALPN_16, ALPN_17, ALPN_18, ALPN_19, ALPN_20, ALPN_21, ALPN_22, ALPN_LITE, ALPN_LITE_03,
-	ALPN_LITE_04, ALPN_LITE_05, ALPN_LITE_06, ALPN_LITE_07, Consume, Error, NEGOTIATED, Role, Session, SessionError,
-	Version, Versions,
+	ALPN_LITE_04, ALPN_LITE_05, ALPN_LITE_06, ALPN_LITE_07_WIP, Consume, Error, NEGOTIATED, Role, Session,
+	SessionError, Version, Versions,
 	coding::{Decode, Encode, Stream},
 	ietf, lite, setup, stats,
 };
@@ -85,7 +85,7 @@ impl Server {
 		runtime: Clock,
 		session: S,
 		version: lite::Version,
-		client_setup: Option<lite::Setup>,
+		client_setup: Option<lite::AcceptedSetup<S>>,
 		peer_hop: Option<crate::Hop>,
 	) -> Result<(Session, crate::Driver<S>), Error>
 	where
@@ -128,6 +128,7 @@ impl Server {
 			start.recv_bandwidth,
 			crate::driver::Protocol::Lite(Box::new(start.driver)),
 			start.goaway,
+			start.setup,
 		))
 	}
 
@@ -151,15 +152,25 @@ impl Server {
 	/// which is what drops the thread-affinity bounds: a pinned `!Send`
 	/// transport can gate on the advertised path too. Anything but a moq-lite
 	/// ALPN is refused with [`Error::Version`].
-	pub async fn accept_request_lite<S>(&self, now: Instant, mut session: S) -> Result<Handshake<S>, Error>
+	pub async fn accept_request_lite<S>(&self, now: Instant, session: S) -> Result<Handshake<S>, Error>
+	where
+		S: crate::transport::poll::Session,
+	{
+		let mut refused = session.clone();
+		self.handshake_lite(now, session)
+			.await
+			.inspect_err(|err| close(&mut refused, err))
+	}
+
+	async fn handshake_lite<S>(&self, now: Instant, mut session: S) -> Result<Handshake<S>, Error>
 	where
 		S: crate::transport::poll::Session,
 	{
 		let runtime = Clock::new(now);
 		let (path, role, origin, handshake) = match session.protocol() {
-			Some(alpn @ (ALPN_LITE_05 | ALPN_LITE_06 | ALPN_LITE_07)) => {
+			Some(alpn @ (ALPN_LITE_05 | ALPN_LITE_06 | ALPN_LITE_07_WIP)) => {
 				let version = match alpn {
-					ALPN_LITE_07 => lite::Version::Lite07,
+					ALPN_LITE_07_WIP => lite::Version::Lite07,
 					ALPN_LITE_06 => lite::Version::Lite06,
 					_ => lite::Version::Lite05,
 				};
@@ -170,9 +181,9 @@ impl Server {
 				// re-reading the (consumed) Setup Stream.
 				let client_setup = lite::accept_setup(&mut session, version).await?;
 				(
-					client_setup.path.clone(),
-					client_setup.role,
-					client_setup.hop,
+					client_setup.setup.path.clone(),
+					client_setup.setup.role,
+					client_setup.setup.hop,
 					PausedHandshake::LiteSetup {
 						session,
 						version,
@@ -215,6 +226,8 @@ impl Server {
 			path,
 			role,
 			origin,
+			// moq-lite carries no SETUP token.
+			token: None,
 			assigned_hop: crate::Hop::random(),
 			inner: Some(RequestInner {
 				server: self.clone(),
@@ -250,7 +263,22 @@ impl Server {
 	///
 	/// The path is surfaced for moq-lite-05 and newer, and every moq-transport
 	/// draft we speak; it's empty on versions with no in-band request path (lite 01-04).
-	pub async fn accept_request<S>(&self, now: Instant, mut session: S) -> Result<Handshake<S>, Error>
+	///
+	/// A SETUP that fails to parse or negotiate closes the session with the matching code,
+	/// so the peer learns why instead of seeing a bare disconnect.
+	pub async fn accept_request<S>(&self, now: Instant, session: S) -> Result<Handshake<S>, Error>
+	where
+		S: crate::transport::poll::Boxable,
+		S::SendStream: MaybeSync,
+		S::RecvStream: MaybeSync,
+	{
+		let mut refused = session.clone();
+		self.handshake(now, session)
+			.await
+			.inspect_err(|err| close(&mut refused, err))
+	}
+
+	async fn handshake<S>(&self, now: Instant, mut session: S) -> Result<Handshake<S>, Error>
 	where
 		S: crate::transport::poll::Boxable,
 		S::SendStream: MaybeSync,
@@ -294,8 +322,8 @@ impl Server {
 			}
 			// Every lite ALPN goes through the same entry point, which is also
 			// what a `!Send` transport calls directly.
-			Some(ALPN_LITE_07 | ALPN_LITE_06 | ALPN_LITE_05 | ALPN_LITE_04 | ALPN_LITE_03) => {
-				return self.accept_request_lite(now, session).await;
+			Some(ALPN_LITE_07_WIP | ALPN_LITE_06 | ALPN_LITE_05 | ALPN_LITE_04 | ALPN_LITE_03) => {
+				return self.handshake_lite(now, session).await;
 			}
 			Some(ALPN_LITE) | None => {
 				let supported = self.versions.filter(&NEGOTIATED.into()).ok_or(Error::Version)?;
@@ -307,7 +335,7 @@ impl Server {
 		// Legacy bidi SETUP exchange (IETF 14-16, lite 01/02). Read the client's
 		// SETUP to choose the version; `ok()` sends the server SETUP and starts.
 		let mut stream = Stream::accept(&mut session, encoding).await?;
-		let mut client: setup::Client = stream.reader.decode().await?;
+		let client: setup::Client = stream.reader.decode().await?;
 
 		let version = client
 			.versions
@@ -319,9 +347,9 @@ impl Server {
 		// Pull the request path and max request ID out now (IETF only) so `ok()`
 		// doesn't re-decode the consumed parameters. moq-transport carries the path
 		// in its SETUP just like lite-05.
-		let (path, request_id_max, peer_declared) = match version {
+		let (path, token, request_id_max, peer_declared) = match version {
 			Version::Ietf(v) => {
-				let params = ietf::Parameters::decode(&mut client.parameters, v)?;
+				let (params, _) = ietf::Parameters::decode_slice(&client.parameters, v)?;
 				let path = match params.get_bytes(ietf::ParameterBytes::Path) {
 					Some(bytes) => Some(
 						std::str::from_utf8(bytes)
@@ -330,23 +358,26 @@ impl Server {
 					),
 					None => None,
 				};
+				let token = ietf::token::from_setup(&params, v)?;
 				let request_id_max = params
 					.get_varint(ietf::ParameterVarInt::MaxRequestId)
 					.map(ietf::RequestId);
 				let peer_declared = ietf::peer::Peer {
 					solicit: ietf::solicit::from_setup(&params, v)?,
 					hidden: ietf::hidden::from_setup(&params, v),
+					active_count: ietf::active_count::from_setup(&params, v),
 					..Default::default()
 				};
-				(path, request_id_max, peer_declared)
+				(path, token, request_id_max, peer_declared)
 			}
-			Version::Lite(_) => (None, None, ietf::peer::Peer::default()),
+			Version::Lite(_) => (None, None, None, ietf::peer::Peer::default()),
 		};
 
 		Ok(Handshake {
 			path,
 			role: None,
 			origin: None,
+			token,
 			assigned_hop: crate::Hop::random(),
 			inner: Some(RequestInner {
 				server: self.clone(),
@@ -382,6 +413,7 @@ impl Server {
 			// A moq-transport peer only has an identity if it negotiated the MoQ
 			// Cluster extension and declared a non-zero Hop ID.
 			origin: peer_setup.declared.cluster.hop.filter(|h| *h != crate::Hop::UNKNOWN),
+			token: peer_setup.token.clone(),
 			assigned_hop: crate::Hop::random(),
 			inner: Some(RequestInner {
 				server: self.clone(),
@@ -407,6 +439,7 @@ pub struct Handshake<S: crate::transport::poll::Session> {
 	path: Option<String>,
 	role: Option<Role>,
 	origin: Option<crate::Hop>,
+	token: Option<setup::Token>,
 	/// The identity this session's routes are stamped with when the peer declares none
 	/// on the wire. Fresh per request unless the caller overrides it
 	/// ([`Handshake::with_peer_hop`]).
@@ -433,7 +466,7 @@ enum PausedHandshake<S: crate::transport::poll::Session> {
 	LiteSetup {
 		session: S,
 		version: lite::Version,
-		client_setup: lite::Setup,
+		client_setup: lite::AcceptedSetup<S>,
 	},
 	/// An IETF (or legacy bidi-SETUP) handshake, boxed where its
 	/// thread-affinity bounds held. The boxing is what keeps [`Handshake`] and
@@ -487,7 +520,7 @@ where
 
 			// The client's SETUP was read at the pause; hand the stream back
 			// for GOAWAY. A server never advertises a path, hence `None`.
-			let (protocol, goaway) = ietf::start(ietf::Config {
+			let (protocol, goaway, setup) = ietf::start(ietf::Config {
 				runtime: runtime.clone(),
 				session: session.clone(),
 				setup: None,
@@ -500,8 +533,10 @@ where
 				cost: None,
 				version,
 				path: None,
+				authority: None,
 				peer_setup_stream: Some(peer_setup.stream),
 				peer_declared: Some(peer_setup.declared),
+				early_unis: peer_setup.early,
 			})?;
 			tracing::debug!(?version, "connected");
 			Ok(Session::new(
@@ -511,14 +546,14 @@ where
 				None,
 				crate::driver::Protocol::Ietf(protocol),
 				goaway,
+				setup,
 			))
 		}
 		.maybe_boxed()
 	}
 
-	fn close(self: Box<Self>, err: Error) {
-		let mut session = self.session;
-		session.close(SessionError::from(&err).to_code(), &err.to_string());
+	fn close(mut self: Box<Self>, err: Error) {
+		close(&mut self.session, &err);
 	}
 }
 
@@ -560,6 +595,7 @@ where
 					parameters.set_bytes(ietf::ParameterBytes::Implementation, b"moq-lite-rs".to_vec());
 					ietf::solicit::into_setup(&mut parameters, v);
 					ietf::hidden::into_setup(&mut parameters, v);
+					ietf::active_count::into_setup(&mut parameters, v);
 					parameters.encode_bytes(v)?
 				}
 				Version::Lite(v) => lite::Parameters::default().encode_bytes(v)?,
@@ -571,7 +607,7 @@ where
 			};
 			stream.writer.encode(&server_setup).await?;
 
-			let (recv_bw, protocol, goaway) = match version {
+			let (recv_bw, protocol, goaway, setup) = match version {
 				Version::Lite(v) => {
 					let stream = stream.with_version(v);
 					// Pre-lite-05: no Setup Stream, so nothing to advertise or seed.
@@ -590,12 +626,13 @@ where
 						start.recv_bandwidth,
 						crate::driver::Protocol::Lite(Box::new(start.driver)),
 						start.goaway,
+						start.setup,
 					)
 				}
 				Version::Ietf(v) => {
 					let stream = stream.with_version(v);
 					// Draft 14-16: path came in the bidi SETUP, no uni SETUP to hand back.
-					let (protocol, goaway) = ietf::start(ietf::Config {
+					let (protocol, goaway, setup) = ietf::start(ietf::Config {
 						runtime: runtime.clone(),
 						session: session.clone(),
 						setup: Some(stream),
@@ -607,21 +644,24 @@ where
 						cost: None,
 						version: v,
 						path: None,
+						authority: None,
 						peer_setup_stream: None,
 						peer_declared: Some(peer_declared),
+						early_unis: Vec::new(),
 					})?;
-					(None, crate::driver::Protocol::Ietf(protocol), goaway)
+					(None, crate::driver::Protocol::Ietf(protocol), goaway, setup)
 				}
 			};
 
-			Ok(Session::new(runtime, session, version, recv_bw, protocol, goaway))
+			Ok(Session::new(
+				runtime, session, version, recv_bw, protocol, goaway, setup,
+			))
 		}
 		.maybe_boxed()
 	}
 
-	fn close(self: Box<Self>, err: Error) {
-		let mut session = self.session;
-		session.close(SessionError::from(&err).to_code(), &err.to_string());
+	fn close(mut self: Box<Self>, err: Error) {
+		close(&mut self.session, &err);
 	}
 }
 
@@ -661,6 +701,14 @@ where
 	/// authenticated identity: authorize on the token or client certificate.
 	pub fn peer_hop(&self) -> Option<crate::Hop> {
 		self.origin
+	}
+
+	/// The credential the client presented in its SETUP's `AUTHORIZATION TOKEN` option.
+	///
+	/// Only moq-transport carries one, so moq-lite sessions return `None`. The transport
+	/// has not verified it: authorize on it the way you would a URL token.
+	pub fn token(&self) -> Option<&setup::Token> {
+		self.token.as_ref()
 	}
 
 	/// Publish to the connected client. Overrides any value from the [`Server`]
@@ -742,8 +790,13 @@ impl<S: crate::transport::poll::Session> RequestInner<S> {
 			PausedHandshake::LiteSetup { session, .. } => session,
 			PausedHandshake::Boxed(paused) => return paused.close(err),
 		};
-		session.close(SessionError::from(&err).to_code(), &err.to_string());
+		close(&mut session, &err);
 	}
+}
+
+/// Close `session` with `err`'s wire code.
+fn close<S: crate::transport::poll::Session>(session: &mut S, err: &Error) {
+	session.close(SessionError::from(err).to_code(), &err.to_string());
 }
 
 impl<S: crate::transport::poll::Session> Drop for Handshake<S> {
@@ -789,12 +842,16 @@ mod tests {
 		}
 	}
 
-	/// A session that replays a queue of unidirectional streams (each a `Vec<u8>`) in
-	/// order from `accept_uni`; everything else is inert.
+	/// A session that replays a queue of streams (each a `Vec<u8>`) in order from
+	/// `accept_uni` and `accept_bi`, and records the code it was closed with; everything
+	/// else is inert.
 	#[derive(Clone)]
 	struct FakeSession {
 		protocol: Option<&'static str>,
 		uni: Arc<Mutex<VecDeque<Vec<u8>>>>,
+		bi: Arc<Mutex<VecDeque<Vec<u8>>>>,
+		closed: Arc<Mutex<Option<u32>>>,
+		stops: Arc<Mutex<Vec<u32>>>,
 	}
 
 	impl FakeSession {
@@ -802,7 +859,19 @@ mod tests {
 			Self {
 				protocol: Some(protocol),
 				uni: Arc::new(Mutex::new(uni.into_iter().collect())),
+				bi: Default::default(),
+				closed: Default::default(),
+				stops: Default::default(),
 			}
+		}
+
+		fn with_bi(self, bi: Vec<u8>) -> Self {
+			self.bi.lock().unwrap().push_back(bi);
+			self
+		}
+
+		fn closed(&self) -> Option<u32> {
+			*self.closed.lock().unwrap()
 		}
 	}
 
@@ -816,7 +885,11 @@ mod tests {
 			_cx: &mut std::task::Context<'_>,
 		) -> std::task::Poll<Result<Self::RecvStream, Self::Error>> {
 			match self.uni.lock().unwrap().pop_front() {
-				Some(data) => std::task::Poll::Ready(Ok(FakeRecv { data: data.into() })),
+				Some(data) => std::task::Poll::Ready(Ok(FakeRecv {
+					data: data.into(),
+					stops: self.stops.clone(),
+				})),
+				None if self.closed().is_some() => std::task::Poll::Ready(Err(FakeError)),
 				None => std::task::Poll::Pending,
 			}
 		}
@@ -824,7 +897,16 @@ mod tests {
 			&mut self,
 			_cx: &mut std::task::Context<'_>,
 		) -> std::task::Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
-			std::task::Poll::Pending
+			match self.bi.lock().unwrap().pop_front() {
+				Some(data) => std::task::Poll::Ready(Ok((
+					FakeSend,
+					FakeRecv {
+						data: data.into(),
+						stops: self.stops.clone(),
+					},
+				))),
+				None => std::task::Poll::Pending,
+			}
 		}
 		fn poll_open_bi(
 			&mut self,
@@ -857,7 +939,9 @@ mod tests {
 		fn protocol(&self) -> Option<&str> {
 			self.protocol
 		}
-		fn close(&mut self, _code: u32, _reason: &str) {}
+		fn close(&mut self, code: u32, _reason: &str) {
+			self.closed.lock().unwrap().get_or_insert(code);
+		}
 		fn poll_closed(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Error> {
 			std::task::Poll::Pending
 		}
@@ -877,7 +961,7 @@ mod tests {
 		) -> std::task::Poll<Result<usize, Self::Error>> {
 			std::task::Poll::Ready(Ok(buf.len()))
 		}
-		fn set_priority(&mut self, _order: u8) {}
+		fn set_priority(&mut self, _order: i32) {}
 		fn finish(&mut self) -> Result<(), Self::Error> {
 			Ok(())
 		}
@@ -889,6 +973,7 @@ mod tests {
 
 	struct FakeRecv {
 		data: VecDeque<u8>,
+		stops: Arc<Mutex<Vec<u32>>>,
 	}
 	impl web_transport_trait::poll::RecvStream for FakeRecv {
 		type Error = FakeError;
@@ -906,7 +991,9 @@ mod tests {
 			}
 			std::task::Poll::Ready(Ok(Some(size)))
 		}
-		fn stop(&mut self, _code: u32) {}
+		fn stop(&mut self, code: u32) {
+			self.stops.lock().unwrap().push(code);
+		}
 		fn poll_closed(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
 			std::task::Poll::Ready(Ok(()))
 		}
@@ -916,7 +1003,9 @@ mod tests {
 	fn lite05_setup(path: Option<&str>, role: Option<Role>, hop: Option<Hop>) -> Vec<u8> {
 		let v = lite::Version::Lite05;
 		let mut buf = Vec::new();
-		lite::DataType::Setup.encode(&mut buf, v).unwrap();
+		lite::DataType::Setup
+			.encode(&mut crate::coding::Encoder::new(&mut buf, v.into()), v)
+			.unwrap();
 		lite::Setup {
 			probe: lite::ProbeLevel::None,
 			path: path.map(str::to_string),
@@ -924,7 +1013,7 @@ mod tests {
 			cost: None,
 			hop,
 		}
-		.encode(&mut buf, v)
+		.encode(&mut crate::coding::Encoder::new(&mut buf, v.into()), v)
 		.unwrap();
 		buf
 	}
@@ -936,16 +1025,103 @@ mod tests {
 		if let Some(path) = path {
 			params.set_bytes(ietf::ParameterBytes::Path, path.as_bytes().to_vec());
 		}
+		ietf_setup_with(version, params)
+	}
+
+	fn ietf_setup_with(version: ietf::Version, params: ietf::Parameters) -> Vec<u8> {
 		let parameters = params.encode_bytes(version).unwrap();
 
 		let mut buf = Vec::new();
 		setup::Setup { parameters }
-			.encode(&mut buf, crate::Version::Ietf(version))
+			.encode(
+				&mut crate::coding::Encoder::new(&mut buf, (crate::Version::Ietf(version)).into()),
+				crate::Version::Ietf(version),
+			)
 			.unwrap();
 		buf
 	}
 
-	#[tokio::test(start_paused = true)]
+	/// Encode a draft 14-16 CLIENT_SETUP, sent on the control bidi stream.
+	fn legacy_setup(version: ietf::Version, params: ietf::Parameters) -> Vec<u8> {
+		let mut buf = Vec::new();
+		setup::Client {
+			versions: crate::coding::Versions::from([crate::Version::Ietf(version).into()]),
+			parameters: params.encode_bytes(version).unwrap(),
+		}
+		.encode(
+			&mut crate::coding::Encoder::new(&mut buf, (crate::Version::Ietf(version)).into()),
+			crate::Version::Ietf(version),
+		)
+		.unwrap();
+		buf
+	}
+
+	fn setup_token() -> setup::Token {
+		setup::Token {
+			kind: setup::Token::OUT_OF_BAND,
+			value: vec![0x00, 0xff, b'j', b'w', b't'],
+		}
+	}
+
+	fn token_params(version: ietf::Version) -> ietf::Parameters {
+		let mut params = ietf::Parameters::default();
+		ietf::token::into_setup(&mut params, &setup_token(), version).unwrap();
+		params
+	}
+
+	#[moq_net_sim::test]
+	async fn accept_request_exposes_the_setup_token() {
+		let modern = FakeSession::new(
+			ALPN_19,
+			[ietf_setup_with(
+				ietf::Version::Draft19,
+				token_params(ietf::Version::Draft19),
+			)],
+		);
+		let legacy = FakeSession::new(ALPN_16, []).with_bi(legacy_setup(
+			ietf::Version::Draft16,
+			token_params(ietf::Version::Draft16),
+		));
+		for (name, session) in [("draft-19", modern), ("draft-16", legacy)] {
+			let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
+			assert_eq!(request.token(), Some(&setup_token()), "{name}");
+		}
+	}
+
+	#[moq_net_sim::test]
+	async fn accept_request_without_a_token_reports_none() {
+		let ietf = FakeSession::new(ALPN_19, [ietf_setup(ietf::Version::Draft19, None)]);
+		let lite = FakeSession::new(ALPN_LITE_05, [lite05_setup(None, None, None)]);
+		for (name, session) in [("draft-19", ietf), ("lite-05", lite)] {
+			let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
+			assert_eq!(request.token(), None, "{name}");
+		}
+	}
+
+	/// A SETUP the server refuses closes the session with the code naming why, on both
+	/// the draft-17+ uni stream and the draft 14-16 bidi stream.
+	#[moq_net_sim::test]
+	async fn a_refused_setup_token_closes_with_its_code() {
+		let delete = [0x0, 0x7]; // DELETE alias 7
+		let truncated = [0x3]; // USE_VALUE with no Token Type
+		for (raw, code) in [
+			(&delete[..], SessionError::ProtocolViolation),
+			(&truncated[..], SessionError::KeyValueFormatting),
+		] {
+			let mut params = ietf::Parameters::default();
+			params.set_bytes(ietf::ParameterBytes::AuthorizationToken, raw.to_vec());
+
+			let modern = FakeSession::new(ALPN_19, [ietf_setup_with(ietf::Version::Draft19, params.clone())]);
+			let legacy = FakeSession::new(ALPN_16, []).with_bi(legacy_setup(ietf::Version::Draft16, params));
+			for (name, session) in [("draft-19", modern), ("draft-16", legacy)] {
+				let result = Server::new().accept_request(moq_net_sim::now(), session.clone()).await;
+				assert!(result.is_err(), "{name}");
+				assert_eq!(session.closed(), Some(code.to_code()), "{name} {code}");
+			}
+		}
+	}
+
+	#[moq_net_sim::test]
 	async fn accept_request_reads_ietf_path() {
 		// Every draft-17+ version gates on the SETUP stream before starting, so the
 		// path is known at authorization time just like lite-05.
@@ -955,114 +1131,120 @@ mod tests {
 			(ALPN_19, ietf::Version::Draft19),
 		] {
 			let session = FakeSession::new(alpn, [ietf_setup(version, Some("/team/room"))]);
-			let request = Server::new()
-				.accept_request(tokio::time::Instant::now().into_std(), session)
-				.await
-				.unwrap();
+			let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
 			assert_eq!(request.path(), "/team/room", "{alpn}");
 		}
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn accept_request_ietf_without_path_is_empty() {
 		let session = FakeSession::new(ALPN_19, [ietf_setup(ietf::Version::Draft19, None)]);
-		let request = Server::new()
-			.accept_request(tokio::time::Instant::now().into_std(), session)
-			.await
-			.unwrap();
+		let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
 		assert_eq!(request.path(), "");
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn accept_request_ietf_empty_path_is_accepted() {
 		let session = FakeSession::new(ALPN_19, [ietf_setup(ietf::Version::Draft19, Some(""))]);
-		let request = Server::new()
-			.accept_request(tokio::time::Instant::now().into_std(), session)
-			.await
-			.unwrap();
+		let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
 		assert_eq!(request.path(), "");
 	}
 
 	/// Encode a lite-05 GROUP uni stream header (just the `DataType::Group` tag).
 	fn lite05_group() -> Vec<u8> {
 		let mut buf = Vec::new();
-		lite::DataType::Group.encode(&mut buf, lite::Version::Lite05).unwrap();
+		lite::DataType::Group
+			.encode(
+				&mut crate::coding::Encoder::new(&mut buf, lite::Version::Lite05.into()),
+				lite::Version::Lite05,
+			)
+			.unwrap();
 		buf
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn accept_request_reads_lite05_path() {
 		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(Some("/team/room"), None, None)]);
-		let request = Server::new()
-			.accept_request(tokio::time::Instant::now().into_std(), session)
-			.await
-			.unwrap();
+		let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
 		assert_eq!(request.path(), "/team/room");
 		assert_eq!(request.role(), None, "a client that omits the role is bidirectional");
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn accept_request_lite05_without_path_is_empty() {
 		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(None, None, None)]);
-		let request = Server::new()
-			.accept_request(tokio::time::Instant::now().into_std(), session)
-			.await
-			.unwrap();
+		let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
 		assert_eq!(request.path(), "");
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn accept_request_lite05_empty_path_is_accepted() {
 		// An empty path is valid on the wire and means the same as omitting it, so a
 		// client that wants the root doesn't have to special-case the parameter.
 		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(Some(""), None, None)]);
-		let request = Server::new()
-			.accept_request(tokio::time::Instant::now().into_std(), session)
-			.await
-			.unwrap();
+		let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
 		assert_eq!(request.path(), "");
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn accept_request_reads_lite05_role() {
 		let session = FakeSession::new(
 			ALPN_LITE_05,
 			[lite05_setup(Some("/team/room"), Some(Role::Publisher), None)],
 		);
-		let request = Server::new()
-			.accept_request(tokio::time::Instant::now().into_std(), session)
-			.await
-			.unwrap();
+		let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
 		assert_eq!(request.role(), Some(Role::Publisher));
 	}
 
-	#[tokio::test(start_paused = true)]
-	async fn accept_request_skips_uni_stream_before_setup() {
-		// A GROUP racing ahead of the SETUP is STOP_SENDING-ed and skipped; the gate
-		// keeps reading until it finds the SETUP.
+	#[moq_net_sim::test]
+	async fn accept_request_holds_uni_stream_before_setup() {
 		let session = FakeSession::new(
 			ALPN_LITE_05,
 			[lite05_group(), lite05_setup(Some("/team/room"), None, None)],
 		);
+		let stops = session.stops.clone();
 		let request = Server::new()
-			.accept_request(tokio::time::Instant::now().into_std(), session)
+			.accept_request_lite(moq_net_sim::now(), session)
 			.await
 			.unwrap();
 		assert_eq!(request.path(), "/team/room");
+		assert!(stops.lock().unwrap().is_empty(), "the early stream must stay open");
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
+	async fn accept_request_reads_buffered_setup_after_transport_close() {
+		let mut session = FakeSession::new(ALPN_LITE_05, [lite05_setup(Some("/closed"), None, None)]);
+		web_transport_trait::poll::Session::close(&mut session, SessionError::Cancel.to_code(), "closed");
+		let request = Server::new()
+			.accept_request_lite(moq_net_sim::now(), session)
+			.await
+			.unwrap();
+		assert_eq!(request.path(), "/closed");
+	}
+
+	#[moq_net_sim::test]
+	async fn accepted_lite_setup_refuses_a_second_setup_stream() {
+		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(None, None, None)]);
+		let transport = session.clone();
+		let request = Server::new()
+			.accept_request_lite(moq_net_sim::now(), session)
+			.await
+			.unwrap();
+		let (_session, mut driver) = request.ok().await.unwrap();
+		transport.uni.lock().unwrap().push_back(vec![1]);
+		let _ = driver.poll(moq_net_sim::now(), &kio::Waiter::noop());
+		assert_eq!(transport.closed(), Some(SessionError::ProtocolViolation.to_code()));
+	}
+
+	#[moq_net_sim::test]
 	async fn accept_request_reads_lite05_peer_hop() {
 		let hop = Hop::new(42).unwrap();
 		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(None, None, Some(hop))]);
-		let request = Server::new()
-			.accept_request(tokio::time::Instant::now().into_std(), session)
-			.await
-			.unwrap();
+		let request = Server::new().accept_request(moq_net_sim::now(), session).await.unwrap();
 		assert_eq!(request.peer_hop(), Some(hop));
 	}
 
-	#[tokio::test(start_paused = true)]
+	#[moq_net_sim::test]
 	async fn anonymous_peer_hop_filters_routes_from_server_session() {
 		let other = Hop::new(778).unwrap();
 		let origin = crate::origin::Config::new(Hop::new(1).unwrap()).produce();
@@ -1075,10 +1257,11 @@ mod tests {
 			path: None,
 			role: None,
 			origin: None,
+			token: None,
 			assigned_hop: Hop::random(),
 			inner: Some(RequestInner {
 				server: Server::new().with_publisher(&origin),
-				runtime: Clock::new(tokio::time::Instant::now().into_std()),
+				runtime: Clock::new(moq_net_sim::now()),
 				handshake: PausedHandshake::Boxed(Box::new(PausedIetfModern {
 					session: transport,
 					version,
@@ -1088,7 +1271,9 @@ mod tests {
 							Version::Ietf(version),
 						),
 						path: None,
+						token: None,
 						declared: ietf::peer::Peer::default(),
+						early: Vec::new(),
 					},
 				})),
 			}),
@@ -1113,13 +1298,13 @@ mod tests {
 			.unwrap();
 
 		let (session, driver) = request.ok().await.unwrap();
-		tokio::spawn(crate::time::run(driver));
+		moq_net_sim::spawn(crate::time::run_sim(driver));
 
 		for _ in 0..100 {
 			if occurrences(&log, b"local-route") > 0 {
 				break;
 			}
-			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+			moq_net_sim::sleep(std::time::Duration::from_millis(1)).await;
 		}
 
 		assert_eq!(occurrences(&log, b"echoed-route"), 0);

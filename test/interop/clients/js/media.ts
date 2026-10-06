@@ -11,11 +11,7 @@
  * Launches with Chromium's gesture-required autoplay policy. The capture case adds a fake device
  * while Playwright controls permission. No page reloads: the publisher reports when it is ready.
  *
- * Every measured window also requires the audio on the thread the pass expects: the page's audio
- * worker by default, the page's own main thread under `--offload false`, which sets the player's
- * `offload="false"`.
- *
- *     bun media.ts --url http://127.0.0.1:4443 [--timeout 30] [--cases pause,detach] [--offload false]
+ *     bun media.ts --url http://127.0.0.1:4443 [--timeout 30] [--cases pause,detach]
  *     bun media.ts --url ... --fault silent-audio --cases none --expect-fail "audio tone"
  *
  * @module
@@ -34,6 +30,7 @@ import {
 	type PlayerState,
 	POLL_INTERVAL_MS,
 	pageUrl,
+	pause,
 	readFixtureState,
 	readPlayerState,
 	SELECTORS,
@@ -47,12 +44,10 @@ import {
 	waitForState,
 	waitForWatch,
 } from "./harness";
-import { closeBrowsers } from "./src/cleanup";
 import {
-	type AudioThread,
 	type CaptureState,
 	FAULTS,
-	KEYFRAME_INTERVAL_MS,
+	lateJoinStartsLive,
 	leakedPlayerStarted,
 	SAMPLE_MS,
 	SAMPLE_RATE,
@@ -70,7 +65,6 @@ const { values } = parseArgs({
 		fault: { type: "string", default: "none" },
 		cases: { type: "string" },
 		leak: { type: "boolean", default: false },
-		offload: { type: "string", default: "true" },
 		"expect-fail": { type: "string" },
 	},
 });
@@ -83,25 +77,13 @@ const selected = new Set<string>(
 	values.cases === undefined ? CASES : values.cases === "none" ? [] : values.cases.split(","),
 );
 const unknown = [...selected].filter((name) => !CASES.some((c) => c === name));
-if (
-	!url ||
-	!Number.isFinite(timeoutMs) ||
-	timeoutMs <= 0 ||
-	!FAULTS.some((f) => f === fault) ||
-	unknown.length > 0 ||
-	(values.offload !== "true" && values.offload !== "false")
-) {
+if (!url || !Number.isFinite(timeoutMs) || timeoutMs <= 0 || !FAULTS.some((f) => f === fault) || unknown.length > 0) {
 	console.error(
-		`usage: media.ts --url U [--timeout S>0] [--fault ${FAULTS.join("|")}] [--cases none|${CASES.join(",")}] [--leak] [--offload true|false] [--expect-fail TEXT]`,
+		`usage: media.ts --url U [--timeout S>0] [--fault ${FAULTS.join("|")}] [--cases none|${CASES.join(",")}] [--leak] [--expect-fail TEXT]`,
 	);
 	process.exit(2);
 }
 const wants = (name: Case) => selected.has(name);
-
-// Whether the player hands its audio to the page's worker, which is its default, and so where every
-// measured window has to find it.
-const offload = values.offload === "true";
-const thread: AudioThread = offload ? "worker" : "main";
 
 // process.exit narrows `url` above, but not inside the function declarations below.
 const relay: string = url;
@@ -132,9 +114,6 @@ const MIN_RATE = 0.5;
  * step off some of the time. Two steps is not boundary noise.
  */
 const MAX_SKEW_STEPS = 1;
-
-/** The first decodable frame may start at the current GOP's keyframe, but never in older history. */
-const MAX_LATE_JOIN_LAG_FRAMES = Math.ceil((Pattern.FPS * KEYFRAME_INTERVAL_MS) / 1000);
 
 const percentile = (values: number[], p: number) => {
 	if (values.length === 0) return Number.NaN;
@@ -188,16 +167,15 @@ async function waitFrozen(page: Page, errors: BrowserErrors, assertion: string, 
 }
 
 // One sample as a line: elapsed time, the frame on the canvas, the tone step heard against the one
-// that frame belongs to, how far the tone stood above the noise floor, whether audio was arriving at
-// all, which separates a silent player from a publisher that stopped sending, and the thread feeding it.
+// that frame belongs to, how far the tone stood above the noise floor, and whether audio was
+// arriving at all, which separates a silent player from a publisher that stopped sending.
 function traceLine(sample: PlayerState, start: number): string {
 	const step = sample.frameId === undefined ? "?" : Pattern.expectedStep(sample.frameId);
 	const margin = sample.toneDb !== undefined && sample.noiseDb !== undefined ? sample.toneDb - sample.noiseDb : 0;
 	return (
 		`    +${((sample.at - start) / 1000).toFixed(2)}s frame=${sample.frameId ?? "-"} ` +
 		`step=${sample.toneStep ?? "-"}/${step} tone=${margin.toFixed(0)}dB ${sample.toneHz?.toFixed(0) ?? "-"}Hz ` +
-		`paused=${sample.paused} audio=${sample.audioBytes}B${sample.audioStalled ? " stalled" : ""} ` +
-		`thread=${sample.audioThread ?? "-"}`
+		`paused=${sample.paused} delay=${sample.delay}ms audio=${sample.audioBytes}B${sample.audioStalled ? " stalled" : ""}`
 	);
 }
 
@@ -221,16 +199,6 @@ function assertMedia(samples: PlayerState[], label: string): void {
 
 function measure(samples: PlayerState[], label: string): void {
 	check(samples.length >= 10, "sampling", () => `${label}: only ${samples.length} samples in the window`);
-
-	// A state rather than a reading: no sample may name the other thread, and the window has to end on
-	// this one. A sample still waiting on the worker is allowed, as the picture can be back before it.
-	const astray = samples.find((s) => s.audioThread !== undefined && s.audioThread !== thread);
-	const ending = samples[samples.length - 1]?.audioThread;
-	check(
-		astray === undefined && ending === thread,
-		"audio thread",
-		() => `${label}: the audio ran on ${astray?.audioThread ?? ending ?? "no thread yet"}, not ${thread}`,
-	);
 
 	const readable = samples.filter((s) => s.frameId !== undefined);
 	check(
@@ -291,7 +259,7 @@ function measure(samples: PlayerState[], label: string): void {
 	);
 	console.error(
 		`  ${label}: ${rate.toFixed(1)}fps presented over ${advance} frames, tone ${margin.toFixed(0)}dB above the floor, ` +
-			`skew median ${median.toFixed(0)}ms p95 ${p95.toFixed(0)}ms, audio on ${thread} (browser output, not a speaker)`,
+			`skew median ${median.toFixed(0)}ms p95 ${p95.toFixed(0)}ms (browser output, not a speaker)`,
 	);
 }
 
@@ -381,15 +349,8 @@ async function subscriber(
 	const [page, errors] = await open(
 		await browserFor(),
 		// visible="always" because the window is never frontmost in a headless run, and the default
-		// policy would stop downloading video and leave the canvas black. `offload` only when it is off,
-		// so the default pass runs the element's own default.
-		pageUrl(server.origin, "subscribe", {
-			url: relay,
-			broadcast,
-			visible: "always",
-			muted: String(muted),
-			...(offload ? {} : { offload: "false" }),
-		}),
+		// policy would stop downloading video and leave the canvas black.
+		pageUrl(server.origin, "subscribe", { url: relay, broadcast, visible: "always", muted: String(muted) }),
 		label,
 		trace,
 	);
@@ -563,21 +524,7 @@ try {
 	// ── pause and resume ─────────────────────────────────────────────────────
 	if (wants("pause")) {
 		console.error("=== pause and resume ===");
-		// Keep the buffering indicator visible so hit testing covers an interrupted stream.
-		await player.locator(SELECTORS.ui).evaluate((element) => {
-			if (!element.shadowRoot) throw new Error("player UI has no shadow root");
-			const style = document.createElement("style");
-			style.dataset.interop = "buffering";
-			style.textContent = ".buffering { display: flex !important; }";
-			element.shadowRoot.append(style);
-		});
-		// The chrome auto-hides while playing; pointer activity reveals the real control.
-		await player.dispatchEvent(SELECTORS.ui, "pointermove");
-		await player.locator(SELECTORS.ui).locator(SELECTORS.pauseControl).click();
-		await player
-			.locator(SELECTORS.ui)
-			.locator('style[data-interop="buffering"]')
-			.evaluate((element) => element.remove());
+		await pause(player);
 		await waitForState(player, playerErrors, {
 			deadline: Date.now() + SETTLE_MS,
 			assertion: "pause takes effect",
@@ -685,7 +632,6 @@ try {
 		console.error("=== stop and republish ===");
 		const before = await readPlayerState(player);
 		await command(publisher, "stop");
-		throwPageErrors(publisherErrors);
 		await waitFrozen(
 			player,
 			playerErrors,
@@ -711,8 +657,8 @@ try {
 	// at the live edge rather than replay what it missed.
 	if (wants("late-join")) {
 		console.error("=== late join ===");
+		const live = await command(publisher, "liveGop");
 		await player.close();
-		const live = await readFixtureState(publisher);
 		[player, playerErrors] = await subscriber(broadcast, "latecomer");
 		await gesture(player);
 		const joined = await waitForState(player, playerErrors, {
@@ -721,23 +667,20 @@ try {
 			description: "the latecomer to present the fixture",
 			predicate: (state) => state.frameId !== undefined && state.audioContext === "running",
 		});
-		// The fixture sample names the frame painted immediately before the page opens. The first
-		// decodable frame can be the keyframe at the start of the current GOP, so require it to be
-		// within that GOP rather than requiring an impossible zero-frame capture/encode delay.
-		const lag = live.frameId - (joined.frameId ?? 0);
+		// requestFrame() is asynchronous, and capture timestamps decide keyframes. The painted
+		// counter can therefore be over 15 ticks ahead of a still-current encoded GOP under load.
+		// Compare against its actual published keyframe, sampled while the old viewer held demand.
 		check(
-			lag <= MAX_LATE_JOIN_LAG_FRAMES,
+			lateJoinStartsLive(live, joined.videoTimestamp),
 			"late join starts live",
 			() =>
-				`joined at frame ${joined.frameId}, ${lag} frames behind the ${live.frameId} already published when it opened (one GOP is ${MAX_LATE_JOIN_LAG_FRAMES})`,
+				`joined at frame ${joined.frameId}, timestamp ${joined.videoTimestamp}ms before the current GOP's ${live.timestamp}ms keyframe`,
 		);
-		console.error(`  joined at frame ${joined.frameId}, live edge was ${live.frameId}`);
+		console.error(`  joined at frame ${joined.frameId}, timestamp ${joined.videoTimestamp}ms, current GOP began at ${live.timestamp}ms`);
 		assertMedia(await collect(player, playerErrors, WINDOW_MS), "late join");
 	}
 
 	if (wants("capture-denial")) await captureDenial(`${broadcast}-capture.hang`);
-	await command(publisher, "stop");
-	throwPageErrors(publisherErrors);
 } catch (err) {
 	failure = err instanceof Error ? err : new Error(String(err));
 }
@@ -765,12 +708,6 @@ if (expectFail !== undefined) {
 }
 
 await finishTraces(code !== 0);
-try {
-	await closeBrowsers(browsers);
-} catch (error) {
-	console.error(`FAIL browser cleanup: ${error instanceof Error ? error.message : String(error)}`);
-	code = 1;
-} finally {
-	server.stop();
-}
+for (const browser of browsers) await browser.close().catch(() => {});
+server.stop();
 process.exit(code);

@@ -10,7 +10,7 @@
 //! global eviction task.
 //!
 //! Cross-track ordering comes from one statistic: the mean last-access time of the
-//! evictable population (every cached group except each track's protected latest).
+//! evictable population (every cached group except each live track's protected latest).
 //! A group accessed more recently than that mean is never evicted, so freshly read
 //! or fetched content in one track can't die while another track holds staler
 //! content, and a track
@@ -18,9 +18,10 @@
 //! old entries and inserting new ones both advance the mean, so the eviction
 //! frontier moves with cache turnover on its own.
 //!
-//! The pool also owns the wall-clock LRU window ([`Pool::expiry`]): a non-latest
-//! group that nobody has read or written for that long is reclaimed, no matter what
-//! retention its track advertises. Track retention
+//! The pool also owns the wall-clock LRU window ([`Pool::expiry`]): a group that
+//! nobody has read or written for that long is reclaimed, no matter what retention
+//! its track advertises. Only a live track's latest group is exempt: once a track
+//! ends, a stale consumer can't pin any of it. Track retention
 //! ([`max_age`](crate::track::Info::max_age)) is measured in media timestamps, so a
 //! congestion stall can't age content out; the pool's expiry is the orthogonal
 //! wall-clock bound that keeps unwatched content from pinning RAM.
@@ -101,8 +102,8 @@ impl Config {
 
 	/// Set the wall-clock LRU window. `None` disables idle reclamation.
 	///
-	/// A non-latest cached group that nobody reads or writes for this long is
-	/// reclaimed, surfacing to any remaining reader as
+	/// A cached group (other than a live track's latest) that nobody reads or writes
+	/// for this long is reclaimed, surfacing to any remaining reader as
 	/// [`Error::Old`](crate::Error::Old). This is independent of track retention:
 	/// [`max_age`](crate::track::Info::max_age) uses media timestamps, while this
 	/// window keeps idle content from pinning memory. Reclaiming without a write behind
@@ -179,7 +180,7 @@ impl Pool {
 			}
 			ms.max(1).div_ceil(TICK_MS).saturating_mul(TICK_MS)
 		});
-		let pool = Self {
+		Self {
 			inner: Arc::new(Inner {
 				used: AtomicU64::new(0),
 				capacity: AtomicU64::new(config.capacity.unwrap_or(u64::MAX)),
@@ -190,10 +191,7 @@ impl Pool {
 				access_count: AtomicU64::new(0),
 				tracks: kio::Lock::new(slab::Slab::new()),
 			}),
-		};
-		#[cfg(test)]
-		crate::model::clock::register(&pool);
-		pool
+		}
 	}
 
 	/// Create a pool that never evicts. This is the [`Default`].
@@ -269,7 +267,7 @@ impl Pool {
 	/// Call after polling and at the returned deadline, including when idle.
 	/// Calls before that deadline only advance the pool's sampled clock. A due
 	/// pass visits every cached group, dating accesses since the last pass and
-	/// reclaiming idle groups except each track's latest. Delayed calls extend
+	/// reclaiming idle groups except each live track's latest. Delayed calls extend
 	/// retention. Shared pools use the latest supplied instant.
 	///
 	/// `None` means both cache policies are disabled. After enabling a capacity
@@ -300,8 +298,18 @@ impl Pool {
 		clock.sweep
 	}
 
+	/// Move the pool's sampled clock forward by `duration`, dating accesses on either
+	/// side without collecting, as if that much time passed between two passes.
 	#[cfg(test)]
-	pub(crate) fn advance_test(&self, now: crate::time::Instant) {
+	pub(crate) fn step(&self, duration: Duration) {
+		let now = self.inner.clock.lock().unwrap().as_ref().map(|clock| clock.now);
+		let now = now.unwrap_or_else(crate::time::Instant::now);
+		self.date(now);
+		self.date(now + duration);
+	}
+
+	#[cfg(test)]
+	fn date(&self, now: crate::time::Instant) {
 		self.advance(now, false);
 		let tracks: Vec<_> = self
 			.inner
@@ -564,7 +572,14 @@ impl Track {
 		}
 		// Counts as a producer while it lives, which is why `track::Producer` gates
 		// its teardown on its own clone count rather than the state's.
-		let Some(state) = self.state.upgrade() else { return };
+		let Some(state) = self.state.upgrade() else {
+			// An ended track's channel is closed, but a stale consumer can still hold its
+			// groups: the sweep expires them in place, or they would never go.
+			if full && scan_expiry {
+				self.state.read(|state| state.expire_closed(state.expiry_scan_drain()));
+			}
+			return;
+		};
 		let expiry = if scan_expiry {
 			let state = state.read();
 			let scan = if full {
@@ -1073,7 +1088,7 @@ mod test {
 	#[test]
 	fn collecting_before_the_deadline_does_not_postpone_it() {
 		let pool = Pool::new(Config::default().with_expiry(Duration::from_secs(2)));
-		let now = crate::model::clock::now();
+		let now = crate::time::Instant::now();
 		let deadline = pool.gc(now);
 		assert_eq!(pool.gc(now + Duration::from_millis(500)), deadline);
 	}
@@ -1081,7 +1096,7 @@ mod test {
 	#[test]
 	fn bounded_pools_sample_recency_without_expiration() {
 		let pool = Pool::unbounded();
-		let now = crate::model::clock::now();
+		let now = crate::time::Instant::now();
 		assert_eq!(pool.gc(now), None);
 		pool.resize(1024);
 		assert_eq!(pool.gc(now), Some(now + DEFAULT_EXPIRY / 2));

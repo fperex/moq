@@ -7,8 +7,8 @@
 //! GET /{broadcast}/manifest.mpd
 //! GET /{broadcast}/{kind}/{rendition}/media.m3u8
 //! GET /{broadcast}/{kind}/{rendition}/init.{hash}.mp4
-//! GET /{broadcast}/{kind}/{rendition}/seg/{segment}.m4s
-//! GET /{broadcast}/{kind}/{rendition}/seg/t{pts}.m4s
+//! GET /{broadcast}/{kind}/{rendition}/seg/{reference}.{segment}.m4s
+//! GET /{broadcast}/{kind}/{rendition}/seg/{reference}.t{pts}.m4s
 //! ```
 //!
 //! `{kind}` is `video` or `audio`, so a video and an audio rendition that share a
@@ -17,7 +17,7 @@
 //! timeline `pts` (`$Time$`). `{hash}` is a hash of the init segment's bytes, so a
 //! reconfigured rendition gets a new init URL. A broadcaster given a generation
 //! ([`Broadcaster::set_generation`](crate::export::Broadcaster::set_generation))
-//! prefixes every segment file with it (`seg/{generation}.{segment}.m4s`), and
+//! prefixes every segment file with it (`seg/{generation}.{reference}.{segment}.m4s`), and
 //! refuses segment URLs carrying any other.
 //!
 //! Every request is served. To gate access, wrap [`Server::router`] in your own
@@ -260,8 +260,8 @@ mod tests {
 		let broadcaster = Broadcaster::new(source, Config::default())
 			.await
 			.expect("catalog broadcast resolves while announced");
-		// Finish the publisher so the resolved broadcast (and the broadcaster) reports closed.
-		producer.finish();
+		// Close the publisher so the resolved broadcast (and the broadcaster) reports closed.
+		producer.close();
 		settle().await;
 		broadcaster
 	}
@@ -311,6 +311,6 @@ mod tests {
 
 		let cached = server.inner.broadcasters.lock().unwrap().get("live").cloned();
 		assert!(cached.is_some_and(|cached| Arc::ptr_eq(&cached, &new)));
-		new_producer.finish();
+		new_producer.close();
 	}
 }

@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.11](https://github.com/moq-dev/moq/compare/hang-v0.21.10...hang-v0.21.11) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.10](https://github.com/moq-dev/moq/compare/hang-v0.21.9...hang-v0.21.10) - 2026-10-03
+
+### Fixed
+
+- *(auth,hang)* out-of-range auth durations and catalog walls no longer panic ([#4600](https://github.com/moq-dev/moq/pull/4600))
+
+## [0.21.9](https://github.com/moq-dev/moq/compare/hang-v0.21.8...hang-v0.21.9) - 2026-09-30
+
+### Other
+
+- updated the following local packages: kio, moq-net, moq-json
+
+## [0.21.8](https://github.com/moq-dev/moq/compare/hang-v0.21.7...hang-v0.21.8) - 2026-09-27
+
+### Added
+
+- *(mux)* detect delay and jitter on JSON and binary tracks ([#4270](https://github.com/moq-dev/moq/pull/4270))
+
+### Fixed
+
+- *(egress)* single-rendition egress serves the best rendition ([#4293](https://github.com/moq-dev/moq/pull/4293))
+
+## [0.21.7](https://github.com/moq-dev/moq/compare/hang-v0.21.6...hang-v0.21.7) - 2026-09-26
+
+### Added
+
+- *(moq-mux)* catalog delay measures cross-rendition encoder lateness ([#4170](https://github.com/moq-dev/moq/pull/4170))
+
+## [0.21.6](https://github.com/moq-dev/moq/compare/hang-v0.21.5...hang-v0.21.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.5](https://github.com/moq-dev/moq/compare/hang-v0.21.4...hang-v0.21.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.4](https://github.com/moq-dev/moq/compare/hang-v0.21.3...hang-v0.21.4) - 2026-09-25
+
+### Added
+
+- *(mux)* measure encoder flush jitter per rendition ([#3940](https://github.com/moq-dev/moq/pull/3940))
+
 ## [0.21.3](https://github.com/moq-dev/moq/compare/hang-v0.21.2...hang-v0.21.3) - 2026-09-25
 
 ### Other

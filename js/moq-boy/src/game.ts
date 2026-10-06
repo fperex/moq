@@ -142,14 +142,11 @@ export class Game {
 		this.#signals.run(this.#runPixelBudget.bind(this));
 
 		const videoEnabled = new Moq.Signals.Signal(true);
-		// The decoders own rendition handoffs and measure how late frames arrive, but they need Sync
-		// to exist first, so its per-track handles are what they wire into.
 		this.videoDecoder = new Watch.Video.Decoder({
 			source: this.videoSource,
 			sync: this.sync,
 			enabled: videoEnabled,
 		});
-		this.#signals.proxy(this.sync.track("video").spread, this.videoDecoder.out.spread);
 		this.#signals.cleanup(() => this.videoDecoder.close());
 
 		// Renderer needs a canvas created by the UI layer, set via `canvas`.
@@ -167,7 +164,6 @@ export class Game {
 			sync: this.sync,
 			enabled: audioEnabled,
 		});
-		this.#signals.proxy(this.sync.track("audio").spread, this.audioDecoder.out.spread);
 		this.#signals.cleanup(() => this.audioDecoder.close());
 
 		const audioPaused = new Moq.Signals.Signal(true);
@@ -306,7 +302,7 @@ export class Game {
 		const viewerBroadcast = origin.createBroadcast(
 			Moq.Path.from(`${this.#viewerPrefix}/${this.sessionId}/${viewerId}`),
 		);
-		viewerBroadcast.announce();
+		viewerBroadcast.announce({ epoch: Moq.Epoch.mint() });
 		effect.cleanup(() => {
 			viewerBroadcast.close();
 			this.viewerId.set(undefined);

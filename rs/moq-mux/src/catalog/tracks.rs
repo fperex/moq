@@ -7,52 +7,77 @@ use super::hang::{Catalog, CatalogExt};
 
 /// A catalog config that can be published as a named rendition.
 ///
-/// Implement it on your own config type to get the full catalog lifecycle through
-/// [`Reserved::track`]: reservation gating, removal on drop, and optional jitter/bitrate detection.
-/// [`VideoConfig`](hang::catalog::VideoConfig) and [`AudioConfig`](hang::catalog::AudioConfig)
-/// implement it for every extension; a custom config implements it for the one [`CatalogExt`] that
-/// holds it:
+/// Implement it on your own config type to get the full catalog lifecycle: reservation gating,
+/// removal on drop, and optional jitter/bitrate detection. [`VideoConfig`](hang::catalog::VideoConfig)
+/// and [`AudioConfig`](hang::catalog::AudioConfig) implement it for every extension; a custom
+/// config implements it for the one [`CatalogExt`] that holds it. Publish a media track under it
+/// with [`Reserved::track`], or a data track with [`Producer::binary_stream`] and the like when it
+/// embeds a data config (see [`IntoRendition`](super::IntoRendition)):
 ///
 /// ```
+/// # use std::collections::BTreeMap;
+/// # use hang::catalog::{BinaryConfig, Mode};
 /// # use moq_mux::catalog::{Estimate, RenditionConfig};
 /// # use moq_mux::catalog::hang::{Catalog, CatalogExt};
 /// # use serde::{Deserialize, Serialize};
-/// # use std::collections::BTreeMap;
 /// #[derive(Serialize, Deserialize, Clone, Default)]
-/// struct MyExt {
-///     telemetry: BTreeMap<String, Telemetry>,
+/// struct Ext {
+///     #[serde(rename = "com.example.mavlink", default)]
+///     mavlink: BTreeMap<String, Mavlink>,
 /// }
-/// impl CatalogExt for MyExt {}
+/// impl CatalogExt for Ext {}
 ///
-/// #[derive(Serialize, Deserialize, Clone, Default)]
-/// struct Telemetry {
-///     schema: String,
-///     bitrate: Option<u64>,
+/// #[derive(Serialize, Deserialize, Clone)]
+/// struct Mavlink {
+///     config: BinaryConfig,
+///     sysid: u8,
 /// }
 ///
-/// impl RenditionConfig<MyExt> for Telemetry {
+/// impl AsMut<BinaryConfig> for Mavlink {
+///     fn as_mut(&mut self) -> &mut BinaryConfig {
+///         &mut self.config
+///     }
+/// }
+///
+/// impl RenditionConfig<Ext> for Mavlink {
+///     fn insert(self, catalog: &mut Catalog<Ext>, name: &str) {
+///         catalog.ext.mavlink.insert(name.to_string(), self);
+///     }
+///     fn get_mut<'a>(catalog: &'a mut Catalog<Ext>, name: &str) -> Option<&'a mut Self> {
+///         catalog.ext.mavlink.get_mut(name)
+///     }
+///     fn remove(catalog: &mut Catalog<Ext>, name: &str) {
+///         catalog.ext.mavlink.remove(name);
+///     }
+///
+///     // Opt into detection through the embedded config.
 ///     fn detects() -> bool {
 ///         true
 ///     }
-///
-///     fn insert(self, catalog: &mut Catalog<MyExt>, name: &str) {
-///         catalog.ext.telemetry.insert(name.to_string(), self);
-///     }
-///     fn get_mut<'a>(catalog: &'a mut Catalog<MyExt>, name: &str) -> Option<&'a mut Self> {
-///         catalog.ext.telemetry.get_mut(name)
-///     }
-///     fn remove(catalog: &mut Catalog<MyExt>, name: &str) {
-///         catalog.ext.telemetry.remove(name);
-///     }
-///
-///     // Opt into bitrate detection; jitter is left undetected.
 ///     fn estimate(&self) -> Estimate {
-///         Estimate::default().with_bitrate(self.bitrate)
+///         Estimate::default()
+///             .with_bitrate(self.config.bitrate)
+///             .with_jitter(self.config.jitter)
+///             .with_delay(self.config.delay)
 ///     }
 ///     fn set_estimate(&mut self, estimate: Estimate) {
-///         self.bitrate = estimate.bitrate;
+///         self.config.bitrate = estimate.bitrate;
+///         self.config.jitter = estimate.jitter;
+///         self.config.delay = estimate.delay;
 ///     }
 /// }
+///
+/// # fn example(
+/// #     broadcast: &mut moq_net::broadcast::Producer,
+/// #     catalog: &moq_mux::catalog::Producer<Ext>,
+/// # ) -> moq_mux::Result<()> {
+/// let track = broadcast.create_track("telemetry", None)?;
+/// // The producer fixes the mode, so the one passed here is only a placeholder.
+/// let entry = Mavlink { config: BinaryConfig::new(Mode::Stream), sysid: 1 };
+/// let mut telemetry = catalog.binary_stream(track, entry)?;
+/// telemetry.append(&b"\xfd..."[..])?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// Note that `insert` takes the whole [`Catalog`], not just the extension, so the built-in media
@@ -62,7 +87,7 @@ use super::hang::{Catalog, CatalogExt};
 /// [`Reserved::track`] and [`Producer::track`](super::Producer::track) enroll the track in the
 /// broadcast timeline, measure it, and keep its estimate current automatically.
 pub trait RenditionConfig<E: CatalogExt>: Clone + Send + 'static {
-	/// Whether container writes should update this config's estimate fields.
+	/// Whether container or data-track writes should update this config's estimate fields.
 	fn detects() -> bool {
 		false
 	}
@@ -95,6 +120,21 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::JsonConfig {
 	fn remove(catalog: &mut Catalog<E>, name: &str) {
 		catalog.json.tracks.remove(name);
 	}
+
+	fn detects() -> bool {
+		true
+	}
+	fn estimate(&self) -> Estimate {
+		Estimate::default()
+			.with_jitter(self.jitter)
+			.with_bitrate(self.bitrate)
+			.with_delay(self.delay)
+	}
+	fn set_estimate(&mut self, estimate: Estimate) {
+		self.jitter = estimate.jitter;
+		self.bitrate = estimate.bitrate;
+		self.delay = estimate.delay;
+	}
 }
 
 impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::BinaryConfig {
@@ -106,6 +146,21 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::BinaryConfig {
 	}
 	fn remove(catalog: &mut Catalog<E>, name: &str) {
 		catalog.binary.tracks.remove(name);
+	}
+
+	fn detects() -> bool {
+		true
+	}
+	fn estimate(&self) -> Estimate {
+		Estimate::default()
+			.with_jitter(self.jitter)
+			.with_bitrate(self.bitrate)
+			.with_delay(self.delay)
+	}
+	fn set_estimate(&mut self, estimate: Estimate) {
+		self.jitter = estimate.jitter;
+		self.bitrate = estimate.bitrate;
+		self.delay = estimate.delay;
 	}
 }
 
@@ -146,6 +201,8 @@ pub struct VideoHint {
 	pub optimize_for_latency: Option<bool>,
 	/// The maximum jitter before the next frame is emitted.
 	pub jitter: Option<Duration>,
+	/// How far this rendition trails the broadcast's earliest rendition.
+	pub delay: Option<Duration>,
 	/// The container wrapping each frame on the wire.
 	///
 	/// Unlike the other fields this is a choice, not a hint: the bitstream never reveals a
@@ -180,6 +237,7 @@ impl From<hang::catalog::VideoConfig> for VideoHint {
 			framerate: config.framerate,
 			optimize_for_latency: config.optimize_for_latency,
 			jitter: config.jitter,
+			delay: config.delay,
 			container: config.container,
 		}
 	}
@@ -203,6 +261,7 @@ impl VideoHint {
 		fill(&mut config.framerate, self.framerate);
 		fill(&mut config.optimize_for_latency, self.optimize_for_latency);
 		fill(&mut config.jitter, self.jitter);
+		fill(&mut config.delay, self.delay);
 		config.container = self.container.clone();
 	}
 
@@ -232,11 +291,17 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::VideoConfig {
 	}
 
 	fn estimate(&self) -> Estimate {
-		Estimate::default().with_jitter(self.jitter).with_bitrate(self.bitrate)
+		Estimate::default()
+			.with_jitter(self.jitter)
+			.with_bitrate(self.bitrate)
+			.with_delay(self.delay)
+			.with_framerate(self.framerate)
 	}
 	fn set_estimate(&mut self, estimate: Estimate) {
 		self.jitter = estimate.jitter;
 		self.bitrate = estimate.bitrate;
+		self.delay = estimate.delay;
+		self.framerate = estimate.framerate;
 	}
 }
 
@@ -256,11 +321,15 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::AudioConfig {
 	}
 
 	fn estimate(&self) -> Estimate {
-		Estimate::default().with_jitter(self.jitter).with_bitrate(self.bitrate)
+		Estimate::default()
+			.with_jitter(self.jitter)
+			.with_bitrate(self.bitrate)
+			.with_delay(self.delay)
 	}
 	fn set_estimate(&mut self, estimate: Estimate) {
 		self.jitter = estimate.jitter;
 		self.bitrate = estimate.bitrate;
+		self.delay = estimate.delay;
 	}
 }
 
@@ -275,10 +344,11 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::TextConfig {
 		catalog.text.renditions.remove(name);
 	}
 	fn estimate(&self) -> Estimate {
-		Estimate::default().with_jitter(self.jitter)
+		Estimate::default().with_jitter(self.jitter).with_delay(self.delay)
 	}
 	fn set_estimate(&mut self, estimate: Estimate) {
 		self.jitter = estimate.jitter;
+		self.delay = estimate.delay;
 	}
 }
 
@@ -474,6 +544,16 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 		&self.name
 	}
 
+	/// A fresh estimator measuring `delay` against the catalog's other renditions.
+	pub(crate) fn estimator(&self) -> super::Estimator {
+		self.catalog.estimator()
+	}
+
+	/// The broadcast clock the catalog stamps its tracks on.
+	pub(crate) fn clock(&self) -> crate::Clock {
+		self.catalog.clock()
+	}
+
 	/// Resolve a timestamp on the broadcast's shared clock (see [`Producer::timestamp`]).
 	pub fn timestamp(&self, hint: Option<moq_net::Timestamp>) -> crate::Result<moq_net::Timestamp> {
 		self.catalog.timestamp(hint)
@@ -489,7 +569,7 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 	pub(crate) fn set(&mut self, mut config: C) -> crate::Result<()> {
 		let supplied = config.estimate();
 		let resolved = Self::resolved(&supplied, &self.detected);
-		self.check_jitter(&resolved)?;
+		self.check_decrease(&resolved)?;
 		config.set_estimate(resolved.clone());
 		{
 			let mut guard = self.catalog.modify()?;
@@ -516,6 +596,12 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 		if estimate.bitrate.is_none() {
 			estimate.bitrate = detected.bitrate;
 		}
+		if estimate.delay.is_none() {
+			estimate.delay = detected.delay;
+		}
+		if estimate.framerate.is_none() {
+			estimate.framerate = detected.framerate;
+		}
 		estimate
 	}
 
@@ -523,8 +609,10 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 	/// [`set`](Self::set).
 	///
 	/// Mint the estimate from an [`Estimator`](super::Estimator), usually the one owned by a
-	/// [`container::Producer`](crate::container::Producer). Cheap to call after every write, since an
-	/// estimate that resolves to what the catalog already carries doesn't republish it.
+	/// [`container::Producer`](crate::container::Producer). Call it after every write: an estimate
+	/// that resolves to what the catalog already carries doesn't republish it, and a `jitter` or
+	/// `delay` rise republishes at most once a second (see
+	/// [`Guard::commit_estimate`](super::Guard::commit_estimate)), going out on a later call.
 	///
 	/// Calling this before [`set`](Self::set) is not wasted: the measurement is remembered and seeds
 	/// the config once it lands.
@@ -537,26 +625,44 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 			return Ok(());
 		}
 		let mut resolved = Self::resolved(&self.supplied, &estimate);
-		// A measurement never lowers the published jitter, including one raised through `modify`.
-		if let Some(published) = self.config()?.estimate().jitter {
-			resolved.jitter = Some(resolved.jitter.map_or(published, |jitter| jitter.max(published)));
-		}
+		// A measurement never lowers the published jitter or delay, including one raised through
+		// `modify`.
+		let published = self.config()?.estimate();
+		resolved.jitter = resolved.jitter.max(published.jitter);
+		resolved.delay = resolved.delay.max(published.delay);
 		self.detected = estimate;
-		if self.published.as_ref() != Some(&resolved) {
-			let mut config = self.config()?;
-			config.set_estimate(resolved.clone());
-			self.replace(config)?;
-			self.published = Some(resolved);
+		if self.published.as_ref() == Some(&resolved) {
+			// Still an observation: it releases a rise held back until its window ended. A closed
+			// catalog has nothing left to release.
+			if let Ok(guard) = self.catalog.modify() {
+				guard.commit_estimate(true)?;
+			}
+			return Ok(());
 		}
+
+		// Bitrate and framerate are already measured over a second of media, so they never churn;
+		// only jitter and delay climb a step per frame.
+		let throttled = self.published.as_ref().is_some_and(|published| {
+			published.bitrate == resolved.bitrate && published.framerate == resolved.framerate
+		});
+		let mut config = self.config()?;
+		config.set_estimate(resolved.clone());
+		self.stage(config)?.commit_estimate(throttled)?;
+		self.published = Some(resolved);
 		Ok(())
 	}
 
-	fn check_jitter(&self, next: &Estimate) -> crate::Result<()> {
-		if self.present
-			&& let Some(previous) = self.config()?.estimate().jitter
-			&& next.jitter.is_none_or(|jitter| jitter < previous)
-		{
+	/// Refuse a config that lowers the jitter or delay already advertised to subscribers.
+	fn check_decrease(&self, next: &Estimate) -> crate::Result<()> {
+		if !self.present {
+			return Ok(());
+		}
+		let previous = self.config()?.estimate();
+		if next.jitter < previous.jitter {
 			return Err(crate::Error::JitterDecreased);
+		}
+		if next.delay < previous.delay {
+			return Err(crate::Error::DelayDecreased);
 		}
 		Ok(())
 	}
@@ -573,16 +679,21 @@ impl<E: CatalogExt, C: RenditionConfig<E>> Rendition<E, C> {
 	}
 
 	pub(crate) fn replace(&mut self, config: C) -> crate::Result<()> {
+		self.stage(config)?.commit()
+	}
+
+	/// Write `config` into the catalog, leaving the caller to choose how the guard publishes it.
+	fn stage(&mut self, config: C) -> crate::Result<super::Guard<'_, E>> {
 		if !self.present {
 			return Err(crate::Error::NotPublished);
 		}
-		self.check_jitter(&config.estimate())?;
+		self.check_decrease(&config.estimate())?;
 		let mut guard = self.catalog.modify()?;
 		let mut next = (*guard).clone();
 		config.insert(&mut next, &self.name);
 		serde_json::to_writer(std::io::sink(), &next).map_err(moq_json::Error::from)?;
 		*guard = next;
-		guard.commit()
+		Ok(guard)
 	}
 }
 
@@ -676,6 +787,45 @@ mod tests {
 		assert_eq!(
 			catalog.snapshot().video.renditions["v"].jitter,
 			Some(Duration::from_millis(100))
+		);
+	}
+
+	#[test]
+	fn published_delay_never_decreases() {
+		let (_broadcast, catalog, mut rendition) = video_track();
+		let delayed = |delay| {
+			let mut config = config(None, None);
+			config.delay = delay;
+			config
+		};
+		rendition.set(delayed(Some(Duration::from_millis(200)))).unwrap();
+		for smaller in [Some(Duration::from_millis(100)), None] {
+			assert!(matches!(
+				rendition.set(delayed(smaller)),
+				Err(crate::Error::DelayDecreased)
+			));
+			assert!(matches!(
+				rendition.replace(delayed(smaller)),
+				Err(crate::Error::DelayDecreased)
+			));
+		}
+		assert_eq!(
+			catalog.snapshot().video.renditions["v"].delay,
+			Some(Duration::from_millis(200))
+		);
+
+		let (_broadcast, catalog, mut detected) = video_track();
+		detected.set(config(None, None)).unwrap();
+		detected
+			.estimate(Estimate::default().with_delay(Duration::from_millis(200)))
+			.unwrap();
+		// A lower measurement holds the published value rather than failing the write path.
+		detected
+			.estimate(Estimate::default().with_delay(Duration::from_millis(100)))
+			.unwrap();
+		assert_eq!(
+			catalog.snapshot().video.renditions["v"].delay,
+			Some(Duration::from_millis(200))
 		);
 	}
 
@@ -793,6 +943,7 @@ mod tests {
 		let config = snapshot.video.renditions.get("v").unwrap();
 		assert!(config.jitter.is_some(), "absent jitter should be auto-detected");
 		assert!(config.bitrate.is_some(), "absent bitrate should be auto-detected");
+		assert_eq!(config.framerate, Some(25.0), "absent framerate should be auto-detected");
 	}
 
 	#[test]
@@ -862,6 +1013,7 @@ mod tests {
 
 		let hint = VideoHint {
 			bitrate: Some(456),
+			framerate: Some(30.0),
 			..Default::default()
 		};
 		let mut config = config(None, None);
@@ -873,6 +1025,11 @@ mod tests {
 		let snapshot = catalog.snapshot();
 		let config = snapshot.video.renditions.get("v").unwrap();
 		assert_eq!(config.bitrate, Some(456), "a hinted bitrate must not be overwritten");
+		assert_eq!(
+			config.framerate,
+			Some(30.0),
+			"a hinted framerate must not be overwritten"
+		);
 		assert!(config.jitter.is_some(), "the unhinted jitter should still be detected");
 	}
 
@@ -1001,21 +1158,18 @@ mod tests {
 		);
 	}
 
-	/// The broadcast has one timeline: every rendition's groups index into the same track, so
-	/// an aligned ladder (source + rung) shares it by construction.
+	/// Every rendition gets its own timeline, advertised together at the catalog root.
 	#[test]
-	fn renditions_share_the_broadcast_timeline() {
+	fn renditions_get_their_own_timelines() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut catalog = super::super::Producer::new(&mut broadcast, super::super::Config::default()).unwrap();
 
-		let _recorder = catalog.enroll("video0").unwrap();
-		let timeline = catalog.timeline();
-		assert_eq!(timeline.section().track, hang::timeline::DEFAULT_NAME);
-		assert_eq!(
-			catalog.snapshot().archive,
-			Some(timeline.section()),
-			"the one timeline is advertised at the catalog root"
-		);
+		let _video0 = catalog.enroll("video0").unwrap();
+		let _video1 = catalog.enroll("video1").unwrap();
+		let section = catalog.timeline().section();
+		assert_eq!(section.timelines["video0"], "video0.timeline.z");
+		assert_eq!(section.timelines["video1"], "video1.timeline.z");
+		assert_eq!(catalog.snapshot().archive, Some(section));
 	}
 
 	mod custom {

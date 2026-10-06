@@ -173,6 +173,9 @@ pub(crate) struct WebState {
 	/// like a QUIC one.
 	#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
 	pub(crate) sessions: crate::session::Registry,
+	/// How long a connection has to send its request headers, and a WebSocket its
+	/// MoQ SETUP; `None` waits forever.
+	pub(crate) timeout: Option<std::time::Duration>,
 }
 
 /// The bound addresses of the public web listeners.
@@ -214,6 +217,7 @@ impl Web {
 			conn_id: AtomicU64::new(0),
 			shutdown: crate::shutdown::Observer::disabled(),
 			sessions: crate::session::Registry::new(),
+			timeout: moq_tokio::listen::Config::default().resolved_timeout(),
 		});
 		Self {
 			state,
@@ -227,8 +231,8 @@ impl Web {
 		}
 	}
 
-	/// Bind configured web sockets now, so an embedder can read ephemeral ports.
-	pub(crate) fn bind(mut self) -> anyhow::Result<Self> {
+	/// Bind the configured listeners now, so [`addrs`](Self::addrs) reports ephemeral ports before serving.
+	pub fn bind(mut self) -> anyhow::Result<Self> {
 		if self.https_tls.is_none() && self.config.https.listen.is_some() {
 			let tls = build_https_config(&self.config.https.cert, &self.config.https.key, &self.config.https.root)?;
 			self.https_tls = Some(RustlsConfig::from_config(tls));
@@ -254,7 +258,7 @@ impl Web {
 		Ok(self)
 	}
 
-	/// The actual bound addresses after [`crate::Relay::load`].
+	/// The actual bound addresses after [`bind`](Self::bind) or [`crate::Relay::load`].
 	pub fn addrs(&self) -> Addrs {
 		self.addrs
 	}
@@ -297,6 +301,18 @@ impl Web {
 	pub fn with_shutdown(mut self, shutdown: crate::shutdown::Observer) -> Self {
 		let state = Arc::get_mut(&mut self.state).expect("with_shutdown called after routes were built");
 		state.shutdown = shutdown;
+		self
+	}
+
+	/// Bound how long a connection may take to send its HTTP request headers, and a
+	/// WebSocket its MoQ SETUP after the upgrade; `None`, or a timeout past the
+	/// clock's range, waits forever. Defaults to the
+	/// [`moq_tokio::listen::Config::resolved_timeout`] default.
+	pub fn with_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+		let state = Arc::get_mut(&mut self.state).expect("with_timeout called after routes were built");
+		// hyper adds the header timeout to the clock unchecked, so an unreachable
+		// one would panic on every connection.
+		state.timeout = timeout.filter(|timeout| std::time::Instant::now().checked_add(*timeout).is_some());
 		self
 	}
 
@@ -360,6 +376,7 @@ impl Web {
 	/// passes that router to [`crate::Relay::with_web`] instead of calling this.
 	pub async fn serve(self, app: Router) -> anyhow::Result<()> {
 		let Web {
+			state,
 			config,
 			health,
 			http_listener,
@@ -374,7 +391,8 @@ impl Web {
 		let ws = config.resolved_ws();
 
 		let http = if let Some(listener) = http_listener {
-			let server = crate::listener::server(listener, health.clone(), WebAcceptor::plain(ws))?;
+			let mut server = crate::listener::server(listener, health.clone(), WebAcceptor::plain(ws))?;
+			header_timeout(&mut server, state.timeout);
 			Some(server.serve(app.clone()))
 		} else {
 			None
@@ -388,7 +406,8 @@ impl Web {
 				config.https.key,
 				config.https.root,
 			));
-			let server = crate::listener::server(listener, health.clone(), WebAcceptor::tls(rustls_config, ws))?;
+			let mut server = crate::listener::server(listener, health.clone(), WebAcceptor::tls(rustls_config, ws))?;
+			header_timeout(&mut server, state.timeout);
 			Some(server.serve(app))
 		} else {
 			None
@@ -449,6 +468,20 @@ async fn get_cors(request: axum::extract::Request, next: axum::middleware::Next)
 		);
 	}
 	response
+}
+
+/// Close an HTTP/1 connection that hasn't sent its full request headers within
+/// `timeout`, or never when `None`.
+///
+/// axum-server builds hyper without a timer, and hyper enforces no header deadline
+/// without one, so a client that trickles its headers would otherwise hold its
+/// connection forever.
+fn header_timeout<A>(server: &mut axum_server::Server<crate::listener::Peer, A>, timeout: Option<std::time::Duration>) {
+	server
+		.http_builder()
+		.http1()
+		.timer(hyper_util::rt::TokioTimer::new())
+		.header_read_timeout(timeout);
 }
 
 /// Build a [`rustls::ServerConfig`] for the HTTPS listener.
@@ -865,8 +898,8 @@ async fn serve_announced(
 	let mut announced = origin.consume().announced();
 	let mut broadcasts = Vec::new();
 
-	while let Some(update) = announced.try_next() {
-		if update.kind.is_active() {
+	while let Some(event) = announced.try_next() {
+		if let moq_net::announce::Event::Start(update) | moq_net::announce::Event::Update(update) = event {
 			broadcasts.push(update.prefix);
 		}
 	}
@@ -917,7 +950,7 @@ async fn serve_fetch(
 	let result = tokio::time::timeout_at(deadline, async {
 		// NOTE: The auth token is already scoped to the broadcast.
 		// Block until a route covers the broadcast (within the fetch deadline) so
-		// freshly-connected subscribers don't get a spurious 404 before gossip arrives.
+		// freshly-connected subscribers don't get a spurious 404 before the announce arrives.
 		let consumer = origin.consume();
 		let broadcast = consumer.routed_broadcast("").await.map_err(|_| StatusCode::NOT_FOUND)?;
 		let sequence = match params.group {
@@ -926,7 +959,10 @@ async fn serve_fetch(
 		};
 		let group = match async { crate::fetch_group(&broadcast.track(&track)?, sequence).await }.await {
 			Ok(group) => group,
-			Err(moq_net::Error::NotFound) => return Err(StatusCode::NOT_FOUND),
+			// A miss upstream arrives as the stream reset that refused the FETCH.
+			Err(moq_net::Error::NotFound | moq_net::Error::Stream(moq_net::StreamError::NotFound)) => {
+				return Err(StatusCode::NOT_FOUND);
+			}
 			Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
 		};
 
@@ -1283,30 +1319,6 @@ mod tests {
 		}
 	}
 
-	/// Two ports the kernel just handed out, released together so neither bind can
-	/// be handed the other's.
-	#[cfg(all(unix, feature = "websocket"))]
-	fn free_ports() -> (u16, u16) {
-		let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-		let https = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-		(http.local_addr().unwrap().port(), https.local_addr().unwrap().port())
-	}
-
-	/// Connect to `port`, waiting for [`Web::serve`] to finish binding.
-	#[cfg(all(unix, feature = "websocket"))]
-	async fn connect(port: u16) -> tokio::net::TcpStream {
-		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-		loop {
-			match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-				Ok(stream) => return stream,
-				Err(err) if std::time::Instant::now() >= deadline => {
-					panic!("web listener never came up on port {port}: {err}")
-				}
-				Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
-			}
-		}
-	}
-
 	/// `GET /socket` over `io`, returning the body the handler produced.
 	///
 	/// Hand-rolled rather than reached through an HTTP client so the same request
@@ -1362,11 +1374,9 @@ mod tests {
 	async fn serve_captures_the_socket_on_every_listener() {
 		let dir = TempDir::new().unwrap();
 		let (ca, cert, key) = make_certs(&dir);
-		let (http, https) = free_ports();
-
 		let mut config = Config::default();
-		config.http.listen = Some(format!("127.0.0.1:{http}").parse().unwrap());
-		config.https.listen = Some(format!("127.0.0.1:{https}").parse().unwrap());
+		config.http.listen = Some("127.0.0.1:0".parse().unwrap());
+		config.https.listen = Some("127.0.0.1:0".parse().unwrap());
 		config.https.cert = vec![cert.clone()];
 		config.https.key = vec![key];
 
@@ -1380,16 +1390,23 @@ mod tests {
 		let cluster = cluster::Cluster::new(crate::cluster::Options::default()).unwrap();
 		let certificates = moq_tokio::tls::Certificates::from_pem(&std::fs::read(&cert).unwrap()).unwrap();
 
-		let web = Web::new(auth, cluster, certificates, config);
+		let web = Web::new(auth, cluster, certificates, config).bind().unwrap();
+		let Addrs {
+			http: Some(http),
+			https: Some(https),
+		} = web.addrs()
+		else {
+			panic!("both listeners are configured");
+		};
 		let serving = tokio::spawn(web.serve(Router::new().route("/socket", get(report_socket))));
 
 		assert_eq!(
-			get_socket(connect(http).await).await,
+			get_socket(tokio::net::TcpStream::connect(http).await.unwrap()).await,
 			"captured",
 			"the HTTP listener must install the capturing acceptor"
 		);
 
-		let tcp = connect(https).await;
+		let tcp = tokio::net::TcpStream::connect(https).await.unwrap();
 		let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
 		let tls = tls_connector(&ca).connect(name, tcp).await.expect("TLS handshake");
 		assert_eq!(
@@ -1397,6 +1414,63 @@ mod tests {
 			"captured",
 			"the HTTPS listener must install the capturing acceptor"
 		);
+
+		serving.abort();
+	}
+
+	/// A timeout past the clock's range waits forever, rather than reaching hyper,
+	/// which would panic adding it to the clock on every connection.
+	#[tokio::test]
+	async fn unreachable_timeout_waits_forever() {
+		let auth_config = crate::auth::Config {
+			public_subscribe: vec![moq_auth::Pattern::all()],
+			..Default::default()
+		};
+		let auth = auth_config.init("test", &moq_tokio::tls::Connect::default()).unwrap();
+		let cluster = cluster::Cluster::new(crate::cluster::Options::default()).unwrap();
+		let dir = TempDir::new().unwrap();
+		let (_, cert, _) = make_certs(&dir);
+		let certificates = moq_tokio::tls::Certificates::from_pem(&std::fs::read(&cert).unwrap()).unwrap();
+		let web = Web::new(auth, cluster, certificates, Config::default()).with_timeout(Some(std::time::Duration::MAX));
+		assert_eq!(web.state.timeout, None);
+	}
+
+	/// A client that never finishes its request headers is disconnected once the
+	/// timeout passes. Real sockets, so this runs on the wall clock and bounds the
+	/// close from below.
+	#[tokio::test]
+	async fn slow_request_headers_are_timed_out() {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let timeout = std::time::Duration::from_millis(200);
+		let mut config = Config::default();
+		config.http.listen = Some("127.0.0.1:0".parse().unwrap());
+		let auth_config = crate::auth::Config {
+			public_subscribe: vec![moq_auth::Pattern::all()],
+			..Default::default()
+		};
+		let auth = auth_config.init("test", &moq_tokio::tls::Connect::default()).unwrap();
+		let cluster = cluster::Cluster::new(crate::cluster::Options::default()).unwrap();
+		let dir = TempDir::new().unwrap();
+		let (_, cert, _) = make_certs(&dir);
+		let certificates = moq_tokio::tls::Certificates::from_pem(&std::fs::read(&cert).unwrap()).unwrap();
+		let web = Web::new(auth, cluster, certificates, config)
+			.with_timeout(Some(timeout))
+			.bind()
+			.unwrap();
+		let http = web.addrs().http.expect("the HTTP listener is configured");
+		let serving = tokio::spawn(web.serve(Router::new()));
+
+		let mut tcp = tokio::net::TcpStream::connect(http).await.unwrap();
+		let start = std::time::Instant::now();
+		tcp.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
+
+		let mut rest = Vec::new();
+		tokio::time::timeout(std::time::Duration::from_secs(10), tcp.read_to_end(&mut rest))
+			.await
+			.expect("slow headers held the connection open")
+			.ok();
+		assert!(start.elapsed() >= timeout, "closed before the timeout");
 
 		serving.abort();
 	}

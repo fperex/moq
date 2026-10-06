@@ -4,12 +4,13 @@ export const Version = {
 	DRAFT_03: 0xff0dad03,
 	DRAFT_04: 0xff0dad04,
 	DRAFT_05: 0xff0dad05,
-	/// Lite-06. Adds announce ids: each active ANNOUNCE_BROADCAST implicitly assigns the next
+	/// Lite-06, advertised as the preferred WebTransport subprotocol.
+	/// Adds announce ids: each active ANNOUNCE_BROADCAST implicitly assigns the next
 	/// ordinal, and ended/restart reference that id instead of repeating the path.
 	/// Also adds frame-precise subscribe/fetch bounds and a GROUP frame offset.
 	DRAFT_06: 0xff0dad06,
-	/// Lite-07, advertised as the preferred WebTransport subprotocol.
-	/// Adds the ANNOUNCE_REQUEST hidden opt-in.
+	/// Work-in-progress lite-07, only negotiated when explicitly offered.
+	/// Adds the ANNOUNCE_REQUEST hidden opt-in and the publisher epoch.
 	DRAFT_07: 0xff0dad07,
 } as const;
 
@@ -229,6 +230,78 @@ export function hasHidden(version: Version): boolean {
 	}
 }
 
+/**
+ * Whether SUBSCRIBE_END carries the subscription's group stream count, sent once every
+ * counted stream is open, in place of SUBSCRIBE_DROP. Added in lite-07.
+ */
+export function hasStreamCount(version: Version): boolean {
+	// Explicitly list older versions so future versions keep the lite-07+ behavior.
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+		case Version.DRAFT_05:
+		case Version.DRAFT_06:
+			return false;
+		default:
+			return true;
+	}
+}
+
+/**
+ * Whether a served SUBSCRIBE completes only once the subscriber FINs or resets its half of the
+ * Subscribe Stream. Added in lite-07, where a subscriber FINs once its tail accounting settles,
+ * since a transport ACK does not say the application read the tail.
+ */
+export function waitsForSubscriberFin(version: Version): boolean {
+	// Explicitly list older versions so future versions keep the lite-07+ behavior.
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+		case Version.DRAFT_05:
+		case Version.DRAFT_06:
+			return false;
+		default:
+			return true;
+	}
+}
+
+/** Whether ANNOUNCE_START, TRACK, SUBSCRIBE, and FETCH carry the publisher epoch. Added in lite-07.
+ * Older versions carry nothing, so a received route has no epoch and is never resumed elsewhere. */
+export function hasEpoch(version: Version): boolean {
+	// Explicitly list older versions so future versions keep the lite-07+ behavior.
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+		case Version.DRAFT_05:
+		case Version.DRAFT_06:
+			return false;
+		default:
+			return true;
+	}
+}
+
+/** Whether ANNOUNCE_START and ANNOUNCE_UPDATE may copy a path head or hop-chain tail from a live announcement. Added in lite-07. */
+export function hasAnnounceCompression(version: Version): boolean {
+	// Explicitly list older versions so future versions keep the lite-07+ behavior.
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+		case Version.DRAFT_05:
+		case Version.DRAFT_06:
+			return false;
+		default:
+			return true;
+	}
+}
+
 /// The WebTransport subprotocol identifier for moq-lite.
 /// Version negotiation still happens via SETUP when this is used.
 export const ALPN = "moql";
@@ -245,8 +318,10 @@ export const ALPN_05 = "moq-lite-05";
 /// The ALPN string for Draft06.
 export const ALPN_06 = "moq-lite-06";
 
-/// The ALPN string for Draft07.
-export const ALPN_07 = "moq-lite-07";
+/// The ALPN string for the work-in-progress Draft07. It is NOT in the default
+/// WebTransport `protocols` list, so lite-07 is never advertised or negotiated by
+/// default; a peer only reaches it when both sides explicitly offer this ALPN.
+export const ALPN_07_WIP = "moq-lite-07-wip";
 
 const VERSION_NAMES: Record<number, string> = {
 	[Version.DRAFT_01]: "moq-lite-01",
@@ -255,9 +330,28 @@ const VERSION_NAMES: Record<number, string> = {
 	[Version.DRAFT_04]: "moq-lite-04",
 	[Version.DRAFT_05]: "moq-lite-05",
 	[Version.DRAFT_06]: "moq-lite-06",
-	[Version.DRAFT_07]: "moq-lite-07",
+	[Version.DRAFT_07]: "moq-lite-07-wip",
 };
 
 export function versionName(v: Version): string {
 	return VERSION_NAMES[v] ?? `unknown(0x${v.toString(16)})`;
+}
+
+/**
+ * Whether SUBSCRIBE_START carries the publisher's largest (group, frame), which a subscriber
+ * takes as where the live feed is. Added in lite-07; an earlier answer says nothing about it.
+ */
+export function hasLargest(version: Version): boolean {
+	// Explicitly list older versions so future versions keep the lite-07+ behavior.
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+		case Version.DRAFT_05:
+		case Version.DRAFT_06:
+			return false;
+		default:
+			return true;
+	}
 }

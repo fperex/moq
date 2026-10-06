@@ -197,7 +197,6 @@ impl StreamError {
 			Self::GoingAway => 0x4,
 			Self::TooFarBehind => 0x5,
 			Self::MalformedTrack => 0x12,
-			// 0x30 NO_CAPACITY is assigned by other work in this range. Do not reuse it.
 			Self::ControlTimeout => 0x31,
 			Self::GroupTooLarge => 0x32,
 			Self::NotFound => 0x33,
@@ -379,10 +378,10 @@ pub enum Error {
 	Closed,
 
 	/// The reader asked for a frame the group never held: below
-	/// [`crate::group::Producer::start_at`], or skipped past a splice. Named from the
-	/// consumer's side; distinct from [`Self::GroupTooLarge`], which aborts the whole
-	/// group when a write exceeds the cache budget, and from [`Self::Evicted`], which
-	/// drops a whole group under the pool's memory pressure.
+	/// [`crate::group::Producer::start_at`]. Named from the consumer's side; distinct
+	/// from [`Self::GroupTooLarge`], which aborts the whole group when a write exceeds
+	/// the cache budget, and from [`Self::Evicted`], which drops a whole group under the
+	/// pool's memory pressure.
 	#[error("lagged")]
 	Lagged,
 
@@ -682,8 +681,7 @@ mod tests {
 			assert_eq!(StreamError::from_code(err.to_code()), err, "{err:?} did not round trip");
 		}
 
-		// moq-lite's own 48-63 range, pinned to the draft's table. They stay off 0x30
-		// (NO_CAPACITY), which other work assigns.
+		// moq-lite's own 48-63 range, pinned to the draft's table.
 		for (err, code) in [
 			(StreamError::ControlTimeout, 0x31),
 			(StreamError::GroupTooLarge, 0x32),

@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
-import { type Group, Origin, Path, Track } from "@moq/net";
-import { Effect } from "@moq/signals";
+import { Origin, Path, Track } from "@moq/net";
+import { Effect, Signal } from "@moq/signals";
 import { Broadcast } from "./broadcast.ts";
 
 // Effects and signal writes coalesce onto microtasks, so a chain of registration -> config -> catalog
@@ -149,6 +149,39 @@ test("serves the catalog through a shared static track", async () => {
 	broadcast.close();
 });
 
+// Regression: the catalog was served from the moment the origin existed, so the snapshots published
+// while renditions resolved stayed on the track and a subscriber could start from a partial one.
+test("serves no catalog until announced, so the first snapshot is the one at announce time", async () => {
+	const announce = new Signal(false);
+	const broadcast = new Broadcast({
+		enabled: true,
+		origin: new Origin.Producer(),
+		name: Path.from("test.hang"),
+		announce,
+	});
+	await settle();
+
+	// Renditions resolve in separate ticks while unannounced.
+	broadcast.video("video").config.set(videoConfig);
+	await settle();
+	broadcast.audio("audio").config.set(audioConfig);
+	await settle();
+
+	announce.set(true);
+	await settle();
+
+	const net = broadcast.net.peek();
+	if (!net) throw new Error("expected a network producer once connected");
+
+	const group = await net.track(Broadcast.CATALOG_TRACK).subscribe().ordered().nextGroup();
+	expect(group?.sequence).toBe(0);
+	const catalog = (await group?.readJson()) as Catalog.Root;
+	expect(Object.keys(catalog.video?.renditions ?? {})).toEqual(["video"]);
+	expect(Object.keys(catalog.audio?.renditions ?? {})).toEqual(["audio"]);
+
+	broadcast.close();
+});
+
 test("keeps the current catalog snapshot for a reconnecting viewer", async () => {
 	const real = performance.now.bind(performance);
 	let now = real();
@@ -170,8 +203,8 @@ test("keeps the current catalog snapshot for a reconnecting viewer", async () =>
 		expect((await new Json.Snapshot.Consumer<Catalog.Root>({ track: first }).next())?.video).toBeDefined();
 		first.close();
 
-		// The default track retention is five seconds. A reconnect after it must still receive
-		// the catalog's sole snapshot instead of waiting forever for an edit that may never come.
+		// A reconnect past the idle cache window must still receive the live track's newest
+		// snapshot instead of waiting forever for an edit that may never come.
 		now += 60_000;
 		const second = net.track(Broadcast.CATALOG_TRACK).subscribe();
 		expect((await new Json.Snapshot.Consumer<Catalog.Root>({ track: second }).next())?.video).toBeDefined();
@@ -182,37 +215,3 @@ test("keeps the current catalog snapshot for a reconnecting viewer", async () =>
 		performance.now = real;
 	}
 });
-
-test("seeds a later catalog subscriber after the first one is reset", async () => {
-	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name: Path.from("test.hang") });
-	broadcast.video("video").config.set(videoConfig);
-	await settle();
-
-	const net = broadcast.net.peek();
-	if (!net) throw new Error("expected a network producer once connected");
-
-	// Read the raw groups rather than through a Json.Snapshot consumer: what a later viewer is
-	// seeded with is the group it lands in.
-	const first = net.track(Broadcast.CATALOG_TRACK).subscribe();
-	expect(await readSnapshot(await first.recvGroup())).toBe("avc1.640028");
-
-	// The peer reset the subscribe stream (StreamCode.Cancel, "remote error: 1" on the wire).
-	first.close(new Error("remote error: 1"));
-	await settle();
-
-	// The next viewer has to see the catalog too. A browser publisher that served its first viewer
-	// and starved every later one is single use: the tile appears, the subscription is accepted and
-	// no catalog ever arrives, so no rendition is chosen and nothing plays.
-	const second = net.track(Broadcast.CATALOG_TRACK).subscribe();
-	expect(await readSnapshot(await second.recvGroup())).toBe("avc1.640028");
-
-	second.close();
-	broadcast.close();
-});
-
-// The codec in a catalog snapshot frame, read straight off the group. CatalogProducer disables
-// deltas, so every frame is a whole catalog in a group of its own.
-async function readSnapshot(group: Group.Consumer | undefined): Promise<string | undefined> {
-	const catalog = (await group?.readJson()) as Catalog.Root | undefined;
-	return catalog?.video?.renditions.video?.codec;
-}

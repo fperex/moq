@@ -114,10 +114,12 @@ async fn rendition_is_not_published_when_the_media_track_fails() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
-	// Squat the broadcast's timeline track, so enrolling the first rendition (and with it building
-	// its media producer) fails. The handle must stay alive: the broadcast tracks names weakly, so
+	// Squat the catalog's timeline track, so enrolling the first rendition (which enrolls the catalog
+	// too, and with it building its media producer) fails. The handle must stay alive: the broadcast tracks names weakly, so
 	// dropping it frees the name.
-	let _squat = broadcast.create_track(hang::timeline::DEFAULT_NAME, None).unwrap();
+	let _squat = broadcast
+		.create_track(hang::timeline::default_name(hang::Catalog::DEFAULT_NAME), None)
+		.unwrap();
 
 	let mut importer = Import::new(broadcast, catalog.reserve());
 	// A track it cannot build surfaces in the catalog rather than in this result.
@@ -271,7 +273,8 @@ async fn import_enhanced_vp9() {
 /// header and carries the frames through.
 #[tokio::test(start_paused = true)]
 async fn import_enhanced_opus() {
-	let head = crate::codec::opus::Config::new(48_000, 2).encode().unwrap();
+	// A 44.1 kHz input rate is informational; the catalog still reports the decoder's 48 kHz.
+	let head = crate::codec::opus::Config::new(44_100, 2).encode().unwrap();
 
 	let mut out = Vec::new();
 	out.extend_from_slice(b"FLV");
@@ -663,4 +666,156 @@ async fn import_rejects_non_flv() {
 	let mut importer = Import::new(producer, catalog.reserve());
 	let buf = bytes::BytesMut::from(&b"NOTFLV\x00\x00\x00"[..]);
 	assert!(importer.decode(&buf).is_err());
+}
+
+/// One encoder session: sequence headers (after the file header when `header`), then `frames`
+/// video frames 40ms apart whose composition offsets reorder like B-frames, interleaved with AAC
+/// frames up to 300ms earlier in PTS, the way a muxer leads audio.
+fn session(header: bool, start_ms: u32, frames: u32) -> Vec<u8> {
+	let mut out = if header { flv_header(0x05) } else { Vec::new() };
+
+	let mut vseq = vec![
+		(super::FRAME_TYPE_KEY << 4) | super::VIDEO_CODEC_AVC,
+		super::AVC_SEQUENCE_HEADER,
+		0,
+		0,
+		0,
+	];
+	vseq.extend_from_slice(&avcc());
+	write_tag(&mut out, super::TAG_VIDEO, start_ms, &vseq);
+	let mut aseq = vec![super::AAC_AUDIO_TAG_HEADER, super::AAC_SEQUENCE_HEADER];
+	aseq.extend_from_slice(&ASC);
+	write_tag(&mut out, super::TAG_AUDIO, start_ms, &aseq);
+
+	for i in 0..frames {
+		let dts = start_ms + i * 40;
+		let frame_type = if i % 25 == 0 {
+			super::FRAME_TYPE_KEY
+		} else {
+			super::FRAME_TYPE_INTER
+		};
+		// IPBPB...: P-frames present two slots late and the B-frames between them step back.
+		let cts: u8 = match i % 25 {
+			0 => 40,
+			j if j % 2 == 1 => 80,
+			_ => 0,
+		};
+		let mut video = vec![(frame_type << 4) | super::VIDEO_CODEC_AVC, super::AVC_NALU, 0, 0, cts];
+		video.extend_from_slice(&[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x00]);
+		write_tag(&mut out, super::TAG_VIDEO, dts, &video);
+
+		let mut audio = vec![super::AAC_AUDIO_TAG_HEADER, super::AAC_RAW];
+		audio.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+		write_tag(&mut out, super::TAG_AUDIO, dts + 20 - start_ms.min(300), &audio);
+	}
+	out
+}
+
+/// What an FLV import published, and the wall-clock window its first chunk arrived in.
+struct Imported {
+	published: std::collections::BTreeMap<String, Vec<u128>>,
+	video: String,
+	/// The root clock the catalog advertised.
+	clock: hang::catalog::Clock,
+	arrival: std::ops::RangeInclusive<std::time::SystemTime>,
+	/// Why a chunk was refused, if one was.
+	refused: Option<crate::Error>,
+}
+
+/// Import `chunks` in order on a catalog with the default clock, stopping at the first refused
+/// chunk.
+async fn import(chunks: &[Vec<u8>]) -> Imported {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+	let mut importer = Import::new(broadcast, catalog.reserve());
+
+	let before = std::time::SystemTime::now();
+	let mut after = before;
+	let mut refused = None;
+	for (i, chunk) in chunks.iter().enumerate() {
+		if let Err(err) = importer.decode(chunk) {
+			refused = Some(err);
+			break;
+		}
+		if i == 0 {
+			after = std::time::SystemTime::now();
+		}
+	}
+	importer.finish().unwrap();
+
+	let snapshot = catalog.snapshot();
+	Imported {
+		published: crate::container::test_util::published(&consumer, &snapshot).await,
+		video: snapshot.video.renditions.keys().next().unwrap().clone(),
+		clock: snapshot.clock.expect("the catalog advertises a clock"),
+		arrival: before..=after,
+		refused,
+	}
+}
+
+/// A feed an hour into its own timeline publishes its tag timestamps verbatim, and the catalog
+/// clock maps its first frame to the arrival time.
+#[tokio::test]
+async fn import_publishes_tag_timestamps_on_an_arrival_clock() {
+	let start_ms = 3_600_000;
+	let import = import(&[session(true, start_ms, 50)]).await;
+	assert!(import.refused.is_none());
+
+	// The first video frame presents 40ms after its decode time.
+	let first = import.published[&import.video][0];
+	assert_eq!(first, (start_ms as u128 + 40) * 1000, "the source's own timestamp");
+
+	let tick = Duration::from_millis(1);
+	let wall = import
+		.clock
+		.wall_clock(moq_net::Timestamp::from_micros(first as u64).unwrap())
+		.unwrap();
+	assert!(
+		*import.arrival.start() - tick <= wall && wall <= *import.arrival.end() + tick,
+		"the first frame is live on arrival"
+	);
+}
+
+/// An encoder restarting its timestamps is a new epoch: the import refuses the rewind rather than
+/// re-anchoring it forward, keeping everything published before it.
+#[tokio::test]
+async fn import_refuses_a_restart() {
+	let import = import(&[session(true, 5_000, 50), session(false, 0, 50)]).await;
+	let err = import.refused.expect("the restart is refused");
+	assert!(matches!(err, crate::Error::TimestampRewind(_)), "{err:?}");
+	assert_eq!(
+		import.published[&import.video].len(),
+		50,
+		"the first session stays published"
+	);
+}
+
+/// The catalog is first published at the first frame, carrying the clock that frame anchors,
+/// rather than at the sequence headers on a provisional clock a copy-once reader would keep.
+#[tokio::test]
+async fn first_catalog_carries_the_anchored_clock() {
+	let start_ms = 3_600_000;
+	let data = session(true, start_ms, 10);
+	let (headers, frames) = data.split_at(session(true, start_ms, 0).len());
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+	let provisional = catalog.clock().wall();
+	let mut clocks = crate::container::test_util::Clocks::subscribe(&consumer).await;
+	let mut importer = Import::new(broadcast, catalog.reserve());
+
+	importer.decode(headers).unwrap();
+	assert_eq!(clocks.drain(), vec![], "the sequence headers alone publish nothing");
+
+	importer.decode(frames).unwrap();
+	let anchored = catalog.clock().wall();
+	assert_ne!(anchored, provisional, "the first frame anchors the clock");
+	let published = clocks.drain();
+	assert!(!published.is_empty(), "the first frame publishes the catalog");
+	assert!(published.iter().all(|clock| *clock == Some(anchored)), "{published:?}");
+
+	importer.finish().unwrap();
+	assert!(clocks.drain().iter().all(|clock| *clock == Some(anchored)));
 }

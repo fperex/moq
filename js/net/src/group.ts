@@ -4,7 +4,7 @@
  * @module
  */
 import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
-import { Expired, FrameTooLarge, GroupTooLarge, TooFarBehind } from "./error.ts";
+import { FrameTooLarge, GroupTooLarge, TooFarBehind } from "./error.ts";
 import { hooks, type ReadGroupFrame } from "./internal.ts";
 import { Timestamp } from "./time.ts";
 
@@ -82,6 +82,43 @@ function appendFrame(state: GroupState, frame: Frame) {
 	state.total.update((total) => total + 1);
 }
 
+let makeDemand: (sequence: number, used: Getter<boolean>, state: GroupState) => Demand;
+
+/** A watch-only view of a group's mirror readers, including coalesced fetches. */
+export class Demand {
+	/** The group sequence this handle watches. */
+	readonly sequence: number;
+	#used: Getter<boolean>;
+	#state: GroupState;
+
+	private constructor(sequence: number, used: Getter<boolean>, state: GroupState) {
+		this.sequence = sequence;
+		this.#used = used;
+		this.#state = state;
+	}
+
+	static {
+		makeDemand = (sequence, used, state) => new Demand(sequence, used, state);
+	}
+
+	/** Whether any mirror reader is attached. */
+	get used(): Getter<boolean> {
+		return this.#used;
+	}
+
+	/** Wait until all mirror readers leave or the group closes. */
+	async unused(): Promise<void> {
+		while (this.#used.peek() && this.#state.closed.peek() === undefined) {
+			await Signal.race(this.#used, this.#state.closed);
+		}
+	}
+
+	/** The group's clean close or abort error. */
+	get closed(): GetPromise<Error | null> {
+		return this.#state.closed;
+	}
+}
+
 /**
  * The write side of an ordered stream of frames within a track.
  *
@@ -94,10 +131,11 @@ export class Producer {
 	#state: GroupState;
 	#mirrors?: Set<GroupState>;
 
-	// Whether any mirror reader is attached (see {@link used}). Fetch coalescing watches it to
+	// Whether any mirror reader is attached (see {@link Demand.used}). Fetch coalescing watches it to
 	// cancel an abandoned download; a group can stay open indefinitely (a catalog or JSON stream),
 	// so this is what stops a reader-less fetch instead of the stream ending on its own.
 	#used = new Signal<boolean>(false);
+	#demand: Demand;
 
 	// When the group was created or last written. Retention ages a group from this,
 	// not from its creation, so a group still being filled is never reclaimed.
@@ -106,12 +144,13 @@ export class Producer {
 	constructor(sequence: number) {
 		this.#state = new GroupState(sequence);
 		this.sequence = sequence;
+		this.#demand = makeDemand(sequence, this.#used, this.#state);
 	}
 
 	/**
 	 * When the group was created or last written, in `performance.now()` milliseconds.
 	 *
-	 * @internal Track retention only.
+	 * @internal Idle cache eviction only.
 	 */
 	get activity(): number {
 		return this.#activity;
@@ -171,28 +210,9 @@ export class Producer {
 		return makeConsumer(dst);
 	}
 
-	/**
-	 * Whether any mirror reader is currently attached.
-	 *
-	 * Pairs with {@link unused}. Fetch coalescing watches it to cancel a download once every reader
-	 * has gone: a group can stay open indefinitely (a catalog track, a JSON stream), so it can't
-	 * rely on the stream ending on its own.
-	 *
-	 * @internal Track fan-out and fetch coalescing only.
-	 */
-	get used(): Getter<boolean> {
-		return this.#used;
-	}
-
-	/**
-	 * Resolves once no mirror reader remains (or the group closes).
-	 *
-	 * @internal Track fan-out and fetch coalescing only.
-	 */
-	async unused(): Promise<void> {
-		while (this.#used.peek() && this.#state.closed.peek() === undefined) {
-			await Signal.race(this.#used, this.#state.closed);
-		}
+	/** Watch the mirror readers attached to this group. */
+	demand(): Demand {
+		return this.#demand;
 	}
 
 	/** Writes a frame to the group. */
@@ -410,7 +430,7 @@ export class Consumer {
 		if (!this.#expiry?.expired()) return false;
 
 		if (unread) {
-			this.#terminal = new Expired();
+			this.#terminal = new Error("group exceeded the subscription max age budget");
 		} else {
 			this.#ended = true;
 		}
@@ -418,6 +438,8 @@ export class Consumer {
 		return true;
 	}
 
+	// Takes a thunk rather than a started promise, so a group already past its budget
+	// never begins the write: an abandoned write would reject later with no handler.
 	#guard<T>(operation: () => Promise<T>): Promise<T> {
 		this.#expire(true);
 		if (this.#terminal) return Promise.reject(this.#terminal);
@@ -441,16 +463,12 @@ export class Consumer {
 				}
 			};
 
-			try {
-				for (const changed of expiry.changed) disposes.push(changed.subscribe(check));
-				operation().then(
-					(value) => finish(() => resolve(value)),
-					(error: unknown) => finish(() => reject(error)),
-				);
-				check();
-			} catch (error) {
-				finish(() => reject(error));
-			}
+			for (const changed of expiry.changed) disposes.push(changed.subscribe(check));
+			operation().then(
+				(value) => finish(() => resolve(value)),
+				(error: unknown) => finish(() => reject(error)),
+			);
+			check();
 		});
 	}
 

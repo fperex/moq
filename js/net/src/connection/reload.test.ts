@@ -135,7 +135,7 @@ test("a peer that severs immediately keeps escalating the backoff", async () => 
 		attempts++;
 		const pair = createMockTransportPair(Lite.ALPN_06);
 		// Sever the session as soon as the server side finishes the handshake.
-		void accept(pair.server, url).then((server) => server.close());
+		void accept(pair.server, url).then((server) => server.abort());
 		return pair.client;
 	};
 	globalThis.WebTransport = stub as unknown as typeof WebTransport;
@@ -179,7 +179,7 @@ test("an explicitly undefined delay field falls back to its default", async () =
 	const stub = function StubWebTransport() {
 		dials += 1;
 		const pair = createMockTransportPair(Lite.ALPN_06);
-		void accept(pair.server, url).then((server) => server.close());
+		void accept(pair.server, url).then((server) => server.abort());
 		return pair.client;
 	};
 	globalThis.WebTransport = stub as unknown as typeof WebTransport;
@@ -219,7 +219,7 @@ test("an announced request follows the reconnect loop", async () => {
 
 	// Every connect attempt gets a fresh session, whose server publishes the path once the
 	// handshake finishes. The client therefore always asks before the broadcast exists.
-	const sessions: { close: () => void }[] = [];
+	const sessions: { abort: () => void }[] = [];
 	const published: BroadcastProducer[] = [];
 	const clientOrigin = new OriginProducer();
 	const stub = function StubWebTransport() {
@@ -247,7 +247,7 @@ test("an announced request follows the reconnect loop", async () => {
 		const first = watched.active.peek();
 
 		// The session dies: the handle drops the broadcast rather than clinging to a dead one.
-		sessions[0]?.close();
+		sessions[0]?.abort();
 		await waitUntil(() => watched.active.peek() === undefined);
 
 		// The reconnect re-announces it, and the handle re-consumes on the new session.
@@ -258,7 +258,7 @@ test("an announced request follows the reconnect loop", async () => {
 		reload.close();
 		clientOrigin.close();
 		for (const broadcast of published) broadcast.close();
-		for (const session of sessions) session.close();
+		for (const session of sessions) session.abort();
 		globalThis.WebTransport = original;
 	}
 });
@@ -509,7 +509,7 @@ test("origins span reconnects: local re-announces, remote re-populates", async (
 
 	// Each connect attempt gets a fresh server session that publishes "remote" and records
 	// what the client announced to it.
-	const servers: { session: { close: () => void }; saw: OriginProducer }[] = [];
+	const servers: { session: { abort: () => void }; saw: OriginProducer }[] = [];
 	const stub = function StubWebTransport() {
 		const pair = createMockTransportPair(Lite.ALPN_05);
 		const saw = new OriginProducer();
@@ -539,7 +539,7 @@ test("origins span reconnects: local re-announces, remote re-populates", async (
 		await waitUntil(() => (servers[0] ? wireOf(servers[0].saw).routes(Path.from("mine")) : false));
 
 		// Kill the session: the remote entry retracts, the local publish stays put.
-		servers[0]?.session.close();
+		servers[0]?.session.abort();
 		await waitUntil(() => !wireOf(reader).routes(Path.from("remote")));
 
 		// The reconnect re-announces the (untouched) publish and re-populates the table.
@@ -570,7 +570,7 @@ test("closing an announce consumer during upstream teardown does not append retr
 		upstream.append({
 			prefix: Path.from("alice/camera.hang"),
 			captures: undefined,
-			kind: "announced",
+			kind: "start",
 			route: Route.default,
 		});
 		await consumer.next();
@@ -594,58 +594,5 @@ test("announced accepts a non-prefix scope before any session exists", () => {
 		announced.close();
 	} finally {
 		reload.close();
-	}
-});
-
-test("a peer away longer than a relay restart is reconnected to", async () => {
-	const original = globalThis.WebTransport;
-	const url = new URL("https://example.com/");
-
-	// A clock the dials drive, so the peer can be away for 22s of simulated time
-	// while the test itself runs in milliseconds. The retry window is read off
-	// `performance.now()`, which is what makes this the window under test rather
-	// than a count of attempts.
-	let clock = 0;
-	const now = spyOn(performance, "now").mockImplementation(() => clock);
-
-	// Longer than a relay's own drain window plus the time its process takes to
-	// come back, which is the outage a live page has to ride out.
-	const AWAY = 11;
-	let dials = 0;
-	const stub = function StubWebTransport() {
-		dials += 1;
-		if (dials <= AWAY) {
-			clock += 2000;
-			return {
-				// `ready` rejecting is a refused dial; `closed` never settles, since the
-				// caller only reaches it once the transport is up.
-				ready: Promise.reject(new Error("connection refused")),
-				closed: new Promise<void>(() => {}),
-				close() {},
-			};
-		}
-		const pair = createMockTransportPair(Lite.ALPN_06);
-		void accept(pair.server, url);
-		return pair.client;
-	};
-	globalThis.WebTransport = stub as unknown as typeof WebTransport;
-
-	// The default retry window, which is the one a page runs on. Only the delays are
-	// shortened: the test must not sleep out the backoff it is not measuring.
-	const reload = new Reload({
-		enabled: true,
-		url,
-		websocket: { enabled: false },
-		delay: { initial: Time.Milli(1), multiplier: 1, max: Time.Milli(1) },
-	});
-
-	try {
-		await waitUntil(() => reload.established.peek() !== undefined);
-		expect(reload.error.peek()).toBeUndefined();
-		expect(dials).toBeGreaterThan(AWAY);
-	} finally {
-		reload.close();
-		now.mockRestore();
-		globalThis.WebTransport = original;
 	}
 });

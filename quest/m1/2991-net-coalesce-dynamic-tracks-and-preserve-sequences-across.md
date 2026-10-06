@@ -15,32 +15,31 @@ but the Rust and JavaScript models violate different parts of that invariant.
 ### Rust resets sequences when a dynamic producer is replaced
 
 A closed dynamic track is removed from the broadcast's weak cache. The next
-subscription creates a fresh `track::Request` (`rs/moq-net/src/model/track.rs:3779`),
-and `Request::new` creates a fresh `TrackState`. Because `max_sequence`
-(`:199`) is empty, both `append_group` (`:1184`) and `append_datagram`
-(`:1216`) restart at sequence 0.
+subscription creates a fresh `track::Request` (`rs/moq-net/src/model/track.rs`),
+and `Request::new` creates a fresh `TrackState`. Because its `max_sequence`
+is empty, both `append_group` and `append_datagram` restart at sequence 0.
 
-That conflicts with the relay's logical track splicing.
-`resume::Producer::takeover` (`rs/moq-net/src/model/resume.rs:328`) retains
-the previous live edge and starts a replacement at `latest + 1`. Groups from a
-restarted producer are therefore filtered until its counter catches up,
-causing the same playback stall fixed for JavaScript in #2953.
+That conflicts with the relay's logical track. The pump this was written
+against is gone: #4741 resumes route changes by reading the routes' copies
+(`rs/moq-net/src/model/front.rs`, `resume.rs`, and `origin.rs`). Re-check
+first that a replacement restarting at sequence 0 still stalls under
+copy-based resume, the way groups from a restarted producer were skipped
+until its counter caught up (the playback stall fixed for JavaScript in
+#2953), and rewrite this section against what the code does now. With #4741 this is the general hazard of restarting at 0 under one
+name, which [broadcast epochs](/quest/m0/broadcast-epoch/README.md) fix for a
+restarted publisher. This quest covers what an epoch does not: one dynamic
+track replaced inside a live broadcast.
 
-The takeover tests in `resume.rs` (`takeover_computes_boundary` `:2313`,
-`takeover_splices_mid_group` `:3257`,
-`takeover_splices_a_replacement_that_resends_the_head` `:3346`,
-`takeover_rolls_past_a_finished_group` `:3467`,
-`takeover_after_empty_segment_keeps_live_edge` `:3617`) create their
-replacement groups with explicit sequences, so none of them exercises
-`append_group()` on a restarted producer; using it there would create group 0
-and leave the subscriber stalled. Those are the tests to extend. Explicit group
-or datagram writes can raise the old producer's shared sequence edge further,
-making the catch-up window longer.
+The route-change tests (`rs/moq-net/tests/route_change.rs`) are the ones to
+extend: none replaces a producer through `append_group()`, which would
+create group 0 and, if the stall still holds, leave the subscriber stalled. Explicit group or datagram
+writes can raise the old producer's shared sequence edge further, making the
+catch-up window longer.
 
 ### JavaScript permits concurrent same-name dynamic producers
 
 `BroadcastProducer.subscribe()` calls the internal `subscribe` with
-`register = false` (`js/net/src/broadcast.ts:49-55`). Multiple publishing-side
+`register = false` (`js/net/src/broadcast.ts`). Multiple publishing-side
 subscriptions for the same name therefore enqueue independent requests and
 create independent `track.Producer` instances.
 
@@ -59,8 +58,7 @@ multiple subscribers fanning out from it.
   one request and share its accepted producer.
 - Subscription options from all subscribers remain aggregated on that request.
   `track::Request` already does this in Rust: it carries `prev_subscription`
-  (`track.rs:3786`) and re-combines the aggregate whenever a subscriber
-  changes (`:3905-3919`).
+  and re-combines the aggregate whenever a subscriber changes.
 - After that producer closes, a later request creates a new producer but
   continues the group and datagram sequence namespace for that broadcast and
   name.
@@ -80,9 +78,9 @@ the closed producer's cache or terminal state.
 - Rust and JavaScript: close a dynamic producer after group and datagram
   sequences have advanced, re-request the same name, and verify the
   replacement appends at the next sequence.
-- Rust relay model: extend the `resume.rs` takeover tests above so a
-  replacement produced with `append_group()` is delivered immediately rather
-  than filtered until catch-up.
+- Rust relay model: extend the route-change tests above so a replacement
+  produced with `append_group()` is delivered immediately rather than skipped
+  until catch-up.
 - Both implementations: verify a separate broadcast generation starts at 0.
 
 ## Closes

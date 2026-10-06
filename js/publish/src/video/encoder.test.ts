@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import * as Container from "@moq/hang/container";
 import * as Moq from "@moq/net";
 import { Signal } from "@moq/signals";
+import { Baseline } from "../jitter";
 import { Encoder } from "./encoder";
 
 class FakeVideoEncoder {
@@ -11,49 +12,72 @@ class FakeVideoEncoder {
 	// Every accepted probe, so a test can assert a published config was actually validated.
 	static accepted: string[] = [];
 
-	// Parks every probe while set, the way a GPU process with no spare capacity does.
-	static hold: Promise<void> | undefined;
+	// The codec string the encoder reports in its output for a configured one. Echoes by default,
+	// like Chrome and Firefox.
+	static report: (codec: string) => string | undefined = (codec) => codec;
 
 	state: CodecState = "unconfigured";
+	#output: VideoEncoderInit["output"];
+	#codec?: string;
+
+	constructor(init: VideoEncoderInit) {
+		this.#output = init.output;
+	}
 
 	static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
 		FakeVideoEncoder.probes++;
 		// Pretend the GPU takes a while, like a real probe under load.
 		await new Promise((resolve) => setTimeout(resolve, 5));
-		const hold = FakeVideoEncoder.hold;
-		if (hold !== undefined) await hold;
 
 		const supported = config.codec.startsWith("avc1");
 		if (supported) FakeVideoEncoder.accepted.push(probeKey(config));
 		return { supported };
 	}
 
-	configure(): void {
+	configure(config: VideoEncoderConfig): void {
 		this.state = "configured";
+		this.#codec = config.codec;
 	}
 
 	encode(): void {}
+
+	// Only the probe flushes, so only it sees an output; the live encoder holds every frame.
+	async flush(): Promise<void> {
+		const codec = this.#codec && FakeVideoEncoder.report(this.#codec);
+		const chunk = { type: "key", timestamp: 0, byteLength: 1, copyTo: () => {} };
+		this.#output(chunk as never, (codec ? { decoderConfig: { codec } } : {}) as never);
+	}
 
 	close(): void {
 		this.state = "closed";
 	}
 }
 
+class FakeVideoFrame {
+	timestamp = 0;
+	close(): void {}
+}
+
 function installFakeVideoEncoder() {
 	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
+	const frame = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
 	Object.defineProperty(globalThis, "VideoEncoder", {
 		configurable: true,
 		value: FakeVideoEncoder,
 		writable: true,
 	});
+	Object.defineProperty(globalThis, "VideoFrame", { configurable: true, value: FakeVideoFrame, writable: true });
 
 	return {
 		[Symbol.dispose]() {
+			FakeVideoEncoder.report = (codec) => codec;
 			if (original) {
 				Object.defineProperty(globalThis, "VideoEncoder", original);
 			} else {
 				Reflect.deleteProperty(globalThis, "VideoEncoder");
 			}
+			if (frame) Object.defineProperty(globalThis, "VideoFrame", frame);
+			else Reflect.deleteProperty(globalThis, "VideoFrame");
 		},
 	};
 }
@@ -68,7 +92,7 @@ test("encoding tracks encoder config in its child effect", async () => {
 		track: new Signal<Moq.Track.Producer | undefined>(track),
 		close: () => track.close(),
 	};
-	const broadcast = { video: () => rendition };
+	const broadcast = { video: () => rendition, baseline: new Baseline() };
 	const capture = {
 		in: { source: new Signal(undefined) },
 		out: {
@@ -95,9 +119,9 @@ test("encoding tracks encoder config in its child effect", async () => {
 	}
 });
 
-test("a demand gap cuts the group and leaves the broadcast-owned track open for resume", async () => {
+test("a demand gap marks a discontinuity and leaves the broadcast-owned track open for resume", async () => {
 	using _videoEncoder = installFakeVideoEncoder();
-	const cut = spyOn(Container.Legacy.Producer.prototype, "cut");
+	const discontinuity = spyOn(Container.Legacy.Producer.prototype, "discontinuity");
 
 	const track = new Moq.Track.Producer("video").accept({ priority: 60 });
 	const live = new Signal<Moq.Track.Producer | undefined>(track);
@@ -115,7 +139,7 @@ test("a demand gap cuts the group and leaves the broadcast-owned track open for 
 	};
 	const encoder = new Encoder("video", {
 		enabled: true,
-		broadcast: { video: () => rendition } as never,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
 		capture: capture as never,
 	});
 
@@ -124,20 +148,20 @@ test("a demand gap cuts the group and leaves the broadcast-owned track open for 
 		live.set(undefined);
 		await settle();
 		expect(track.closed.peek()).toBeUndefined();
-		expect(cut).toHaveBeenCalledTimes(1);
+		expect(discontinuity).toHaveBeenCalledTimes(1);
 
 		live.set(track);
 		await settle();
 		expect(track.closed.peek()).toBeUndefined();
 
-		cut.mockClear();
+		discontinuity.mockClear();
 		track.close();
 		encoder.close();
-		expect(cut).not.toHaveBeenCalled();
+		expect(discontinuity).not.toHaveBeenCalled();
 	} finally {
 		encoder.close();
 		track.close();
-		cut.mockRestore();
+		discontinuity.mockRestore();
 	}
 });
 
@@ -172,7 +196,7 @@ test("a bandwidth estimate updates the bitrate without blanking the config or re
 
 	const encoder = new Encoder("video", {
 		enabled: true,
-		broadcast: { video: () => rendition } as never,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
 		capture: capture as never,
 		bandwidth,
 	});
@@ -253,7 +277,7 @@ test("every published config was probed for its own codec and dimensions", async
 
 	const encoder = new Encoder("video", {
 		enabled: true,
-		broadcast: { video: () => rendition } as never,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
 		capture: capture as never,
 		bandwidth,
 	});
@@ -311,6 +335,7 @@ test("hardware encoding takes priority over software H.264", async () => {
 		await settle();
 		expect(encoder.out.resolved.peek()?.hardwareAcceleration).toBe("prefer-hardware");
 		expect(probe.mock.calls.every(([config]) => config.hardwareAcceleration === "prefer-hardware")).toBe(true);
+		expect(encoder.settled.peek()).toBe(true);
 	} finally {
 		encoder.close();
 		probe.mockRestore();
@@ -334,10 +359,44 @@ test("software-only AV1 is refused even when explicitly requested", async () => 
 		expect(probe.mock.calls.some(([config]) => config.hardwareAcceleration === "prefer-software")).toBe(false);
 		expect(encoder.out.resolved.peek()).toBeUndefined();
 		expect(error).toHaveBeenCalled();
+		// No codec fits, so `<moq-publish>` must stop waiting on this rendition to announce.
+		expect(encoder.settled.peek()).toBe(true);
 	} finally {
 		encoder.close();
 		probe.mockRestore();
 		error.mockRestore();
+	}
+});
+
+// Regression: only the codec probe and `maxScale` settled the encoder on failure, so a knob that broke
+// resolution later (a negative bitrate) held `<moq-publish>`'s announce forever.
+test("an invalid knob settles the encoder without a config", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const error = spyOn(console, "error").mockImplementation(() => {});
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1920, height: 1080 }) },
+	};
+	const config = new Signal<{ bitrateScale?: number } | undefined>({ bitrateScale: -1 });
+	const probe = spyOn(FakeVideoEncoder, "isConfigSupported");
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never, config });
+	try {
+		await settle();
+		expect(encoder.out.catalog.peek()).toBeUndefined();
+		expect(encoder.settled.peek()).toBe(true);
+		expect(error).toHaveBeenCalled();
+		// Refused before the browser could coerce it into an unsigned bitrate.
+		expect(probe).not.toHaveBeenCalled();
+
+		// Fixing the knob clears the failure and resolves a config.
+		config.set(undefined);
+		await settle();
+		expect(encoder.out.catalog.peek()).toBeDefined();
+		expect(encoder.settled.peek()).toBe(true);
+	} finally {
+		encoder.close();
+		error.mockRestore();
+		probe.mockRestore();
 	}
 });
 
@@ -431,40 +490,8 @@ test("frame sources retain their dimensions and nominal frame rate", async () =>
 
 test.each(["encoder lag", "quiet startup"])("marks a rendition stalled for %s", async (reason) => {
 	const clock = spyOn(performance, "now").mockReturnValue(0);
-	class DelayedVideoEncoder {
-		static probes = 0;
-		state: CodecState = "unconfigured";
-		#output: VideoEncoderInit["output"];
-
-		constructor(init: VideoEncoderInit) {
-			this.#output = init.output;
-		}
-
-		static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
-			DelayedVideoEncoder.probes++;
-			return { supported: config.codec.startsWith("avc1") };
-		}
-
-		configure(): void {
-			this.state = "configured";
-		}
-
-		encode(): void {
-			// Hold the output: a throttled encoder never hands frames to the session.
-		}
-
-		close(): void {
-			this.state = "closed";
-			void this.#output;
-		}
-	}
-
-	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
-	Object.defineProperty(globalThis, "VideoEncoder", {
-		configurable: true,
-		value: DelayedVideoEncoder,
-		writable: true,
-	});
+	// The fake holds every live output, like a throttled encoder that never hands frames to the session.
+	using _videoEncoder = installFakeVideoEncoder();
 
 	class Frame {
 		codedWidth = 640;
@@ -514,7 +541,7 @@ test.each(["encoder lag", "quiet startup"])("marks a rendition stalled for %s", 
 	};
 	const encoder = new Encoder("video/hd", {
 		enabled: true,
-		broadcast: { video: () => rendition } as never,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
 		capture: capture as never,
 	});
 
@@ -538,195 +565,102 @@ test.each(["encoder lag", "quiet startup"])("marks a rendition stalled for %s", 
 		encoder.close();
 		fanout.close();
 		clock.mockRestore();
-		if (original) Object.defineProperty(globalThis, "VideoEncoder", original);
-		else Reflect.deleteProperty(globalThis, "VideoEncoder");
 	}
 });
 
-test("paces capture, bounds delayed raw frames, and resets cadence at timing boundaries", async () => {
-	class HoldingVideoEncoder {
-		static current: HoldingVideoEncoder;
-		state: CodecState = "unconfigured";
-		encodeQueueSize = 0;
-		processing = true;
-		readonly encoded: Array<{ timestamp: number; keyFrame: boolean }> = [];
-		readonly #output: VideoEncoderInit["output"];
-
-		constructor(init: VideoEncoderInit) {
-			this.#output = init.output;
-			HoldingVideoEncoder.current = this;
-		}
-
-		static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
-			return { supported: config.codec.startsWith("avc1") };
-		}
-
-		configure(): void {
-			this.state = "configured";
-		}
-
-		encode(frame: VideoFrame, options?: VideoEncoderEncodeOptions): void {
-			this.encoded.push({ timestamp: frame.timestamp, keyFrame: !!options?.keyFrame });
-			if (!this.processing) this.encodeQueueSize++;
-		}
-
-		output(index: number): void {
-			const frame = this.encoded[index];
-			this.#output({
-				timestamp: frame.timestamp,
-				type: frame.keyFrame ? "key" : "delta",
-				byteLength: 1,
-				copyTo: (buffer: Uint8Array) => {
-					buffer[0] = 0;
-				},
-			} as EncodedVideoChunk);
-		}
-
-		close(): void {
-			this.state = "closed";
-		}
-
-		resume(): void {
-			this.processing = true;
-			this.encodeQueueSize = 0;
-		}
-	}
-
-	class Frame {
-		static all: Frame[] = [];
-		readonly codedWidth = 640;
-		readonly codedHeight = 480;
-		readonly timestamp: number;
-		closed = false;
-
-		constructor(timestamp: number) {
-			this.timestamp = timestamp;
-			Frame.all.push(this);
-		}
-
-		clone(): Frame {
-			return new Frame(this.timestamp);
-		}
-
-		close(): void {
-			this.closed = true;
-		}
-	}
-
-	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
-	Object.defineProperty(globalThis, "VideoEncoder", {
-		configurable: true,
-		value: HoldingVideoEncoder,
-		writable: true,
-	});
-
-	const { Fanout } = await import("../fanout");
-	let controller!: ReadableStreamDefaultController<VideoFrame>;
-	const stream = new ReadableStream<VideoFrame>({
-		start: (next) => {
-			controller = next;
-		},
-	});
-	const fanout = new Fanout(stream, {
-		queue: 128,
-		clone: (frame) => frame.clone(),
-		release: (frame) => frame.close(),
-	});
-	const track = new Moq.Track.Producer("video/hd").accept();
-	const sub = track.subscribe();
-	const rendition = {
-		config: new Signal(undefined),
-		track: new Signal<Moq.Track.Producer | undefined>(track),
-		close: () => track.close(),
-	};
+// Every browser refuses a bare hint, so probing one only delays the fallback, and a browser that
+// accepted it would publish a codec no native player can decode.
+test("the probe only offers full codec strings", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const probe = spyOn(FakeVideoEncoder, "isConfigSupported").mockImplementation(async () => ({ supported: false }));
+	const error = spyOn(console, "error").mockImplementation(() => {});
 	const capture = {
-		in: {
-			source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) } as never),
-		},
-		out: {
-			display: new Signal({ width: 640, height: 480 }),
-			frames: new Signal(fanout),
-		},
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1280, height: 720 }) },
 	};
-	const encoder = new Encoder("video/hd", {
-		enabled: true,
-		broadcast: { video: () => rendition } as never,
-		capture: capture as never,
-		config: { frameRate: 30 },
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never });
+	try {
+		await settle();
+		const probed = probe.mock.calls.map(([config]) => config.codec);
+		expect(probed.length).toBeGreaterThan(0);
+		expect(probed.filter((codec) => codec !== "vp8" && !codec.includes("."))).toEqual([]);
+		expect(encoder.settled.peek()).toBe(true);
+	} finally {
+		encoder.close();
+		probe.mockRestore();
+		error.mockRestore();
+	}
+});
+
+// The catalog is written before any subscriber starts the real encoder, so it has to carry what the
+// bitstream will say from the first announce, not a probe input a native player may refuse.
+test("the catalog advertises the codec string a probe encode reports", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	// Refine the configured string, as an encoder that picks its own level would.
+	const REPORTED: Record<string, string> = {
+		"vp09.00.10.08": "vp09.00.31.08",
+		"avc1.640028": "avc1.64001F",
+	};
+	const probe = spyOn(FakeVideoEncoder, "isConfigSupported").mockImplementation(async (config) => ({
+		supported: config.codec in REPORTED,
+	}));
+	FakeVideoEncoder.report = (codec) => REPORTED[codec];
+
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1280, height: 720 }) },
+	};
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never });
+	const advertised: string[] = [];
+	const unsubscribe = encoder.out.catalog.subscribe((catalog) => {
+		if (catalog) advertised.push(catalog.codec);
 	});
 
 	try {
 		await settle();
-		for (let index = 0; index < 12; index++) {
-			controller.enqueue(new Frame(1_000_000 + Math.round((index * 1_000_000) / 60)) as never);
-		}
-		await settle();
-		expect(HoldingVideoEncoder.current.encoded.map((frame) => frame.timestamp)).toEqual([
-			1_000_000, 1_033_333, 1_066_667, 1_100_000, 1_133_333, 1_166_667,
-		]);
+		expect(encoder.out.resolved.peek()?.codec).toBe("vp09.00.10.08");
+		expect(encoder.out.catalog.peek()?.codec).toBe("vp09.00.31.08");
 
-		for (const timestamp of [1_200_000, 1_232_000, 1_267_000, 1_299_000, 1_334_000]) {
-			controller.enqueue(new Frame(timestamp) as never);
-		}
+		// A codec change re-probes and advertises the new encoder's string.
+		encoder.config.set({ codec: "avc1" });
 		await settle();
-		expect(HoldingVideoEncoder.current.encoded).toHaveLength(11);
-		HoldingVideoEncoder.current.output(0);
+		expect(encoder.out.resolved.peek()?.codec).toBe("avc1.640028");
+		expect(encoder.out.catalog.peek()?.codec).toBe("avc1.64001F");
 
-		HoldingVideoEncoder.current.processing = false;
-		for (let index = 0; index < 12; index++) {
-			controller.enqueue(new Frame(2_000_000 + Math.round((index * 1_000_000) / 30)) as never);
-		}
-		await settle();
-		expect(HoldingVideoEncoder.current.encoded).toHaveLength(19);
-		expect(HoldingVideoEncoder.current.encodeQueueSize).toBe(8);
-		expect(Frame.all.every((frame) => frame.closed)).toBe(true);
-
-		HoldingVideoEncoder.current.resume();
-		controller.enqueue(new Frame(4_000_000) as never);
-		await settle();
-		expect(HoldingVideoEncoder.current.encoded).toHaveLength(20);
-		expect(HoldingVideoEncoder.current.encoded.at(-1)).toEqual({ timestamp: 4_000_000, keyFrame: true });
-
-		encoder.config.set({ frameRate: 20 });
-		await settle();
-		controller.enqueue(new Frame(4_001_000) as never);
-		await settle();
-		expect(HoldingVideoEncoder.current.encoded.at(-1)?.timestamp).toBe(4_001_000);
-
-		controller.enqueue(new Frame(100_000) as never);
-		await settle();
-		expect(HoldingVideoEncoder.current.encoded.at(-1)).toEqual({ timestamp: 100_000, keyFrame: true });
-		HoldingVideoEncoder.current.output(19);
-
-		encoder.config.set({ frameRate: 30 });
-		await settle();
-		const jittered = [200_000, 232_000, 267_000, 299_000, 334_000];
-		for (const timestamp of jittered) controller.enqueue(new Frame(timestamp) as never);
-		await settle();
-		expect(HoldingVideoEncoder.current.encoded.slice(-jittered.length).map((frame) => frame.timestamp)).toEqual(
-			jittered,
-		);
-		controller.enqueue(new Frame(2_200_000) as never);
-		await settle();
-		expect(HoldingVideoEncoder.current.encoded.at(-1)).toEqual({ timestamp: 2_200_000, keyFrame: true });
-		expect(Frame.all.every((frame) => frame.closed)).toBe(true);
+		// The configured strings were never advertised, not even briefly.
+		expect([...new Set(advertised)]).toEqual(["vp09.00.31.08", "avc1.64001F"]);
 	} finally {
+		unsubscribe();
 		encoder.close();
-		fanout.close();
-		sub.close();
-		if (original) Object.defineProperty(globalThis, "VideoEncoder", original);
-		else Reflect.deleteProperty(globalThis, "VideoEncoder");
+		probe.mockRestore();
 	}
 });
 
-// Hiding video and showing it again reruns the codec probe, and a rerun waits for the task the
-// previous run spawned. A probe that has not answered yet therefore held the encoder at the old
-// state for its whole duration: no resolved config, no rendition in the catalog, and nothing the
-// second toggle could do about it. The probe has to be cancelled with the run that wanted it.
-test("a probe that has not answered does not hold the encoder through a toggle", async () => {
+test("a probe encode that reports no codec string fails loud", async () => {
 	using _videoEncoder = installFakeVideoEncoder();
-	const stuck = Promise.withResolvers<void>();
-	FakeVideoEncoder.hold = stuck.promise;
+	FakeVideoEncoder.report = () => undefined;
+	const error = spyOn(console, "error").mockImplementation(() => {});
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1280, height: 720 }) },
+	};
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never });
+	try {
+		await settle();
+		expect(encoder.out.catalog.peek()).toBeUndefined();
+		expect(encoder.settled.peek()).toBe(true);
+		expect(error).toHaveBeenCalled();
+	} finally {
+		encoder.close();
+		error.mockRestore();
+	}
+});
+
+// An encoder may pick its level from the frame rate or bitrate, so the probe encodes with both. The
+// bitrate is the ceiling, so a bandwidth grant caps the live encoder without re-probing.
+test("the probe encodes with the frame rate and bitrate ceiling", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const probe = spyOn(FakeVideoEncoder, "isConfigSupported");
 
 	const track = new Moq.Track.Producer("video").accept({ priority: 60 });
 	const sub = track.subscribe();
@@ -736,92 +670,119 @@ test("a probe that has not answered does not hold the encoder through a toggle",
 		close: () => track.close(),
 	};
 	const capture = {
-		in: {
-			source: new Signal({
-				getSettings: () => ({ frameRate: 30 }),
-				getConstraints: () => ({}),
-			} as never),
-		},
-		out: {
-			display: new Signal({ width: 1280, height: 720 }),
-			frames: new Signal(undefined),
-		},
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1280, height: 720 }), frames: new Signal(undefined) },
 	};
-
-	const enabled = new Signal(true);
+	const estimate = new Signal<number | undefined>(100_000_000);
+	const bandwidth = new Moq.Bandwidth.Allocator(estimate);
 	const encoder = new Encoder("video", {
-		enabled,
-		broadcast: { video: () => rendition } as never,
+		enabled: true,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
 		capture: capture as never,
+		bandwidth,
 	});
+	const accepted = () =>
+		probe.mock.calls.map(([config]) => config).filter((config) => config.codec.startsWith("avc1"));
 
 	try {
 		await settle();
-		expect(FakeVideoEncoder.probes).toBeGreaterThan(0);
-		expect(encoder.out.resolved.peek()).toBeUndefined();
+		const first = accepted().at(-1);
+		expect(first).toMatchObject({ framerate: 30 });
+		expect(first?.bitrate).toBeGreaterThan(0);
+		expect(encoder.out.resolved.peek()?.bitrate).toBe(first?.bitrate);
 
-		// The user hides video and shows it again while that probe is still out.
-		enabled.set(false);
+		// A grant below the ceiling caps the live config but leaves the probe alone.
+		const probes = probe.mock.calls.length;
+		estimate.set(500_000);
 		await settle();
+		expect(encoder.out.resolved.peek()?.bitrate).toBe(500_000);
+		expect(probe.mock.calls.length).toBe(probes);
 
-		// The GPU frees up, so the probe this run starts answers straight away.
-		FakeVideoEncoder.hold = undefined;
-		enabled.set(true);
+		// A frame rate change re-probes with the new rate and its larger ceiling.
+		encoder.config.set({ frameRate: 60 });
 		await settle();
-
-		expect(encoder.out.resolved.peek()).toBeDefined();
-		expect(encoder.out.catalog.peek()).toBeDefined();
-
-		// The abandoned probe finally answers. It speaks for a run that is gone, so it changes nothing.
-		const codec = encoder.out.resolved.peek()?.codec;
-		stuck.resolve();
-		await settle();
-		expect(encoder.out.resolved.peek()?.codec).toBe(codec);
+		expect(probe.mock.calls.length).toBeGreaterThan(probes);
+		const second = accepted().at(-1);
+		expect(second).toMatchObject({ framerate: 60 });
+		expect(second?.bitrate).toBeGreaterThan(first?.bitrate ?? 0);
+		expect(encoder.out.catalog.peek()?.framerate).toBe(60);
 	} finally {
-		FakeVideoEncoder.hold = undefined;
-		stuck.resolve();
 		encoder.close();
+		bandwidth.close();
 		sub.close();
+		probe.mockRestore();
 	}
 });
 
-// A rendition that stops encoding (video hidden, capture stopped) must not close its track
-// producer. Closing it FINs the subscribe stream, and a peer reads that FIN as the track being over
-// for good (`rs/moq-net/src/lite/subscriber.rs:3381`, `ServeEnd::Finished`), so every later
-// subscription is answered from the finished track: the relay logs `subscribed started` and
-// `subscribed complete` milliseconds apart, over and over, while the catalog still advertises the
-// rendition and the tile stays black. The track producer belongs to the Broadcast, which closes it
-// when the rendition is superseded or unregistered; the encoder only writes into it.
-test("a rendition that stops encoding keeps its track open for the next subscriber", async () => {
-	class InstantVideoEncoder {
-		static current: InstantVideoEncoder | undefined;
+// A re-probe keeps the rendition advertised while it runs: dropping it, even for a moment, would
+// tell every subscriber the track went away.
+test("a re-probe swaps the catalog entry in one update", async () => {
+	using _videoEncoder = installFakeVideoEncoder();
+	const probe = spyOn(FakeVideoEncoder, "isConfigSupported");
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) }) },
+		out: { display: new Signal({ width: 1280, height: 720 }) },
+	};
+	const encoder = new Encoder("video", { enabled: true, capture: capture as never });
+
+	try {
+		await settle();
+		expect(encoder.out.catalog.peek()?.framerate).toBe(30);
+
+		const published: (number | undefined)[] = [];
+		const unsubscribe = encoder.out.catalog.subscribe((catalog) => published.push(catalog?.framerate));
+		try {
+			// A frame rate change re-probes, and the catalog goes straight from the old entry to the new.
+			let probes = probe.mock.calls.length;
+			encoder.config.set({ frameRate: 60 });
+			await settle();
+			expect(probe.mock.calls.length).toBeGreaterThan(probes);
+			expect(published).toEqual([60]);
+
+			// A re-probe that lands on the same config leaves the catalog untouched.
+			probes = probe.mock.calls.length;
+			encoder.config.set({ frameRate: 60, maxPixels: 1280 * 720 });
+			await settle();
+			expect(probe.mock.calls.length).toBeGreaterThan(probes);
+			expect(published).toEqual([60]);
+		} finally {
+			unsubscribe();
+		}
+	} finally {
+		encoder.close();
+		probe.mockRestore();
+	}
+});
+
+test("cut forces a keyframe, coalescing requests and spacing them at least 500ms apart", async () => {
+	const keys: number[] = [];
+	class RecordingVideoEncoder {
 		state: CodecState = "unconfigured";
-		encodeQueueSize = 0;
-		readonly #output: VideoEncoderInit["output"];
+		#output: VideoEncoderInit["output"];
+		#codec?: string;
 
 		constructor(init: VideoEncoderInit) {
 			this.#output = init.output;
-			InstantVideoEncoder.current = this;
 		}
 
 		static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
 			return { supported: config.codec.startsWith("avc1") };
 		}
 
-		configure(): void {
+		configure(config: VideoEncoderConfig): void {
 			this.state = "configured";
+			this.#codec = config.codec;
 		}
 
-		// Straight through: what this test cares about is the track the chunks land in.
+		// Records the test's frames only, not the probe's.
 		encode(frame: VideoFrame, options?: VideoEncoderEncodeOptions): void {
-			this.#output({
-				timestamp: frame.timestamp,
-				type: options?.keyFrame ? "key" : "delta",
-				byteLength: 1,
-				copyTo: (buffer: Uint8Array) => {
-					buffer[0] = 0;
-				},
-			} as EncodedVideoChunk);
+			if (options?.keyFrame && frame instanceof Frame) keys.push(frame.timestamp / 1000);
+		}
+
+		// Only the probe flushes; report the configured codec, as Chrome does.
+		async flush(): Promise<void> {
+			const chunk = { type: "key", timestamp: 0, byteLength: 1, copyTo: () => {} };
+			this.#output(chunk as never, { decoderConfig: { codec: this.#codec } } as never);
 		}
 
 		close(): void {
@@ -829,115 +790,85 @@ test("a rendition that stops encoding keeps its track open for the next subscrib
 		}
 	}
 
-	class TestFrame {
-		readonly codedWidth = 640;
-		readonly codedHeight = 480;
-		readonly timestamp: number;
+	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
+	Object.defineProperty(globalThis, "VideoEncoder", {
+		configurable: true,
+		value: RecordingVideoEncoder,
+		writable: true,
+	});
+	const videoFrame = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+	Object.defineProperty(globalThis, "VideoFrame", { configurable: true, value: FakeVideoFrame, writable: true });
 
+	class Frame {
+		readonly timestamp: number;
 		constructor(timestamp: number) {
 			this.timestamp = timestamp;
 		}
-
-		clone(): TestFrame {
-			return new TestFrame(this.timestamp);
+		clone(): Frame {
+			return new Frame(this.timestamp);
 		}
 		close(): void {}
 	}
 
-	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
-	Object.defineProperty(globalThis, "VideoEncoder", {
-		configurable: true,
-		value: InstantVideoEncoder,
-		writable: true,
-	});
-
 	const { Fanout } = await import("../fanout");
-	const { Broadcast } = await import("../broadcast");
-
 	let controller!: ReadableStreamDefaultController<VideoFrame>;
-	const stream = new ReadableStream<VideoFrame>({
-		start: (next) => {
-			controller = next;
-		},
-	});
-	const fanout = new Fanout(stream, {
-		queue: 128,
-		clone: (frame) => (frame as unknown as TestFrame).clone() as never,
-		release: (frame) => frame.close(),
-	});
+	const fanout = new Fanout(
+		new ReadableStream<VideoFrame>({
+			start: (c) => {
+				controller = c;
+			},
+		}),
+		{ clone: (frame) => frame.clone(), release: (frame) => frame.close() },
+	);
 
-	const capture = {
-		in: {
-			source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) } as never),
-		},
-		out: {
-			display: new Signal({ width: 640, height: 480 }),
-			frames: new Signal(fanout),
-		},
+	const track = new Moq.Track.Producer("video").accept();
+	const rendition = {
+		config: new Signal(undefined),
+		track: new Signal<Moq.Track.Producer | undefined>(track),
+		close: () => track.close(),
 	};
-	const enabled = new Signal(true);
-	const broadcast = new Broadcast({
-		enabled: true,
-		origin: new Moq.Origin.Producer(),
-		name: Moq.Path.from("toggle.hang"),
-	});
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) } as never) },
+		out: { display: new Signal({ width: 640, height: 480 }), frames: new Signal(fanout) },
+	};
 	const encoder = new Encoder("video", {
-		enabled,
-		broadcast,
+		enabled: true,
+		broadcast: { video: () => rendition } as never,
 		capture: capture as never,
-		config: { frameRate: 30 },
 	});
 
-	let front: Moq.Broadcast.Consumer | undefined;
-	let first: Moq.Track.Subscriber | undefined;
-	let second: Moq.Track.Subscriber | undefined;
+	// One frame per 100ms of media time, after calling cut() when `cut` says so.
+	const send = async (millis: number, cut = false) => {
+		if (cut) encoder.cut();
+		controller.enqueue(new Frame(millis * 1000) as unknown as VideoFrame);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	};
 
 	try {
 		await settle();
 
-		const net = broadcast.net.peek();
-		if (!net) throw new Error("expected a network producer");
-		front = net.consume();
+		// The opening keyframe serves a request made before it.
+		await send(0, true);
+		await send(100);
+		// Several requests before one frame produce one keyframe.
+		encoder.cut();
+		encoder.cut();
+		await send(600, true);
+		await send(700);
+		// Too soon after the last: deferred until 500ms have passed, not dropped.
+		await send(800, true);
+		await send(1000);
+		await send(1100);
+		await send(1200);
 
-		// The watcher subscribes, and the encoder starts feeding the accepted producer.
-		first = front.track("video").subscribe();
-		await settle();
-		controller.enqueue(new TestFrame(1_000_000) as never);
-		await settle();
-		expect((await first.recvGroup())?.sequence).toBe(0);
-
-		// The user hides video, so the rendition stops encoding. It stays registered, and a
-		// subscriber is meant to get an idle track rather than a track that is over.
-		enabled.set(false);
-		await settle();
-		expect(first.closed.peek()).toBeUndefined();
-
-		// Video comes back: the rendition is advertised again and the same subscription resumes on
-		// a keyframe. A track closed by the hide is over for good on the wire, so the watcher would
-		// be left subscribing to a finished track while the catalog says the rendition is there.
-		enabled.set(true);
-		await settle();
-		expect(encoder.out.catalog.peek()).toBeDefined();
-		controller.enqueue(new TestFrame(4_000_000) as never);
-		await settle();
-		const resumed = await first.recvGroup();
-		expect(resumed?.sequence).toBeGreaterThan(0);
-
-		// And a subscription opened after the stop is served rather than completing at once.
-		second = front.track("video").subscribe();
-		await settle();
-		controller.enqueue(new TestFrame(7_000_000) as never);
-		await settle();
-		expect(second.closed.peek()).toBeUndefined();
-		expect(await second.recvGroup()).toBeDefined();
+		expect(keys).toEqual([0, 600, 1100]);
 	} finally {
-		first?.close();
-		second?.close();
-		front?.close();
 		encoder.close();
-		broadcast.close();
 		fanout.close();
+		track.close();
 		if (original) Object.defineProperty(globalThis, "VideoEncoder", original);
 		else Reflect.deleteProperty(globalThis, "VideoEncoder");
+		if (videoFrame) Object.defineProperty(globalThis, "VideoFrame", videoFrame);
+		else Reflect.deleteProperty(globalThis, "VideoFrame");
 	}
 });

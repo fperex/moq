@@ -237,7 +237,7 @@ async fn run(config: &Config) -> Result<()> {
 		.create_broadcast(&broadcast_path)
 		.context("failed to create broadcast")?;
 	broadcast
-		.announce(Default::default())
+		.announce(moq_net::origin::Route::default().with_epoch(moq_net::Epoch::mint()))
 		.context("failed to announce broadcast")?;
 
 	// Consume origin: viewer broadcasts under the viewer prefix.
@@ -305,9 +305,8 @@ async fn run(config: &Config) -> Result<()> {
 		res = input::handle_viewers(&viewer_consumer, &cmd_tx) => res,
 	};
 
-	// Cleanly close the broadcast so subscribers see a normal end rather than
-	// Error::Dropped.
-	broadcast.finish();
+	// Close the broadcast now, even if the emulator thread still holds a clone.
+	broadcast.close();
 	result
 }
 

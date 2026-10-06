@@ -63,7 +63,8 @@ pub enum Resource {
 		/// The hash of the init bytes the URL names.
 		hash: String,
 	},
-	/// `{kind}/{rendition}/seg/[{generation}.]{sequence}.m4s`: a segment by its HLS number.
+	/// `{kind}/{rendition}/seg/[{generation}.]{reference}.{sequence}.m4s`: a segment by its HLS
+	/// number.
 	#[non_exhaustive]
 	Segment {
 		/// The rendition's kind.
@@ -72,11 +73,13 @@ pub enum Resource {
 		rendition: String,
 		/// The publisher run the URL names, if the broadcaster carries one.
 		generation: Option<String>,
+		/// The tag of the reference rendition whose records number the segment.
+		reference: String,
 		/// The segment's aligned number.
 		sequence: u64,
 	},
-	/// `{kind}/{rendition}/seg/[{generation}.]t{pts}.m4s`: the same bytes, addressed by the
-	/// DASH timeline pts (`$Time$`).
+	/// `{kind}/{rendition}/seg/[{generation}.]{reference}.t{pts}.m4s`: the same bytes, addressed
+	/// by the DASH timeline pts (`$Time$`).
 	#[non_exhaustive]
 	SegmentAt {
 		/// The rendition's kind.
@@ -85,6 +88,8 @@ pub enum Resource {
 		rendition: String,
 		/// The publisher run the URL names, if the broadcaster carries one.
 		generation: Option<String>,
+		/// The tag of the reference rendition whose records number the segment.
+		reference: String,
 		/// The segment's timeline pts.
 		pts: u64,
 	},
@@ -134,22 +139,26 @@ impl Route {
 				let kind = Kind::parse(kind)?;
 				let rendition = rendition.clone();
 				let stem = file.strip_suffix(".m4s")?;
-				// `{generation}.{segment}` when the export carries a generation, `{segment}` otherwise.
-				let (generation, stem) = match stem.split_once('.') {
-					Some((generation, stem)) => (Some(generation.to_string()), stem),
-					None => (None, stem),
+				// `{generation}.{reference}.{segment}` when the export carries a generation,
+				// `{reference}.{segment}` otherwise.
+				let (generation, reference, stem) = match stem.split('.').collect::<Vec<_>>().as_slice() {
+					[reference, stem] => (None, reference.to_string(), *stem),
+					[generation, reference, stem] => (Some(generation.to_string()), reference.to_string(), *stem),
+					_ => return None,
 				};
 				let resource = match stem.strip_prefix('t') {
 					Some(pts) => Resource::SegmentAt {
 						kind,
 						rendition,
 						generation,
+						reference,
 						pts: pts.parse().ok()?,
 					},
 					None => Resource::Segment {
 						kind,
 						rendition,
 						generation,
+						reference,
 						sequence: stem.parse().ok()?,
 					},
 				};
@@ -201,18 +210,20 @@ impl Server {
 				kind,
 				rendition,
 				generation,
+				reference,
 				sequence,
 			} => {
-				let at = SegmentAt::Sequence(*sequence);
+				let at = SegmentAt::Sequence(reference, *sequence);
 				segment(self, broadcast, *kind, rendition, generation.as_deref(), at).await
 			}
 			Resource::SegmentAt {
 				kind,
 				rendition,
 				generation,
+				reference,
 				pts,
 			} => {
-				let at = SegmentAt::Pts(*pts);
+				let at = SegmentAt::Pts(reference, *pts);
 				segment(self, broadcast, *kind, rendition, generation.as_deref(), at).await
 			}
 		}
@@ -267,11 +278,12 @@ async fn init(server: &Server, broadcast: &str, kind: Kind, rendition: &str, has
 	media_result(rendition.init_versioned(hash).await, server)
 }
 
-/// How a segment URL addresses its bytes: HLS by aligned number (`seg/0.m4s`), DASH by
-/// timeline pts (`seg/t2000.m4s`, the SegmentTemplate's `$Time$`).
-enum SegmentAt {
-	Sequence(u64),
-	Pts(u64),
+/// How a segment URL addresses its bytes under its reference's tag: HLS by aligned number
+/// (`seg/{tag}.0.m4s`), DASH by timeline pts (`seg/{tag}.t2000.m4s`, the SegmentTemplate's
+/// `$Time$`).
+enum SegmentAt<'a> {
+	Sequence(&'a str, u64),
+	Pts(&'a str, u64),
 }
 
 async fn segment(
@@ -280,7 +292,7 @@ async fn segment(
 	kind: Kind,
 	rendition: &str,
 	generation: Option<&str>,
-	at: SegmentAt,
+	at: SegmentAt<'_>,
 ) -> Response {
 	let Some(rendition) = rendition_for(server, broadcast, kind, rendition).await else {
 		return not_found();
@@ -292,8 +304,8 @@ async fn segment(
 		return not_found();
 	}
 	let result = match at {
-		SegmentAt::Sequence(sequence) => rendition.segment(sequence).await,
-		SegmentAt::Pts(pts) => rendition.segment_at(pts).await,
+		SegmentAt::Sequence(reference, sequence) => rendition.segment(reference, sequence).await,
+		SegmentAt::Pts(reference, pts) => rendition.segment_at(reference, pts).await,
 	};
 	// A generation change while fetching may have swapped the rows under the lookup.
 	if !current() {
@@ -391,38 +403,42 @@ mod tests {
 			})
 		);
 		assert_eq!(
-			resource("/project/live/video/main/seg/42.m4s"),
+			resource("/project/live/video/main/seg/ab12cd34.42.m4s"),
 			Some(Resource::Segment {
 				kind: Kind::Video,
 				rendition: "main".to_string(),
 				generation: None,
+				reference: "ab12cd34".to_string(),
 				sequence: 42,
 			})
 		);
 		assert_eq!(
-			resource("/project/live/video/main/seg/run-1.42.m4s"),
+			resource("/project/live/video/main/seg/run-1.ab12cd34.42.m4s"),
 			Some(Resource::Segment {
 				kind: Kind::Video,
 				rendition: "main".to_string(),
 				generation: Some("run-1".to_string()),
+				reference: "ab12cd34".to_string(),
 				sequence: 42,
 			})
 		);
 		assert_eq!(
-			resource("/project/live/video/main/seg/t2000.m4s"),
+			resource("/project/live/video/main/seg/ab12cd34.t2000.m4s"),
 			Some(Resource::SegmentAt {
 				kind: Kind::Video,
 				rendition: "main".to_string(),
 				generation: None,
+				reference: "ab12cd34".to_string(),
 				pts: 2000,
 			})
 		);
 		assert_eq!(
-			resource("/project/live/video/main/seg/init.t2000.m4s"),
+			resource("/project/live/video/main/seg/init.ab12cd34.t2000.m4s"),
 			Some(Resource::SegmentAt {
 				kind: Kind::Video,
 				rendition: "main".to_string(),
 				generation: Some("init".to_string()),
+				reference: "ab12cd34".to_string(),
 				pts: 2000,
 			})
 		);
@@ -431,7 +447,11 @@ mod tests {
 		assert!(Route::parse("/project/live/data/main/media.m3u8").is_none());
 		assert!(Route::parse("/project/live/video/main/init.mp4").is_none());
 		assert!(Route::parse("/project/live/video/main/init..mp4").is_none());
-		assert!(Route::parse("/project/live/video/main/seg/tx.m4s").is_none());
+		assert!(Route::parse("/project/live/video/main/seg/ab12cd34.tx.m4s").is_none());
+		assert!(
+			Route::parse("/project/live/video/main/seg/42.m4s").is_none(),
+			"a segment URL names its reference"
+		);
 		assert!(Route::parse("/project/live/video/main/seg/1.ts").is_none());
 	}
 
@@ -484,59 +504,51 @@ mod tests {
 	}
 
 	async fn lite_pair_pub(config: impl Into<moq_net::origin::Config>) -> LitePair {
-		use std::net::TcpListener;
-
 		let lite: moq_net::Version = "moq-lite-05".parse().expect("lite version");
 		let pub_origin = moq_tokio::origin::spawn_config(config.into());
 		let sub_origin = moq_tokio::origin::spawn();
 
-		for _ in 0..20 {
-			let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
-			let port = probe.local_addr().expect("local addr").port();
-			drop(probe);
+		let mut listen = moq_tokio::listen::Config::default();
+		listen.tcp.bind = Some("127.0.0.1:0".parse().expect("addr"));
+		listen.version = vec![lite];
+		let mut server = listen
+			.init(Default::default())
+			.expect("server")
+			.listen()
+			.await
+			.expect("listen");
+		let addr = server.tcp_local_addr().expect("tcp listener bound");
 
-			let mut listen = moq_tokio::listen::Config::default();
-			listen.tcp.bind = Some(format!("127.0.0.1:{port}").parse().expect("addr"));
-			listen.version = vec![lite];
-			let Ok(server) = listen.init(Default::default()) else {
-				continue;
-			};
-			let Ok(mut server) = server.listen().await else {
-				continue;
-			};
-
-			let pub_for_accept = pub_origin.clone();
-			let accept = tokio::spawn(async move {
-				let request = server.accept().await.expect("accept");
-				let session = request
-					.with_publisher(&pub_for_accept)
-					.ok()
-					.await
-					.expect("publisher session");
-				let _ = session.closed().await;
-			});
-
-			let mut connect = moq_tokio::connect::Config::default();
-			connect.version = vec![lite];
-			let client = connect
-				.init(Default::default())
-				.expect("client")
-				.with_subscriber(sub_origin.clone())
-				.with_reconnect(false);
-			let url: url::Url = format!("tcp://127.0.0.1:{port}/").parse().expect("url");
-			let connection = tokio::time::timeout(TIMEOUT, client.connect(url).established())
+		let pub_for_accept = pub_origin.clone();
+		let accept = tokio::spawn(async move {
+			let request = server.accept().await.expect("accept");
+			let session = request
+				.with_publisher(&pub_for_accept)
+				.ok()
 				.await
-				.expect("connect timed out")
-				.expect("connect");
+				.expect("publisher session");
+			let _ = session.closed().await;
+		});
 
-			return LitePair {
-				pub_origin,
-				sub_origin,
-				_connection: connection,
-				accept,
-			};
+		let mut connect = moq_tokio::connect::Config::default();
+		connect.version = vec![lite];
+		let client = connect
+			.init(Default::default())
+			.expect("client")
+			.with_subscriber(sub_origin.clone())
+			.with_reconnect(false);
+		let url: url::Url = format!("tcp://{addr}/").parse().expect("url");
+		let connection = tokio::time::timeout(TIMEOUT, client.connect(url).established())
+			.await
+			.expect("connect timed out")
+			.expect("connect");
+
+		LitePair {
+			pub_origin,
+			sub_origin,
+			_connection: connection,
+			accept,
 		}
-		panic!("could not bind a free TCP port after 20 attempts");
 	}
 
 	async fn oneshot(app: axum::Router, uri: &str) -> axum::http::Response<axum::body::Body> {
@@ -623,7 +635,7 @@ mod tests {
 			if response.status() == StatusCode::OK {
 				let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
 				let body = String::from_utf8(body.to_vec()).unwrap();
-				if body.contains("seg/0.m4s") {
+				if body.contains("seg/656e3d1b.0.m4s") {
 					break body;
 				}
 			}
@@ -634,7 +646,7 @@ mod tests {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		};
 		assert!(body.contains(".mp4?jwt=abc\""), "{body}");
-		assert!(body.contains("seg/0.m4s?jwt=abc"), "{body}");
+		assert!(body.contains("seg/656e3d1b.0.m4s?jwt=abc"), "{body}");
 
 		pair.accept.abort();
 	}
@@ -655,14 +667,14 @@ mod tests {
 
 		let server = Server::new(origin.consume(), crate::export::Config::default());
 		let app = server.router();
-		wait_listed(&app, "/live/video/video0/media.m3u8", "seg/0.m4s").await;
+		wait_listed(&app, "/live/video/video0/media.m3u8", "seg/656e3d1b.0.m4s").await;
 		let broadcaster = server.broadcaster("live").await.expect("broadcaster");
 		broadcaster.set_generation(Some("run-1")).unwrap();
 
 		let response = oneshot(app.clone(), "/live/video/video0/media.m3u8").await;
 		let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
 		let playlist = String::from_utf8(body.to_vec()).unwrap();
-		assert!(playlist.contains("\nseg/run-1.0.m4s\n"), "{playlist}");
+		assert!(playlist.contains("\nseg/run-1.656e3d1b.0.m4s\n"), "{playlist}");
 		let map = playlist.lines().find(|line| line.starts_with("#EXT-X-MAP:")).unwrap();
 		let init = map
 			.strip_prefix("#EXT-X-MAP:URI=\"")
@@ -680,24 +692,27 @@ mod tests {
 			StatusCode::NOT_FOUND
 		);
 
-		assert_eq!(status(&app, "/live/video/video0/seg/run-1.0.m4s").await, StatusCode::OK);
 		assert_eq!(
-			status(&app, "/live/video/video0/seg/run-1.t0.m4s").await,
+			status(&app, "/live/video/video0/seg/run-1.656e3d1b.0.m4s").await,
 			StatusCode::OK
 		);
 		assert_eq!(
-			status(&app, "/live/video/video0/seg/0.m4s").await,
+			status(&app, "/live/video/video0/seg/run-1.656e3d1b.t0.m4s").await,
+			StatusCode::OK
+		);
+		assert_eq!(
+			status(&app, "/live/video/video0/seg/656e3d1b.0.m4s").await,
 			StatusCode::NOT_FOUND
 		);
 		assert_eq!(
-			status(&app, "/live/video/video0/seg/run-0.0.m4s").await,
+			status(&app, "/live/video/video0/seg/run-0.656e3d1b.0.m4s").await,
 			StatusCode::NOT_FOUND
 		);
 
 		// A new run: the previous generation's URLs are refused even for numbers it reuses.
 		broadcaster.set_generation(Some("run-2")).unwrap();
 		assert_eq!(
-			status(&app, "/live/video/video0/seg/run-1.0.m4s").await,
+			status(&app, "/live/video/video0/seg/run-1.656e3d1b.0.m4s").await,
 			StatusCode::NOT_FOUND
 		);
 	}
@@ -718,9 +733,9 @@ mod tests {
 		write_three_gops(&mut media);
 
 		let app = Server::new(pair.sub_origin.consume(), crate::export::Config::default()).router();
-		wait_listed(&app, "/live/video/video0/media.m3u8", "seg/0.m4s").await;
+		wait_listed(&app, "/live/video/video0/media.m3u8", "seg/656e3d1b.0.m4s").await;
 
-		let response = oneshot(app, "/live/video/video0/seg/0.m4s").await;
+		let response = oneshot(app, "/live/video/video0/seg/656e3d1b.0.m4s").await;
 		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 		assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
 
@@ -736,7 +751,7 @@ mod tests {
 		write_three_gops(&mut media);
 
 		let app = Server::new(pair.sub_origin.consume(), crate::export::Config::default()).router();
-		wait_listed(&app, "/live/video/video0/media.m3u8", "seg/0.m4s").await;
+		wait_listed(&app, "/live/video/video0/media.m3u8", "seg/656e3d1b.0.m4s").await;
 
 		let remote = tokio::time::timeout(TIMEOUT, pair.sub_origin.consume().request_broadcast("live"))
 			.await
@@ -747,7 +762,7 @@ mod tests {
 			.await
 			.expect("publisher close timed out");
 
-		let response = oneshot(app, "/live/video/video0/seg/0.m4s").await;
+		let response = oneshot(app, "/live/video/video0/seg/656e3d1b.0.m4s").await;
 		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 		assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
 
@@ -781,7 +796,7 @@ mod tests {
 		write_three_gops(&mut media);
 
 		let app = Server::new(pair.sub_origin.consume(), crate::export::Config::default()).router();
-		wait_listed(&app, "/room/live/video/video0/media.m3u8", "seg/0.m4s").await;
+		wait_listed(&app, "/room/live/video/video0/media.m3u8", "seg/656e3d1b.0.m4s").await;
 
 		let remote_media = tokio::time::timeout(TIMEOUT, pair.sub_origin.consume().request_broadcast("room/source"))
 			.await
@@ -793,7 +808,7 @@ mod tests {
 			.await
 			.expect("sibling close timed out");
 
-		let response = oneshot(app, "/room/live/video/video0/seg/0.m4s").await;
+		let response = oneshot(app, "/room/live/video/video0/seg/656e3d1b.0.m4s").await;
 		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 		assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
 

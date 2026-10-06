@@ -1,18 +1,60 @@
 //! The `play` verb's command-line surface.
 
+use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 
 use moq_mux::catalog::CatalogFormat;
 
 use crate::subscribe::{CatalogFormatArg, SelectArgs};
 
-/// The deepest buffer playout can be asked for, which is what bounds `--delay`.
+/// The longest delay the speaker can hold, which is what bounds `--delay`.
 ///
-/// The estimator describes delay with a hundred twenty millisecond buckets
-/// (`doc/concept/playout.md`), so two seconds is the widest target it can produce
-/// and the widest floor it can be held to. Duplicated as a number because this
-/// module compiles without the `play` feature, and so without `moq-audio`.
-const DELAY_MAX: Duration = Duration::from_secs(2);
+/// Duplicated from `moq_audio::playback::Input::LATENCY_MAX` because this module
+/// compiles without the `play` feature, and so without that crate. The test
+/// below pins the two together in a build that has both.
+const DELAY_MAX: Duration = Duration::from_secs(10);
+
+/// How long `auto` waits on a stalled group before skipping it.
+///
+/// The estimate only sees what the container hands over, and a skipped group is
+/// never handed over, so a budget under the estimate's ceiling would cap the
+/// target at the budget it was cut to. Two seconds is that ceiling, the most
+/// lateness the estimate can represent.
+const AUTO_MAX_AGE: Duration = Duration::from_secs(2);
+
+/// How far video alone trails the live edge under `auto`. The estimate is
+/// audio's; video follows the speaker whenever there is one.
+const AUTO_VIDEO_DELAY: Duration = Duration::from_millis(100);
+
+/// How far playback trails the live edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delay {
+	/// Sized from how unevenly audio arrives, and following it as that changes.
+	Auto,
+	/// Held at exactly this.
+	Fixed(Duration),
+}
+
+impl FromStr for Delay {
+	type Err = humantime::DurationError;
+
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		match value {
+			"auto" => Ok(Self::Auto),
+			value => humantime::parse_duration(value).map(Self::Fixed),
+		}
+	}
+}
+
+impl fmt::Display for Delay {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Auto => f.write_str("auto"),
+			Self::Fixed(delay) => humantime::format_duration(*delay).fmt(f),
+		}
+	}
+}
 
 /// Play one MoQ broadcast through a native window and speaker.
 #[derive(usage::Args, Clone)]
@@ -22,15 +64,17 @@ pub struct Args {
 	#[usage(long, value_enum)]
 	pub catalog_format: Option<CatalogFormatArg>,
 
-	/// The least playback trails the live edge.
+	/// How far playback trails the live edge: `auto`, or a fixed duration.
 	///
-	/// A floor, not a fixed delay: the jitter buffer measures what actually arrives and
-	/// holds at least this much, more when the path asks for it. Every frame is presented
-	/// that long after the live edge, which is how late one may arrive and still make its
-	/// slot, and the staleness budget is sized from it, since nothing older than the
-	/// playhead is worth presenting. The picture follows the speaker either way.
-	#[usage(long, default = "100ms")]
-	pub delay: crate::duration::Duration,
+	/// The playout delay: every frame is presented this long after the live edge, which is
+	/// how late one may arrive and still make its slot. `auto` measures how unevenly audio
+	/// arrives and follows it, so a publisher that flushes in bursts gets a buffer deep
+	/// enough to play through them. A duration fixes the delay instead, and doubles as the
+	/// staleness budget, since nothing older than the playhead is worth presenting. The
+	/// speaker holds the delay, with a 50ms floor under it, so a smaller value than that
+	/// does not reach the picture either.
+	#[usage(long, default = "auto")]
+	pub delay: Delay,
 
 	/// Rendition selection by track name or codec.
 	#[usage(flatten)]
@@ -45,6 +89,24 @@ impl Args {
 			.unwrap_or_default()
 	}
 
+	/// The fixed playout delay, or `None` to estimate it.
+	pub(super) fn fixed_delay(&self) -> Option<Duration> {
+		match self.delay {
+			Delay::Auto => None,
+			Delay::Fixed(delay) => Some(delay),
+		}
+	}
+
+	/// How long a stalled group is waited on before it is skipped.
+	pub(super) fn max_age(&self) -> Duration {
+		self.fixed_delay().unwrap_or(AUTO_MAX_AGE)
+	}
+
+	/// How far video trails the live edge while no speaker is setting the pace.
+	pub(super) fn video_delay(&self) -> Duration {
+		self.fixed_delay().unwrap_or(AUTO_VIDEO_DELAY)
+	}
+
 	/// Reject a codec the local decoders can't open.
 	///
 	/// The selection flags are shared with the stdout exports, which pass bytes
@@ -55,14 +117,14 @@ impl Args {
 		use crate::subscribe::VideoCodecArg;
 
 		anyhow::ensure!(
-			!matches!(self.select.video_codec, Some(VideoCodecArg::Vp8 | VideoCodecArg::Vp9)),
-			"`play` cannot decode vp8 or vp9; pass --video-codec h264, h265, or av1"
+			cfg!(feature = "vpx") || !matches!(self.select.video_codec, Some(VideoCodecArg::Vp8 | VideoCodecArg::Vp9)),
+			"`play` was built without the `vpx` feature, so it cannot decode vp8 or vp9; pass --video-codec h264, h265, or av1"
 		);
-		// A floor deeper than the estimator can describe would be refused when the
-		// decoder is built, which is after the pipeline has opened a device.
+		// The delay is the speaker's ring depth, so a value it cannot hold is
+		// refused here rather than after the pipeline has opened a device.
 		anyhow::ensure!(
-			self.delay.into_std() <= DELAY_MAX,
-			"--delay must be at most {DELAY_MAX:?}; it is the least audio playout buffers"
+			self.fixed_delay().is_none_or(|delay| delay <= DELAY_MAX),
+			"--delay must be at most {DELAY_MAX:?}; it is the depth the speaker buffers"
 		);
 		Ok(())
 	}
@@ -91,37 +153,55 @@ mod tests {
 		parse(&["--video-codec", "h264"]).validate().unwrap();
 		parse(&["--video-codec", "av1"]).validate().unwrap();
 
-		let err = parse(&["--video-codec", "vp9"]).validate().unwrap_err().to_string();
-		assert!(err.contains("vp8 or vp9"), "{err}");
-		assert!(parse(&["--video-codec", "vp8"]).validate().is_err());
+		// VP8 and VP9 decode only through the opt-in libvpx backend.
+		for codec in ["vp8", "vp9"] {
+			let result = parse(&["--video-codec", codec]).validate();
+			if cfg!(feature = "vpx") {
+				result.unwrap();
+			} else {
+				let err = result.unwrap_err().to_string();
+				assert!(err.contains("vp8 or vp9"), "{err}");
+			}
+		}
 	}
 
-	/// The delay is the floor under the playout buffer and what the staleness budget
-	/// is sized from, so its default has to be one a live stream can present against.
+	/// Playback can leave a role out, but not both, and not one it also narrows.
 	#[test]
-	fn the_delay_sets_the_staleness_budget() {
-		assert_eq!(parse(&[]).delay.into_std(), std::time::Duration::from_millis(100));
-		assert_eq!(
-			parse(&["--delay", "500ms"]).delay.into_std(),
-			std::time::Duration::from_millis(500)
-		);
+	fn a_role_can_be_left_out() {
+		let selection = parse(&["--no-video"]).select.selection(None);
+		assert!(!selection.has_video());
+		assert!(selection.has_audio());
+
+		for refused in [
+			["--no-video", "--no-audio"].as_slice(),
+			&["--no-video", "--video-codec", "h264"],
+			&["--no-audio", "--audio-name", "stereo"],
+		] {
+			let argv: Vec<&std::ffi::OsStr> = refused.iter().map(std::ffi::OsStr::new).collect();
+			assert!(Cli::parse_from(&argv).is_err(), "{refused:?} parsed");
+		}
 	}
 
-	/// `moq play --help` is what `doc/bin/cli.md` describes, so the page has to say
-	/// `--delay` is a floor. A doc that still calls it the speaker's ring depth is a
-	/// doc for a player that no longer exists.
-	#[cfg(feature = "play")]
+	/// A fixed delay is the playout offset and the staleness budget at once.
 	#[test]
-	fn the_help_page_calls_the_delay_a_floor() {
-		let Err(err) = crate::args::Invocation::try_parse_from(["moq", "play", "--help"]) else {
-			panic!("--help parsed instead of asking a question")
-		};
-		assert_eq!(err.kind(), crate::args::ParseErrorKind::DisplayHelp);
+	fn a_fixed_delay_sets_the_staleness_budget() {
+		let args = parse(&["--delay", "500ms"]);
+		assert_eq!(args.fixed_delay(), Some(Duration::from_millis(500)));
+		assert_eq!(args.max_age(), Duration::from_millis(500));
+		assert_eq!(args.video_delay(), Duration::from_millis(500));
+	}
 
-		let help = err.to_string();
-		assert!(help.contains("--delay"), "{help}");
-		assert!(help.contains("The least playback trails the live edge"), "{help}");
-		assert!(help.contains("100ms"), "{help}");
+	/// The default measures the delay, and waits on a stalled group as long as the
+	/// estimate can see, so the budget never caps what it measures.
+	#[test]
+	fn the_delay_defaults_to_the_estimate() {
+		let args = parse(&[]);
+		assert_eq!(args.delay, Delay::Auto);
+		assert_eq!(args.fixed_delay(), None);
+		assert_eq!(args.max_age(), AUTO_MAX_AGE);
+		assert_eq!(parse(&["--delay", "auto"]).delay, Delay::Auto);
+		assert_eq!(Delay::Auto.to_string(), "auto");
+		assert_eq!(Delay::Fixed(Duration::from_millis(250)).to_string(), "250ms");
 	}
 
 	/// The playout budget has one spelling because it always controls both
@@ -134,18 +214,19 @@ mod tests {
 		}
 	}
 
-	/// A floor deeper than the estimator can describe is refused up front, rather
-	/// than after the pipeline has opened a device.
+	/// A depth the speaker cannot hold is refused up front, rather than after the
+	/// pipeline has opened a device.
 	#[test]
-	fn the_delay_is_bounded_by_what_playout_can_hold() {
-		let err = parse(&["--delay", "3s"]).validate().unwrap_err().to_string();
+	fn the_delay_is_bounded_by_the_speakers_ring() {
+		let err = parse(&["--delay", "11s"]).validate().unwrap_err().to_string();
 		assert!(err.contains("--delay must be at most"), "{err}");
-		parse(&["--delay", "2s"]).validate().unwrap();
+		parse(&["--delay", "10s"]).validate().unwrap();
+		parse(&["--delay", "auto"]).validate().unwrap();
 
-		// The bound has to be playout's own, which only a build carrying playout
+		// The bound has to be the sink's own, which only a build carrying the sink
 		// can say.
 		#[cfg(feature = "play")]
-		assert_eq!(DELAY_MAX, moq_audio::decode::Options::DELAY_MAX);
+		assert_eq!(DELAY_MAX, moq_audio::playback::Input::LATENCY_MAX);
 	}
 
 	/// The suffix picks the format, and the flag overrides it.

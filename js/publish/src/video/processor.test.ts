@@ -4,6 +4,8 @@ import type { FromWorker, ToWorker } from "./capture-worker.ts";
 // Whether the fake worker claims a native MediaStreamTrackProcessor, how much its source clock
 // advances per frame (WebKit's canvas tracks don't advance at all), and every worker spawned so far.
 let supported = true;
+// Whether the fake worker fails to load, which reports through onerror instead of a ready message.
+let loadFails = false;
 let advance = 1000;
 // Added to each frame's arrival time, so a test can space arrivals apart by more than the clock
 // resolution rather than relying on performance.now() ticking between microtasks.
@@ -14,14 +16,11 @@ const spawned: FakeWorker[] = [];
 // frame whose timestamp advances by 1000us.
 class FakeWorker {
 	onmessage: ((event: MessageEvent<FromWorker>) => void) | null = null;
-	onerror: unknown = null;
+	onerror: ((event: ErrorEvent) => void) | null = null;
 	onmessageerror: unknown = null;
 
 	terminated = false;
 	started?: FakeTrack;
-	// The cadence the <video> fallback asked for, and its ticks, which a test drives by hand rather
-	// than waiting on a real timer.
-	period?: number;
 
 	#timestamp = 5_000_000; // the camera's own epoch, which the rewrite has to erase
 	#frames = 0;
@@ -29,22 +28,13 @@ class FakeWorker {
 
 	constructor() {
 		spawned.push(this);
-		this.#emit({ type: "ready", supported });
-	}
-
-	/** One tick, as the real worker's interval would post it. */
-	tick(): void {
-		this.#emit({ type: "tick" });
+		if (loadFails) queueMicrotask(() => this.onerror?.({ message: "404" } as ErrorEvent));
+		else this.#emit({ type: "ready", supported });
 	}
 
 	postMessage(msg: ToWorker): void {
 		if (msg.type === "start") {
 			this.started = msg.track as unknown as FakeTrack;
-			return;
-		}
-
-		if (msg.type === "tick") {
-			this.period = msg.period;
 			return;
 		}
 
@@ -93,123 +83,16 @@ class FakeTrack {
 	stop(): void {
 		this.stopped = true;
 	}
-
-	getSettings(): { frameRate: number } {
-		return { frameRate: RATE };
-	}
 }
 
-// The camera's rate, picked so the fallback's grace (two frame periods) is short enough to wait out
-// in a test without making it a timing race.
-const RATE = 200;
-
-/**
- * Stands in for the detached <video> the polyfill captures from.
- *
- * `advance` is one camera frame reaching the element: its media clock moves on, and the frame
- * callback fires unless it has been suspended, which is what Firefox does to a hidden document.
- */
-class FakeVideo {
-	currentTime = 0;
-	srcObject: unknown = null;
-	suspended = false;
-
-	#callbacks = new Map<number, (now: number, metadata: { captureTime?: number }) => void>();
-	#next = 1;
-
-	play(): Promise<void> {
-		return Promise.resolve();
-	}
-
-	set onloadedmetadata(resolve: () => void) {
-		queueMicrotask(resolve);
-	}
-
-	requestVideoFrameCallback(callback: (now: number, metadata: { captureTime?: number }) => void): number {
-		const handle = this.#next++;
-		this.#callbacks.set(handle, callback);
-		return handle;
-	}
-
-	cancelVideoFrameCallback(handle: number): void {
-		this.#callbacks.delete(handle);
-	}
-
-	/**
-	 * A new picture arrives. Returns the instant it was reported at, which is what stamps it. `at`
-	 * overrides that instant, for a callback whose timestamp is the frame's start (vsync) rather
-	 * than when it ran.
-	 */
-	advance(metadata: { captureTime?: number } = {}, at?: number): number {
-		this.currentTime += 1 / RATE;
-
-		const now = at ?? performance.now();
-		if (this.suspended) return now;
-
-		// The real callback re-registers itself, so hand out the pending ones and start empty.
-		const pending = [...this.#callbacks.values()];
-		this.#callbacks.clear();
-		for (const callback of pending) callback(now, metadata);
-		return now;
-	}
-}
-
-// The polyfill needs a document to create its element and a MediaStream to wrap the track, neither
-// of which bun has. Restores whatever was there, because the test above it asserts their absence.
-function install(): { video: () => FakeVideo; restore: () => void } {
-	let video: FakeVideo | undefined;
-	const had = Object.getOwnPropertyDescriptor(globalThis, "document");
-
-	Object.defineProperty(globalThis, "document", {
-		configurable: true,
-		writable: true,
-		value: {
-			createElement(tag: string) {
-				if (tag !== "video") throw new Error(`unexpected element: ${tag}`);
-				video = new FakeVideo();
-				return video;
-			},
-		},
-	});
-	Object.defineProperty(globalThis, "MediaStream", {
-		configurable: true,
-		writable: true,
-		value: class {
-			readonly tracks: unknown[];
-			constructor(tracks: unknown[]) {
-				this.tracks = tracks;
-			}
-		},
-	});
-
-	return {
-		video: () => {
-			if (!video) throw new Error("the polyfill never created a <video>");
-			return video;
-		},
-		restore: () => {
-			if (had) Object.defineProperty(globalThis, "document", had);
-			else Reflect.deleteProperty(globalThis, "document");
-			Reflect.deleteProperty(globalThis, "MediaStream");
-		},
-	};
-}
-
-// Let every pending microtask settle, so the stream has asked for its next frame before the test
-// produces one. The polyfill only captures while a read is outstanding.
-const drain = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
-
-// Whether a read is still waiting, rather than hanging the test on one that never resolves.
-async function pending<T>(read: Promise<T>): Promise<T | "pending"> {
-	return await Promise.race([read, new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 25))]);
-}
-
-// The capture worker is imported as an inlined blob URL, which the bun test loader can't resolve.
-mock.module("./capture-worker.ts?worker&inline", () => ({ default: FakeWorker }));
+// The capture worker is imported through a `?worklet` URL, which the bun test loader can't resolve.
+mock.module("./capture-worker.ts?worklet", () => ({ default: async () => "blob:fake-worker" }));
 
 Object.defineProperty(globalThis, "VideoFrame", { configurable: true, writable: true, value: FakeVideoFrame });
+Object.defineProperty(globalThis, "Worker", { configurable: true, writable: true, value: FakeWorker });
 
-const { TrackProcessor } = await import("./processor.ts");
+const { TrackProcessor, workerSupported } = await import("./processor.ts");
+const { assets } = await import("../assets.ts");
 
 test("captures through the worker, transferring a clone", async () => {
 	supported = true;
@@ -217,7 +100,7 @@ test("captures through the worker, transferring a clone", async () => {
 	arrivalStep = 0;
 	spawned.length = 0;
 
-	// The worker is constructed synchronously inside TrackProcessor, so bracket the whole call.
+	// Bracket the whole call, which spawns the worker.
 	const before = performance.now() * 1000;
 
 	const track = new FakeTrack();
@@ -294,214 +177,42 @@ test("falls back to arrival time when the source clock is stuck", async () => {
 	await reader.cancel();
 });
 
-test("keeps capturing when the frame callback is suspended", async () => {
-	supported = false;
-	advance = 1000;
-	arrivalStep = 0;
+test("probes support again after assets() switches to hosted files", async () => {
 	spawned.length = 0;
 
-	const realNow = performance.now.bind(performance);
-	let clock = realNow();
-	performance.now = () => clock;
-	const dom = install();
-	try {
-		const track = new FakeTrack();
-		const stream = TrackProcessor(track as unknown as Parameters<typeof TrackProcessor>[0]);
-		const reader = stream.getReader();
+	// A strict CSP refuses the blob: worker, so the first probe fails, and the result is cached.
+	supported = false;
+	expect(await workerSupported()).toBe(false);
+	expect(await workerSupported()).toBe(false);
+	expect(spawned).toHaveLength(1);
 
-		await drain();
-		const video = dom.video();
-
-		// While the callback fires, every picture comes through it, stamped with the instant it
-		// reported, in microseconds.
-		for (let i = 0; i < 3; i++) {
-			const read = reader.read();
-			await drain();
-			clock += 1000 / RATE;
-			const now = video.advance();
-			expect((await read).value?.timestamp).toBe(now * 1000);
-		}
-
-		// Firefox suspends requestVideoFrameCallback in a hidden document while the camera keeps
-		// filling the element. Everything below this line has to come from the fallback.
-		video.suspended = true;
-
-		const ticker = spawned.at(-1) as FakeWorker;
-		// Twice the camera's rate: over-sampling is dropped by the media clock check, while
-		// under-sampling would cost frames.
-		expect(ticker.period).toBeCloseTo(500 / RATE, 6);
-
-		// A tick inside the grace is normal jitter, not a suspended callback.
-		const early = reader.read();
-		await drain();
-		clock += 1000 / RATE;
-		video.advance();
-		ticker.tick();
-		expect(await pending(early)).toBe("pending");
-
-		// Past the grace the tick drives capture: one frame per picture, none of them repeats.
-		const stamps: number[] = [];
-		clock += 2000 / RATE;
-		ticker.tick();
-		stamps.push((await early).value?.timestamp ?? 0);
-
-		for (let i = 0; i < 9; i++) {
-			const read = reader.read();
-			await drain();
-			clock += 1000 / RATE;
-			video.advance();
-			ticker.tick();
-			const frame = await read;
-			expect(frame.done).toBe(false);
-			stamps.push(frame.value?.timestamp ?? 0);
-		}
-
-		expect(stamps).toHaveLength(10);
-		// One timeline, still going forwards: both clocks read performance.now(), because Firefox
-		// supplies no captureTime.
-		for (let i = 1; i < stamps.length; i++) expect(stamps[i]).toBeGreaterThan(stamps[i - 1]);
-
-		await reader.cancel();
-		expect(ticker.terminated).toBe(true);
-	} finally {
-		performance.now = realNow;
-		dom.restore();
-	}
+	// The hosted file loads, so a probe cached from the blob: attempt would be wrong.
+	Object.defineProperty(globalThis, "document", {
+		configurable: true,
+		writable: true,
+		value: { baseURI: "https://example.com/" },
+	});
+	assets("/moq/");
+	supported = true;
+	expect(await workerSupported()).toBe(true);
+	expect(spawned).toHaveLength(2);
 });
 
-test("never captures the same picture twice", async () => {
-	supported = false;
-	advance = 1000;
-	arrivalStep = 0;
+test("fails loud when the hosted capture worker doesn't load", async () => {
 	spawned.length = 0;
+	supported = true;
+	loadFails = true;
 
-	const dom = install();
-	try {
-		const track = new FakeTrack();
-		const stream = TrackProcessor(track as unknown as Parameters<typeof TrackProcessor>[0]);
-		const reader = stream.getReader();
+	// Still hosted from the previous test, so a missing file is a broken deploy, not a reason to
+	// quietly fall back to the <video> pipeline.
+	assets("/missing/");
+	await expect(workerSupported()).rejects.toThrow("hosted capture worker");
 
-		await drain();
-		const video = dom.video();
-		video.suspended = true;
+	const track = new FakeTrack();
+	const stream = TrackProcessor(track as unknown as Parameters<typeof TrackProcessor>[0]);
+	await expect(stream.getReader().read()).rejects.toThrow("hosted capture worker");
 
-		const ticker = spawned.at(-1) as FakeWorker;
-
-		// Out of the grace, and one picture through the fallback, so the pipeline is running.
-		const first = reader.read();
-		await drain();
-		video.advance();
-		expect(await pending(first)).toBe("pending");
-		ticker.tick();
-		expect((await first).value).toBeDefined();
-
-		// The camera has delivered nothing since. A tick that captured anyway would hand the
-		// encoder the same picture again, under a new timestamp.
-		const read = reader.read();
-		await drain();
-		for (let i = 0; i < 10; i++) ticker.tick();
-		expect(await pending(read)).toBe("pending");
-
-		// And it picks up again the moment the camera does.
-		video.advance();
-		ticker.tick();
-		expect((await read).value).toBeDefined();
-
-		await reader.cancel();
-	} finally {
-		dom.restore();
-	}
-});
-
-test("stops rather than hand the encoder a timeline that goes backwards", async () => {
-	supported = false;
-	advance = 1000;
-	arrivalStep = 0;
-	spawned.length = 0;
-
-	const dom = install();
-	try {
-		const track = new FakeTrack();
-		const stream = TrackProcessor(track as unknown as Parameters<typeof TrackProcessor>[0]);
-		const reader = stream.getReader();
-
-		await drain();
-		const video = dom.video();
-
-		const read = reader.read();
-		await drain();
-		const now = video.advance();
-		expect((await read).value?.timestamp).toBe(now * 1000);
-
-		// An engine that does supply captureTime could report one from before the frame we already
-		// stamped. That is not something to paper over: the encoder's timeline is the contract.
-		const next = reader.read();
-		await drain();
-		video.advance({ captureTime: now - 100 });
-		await expect(next).rejects.toThrow(/backwards/);
-
-		// A stream that errors is never cancelled, so it has to let go of both clocks itself.
-		expect((spawned.at(-1) as FakeWorker).terminated).toBe(true);
-	} finally {
-		dom.restore();
-	}
-});
-
-// N10: when a hidden window comes back, the worker tick has been capturing, stamped with
-// performance.now() when its message was handled. The first frame callback after that carries the
-// refresh tick's timestamp, taken when the frame began, which can sit just before the tick's stamp
-// if the tick ran between vsync and the callbacks. That is one new picture half a millisecond
-// "early", not a clock fault, and it must not tear the capture down.
-test("a callback stamped just before the last tick keeps the stream readable", async () => {
-	supported = false;
-	advance = 1000;
-	arrivalStep = 0;
-	spawned.length = 0;
-
-	const realNow = performance.now.bind(performance);
-	let clock = 1000;
-	performance.now = () => clock;
-	const dom = install();
-	try {
-		const track = new FakeTrack();
-		const stream = TrackProcessor(track as unknown as Parameters<typeof TrackProcessor>[0]);
-		const reader = stream.getReader();
-
-		await drain();
-		const video = dom.video();
-
-		// On screen, one picture through the callback.
-		const shown = reader.read();
-		await drain();
-		video.advance();
-		expect((await shown).value).toBeDefined();
-
-		// Hidden: past the grace, the tick takes the next picture and stamps it with its own clock.
-		video.suspended = true;
-		const ticker = spawned.at(-1) as FakeWorker;
-		const hidden = reader.read();
-		await drain();
-		expect(await pending(hidden)).toBe("pending");
-		clock += 2000 / RATE;
-		video.advance();
-		ticker.tick();
-		const stamped = ((await hidden).value?.timestamp ?? 0) / 1000;
-
-		// Visible again: the next new picture's callback reports the frame start, 0.5 ms before that.
-		video.suspended = false;
-		const next = reader.read();
-		await drain();
-		video.advance({}, stamped - 0.5);
-
-		const result = await next.then(
-			(read) => ({ readable: true, frame: read.value !== undefined }),
-			(err: Error) => ({ readable: false, error: err.message }),
-		);
-		expect(result).toEqual({ readable: true, frame: true });
-
-		await reader.cancel();
-	} finally {
-		performance.now = realNow;
-		dom.restore();
-	}
+	expect(spawned).toHaveLength(2);
+	expect(spawned.every((worker) => worker.terminated)).toBe(true);
+	loadFails = false;
 });

@@ -29,8 +29,56 @@ implement in an afternoon. The wire spec is
 A dedicated ALPN selects the wire version for moq-lite 03 and newer. The
 legacy `moql` ALPN negotiates moq-lite 01 or 02 via `SETUP`. In moq-lite 05
 and newer, each side also sends a `SETUP` message with its capabilities.
-Rust and TypeScript speak moq-lite 01 through 07 and moq-transport drafts
-14 through 22. Clients offer `moq-lite-07` first by default.
+Streams that depend on negotiated capabilities wait for the peer's `SETUP`;
+everything else proceeds immediately. A Rust server holds unidirectional streams
+that arrive before the client's `SETUP`, since it routes by the path in `SETUP`. A second Setup Stream closes the session
+with `PROTOCOL_VIOLATION`.
+Rust and TypeScript speak moq-lite 01 through 06 and moq-transport drafts
+14 through 22. Clients offer `moq-lite-06` first by default. moq-lite 07 is
+still in progress: it negotiates as `moq-lite-07-wip`, and only when both
+sides explicitly enable it. moq-lite 07 also switches every varint from QUIC's
+two-bit length prefix to moq-transport's leading-ones form, so values up to 127
+take one byte instead of up to 63, and the range widens from 62 to 64 bits.
+A relay cannot forward a value past 2^62 - 1 to an older peer, so it fails
+that subscription or group and keeps the session.
+
+## Subscription completion
+
+On moq-lite 07, `SUBSCRIBE_END` counts the group streams opened for the
+subscription. Rust and TypeScript stop waiting for missing streams once that
+many headers have arrived; skipped group sequences add no wait. A stream whose
+header arrived is always read to its end before the subscription completes.
+
+A stream reset before its header arrived cannot be counted, so the subscriber
+still allows a grace period for late streams. The grace uses the subscription's
+nonzero effective maximum age, or one second when no maximum age is set.
+moq-lite 05 and 06 instead account for group sequences using received headers,
+datagrams, and `SUBSCRIBE_DROP`, from the start group the subscription last
+asked for. A lost datagram is not owed, but its hole waits out the grace like a
+lost stream.
+
+From moq-lite 06, an end that contradicts the groups received aborts the track:
+a group at or past `SUBSCRIBE_END`, or a `SUBSCRIBE_END` below a group already
+received. moq-lite 05 specified an inclusive end, so there it only drops that
+group or the early boundary.
+
+On moq-lite 07, a subscription ends with both sides' FIN. The subscriber sends
+its FIN after settling the tail. A publisher closing gracefully waits for that
+FIN or a reset before closing the connection, within its close deadline.
+moq-lite 05 and 06 retain transport acknowledgement based draining.
+
+## Group reads across failover
+
+Rust origin readers can keep reading an in-flight group after its source fails.
+A group reader waiting on a replacement copy subscribes to it from the frame it
+needs, even when the caller is not polling for the next group, and holds that
+subscription until the group ends. If that copy refuses the subscription, the
+read ends with an error. The copy's declared start says whether the group is
+still coming, so a newer group overtaking it on the wire does not end the wait.
+A copy that declares no start (a local track) and has advanced past the group
+ends the read with an error. This also applies when waiting for the group's
+completion; no FETCH is issued. A replacement that later drops the group it is
+serving still needs SUBSCRIBE\_DROP support to resolve that wait.
 
 ## Discovery
 
@@ -49,26 +97,92 @@ always a prefix, on every wire version and on moq-transport alike; a service
 that serves only some of the paths beneath its prefix refuses the rest as they
 are requested. Each route carries the chain of relay identities it passed
 through, which is how forwarding loops are caught, and a cost, which is how a
-subscriber picks among several routes to the same broadcast. A hop of 0 is the
-anonymous mark and travels the chain unchanged. A route that passed through an
+subscriber picks among several routes to the same broadcast. A route may also
+carry a [publisher epoch](#publisher-epochs), which says which routes serve the
+same bytes. A hop of 0 is
+the anonymous mark and travels the chain unchanged; when it is the first hop, a
+relay puts a random ID, fresh per connection, in front of it. A route that passed through an
 anonymous hop at any depth ranks below every fully identified route, whatever
 the costs say; among anonymous routes, cost keeps ordering.
+
+On moq-lite 07, an announcement may copy the head of its path and the tail of
+its relay chain from one still live on the same stream, so many broadcasts
+from a few origins behind the same relays stop repeating those bytes. Rust
+compresses when it helps; TypeScript decodes it but always sends literally.
 
 A broadcast exists only while it is announced, for consumers in the same
 process and across a session alike: one that is created but never announced
 can be neither discovered nor requested. A broadcast published locally
-competes with remote routes to its path on cost like any other route, winning
-only a tie. Retracting a route (an unannounce, or the peer's `ANNOUNCE_END`)
+competes with remote routes to its path like any other route: a newer epoch
+beats it whatever the cost, so a local broadcast without an epoch loses to any
+remote route that carries one, and among equal epochs it wins a cost tie.
+Retracting a route (an unannounce, or the peer's `ANNOUNCE_END`)
 stops new requests from resolving through it but leaves subscriptions already
-in flight alone: each track runs to its own end, the publisher's FIN or reset.
-moq-transport sessions behave the same when a namespace is withdrawn.
+in flight alone: each track runs to its own end or failure, or until its last
+subscriber leaves, which cancels it upstream. On moq-lite 05 and
+newer, a clean end requires `SUBSCRIBE_END` before the publisher's FIN. A FIN
+without that declaration fails the subscription with `ProtocolViolation`; older
+moq-lite versions use FIN alone. moq-transport requires `PUBLISH_DONE` before FIN.
+moq-transport sessions behave the same when a namespace is withdrawn. A route
+update that changes its first hop, the original publisher, is not a retraction:
+subscriptions in flight carry on through it.
+
+A graceful session close withdraws its announcements and waits up to one
+second for transport acknowledgement before disconnecting. Rust uses
+`session.close().await`; JavaScript uses `await connection.close()` on an
+established connection. An abort skips the withdrawal and ends immediately.
+The source origin remains usable by other sessions. Acknowledgement confirms
+transport delivery, not that the peer application has finished processing it.
+IETF drafts 14 through 16 send their withdrawals on the shared control stream
+without waiting, since it has no FIN to acknowledge.
+
+### Publisher epochs
+
+A route may carry an `Epoch`: a UUIDv7 naming the publisher instance behind it,
+ordered newest last, with its creation time available as `Epoch::time()` in
+Rust or `Epoch.time(epoch)` in TypeScript. A path and an epoch name one
+broadcast. The path never changes, so authorization, patterns, and hidden
+names work exactly as without one.
+
+- **Publishing**: the epoch is whatever the route names, and nothing is minted
+  for you. A publisher mints one per run (`Epoch::mint()` with
+  `Route::with_epoch`, or `announce({ epoch: Epoch.mint() })`), so a restart is
+  a new broadcast. Replicas of the same content announce the same one. A route
+  without an epoch, such as a prefix claim, names no instance.
+- **Resolution** ranks the newest epoch first among routes at the same prefix,
+  ahead of cost, and a route without an epoch last. Newest means the latest
+  UUIDv7 timestamp, so ordering instances minted on different hosts trusts
+  their clocks: a restart on a host whose clock runs behind loses to the old
+  instance until that one retracts.
+- **Re-pricing**: announcing again (or `update` on a dynamic route) replaces
+  the whole route, epoch included. Start from the current route, as in
+  `broadcast.route()` or `dynamic.route()`, and change the cost, or the update
+  names another instance.
+- **Resume**: a subscription moves between routes with the same epoch without a
+  seam, continuing from the first frame it lacks. A route without an epoch
+  names no instance, so its subscriptions stay on that route (a transcoder
+  claim stays on the worker that first served it) and end when it goes.
+- **Replacement**: when a newer epoch wins the path, subscriptions to the old
+  one end with `Unroutable`, even ones in flight, and announcement streams see
+  the old route end and the new one start. Clients re-request and get the new
+  broadcast instead of stalling on the old.
+
+The epoch travels on moq-lite 07 in `ANNOUNCE_START`, and relays fill it into
+the `TRACK`, `SUBSCRIBE`, and `FETCH` they send upstream; a publisher refuses a
+request naming another epoch. Older moq-lite versions and moq-transport cannot
+carry it: their routes have no epoch, so they keep their subscriptions on one
+route and see a replacement as an ordinary end and start at the same path. In
+a mixed deployment, where the same content reaches a relay over both an older
+link (no epoch) and a moq-lite 07 link (with one), the epoch-carrying route
+supersedes the other each time it appears, so a flapping moq-lite 07 link cuts
+the viewers resolved through the older one.
 
 ### Hidden broadcasts
 
 A path segment starting with `.` hides a route from discovery, the way a
 dotfile hides from `ls`. A platform publishes its own broadcasts there (relay
-stats under `.stats/`, cluster gossip under `.internal/`) without them turning
-up in an app that lists everything and plays what it finds. Only segments
+stats under `.stats/`) without them turning up in an app that lists
+everything and plays what it finds. Only segments
 below the requested prefix count: listing the root skips `.stats/node`, but
 listing `.stats` shows `node`. A `.` elsewhere in a segment (`catalog.pro`) is
 part of the name.
@@ -85,10 +199,15 @@ let announced = origin.consume().with_hidden(true).announced();
 const announced = connection.announced(Path.Pattern.all(), { hidden: true });
 ```
 
-On the wire, moq-lite 07 carries the opt-in on each announce request, and
+On the wire, moq-lite 07 (`moq-lite-07-wip`, opt-in only) carries the opt-in
+on each announce request, and
 moq-transport carries it as a `SUBSCRIBE_NAMESPACE` parameter once the peer's
-`SETUP` says it understands one ([hidden](/draft/moq-hidden)). An older peer
-never opts in, so it never discovers hidden routes. Rust sessions always opt in
+`SETUP` says it understands one ([hidden](/draft/moq-hidden)). An older MoQ Lite peer
+never opts in, so it never discovers hidden routes.
+IETF peers that omit the MoQ Hidden setup option receive all authorized
+namespaces, including dot-prefixed namespaces. Peers that declare it opt in
+per subscription; a prefix naming the dot segment itself also lists its
+children. Rust sessions always opt in
 on the wire and filter per local reader, so a relay mirrors everything and
 each consumer decides.
 
@@ -125,19 +244,40 @@ prefixes it is told about.
 
 A subscriber watching under a root sees advertisements named relative to that
 root. The pattern scope filters which prefixes are visible without changing a
-route's prefix. Announce events carry the covered path, captures, and what
-happened to it: Rust
-`announce::Update { path, captures: Option<Vec<Pattern>>, route, kind }` and
-TypeScript `Announce.Update { path, captures, route, kind }`, where the kind is
-announced, updated (a reprice in place), or retracted. Captures are present when
-the announced prefix pins every wildcard in the most-specific matching scope
-member. The Rust consumer is a `Stream` and the TypeScript one an async iterable.
+route's prefix. When several routes advertise one prefix, each reader sees the
+best route its scope can use, so a cheaper route scoped elsewhere never hides
+it. Announce events carry the covered path, captures, and what
+happened to it: Rust `announce::Event::{Start, Update, End}`, each
+holding an `announce::Announce { prefix, captures: Option<Vec<Pattern>>, route }`,
+and TypeScript `Announce.Event`, whose `kind` is `"start"`, `"update"`, or
+`"end"` alongside the same `Announce.Announce` fields. An update is a
+reprice in place. Captures are present when the announced prefix pins every
+wildcard in the most-specific matching scope member. The Rust consumer is a
+`Stream` and the TypeScript one an async iterable. Both, and every binding over
+moq-ffi or moq-c, also yield one `Live` marker (TypeScript `{ kind: "live" }`)
+once the routes live at subscribe time have all been delivered, including those
+a peer session was still sending: moq-lite-05+ counts them in `ANNOUNCE_OK`,
+moq-lite-01/02 send them in `ANNOUNCE_INIT`, Rust IETF draft-16+ sessions count
+them in `REQUEST_OK` when both sides speak
+[active-count](/draft/moq-active-count), and anything else waits for the
+stream to go quiet.
 
 Announcements are hints; requests are the authority. When a subscriber asks
 for a covered path the advertiser will not serve, the advertiser refuses that
 request rather than narrowing the claim, and no message narrows a route. Token
 scope is any pattern union; the session asks for each member's literal head on
-the prefix-only wire and filters locally.
+the prefix-only wire and filters locally. In Rust and TypeScript,
+`origin.scope(root, patterns)` narrows the handle's permissions and presents paths
+relative to `root`. Nested scopes intersect with their parent. In Rust,
+`origin.mount(at, target)` reads the subtree at `at` from `target` instead: a
+request for `at/rest` joins the one front at `target/rest`, announcements under
+`target` present under `at`, the handle's patterns still authorize `at/rest`,
+and nothing is published beneath `at`. Mounts never chain: a mount point that
+overlaps another mount's point or any target, its own included, is refused. A session receiving
+into that scoped origin asks for the literal heads of its allowed patterns,
+coalescing duplicate or nested heads. An unscoped origin still asks for the empty
+prefix, covering every namespace. These subscriptions include hidden routes;
+each local announcement reader decides whether to show them.
 
 ```typescript
 import { Path } from "@moq/net";
@@ -169,15 +309,9 @@ Use `specificity` to rank structural constraints when selecting rules, and
 A subscriber names a broadcast and track. Delivery starts at the oldest group
 it can still use, which at the default budget is the latest one, so every group
 must begin at a point a fresh subscriber can decode from (a keyframe, a full
-JSON snapshot). A publisher whose media paused (an encoder stopped for lack of
-demand) declares a break where it stopped, and a subscription made after it
-starts there: until the media resumes, nothing newer exists to make the groups
-before the pause look old. The break stays with the publisher: a relay already
-subscribed when it is declared does not learn it, so a viewer joining that relay
-mid-pause can still start on the group before it. Groups can be fetched by
-sequence number too, optionally bounded to a range of frames, which is how the
-[HLS gateway](/bin/hls) and the relay's [HTTP fetch](/bin/relay/http) serve
-history, breaks or not.
+JSON snapshot). Groups can be fetched by sequence number too, optionally
+bounded to a range of frames, which is how the [HLS gateway](/bin/hls) and the
+relay's [HTTP fetch](/bin/relay/http) serve history.
 
 Each subscription carries the knobs that decide behavior under congestion:
 
@@ -193,9 +327,40 @@ anything on its own. Both ends apply it: the publisher skips a group rather
 than sending it, and the subscriber skips it again as it reads, since the
 publisher only ever sees the most tolerant budget across its subscribers.
 
-The publisher declares a retention window per track, which bounds how far back
-a fetch or late subscriber can reach. Media tracks default to 30 seconds so a
+A route failover is invisible to max age: a group open across the change carries
+on from the new route at the frame where the old one stopped, and a group only a
+replaced route that went quiet still holds is given up once it falls a full
+budget behind the new route's live edge. A successor group with no timestamp
+leaves the preceding group's reach unbounded until its first frame arrives; if
+it is dropped first, the next group takes its place.
+
+A relay cancels its upstream subscription once nobody subscribes, but keeps its
+copy of the track for 30 seconds after the last reader leaves, so a returning
+reader or the next fetch finds its cache. That copy is not live meanwhile:
+readers get nothing from its cache until the source answers again, since how
+stale it is cannot be told. lite-07 and moq-transport answer with their largest
+position, and older lite versions are asked from the head of the newest cached
+group, so their first frame says where their feed is. A feed that has moved on
+past everything cached leaves the cache below it to fetches.
+
+The publisher may declare a retention window per track. Omission sets no limit;
+zero keeps only the live edge. The origin cache ceiling and cache pool may still
+evict content sooner. Relays preserve the publisher's declaration rather than
+substituting a local default. Media tracks explicitly use 30 seconds so a
 segmented egress can still find its segments.
+
+IETF carries this value as MAX\_CACHE\_DURATION, received on every supported draft
+and sent from draft 17 onward. A relay reads it from FETCH\_OK as well as SUBSCRIBE\_OK, so a track it
+only fetches still learns its window. Drafts 14–16 remain receive-only for compatibility
+with older implementations. This is an approximate mapping: IETF measures wall
+time, while max age uses media timestamps and always keeps the newest group.
+EXPIRES describes subscription lifetime and does not set retention.
+
+Lite-07 encodes a finite limit as milliseconds plus one, with zero meaning no limit.
+Lite-05/06 send no limit as `2^53 - 1` milliseconds so older JavaScript readers can
+parse it. New readers treat every value at or above that boundary as no limit;
+older readers treat it as a finite window of approximately 285,000 years. Their
+timer cap schedules periodic age checks and does not shorten that window.
 
 Put together, a conference might use:
 
@@ -238,7 +403,9 @@ codes as `moq_net::Error::Session(SessionError)` or `Error::Stream(StreamError)`
 JavaScript exposes `SessionError` and `StreamError`. Match the registry before
 interpreting the number. Native bindings expose scope, code, kind, and a diagnostic
 message; unknown and application codes retain their numeric value. Transport
-failures without a protocol code remain separate.
+failures without a protocol code remain separate. A deliberate local close ends
+received tracks cleanly after their delivered groups; a peer close ends tracks
+and open group readers with the session error.
 
 ## Local read limits
 

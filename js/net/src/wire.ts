@@ -7,8 +7,10 @@
  *
  * @module
  */
-import type { Dispose, Getter } from "@moq/signals";
+import type { Dispose, GetPromise, Getter } from "@moq/signals";
 import type * as broadcast from "./broadcast.ts";
+import type { Drain } from "./connection/goaway.ts";
+import type * as Epoch from "./epoch.ts";
 import type { Consumer as GroupConsumer } from "./group.ts";
 import type { Route } from "./hop.ts";
 import type * as origin from "./origin.ts";
@@ -25,14 +27,25 @@ export interface Broadcast {
 
 /** The protocol-facing operations behind an origin producer. */
 export interface OriginProducer {
+	/** Minimal root-relative namespace prefixes that cover this origin scope. */
+	interests(): readonly Path.Valid[];
+	/** Whether an advertised prefix overlaps the handle's allowed paths. */
+	accepts(prefix: Path.Valid): boolean;
 	receive(
 		prefix: Path.Valid,
-		route?: Route | { hops?: Route["hops"]; cost?: Route["cost"] | bigint },
+		route?: Route | { epoch?: Route["epoch"]; hops?: Route["hops"]; cost?: Route["cost"] | bigint },
 	): origin.Dynamic;
 	attach(discovery: boolean): Dispose;
 	expect(): Dispose;
+	/**
+	 * Hold the live marker of announcement streams opened now that overlap `prefix`, until the
+	 * peer's initial set under it lands.
+	 */
+	replaying(prefix: Path.Valid): Dispose;
 	readonly requests: Getter<ReadonlyMap<Path.Valid, origin.RequestSlot> | undefined>;
-	changed(): Promise<unknown>;
+	changed(): GetPromise<unknown>;
+	/** Whether sessions should answer the request with a blind subscription right now. */
+	blind(slot: origin.RequestSlot): boolean;
 	answer(path: Path.Valid, front: broadcast.Consumer): Dispose | undefined;
 	routes(path: Path.Valid): boolean;
 }
@@ -41,21 +54,33 @@ export interface OriginProducer {
 export interface OriginConsumer {
 	routes(path: Path.Valid): boolean;
 	readonly broadcasts: Getter<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>;
-	readonly advertised: Getter<ReadonlyMap<Path.Valid, Advertised> | undefined>;
-	/** The announced local broadcast at `path`, when it is the route peers are offered there. */
-	local(path: Path.Valid): broadcast.Consumer | undefined;
-	demand(path: Path.Valid): Promise<broadcast.Consumer | undefined>;
+	readonly advertised: Getter<Advertisements | undefined>;
+	/** The announced local broadcast at `path`, when it is the route peers are offered there.
+	 * A request naming an `epoch` only matches a route serving it. */
+	local(path: Path.Valid, epoch?: Epoch.Valid): broadcast.Consumer | undefined;
+	/** Resolve `path` for serving; throws `Unroutable` when the route serves another `epoch`. */
+	demand(path: Path.Valid, epoch?: Epoch.Valid): Promise<broadcast.Consumer | undefined>;
 }
 
 /** One originated advertisement exposed to the publishing wire. */
 export interface Advertised {
 	readonly identity: object;
 	readonly route: Route;
+	/** The paths a scoped route may serve beneath its prefix, relative like its key; unset for the whole subtree. */
+	readonly claim?: Path.Patterns;
 }
 
-/** The protocol-facing operation behind an established session. */
+/**
+ * Every originated advertisement per prefix, most preferred first. A reader takes the first
+ * one its scope admits, so a cheaper route it cannot use never hides one it can.
+ */
+export type Advertisements = ReadonlyMap<Path.Valid, readonly Advertised[]>;
+
+/** The protocol-facing operations behind an established session. */
 export interface Established {
 	consume(path: Path.Valid): broadcast.Consumer;
+	/** Settles with the peer's GOAWAY; the session keeps serving until it closes. */
+	readonly goaway: GetPromise<Drain>;
 }
 
 type View = Broadcast | OriginProducer | OriginConsumer | Established;

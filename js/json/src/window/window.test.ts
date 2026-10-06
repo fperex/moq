@@ -75,6 +75,28 @@ test("push and pop round-trip", async () => {
 	]);
 });
 
+test("a cut is invisible to the consumer", async () => {
+	const live = new Live();
+	await live.push(0);
+	live.producer.cut();
+	live.producer.cut();
+	await live.push(1);
+
+	expect(await live.finish()).toEqual([
+		{ push: { index: 0, value: { n: 0 } } },
+		{ push: { index: 1, value: { n: 1 } } },
+	]);
+});
+
+test("reset makes the next edit a header", () => {
+	const encoder = new Encoder<Rec>({});
+	encoder.push({ n: 0 }).commit();
+	expect(encoder.push({ n: 1 }).keyframe).toBe(false);
+
+	encoder.reset();
+	expect(encoder.push({ n: 2 }).keyframe).toBe(true);
+});
+
 test("concurrent consumer reads are rejected", async () => {
 	const track = new Track.Producer("test");
 	const consumer = new Consumer<Rec>({ track: track.subscribe() });
@@ -417,35 +439,4 @@ test("an uncommitted edit leaves the window unchanged", () => {
 	next.commit();
 	popped.commit();
 	expect(encoder.window).toEqual([2, 3]);
-});
-
-test("an expired group is a gap whichever publisher reset it", async () => {
-	for (const [publisher, error] of [
-		["rust (Error::Old, 0x34)", new NetError.Stream(StreamCode.Old)],
-		["js (Expired)", new NetError.Expired()],
-	] as const) {
-		const track = new Track.Producer("test");
-		const consumer = new Consumer<Rec>({ track: track.subscribe() });
-		const encoder = new Encoder<Rec>({ opRatio: 0 });
-
-		let frame = encoder.push({ n: 0 });
-		let group = track.appendGroup();
-		group.writeFrame({ payload: frame.payload, timestamp: Time.Timestamp.now() });
-		frame.commit();
-		expect(await consumer.next()).toEqual({ push: { index: 0, value: { n: 0 } } });
-		group.close(error);
-
-		frame = encoder.push({ n: 1 });
-		group = track.appendGroup();
-		group.writeFrame({ payload: frame.payload, timestamp: Time.Timestamp.now() });
-		frame.commit();
-		group.close();
-		track.close();
-
-		const next = await consumer.next().then(
-			(event) => event,
-			(err: unknown) => `fatal: ${String(err)} (code ${(err as { code?: number }).code})`,
-		);
-		expect({ publisher, next }).toEqual({ publisher, next: { push: { index: 1, value: { n: 1 } } } });
-	}
 });

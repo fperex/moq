@@ -1,9 +1,18 @@
 import * as Util from "@moq/hang/util";
-import { Time } from "@moq/net";
-import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
-// Compiled and inlined as a blob URL via vite-plugin-worklet.
+import type { Time } from "@moq/net";
+import {
+	type Computed,
+	Effect,
+	type Getter,
+	getter,
+	type Inputs,
+	type Readonlys,
+	readonlys,
+	Signal,
+} from "@moq/signals";
+import { hostedAssets } from "../assets";
 import { Fanout } from "../fanout";
-import type { Close, Quantum, Stopped } from "./capture-worklet";
+// A blob: URL, or a hosted file when assets() is set; see vite-plugin-worklet.
 import CaptureWorklet from "./capture-worklet.ts?worklet";
 import { isSampleSource, normalizeSource, type SampleSource, type Source, type SourceConfig } from "./types";
 
@@ -28,12 +37,6 @@ export interface Format {
 // How many capture quanta a rendition may fall behind before it starts losing the oldest. A worklet
 // pushes on the audio thread and can't be told to wait. Roughly 85ms at 48kHz.
 const QUEUE = 32;
-
-// How far the context clock may fall behind the wall clock before it counts as a stall rather than a
-// stale reading. `currentTime` is refreshed once per device callback, so a reading taken just before
-// the next one lands is a few milliseconds old; a device opening or a context suspending is two
-// orders of magnitude more than that.
-const STALL = Time.Micro.fromMilli(Time.Milli(20));
 
 // The rate to run the capture graph at when nothing asks for another.
 //
@@ -96,6 +99,19 @@ export class Capture {
 	};
 	readonly out = readonlys(this.#out);
 
+	// Whether the track's context is suspended until the page's first click or keypress.
+	readonly #waiting = new Signal(false);
+
+	// How many graph-building runs threw for their current inputs, so no format is coming until one
+	// reruns.
+	readonly #failures = new Signal(0);
+
+	/**
+	 * @internal Whether a track's format can't arrive until something outside the capture changes: the
+	 * page's first click or keypress, or new inputs after its graph failed to build.
+	 */
+	readonly blocked: Computed<boolean>;
+
 	#signals = new Effect();
 
 	constructor(props?: CaptureProps) {
@@ -105,8 +121,27 @@ export class Capture {
 		};
 		this.sampleRate = Signal.from<number | undefined>(props?.sampleRate);
 		this.channelCount = Signal.from<number | undefined>(props?.channelCount);
+		this.blocked = this.#signals.computed((effect) => effect.get(this.#failures) > 0 || effect.get(this.#waiting));
 
-		this.#signals.run(this.#run.bind(this));
+		this.#signals.run(this.#guard(this.#run.bind(this)));
+	}
+
+	// Count a throw from `fn` as a failure until its effect reruns, so a graph that can't build
+	// reports blocked instead of leaving the encoder waiting on a format forever.
+	#guard(fn: (effect: Effect) => void): (effect: Effect) => void {
+		return (effect) => {
+			try {
+				fn(effect);
+			} catch (err) {
+				this.#fail(effect);
+				throw err;
+			}
+		};
+	}
+
+	#fail(effect: Effect): void {
+		this.#failures.update((n) => n + 1);
+		effect.cleanup(() => this.#failures.update((n) => n - 1));
 	}
 
 	#run(effect: Effect): void {
@@ -151,18 +186,23 @@ export class Capture {
 			latencyHint: "interactive",
 			sampleRate,
 		});
-		// Closes the context once every processor built below has stopped, which the graph tells them to
-		// later in this same teardown.
-		const processors = new Processors(context);
-		effect.cleanup(() => processors.close());
+		effect.cleanup(() => context.close());
 
 		// Nothing guarantees a gesture has happened yet: a pre-granted microphone reaches here on page
 		// load. A context built then starts suspended and renders nothing until one arrives.
 		const running = Util.Gesture.unlock(effect, context);
 
+		// A context starts suspended even after a gesture, until it resumes a moment later; only one
+		// still waiting on the page's first gesture may wait indefinitely.
+		effect.run((inner) => {
+			const waiting = !inner.get(running) && !navigator.userActivation?.hasBeenActive;
+			inner.set(this.#waiting, waiting, false);
+		});
+
 		const root = new MediaStreamAudioSourceNode(context, {
 			mediaStream: new MediaStream([source.track]),
 		});
+		effect.cleanup(() => root.disconnect());
 
 		const loaded = new Signal(false);
 
@@ -172,61 +212,65 @@ export class Capture {
 			// module registration was abandoned, so building against its name would throw. Gate on the race
 			// result, not `context.state`, because `AudioContext.close()` only flips `.state` to "closed"
 			// synchronously on Chrome (Firefox/Safari report "suspended").
-			const ok = await effect.race(context.audioWorklet.addModule(CaptureWorklet).then(() => true));
-			if (ok) loaded.set(true);
+			try {
+				const ok = await effect.race(
+					CaptureWorklet(hostedAssets()).then(async (url) => {
+						await context.audioWorklet.addModule(url);
+						return true;
+					}),
+				);
+				if (ok) loaded.set(true);
+			} catch (err) {
+				this.#fail(effect);
+				throw err;
+			}
 		});
 
-		// Only capture while the graph runs. A suspended graph carries nothing, so it has no format: the
-		// encoder announces no audio until samples actually flow, and drops it again if Safari interrupts
-		// the context. The timestamps need no such gate: `#drain` re-pairs the context clock with the wall
-		// clock whenever the former stalls, which is what a suspend is.
-		effect.run((inner) => {
-			if (!inner.get(loaded) || !inner.get(running)) return;
+		// Only capture while the graph runs. The worklet stamps frames from when it is built, so one built
+		// while suspended would lag the wall clock by however long the page waited for a gesture. And a
+		// suspended graph carries nothing, so it has no format: the encoder announces no audio until
+		// samples actually flow, and drops it again if Safari interrupts the context.
+		effect.run(
+			this.#guard((inner) => {
+				if (!inner.get(loaded) || !inner.get(running)) return;
 
-			const channelCount = requestedChannels ?? settings.channelCount ?? root.channelCount;
-			const worklet = new AudioWorkletNode(context, "capture", {
-				numberOfInputs: 1,
-				numberOfOutputs: 0,
-				channelCount,
-				// "explicit" forces Web Audio to (down)mix the input to channelCount before the
-				// worklet sees it. The default "max" just follows the input, which is the unreliable
-				// path on macOS. Only force it when we actually have a requested count to honor.
-				channelCountMode: requestedChannels !== undefined ? "explicit" : "max",
-			});
-			processors.add(worklet);
-			root.connect(worklet);
-			inner.cleanup(() => {
-				const close: Close = { type: "close" };
-				worklet.port.postMessage(close);
-				root.disconnect(worklet);
-			});
+				const channelCount = requestedChannels ?? settings.channelCount ?? root.channelCount;
+				const worklet = new AudioWorkletNode(context, "capture", {
+					numberOfInputs: 1,
+					numberOfOutputs: 0,
+					channelCount,
+					// "explicit" forces Web Audio to (down)mix the input to channelCount before the
+					// worklet sees it. The default "max" just follows the input, which is the unreliable
+					// path on macOS. Only force it when we actually have a requested count to honor.
+					channelCountMode: requestedChannels !== undefined ? "explicit" : "max",
+					// Stamp audio against the same wall clock as video (see video/processor.ts), so both
+					// tracks share an epoch and stay in sync.
+					processorOptions: { zero: performance.now() * 1000 },
+				});
+				// The edge originates at root, so only root can remove it; the worklet has no outputs.
+				root.connect(worklet);
+				inner.cleanup(() => root.disconnect(worklet));
 
-			const fanout = new Fanout(this.#drain(worklet, context, inner), { queue: QUEUE });
-			inner.cleanup(() => fanout.close());
-			inner.cleanup(() => this.#out.format.set(undefined));
+				const fanout = new Fanout(this.#drain(worklet, context.sampleRate, inner), { queue: QUEUE });
+				inner.cleanup(() => fanout.close());
+				inner.cleanup(() => this.#out.format.set(undefined));
 
-			inner.set(this.#out.root, root);
-			inner.set(this.#out.frames, fanout);
-		});
+				inner.set(this.#out.root, root);
+				inner.set(this.#out.frames, fanout);
+			}),
+		);
 	}
 
-	// Turn the quanta the worklet pushes into a stream, stamped against the same wall clock as video
-	// (see video/processor.ts) so both tracks share an epoch. The audio thread can't be asked to
-	// wait, so this never applies backpressure; the fanout above bounds each reader instead. A drop
-	// shows up downstream as a timestamp gap, which the framer re-anchors on rather than silently
-	// sliding.
-	#drain(worklet: AudioWorkletNode, context: AudioContext, effect: Effect): ReadableStream<AudioFrame> {
-		const sampleRate = context.sampleRate;
-
-		// The wall clock, in microseconds, that the context's frame 0 sits on.
-		let zero: Time.Micro | undefined;
-
+	// Turn the quanta the worklet pushes into a stream. The audio thread can't be asked to wait, so
+	// this never applies backpressure; the fanout above bounds each reader instead. A drop shows up
+	// downstream as a timestamp gap, which the framer re-anchors on rather than silently sliding.
+	#drain(worklet: AudioWorkletNode, sampleRate: number, effect: Effect): ReadableStream<AudioFrame> {
 		return new ReadableStream<AudioFrame>(
 			{
 				start: (controller) => {
 					effect.event(worklet.port, "message", (event: Event) => {
-						const quantum = (event as MessageEvent<Quantum>).data;
-						const channelCount = quantum.channels.length;
+						const frame = (event as MessageEvent<AudioFrame>).data;
+						const channelCount = frame.channels.length;
 						if (!channelCount) return;
 
 						// The channel count is unreliable on some platforms (Apple's Safari), so
@@ -235,26 +279,7 @@ export class Capture {
 							this.#out.format.set({ sampleRate, channelCount });
 						}
 
-						// Both clocks are read at the same instant, so the pairing only moves when the
-						// context clock stalls against the wall clock: the device opening, a suspend,
-						// the machine sleeping. A graph renders its first quanta before the device has
-						// opened, so pairing once and never looking again anchors the whole timeline a
-						// fifth of a second before the audio it describes.
-						let observed: Time.Micro;
-						try {
-							observed = anchor(context);
-						} catch (error) {
-							controller.error(error);
-							return;
-						}
-						if (zero === undefined || observed - zero > STALL) zero = observed;
-
-						const elapsed = Time.Micro.fromSecond((quantum.frame / sampleRate) as Time.Second);
-						const timestamp = (zero + elapsed) as Time.Micro;
-
-						if ((controller.desiredSize ?? 0) > 0) {
-							controller.enqueue({ timestamp, channels: quantum.channels });
-						}
+						if ((controller.desiredSize ?? 0) > 0) controller.enqueue(frame);
 					});
 					worklet.port.start();
 				},
@@ -266,65 +291,6 @@ export class Capture {
 	/** Stop capturing and release the graph. */
 	close(): void {
 		this.#signals.close();
-	}
-}
-
-/**
- * The processors built in one AudioContext, which closes it once every one of them has stopped.
- *
- * Chromium keeps a closed context, and every node in it, for as long as one of its processors has not
- * stopped, and a processor only stops in a quantum its context renders. So a running context is closed
- * once each processor has said it stopped (see `Stopped`), and one that renders nothing (suspended for
- * want of a gesture, interrupted, failed) is closed at once: its processors can never stop, and waiting
- * would only hold it open.
- */
-class Processors {
-	readonly #context: AudioContext;
-	// Every processor that has not said it stopped.
-	readonly #active = new Set<AudioWorkletNode>();
-	// Owns every listener, all released once the context is closed.
-	readonly #signals = new Effect();
-	#closing = false;
-
-	constructor(context: AudioContext) {
-		this.#context = context;
-	}
-
-	/** Follow the processor behind `node` until it says it stopped, or fails, which stops it too. */
-	add(node: AudioWorkletNode): void {
-		this.#active.add(node);
-		const dispose = this.#signals.run((effect) => {
-			const stop = () => {
-				dispose();
-				this.#active.delete(node);
-				if (this.#closing && this.#active.size === 0) this.#close();
-			};
-			effect.event(node.port, "message", (event) => {
-				if ((event as MessageEvent<Partial<Stopped>>).data?.type === "stopped") stop();
-			});
-			effect.event(node, "processorerror", stop);
-			// A port only delivers to listeners added with addEventListener once it is started.
-			node.port.start();
-		});
-	}
-
-	/** Close the context once every processor in it has stopped, or now if it renders nothing. */
-	close(): void {
-		this.#closing = true;
-		if (this.#active.size === 0 || this.#context.state !== "running") {
-			this.#close();
-			return;
-		}
-		// A context that stops rendering never runs the quantum a processor would stop in.
-		this.#signals.event(this.#context, "statechange", () => {
-			if (this.#context.state !== "running") this.#close();
-		});
-	}
-
-	#close(): void {
-		this.#signals.close();
-		// There is nothing to do about a close that fails.
-		this.#context.close().catch(() => {});
 	}
 }
 
@@ -345,21 +311,6 @@ function planar(): TransformStream<AudioData, AudioFrame> {
 			data.close();
 		},
 	});
-}
-
-// The wall clock, in microseconds, that a context's frame 0 sits on.
-//
-// `currentTime` only advances while the context renders, so pairing it with `performance.now()` is
-// what puts the captured samples on the clock video is stamped against. Refuse an unusable reading
-// instead of guessing: a bad pairing offsets every timestamp the publisher sends, which a listener
-// hears as sound running ahead of picture.
-function anchor(context: AudioContext): Time.Micro {
-	const elapsed = context.currentTime;
-	if (!Number.isFinite(elapsed) || elapsed < 0) {
-		throw new Error(`unusable AudioContext clock: currentTime is ${elapsed}`);
-	}
-
-	return (Time.Micro.now() - Time.Micro.fromSecond(elapsed as Time.Second)) as Time.Micro;
 }
 
 // getConstraints() echoes the constraints applied via getUserMedia, which (unlike getSettings)

@@ -6,6 +6,10 @@
 				"hooks": [
 					{
 						"type": "command",
+						"command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/submodule.sh"
+					},
+					{
+						"type": "command",
 						"command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/direnv.sh"
 					}
 				]
@@ -18,7 +22,7 @@
 			"Bash(cargo *)",
 			"Bash(bun *)",
 			"Bash(ffprobe:*)",
-			"Bash(rs/libmoq/build.sh:*)",
+			"Bash(rs/moq-c/build.sh:*)",
 			"WebFetch(domain:www.ietf.org)",
 			"WebFetch(domain:datatracker.ietf.org)",
 			"WebFetch(domain:docs.rs)",

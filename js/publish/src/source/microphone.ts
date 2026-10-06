@@ -21,11 +21,7 @@ export interface MicrophoneProps extends Inputs<MicrophoneInput> {
 type MicrophoneOutput = {
 	// The live microphone track, or undefined while disabled or denied.
 	source: Signal<Media | undefined>;
-	/**
-	 * Why there is no track while the microphone is enabled, or undefined while it is capturing: a
-	 * refusal that stands until the settings, device list, or permission changes, or the failure it
-	 * is retrying after.
-	 */
+	/** A terminal capture failure, cleared when a new capture attempt begins. */
 	error: Signal<Error | undefined>;
 };
 
@@ -46,7 +42,7 @@ export class Microphone {
 	readonly out = readonlys(this.#out);
 
 	#signals = new Effect();
-	#retry = new Retry(this.#out.error);
+	#retry = new Retry();
 
 	constructor(props?: MicrophoneProps) {
 		this.in = {
@@ -73,6 +69,10 @@ export class Microphone {
 		const constraints = effect.get(this.constraints);
 
 		if (!this.#retry.begin(effect, [device, constraints])) {
+			// `failure` is set only when nothing remains, so a backoff stays quiet.
+			const failure = this.#retry.spent();
+			if (failure) this.#out.error.set(failure);
+
 			// Waiting out a backoff, or out of budget entirely, with the same settings. Either way
 			// a change to what is plugged in is new information worth acting on now, so watch the
 			// device list here and not while healthy, where a rerun would restart a working capture
@@ -88,13 +88,36 @@ export class Microphone {
 			return;
 		}
 
+		this.#out.error.set(undefined);
+
 		const finalConstraints: MediaTrackConstraints = {
 			...constraints,
 			deviceId: device ? { exact: device } : undefined,
 		};
 
 		effect.spawn(async () => {
-			const stream = await this.#retry.open(effect, { audio: finalConstraints });
+			const media = navigator.mediaDevices.getUserMedia({ audio: finalConstraints });
+
+			// If the effect is cancelled, stop any stream that arrives after cancellation too.
+			effect.cleanup(() =>
+				media.then(
+					(stream) =>
+						stream.getTracks().forEach((track) => {
+							track.stop();
+						}),
+					() => {},
+				),
+			);
+
+			let stream: MediaStream | undefined;
+			try {
+				stream = await effect.race(media);
+			} catch (error) {
+				if (effect.abort.aborted) return;
+				if (this.#retry.rejected(error)) return;
+				this.#out.error.set(error instanceof Error ? error : new Error(String(error)));
+				return;
+			}
 
 			// A torn-down run is not a failed attempt: whatever cancelled it reruns us.
 			if (effect.abort.aborted || !stream) return;
@@ -107,7 +130,8 @@ export class Microphone {
 
 			// A track that arrives dead already fired "ended", so nothing would ever rerun us.
 			if (!track || track.readyState === "ended") {
-				return this.#retry.failed(new Error("the microphone produced no live track"));
+				this.#retry.ended();
+				return;
 			}
 
 			this.#retry.succeeded(effect, track);

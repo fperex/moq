@@ -1,7 +1,8 @@
 import { expect, spyOn, test } from "bun:test";
 import { Signal } from "@moq/signals";
 import type { Probe as ProbeStats } from "../connection/stats.ts";
-import { error, reason } from "../error.ts";
+import * as Epoch from "../epoch.ts";
+import { error, fromTransport, reason, StreamCode, StreamError } from "../error.ts";
 import { HopSchema, isAnonymous, MAX_HOPS, Route, UNKNOWN_HOP } from "../hop.ts";
 import * as Path from "../path.ts";
 import { Writer } from "../stream.ts";
@@ -9,7 +10,18 @@ import * as Time from "../time.ts";
 import { type AnnounceBroadcast, AnnounceInit, AnnounceOk, encodeAnnounceBroadcast } from "./announce.ts";
 import { Probe } from "./probe.ts";
 import { Subscriber } from "./subscriber.ts";
+import { TrackInfo } from "./track.ts";
 import { Version } from "./version.ts";
+
+/** The next route event, skipping the live marker: these tests pin routes, and the marker has its own. */
+async function nextRoute<E extends { kind: string }>(announced: {
+	next(): Promise<E | undefined>;
+}): Promise<Exclude<E, { kind: "live" }> | undefined> {
+	for (;;) {
+		const event = await announced.next();
+		if (event?.kind !== "live") return event as Exclude<E, { kind: "live" }> | undefined;
+	}
+}
 
 test("closing the subscriber suppresses probe stream warnings", async () => {
 	let readable!: ReadableStreamDefaultController<Uint8Array>;
@@ -71,6 +83,7 @@ function announceHarness(version: Version, origin = 1n) {
 		const written: Uint8Array[] = [];
 		const writer = new Writer(
 			new WritableStream<Uint8Array>({ write: (chunk) => void written.push(new Uint8Array(chunk)) }),
+			version,
 		);
 		await f(writer);
 		writer.close();
@@ -150,9 +163,9 @@ test("a max-length chain plus withheld responder is dropped", async () => {
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toMatchObject({
+	expect(await nextRoute(announced)).toMatchObject({
 		prefix: Path.from("room"),
-		kind: "announced",
+		kind: "start",
 		route: { hops: [PUBLISHER_A, UNKNOWN_HOP] },
 	});
 
@@ -173,9 +186,9 @@ test("an unidentified responder keeps hop 0 on a nonempty chain", async () => {
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toMatchObject({
+	expect(await nextRoute(announced)).toMatchObject({
 		prefix: Path.from("room"),
-		kind: "announced",
+		kind: "start",
 		route: { hops: [PUBLISHER_A, UNKNOWN_HOP] },
 	});
 
@@ -183,26 +196,35 @@ test("an unidentified responder keeps hop 0 on a nonempty chain", async () => {
 	subscriber.close();
 });
 
-test("a received empty hop list is filled with hop 0 and marked anonymous", async () => {
-	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
-	const announced = subscriber.announced();
-	await settle();
+test("a received hop list naming no publisher is stamped per connection", async () => {
+	const first = async () => {
+		const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
+		const announced = subscriber.announced();
+		await settle();
 
-	await send((w) => new AnnounceOk(UNKNOWN_HOP, 0).encode(w, Version.DRAFT_06));
-	await send((w) =>
-		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from("room"), hops: [] }, Version.DRAFT_06),
-	);
-	expect(await announced.next()).toMatchObject({
-		prefix: Path.from("room"),
-		kind: "announced",
-		route: { hops: [UNKNOWN_HOP] },
-	});
+		await send((w) => new AnnounceOk(UNKNOWN_HOP, 0).encode(w, Version.DRAFT_06));
+		await send((w) =>
+			encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from("room"), hops: [] }, Version.DRAFT_06),
+		);
+		const update = await nextRoute(announced);
+		expect(update).toMatchObject({ prefix: Path.from("room"), kind: "start" });
+		const hops = update?.route.hops ?? [];
+		expect(hops).toHaveLength(2);
+		expect(hops[0]).not.toBe(UNKNOWN_HOP);
+		// The 0 after the stamp keeps the unnamed publisher ranked as anonymous.
+		expect(hops[1]).toBe(UNKNOWN_HOP);
+		expect(update && isAnonymous(update.route)).toBe(true);
 
-	announced.close();
-	subscriber.close();
+		announced.close();
+		subscriber.close();
+		return hops[0];
+	};
+
+	// A reconnect is a new connection, so the same unnamed publisher reads as a new one.
+	expect(await first()).not.toBe(await first());
 });
 
-test("a received chain with hop 0 is marked anonymous", async () => {
+test("a received chain starting with hop 0 keeps it behind the stamp", async () => {
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
 	const announced = subscriber.announced();
 	await settle();
@@ -215,50 +237,68 @@ test("a received chain with hop 0 is marked anonymous", async () => {
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toMatchObject({
-		prefix: Path.from("room"),
-		kind: "announced",
-	});
+	const update = await nextRoute(announced);
+	expect(update).toMatchObject({ prefix: Path.from("room"), kind: "start" });
+	const [stamp, ...rest] = update?.route.hops ?? [];
+	expect(stamp).not.toBe(UNKNOWN_HOP);
+	expect(rest).toEqual([UNKNOWN_HOP, PUBLISHER_A, PEER]);
 
 	announced.close();
 	subscriber.close();
 });
 
-test("a restart from the same publisher is a route change, not a republish", async () => {
+test("a restart updates the route in place, even from another publisher", async () => {
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
 	const announced = subscriber.announced();
 	await settle();
+	const room = Path.from("room");
 
 	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_06));
 	await send((w) =>
+		encodeAnnounceBroadcast(w, { status: "active", suffix: room, hops: [PUBLISHER_A] }, Version.DRAFT_06),
+	);
+	expect(await nextRoute(announced)).toMatchObject({ prefix: room, kind: "start" });
+	const held = subscriber.consume(room);
+
+	// Same publisher over an identical route: no metadata to forward, so nothing surfaces.
+	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_A] }, Version.DRAFT_06));
+
+	// A reprice from the same publisher surfaces, which proves the identical restart above
+	// emitted nothing. The same publisher keeps sharing one broadcast.
+	await send((w) =>
 		encodeAnnounceBroadcast(
 			w,
-			{ status: "active", suffix: Path.from("room"), hops: [PUBLISHER_A] },
+			{ status: "restart", id: 0n, hops: [PUBLISHER_A], cost: { warm: 4n, cold: 4n } },
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: room, kind: "update" });
+	const same = subscriber.consume(room);
+	expect(same.closed).toBe(held.closed);
 
-	// Same publisher over an identical route. In-flight subscriptions resume across it,
-	// and there is no metadata to forward, so the subscriber must not surface a restart.
-	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_A] }, Version.DRAFT_06));
-
-	// A different publisher took the path: nothing carries over, so this one does surface,
-	// as an end before the start. Reaching it proves the identical reroute above emitted nothing.
+	// A different publisher took the path: an in-place update, never a retraction.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_B] }, Version.DRAFT_06));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({
+		prefix: room,
+		kind: "update",
+		route: { hops: [PUBLISHER_B, PEER] },
+	});
 
-	// A third publisher takes over. The replacement above has to leave its own publisher on
-	// record, or this one reads as a first announcement and skips the end.
-	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_C] }, Version.DRAFT_06));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	// The path still names the same broadcast, so the next consume shares it.
+	expect(subscriber.consume(room).closed).toBe(held.closed);
+	expect(held.closed.peek()).toBeUndefined();
 
-	// And the new owner's own reroute is still transparent.
+	// A third publisher is another update, still the same broadcast.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_C] }, Version.DRAFT_06));
+	expect(await announced.next()).toMatchObject({
+		prefix: room,
+		kind: "update",
+		route: { hops: [PUBLISHER_C, PEER] },
+	});
+	expect(subscriber.consume(room).closed).toBe(held.closed);
+
 	await send((w) => encodeAnnounceBroadcast(w, { status: "endedId", id: 0n }, Version.DRAFT_06));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: room, kind: "end" });
 
 	announced.close();
 	subscriber.close();
@@ -277,9 +317,9 @@ test("a restart that re-prices the same publisher emits the new route", async ()
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toMatchObject({
+	expect(await nextRoute(announced)).toMatchObject({
 		prefix: Path.from("room"),
-		kind: "announced",
+		kind: "start",
 		route: { hops: [PUBLISHER_A, PEER], cost: { warm: 0n, cold: 0n } },
 	});
 
@@ -290,9 +330,9 @@ test("a restart that re-prices the same publisher emits the new route", async ()
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toMatchObject({
+	expect(await nextRoute(announced)).toMatchObject({
 		prefix: Path.from("room"),
-		kind: "updated",
+		kind: "update",
 		route: { hops: [PUBLISHER_A, PEER], cost: { warm: 4n, cold: 4n } },
 	});
 
@@ -310,38 +350,46 @@ test("a lite-05 duplicate announce follows the same restart rule", async () => {
 		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from("room"), hops }, Version.DRAFT_05);
 
 	await send(active([PUBLISHER_A]));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "start" });
 
 	// On lite-05 a restart travels as a duplicate ANNOUNCE rather than its own message.
 	await send(active([PUBLISHER_A]));
 	await send(active([PUBLISHER_B]));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "update" });
 
 	announced.close();
 	subscriber.close();
 });
 
 // A responder that withholds its Hop ID sends the reserved 0, and an empty chain means it
-// originated the path itself, so the advertisement names nobody. Two such advertisements can
-// be unrelated publishers, so a restart must replace the broadcast rather than reroute it:
-// cached track info and in-flight subscriptions must not splice across them. Mirrors the Rust
-// `unknown_publisher_restart_replaces` regression.
-test("a restart from an unidentified publisher replaces rather than reroutes", async () => {
+// originated the path itself, so the advertisement names nobody and the connection stamps it.
+// A restart on the same connection keeps that stamp, so it is a reprice that updates in place
+// and keeps the shared broadcast, as does one that names a publisher.
+test("a restart from an unidentified publisher updates in place", async () => {
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
 	const announced = subscriber.announced();
 	await settle();
+	const room = Path.from("room");
 
 	await send((w) => new AnnounceOk(UNKNOWN_HOP, 0).encode(w, Version.DRAFT_06));
-	await send((w) =>
-		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from("room"), hops: [] }, Version.DRAFT_06),
-	);
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	await send((w) => encodeAnnounceBroadcast(w, { status: "active", suffix: room, hops: [] }, Version.DRAFT_06));
+	expect(await nextRoute(announced)).toMatchObject({ prefix: room, kind: "start" });
+	const held = subscriber.consume(room);
 
-	// Nobody is named on either side, so this is not provably the same content.
-	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [] }, Version.DRAFT_06));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	await send((w) =>
+		encodeAnnounceBroadcast(
+			w,
+			{ status: "restart", id: 0n, hops: [], cost: { warm: 4n, cold: 4n } },
+			Version.DRAFT_06,
+		),
+	);
+	expect(await nextRoute(announced)).toMatchObject({ prefix: room, kind: "update" });
+	expect(subscriber.consume(room).closed).toBe(held.closed);
+
+	// Naming a publisher changes the route, not the broadcast.
+	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_A] }, Version.DRAFT_06));
+	expect(await nextRoute(announced)).toMatchObject({ prefix: room, kind: "update" });
+	expect(subscriber.consume(room).closed).toBe(held.closed);
 
 	announced.close();
 	subscriber.close();
@@ -353,6 +401,7 @@ async function probeBytes(probes: Probe[], version: Version): Promise<Uint8Array
 	const chunks: Uint8Array[] = [];
 	const writer = new Writer(
 		new WritableStream<Uint8Array>({ write: (chunk) => void chunks.push(new Uint8Array(chunk)) }),
+		version,
 	);
 	for (const probe of probes) await probe.encode(writer, version);
 	writer.close();
@@ -469,7 +518,7 @@ test("an announce skipped as a reflected loop still holds its path", async () =>
 		),
 	);
 
-	await expect(announced.next()).rejects.toThrow("duplicate announce");
+	await expect(nextRoute(announced)).rejects.toThrow("duplicate announce");
 	// The peer has to hear about it: closing only our side would leave it announcing
 	// into a stream nobody reads.
 	expect(await abortReason()).toContain("duplicate announce");
@@ -502,11 +551,40 @@ test("a restart replaces an announce that was skipped as a reflected loop", asyn
 
 	// The id stays live, so the peer may restart it into a route that is usable here.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_A] }, Version.DRAFT_06));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "start" });
 
 	// Retiring the id ends what the restart attached, and nothing else.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "endedId", id: 0n }, Version.DRAFT_06));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "end" });
+
+	announced.close();
+	subscriber.close();
+});
+
+test("a restart keeps the epoch of an announce skipped as a reflected loop", async () => {
+	const SELF = 1n;
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_07, SELF);
+	const announced = subscriber.announced();
+	await settle();
+
+	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_07));
+
+	// Skipped: the chain reflects back through us. The epoch still names the instance.
+	const epoch = Epoch.mint();
+	await send((w) =>
+		encodeAnnounceBroadcast(
+			w,
+			{ status: "active", suffix: Path.from("room"), epoch, hops: [HopSchema.parse(SELF)] },
+			Version.DRAFT_07,
+		),
+	);
+	await settle();
+
+	// A restart never carries the epoch, so the attached route takes the one the start named.
+	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_A] }, Version.DRAFT_07));
+	const started = await nextRoute(announced);
+	expect(started).toMatchObject({ prefix: Path.from("room"), kind: "start" });
+	expect(started?.route.epoch).toBe(epoch);
 
 	announced.close();
 	subscriber.close();
@@ -536,13 +614,13 @@ test("retiring an id whose announce was skipped ends nothing", async () => {
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("lobby"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("lobby"), kind: "start" });
 
 	// Retire the skipped one, then the live one. The first must surface nothing, so the
 	// only end a consumer sees is "lobby".
 	await send((w) => encodeAnnounceBroadcast(w, { status: "endedId", id: 0n }, Version.DRAFT_06));
 	await send((w) => encodeAnnounceBroadcast(w, { status: "endedId", id: 1n }, Version.DRAFT_06));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("lobby"), kind: "retracted" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("lobby"), kind: "end" });
 
 	announced.close();
 	subscriber.close();
@@ -556,10 +634,10 @@ test("a draft-02 initial announcement can still be retracted", async () => {
 	// ANNOUNCE_INIT carries the initial set. These are advertisements like any other, so
 	// the peer may retract one later and the consumer has to hear about it.
 	await send((w) => new AnnounceInit([Path.from("room")]).encode(w, Version.DRAFT_02));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "start" });
 
 	await send((w) => encodeAnnounceBroadcast(w, { status: "ended", suffix: Path.from("room") }, Version.DRAFT_02));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "end" });
 
 	announced.close();
 	subscriber.close();
@@ -581,7 +659,7 @@ test("a duplicate start is reported even when its own route reflects", async () 
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "start" });
 
 	// A second start for that path, carrying a route that loops back through us. Skipping
 	// it must not pre-empt the violation: the peer sent two starts with no end between
@@ -594,7 +672,7 @@ test("a duplicate start is reported even when its own route reflects", async () 
 		),
 	);
 
-	await expect(announced.next()).rejects.toThrow("duplicate announce");
+	await expect(nextRoute(announced)).rejects.toThrow("duplicate announce");
 
 	announced.close();
 	subscriber.close();
@@ -612,7 +690,7 @@ test("a draft-02 initial set naming a path twice is refused", async () => {
 
 	// Erroring the stream discards what it had already queued, so the consumer sees the
 	// violation rather than the first entry followed by it.
-	await expect(announced.next()).rejects.toThrow("duplicate announce");
+	await expect(nextRoute(announced)).rejects.toThrow("duplicate announce");
 	expect(await abortReason()).toContain("duplicate announce");
 	// The draft makes this session-fatal: resetting only the stream would let the peer
 	// repeat the violation on the next one. The code has to say so too, or the peer reads
@@ -637,10 +715,10 @@ test("a violation on a very long path still ends the session", async () => {
 	const long = Path.from("x".repeat(2000));
 	const active: AnnounceBroadcast = { status: "active", suffix: long, hops: [PUBLISHER_A] };
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_06));
-	expect(await announced.next()).toMatchObject({ prefix: long, kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: long, kind: "start" });
 
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_06));
-	await expect(announced.next()).rejects.toThrow("duplicate announce");
+	await expect(nextRoute(announced)).rejects.toThrow("duplicate announce");
 
 	const info = await sessionEnded();
 	expect(info?.closeCode).toBe(15);
@@ -658,14 +736,14 @@ test("a draft-04 duplicate start is a violation, not a restart", async () => {
 
 	const active: AnnounceBroadcast = { status: "active", suffix: Path.from("room"), hops: [PUBLISHER_A] };
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_04));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "start" });
 
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_04));
 
 	// Session first: it is the bounded assertion, so a version that treats this as a
 	// restart fails here in 250ms instead of hanging on a rejection that never comes.
 	expect((await sessionEnded())?.closeCode).toBe(15);
-	await expect(announced.next()).rejects.toThrow("duplicate announce");
+	await expect(nextRoute(announced)).rejects.toThrow("duplicate announce");
 });
 
 test("a draft-05 duplicate start is still a restart", async () => {
@@ -677,17 +755,346 @@ test("a draft-05 duplicate start is still a restart", async () => {
 
 	const active: AnnounceBroadcast = { status: "active", suffix: Path.from("room"), hops: [PUBLISHER_A] };
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_05));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "start" });
 
 	// Same publisher over a new route: transparent, and emphatically not an error.
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_05));
 
-	// A different publisher does surface, which is what proves the reroute above passed.
+	// A different publisher surfaces as an update, which is what proves the reroute above passed.
 	const replaced: AnnounceBroadcast = { status: "active", suffix: Path.from("room"), hops: [PUBLISHER_B] };
 	await send((w) => encodeAnnounceBroadcast(w, replaced, Version.DRAFT_05));
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
-	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
+	expect(await nextRoute(announced)).toMatchObject({ prefix: Path.from("room"), kind: "update" });
 
 	announced.close();
+	subscriber.close();
+});
+
+// ANNOUNCE_OK's count lands the initial set at exactly that many ANNOUNCE_STARTs: an unknown
+// message does not count toward it, and a live update right behind the set comes after the
+// marker. Mirrors the Rust `the_count_lands_at_the_last_initial_start`.
+test("the count lands at the last initial start", async () => {
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
+	const announced = subscriber.announced();
+	await settle();
+
+	const start = (suffix: string) => (w: Writer) =>
+		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from(suffix), hops: [] }, Version.DRAFT_06);
+	await send((w) => new AnnounceOk(PEER, 1).encode(w, Version.DRAFT_06));
+	// An unknown announce type with an empty body, which decodes as skipped.
+	await send((w) => w.write(new Uint8Array([0x3f, 0x00])));
+	await send(start("a"));
+	await send(start("b"));
+
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("a"), kind: "start" });
+	expect(await announced.next()).toEqual({ kind: "live" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("b"), kind: "start" });
+
+	announced.close();
+	subscriber.close();
+});
+
+test("a count of zero is live before any announcement", async () => {
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_05);
+	const announced = subscriber.announced();
+	await settle();
+
+	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_05));
+	expect(await announced.next()).toEqual({ kind: "live" });
+
+	await send((w) =>
+		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from("a"), hops: [] }, Version.DRAFT_05),
+	);
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("a"), kind: "start" });
+
+	announced.close();
+	subscriber.close();
+});
+
+test("a draft-02 initial set is live after its ANNOUNCE_INIT", async () => {
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_02);
+	const announced = subscriber.announced();
+	await settle();
+
+	await send((w) => new AnnounceInit([Path.from("a"), Path.from("b")]).encode(w, Version.DRAFT_02));
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("a"), kind: "start" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("b"), kind: "start" });
+	expect(await announced.next()).toEqual({ kind: "live" });
+
+	announced.close();
+	subscriber.close();
+});
+
+// Lite-03/04 say nothing about where the initial set ends, so it lands once the stream goes quiet.
+test("a draft-04 initial set is live once the stream goes quiet", async () => {
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_04);
+	const announced = subscriber.announced();
+	await settle();
+
+	const start = (suffix: string) => (w: Writer) =>
+		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from(suffix), hops: [] }, Version.DRAFT_04);
+	await send(start("a"));
+	await send(start("b"));
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("a"), kind: "start" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("b"), kind: "start" });
+	expect(await announced.next()).toEqual({ kind: "live" });
+
+	announced.close();
+	subscriber.close();
+});
+
+interface FakeStream {
+	inbound: ReadableStreamDefaultController<Uint8Array>;
+	// Resolves once the subscriber waits on a read the test has not answered.
+	reading: Promise<void>;
+	aborted: Promise<unknown>;
+	// Hands the stream to the subscriber, for an open the session was told to park.
+	release: () => void;
+}
+
+// A session whose streams the test answers by hand and that never fails them on its own, so
+// only Subscriber.close() can end a wait. Opens numbered in `park` wait for `release()`.
+function fakeSession(park: number[] = []) {
+	const streams: FakeStream[] = [];
+	const quic = {
+		createBidirectionalStream: () => {
+			let inbound!: ReadableStreamDefaultController<Uint8Array>;
+			let onRead!: () => void;
+			let onAbort!: (reason: unknown) => void;
+			let release!: () => void;
+			const reading = new Promise<void>((resolve) => (onRead = resolve));
+			const aborted = new Promise<unknown>((resolve) => (onAbort = resolve));
+			// No high water mark, so pull() means the subscriber is blocked on a read.
+			const readable = new ReadableStream<Uint8Array>(
+				{
+					start: (controller) => {
+						inbound = controller;
+					},
+					pull: () => onRead(),
+				},
+				{ highWaterMark: 0 },
+			);
+			const writable = new WritableStream<Uint8Array>({ abort: (reason) => void onAbort(reason) });
+			const opened = new Promise((resolve) => (release = () => resolve({ readable, writable })));
+			if (!park.includes(streams.length)) release();
+			streams.push({ inbound, reading, aborted, release });
+			return opened;
+		},
+	} as unknown as WebTransport;
+	return { quic, streams };
+}
+
+async function answerTrackInfo(stream: FakeStream): Promise<void> {
+	const chunks: Uint8Array[] = [];
+	const writer = new Writer(
+		new WritableStream<Uint8Array>({ write: (chunk) => void chunks.push(new Uint8Array(chunk)) }),
+		Version.DRAFT_05,
+	);
+	await new TrackInfo({}).encode(writer, Version.DRAFT_05);
+	for (const chunk of chunks) stream.inbound.enqueue(chunk);
+	stream.inbound.close();
+}
+
+function expectCut(err: unknown, cause: Error | undefined) {
+	if (cause) {
+		expect(err).toBe(cause);
+	} else {
+		expect(err).toBeInstanceOf(StreamError);
+		expect((err as StreamError).code).toBe(StreamCode.SessionClosed);
+	}
+}
+
+// Lite has no FETCH_OK, so a publisher that never answers holds each setup stage until the
+// subscriber closes. The stream that stage opened is reset, even one opening after the close.
+test.each([
+	["the TRACK_INFO", "track", undefined],
+	["the FETCH", "fetch", undefined],
+	["the FETCH, on a session error", "fetch", new Error("session died")],
+	["a stream slot for the FETCH", "open", undefined],
+] as const)("closing the subscriber rejects a fetch waiting on %s", async (_, stage, cause) => {
+	const { quic, streams } = fakeSession(stage === "open" ? [1] : []);
+	const subscriber = new Subscriber(quic, Version.DRAFT_05, HopSchema.parse(1n));
+
+	let settled = false;
+	const fetch = subscriber.fetchGroup(Path.from("room"), "video", 0).then(
+		() => {
+			settled = true;
+			return undefined;
+		},
+		(err: unknown) => {
+			settled = true;
+			return err;
+		},
+	);
+
+	await drainUntil(() => streams.length === 1);
+	if (stage === "track") {
+		await streams[0].reading;
+	} else {
+		await answerTrackInfo(streams[0]);
+		await drainUntil(() => streams.length === 2);
+		if (stage === "fetch") await streams[1].reading;
+	}
+	expect(settled).toBe(false);
+
+	subscriber.close(cause);
+	expectCut(await fetch, cause);
+
+	const stuck = streams[stage === "track" ? 0 : 1];
+	stuck.release();
+	await stuck.aborted;
+});
+
+test("a fetch started after the subscriber closes rejects without opening a stream", async () => {
+	const { quic, streams } = fakeSession();
+	const subscriber = new Subscriber(quic, Version.DRAFT_05, HopSchema.parse(1n));
+	subscriber.close();
+
+	const err = await subscriber.fetchGroup(Path.from("room"), "video", 0).catch((err: unknown) => err);
+	expectCut(err, undefined);
+	expect(streams.length).toBe(0);
+});
+
+test("an already-aborted fetch rejects without opening a stream", async () => {
+	const { quic, streams } = fakeSession();
+	const subscriber = new Subscriber(quic, Version.DRAFT_05, HopSchema.parse(1n));
+	const cause = new Error("gone");
+
+	const err = await subscriber
+		.fetchGroup(Path.from("room"), "video", 0, { signal: AbortSignal.abort(cause) })
+		.catch((err: unknown) => err);
+	expect(err).toBe(cause);
+	expect(streams.length).toBe(0);
+});
+
+// Coalesced fetches share one FETCH stream. An abort releases only that caller's share; the
+// stream is cancelled once the last sharer leaves, before its FETCH is sent if it can be.
+test("one of two fetch sharers aborting leaves the other's fetch", async () => {
+	const { quic, streams } = fakeSession();
+	const subscriber = new Subscriber(quic, Version.DRAFT_05, HopSchema.parse(1n));
+
+	const controller = new AbortController();
+	const a = subscriber.fetchGroup(Path.from("room"), "video", 0, { signal: controller.signal });
+	const b = subscriber.fetchGroup(Path.from("room"), "video", 0);
+
+	await drainUntil(() => streams.length === 1);
+	await answerTrackInfo(streams[0]);
+	await drainUntil(() => streams.length === 2);
+	await streams[1].reading;
+
+	const cause = new Error("gone");
+	controller.abort(cause);
+	expect(await a.catch((err: unknown) => err)).toBe(cause);
+
+	let aborted = false;
+	void streams[1].aborted.then(() => {
+		aborted = true;
+	});
+	// An empty-group FIN accepts the fetch.
+	streams[1].inbound.close();
+	const group = await b;
+	expect(await group.readFrame()).toBeUndefined();
+	expect(aborted).toBe(false);
+
+	subscriber.close();
+});
+
+test.each([
+	["the TRACK_INFO", "track"],
+	["the FETCH", "fetch"],
+] as const)("the last fetch sharer aborting during %s cancels it", async (_, stage) => {
+	const { quic, streams } = fakeSession();
+	const subscriber = new Subscriber(quic, Version.DRAFT_05, HopSchema.parse(1n));
+
+	const first = new AbortController();
+	const second = new AbortController();
+	const a = subscriber.fetchGroup(Path.from("room"), "video", 0, { signal: first.signal });
+	const b = subscriber.fetchGroup(Path.from("room"), "video", 0, { signal: second.signal });
+
+	await drainUntil(() => streams.length === 1);
+	await streams[0].reading;
+	if (stage === "fetch") {
+		await answerTrackInfo(streams[0]);
+		await drainUntil(() => streams.length === 2);
+		await streams[1].reading;
+	}
+
+	first.abort(new Error("first"));
+	second.abort(new Error("second"));
+	expect(((await a.catch((err: unknown) => err)) as Error).message).toBe("first");
+	expect(((await b.catch((err: unknown) => err)) as Error).message).toBe("second");
+
+	if (stage === "track") {
+		// The TRACK_INFO still completes, but no FETCH is sent for the abandoned group.
+		await answerTrackInfo(streams[0]);
+		for (let i = 0; i < 100; i++) await Promise.resolve();
+		expect(streams.length).toBe(1);
+	} else {
+		const err = fromTransport(await streams[1].aborted) as StreamError;
+		expect(err.code).toBe(StreamCode.Cancel);
+	}
+
+	subscriber.close();
+});
+
+// The fetch is withdrawn the moment it is cancelled, so a fetch arriving at any point after the
+// last sharer left either revives it or starts a fresh one, never joins the cancelled one.
+test("a fetch after the last sharer left is never failed with the cancelled one", async () => {
+	for (let depth = 0; depth < 32; depth++) {
+		const { quic, streams } = fakeSession();
+		const subscriber = new Subscriber(quic, Version.DRAFT_05, HopSchema.parse(1n));
+
+		const controller = new AbortController();
+		const a = subscriber.fetchGroup(Path.from("room"), "video", 0, { signal: controller.signal });
+		void a.catch(() => undefined);
+		await drainUntil(() => streams.length === 1);
+		await answerTrackInfo(streams[0]);
+		await drainUntil(() => streams.length === 2);
+		await streams[1].reading;
+
+		controller.abort(new Error("gone"));
+		for (let i = 0; i < depth; i++) await Promise.resolve();
+		const b = subscriber.fetchGroup(Path.from("room"), "video", 0).catch((err: unknown) => err);
+		for (let i = 0; i < 64; i++) await Promise.resolve();
+
+		// An empty-group FIN accepts whichever FETCH the late caller is waiting on.
+		if (streams.length > 2) {
+			await answerTrackInfo(streams[2]);
+			await drainUntil(() => streams.length === 4);
+			await streams[3].reading;
+			streams[3].inbound.close();
+		} else {
+			// Only open if the late caller revived it.
+			try {
+				streams[1].inbound.close();
+			} catch {}
+		}
+		const res = await b;
+		expect(res instanceof Error ? `depth ${depth}: ${res.message}` : undefined).toBeUndefined();
+
+		subscriber.close();
+	}
+});
+
+// A reader leaving partway through a fetched group cancels the FETCH: the truncated group
+// must not end clean, as a FIN would make it read whole.
+test("the last reader leaving mid-response cancels the fetch", async () => {
+	const { quic, streams } = fakeSession();
+	const subscriber = new Subscriber(quic, Version.DRAFT_05, HopSchema.parse(1n));
+
+	const fetch = subscriber.fetchGroup(Path.from("room"), "video", 0);
+	await drainUntil(() => streams.length === 1);
+	await answerTrackInfo(streams[0]);
+	await drainUntil(() => streams.length === 2);
+	await streams[1].reading;
+
+	// One frame of the group: a zero timestamp delta, then the sized payload.
+	streams[1].inbound.enqueue(new Uint8Array([0, 4, ...new TextEncoder().encode("head")]));
+	const group = await fetch;
+	expect(new TextDecoder().decode((await group.readFrame())?.payload)).toBe("head");
+	group.close();
+
+	const err = fromTransport(await streams[1].aborted) as StreamError;
+	expect(err.code).toBe(StreamCode.Cancel);
+
 	subscriber.close();
 });

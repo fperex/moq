@@ -20,14 +20,8 @@ ones. Behind the decode seam as the first candidate on `target_os =
   not advertised on that host, not an error at decode time.
 - Fixtures and layout-order tests as in the AudioToolbox quest.
 - Verification runs on a Windows host; the per-PR CI only compiles the
-  platform code, and `just rs windows` runs nightly.
-
-## Required
-
-- [Decode seam](/quest/m1/audio-codecs/decode-backend.md) - the candidate order this backend joins
-- [Layout](/quest/m1/audio-codecs/layout.md) - what a multichannel frame is delivered as
+  platform code (`just rs windows`).
 
 ## Related
 
-- [Runtime QA hosts](/quest/m2/runtime-qa-hosts.md) - where the Windows run happens
-- [Windows decoded frames](/quest/m1/obs-moq-video/decode-windows.md) - the OBS Windows line this feeds
+- [Windows decoded frames](/quest/m2/obs-decode-windows.md) - the OBS Windows line this feeds

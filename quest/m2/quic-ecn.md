@@ -9,10 +9,12 @@ marks fall back to no ECN, and a viewer's session is unaffected.
 
 ## Plan
 
-Classic ECN is already end to end on both runtimes; this quest is the
-fork-side half. noq-proto has no ECN knob: `sending_ecn` is hardcoded on
-per path and only an ACK without counts turns it off, so both `off` and
-`ect1` need the fork.
+ECT(0) marking and ACK ECN counts are carried end to end, and BBR's classic
+CE response ([moq-dev/noq#12](https://github.com/moq-dev/noq/pull/12), in
+moq-noq 1.3.2) is the baseline. This quest adds the scalable policy separately.
+noq-proto has no ECN knob: `sending_ecn` starts on per path and validation
+failure or an ACK without counts turns it off, so both `off` and `ect1`
+need the fork.
 
 - In the fork: an `Ect1` marking option and the accounting to keep the two
   codepoints apart, so an L4S response (proportional to the CE fraction per
@@ -22,7 +24,7 @@ per path and only an ACK without counts turns it off, so both `off` and
   default (today's behavior on tokio), and `doc/bin/relay/config.md`
   documents it in the same PR.
 - Measure on the netem bottleneck from the
-  [ECN study](/quest/m1/quic/ecn-measure.md) with `dualpi2` marking against
+  [ECN study](/quest/m2/quic-ecn-measure.md) with `dualpi2` marking against
   the same bottleneck dropping: queueing delay, goodput, loss. The study's
   provider verdict decides whether the result matters outside the lab;
   if neither Linode nor OVH preserves the marks, L4S stays off and the
@@ -33,5 +35,10 @@ per path and only an ACK without counts turns it off, so both `off` and
 
 ## Required
 
-- [Measure ECN on the backbone](/quest/m1/quic/ecn-measure.md) - the
+- [Hard fork](/quest/m1/quic/fork/README.md) - the change lands in `moq-quic`, not the frozen fork
+- [Measure ECN on the backbone](/quest/m2/quic-ecn-measure.md) - the
   provider verdict this quest acts on
+
+## Related
+
+- [noq#814](https://github.com/n0-computer/noq/issues/814) - the L4S proposal to n0

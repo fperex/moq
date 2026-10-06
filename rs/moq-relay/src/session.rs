@@ -136,7 +136,7 @@ impl Registry {
 ///
 /// `id` and every scalar are exact. `path` is a [`Pattern`] against the dialed
 /// path. `remote` is an IP or CIDR with the port dropped and IPv4-mapped IPv6
-/// folded. `query` is not a field: it may carry the credential.
+/// folded. `query` and `token` are not fields: they carry the credential.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filter {
 	/// Session id.
@@ -354,16 +354,10 @@ fn tls_matches(want: &Option<String>, have: Option<&str>) -> bool {
 	}
 }
 
+/// The wire spelling `moq-auth` serializes, so a new transport is filterable without a second list.
 fn parse_transport(value: &str) -> Option<Transport> {
-	Some(match value {
-		"quic" => Transport::Quic,
-		"iroh" => Transport::Iroh,
-		"websocket" => Transport::WebSocket,
-		"tcp" => Transport::Tcp,
-		"unix" => Transport::Unix,
-		"http" => Transport::Http,
-		_ => return None,
-	})
+	use serde::{Deserialize, de::IntoDeserializer};
+	Transport::deserialize(IntoDeserializer::<serde::de::value::Error>::into_deserializer(value)).ok()
 }
 
 fn parse_role(value: &str) -> Option<Role> {
@@ -402,7 +396,7 @@ impl IntoResponse for Error {
 }
 
 /// One live session as the list route returns it: the request the server saw,
-/// minus `query`, plus when it was admitted.
+/// minus its credentials (`query` and `token`), plus when it was admitted.
 #[serde_as]
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -453,7 +447,7 @@ impl View {
 /// `GET /sessions` body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct List {
-	/// Matching sessions, `query` omitted.
+	/// Matching sessions, credentials omitted.
 	pub sessions: Vec<View>,
 }
 
@@ -487,6 +481,21 @@ mod tests {
 	fn query_and_unknown_fields_are_refused() {
 		assert!(matches!(Filter::from_query(Some("query=jwt")), Err(Error::Unknown(field)) if field == "query"));
 		assert!(matches!(Filter::from_query(Some("foo=bar")), Err(Error::Unknown(field)) if field == "foo"));
+	}
+
+	#[test]
+	fn every_transport_spelling_filters() {
+		for transport in [
+			Transport::Quic,
+			Transport::Http,
+			Transport::Rtmp,
+			Transport::Srt,
+			Transport::WebRtc,
+		] {
+			let filter = Filter::from_query(Some(&format!("transport={transport}"))).unwrap();
+			assert_eq!(filter.transport, Some(transport));
+		}
+		assert!(Filter::from_query(Some("transport=carrier-pigeon")).is_err());
 	}
 
 	#[test]
@@ -530,14 +539,21 @@ mod tests {
 	}
 
 	#[test]
-	fn list_omits_query() {
+	fn list_omits_credentials() {
 		let registry = Registry::new();
-		let _reg = registry.register(request("abc", "/room", "127.0.0.1:1"));
+		let mut session = request("abc", "/room", "127.0.0.1:1");
+		session.query = Some("jwt=secret".into());
+		session.token = Some(moq_auth::Token {
+			kind: moq_auth::Token::OUT_OF_BAND,
+			value: b"secret".to_vec(),
+		});
+		let _reg = registry.register(session);
 		let list = registry.list(&Filter::default());
 		assert_eq!(list.len(), 1);
 		assert_eq!(list[0].id, "abc");
 		let json = serde_json::to_value(&list[0]).unwrap();
 		assert!(json.get("query").is_none());
+		assert!(json.get("token").is_none());
 	}
 
 	#[tokio::test]

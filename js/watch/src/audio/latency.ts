@@ -1,12 +1,45 @@
-import * as Container from "@moq/hang/container";
 import { Time } from "@moq/net";
-import { WORKLET_QUANTUM } from "./config";
-import { STRETCH_BOUND } from "./playout";
+
+/** The terms of the audio playout target, all in milliseconds. */
+export interface Target {
+	/** The arrival estimate from the container consumer. */
+	measured: Time.Milli;
+	/** The flush span the rendition advertises, if any. */
+	advertised?: Time.Milli;
+	/** The codec's frame duration, if known. */
+	frame?: Time.Milli;
+	/** The catalog `delay`: how far this rendition trails the broadcast's earliest one, if any. */
+	delay?: Time.Milli;
+}
+
+/**
+ * The "auto" playout target: the measured term floored by the advertised span, plus one frame, plus
+ * the rendition's catalog delay.
+ *
+ * The advertised span is a floor rather than an addend, because the receiver's measurement already
+ * contains the publisher's flush delay. The catalog delay is an addend, because the measurement is
+ * taken against the track's own fastest frame and cancels any offset between tracks. See
+ * doc/concept/audio-jitter.md.
+ */
+export function target(props: Target): Time.Milli {
+	const floored = Time.Milli.max(props.measured, props.advertised ?? Time.Milli.zero);
+	const own = Time.Milli.add(floored, props.frame ?? Time.Milli.zero);
+	return Time.Milli.add(own, props.delay ?? Time.Milli.zero);
+}
+
+/**
+ * The least subscription max age an "auto" track asks for: the estimator's ceiling.
+ *
+ * The measured term saturates at 100 buckets of 20 ms, so a frame later than this adds nothing.
+ */
+export const AUTO_MAX_AGE = 2000 as Time.Milli;
+
+// An AudioWorkletProcessor renders in fixed 128-sample quanta, so a ring shallower than one can
+// never be read from.
+const RENDER_QUANTUM = 128;
 
 /**
  * The ring depth for a target delay, floored at one AudioWorklet render quantum.
- *
- * A ring shallower than one quantum can never be read from.
  *
  * `delay="instant"` reports a zero buffer, which the ring rejects outright: construction throws,
  * the worklet is left with no backend, and every later resize is gated on that backend existing, so
@@ -14,35 +47,5 @@ import { STRETCH_BOUND } from "./playout";
  * buffer whose meaning is "video holds nothing".
  */
 export function ringSamples(rate: number, delay: Time.Milli): number {
-	return Math.max(WORKLET_QUANTUM, Math.ceil(rate * Time.Second.fromMilli(delay)));
-}
-
-/**
- * How long the ring holds a depth before it sheds another bucket of a fall.
- *
- * A shallower target is reached by time-compressing audio the ring already holds: it cannot
- * un-receive it. One bucket a second is one stretch period a second, which speech carries. The
- * whole of a cold-start seed at once is six of them inside half a second, which is the fast-forward
- * heard in the first seconds of a self-publish, where a browser publisher declares no flush span
- * and the estimator's first measurement replaces the 80ms guess with 20ms. NetEq lets the buffer
- * drift towards a lower target rather than stretching straight after a start for the same reason
- * (`delay_manager.cc`, and the accelerate decision in `decision_logic.cc`).
- */
-export const LOWER_INTERVAL = Time.Milli(1_000);
-
-/**
- * The depth to hold now, given the one being held, the one asked for, and how long the current one
- * has stood.
- *
- * Rises land at once: the reader expands into a deeper target however far away it is, and holding
- * the bar back only lengthens the shallow window an underrun is waiting in. So does a fall further
- * than the reader's own stretch bound, because past that the reader skips ahead instead of
- * stretching ({@link STRETCH_BOUND}), which is one discontinuity rather than a run of them: walking
- * a viewer's 2s delay down to 100ms would turn that single jump into a minute of bent audio.
- * Everything in between is walked, one bucket per {@link LOWER_INTERVAL}.
- */
-export function nextLatency(current: Time.Milli, target: Time.Milli, held: Time.Milli): Time.Milli {
-	if (target >= current || current - target > STRETCH_BOUND) return target;
-	if (held < LOWER_INTERVAL) return current;
-	return Time.Milli(Math.max(target, current - Container.Jitter.BUCKET));
+	return Math.max(RENDER_QUANTUM, Math.ceil(rate * Time.Second.fromMilli(delay)));
 }

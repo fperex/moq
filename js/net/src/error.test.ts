@@ -2,7 +2,6 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { StreamError as QmuxStreamError } from "@moq/qmux";
 import {
 	controlTimeout,
-	Expired,
 	FrameTooLarge,
 	fromClose,
 	fromTransport,
@@ -73,11 +72,11 @@ afterEach(() => {
 });
 
 test("fromTransport: a stream reset keeps the peer's code verbatim", () => {
-	const src = fake("stream", 0x35);
+	const src = fake("stream", 2);
 	const err = fromTransport(src);
 	expect(err).toBeInstanceOf(StreamError);
-	expect((err as StreamError).code).toBe(StreamCode.Evicted);
-	expect(err.message).toBe("remote error: 53");
+	expect((err as StreamError).code).toBe(StreamCode.DeliveryTimeout);
+	expect(err.message).toBe("remote error: 2");
 	// The original error stays reachable for logging.
 	expect(err.cause).toBe(src);
 });
@@ -223,11 +222,11 @@ test("the code tables match the spec", () => {
 	// carries nothing, so no code sits there.
 	const assignedLite: StreamCode[] = [
 		StreamCode.ControlTimeout,
-		StreamCode.NoCapacity,
 		StreamCode.GroupTooLarge,
 		StreamCode.NotFound,
 		StreamCode.Old,
 		StreamCode.Evicted,
+		StreamCode.Unroutable,
 		StreamCode.FrameTooLarge,
 	];
 	for (const code of Object.values(StreamCode)) {
@@ -240,11 +239,11 @@ test("the code tables match the spec", () => {
 	}
 	// The values the Rust `StreamError` sends for the same conditions.
 	expect(Number(StreamCode.ControlTimeout)).toBe(0x31);
-	expect(Number(StreamCode.NoCapacity)).toBe(0x30);
 	expect(Number(StreamCode.GroupTooLarge)).toBe(0x32);
 	expect(Number(StreamCode.NotFound)).toBe(0x33);
 	expect(Number(StreamCode.Old)).toBe(0x34);
 	expect(Number(StreamCode.Evicted)).toBe(0x35);
+	expect(Number(StreamCode.Unroutable)).toBe(0x36);
 	expect(Number(StreamCode.FrameTooLarge)).toBe(0x38);
 
 	// The spaces are disjoint: 0 ends a session cleanly but fails a stream.
@@ -303,7 +302,6 @@ test("toTransport: works with no WebTransportError global", () => {
 // lagging reader or an unknown broadcast reads as a crash on the sender's side.
 test("toStreamCode: a local condition maps to the code the peer can act on", () => {
 	expect(toStreamCode(new Lagged())).toBe(StreamCode.TooFarBehind);
-	expect(toStreamCode(new Expired())).toBe(StreamCode.Old);
 	expect(toStreamCode(new FrameTooLarge())).toBe(StreamCode.FrameTooLarge);
 	expect(toStreamCode(new GroupTooLarge())).toBe(StreamCode.GroupTooLarge);
 	expect(toStreamCode(new NotFound("broadcast x"))).toBe(StreamCode.NotFound);
@@ -363,11 +361,11 @@ test("toStreamCode and fromTransport agree on what a code means", () => {
 		StreamCode.TooFarBehind,
 		StreamCode.MalformedTrack,
 		StreamCode.ControlTimeout,
-		StreamCode.NoCapacity,
 		StreamCode.GroupTooLarge,
 		StreamCode.NotFound,
 		StreamCode.Old,
 		StreamCode.Evicted,
+		StreamCode.Unroutable,
 		StreamCode.FrameTooLarge,
 		StreamCode(70),
 	]) {
@@ -381,9 +379,6 @@ test("toStreamCode and fromTransport agree on what a code means", () => {
 	expect(new FrameTooLarge()).toBeInstanceOf(StreamError);
 	expect(fromTransport(toTransport(StreamCode.GroupTooLarge, "overflow"))).toBeInstanceOf(GroupTooLarge);
 	expect(new GroupTooLarge()).toBeInstanceOf(StreamError);
-	expect(fromTransport(toTransport(StreamCode.Old, "superseded"))).toBeInstanceOf(Expired);
-	expect(new Expired()).toBeInstanceOf(StreamError);
-	expect(new Expired().code).toBe(StreamCode.Old);
 
 	// The values the four codes were sent from before they were assigned stay reserved:
 	// a peer still emitting one is not read as anything.
@@ -402,12 +397,9 @@ test("toStreamCode: lite-only codes do not reach an IETF peer", () => {
 		StreamCode.Old,
 		StreamCode.Evicted,
 		StreamCode.GroupTooLarge,
+		StreamCode.Unroutable,
 		StreamCode.FrameTooLarge,
 	]) {
 		expect(toStreamCode(new StreamError(code), { version: Version.DRAFT_20 })).toBe(StreamCode.Internal);
 	}
-});
-
-test("delivery timeout does not claim the subscription age verdict", () => {
-	expect(fromTransport(toTransport(StreamCode.DeliveryTimeout, "too late"))).not.toBeInstanceOf(Expired);
 });

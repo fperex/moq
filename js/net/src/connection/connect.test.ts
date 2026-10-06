@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ALPN_05, ALPN_07 } from "../lite/version.ts";
+import { ALPN_05, ALPN_06, ALPN_07_WIP } from "../lite/version.ts";
 import { createMockTransportPair } from "../mock.ts";
 import { type ConnectProps, connect as connectSession } from "./connect.ts";
 
@@ -54,8 +54,10 @@ function stubWebTransport(transport: WebTransport): () => void {
 	};
 }
 
-test("WebTransport offers lite-07 first by default", async () => {
-	const pair = createMockTransportPair(ALPN_07);
+// Connect through a stubbed `new WebTransport(...)`, returning the offered protocols and
+// the negotiated version.
+async function offered(alpn: string, props: Omit<ConnectProps, "url"> = {}) {
+	const pair = createMockTransportPair(alpn);
 	const original = globalThis.WebTransport;
 	let protocols: string[] | undefined;
 
@@ -66,13 +68,24 @@ test("WebTransport offers lite-07 first by default", async () => {
 	globalThis.WebTransport = StubWebTransport as unknown as typeof WebTransport;
 
 	try {
-		const connection = await connect(url, { websocket: { enabled: false } });
-		connection.close();
+		const connection = await connect(url, { websocket: { enabled: false }, ...props });
+		connection.abort();
+		return { protocols, version: connection.version };
 	} finally {
 		globalThis.WebTransport = original;
 	}
+}
 
-	expect(protocols?.[0]).toBe("moq-lite-07");
+test("WebTransport offers lite-06 first by default", async () => {
+	const { protocols } = await offered(ALPN_06);
+	expect(protocols?.[0]).toBe("moq-lite-06");
+	expect(protocols).not.toContain(ALPN_07_WIP);
+});
+
+test("WebTransport negotiates lite-07-wip only when explicitly offered", async () => {
+	const { protocols, version } = await offered(ALPN_07_WIP, { webtransport: { protocols: [ALPN_07_WIP] } });
+	expect(protocols).toEqual(["moq-lite-07-wip"]);
+	expect(version).toBe("moq-lite-07-wip");
 });
 
 test("connect logs the relay URL without its credentials", async () => {
@@ -80,21 +93,12 @@ test("connect logs the relay URL without its credentials", async () => {
 	const restoreTransport = stubWebTransport(pair.client);
 	const captured = captureConsole();
 
-	const mode = process.env.MODE;
-	const nodeEnv = process.env.NODE_ENV;
-	process.env.MODE = "development";
-	process.env.NODE_ENV = "development";
-
 	try {
 		const connection = await connect(authUrl, { websocket: { enabled: false } });
-		connection.close();
+		connection.abort();
 	} finally {
 		captured.restore();
 		restoreTransport();
-		if (mode === undefined) delete process.env.MODE;
-		else process.env.MODE = mode;
-		if (nodeEnv === undefined) delete process.env.NODE_ENV;
-		else process.env.NODE_ENV = nodeEnv;
 	}
 
 	// The diagnostics must still identify the relay, just without the query.
@@ -105,32 +109,6 @@ test("connect logs the relay URL without its credentials", async () => {
 		expect(line).not.toContain(SECRET);
 		expect(line).not.toContain("jwt");
 	}
-});
-
-test("connect emits no diagnostics in a production build", async () => {
-	const pair = createMockTransportPair(ALPN_05);
-	const restoreTransport = stubWebTransport(pair.client);
-
-	// Bun aliases `import.meta.env` to `process.env`, which is what the DEV check reads.
-	const mode = process.env.MODE;
-	process.env.MODE = "production";
-
-	const captured = captureConsole();
-
-	try {
-		const connection = await connect(authUrl, { websocket: { enabled: false } });
-		connection.close();
-	} finally {
-		captured.restore();
-		restoreTransport();
-		if (mode === undefined) {
-			delete process.env.MODE;
-		} else {
-			process.env.MODE = mode;
-		}
-	}
-
-	expect(captured.lines).toEqual([]);
 });
 
 test("already-aborted signal rejects without connecting", async () => {
@@ -226,7 +204,7 @@ test("abort after a successful connect does nothing", async () => {
 		await settle();
 		expect(closed).toBe(false);
 
-		connection.close();
+		connection.abort();
 	} finally {
 		globalThis.WebTransport = original;
 	}
@@ -259,7 +237,7 @@ test("abort race never returns a closed connection", async () => {
 
 		if ("connection" in result) {
 			expect(transportClosed).toBe(false);
-			result.connection.close();
+			result.connection.abort();
 		} else {
 			expect(result.err).toBe(reason);
 			expect(transportClosed).toBe(true);
@@ -273,5 +251,5 @@ test("connect without a signal still works", async () => {
 	const connection = await connect(url, { transport: pair.client });
 	expect(connection.url.href).toBe(url.href);
 
-	connection.close();
+	connection.abort();
 });

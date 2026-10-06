@@ -1,276 +1,167 @@
 /**
- * Grades the recorded arrival traces, with no relay, no shaper, and no browser.
+ * Replays the recorded traces through the player's consumer and rings, and writes each row the way
+ * `driver.ts` writes a browser row, so `analyze.ts` reduces both alike.
  *
- * The other two lanes measure a player against a live path, which is the only way to learn what a
- * listener hears and also the reason they take half an hour and drift by a few percent between runs.
- * This one measures the same player against a recording: the same `Container.Jitter`, the same two
- * rings, the same `Stretcher`, driven on a simulated clock by
- * [`js/watch/src/audio/replay.ts`](../../../../js/watch/src/audio/replay.ts), which is also what
- * `replay.test.ts` drives. It is deterministic, it runs in a second, and its budgets can be hard
- * zeros because nothing in it can be unlucky.
+ * The player half is `js/watch/src/audio/replay.ts`: the real container consumer and rings on a
+ * simulated clock, at the delay a real `Sync` resolves from the playout target it measures. This half
+ * reads its quanta through the same classifier the page's output tap runs, and samples the ring
+ * every 250 ms of simulated time, as the probe samples a page. Every profile is the trace's name at
+ * the "auto" delay a viewer gets by default.
  *
- * What it cannot say is anything about the transport, the decoder, the device, or the wall clock:
- * there is no session and no audio hardware, so those metrics are null rather than zero. The traces
- * are arrival timing only, trimmed from the recordings attached to moq-dev/moq#3477.
+ *     bun replay.ts --traces ../../traces --profiles relay-bbb --rings plain --codecs aac --list
+ *     bun replay.ts --traces ../../traces --out <run dir>
  *
- *     bun replay.ts --out <run dir> [--rings isolated,plain] [--fixtures lan-bbb,...]
+ * `--list` prints the row tags; otherwise it writes `<tag>.ndjson` and `<tag>.page.json` per row.
  *
  * @module
  */
-import { mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { parseArgs } from "node:util";
-import fourKWebm from "../../../../js/watch/src/audio/fixtures/4k-webm.json" with { type: "json" };
-import lanBbb from "../../../../js/watch/src/audio/fixtures/lan-bbb.json" with { type: "json" };
-import micFirefox from "../../../../js/watch/src/audio/fixtures/mic-firefox.json" with { type: "json" };
-import micLocal from "../../../../js/watch/src/audio/fixtures/mic-local.json" with { type: "json" };
-import micLocalMute from "../../../../js/watch/src/audio/fixtures/mic-local-mute.json" with { type: "json" };
-import micRemote from "../../../../js/watch/src/audio/fixtures/mic-remote.json" with { type: "json" };
-import relayBbb7Frame from "../../../../js/watch/src/audio/fixtures/relay-bbb-7frame.json" with { type: "json" };
-import { type Fixture, post, recorded, replay, shared } from "../../../../js/watch/src/audio/replay.ts";
+import type * as Catalog from "@moq/hang/catalog";
+import { classify, Ledger } from "./src/quantum.ts";
 import {
-	BUCKET_MS,
-	convergence,
-	episodes as episodesOf,
-	frameFloor,
-	type Point,
+	type Environment,
 	type Ring,
 	type Row,
-	round1,
 	rowKey,
 	SAMPLE_INTERVAL_MS,
-	STAGES,
-	type Stage,
-	type StageSpan,
-	type Summary,
-	stats,
+	type Sample,
+	SILENCE_RMS,
+	type Stall,
+	type Trace,
+	traceCodec,
 } from "./src/schema.ts";
-
-/**
- * A trace, and the stream it was recorded off.
- *
- * The codec and rate are the recording's, not a choice: a trace carries no bitstream, but the frame
- * spacing in it is the codec's frame duration, and running the ring at a rate the recording never
- * had would grade a stream that never existed. `lan-bbb` and `relay-bbb-7frame` are 23.22 ms apart,
- * which is 1024 samples at 44.1 kHz; `4k-webm` and the two microphone recordings are 20 ms, which is
- * Opus.
- */
-type Recording = {
-	/** The trace, which is the row's `profile`: what the path did, recorded rather than shaped. */
-	name: string;
-	fixture: Fixture;
-	codec: Row["codec"];
-	rate: number;
-};
-
-const RECORDINGS: Recording[] = [
-	{ name: "lan-bbb", fixture: lanBbb as Fixture, codec: "aac", rate: 44100 },
-	{ name: "relay-bbb-7frame", fixture: relayBbb7Frame as Fixture, codec: "aac", rate: 44100 },
-	{ name: "4k-webm", fixture: fourKWebm as Fixture, codec: "opus", rate: 48000 },
-	{ name: "mic-local", fixture: micLocal as Fixture, codec: "opus", rate: 48000 },
-	{ name: "mic-local-mute", fixture: micLocalMute as Fixture, codec: "opus", rate: 48000 },
-	{ name: "mic-remote", fixture: micRemote as Fixture, codec: "opus", rate: 48000 },
-	{ name: "mic-firefox", fixture: micFirefox as Fixture, codec: "opus", rate: 48000 },
-];
-
-/**
- * Wall time discarded before grading, in ms.
- *
- * The target starts at the cold-start guess and falls one bucket a second, and every fall costs the
- * ring the bucket it lands on. That is convergence, which `converge_s` grades on its own; grading it
- * again as an underrun would grade the tune-in twice. The same figure `replay.test.ts` uses on these
- * recordings.
- */
-const WARMUP_MS = 4000;
 
 const { values } = parseArgs({
 	options: {
-		out: { type: "string" },
+		traces: { type: "string" },
+		profiles: { type: "string" },
 		rings: { type: "string", default: "isolated,plain" },
-		fixtures: { type: "string", default: RECORDINGS.map((r) => r.name).join(",") },
+		codecs: { type: "string", default: "opus,aac" },
+		out: { type: "string" },
 		list: { type: "boolean", default: false },
 	},
 });
-
-if (!values.out && !values.list) {
-	console.error("usage: replay.ts --out <run dir> [--rings isolated,plain] [--fixtures lan-bbb,...] [--list]");
+if (!values.traces || (!values.list && !values.out)) {
+	console.error("usage: replay.ts --traces DIR [--profiles a,b] [--rings r] [--codecs c] (--list | --out DIR)");
 	process.exit(2);
 }
+const dir = values.traces;
+const split = (list: string) => list.split(",").filter((s) => s !== "");
 
-const wanted = values.rings.split(",").map((r) => r.trim());
-for (const ring of wanted) {
-	if (ring !== "isolated" && ring !== "plain") {
-		console.error(`error: unknown ring '${ring}' (known: isolated, plain)`);
+const traces = readdirSync(dir)
+	.filter((f) => f.endsWith(".json"))
+	.sort()
+	.map((f) => ({ profile: basename(f, ".json"), trace: JSON.parse(readFileSync(join(dir, f), "utf8")) as Trace }));
+const profiles = values.profiles === undefined ? undefined : split(values.profiles);
+const rings = split(values.rings);
+const codecs = split(values.codecs);
+const selectors: [string, string[], string[]][] = [
+	["profile", profiles ?? [], traces.map((t) => t.profile)],
+	["ring", rings, ["isolated", "plain"]],
+	["codec", codecs, ["opus", "aac"]],
+];
+for (const [name, list, known] of selectors) {
+	const unknown = list.find((v) => !known.includes(v));
+	if (unknown !== undefined) {
+		console.error(`unknown ${name} '${unknown}' (known: ${known.join(", ")})`);
 		process.exit(2);
 	}
 }
-const names = values.fixtures.split(",").map((f) => f.trim());
-for (const name of names) {
-	if (!RECORDINGS.some((r) => r.name === name)) {
-		console.error(`error: unknown fixture '${name}' (known: ${RECORDINGS.map((r) => r.name).join(", ")})`);
-		process.exit(2);
+
+const rows: { row: Row; trace: Trace }[] = [];
+for (const { profile, trace } of traces) {
+	if (trace.version !== 2) throw new Error(`${profile}: trace version ${trace.version}, expected 2`);
+	const codec = traceCodec(trace);
+	if (profiles && !profiles.includes(profile)) continue;
+	if (!codecs.includes(codec)) continue;
+	for (const ring of rings as Ring[]) {
+		rows.push({ row: { runtime: "replay", codec, rate: trace.config.sampleRate, profile, ring }, trace });
 	}
 }
-
-/** Samples in `ms` at `rate`, which is how every sample count reaches a summary. */
-const asMs = (samples: number, rate: number): number => (samples / rate) * 1000;
-
-/** Every row this invocation covers, in the order it runs them. */
-const matrix = names.flatMap((name) => {
-	const recording = RECORDINGS.find((r) => r.name === name) as Recording;
-	return (wanted as Ring[]).map((ring) => ({
-		recording,
-		row: { runtime: "replay", codec: recording.codec, rate: recording.rate, profile: recording.name, ring } as Row,
-	}));
-});
 
 if (values.list) {
-	for (const { row } of matrix) console.log(rowKey(row));
-	console.error(`\n${matrix.length} rows, one per recording per ring`);
+	for (const { row } of rows) console.log(rowKey(row));
 	process.exit(0);
 }
+const out = values.out as string;
 
-const out = resolve(values.out as string);
-mkdirSync(out, { recursive: true });
+// Loaded only to play: listing runs before `run.sh` has installed the workspace the player needs.
+const { replay } = await import("../../../../js/watch/src/audio/replay.ts");
 
-for (const { recording, row } of matrix) {
+for (const { row, trace } of rows) {
 	const tag = rowKey(row);
+	const rate = row.rate;
 
-	const arrivals = recorded(recording.fixture);
-	const floorMs = frameFloor(arrivals.map((a) => a.media));
-	if (floorMs === undefined) {
-		console.error(`error: ${tag} has no two distinct media timestamps, so it has no frame duration`);
-		process.exit(2);
-	}
+	const ledger = new Ledger(rate, SILENCE_RMS);
+	const samples: Sample[] = [];
+	let stalls: Stall[] = [];
+	let stalled = true;
+	let frame = 0;
+	let next = SAMPLE_INTERVAL_MS;
 
-	const build = row.ring === "isolated" ? shared(recording.rate) : post(recording.rate);
-	const result = replay(build, arrivals, {
-		rate: recording.rate,
-		floorMs,
-		warmupMs: WARMUP_MS,
-		sampleMs: SAMPLE_INTERVAL_MS,
+	// The consumer's warnings, as the page's probe keeps a browser row's console.
+	const notes: string[] = [];
+	const warn = console.warn;
+	console.warn = (...args: unknown[]) => {
+		if (notes.length < 200) notes.push(args.map(String).join(" ").slice(0, 200));
+	};
+
+	const arrivals = trace.arrivals.map(([at, timestamp, group]) => ({ at, timestamp, group }));
+	const sample = (quantum: { at: number; timestamp: number; stalled: boolean; delay: number }) => {
+		const gaps = ledger.take();
+		samples.push({
+			at: quantum.at,
+			render: quantum.at,
+			timestamp: quantum.timestamp,
+			stalled: quantum.stalled,
+			delay: quantum.delay,
+			quanta: ledger.counts.quanta,
+			quiet: ledger.counts.quiet,
+			gaps: gaps.length > 0 ? gaps : undefined,
+			stalls: stalls.length > 0 ? stalls : undefined,
+		});
+		stalls = [];
+	};
+
+	const quanta = replay(arrivals, {
+		ring: row.ring === "isolated" ? "shared" : "post",
+		rate,
+		delay: "auto",
+		config: trace.config as unknown as Catalog.AudioConfig,
+		duration: trace.duration,
 	});
+	let last: { at: number; timestamp: number; stalled: boolean; delay: number } | undefined;
+	for await (const quantum of quanta) {
+		// The render clock is the simulated one: the trace's `at`, which starts at zero.
+		ledger.add(frame, quantum.output.length, classify([quantum.output]));
+		frame += quantum.output.length;
+		if (quantum.stalled !== stalled) {
+			stalled = quantum.stalled;
+			stalls.push({ at: quantum.at, stalled });
+		}
+		last = { at: quantum.at, timestamp: quantum.timestamp, stalled: quantum.stalled, delay: quantum.delay };
 
-	// Everything below the warmup mark is the tune-in, and `converge_s` is what grades it.
-	const graded = result.samples.filter((s) => s.at >= WARMUP_MS);
-	const first = graded[0];
-	const last = graded.at(-1);
-	const windowMs = last && first ? last.at - first.at : 0;
-	const minutes = Math.max(1e-9, windowMs / 60000);
+		if (quantum.at >= next) {
+			next += SAMPLE_INTERVAL_MS;
+			sample(last);
+		}
+	}
+	// A trace that ends inside a gap still counts it.
+	ledger.finish();
+	if (last) sample(last);
+	console.warn = warn;
 
-	// The ring's own underrun counter, sampled: exact, unlike the browser's, because there is no
-	// page between the counter and this file.
-	const points: Point[] = graded.map((cur, i) => ({
-		at: cur.at,
-		rising: i > 0 && cur.debug.underruns > (graded[i - 1]?.debug.underruns ?? 0),
-		excluded: cur.debug.stalled,
-	}));
-	const episodes = episodesOf(points, last?.at ?? WARMUP_MS);
-	const episodeStats = stats(episodes);
-
-	const targetSeries = result.samples.map((s) => ({ at: s.at, ms: s.target }));
-	const targetStats = stats(graded.map((s) => s.target));
-	const stalled = graded.length > 0 ? graded.filter((s) => s.debug.stalled).length / graded.length : null;
-
-	const rise = (read: (at: (typeof graded)[number]) => number): number =>
-		last && first ? read(last) - read(first) : 0;
-	const underruns = rise((s) => s.debug.underruns);
-	const skips = rise((s) => s.debug.skips);
-	const skippedSamples = rise((s) => s.debug.skipped);
-	const observedJumps = rise((s) => s.debug.jumps);
-	const observedSkipped = rise((s) => s.debug.jumped);
-	const discarded = rise((s) => s.debug.discarded);
-	const accelerates = rise((s) => s.debug.accelerates);
-	const expands = rise((s) => s.debug.expands);
-	// The ring publishes the signed net (what an accelerate removed less what an expansion
-	// inserted), so a row where both ran reports the net rather than the sum: a lower bound on how
-	// much media had its duration altered, not the total.
-	const stretched = Math.abs(rise((s) => s.debug.stretched));
-	const short = rise((s) => s.debug.short);
-
-	// The one span this lane holds: what the receiver is buffering. There is no device and no
-	// session, so the rest are unmeasured rather than zero, and there is no end-to-end to check
-	// the sum against.
-	const measured: Partial<Record<Stage, StageSpan>> = {
-		jitter_buffer: { ms: round1(last?.target) ?? null, source: "measured" },
+	const environment: Environment = {
+		crossOriginIsolated: row.ring === "isolated",
+		transport: trace.transport,
+		codec: trace.config.codec,
+		rate,
+		jitter: trace.config.jitter,
+		contextRate: rate,
 	};
-	const stages = Object.fromEntries(
-		STAGES.map((stage) => [stage, measured[stage] ?? { ms: null, source: "unmeasured" }]),
-	) as Record<Stage, StageSpan>;
-
-	const summary: Summary = {
-		version: 1,
-		row,
-		seed: 0,
-		windowSec: round1(windowMs / 1000) ?? 0,
-		warmupSec: WARMUP_MS / 1000,
-		rate: recording.rate,
-		environment: null,
-		voids: [],
-		metrics: {
-			underruns_total: underruns,
-			underruns_per_min: round1(underruns / minutes),
-			underrun_episodes_total: episodes.length,
-			underrun_episodes_per_min: round1(episodes.length / minutes),
-			underrun_episodes_p50: round1(episodeStats.p50),
-			underrun_episodes_p95: round1(episodeStats.p95),
-			underrun_episodes_max: round1(episodeStats.max),
-			// Every sample count here is exact, so it is converted at the recording's own rate
-			// rather than estimated from a sampling grid.
-			underrun_samples_total: null,
-			underrun_samples_per_min: null,
-			short_quanta_total: short,
-			short_quanta_per_min: round1(short / minutes),
-			stalled_quanta_share: stalled === null ? null : Math.round(stalled * 1000) / 1000,
-			discarded_samples_total: round1(asMs(discarded, recording.rate)),
-			discarded_samples_per_min: round1(asMs(discarded, recording.rate) / minutes),
-			skip_aheads_total: skips,
-			skip_aheads_per_min: round1(skips / minutes),
-			skipped_samples_total: round1(asMs(skippedSamples, recording.rate)),
-			skipped_samples_per_min: round1(asMs(skippedSamples, recording.rate) / minutes),
-			observed_jumps_total: observedJumps,
-			observed_jumps_per_min: round1(observedJumps / minutes),
-			observed_skipped_samples_total: round1(asMs(observedSkipped, recording.rate)),
-			observed_skipped_samples_per_min: round1(asMs(observedSkipped, recording.rate) / minutes),
-			accelerates_total: accelerates,
-			accelerates_per_min: round1(accelerates / minutes),
-			expands_total: expands,
-			expands_per_min: round1(expands / minutes),
-			stretched_samples_total: round1(asMs(stretched, recording.rate)),
-			stretched_samples_per_min: round1(asMs(stretched, recording.rate) / minutes),
-			// No container consumer, no subscription, no device, no session: the metrics that
-			// read them report null rather than a flattering zero.
-			skipped_groups_total: null,
-			skipped_groups_per_min: null,
-			target_ms_p50: round1(targetStats.p50),
-			target_ms_p95: round1(targetStats.p95),
-			target_ms_max: round1(targetStats.max),
-			target_ms_last: round1(last?.target),
-			converge_s_seconds: round1(convergence(targetSeries, 0, BUCKET_MS, result.elapsedMs)),
-			silence_share_share: null,
-			wall_clock_share_share: null,
-			render_load_p95: null,
-			render_load_max: null,
-			worklet_cadence_p95: null,
-			worklet_cadence_max: null,
-			media_drift_last: null,
-		},
-		targetSeries,
-		episodes: episodes.map((e) => round1(e) ?? 0),
-		stages,
-		endToEndMs: null,
-		identityHolds: null,
-		drift: [],
-		shaper: null,
-		notes: [
-			`replayed ${recording.fixture.source}`,
-			"no transport, device, or wall clock: the metrics that need one report null",
-		],
-	};
-
-	await Bun.write(join(out, `${tag}.summary.json`), JSON.stringify(summary, null, 1));
-	console.log(
-		`${tag}: target ${last?.target ?? 0}ms, ${underruns} underruns in ${episodes.length} episodes, ` +
-			`${skips} skips over ${round1(windowMs / 1000)}s, ${accelerates} accelerates and ${expands} expands`,
-	);
+	await Bun.write(join(out, `${tag}.ndjson`), `${samples.map((s) => JSON.stringify(s)).join("\n")}\n`);
+	await Bun.write(join(out, `${tag}.page.json`), JSON.stringify({ environment, notes, voids: [] }, null, 1));
+	console.log(`${tag}: ${samples.length} samples, settling at a ${Math.round(last?.delay ?? 0)} ms target`);
 }

@@ -1,136 +1,29 @@
-import * as Container from "@moq/hang/container";
+import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
-import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
+import {
+	type Dispose,
+	Effect,
+	type Getter,
+	getter,
+	type Inputs,
+	type Readonlys,
+	readonlys,
+	Signal,
+} from "@moq/signals";
 
 /**
  * How far playback trails the live edge.
  *
- * `"auto"` (the default) sizes the jitter buffer from how late frames actually arrive; a
- * `Time.Milli` is the whole delay, with nothing added to it for what the publisher advertises.
+ * `"auto"` (the default) holds the largest playout target the registered decoders measure from how
+ * late their frames arrive (see doc/concept/audio-jitter.md). A `Time.Milli` fixes the delay at
+ * exactly that number and disables adaptation.
  *
  * `"instant"` drops the buffer and the pacing together: nothing is held, and {@link Sync.wait}
  * returns without sleeping, so a frame presents as soon as it exists. It also overrides
  * {@link SyncInput.buffer}, since holding a lookahead would contradict holding nothing. Audio is
- * the owner's business: a ring with no depth underruns, so whoever wants this mode is expected to
- * turn audio off.
+ * off: a ring with no depth underruns, so the audio decoder unsubscribes and flushes its ring.
  */
 export type Delay = "instant" | "auto" | Time.Milli;
-
-// The widest measured jitter "auto" sizes a buffer from, which is the estimator's own ceiling.
-const JITTER_CEILING = Time.Milli(Container.Jitter.CEILING);
-
-// The lead a viewer does not notice (ITU-R BT.1359: about 45ms of sound-ahead), so the part of it
-// the hold does not have to buy back: a call wants the latency more than perfect sync.
-const OFFSET_TOLERANCE = Time.Milli(45);
-
-// The most latency lip sync is worth, which is what a call tolerates: a picture further behind is
-// out of sync whatever the sound does. It also bounds tune-in, where the video track replays the
-// backlog since its last keyframe and every arrival looks that late.
-const OFFSET_MAX = Time.Milli(100);
-
-// How long the hold holds a value before it may move another bucket. The ring spends every move as
-// a park or a stretch, audible in a burst, and a transient such as the camera's warm-up frames
-// rotates out of the windows before the hold has grown into it.
-const OFFSET_STEP = Time.Milli(1_000);
-
-// How long one track's arrival floor stands before it stops counting.
-//
-// Two of these are kept and rotated, so a track that stops delivering (a muted tile, a hidden
-// canvas) drops out of the comparison within two windows rather than holding the buffer deep for
-// the rest of the session. Wide enough that an ordinary group cadence refreshes it many times over.
-const OFFSET_WINDOW = Time.Milli(2_000);
-
-// How long a track's reading stays in the comparison after the track stops publishing one. A
-// rendition that blinks (a hidden camera) would otherwise resize the ring down and straight back,
-// an underrun the listener hears; a track that has really gone still lets go.
-const SPREAD_WINDOW = Time.Milli(2_000);
-
-// Submillisecond clock noise does not move waiting frames' display deadlines.
-const REFERENCE_SLACK = Time.Milli(1);
-
-/**
- * One track's arrival floor, as two rotating windows.
- *
- * A minimum rather than a mean, for the same reason the estimator measures each arrival against
- * the fastest recent one: the floor is the path, and everything above it is jitter the estimator
- * already covers.
- */
-type Arrival = {
-	/** The floor seen since the window opened. */
-	current: number;
-	/** The previous window's floor, so the reading spans at least one full window. */
-	previous: number;
-	/** When the current window opened. */
-	opened: Time.Milli;
-};
-
-/**
- * A sample of a track's playhead: where it is on the media timeline, and when it was there.
- *
- * The track that publishes one drives playback for every other track. See {@link Sync.track}.
- */
-export type Clock = {
-	/** The media position the playhead held at {@link Clock.reference}. */
-	timestamp: Time.Micro;
-
-	/** The monotonic time (`Time.Milli.now()`) at which the playhead held {@link Clock.timestamp}. */
-	reference: Time.Milli;
-
-	/**
-	 * Media time per unit of wall time: 1 while playing, 0 while the playhead is parked.
-	 *
-	 * {@link Sync} extrapolates with it between samples, so a parked playhead parks playback rather
-	 * than letting the other tracks run away from it.
-	 */
-	rate: number;
-};
-
-/** Where `clock` puts the playhead at `now`, extrapolated at its own rate. */
-function extrapolate(clock: Clock, now: Time.Milli): Time.Milli {
-	const elapsed = Time.Milli.sub(now, clock.reference);
-	return Time.Milli.add(Time.Milli.fromMicro(clock.timestamp), Time.Milli(elapsed * clock.rate));
-}
-
-/**
- * One of the tracks {@link Sync} keeps in step.
- *
- * See {@link Sync.track}.
- */
-export class SyncTrack {
-	/** Which track this is. */
-	readonly name: "audio" | "video" | "text";
-
-	/**
-	 * How late this track's frames arrive relative to the earliest one, from the container consumer.
-	 *
-	 * This is what `"auto"` sizes the jitter buffer from: it measures what the publisher and the
-	 * network actually deliver, which the round trip does not describe. The rendition's advertised
-	 * flush span is where that measurement starts, applied by the container consumer, so it needs no
-	 * second term here.
-	 */
-	readonly spread = new Signal<Time.Milli | undefined>(undefined);
-
-	constructor(name: "audio" | "video" | "text") {
-		this.name = name;
-	}
-}
-
-/**
- * A track that renders on a playhead of its own, so it can drive the clock.
- *
- * Set {@link SyncClockTrack.clock} while that playhead is moving and every other track is paced
- * against it; clear it when the track stops rendering. Captions are not one of these: they render
- * on {@link Sync.now}, so nominating one would leave the clock chasing itself.
- */
-export class SyncClockTrack extends SyncTrack {
-	/**
-	 * This track's playhead, or `undefined` while it is not rendering.
-	 *
-	 * Republish it as the playhead moves; {@link Sync} extrapolates between samples, so a slow
-	 * cadence costs accuracy rather than motion.
-	 */
-	readonly clock = new Signal<Clock | undefined>(undefined);
-}
 
 export type SyncInput = {
 	/** How far playback trails the live edge. See {@link Delay}. */
@@ -145,31 +38,26 @@ export type SyncInput = {
 	 * drops its oldest samples rather than exhausting memory.
 	 */
 	buffer: Getter<Time.Milli>;
+
+	/** @internal */
+	probe: Getter<Moq.Connection.Probe | undefined>;
 };
 
 type SyncOutput = {
-	// The earliest time we've received a frame, relative to its timestamp: the wall-clock anchor
-	// playback runs on. While a track drives the clock this is re-derived from its playhead instead,
-	// so dropping the clock leaves playback exactly where the playhead left it.
+	// Derived: whether the delay is "instant". Numeric and "auto" delays share `false`, so readers
+	// that only care about the mode don't rerun when the number changes.
+	instant: Signal<boolean>;
+
+	// The earliest time we've received a frame, relative to its timestamp.
+	// This will keep being updated as we catch up to the live playhead then will be relatively static.
 	reference: Signal<Time.Milli | undefined>;
 
-	// Which track's playhead the reference follows, or undefined while it follows the wall clock.
-	clock: Signal<"audio" | "video" | undefined>;
-
-	// The resolved delay from the live edge to the playhead, which is the jitter and nothing else.
-	// The publisher's advertised flush span is the quantity the estimator measures, so it seeds the
-	// estimate (`Container.Consumer`'s `jitter` prop) rather than adding a second term here.
+	// The resolved delay from the live edge to the playhead: the configured number, or in "auto" the
+	// largest registered playout target. Zero for "instant".
 	delay: Signal<Time.Milli>;
 
-	// The jitter, always equal to `delay`: the widest measured arrival spread across tracks in
-	// "auto" mode, the configured number when fixed, zero when "instant".
+	// The jitter buffer, always equal to `delay`.
 	jitter: Signal<Time.Milli>;
-
-	// How long the sound is held so a later picture lands with it: how much later the picture
-	// arrives, less the lead a viewer would not notice, capped at what a call tolerates and moved
-	// one bucket at a time. Zero when they arrive together, which is the ordinary case, and zero
-	// until something has been measured. See `#observeArrival`.
-	offset: Signal<Time.Milli>;
 
 	// The media timestamp of the most recently received frame.
 	timestamp: Signal<Time.Milli | undefined>;
@@ -187,48 +75,21 @@ type SyncOutput = {
 export class Sync {
 	readonly in: Readonlys<SyncInput>;
 
-	readonly #tracks = {
-		audio: new SyncClockTrack("audio"),
-		video: new SyncClockTrack("video"),
-		text: new SyncTrack("text"),
-	};
-
 	readonly #out: SyncOutput = {
+		instant: new Signal<boolean>(false),
 		reference: new Signal<Time.Milli | undefined>(undefined),
-		clock: new Signal<"audio" | "video" | undefined>(undefined),
 		delay: new Signal<Time.Milli>(Time.Milli.zero),
 		jitter: new Signal<Time.Milli>(Time.Milli.zero),
-		offset: new Signal<Time.Milli>(Time.Milli.zero),
 		timestamp: new Signal<Time.Milli | undefined>(undefined),
 		buffered: new Signal<boolean>(false),
 		maxAge: new Signal<Time.Milli>(Time.Milli.zero),
 	};
 	readonly out = readonlys(this.#out);
 
-	// The playhead sample playback is extrapolated from, or undefined while it runs on the wall
-	// clock. Read on every `now()`/`wait()`, which is why it is a plain field: video paces against
-	// main-thread memory rather than reaching across to the worklet per frame.
-	#clock: Clock | undefined;
-
 	// Per-label late-frame tracking: accumulate count and max lateness, flush on recovery.
 	#late = new Map<string, { count: number; maxMs: number }>();
 
-	// Per-track arrival floors, for the cross-track offset. Only the tracks that render on the
-	// shared clock: captions render on `now()`, so holding sound for a late one would be wrong.
-	#arrivals = new Map<"audio" | "video", Arrival>();
-
-	// When the hold last moved, so it moves by one bucket at a time rather than in a burst.
-	#stepped: Time.Milli | undefined;
-
-	// The trail the published reference was derived with, so a new trail always republishes it.
-	#referenceTrail: Time.Milli | undefined;
-
-	// The last reading each track published, and when it stops counting once the track has stopped
-	// publishing it. See SPREAD_WINDOW.
-	#spreads = new Map<"audio" | "video" | "text", { spread: Time.Milli; until?: Time.Milli }>();
-
-	// Bumped when a departed track's reading runs out, so the widest is taken again without it.
-	#expired = new Signal(0);
+	#media = new Signal<{ target: Getter<Time.Milli | undefined> }[]>([]);
 
 	#signals = new Effect();
 
@@ -236,273 +97,72 @@ export class Sync {
 		this.in = {
 			delay: getter(props?.delay ?? ("auto" as Delay)),
 			buffer: getter(props?.buffer ?? Time.Milli.zero),
+			probe: getter(props?.probe),
 		};
 
-		this.#signals.run(this.#runJitter.bind(this));
+		this.#signals.run(this.#runInstant.bind(this));
+		this.#signals.run(this.#runDelay.bind(this));
 		this.#signals.run(this.#runMaxAge.bind(this));
-		this.#signals.run(this.#runClock.bind(this));
 	}
 
-	/**
-	 * The handle for one of the tracks being kept in step.
-	 *
-	 * Stable for the life of the `Sync`: the decoders wire their measured spread into it, and the
-	 * ones that render on a playhead nominate themselves as the clock.
-	 */
-	track(name: "audio" | "video"): SyncClockTrack;
-	track(name: "text"): SyncTrack;
-	track(name: "audio" | "video" | "text"): SyncTrack {
-		return this.#tracks[name];
+	/** Hold a decoder's "auto" playout target in the shared playback clock until disposed. */
+	register(target: Getter<Time.Milli | undefined>): Dispose {
+		const registered = { target };
+		this.#media.update((media) => [...media, registered]);
+		return () => this.#media.update((media) => media.filter((candidate) => candidate !== registered));
 	}
 
-	// Derive `buffered` / `maxAge` from how far playback trails and the configured lookahead.
-	//
-	// The offset is in here because the budget has to reach as far back as playback waits: a
-	// picture the deeper hold is still waiting for would otherwise be convicted as stale before
-	// it was ever due.
+	#runInstant(effect: Effect): void {
+		this.#out.instant.set(effect.get(this.in.delay) === "instant");
+	}
+
+	// Derive `buffered` / `maxAge` from the resolved delay and the configured lookahead.
 	#runMaxAge(effect: Effect): void {
-		const trail = Time.Milli.add(effect.get(this.#out.delay), effect.get(this.#out.offset));
+		const delay = effect.get(this.#out.delay);
 		// "instant" holds nothing, so a configured lookahead doesn't apply.
-		const buffer = effect.get(this.in.delay) === "instant" ? Time.Milli.zero : effect.get(this.in.buffer);
+		const buffer = effect.get(this.#out.instant) ? Time.Milli.zero : effect.get(this.in.buffer);
 
 		this.#out.buffered.set(buffer > 0);
-		this.#out.maxAge.set(Time.Milli.add(trail, buffer));
+		this.#out.maxAge.set(Time.Milli.add(delay, buffer));
 	}
 
-	/**
-	 * How far behind the live edge playback runs: the estimator's answer plus the cross-track offset.
-	 *
-	 * `out.delay` stays the estimator's answer alone, which is what the player's jitter buffer row
-	 * reports and what the conformance corpus holds both languages to. This is what the clock, the
-	 * age budget and the audio ring are actually sized from.
-	 */
-	#trail(): Time.Milli {
-		return Time.Milli.add(this.#out.delay.peek(), this.#out.offset.peek());
-	}
+	// A fixed delay is taken literally and "auto" holds the deepest track's target, so every track
+	// plays from one clock. See doc/concept/audio-jitter.md for how a target is measured.
+	#runDelay(effect: Effect): void {
+		const mode = effect.get(this.in.delay);
 
-	// "auto" sizes the buffer from what arrives, not from the round trip. A retransmit costs an RTT,
-	// but a publisher flushing a second of media at once costs a second, and a well-paced publisher
-	// across the world costs nothing above its frame duration: the arrival spread measures both, so
-	// it is the only term here.
-	#runJitter(effect: Effect): void {
-		const delay = effect.get(this.in.delay);
-
-		if (delay === "instant") {
-			// Holds nothing at all.
-			this.#out.jitter.set(Time.Milli.zero);
-			this.#out.delay.set(Time.Milli.zero);
-			return;
-		}
-
-		if (typeof delay === "number") {
-			// Fixed mode: the configured delay is the jitter.
-			this.#out.jitter.set(delay);
-			this.#out.delay.set(delay);
-			return;
-		}
-
-		// A track that stopped publishing a reading keeps the last one for SPREAD_WINDOW, so a
-		// rendition that blinks does not take the shared delay down and put it straight back.
-		effect.get(this.#expired);
-		const now = Time.Milli.now();
-
-		let spread = Time.Milli.zero;
-		let expires: Time.Milli | undefined;
-		for (const track of Object.values(this.#tracks)) {
-			const reading = effect.get(track.spread);
-			if (reading !== undefined) {
-				// A reading that stands still never reruns this, so the window cannot be a deadline
-				// refreshed here: it would measure how long ago the reading last moved.
-				this.#spreads.set(track.name, { spread: reading });
-				spread = Time.Milli.max(spread, reading);
-				continue;
+		let delay = Time.Milli.zero;
+		if (typeof mode === "number") {
+			delay = mode;
+		} else if (mode === "auto") {
+			for (const registered of effect.get(this.#media)) {
+				delay = Time.Milli.max(delay, effect.get(registered.target) ?? Time.Milli.zero);
 			}
-
-			const held = this.#spreads.get(track.name);
-			if (!held) continue;
-
-			// The window starts where the track stopped publishing, which is this run.
-			held.until ??= Time.Milli.add(now, SPREAD_WINDOW);
-			if (held.until <= now) {
-				this.#spreads.delete(track.name);
-				continue;
-			}
-
-			spread = Time.Milli.max(spread, held.spread);
-			expires = Time.Milli.min(expires ?? held.until, held.until);
 		}
 
-		// Nothing else wakes this effect when the last reading of a departed track runs out.
-		if (expires !== undefined) {
-			effect.timer(() => this.#expired.update((count) => count + 1), Time.Milli.sub(expires, now));
-		}
-
-		// The estimator drops anything past its histogram's range rather than clamping it, so a
-		// reading above the range is not a reading. Bound the buffer by it either way.
-		const jitter = Time.Milli.min(JITTER_CEILING, spread);
-		this.#out.jitter.set(jitter);
-		this.#out.delay.set(jitter);
-	}
-
-	/**
-	 * Follow whichever track nominated itself, and re-derive the reference from its playhead.
-	 *
-	 * Audio wins over video: it is the track a listener notices a discontinuity in, and it is the
-	 * one whose renderer consumes media on a clock of its own. The reference is kept up to date
-	 * rather than only consulted, so dropping the clock (a mute, a track ending) leaves playback
-	 * running at wall speed from exactly where the playhead was, with no jump for video.
-	 */
-	#runClock(effect: Effect): void {
-		const audio = effect.get(this.#tracks.audio.clock);
-		const video = effect.get(this.#tracks.video.clock);
-		// The reference is expressed relative to how far playback trails, so a change re-derives it.
-		effect.get(this.#out.delay);
-		effect.get(this.#out.offset);
-		const delay = this.#trail();
-
-		let source: "audio" | "video" | undefined;
-		if (audio) source = "audio";
-		else if (video) source = "video";
-
-		const clock = audio ?? video;
-		const previous = this.#clock;
-		const was = this.#out.clock.peek();
-		this.#clock = clock;
-		this.#out.clock.set(source);
-
-		// Nothing nominated and nothing to hand over: the wall-clock anchor from `received` stands.
-		const sample = clock ?? previous;
-		if (!sample) return;
-
-		const now = Time.Milli.now();
-		const reference = Time.Milli.sub(Time.Milli.sub(now, delay), extrapolate(sample, now));
-		// A new sample from the same clock, at the same rate and trail, that lands where the last one
-		// already put playback is not news. Anything else (a handover, a park or resume, a new trail)
-		// is always published.
-		const current = this.#out.reference.peek();
-		const same =
-			current !== undefined &&
-			clock !== undefined &&
-			source === was &&
-			previous !== undefined &&
-			previous.rate === clock.rate &&
-			delay === this.#referenceTrail &&
-			Math.abs(reference - current) < REFERENCE_SLACK;
-		this.#referenceTrail = delay;
-		if (same) return;
-		this.#out.reference.set(reference);
-	}
-
-	/**
-	 * The media position that should be rendering at `now`, or undefined before anything anchored it.
-	 *
-	 * The nominated playhead when there is one, extrapolated locally so a per-frame `wait()` never
-	 * crosses a thread, and the wall-clock anchor otherwise.
-	 */
-	#playhead(now: Time.Milli): Time.Milli | undefined {
-		const clock = this.#clock;
-		if (clock) return extrapolate(clock, now);
-
-		const reference = this.#out.reference.peek();
-		if (reference === undefined) return undefined;
-		return Time.Milli.sub(Time.Milli.sub(now, reference), this.#trail());
-	}
-
-	/**
-	 * Measure how much later one track arrives than the other for the same media timestamp, which
-	 * neither track's own spread can see. See "Holding the sound for a later picture" in
-	 * `doc/concept/playout.md`.
-	 */
-	#observeArrival(name: "audio" | "video", timestamp: Time.Milli, now: Time.Milli): void {
-		const floor = Time.Milli.sub(now, timestamp);
-
-		const entry = this.#arrivals.get(name);
-		if (!entry) {
-			this.#arrivals.set(name, { current: floor, previous: Number.POSITIVE_INFINITY, opened: now });
-		} else if (Time.Milli.sub(now, entry.opened) >= 2 * OFFSET_WINDOW) {
-			// Gone past both windows (a mute): carry what it measured across as the previous window,
-			// since a pause stops the download and not the path, and a hold re-derived from a cold
-			// window would move at the unmute. Re-opened at `now`, so one arrival costs one rotation.
-			entry.previous = entry.current;
-			entry.current = floor;
-			entry.opened = now;
-		} else if (Time.Milli.sub(now, entry.opened) >= OFFSET_WINDOW) {
-			entry.previous = entry.current;
-			entry.current = floor;
-			entry.opened = Time.Milli.add(entry.opened, OFFSET_WINDOW);
-		} else {
-			entry.current = Math.min(entry.current, floor);
-		}
-
-		const floors = new Map<"audio" | "video", number>();
-		for (const [track, arrival] of this.#arrivals) {
-			// A picture that stopped arriving stops counting, so muting a tile or scrolling its
-			// canvas away does not hold the sound deep for the rest of the session: there is
-			// nothing left to be in sync with. Audio is carried instead, because the term is not
-			// about the sound arriving, it is about the picture being later than it.
-			if (track === "video" && Time.Milli.sub(now, arrival.opened) >= 2 * OFFSET_WINDOW) {
-				this.#arrivals.delete(track);
-				continue;
-			}
-			const reading = Math.min(arrival.current, arrival.previous);
-			if (Number.isFinite(reading)) floors.set(track, reading);
-		}
-
-		const audio = floors.get("audio");
-		const video = floors.get("video");
-		if (audio === undefined || video === undefined) {
-			this.#stepOffset(Time.Milli.zero, now);
-			return;
-		}
-
-		// Only the part of video's excess over audio a viewer would notice. An early picture is
-		// already held until the playhead reaches it, so only a late one needs the sound to wait.
-		const behind = Math.max(0, video - audio - OFFSET_TOLERANCE);
-		const bucket = Container.Jitter.BUCKET;
-		const quantised = behind < bucket ? 0 : Math.ceil(behind / bucket) * bucket;
-		this.#stepOffset(Time.Milli(Math.min(OFFSET_MAX, quantised)), now);
-	}
-
-	/**
-	 * Move the hold one bucket towards what the floors ask for, at most once per {@link OFFSET_STEP}.
-	 *
-	 * Both directions, because the ring pays for both: it parks to reach a deeper hold and
-	 * time-compresses to reach a shallower one. The measured value is followed rather than
-	 * smoothed, so a hold that is wrong is still on its way to being right within a few seconds.
-	 */
-	#stepOffset(wanted: Time.Milli, now: Time.Milli): void {
-		const current = this.#out.offset.peek();
-		if (wanted === current) return;
-		if (this.#stepped !== undefined && Time.Milli.sub(now, this.#stepped) < OFFSET_STEP) return;
-
-		const bucket = Container.Jitter.BUCKET;
-		const next = wanted > current ? Math.min(wanted, current + bucket) : Math.max(wanted, current - bucket);
-		this.#stepped = now;
-		this.#out.offset.set(Time.Milli(next));
+		this.#out.jitter.set(delay);
+		this.#out.delay.set(delay);
 	}
 
 	// Fold a newly received frame into the reference. The reference anchors playback to the
 	// wall clock; we lower it (skip ahead) only when keeping it would push the lookahead past `maxAge`.
-	//
-	// `at` is when the frame arrived, on this thread's `Time.Milli.now()` clock, for a frame read on
-	// another thread and reported here later: measured at the report instead, the hop would read as
-	// the path delivering late.
-	received(timestamp: Time.Milli, label = "", at?: Time.Milli): void {
+	received(timestamp: Time.Milli, label = ""): void {
 		this.#out.timestamp.update((current) => (current === undefined || timestamp > current ? timestamp : current));
-		const now = at ?? Time.Milli.now();
-		if (label === "audio" || label === "video") this.#observeArrival(label, timestamp, now);
-		const playhead = this.#playhead(now);
+		const now = Time.Milli.now();
+		const ref = Time.Milli.sub(now, timestamp);
+		const currentRef = this.#out.reference.peek();
 
 		// First frame anchors the reference.
-		if (playhead === undefined) {
-			this.#out.reference.set(Time.Milli.sub(now, timestamp));
+		if (currentRef === undefined) {
+			this.#out.reference.set(ref);
 			return;
 		}
 
 		// Check if `wait()` would not sleep at all.
 		// NOTE: We check here instead of in `wait()` so we can identify when frames are received late.
 		// Otherwise, chained `wait()` calls would cause a false-positive during CPU starvation.
-		const sleep = Time.Milli.sub(timestamp, playhead);
+		const delay = this.#out.delay.peek();
+		const sleep = Time.Milli.add(Time.Milli.sub(currentRef, ref), delay);
 		if (sleep < 0) {
 			const entry = this.#late.get(label);
 			if (entry) {
@@ -521,14 +181,6 @@ export class Sync {
 			}
 		}
 
-		// A nominated playhead is the clock, so an arrival cannot move it: the buffer the frame
-		// lands in decides when it plays, and that buffer is what the playhead reports.
-		if (this.#clock) return;
-
-		const ref = Time.Milli.sub(now, timestamp);
-		const currentRef = this.#out.reference.peek();
-		if (currentRef === undefined) return;
-
 		// Frame isn't earlier than the anchor: it can't add lookahead, so keep the reference.
 		if (ref >= currentRef) return;
 
@@ -538,40 +190,34 @@ export class Sync {
 		if (sleep <= cap) return; // within budget: let the buffer grow instead of skipping ahead
 
 		// Over the cap: re-anchor down so the resulting lookahead is exactly the cap.
-		this.#out.reference.set(Time.Milli.add(ref, Time.Milli.sub(cap, this.#trail())));
+		this.#out.reference.set(Time.Milli.add(ref, Time.Milli.sub(cap, delay)));
 	}
 
 	// Re-anchor playback to the next frame received. Call this at an utterance boundary
 	// in buffered mode (typically alongside flushing the audio buffer) so the new content
 	// plays from its own first frame instead of inheriting the previous reference.
-	//
-	// A nominated track re-anchors the clock on its next sample, which is how the flushed ring
-	// reports where the new utterance starts.
 	reset(): void {
 		this.#out.reference.set(undefined);
-		this.#out.clock.set(undefined);
-		this.#clock = undefined;
 		this.#late.clear();
-		// A rewind moves the media axis, so every arrival floor describes a timeline that no longer
-		// exists. The estimator drops its own reference on a discontinuity for the same reason.
-		this.#arrivals.clear();
-		this.#stepped = undefined;
-		this.#out.offset.set(Time.Milli.zero);
 	}
 
-	// The PTS that should be rendering right now, derived from the clock or the reference.
+	// The PTS that should be rendering right now, derived from the reference + buffer.
 	// Returns undefined if no frames have been received yet.
 	now(): Time.Milli | undefined {
-		return this.#playhead(Time.Milli.now());
+		const reference = this.#out.reference.peek();
+		if (reference === undefined) return undefined;
+		return Time.Milli.sub(Time.Milli.sub(Time.Milli.now(), reference), this.#out.delay.peek());
 	}
 
 	// Sleep until it's time to render this frame.
 	async wait(timestamp: Time.Milli): Promise<void> {
 		// A zero delay still sleeps: the sleep comes from the reference, which holds an early frame
 		// until its timestamp comes up. "instant" is the only thing that skips the wait itself.
+		// Peek the input, not `out.instant`, which lags a same-turn change until effects flush.
 		if (this.in.delay.peek() === "instant") return;
 
-		if (this.#playhead(Time.Milli.now()) === undefined) {
+		const reference = this.#out.reference.peek();
+		if (reference === undefined) {
 			throw new Error("reference not set; call received() first");
 		}
 
@@ -581,36 +227,37 @@ export class Sync {
 
 			// Sleep until it's time to decode the next frame.
 			// NOTE: This function runs in parallel for each frame.
-			const playhead = this.#playhead(Time.Milli.now());
-			if (playhead === undefined) return;
+			const now = Time.Milli.now();
+			const ref = Time.Milli.sub(now, timestamp);
 
-			const remaining = Time.Milli.sub(timestamp, playhead);
-			if (remaining <= 0) return;
+			const currentRef = this.#out.reference.peek();
+			if (currentRef === undefined) return;
 
-			// A parked playhead has no deadline to sleep towards, only a change to wait for.
-			const rate = this.#clock?.rate ?? 1;
-			await this.#sleep(rate > 0 ? remaining / rate : undefined);
+			const sleep = Time.Milli.add(Time.Milli.sub(currentRef, ref), this.#out.delay.peek());
+			if (sleep <= 0) return;
+
+			// Skip setTimeout for small sleeps; the timer resolution (~4ms) would overshoot.
+			if (sleep < 5) return;
+
+			if (await this.#sleep(sleep)) return;
 		}
 	}
 
-	// Sleeps for `ms`, or until woken when it is undefined, returning early once anything the sleep
-	// was computed from changes. The loop in `wait()` re-reads the playhead either way. Releases
-	// every listener either way: frames sleep once each, so a listener left on a signal that never
-	// changes would pile up for the life of the player.
-	#sleep(ms: number | undefined): Promise<void> {
+	// Sleeps for `ms`, or returns false early once anything the sleep was computed from changes.
+	// Releases every listener either way: frames sleep once each, so a listener left on a signal
+	// that never changes would pile up for the life of the player.
+	#sleep(ms: number): Promise<boolean> {
 		return new Promise((resolve) => {
-			const wake = () => {
+			const wake = (ok: boolean) => {
 				clearTimeout(timer);
 				for (const dispose of disposes) dispose();
-				resolve();
+				resolve(ok);
 			};
-			const timer = ms === undefined ? undefined : setTimeout(wake, ms);
+			const timer = setTimeout(() => wake(true), ms);
 			const disposes = [
-				this.in.delay.changed(wake),
-				this.#out.delay.changed(wake),
-				this.#out.offset.changed(wake),
-				// A nominated clock re-derives the reference from every sample that moves the playhead.
-				this.#out.reference.changed(wake),
+				this.in.delay.changed(() => wake(false)),
+				this.#out.delay.changed(() => wake(false)),
+				this.#out.reference.changed(() => wake(false)),
 			];
 		});
 	}
@@ -626,6 +273,5 @@ export class Sync {
 
 	close() {
 		this.#signals.close();
-		this.reset();
 	}
 }

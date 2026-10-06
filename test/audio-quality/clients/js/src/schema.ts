@@ -1,68 +1,63 @@
 /**
- * The metric contract: what the page measures, what the analyzer reduces it to, and what the grader
- * compares against a budget.
+ * The metric contract: what the page samples, what a row reduces to, and what a budget grades.
  *
- * This file is the schema, not a description of one. The page emits {@link Sample}s, the analyzer
- * turns them into a {@link Summary}, the grader reads {@link Summary} against `budgets.json`, and
- * {@link METRICS} says for every graded number what its unit is, which clock it sits on, and how a
- * series became one value. A native lane emitting the same {@link Summary} is comparable to this one
- * by construction rather than by agreement, which is the point of writing it down here.
+ * This file is the schema, not a description of one. The page emits {@link Sample}s, `analyze.ts`
+ * reduces them to a {@link Summary}, and `grade.ts` reads that against `budgets.json`. {@link METRICS}
+ * says for every graded number what it counts, which clock it sits on, and how a series became one
+ * value. Another lane (native playout, the latency ledger) that emits the same {@link Summary} is
+ * comparable to this one by construction.
  *
- * Conventions, once, for everything below:
+ * Conventions, stated once for everything below:
  *
- * - Every duration is milliseconds as a float. Nothing is in seconds, samples, or microseconds by
- *   the time it reaches a {@link Summary}; a sample count is converted at the rate it was counted
- *   at and reported as ms alongside the count.
- * - Every count is a non-negative integer.
- * - Every share is a fraction of 1, not a percentage.
- * - Every timestamp sits on a named {@link Clock}, and the analyzer reduces all of them to the
- *   `viewer` reference before subtracting any two. See {@link Drift}.
+ * - Every duration is milliseconds as a float. A sample count is converted at the rate it was
+ *   counted at before it reaches a {@link Summary}.
+ * - Every count is a non-negative integer. Every share is a fraction of 1.
+ * - Every timestamp sits on a named {@link Clock} and is reduced to `viewer` before any two are
+ *   subtracted. {@link Drift} records what each reduction took.
  *
  * @module
  */
 
-import type MoqWatch from "@moq/watch/element";
-
 /** Milliseconds, as a float. The unit of every duration in this schema. */
 export type Ms = number;
 
-/** Sort media timestamps and return the smallest positive gap, rounded up to milliseconds. */
-export function frameFloor(media: number[]): Ms | undefined {
-	media.sort((a, b) => a - b);
-	let smallest = Number.POSITIVE_INFINITY;
-	for (let i = 1; i < media.length; i++) {
-		const gap = media[i] - media[i - 1];
-		if (gap > 0 && gap < smallest) smallest = gap;
-	}
-	return Number.isFinite(smallest) ? Math.ceil(smallest) : undefined;
-}
-
-/** A fraction of 1. The unit of every share in this schema. */
-export type Share = number;
+/**
+ * The clocks a timestamp can be taken on.
+ *
+ * - `viewer`: the page's `performance.now()`, monotonic. The reference every other clock is reduced
+ *   to, so a stage span is always a difference of two `viewer` values.
+ * - `render`: the page's `AudioContext` frame clock, the audio device's oscillator. Same host, so it
+ *   is reduced by an offset and a drift fitted over the run from paired readings (see
+ *   {@link MAX_RENDER_DRIFT}).
+ * - `media`: the publisher's presentation timestamps, seen through the stream. Not a clock the viewer
+ *   can read directly: its rate against `viewer` is fitted, its offset is unknowable from here.
+ * - `publisher`, `relay`: other processes, often other machines. A timestamp taken there is reduced
+ *   to `viewer` by an offset measured over the same session, NTP style: the offset at the midpoint of
+ *   a round trip, with half the round trip as its uncertainty. A stage whose uncertainty exceeds
+ *   {@link identityTolerance} is reported unmeasured rather than guessed. The browser lane carries no
+ *   such timestamp yet, so every stage that needs one is null here.
+ */
+export type Clock = "viewer" | "render" | "media" | "publisher" | "relay";
 
 /**
- * The clocks a measurement can originate on.
+ * How a series became the one number a budget grades.
  *
- * They are separate processes, so their epochs differ and their rates drift. The analyzer reduces
- * every timestamp to `viewer` and records what that correction was; cross-machine calibration is
- * explicitly not shipped, so a run whose hosts are not the same machine is not comparable and the
- * drift check is what catches it.
+ * - `total`: summed over the graded window.
+ * - `per_min`: `total` divided by the graded window's length in minutes.
+ * - `p50`, `p95`: nearest-rank percentile of the window's samples.
+ * - `max`: the largest value in the window.
+ * - `share`: the fraction of the window for which the condition held.
+ * - `last`: the value at the end of the window.
  */
-export type Clock = "viewer" | "publisher" | "relay" | "shaper";
-
-/** How a series of measurements became the one number a budget grades. */
-export type Aggregation = "total" | "per_min" | "p50" | "p95" | "max" | "share" | "last" | "seconds";
-
-/** The unit a metric is counted in, before aggregation. */
-export type Unit = "ms" | "count" | "share" | "samples";
+export type Aggregation = "total" | "per_min" | "p50" | "p95" | "max" | "share" | "last";
 
 /** What one metric is: enough to read a number off a summary without guessing. */
 export type MetricSpec = {
-	/** What the raw measurement counts. */
-	unit: Unit;
-	/** Which clock its timestamps came from. */
+	/** What the raw measurement is counted in, before aggregation. */
+	unit: "ms" | "count" | "share";
+	/** The clock its timestamps were taken on, before reduction to `viewer`. */
 	clock: Clock;
-	/** The aggregations reported for it, and therefore the budget keys it can be graded by. */
+	/** The aggregations reported for it, and therefore the budget keys that can grade it. */
 	aggregations: Aggregation[];
 	/** One plain line saying what it measures. */
 	description: string;
@@ -71,168 +66,134 @@ export type MetricSpec = {
 /**
  * Every graded metric, keyed by its base name.
  *
- * A budget key is `<name>_<aggregation>`, so `underrun_episodes` graded `per_min` is
- * `underrun_episodes_per_min`. Naming the aggregation in the key is what keeps "underruns: 3" and
- * "underruns: 3/min" from being graded against each other.
+ * A budget key is `<name>_<aggregation>`: `underruns` graded per minute is `underruns_per_min`. Naming
+ * the aggregation in the key is what keeps "underruns: 3" and "underruns: 3/min" from being graded
+ * against each other.
  */
-export const METRICS: Record<string, MetricSpec> = {
+export const METRICS = {
 	underruns: {
 		unit: "count",
-		clock: "viewer",
+		clock: "render",
 		aggregations: ["total", "per_min"],
-		description: "Quanta the ring could only partly fill, counted by the playout ring itself.",
-	},
-	underrun_episodes: {
-		unit: "count",
-		clock: "viewer",
-		aggregations: ["total", "per_min", "p50", "p95", "max"],
 		description:
-			"Runs of consecutive underrunning quanta, counted as one event each. The percentiles are the episode's duration in ms.",
-	},
-	underrun_samples: {
-		unit: "samples",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Samples the ring could not supply, reported in ms at the stream's sample rate.",
+			"Render quanta the ring could only partly fill, or not fill at all, while it was playing. A quantum rendered while the ring is stalled is not one.",
 	},
 	short_quanta: {
 		unit: "count",
-		clock: "viewer",
+		clock: "render",
 		aggregations: ["total", "per_min"],
-		description: "Quanta delivered with fewer samples than the render quantum asked for.",
+		description: "Of the underruns, the quanta the ring filled the front of and then ran dry part-way through.",
 	},
-	stalled_quanta: {
-		unit: "share",
-		clock: "viewer",
-		aggregations: ["share"],
+	underrun_episodes: {
+		unit: "count",
+		clock: "render",
+		aggregations: ["total", "per_min"],
+		description: "Maximal runs of consecutive underruns: one audible gap each, however many quanta it spanned.",
+	},
+	underrun_ms: {
+		unit: "ms",
+		clock: "render",
+		aggregations: ["total", "per_min", "max"],
 		description:
-			"Share of the run the ring spent re-stalled, refilling rather than playing. Graded separately from underruns: it is silence the player chose.",
-	},
-	discarded_samples: {
-		unit: "samples",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Writer discard operations from late input or capacity bounds, reported in ms.",
+			"Audio the ring failed to supply while playing: the missing samples at the device rate. `max` is the longest episode.",
 	},
 	skip_aheads: {
 		unit: "count",
 		clock: "viewer",
 		aggregations: ["total", "per_min"],
-		description: "Browser: observed playback jumps. Replay: explicit skip operations, excluding capacity bounds.",
+		description:
+			"Re-anchors that discarded buffered audio: a forward step in the lag between the viewer clock and the playhead.",
 	},
-	skipped_samples: {
-		unit: "samples",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Media time attributed to skip_aheads, reported in ms.",
-	},
-	observed_jumps: {
-		unit: "count",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Forward discontinuities observed when the reader commits media, excluding startup and resets.",
-	},
-	observed_skipped_samples: {
-		unit: "samples",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Media passed over by observed playback discontinuities, reported in ms.",
-	},
-	accelerates: {
-		unit: "count",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Time-stretch decisions that played the buffer down faster than real time.",
-	},
-	expands: {
-		unit: "count",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Time-stretch decisions that lengthened buffered audio.",
-	},
-	stretched_samples: {
-		unit: "samples",
-		clock: "viewer",
-		aggregations: ["total", "per_min"],
-		description: "Magnitude of net compression minus expansion, in ms; a lower bound on altered duration.",
-	},
-	skipped_groups: {
-		unit: "count",
-		clock: "viewer",
+	discarded_ms: {
+		unit: "ms",
+		clock: "media",
 		aggregations: ["total", "per_min"],
 		description:
-			"Groups the container consumer abandoned with content still unread. A group the next one already covers is not one of these: nothing was lost there.",
+			"Media time the skip-aheads jumped over without playing. Audio dropped before it reached the ring moves no playhead and is not counted.",
+	},
+	stalled: {
+		unit: "share",
+		clock: "viewer",
+		aggregations: ["share"],
+		description:
+			"Share of the window the ring spent stalled, refilling rather than playing: silence the player chose.",
+	},
+	silence: {
+		unit: "share",
+		clock: "render",
+		aggregations: ["share"],
+		description:
+			"Share of rendered quanta under the silence floor at the player's output, whatever the cause. The published tone is never quiet, so any of it is a gap or a stall.",
 	},
 	target_ms: {
 		unit: "ms",
 		clock: "viewer",
-		aggregations: ["p50", "p95", "max", "last"],
-		description: "The playout delay the receiver resolved, sampled through the run.",
+		aggregations: ["p50", "p95", "max"],
+		description: "The playout delay the receiver resolved (`sync.out.delay`), sampled through the window.",
 	},
-	converge_s: {
+	converge_ms: {
 		unit: "ms",
 		clock: "viewer",
-		aggregations: ["seconds"],
+		aggregations: ["last"],
 		description:
-			"Seconds from first audio until the resolved target stayed within one bucket of its final value for the rest of the run.",
-	},
-	silence_share: {
-		unit: "share",
-		clock: "viewer",
-		aggregations: ["share"],
-		description:
-			"Share of sampled windows whose RMS at the audio graph's output was below the silence floor. The only metric read from the audio itself rather than from a counter.",
-	},
-	wall_clock_share: {
-		unit: "share",
-		clock: "viewer",
-		aggregations: ["share"],
-		description:
-			"Share of the graded window in which no track's playhead drove playback, so the reference followed the wall clock and the ring was chasing it rather than setting the pace.",
+			"From first audio to the last time the resolved target moved more than one bucket from its final value.",
 	},
 	render_load: {
 		unit: "share",
-		clock: "viewer",
-		aggregations: ["p95", "max"],
-		description: "AudioContext render capacity load: how much of each render quantum's budget was used.",
-	},
-	worklet_cadence: {
-		unit: "ms",
-		clock: "viewer",
-		aggregations: ["p95", "max"],
+		clock: "render",
+		aggregations: ["max"],
 		description:
-			"Wall time a hundred render quanta actually took. The stand-in for render_load where there is no render capacity surface: a render thread that hitched took longer than the hundred quanta were worth.",
+			"Chromium's render capacity: the share of each quantum's budget the graph used. High says the runner, not the player, was short of time.",
 	},
-	media_drift: {
-		unit: "ms",
-		clock: "publisher",
-		aggregations: ["last"],
-		description:
-			"Rate at which the media timeline runs away from wall time, in ms per second. Fitted independently of the ring counters, which count skip-aheads directly.",
-	},
-};
+} as const satisfies Record<string, MetricSpec>;
 
-/** RMS below this at the graph output counts the window as silent. About -60 dBFS. */
+/** One of the {@link METRICS} names. */
+export type Metric = keyof typeof METRICS;
+
+/** Every `<metric>_<aggregation>` key, in schema order, so tables read the same every run. */
+export const METRIC_KEYS: string[] = Object.entries(METRICS).flatMap(([name, spec]) =>
+	spec.aggregations.map((aggregation) => `${name}_${aggregation}`),
+);
+
+/** A quantum whose RMS at the player's output is under this is quiet. About -60 dBFS. */
 export const SILENCE_RMS = 0.001;
 
-/** Frames of graph output each RMS is taken over: the probe's AnalyserNode `fftSize`. */
-export const RMS_FRAMES = 2048;
-
-/** How often the page samples its signals. Every series in a {@link Summary} is on this grid. */
+/** How often the page samples. */
 export const SAMPLE_INTERVAL_MS = 250;
 
-/** Frames in one AudioWorklet render quantum, fixed by the Web Audio specification. */
-export const RENDER_QUANTUM = 128;
-
-/** How many quanta `worklet_cadence` is reported over, so the number is readable at a glance. */
-export const CADENCE_QUANTA = 100;
+/** A resolved target within this of its final value has settled. One estimator bucket. */
+export const BUCKET_MS = 20;
 
 /**
- * The stages an end-to-end delay is split into, in order, as exclusive spans.
+ * The render clock may run this far from the viewer's, as a fraction, before the row is void.
  *
- * Exclusive is the requirement that makes the sum mean anything: no two stages may claim the same
- * millisecond, so they have to be defined by their boundaries rather than by what they feel like.
- * `unaccounted` is the named remainder, and a large one is a finding rather than a rounding error.
+ * Both oscillators are on one host, so real drift is parts per million. Past 1% the device is not
+ * running at wall rate at all, which is a throttled or stalled context, and every render-clock count
+ * would be read off a clock that was not moving.
+ */
+export const MAX_RENDER_DRIFT = 0.01;
+
+/**
+ * The stages an end-to-end delay splits into, in order, as exclusive spans.
+ *
+ * Exclusive is what makes the sum mean anything: each stage is defined by the two boundaries that
+ * end the previous stage and start the next, so no two can claim the same millisecond.
+ *
+ * - `capture`: sound at the publisher's input to its samples being readable.
+ * - `encode`: samples readable to the encoded frame existing.
+ * - `publish_flush`: frame existing to it being written to the transport, where a publisher that
+ *   batches frames holds them.
+ * - `network`: written by the publisher to delivered to the viewer's container consumer, relay
+ *   included.
+ * - `jitter_buffer`: delivered to its decoded samples leaving the ring for a render quantum. The
+ *   decoder runs inside this span in a live pipeline, so it is not also `decode`.
+ * - `decode`: decode time that did not overlap the jitter buffer, which is zero while the ring holds
+ *   anything.
+ * - `render`: leaving the ring to leaving the audio graph.
+ * - `device`: leaving the graph to the speaker (`outputLatency` plus `baseLatency`).
+ * - `unaccounted`: end-to-end minus the sum of the rest. Named because a large one is the finding.
+ *
+ * The identity is `sum(stages) == end-to-end`, within {@link identityTolerance}.
  */
 export const STAGES = [
 	"capture",
@@ -249,207 +210,203 @@ export const STAGES = [
 /** One of {@link STAGES}. */
 export type Stage = (typeof STAGES)[number];
 
-/** A stage span, and how it was arrived at. */
+/** A stage span and where its number came from. */
 export type StageSpan = {
-	/** The span's duration, or null when this lane cannot measure it. */
+	/** The span, or null when this lane cannot measure it. */
 	ms: Ms | null;
-	/** "measured", "declared" (the publisher said so), or "unmeasured". */
+	/** `measured` on the viewer clock, `declared` by the publisher, or `unmeasured`. */
 	source: "measured" | "declared" | "unmeasured";
 };
 
-/**
- * The tolerance on the sum-to-end-to-end identity: the larger of 2 ms or 2% of the total.
- *
- * Below that, the stages and the measured end-to-end agree. Above it, `unaccounted` is carrying
- * something real.
- */
-export const identityTolerance = (endToEndMs: Ms): Ms => Math.max(2, endToEndMs * 0.02);
+/** The tolerance on the sum-to-end-to-end identity: the larger of 2 ms or 2% of the total. */
+export const identityTolerance = (endToEnd: Ms): Ms => Math.max(2, endToEnd * 0.02);
 
-/**
- * Clock drift beyond this voids a run, in ms per minute.
- *
- * Two processes on one host share a hardware clock, so anything past a couple of ms a minute means
- * they are not on one host and the stage arithmetic is subtracting unrelated numbers.
- */
-export const MAX_DRIFT_MS_PER_MIN = 2;
-
-/** What one clock's timestamps needed to be reduced to the viewer reference. */
+/** What reducing one clock to `viewer` took. */
 export type Drift = {
 	/** Which clock. */
 	clock: Clock;
-	/** Measured drift against the viewer clock, ms per minute. */
-	msPerMin: Ms | null;
-	/** Offset removed to put it on the viewer epoch. */
-	offsetMs: Ms | null;
+	/** Its rate against `viewer`, minus one: 0.001 runs 1 ms fast per second. Null when unmeasured. */
+	rate: number | null;
+	/** What was added to put it on the viewer epoch. Null when unmeasured or unknowable. */
+	offset: Ms | null;
 };
 
-// ── the row identity ────────────────────────────────────────────────────────
+// ── the row ─────────────────────────────────────────────────────────────────
 
-/** Document isolation for browser rows, or shared/message ring selection for replay. */
+/** Which ring the page ran, decided by whether the document is cross-origin isolated. */
 export type Ring = "isolated" | "plain";
+
+/** The audio codecs the matrix publishes. */
+export type Codec = "opus" | "aac";
+
+/**
+ * Where a row played: a headless browser over the shaper, or a {@link Trace} replayed through the
+ * player's rings on a simulated clock, whose profile is the trace's name.
+ */
+export type Runtime = "chromium" | "replay";
 
 /**
  * One matrix cell.
  *
- * A budget is keyed by the whole thing. Keying by profile alone would grade one codec's floor
- * against another's, and preserves the isolation context in browser results.
+ * A budget is keyed by the whole thing. The codec, its rate, and the ring each move the expected
+ * floor as much as the profile does, so a profile-only key would grade one cell against another's
+ * threshold.
  */
 export type Row = {
-	/** The runtime that played it. */
-	runtime: "chromium" | "safari" | "replay";
-	/** The audio codec. */
-	codec: "opus" | "aac";
+	runtime: Runtime;
+	codec: Codec;
 	/** Sample rate in Hz. */
 	rate: number;
-	/** The shaper profile the path ran under. */
 	profile: string;
-	/** Document isolation in browser rows; concrete ring selection in replay rows. */
 	ring: Ring;
 };
 
-/** The row identity as a flat string, used as a directory name and a table label. */
+/** The row as a flat string: a file name and a table label. */
 export const rowKey = (row: Row): string => `${row.runtime}-${row.codec}-${row.rate}-${row.profile}-${row.ring}`;
+
+/** Parse {@link rowKey}. The profile is the only field that may contain a dash. */
+export function parseRow(key: string): Row {
+	const parts = key.split("-");
+	const [runtime, codec, rate] = parts;
+	const ring = parts.at(-1);
+	const profile = parts.slice(3, -1).join("-");
+	const hz = Number.parseInt(rate ?? "", 10);
+	if (
+		(runtime !== "chromium" && runtime !== "replay") ||
+		(codec !== "opus" && codec !== "aac") ||
+		(ring !== "isolated" && ring !== "plain") ||
+		!Number.isFinite(hz) ||
+		profile === ""
+	) {
+		throw new Error(`not a row key: ${key}`);
+	}
+	return { runtime, codec, rate: hz, profile, ring };
+}
+
+// ── what the recorder keeps ─────────────────────────────────────────────────
+
+/**
+ * One audio frame reaching the viewer's container consumer: when, on the `viewer` clock; its
+ * timestamp, on the `media` clock; and the group that carried it.
+ */
+export type Arrival = [at: Ms, timestamp: Ms, group: number];
+
+/** A recorded arrival trace, as checked in under `traces/`. The file name is its profile. */
+export type Trace = {
+	/** Bumped when a field's meaning changes. */
+	version: 2;
+	/** Where it was recorded: the relay, the broadcast, its publisher, the date. */
+	source: string;
+	/** The shape it carries, and why it is kept. */
+	description: string;
+	/** The transport the session negotiated. */
+	transport: string;
+	/** The smallest round trip the connection's PROBE reported, which "auto" sizes from. */
+	rtt: Ms | null;
+	/** The audio rendition, as the catalog advertised it. */
+	config: {
+		codec: string;
+		sampleRate: number;
+		numberOfChannels: number;
+		container: { kind: string };
+		jitter?: number;
+		delay?: number;
+		[key: string]: unknown;
+	};
+	/** How long the recording observed, from the first arrival: silence after the last one is an outage. */
+	duration: Ms;
+	/** Every arrival in order, `at` counted from the first. */
+	arrivals: Arrival[];
+};
+
+/** The codec a trace's rendition is, as a row names it. */
+export function traceCodec(trace: Trace): Codec {
+	const codec = trace.config.codec;
+	if (codec === "opus") return "opus";
+	if (codec.startsWith("mp4a")) return "aac";
+	throw new Error(`no row codec for ${codec}`);
+}
 
 // ── what the page emits ─────────────────────────────────────────────────────
 
-/**
- * Which thread fed the ring, from `audio.out.thread`: the page's audio worker, with the transport its own
- * session ran over, or the page's main thread, with why the page took the audio back when it did.
- * `pending` while the worker is starting.
- */
-export type Thread = { kind: "worker"; transport?: string } | { kind: "main"; reason?: string } | { kind: "pending" };
-
-/** The concrete ring reported by the running player. */
-export type Backend = NonNullable<ReturnType<MoqWatch["audio"]["out"]["debug"]["peek"]>>["backend"];
-
-/** Reject a row whose concrete ring differs from the requested execution path. */
-export function backendVoid(actual: Backend | undefined, expected: Backend): Void | undefined {
-	return actual === expected
-		? undefined
-		: { assertion: "backend", detail: `expected ${expected} ring, observed ${actual ?? "unknown"}` };
-}
-
-/** One 250 ms probe sample: everything public the page could read at that instant. */
-export type Sample = {
-	/** Milliseconds since the page started sampling, on the viewer clock. */
+/** A run of consecutive quanta the ring did not fill, as the output tap saw it. */
+export type Gap = {
+	/** Where the first missing sample would have played, on the `render` clock. */
 	at: Ms;
+	/** The missing audio, at the device rate. */
+	ms: Ms;
+	/** Quanta in it the ring did not fill, short and silent alike. */
+	quanta: number;
+	/** Of those, the quanta it filled the front of. */
+	short: number;
+};
 
-	/**
-	 * `audio.out.timestamp`: the playhead, in ms of media time.
-	 *
-	 * Undefined whenever the ring has no playhead: before the first insert anchors it, and from a
-	 * flush until the next insert re-anchors it. That is a missing position rather than a zero one,
-	 * so `analyze.ts` skips those samples rather than reading them as a plateau or a step.
-	 */
+/** A change in whether the ring is stalled, stamped on the `render` clock when the page saw it. */
+export type Stall = {
+	at: Ms;
+	stalled: boolean;
+};
+
+/** One probe sample: what the page could read at that instant, plus what the tap reported since. */
+export type Sample = {
+	/** `performance.now()`: the `viewer` clock. */
+	at: Ms;
+	/** `AudioContext.currentTime`, read at the same instant: the `render` clock. */
+	render?: Ms;
+
+	/** `audio.out.timestamp`: the playhead on the `media` clock. Undefined while there is none. */
 	timestamp?: Ms;
 	/** `audio.out.stalled`: the ring is refilling rather than playing. */
 	stalled?: boolean;
-	/** `audio.out.underruns`: cumulative count of partly-filled quanta. */
-	underruns?: number;
-	/** `audio.out.spread`: the measured arrival spread feeding the target, in ms. */
-	spread?: Ms;
-	/** `audio.out.buffered`: how much audio is ready to play, in ms. */
-	buffered?: Ms;
-	/** `audio.out.skipped`: cumulative groups the container consumer abandoned. */
-	skipped?: number;
-	/** Ring counters, with their graph identity and sample rate. Missing on older builds. */
-	playout?: Omit<NonNullable<ReturnType<MoqWatch["audio"]["out"]["debug"]["peek"]>>, "budget"> & {
-		generation: number;
-		rate: number;
-	};
-	/** `audio.out.stats`, passed through as-is: whatever the build publishes. */
-	stats?: Record<string, unknown>;
-	/**
-	 * `audio.out.thread`: which thread fed the ring. Absent on a build without the signal, which is a
-	 * different answer from `pending`: that build cannot say, rather than has not started.
-	 */
-	thread?: Thread;
-
-	/** `sync.out.delay`: the resolved playout target, in ms. */
+	/** `sync.out.delay`: the resolved playout target. */
 	delay?: Ms;
-	/** `sync.out.jitter`: the jitter estimate feeding it, in ms. */
+	/** The current connection PROBE round trip, before Sync keeps its minimum. */
+	rtt?: Ms;
+	/** `sync.out.jitter`: the network portion in auto mode, or the configured fixed delay. */
+	networkJitter?: Ms;
+	/** The selected rendition's advertised jitter at this sample. */
 	jitter?: Ms;
-	/** `sync.out.maxAge`: the subscription's age budget, in ms. */
-	maxAge?: Ms;
-	/** `sync.out.reference`: the clock reference the renderer is pacing against. */
-	reference?: number;
-	/** `sync.out.timestamp`: the media time `sync` believes should be playing now. */
-	syncTimestamp?: Ms;
-	/**
-	 * `sync.out.clock`: whose playhead playback is paced against.
-	 *
-	 * `"none"` is the wall clock, which is a different answer from the field being absent: absent
-	 * means the build predates the signal, and grading those two the same would read a player that
-	 * never handed the clock to audio as one that could not be asked.
-	 */
-	clock?: "audio" | "video" | "none";
+	/** The selected rendition's advertised delay at this sample. */
+	renditionDelay?: Ms;
 
-	/** RMS at the audio graph output over this window, from an AnalyserNode. */
-	rms?: number;
-	/** `AudioContext.renderCapacity` load, a share of the quantum budget. */
-	renderLoad?: number;
-	/** `AudioContext.outputLatency`, in ms. */
+	/** `AudioContext.outputLatency`. */
 	outputLatency?: Ms;
-	/** `AudioContext.baseLatency`, in ms. */
+	/** `AudioContext.baseLatency`. */
 	baseLatency?: Ms;
-	/** `AudioContext.currentTime`, in ms: the device clock, which must track wall time. */
-	contextTime?: Ms;
-	/**
-	 * `AudioContext.sampleRate`, in Hz: the device's rate, not the stream's.
-	 *
-	 * It is what a render quantum is worth in wall time, so `worklet_cadence` is unreadable without
-	 * it, and it is routinely not the catalog's: a 44.1 kHz stream still renders at whatever the
-	 * output device runs at. Sampled rather than reported once in the {@link Environment}, because
-	 * the context does not exist yet when the catalog first makes the rest of that readable.
-	 */
+	/** `AudioContext.renderCapacity` average load, Chromium only. */
+	renderLoad?: number;
+
+	/** The tap's cumulative quanta rendered since the first audible one. */
+	quanta?: number;
+	/** The tap's cumulative quanta under {@link SILENCE_RMS}. */
+	quiet?: number;
+	/** Gaps the tap closed since the previous sample. */
+	gaps?: Gap[];
+	/** Stall changes since the previous sample. */
+	stalls?: Stall[];
+};
+
+/** What the page reports once the session is up. */
+export type Environment = {
+	/** Whether the document is cross-origin isolated, and therefore which ring runs. */
+	crossOriginIsolated: boolean;
+	/** The transport the session negotiated. Anything but WebTransport never crossed the UDP shaper. */
+	transport?: string;
+	/** The audio rendition's codec string. */
+	codec?: string;
+	/** The audio rendition's sample rate, Hz. */
+	rate?: number;
+	/** The publisher's declared flush span: the `publish_flush` stage. */
+	jitter?: Ms;
+	/** The full audio configuration needed to replay a captured live row. */
+	config?: Trace["config"];
+	/** The AudioContext's rate, Hz, which the render clock counts in. */
 	contextRate?: number;
 };
 
-/** What the page reports once, at the start, rather than every sample. */
-export type Environment = {
-	/** Whether the document is cross-origin isolated, permitting shared memory. */
-	crossOriginIsolated: boolean;
-	/**
-	 * The transport the page's session negotiated. Anything but WebTransport bypasses the UDP shaper. The
-	 * audio worker's own session is a second one, reported in {@link Sample.thread}.
-	 */
-	transport?: string;
-	/** Round-trip time the connection reports, in ms. */
-	rtt?: Ms;
-	/** The audio track's codec string from the catalog. */
-	catalogCodec?: string;
-	/** The audio track's sample rate from the catalog, in Hz. */
-	catalogRate?: number;
-	/** The publisher's declared flush span, in ms: the `publish_flush` stage, declared not measured. */
-	catalogJitter?: Ms;
-	/** `performance.timeOrigin`, so the viewer clock can be put on the host epoch. */
-	timeOrigin: number;
-};
+// ── what a row reduces to ───────────────────────────────────────────────────
 
-/** One batch of samples, as the page POSTs it to the sink. */
-export type Beacon = {
-	/** The row this page is playing, as a directory-safe key. */
-	tag: string;
-	/** Sent on the first batch that has it, and not again. */
-	environment?: Environment;
-	/** The samples in this batch. */
-	samples: Sample[];
-	/** Console warnings and errors the page saw, truncated. */
-	notes?: string[];
-};
-
-// ── what the analyzer produces ──────────────────────────────────────────────
-
-/** A series reduced every way the schema reports it. Nulls mean the series was empty. */
-export type Stats = {
-	n: number;
-	p50: number | null;
-	p95: number | null;
-	max: number | null;
-	min: number | null;
-};
-
-/** The shaper's own counters for one direction, copied through so a row records its impairment. */
+/** The shaper's counters for one direction, as its exit line prints them. */
 export type ShaperCounters = {
 	packets: number;
 	lost: number;
@@ -459,280 +416,52 @@ export type ShaperCounters = {
 	reordered: number;
 };
 
-/** Why a row is not gradeable. A void row is reported, never silently passed. */
+/** The shaper's run: its seed, how it exited, and what it did. */
+export type Shaper = {
+	seed: number | null;
+	/** Its exit status. Nonzero means the profile never acted, or forwarding stopped. */
+	status: number | null;
+	up: ShaperCounters | null;
+	down: ShaperCounters | null;
+};
+
+/** Why a row cannot be graded. A void row is reported, and fails an enforced run. */
 export type Void = {
-	/** The assertion that failed, as a name. */
+	/** The assertion that failed. */
 	assertion: string;
 	/** What was seen instead. */
 	detail: string;
 };
 
-/**
- * Why a browser row's audio did not run where the row expects it, or undefined when it did: on the page's
- * audio worker, whose own session negotiated `transport`, the lane's. That session is a second one, which
- * the page's `transport` does not show. A row that keeps its audio on the page (`expect` "main") expects
- * the main thread by choice instead, so a fallback to it, which carries a reason, means the page tried the
- * worker after all. A build that cannot say which thread is not voided for it.
- */
-export function threadVoid(
-	thread: Thread | undefined,
-	transport: string,
-	expect: "worker" | "main" = "worker",
-): Void | undefined {
-	if (thread === undefined) return undefined;
-	if (expect === "main") {
-		if (thread.kind === "main" && thread.reason === undefined) return undefined;
-		const detail =
-			thread.kind === "main"
-				? `the page fell back to the main thread rather than keeping the audio there: ${thread.reason}`
-				: thread.kind === "worker"
-					? "the audio played on the worker, where the row keeps it on the main thread"
-					: "the audio had no thread yet, where the row keeps it on the main thread";
-		return { assertion: "thread", detail };
-	}
-	if (thread.kind === "pending") return { assertion: "thread", detail: "the audio worker never started" };
-	if (thread.kind === "main") {
-		const why = thread.reason === undefined ? "" : `: ${thread.reason}`;
-		return { assertion: "thread", detail: `the audio played on the main thread${why}` };
-	}
-	if (thread.transport === transport) return undefined;
-	const detail = thread.transport
-		? `the audio worker's session negotiated ${thread.transport}`
-		: "the audio worker had no session";
-	return { assertion: "transport", detail };
-}
-
-/** One quiet window, placed in the source or refused. */
-export type QuietWindow = {
-	/** When the page sampled it, on the viewer clock. */
-	at: Ms;
-	/** Its RMS at the graph output. */
-	rms: number;
-	/** Seconds into the source file its first frame lines up with, or null when it was not placed. */
-	source: number | null;
-	/** The loudest source RMS across its timing uncertainty, or null when it was not placed. */
-	reference: number | null;
-	/** Frames its segment's analyser data ran behind the context clock, when it was placed. */
-	lag?: number;
-	/** Why it is not proven, when it is not. */
-	refused?: string;
-};
-
-/**
- * A run of a row over which the AnalyserNode's data sat a constant number of whole windows behind the
- * context clock, and whether that run's own audible windows prove it.
- */
-export type Segment = {
-	/** When its first and last windows were sampled, on the viewer clock. */
-	from: Ms;
-	to: Ms;
-	/** Frames its windows sit behind the context clock, relative to the row's least-behind segment. */
-	lag: number;
-	/** Its own exact audible windows' fit at that lag, or null when it has none to fit. */
-	alignment: Alignment | null;
-	/** Whether its own windows prove its lag; its quiet windows are refused otherwise. */
-	proven: boolean;
-	/** Why not, when not. */
-	reason?: string;
-};
-
-/** How a row's windows were lined up with the source before any quiet window was placed. */
-export type Alignment = {
-	/** Correlation of log RMS, output against source, over the audible windows the fit used. */
-	correlation: number;
-	/** Median output RMS over source RMS on those windows: 1 when both are measured alike. */
-	gain: number;
-	/** Audible windows the fit used. */
-	audible: number;
-	/** The fitted source position against the playhead's own media time, in ms. */
-	shiftMs: Ms;
-};
-
-/** Where a reference came from: enough to rebuild the same PCM. */
-export type Provenance = {
-	/** The file the publisher looped. */
-	media: string;
-	/** Its SHA-256. */
-	sha256: string;
-	/** The publisher's own audio encode of that file, replayed from the start of its stream. */
-	encode: string[];
-	/** The decode of that replay into PCM, with the decoder the page used. */
-	decode: string[];
-	/** Seconds into the publisher's stream the decoded span begins. */
-	from: number;
-	/** Seconds decoded. */
-	seconds: number;
-	/** Frames per second: the graph's rate. */
-	rate: number;
-};
-
-/**
- * Whether every quiet window `silence_share` counted lines up with a quiet window of the source at
- * the same media time. A raw share over its ceiling passes only when this is proven; see
- * `silence.ts`.
- */
-export type QuietProof = {
-	/** True only when the alignment held and every quiet window was placed over quiet source. */
-	proven: boolean;
-	/** Why the row is not proven, when it is not. */
-	reason?: string;
-	/** Windows the raw share counted. */
-	windows: number;
-	/** Of those, the quiet ones. */
-	quiet: number;
-	/** Quiet windows placed over quiet source. */
-	matched: number;
-	/** The row's alignment over every segment's windows at its own lag, or null when it never ran. */
-	alignment: Alignment | null;
-	/** The row split where the analyser's lag changed, each run proven by its own windows or not. */
-	segments: Segment[];
-	/** The reference the windows were placed in, or null without one. */
-	reference: Provenance | null;
-	/** Every quiet window. */
-	quietWindows: QuietWindow[];
-};
-
-/** Everything one matrix row produced: the graded numbers plus what makes them trustworthy. */
+/** Everything one row produced: the graded numbers and what makes them trustworthy. */
 export type Summary = {
-	/** Schema version, bumped when a metric's meaning changes rather than when one is added. */
+	/** Bumped when a metric's meaning changes, not when one is added. */
 	version: 1;
-	/** The matrix cell. */
 	row: Row;
-	/** The shaper profile's seed, so a failing row can be replayed. */
-	seed: number;
-	/** Seconds of run graded, after the warmup window. */
-	windowSec: number;
-	/** Warmup discarded before grading, in seconds. */
-	warmupSec: number;
-	/** Sample rate the counters were converted at, in Hz. */
-	rate: number;
-	/** What the page reported about itself. */
+	/** Graded window, after the warmup. */
+	windowMs: Ms;
+	/** Discarded after first audio, before grading. */
+	warmupMs: Ms;
 	environment: Environment | null;
-	/**
-	 * Which thread fed the ring when the run ended. The page never gives the audio back to its worker once
-	 * it takes it, so this is the one that held. Null on a build that cannot say; absent on a lane with no
-	 * page.
-	 */
-	thread?: Thread | null;
-	/** Reasons this row is not gradeable. Empty means it is. */
+	/** Empty means the row is gradeable. */
 	voids: Void[];
-
-	/** Every metric in {@link METRICS}, flattened to `<name>_<aggregation>` keys. */
+	/** Every {@link METRIC_KEYS} entry. Null is unmeasured, never zero. */
 	metrics: Record<string, number | null>;
-	/**
-	 * The quiet windows behind `silence_share`, each placed in the source or refused. Absent from a
-	 * lane with no graph output to measure, and from a summary written before it existed; either
-	 * way a share over its ceiling stays a failure.
-	 */
-	silence?: QuietProof;
-	/** The resolved-target series, so a plateau can be looked at rather than inferred. */
-	targetSeries: { at: Ms; ms: Ms }[];
-	/** Underrun episode durations, in ms. */
-	episodes: Ms[];
-	/** The stage breakdown, and its named remainder. */
 	stages: Record<Stage, StageSpan>;
-	/** The measured end-to-end delay the stages have to sum to, in ms. */
-	endToEndMs: Ms | null;
-	/** Whether the stages summed to the end-to-end within {@link identityTolerance}. */
-	identityHolds: boolean | null;
-	/** What each non-viewer clock needed to be reduced to the viewer reference. */
+	/** The delay the stages sum to, or null when no clock spans the whole path. */
+	endToEnd: Ms | null;
 	drift: Drift[];
-	/** The shaper's counters, both directions. */
-	shaper: { profile: string; seed: number; up: ShaperCounters; down: ShaperCounters } | null;
+	shaper: Shaper | null;
 	/** Console warnings and errors, truncated. */
 	notes: string[];
 };
 
-/** A budget row: the matrix cell it applies to, plus a ceiling per graded key. */
-export type Budget = Row & {
-	/** True while the values are what was measured rather than what is required. */
-	recorded?: boolean;
-	/** Why this row's ceilings are what they are. */
-	note?: string;
-	/** Every other key is `<metric>_<aggregation>` to a ceiling. */
-	[key: string]: unknown;
-};
+/** One budget: the whole row it applies to, and a ceiling per graded key. */
+export type Budget = Row & { [key: string]: number | string };
 
 /** The checked-in budget file. */
 export type Budgets = {
-	version: 1;
-	/** What the values mean right now. */
+	/** How the ceilings were arrived at. */
 	note: string;
 	rows: Budget[];
 };
-
-/** Reduce a series to {@link Stats}. Empty in, nulls out. */
-export function stats(values: number[]): Stats {
-	if (values.length === 0) return { n: 0, p50: null, p95: null, max: null, min: null };
-	const sorted = [...values].sort((a, b) => a - b);
-	const at = (p: number) => sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] ?? null;
-	return { n: values.length, p50: at(50), p95: at(95), max: at(100), min: at(0) };
-}
-
-/** One sample of "was the ring underrunning here", on whatever grid the lane samples at. */
-export type Point = {
-	/** When the sample was taken, on the viewer clock. */
-	at: Ms;
-	/** Whether the underrun counter rose between the previous sample and this one. */
-	rising: boolean;
-	/** Whether this sample is not gradeable: a stalled ring is silent on purpose. */
-	excluded?: boolean;
-};
-
-/**
- * Maximal runs of consecutive rising samples, as durations in ms: one audible gap each.
- *
- * A point's `rising` describes the interval that ended at it, so an episode runs from the sample
- * before the first rising one to the last rising one. The sample that closes it is the first that
- * did not rise, and the interval before it carried no underrun, so it is not part of the gap.
- *
- * A run open at the last sample is closed at `endAt`. An excluded sample closes any run it lands in
- * rather than extending it, because a stall is silence the player chose and is graded on its own.
- *
- * Shared by every lane so "one long gap" and "forty scattered ones" are separated the same way
- * whether the samples came from a page, from a replay, or later from a native run.
- */
-export function episodes(points: Point[], endAt: Ms): Ms[] {
-	const out: Ms[] = [];
-	let open: Ms | undefined;
-	for (let i = 1; i < points.length; i++) {
-		const prev = points[i - 1];
-		const cur = points[i];
-		if (!prev || !cur) continue;
-		if (cur.rising && !cur.excluded && !prev.excluded) {
-			open ??= prev.at;
-		} else if (open !== undefined) {
-			out.push(prev.at - open);
-			open = undefined;
-		}
-	}
-	if (open !== undefined) out.push(endAt - open);
-	return out;
-}
-
-/**
- * Seconds from `startAt` until `series` stayed within `band` of its final value for the rest of it.
- *
- * Measured backwards from the end, because a target that settles and then moves again has not
- * converged: the question is when the last move was, not when the first plateau began.
- */
-export function convergence(series: { at: Ms; ms: Ms }[], startAt: Ms, band: Ms, endAt: Ms): number | null {
-	if (series.length === 0) return null;
-	const final = series.at(-1)?.ms ?? 0;
-	let last = -1;
-	for (let i = series.length - 1; i >= 0; i--) {
-		if (Math.abs((series[i]?.ms ?? 0) - final) > band) {
-			last = i;
-			break;
-		}
-	}
-	const at = last < 0 ? (series[0]?.at ?? 0) : (series[last + 1]?.at ?? endAt);
-	return Math.max(0, (at - startAt) / 1000);
-}
-
-/** One estimator bucket. A target within this of its final value is settled, not still moving. */
-export const BUCKET_MS = 20;
-
-/** Round to one decimal, passing null through, so a summary diff is readable. */
-export const round1 = (x: number | null | undefined): number | null =>
-	x === null || x === undefined || Number.isNaN(x) ? null : Math.round(x * 10) / 10;

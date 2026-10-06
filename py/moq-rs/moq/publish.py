@@ -102,6 +102,10 @@ class MediaProducer:
         """
         self._inner.flush(timestamp_us)
 
+    def discontinuity(self) -> None:
+        """Mark a timeline break and restart handoff measurement, preserving advertised jitter."""
+        self._inner.discontinuity()
+
     def cut(self) -> None:
         """Draw a group boundary here.
 
@@ -749,8 +753,8 @@ class BroadcastProducer:
     ) -> AudioProducer:
         """Publish a raw-audio track with an in-process encoder.
 
-        Select the codec with ``moq.AudioCodec.opus()`` (currently the only
-        constructor), placed in ``output``.
+        Select the codec with ``moq.AudioCodec.opus()`` or
+        ``moq.AudioCodec.aac()``, placed in ``output``.
 
         Pass ``bandwidth`` to reserve this track's bitrate against the session's
         allocator so a co-resident video encoder sizes itself against what is left.
@@ -792,8 +796,8 @@ class BroadcastProducer:
         ``delta_ratio`` controls how aggressively deltas are emitted instead of full
         snapshots (0 disables deltas); ``None`` uses the binding's default. Set
         ``compression`` to DEFLATE-compress each group; the consumer must pass the same
-        flag. Advertise the track with :meth:`set_catalog_section` if consumers should
-        discover it.
+        flag. The track is advertised in the broadcast's catalog (``json.tracks.<name>``)
+        until it finishes; a name the catalog already carries is refused.
         """
         # Let the record supply delta_ratio's default rather than restating it here.
         config = (
@@ -807,7 +811,9 @@ class BroadcastProducer:
         """Publish a JSON stream track (lossless append-log).
 
         Every appended record is preserved and delivered in order. Set ``compression`` to
-        DEFLATE-compress the group; the consumer must pass the same flag.
+        DEFLATE-compress the group; the consumer must pass the same flag. The track is
+        advertised in the broadcast's catalog (``json.tracks.<name>``) until it finishes; a
+        name the catalog already carries is refused.
         """
         config = MoqJsonStreamConfig(compression=compression)
         return JsonStreamProducer(self._inner.publish_json_stream(name, config))
@@ -837,6 +843,9 @@ class BroadcastProducer:
 
         return BroadcastConsumer(self._inner.consume())
 
-    def finish(self) -> None:
-        """Finish the broadcast, closing its tracks and unpublishing it."""
-        self._inner.finish()
+    def close(self) -> None:
+        """End the broadcast for good: retract it and serve no new tracks.
+
+        Tracks already subscribed carry on to their own end. Closing again is a no-op.
+        """
+        self._inner.close()

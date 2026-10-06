@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.22](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.21...moq-tokio-v0.19.22) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.19.21](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.20...moq-tokio-v0.19.21) - 2026-10-03
+
+### Added
+
+- *(relay)* drain sessions gracefully over GOAWAY ([#4132](https://github.com/moq-dev/moq/pull/4132))
+- *(tokio)* default QUIC idle timeout to 10s ([#4606](https://github.com/moq-dev/moq/pull/4606))
+- *(tokio)* deadline accepted handshakes and relay HTTP headers ([#4612](https://github.com/moq-dev/moq/pull/4612))
+
+### Other
+
+- *(moxygen)* Moxygen compatibility ([#4253](https://github.com/moq-dev/moq/pull/4253))
+
+## [0.19.20](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.19...moq-tokio-v0.19.20) - 2026-09-30
+
+### Added
+
+- *(net)* drain queued stream data before a graceful close ([#4430](https://github.com/moq-dev/moq/pull/4430))
+
+### Fixed
+
+- *(net)* send the AUTHORITY setup option from moqt:// clients ([#4578](https://github.com/moq-dev/moq/pull/4578))
+- *(moq-net)* a group awaiting its FIN ack still expires and follows priority ([#4534](https://github.com/moq-dev/moq/pull/4534))
+- *(tokio)* drive raw stream handshakes per connection ([#4474](https://github.com/moq-dev/moq/pull/4474))
+- *(moq-tokio)* iroh honors the configured versions ([#4448](https://github.com/moq-dev/moq/pull/4448))
+- *(tokio)* keep a WebTransport session's H3 streams open while it closes ([#4429](https://github.com/moq-dev/moq/pull/4429))
+- *(tokio)* drain a GOAWAY predecessor on Connection::close ([#4436](https://github.com/moq-dev/moq/pull/4436))
+- *(sock)* resolve an ephemeral reuseport group's port with a plain bind ([#4409](https://github.com/moq-dev/moq/pull/4409))
+- *(tokio)* handle IPv6 literals in TLS server names ([#4322](https://github.com/moq-dev/moq/pull/4322))
+- *(tokio)* accept a bare IPv6 TLS host name override on WebSocket ([#4405](https://github.com/moq-dev/moq/pull/4405))
+
+### Other
+
+- *(tokio)* isolate TLS root reload tests from shared /tmp ([#4537](https://github.com/moq-dev/moq/pull/4537))
+- *(tokio)* match a worker group's full address when counting its sockets ([#4404](https://github.com/moq-dev/moq/pull/4404))
+- prove stopped relays and worker groups closed their sockets instead of racing a rebind ([#4408](https://github.com/moq-dev/moq/pull/4408))
+
+## [0.19.19](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.18...moq-tokio-v0.19.19) - 2026-09-27
+
+### Added
+
+- *(net)* the SETUP AUTHORIZATION TOKEN option reaches the verifier ([#4278](https://github.com/moq-dev/moq/pull/4278))
+
+### Fixed
+
+- *(cli)* close the relay connection on SIGINT and SIGTERM ([#4287](https://github.com/moq-dev/moq/pull/4287))
+
+### Other
+
+- fix three load-only test failures at the cause ([#4286](https://github.com/moq-dev/moq/pull/4286))
+
+## [0.19.18](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.17...moq-tokio-v0.19.18) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+
+### Fixed
+
+- *(net)* end a track with its session's error when the session dies ([#4120](https://github.com/moq-dev/moq/pull/4120))
+
+## [0.19.17](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.16...moq-tokio-v0.19.17) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.19.16](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.15...moq-tokio-v0.19.16) - 2026-09-25
+
+### Fixed
+
+- *(net)* skip a stale warm cache on an IETF rejoin ([#4150](https://github.com/moq-dev/moq/pull/4150))
+
+## [0.19.15](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.14...moq-tokio-v0.19.15) - 2026-09-25
+
+### Fixed
+
+- *(moq-tokio)* release the QUIC socket before Listener::close returns ([#4087](https://github.com/moq-dev/moq/pull/4087))
+
+### Other
+
+- *(moq-tokio)* dial the WebSocket fallback on its own ephemeral port ([#4084](https://github.com/moq-dev/moq/pull/4084))
+
 ## [0.19.14](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.13...moq-tokio-v0.19.14) - 2026-09-25
 
 ### Added

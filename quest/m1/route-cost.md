@@ -1,27 +1,32 @@
-# [S] Route cost in the JS origin
+# [M] One route cost
 
 ## Goal
 
-The `@moq/net` origin serves a path through the best route it knows, ranked by
-cost and then hop count the way Rust's origin does, instead of the newest
-announce. The lite-06 route cost that arrives on every announce is read rather
-than dropped.
+A route carries one static cost. Warm and Cold Route Cost, and the
+cache-state accounting behind Warm, are gone from the next wip lite version
+and from moq-net's model. lite-06 peers keep working.
 
 ## Plan
 
-`announce.ts` already decodes `Cost { warm, cold }` and `hop.ts` already
-carries the hop chain; neither reaches `OriginState.remote`, which keeps
-providers newest-first. Carry both on the provider, rank with the same order
-as `route_order` in `rs/moq-net/src/model/origin.rs` (cost, chain length, a
-deterministic tiebreak), including `Cost::UNKNOWN` for an announce that
-carries no cost (free to reach, cold path at the ceiling, so hop count decides
-as it did before route cost existed), and re-pick when the chosen route is
-retracted.
+Decided in the 2026-09-30 wildcard audit (cache tiers): with configured edge
+and core tiers and static core links, nothing switches routes on cache
+state, so Warm has no job.
 
-Tests in `js/net` with the mock transport pair: two sessions announcing the
-same path at different costs, the cheaper one serves, its retraction moves
-the consumer to the other.
+- The next wip lite version (`moq-lite-07-wip` while it is unpublished)
+  carries a single route cost in ANNOUNCE_START and ANNOUNCE_UPDATE. Update
+  `drafts/draft-lcurley-moq-lite.md` in the same PR.
+- lite-06 sessions keep parsing both fields: read Warm as the cost and
+  ignore Cold, and write the one cost as Warm with Cold at the saturation
+  ceiling.
+- The single cost still prices a standby claim above a live one, per the
+  standby floor Wildcard landed in #4403. Update anything naming
+  `Cost { warm, cold }`.
+- Replace `Cost { warm, cold }` in `rs/moq-net/src/model/origin.rs` and its
+  JS mirror, and delete what computes Warm from cache state.
+- The moq-transport cluster extension already carries one cost.
+- Once [Routes and announces](/quest/m1/cluster-routing/routes.md) lands, this
+  single cost stays on ANNOUNCE as the origin's per-prefix seed and stops
+  accumulating per hop; link costs move to the ROUTE metric.
 
-## Related
-
-- [P2P](/quest/m1/p2p/README.md) - the watcher-side route pick that line needs
+Public API: `Cost` changes shape (a break). Wire: the
+wip version drops a field; lite-06 is unchanged.

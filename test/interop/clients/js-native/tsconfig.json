@@ -1,7 +1,0 @@
-{
-	"extends": "../../../../js/tsconfig.json",
-	"compilerOptions": {
-		"types": ["node"]
-	},
-	"include": ["subscribe.ts"]
-}

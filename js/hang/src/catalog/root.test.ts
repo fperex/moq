@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import * as z from "@zod/mini";
 import { ARCHIVE_VERSION } from "./archive.ts";
+import { u53 } from "./integers.ts";
 import type { RelativeBroadcast } from "./path.ts";
 import { RootSchema } from "./root.ts";
 
@@ -95,6 +96,33 @@ test("legacy zero jitter is absent for audio and video", () => {
 	expect(JSON.stringify(parsed)).not.toContain('"jitter"');
 });
 
+test("delay parses beside jitter and zero is absent", () => {
+	const parsed = RootSchema.parse({
+		audio: {
+			renditions: {
+				audio: {
+					codec: "opus",
+					container: { kind: "legacy" },
+					sampleRate: 48000,
+					numberOfChannels: 2,
+					delay: 0,
+				},
+			},
+		},
+		video: {
+			renditions: { video: { codec: "avc1.64001f", container: { kind: "legacy" }, jitter: 34, delay: 200 } },
+		},
+		text: { renditions: { captions: { format: "vtt", container: { kind: "legacy" }, delay: 120 } } },
+		json: { tracks: { gps: { mode: "stream", jitter: 10, delay: 250 } } },
+		binary: { tracks: { frames: { mode: "snapshot", delay: 0 } } },
+	});
+	expect(parsed.json?.tracks.gps?.delay).toBe(u53(250));
+	expect(parsed.binary?.tracks.frames?.delay).toBeUndefined();
+	expect(parsed.audio?.renditions.audio?.delay).toBeUndefined();
+	expect(parsed.video?.renditions.video?.delay).toBe(u53(200));
+	expect(parsed.text?.renditions.captions?.delay).toBe(u53(120));
+});
+
 test("clock round-trips at the root", () => {
 	const parsed = RootSchema.parse({
 		clock: { wall: 1_751_846_400_000_000, timescale: 1_000_000 },
@@ -109,7 +137,7 @@ test("clock stays off the wire when absent", () => {
 test("archive round-trips at the root", () => {
 	const parsed = RootSchema.parse({
 		archive: {
-			track: "timeline.z",
+			timelines: { video: "video.timeline.z" },
 			durationMax: 2000,
 			replay: "./recordings/clip",
 			store: "https://objects.example/rec/",
@@ -117,12 +145,12 @@ test("archive round-trips at the root", () => {
 		},
 	});
 	expect(parsed.archive).toMatchObject({
-		track: "timeline.z",
+		timelines: { video: "video.timeline.z" },
 		timescale: 1000,
 		durationMax: 2000,
 		replay: "recordings/clip",
 		store: "https://objects.example/rec/",
-		version: 1,
+		version: 2,
 	});
 	expect(JSON.stringify(parsed)).not.toContain('"timeline":');
 });
@@ -133,7 +161,23 @@ test("a legacy root timeline is not an archive", () => {
 });
 
 test("an invalid store URL is refused", () => {
-	expect(() => RootSchema.parse({ archive: { track: "timeline.z", store: "not a url" } })).toThrow();
+	expect(() => RootSchema.parse({ archive: { timelines: {}, store: "not a url" } })).toThrow();
+});
+
+test("a single shared timeline is refused", () => {
+	expect(() => RootSchema.parse({ archive: { track: "timeline.z" } })).toThrow();
+});
+
+// The exact shape Rust's moq-mux publishes for every broadcast, so a native publisher's catalog
+// stays playable.
+test("a Rust per-track archive parses", () => {
+	const parsed = RootSchema.parse({
+		archive: {
+			timelines: { "catalog.json": "catalog.json.timeline.z", video0: "video0.timeline.z" },
+			timescale: 1000,
+		},
+	});
+	expect(parsed.archive?.timelines.video0).toBe("video0.timeline.z");
 });
 
 test("an absent or foreign text section parses to empty", () => {

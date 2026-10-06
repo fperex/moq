@@ -19,15 +19,18 @@ so `go get moq.dev/moq@latest` always pulls the latest native core.
 go get moq.dev/moq@latest
 ```
 
-```go
-import "moq.dev/moq"
-```
-
 `CGO_ENABLED=1` is required (the default on Unix); the prebuilt `libmoq_ffi.a` comes transitively from `moq.dev/moq-ffi`, so there is no Rust toolchain or shared-library setup.
 
 ## Quick start
 
 ```go
+import (
+	"context"
+	"fmt"
+	"log"
+	"moq.dev/moq"
+)
+
 ctx := context.Background()
 
 client, err := moq.Dial(ctx, "https://relay.example.com")
@@ -40,16 +43,20 @@ announced, err := client.Announced(moq.AnnounceOptions{Prefix: "demos/"})
 if err != nil {
 	log.Fatal(err)
 }
-for ann, err := range announced.All(ctx) {
+for event, err := range announced.All(ctx) {
 	if err != nil {
 		if moq.IsShutdown(err) {
 			break
 		}
 		log.Fatal(err)
 	}
-	// Prefix stays origin-relative; Captures reports wildcard matches.
-	fmt.Println("got broadcast", ann.Prefix())
-	fmt.Println("captures", ann.Captures())
+	switch event := event.(type) {
+	case moq.AnnounceEventStart:
+		// Prefix stays origin-relative; Captures reports wildcard matches.
+		fmt.Println("got broadcast", event.Announce.Prefix)
+	case moq.AnnounceEventLive:
+		fmt.Println("caught up; later events are live changes")
+	}
 }
 ```
 
@@ -110,15 +117,15 @@ Raw tracks support best-effort datagrams alongside groups: `TrackProducer.Append
 sends one `Frame` and returns its sequence number, while `TrackConsumer.RecvDatagram`
 and `TrackConsumer.Datagrams` receive them in arrival order. Payloads are capped at
 1200 bytes. Datagram delivery requires a datagram-capable transport and lite-05 or
-newer moq-lite; IETF moq-transport, pre-lite-05, WebSocket, and TCP paths do not
+newer moq-lite, or moq-transport; pre-lite-05, WebSocket, and TCP paths do not
 deliver them, and there is no stream fallback.
 
 ## Versioning
 
-`VERSION` holds the human-owned `MAJOR.MINOR` line (the wrapper API version). Bump it in a PR when the wrapper's own API changes. The patch number is derived by CI from the existing mirror tags, so every release (whether triggered by a wrapper change or by a new `moq.dev/moq-ffi`) just takes the next patch on that line.
+`VERSION` holds the human-owned `MAJOR.MINOR` line (the wrapper API version). Bump it in a PR only for a breaking change to the wrapper's own API. The patch number is derived by CI from the existing mirror tags, so every release (whether triggered by a wrapper change or by a new `moq.dev/moq-ffi`) just takes the next patch on that line.
 
 The committed `go.mod` carries a `require moq.dev/moq-ffi v0.0.0` **placeholder**. Do not "fix" it or add a `replace`: `just go check` injects a local `replace` to the freshly-generated bindings, and CI rewrites the `require` to the latest published `moq.dev/moq-ffi` at release time. Because Go resolves to the maximum version across the build graph, that `require` is a floor. Consumers always get an ffi at least as new as the wrapper was built against.
 
 ## Local development
 
-Run `just go check`: it builds `moq-ffi` for the host, regenerates the bindings, stages both modules into `dist/` with a `replace` wiring the wrapper to the local ffi, and runs `go build`/`go vet`/`go test`. It also runs `scripts/publish-wrapper.test.sh`, which exercises the publisher's release/no-op/recovery paths against a scratch bare repo standing in for the mirror. See [../ffi/README.md](../ffi/README.md) for the `uniffi-bindgen-go` install.
+Run `just go check`: it builds `moq-ffi` for the host, regenerates the bindings, stages both modules into `dist/` with a `replace` wiring the wrapper to the local ffi, and runs `go build`/`go vet`/`go test`. See [../ffi/README.md](../ffi/README.md) for the `uniffi-bindgen-go` install.

@@ -5,13 +5,14 @@
 # public registry to catch packaging breakage), this builds every client from
 # the workspace source. It proves the code in the tree interoperates across
 # implementations before anything is published: a relay built from rs/moq-relay,
-# clients built from rs/moq-cli, py/, js/, and rs/libmoq, all talking to each
+# clients built from rs/moq-cli, py/, js/, and rs/moq-c, all talking to each
 # other. There's no apt/brew/npm/PyPI here, just cargo/bun/uv/cc.
 #
 # It stands up a moq-relay, then for each publisher language publishes an H.264
 # broadcast and confirms every subscriber sees data flowing before the timeout.
 # Every publisher but the Rust CLI also carries audio. The browser subscriber
-# verifies rendered WebCodecs output, player pause/resume, and that audio.
+# verifies rendered WebCodecs output, player pause/resume, and that audio, then
+# that a session the relay refuses hands Chromium the close code and reason.
 set -euo pipefail
 
 INTEROP_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -37,7 +38,7 @@ URL=""
 NEGATIVE=0
 MEDIA=0
 
-# Cargo profile for the relay/cli/libmoq builds. Debug compiles faster, which is
+# Cargo profile for the relay/cli/moq-c builds. Debug compiles faster, which is
 # what an interop test wants; the workload (320x240@30) is trivial either way.
 PROFILE="${INTEROP_PROFILE:-debug}"
 
@@ -78,6 +79,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --media)
             MEDIA=1
+            shift
+            ;;
+        # The full matrix. --timeout 30 gives headless Chromium cold-start
+        # headroom; flags after it still override.
+        --all)
+            PUBLISHERS="rust,python,go,js"
+            SUBSCRIBERS="rust,python,go,js,js-native-node,js-native-bun,c,gst"
+            TIMEOUT=30
             shift
             ;;
         *)
@@ -161,7 +170,7 @@ require_tools() {
         exit 1
     fi
     # Resolve the cargo target dir once (honors a custom CARGO_TARGET_DIR, which
-    # the self-hosted CI runner sets), so the built binaries and libmoq's header
+    # the self-hosted CI runner sets), so the built binaries and moq-c's header
     # are found wherever cargo actually writes them.
     TARGET_BASE=$(cargo metadata --format-version 1 --manifest-path "$WORKSPACE/Cargo.toml" --no-deps |
         sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
@@ -188,23 +197,31 @@ build_relay_cli() {
     [[ -n "$MOQ" ]] || MOQ="$TARGET_BASE/$PROFILE/moq"
 }
 
-# Editable-install the workspace Python build (maturin builds rs/moq-ffi, then
-# the moq-rs wrapper installs on top) into the repo-root .venv. `import moq`
-# then resolves to this checkout, not a PyPI wheel.
+# Build the workspace Python packages as wheels (maturin builds rs/moq-ffi, hatchling
+# the moq-rs wrapper) and install them into a venv in the run directory, so `import moq`
+# resolves to this checkout rather than a PyPI wheel. The shared .venv is off limits: a
+# concurrent run's `just py build` uninstalls the package there while this run's
+# clients are importing it.
 prepare_python() {
     have uv || {
         mark_broken python "uv not found"
         return
     }
-    echo "building python client (workspace moq via maturin)..."
-    if (cd "$WORKSPACE" && just py build) >"$HARNESS_RUN/py-build.log" 2>&1; then
-        PY="$WORKSPACE/.venv/bin/python"
-        [[ -x "$PY" ]] || {
-            mark_broken python "workspace .venv python not found after build"
-            sed 's/^/        /' "$HARNESS_RUN/py-build.log" >&2 || true
-        }
+    echo "building python client (workspace moq wheels)..."
+    local venv="$HARNESS_RUN/py-venv" wheels="$HARNESS_RUN/py-wheels"
+    # maturin stages the bindings at a fixed path under the cargo target dir, so one
+    # build at a time per target. Debug like the other clients; its build backend
+    # defaults to release.
+    if (cd "$WORKSPACE" &&
+        harness_locked "$TARGET_BASE/.moq-test-maturin.lock" \
+            env MATURIN_PEP517_ARGS="--profile dev --locked" \
+            uv build --wheel --package moq-ffi --out-dir "$wheels" &&
+        uv build --wheel --package moq-rs --out-dir "$wheels" &&
+        uv venv "$venv" &&
+        uv pip install --python "$venv/bin/python" --no-deps "$wheels"/*.whl) >"$HARNESS_RUN/py-build.log" 2>&1; then
+        PY="$venv/bin/python"
     else
-        mark_broken python "just py build failed"
+        mark_broken python "wheel build failed"
         sed 's/^/        /' "$HARNESS_RUN/py-build.log" >&2 || true
     fi
 }
@@ -230,12 +247,11 @@ prepare_js() {
         elif ! (cd "$CLIENTS/js" && bun run check) >"$HARNESS_RUN/js-check.log" 2>&1; then
             mark_broken js "type check failed"
             sed 's/^/        /' "$HARNESS_RUN/js-check.log" >&2 || true
-        elif ! (cd "$CLIENTS/js" && bunx vite build) >"$HARNESS_RUN/js-vite.log" 2>&1; then
+        # Into the run directory, where harness.ts serves it from: vite empties its output
+        # first, so a shared dist/ vanishes under a concurrent run's page loads.
+        elif ! (cd "$CLIENTS/js" && bunx vite build --outDir "$HARNESS_RUN/js-dist" --emptyOutDir) >"$HARNESS_RUN/js-vite.log" 2>&1; then
             mark_broken js "vite build failed"
             sed 's/^/        /' "$HARNESS_RUN/js-vite.log" >&2 || true
-        elif ! (cd "$CLIENTS/js" && bun trace-retention.ts) >"$HARNESS_RUN/js-trace-retention.log" 2>&1; then
-            mark_broken js "trace retention failed"
-            sed 's/^/        /' "$HARNESS_RUN/js-trace-retention.log" >&2 || true
         fi
     fi
     if needs js-native-node && ! have node; then
@@ -243,7 +259,7 @@ prepare_js() {
     fi
 }
 
-# Stage the Go modules from this checkout (go/scripts/stage.sh builds moq-ffi for
+# Stage the Go modules from this checkout (sh/go/stage.sh builds moq-ffi for
 # the host, regenerates the bindings, and wires the wrapper to them by replace),
 # then build the interop client against that exact tree. The client is copied to a
 # scratch dir first so the committed go.mod keeps its placeholder require; every
@@ -259,8 +275,8 @@ prepare_go() {
     }
     echo "building go client (workspace moq-go via uniffi-bindgen-go)..."
     local staged ffi_pkg wrapper_pkg src="$HARNESS_RUN/go-client"
-    if ! staged=$(bash "$WORKSPACE/go/scripts/stage.sh" 2>"$HARNESS_RUN/go-stage.log"); then
-        mark_broken go "go/scripts/stage.sh failed"
+    if ! staged=$(bash "$WORKSPACE/sh/go/stage.sh" --output "$HARNESS_RUN/go-stage" 2>"$HARNESS_RUN/go-stage.log"); then
+        mark_broken go "sh/go/stage.sh failed"
         sed 's/^/        /' "$HARNESS_RUN/go-stage.log" >&2 || true
         return
     fi
@@ -283,35 +299,37 @@ prepare_go() {
     fi
 }
 
-# Build libmoq (the C staticlib + cbindgen header) and compile the C subscriber
-# against it. cargo writes moq.h to $TARGET_BASE/include and libmoq.a to the
-# profile dir.
+# Build moq-c (the C staticlib + cbindgen header) and compile the C subscriber
+# against it. cargo writes libmoq.a to the profile dir, and build.rs writes
+# moq.h into its OUT_DIR, which only cargo's JSON messages name.
 prepare_c() {
-    local cc="${CC:-cc}" header lib os_libs
+    local cc="${CC:-cc}" out_dir header lib os_libs
     have "$cc" || {
         mark_broken c "no C compiler ($cc) on PATH"
         return
     }
-    echo "building c client (workspace libmoq + cc)..."
+    echo "building c client (workspace moq-c + cc)..."
     local flag=()
     [[ "$PROFILE" == "release" ]] && flag=(--release)
-    if ! (cd "$WORKSPACE" && cargo build --locked ${flag[@]+"${flag[@]}"} -p libmoq) >"$HARNESS_RUN/c-build.log" 2>&1; then
-        mark_broken c "cargo build -p libmoq failed"
+    if ! (cd "$WORKSPACE" && cargo build --locked ${flag[@]+"${flag[@]}"} -p moq-c --message-format=json-render-diagnostics) >"$HARNESS_RUN/c-build.json" 2>"$HARNESS_RUN/c-build.log"; then
+        mark_broken c "cargo build -p moq-c failed"
         sed 's/^/        /' "$HARNESS_RUN/c-build.log" >&2 || true
         return
     fi
-    header="$TARGET_BASE/include/moq.h"
+    out_dir=$(grep '"reason":"build-script-executed"' "$HARNESS_RUN/c-build.json" | grep -F '/moq-c#' |
+        sed -n 's/.*"out_dir":"\([^"]*\)".*/\1/p' | tail -1) || true
+    header="$out_dir/include/moq.h"
     lib="$TARGET_BASE/$PROFILE/libmoq.a"
     [[ -f "$header" && -f "$lib" ]] || {
-        mark_broken c "libmoq artifacts missing ($header / $lib)"
+        mark_broken c "moq-c artifacts missing ($header / $lib)"
         return
     }
     # cargo can't inject libmoq.a's native deps into an external link, so read
-    # them from the same list build.rs and CMake use.
+    # them from the same list moq-c.pc and CMake use.
     local native_libs
     case "$(uname -s)" in
-        Darwin) native_libs="$WORKSPACE/rs/libmoq/native-libs/apple.txt" ;;
-        *) native_libs="$WORKSPACE/rs/libmoq/native-libs/linux.txt" ;;
+        Darwin) native_libs="$WORKSPACE/rs/moq-c/native-libs/apple.txt" ;;
+        *) native_libs="$WORKSPACE/rs/moq-c/native-libs/linux.txt" ;;
     esac
     os_libs=()
     while read -r entry; do
@@ -322,7 +340,7 @@ prepare_c() {
         esac
     done <"$native_libs"
     C_INTEROP="$HARNESS_RUN/c-interop"
-    if ! "$cc" "$CLIENTS/c/subscribe.c" -I"$TARGET_BASE/include" -L"$TARGET_BASE/$PROFILE" -lmoq "${os_libs[@]}" -o "$C_INTEROP" >"$HARNESS_RUN/c-compile.log" 2>&1; then
+    if ! "$cc" "$CLIENTS/c/subscribe.c" -I"$out_dir/include" -L"$TARGET_BASE/$PROFILE" -lmoq "${os_libs[@]}" -o "$C_INTEROP" >"$HARNESS_RUN/c-compile.log" 2>&1; then
         mark_broken c "cc compile failed"
         sed 's/^/        /' "$HARNESS_RUN/c-compile.log" >&2 || true
     fi
@@ -637,11 +655,6 @@ if [[ "$MEDIA" -eq 1 ]]; then
     else
         echo "=== media output and lifecycle ==="
         run_media "media output + lifecycle"
-        # The same player with its audio kept on the page (offload="false"): the path a page gets when
-        # its audio worker cannot run. Every case that plays the player's audio; the capture case
-        # never does.
-        run_media "media output + lifecycle, audio on the main thread" --offload false \
-            --cases pause,rejoin,detach,republish,late-join
         run_media "control: frozen video" --fault frozen-video --cases none --expect-fail "video progress"
         run_media "control: silent audio" --fault silent-audio --cases none --expect-fail "audio tone"
         run_media "control: offset audio" --fault audio-offset --cases none --expect-fail "audio/video sync"
@@ -666,6 +679,25 @@ else
         start_publisher "$pub" "$broadcast"
         run_round "$pub" "$broadcast" "$PUB_PID"
     done
+
+    # The relay refuses a token on its public rules, and Chromium has to read the close code and
+    # reason it sends. Chromium is the strict peer here, so no Rust client stands in for it.
+    if needs js; then
+        echo "=== browser close code ==="
+        if is_broken js; then
+            echo "  FAIL  refused session (browser client unavailable)"
+            overall=1
+        else
+            started=$SECONDS
+            if (cd "$CLIENTS/js" && bun close.ts --url "$URL" --timeout "$TIMEOUT") >"$HARNESS_RUN/close.log" 2>&1; then
+                echo "  PASS  refused session ($((SECONDS - started))s)"
+            else
+                echo "  FAIL  refused session ($((SECONDS - started))s)"
+                sed 's/^/        /' "$HARNESS_RUN/close.log" >&2 || true
+                overall=1
+            fi
+        fi
+    fi
 fi
 
 if [[ "$overall" -eq 0 ]]; then

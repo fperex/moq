@@ -4,10 +4,11 @@
 		"types": ["bun", "vite/client"]
 	},
 	"include": [
+		"close.ts",
 		"driver.ts",
 		"harness.ts",
+		"harness.browser.ts",
 		"media.ts",
-		"trace-retention.ts",
 		"src",
 		"vite.config.ts",
 		"../../../../js/common/worklet.d.ts"

@@ -54,6 +54,13 @@ impl Presentation {
 		before != Some(self.pacer.pace(timestamp, now))
 	}
 
+	/// Start a new video timeline without taking ownership from a speaker.
+	pub(super) fn video_restarted(&mut self) {
+		if !self.speaker {
+			self.pacer = moq_mux::Pacer::default().with_delay(self.delay);
+		}
+	}
+
 	/// Fold the speaker's position into the anchor, reporting whether that moved
 	/// the schedule.
 	///
@@ -138,11 +145,13 @@ pub(super) struct AudioTimeline {
 	written: u64,
 }
 
-/// Where the frame just pushed leaves the speaker: a fresh sink when the timeline
-/// jumped somewhere the buffered audio cannot be carried across.
+/// What the speaker owes before the frame just pushed: silence to play a hole
+/// through, or a fresh sink when the timeline jumped too far to fill.
 pub(super) struct AudioTiming {
 	/// Media time the pushed frame ends at.
 	pub(super) end: Duration,
+	/// Samples of silence to write first.
+	pub(super) silence: u64,
 	/// Whether the buffered sink has to be replaced.
 	pub(super) reset_sink: bool,
 }
@@ -165,13 +174,11 @@ impl AudioTimeline {
 		// Measure every hole from the track origin so timestamp rounding cannot
 		// accumulate into drift. Advancing to `expected` even when the hole is skipped
 		// keeps the next frame contiguous with the new timeline position.
-		//
-		// A hole this player would rather sit through is one playout already
-		// concealed, so what is left here is a timeline that moved: past the cap the
-		// speaker starts over rather than carrying audio across it.
 		let origin = *self.origin.get_or_insert(start);
 		let expected = (start.saturating_sub(origin).as_secs_f64() * sample_rate as f64).round() as u64;
-		let skipped = expected.saturating_sub(self.written) > fill_max;
+		let hole = expected.saturating_sub(self.written);
+		let skipped = hole > fill_max;
+		let silence = if skipped { 0 } else { hole };
 		let reset_sink = rewound || skipped;
 		self.written = self
 			.written
@@ -179,8 +186,46 @@ impl AudioTimeline {
 			.saturating_add(u64::try_from(samples).unwrap_or(u64::MAX));
 		self.end = Some(end);
 
-		AudioTiming { end, reset_sink }
+		AudioTiming {
+			end,
+			silence,
+			reset_sink,
+		}
 	}
+}
+
+/// How to hand `incoming` samples to a speaker already holding `buffered`, so
+/// it sits on `target`: the jitter buffer the browser's audio rings hold, in
+/// sample frames.
+///
+/// A `dry` ring, one that ran out or has only just opened, re-stalls: it pads up
+/// to the target before playing on, rather than playing the next arrival on an
+/// empty cushion. A ring more than
+/// `slack` over the target lands back on it by skipping the oldest of what is
+/// arriving. The slack is what a device period and a write's own length move the
+/// level by, so ordinary cadence never skips.
+pub(super) fn fit(dry: bool, buffered: u64, target: u64, slack: u64, incoming: u64) -> Fit {
+	let pad = if dry {
+		target.saturating_sub(buffered + incoming)
+	} else {
+		0
+	};
+	let level = buffered + pad + incoming;
+	let skip = if level > target + slack {
+		(level - target).min(incoming)
+	} else {
+		0
+	};
+	Fit { pad, skip }
+}
+
+/// What [`fit`] decided for one write.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Fit {
+	/// Silence to write first.
+	pub(super) pad: u64,
+	/// Samples to drop from the front of the write.
+	pub(super) skip: u64,
 }
 
 #[cfg(test)]
@@ -355,9 +400,11 @@ mod tests {
 
 		let rewound = timeline.push(Duration::from_secs(5), 960, 48_000, 24_000);
 		assert!(rewound.reset_sink);
+		assert_eq!(rewound.silence, 0);
 
 		let next = timeline.push(Duration::from_millis(5_020), 960, 48_000, 24_000);
 		assert!(!next.reset_sink);
+		assert_eq!(next.silence, 0);
 	}
 
 	#[test]
@@ -376,14 +423,46 @@ mod tests {
 		let mut timeline = AudioTimeline::default();
 		timeline.push(Duration::ZERO, 960, 48_000, 4_800);
 
-		// A hole inside the cap is one playout concealed, so the speaker plays on.
 		let filled = timeline.push(Duration::from_millis(100), 960, 48_000, 4_800);
 		assert!(!filled.reset_sink);
+		assert_eq!(filled.silence, 3_840);
 
 		let skipped = timeline.push(Duration::from_secs(1), 960, 48_000, 4_800);
 		assert!(skipped.reset_sink);
+		assert_eq!(skipped.silence, 0);
 
 		let next = timeline.push(Duration::from_millis(1_020), 960, 48_000, 4_800);
 		assert!(!next.reset_sink);
+		assert_eq!(next.silence, 0);
+	}
+
+	/// A dry ring refills to the target before the next arrival plays.
+	#[test]
+	fn a_dry_ring_restalls_to_the_target() {
+		assert_eq!(fit(true, 0, 4_800, 960, 960), Fit { pad: 3_840, skip: 0 });
+		// A fresh sink starts on a little silence of its own, which counts.
+		assert_eq!(fit(true, 2_400, 4_800, 960, 960), Fit { pad: 1_440, skip: 0 });
+		// A write longer than the target needs no padding, only the landing.
+		assert_eq!(fit(true, 0, 960, 960, 4_800), Fit { pad: 0, skip: 3_840 });
+	}
+
+	/// Ordinary cadence, a write on a ring already at the target, stays within
+	/// the slack and loses nothing.
+	#[test]
+	fn cadence_within_the_slack_plays_everything() {
+		assert_eq!(fit(false, 4_000, 4_800, 960, 960), Fit { pad: 0, skip: 0 });
+		assert_eq!(fit(false, 4_800, 4_800, 960, 960), Fit { pad: 0, skip: 0 });
+		// Running low is not running dry: nothing is padded until the ring is out.
+		assert_eq!(fit(false, 480, 4_800, 960, 960), Fit { pad: 0, skip: 0 });
+	}
+
+	/// A burst past the slack lands back on the target, and a ring already
+	/// over it drops the whole write.
+	#[test]
+	fn a_burst_lands_on_the_target() {
+		assert_eq!(fit(false, 4_800, 4_800, 960, 1_920), Fit { pad: 0, skip: 1_920 });
+		assert_eq!(fit(false, 4_000, 4_800, 960, 4_800), Fit { pad: 0, skip: 4_000 });
+		// A target that fell is reached by skipping, not by waiting to drain.
+		assert_eq!(fit(false, 9_600, 4_800, 960, 960), Fit { pad: 0, skip: 960 });
 	}
 }

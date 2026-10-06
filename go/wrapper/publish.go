@@ -193,7 +193,7 @@ func (b *BroadcastProducer) PublishContainerStream(format ContainerFormat) (*Con
 
 // EncodeAudio publishes a raw-audio track with an in-process encoder.
 //
-// Select the codec with OpusAudioCodec (currently the only constructor).
+// Select the codec with OpusAudioCodec or AacAudioCodec.
 // Pass bandwidth to reserve this track's bitrate against the session's
 // allocator so a co-resident video encoder sizes itself against what is left.
 func (b *BroadcastProducer) EncodeAudio(name string, input AudioEncoderInput, output AudioEncoderOutput, bandwidth *Bandwidth) (*AudioProducer, error) {
@@ -262,9 +262,10 @@ func (b *BroadcastProducer) RemoveCatalogSection(name string) error {
 	return b.inner.RemoveCatalogSection(name)
 }
 
-// Finish closes the broadcast.
-func (b *BroadcastProducer) Finish() error {
-	return b.inner.Finish()
+// Close ends the broadcast for good: it retracts and serves no new tracks.
+// Tracks already subscribed carry on to their own end. Closing again is a no-op.
+func (b *BroadcastProducer) Close() error {
+	return b.inner.Close()
 }
 
 // BroadcastDynamic is a stream of subscriber-requested tracks.
@@ -363,6 +364,11 @@ func (m *MediaProducer) WriteFrame(frame Frame) error {
 // Call after WriteFrame only for local encoder output, not file or network imports.
 func (m *MediaProducer) Flush(timestampUs uint64) error {
 	return m.inner.Flush(timestampUs)
+}
+
+// Discontinuity marks a timeline break and restarts handoff measurement, preserving advertised jitter.
+func (m *MediaProducer) Discontinuity() error {
+	return m.inner.Discontinuity()
 }
 
 // Cut draws a group boundary here.

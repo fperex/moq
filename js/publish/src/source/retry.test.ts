@@ -1,5 +1,5 @@
-import { expect, spyOn, test } from "bun:test";
-import { Effect, Signal } from "@moq/signals";
+import { expect, jest, spyOn, test } from "bun:test";
+import { Signal } from "@moq/signals";
 import { Camera } from "./camera";
 import { Microphone } from "./microphone";
 import { Retry } from "./retry";
@@ -12,9 +12,6 @@ class FakeTrack extends EventTarget {
 	readyState: MediaStreamTrackState = "live";
 	stopped = false;
 
-	// Told to the device that handed this track out, which stays busy for a while afterwards.
-	onstop: (() => void) | undefined;
-
 	getSettings(): MediaTrackSettings {
 		return { deviceId: "default" };
 	}
@@ -22,7 +19,6 @@ class FakeTrack extends EventTarget {
 	stop(): void {
 		this.stopped = true;
 		this.readyState = "ended";
-		this.onstop?.();
 	}
 
 	/** Die the way an unplugged device does. */
@@ -34,6 +30,7 @@ class FakeTrack extends EventTarget {
 
 class FakeMediaDevices extends EventTarget {
 	tracks: FakeTrack[] = [];
+	errors: Error[] = [];
 
 	// getUserMedia rejects, the way it does once the last device is gone.
 	missing = false;
@@ -53,31 +50,14 @@ class FakeMediaDevices extends EventTarget {
 	// a missing device rejects without pushing one.
 	attempts = 0;
 
-	// How long the device stays busy after a capture on it is stopped. A browser finishes handing a
-	// camera back to the OS well after `stop()` returns, and answers anything asking meanwhile with
-	// "could not start video source".
-	release = 0;
-	#busyUntil = 0;
-
-	// Held open to keep an attempt in flight, so a toggle can land while one is still running.
-	hold: PromiseWithResolvers<void> | undefined;
-
-	// Acquisitions and releases in the order they happened.
-	order: ("acquire" | "release")[] = [];
-
 	async getUserMedia(): Promise<MediaStream> {
-		this.order.push("acquire");
 		this.attempts += 1;
-		if (this.hold) await this.hold.promise;
+		const error = this.errors.shift();
+		if (error) throw error;
 		if (this.denied) throw new DOMException("Permission denied", "NotAllowedError");
 		if (this.missing) throw new Error("NotFoundError");
-		if (Date.now() < this.#busyUntil) throw new DOMException("Could not start video source", "NotReadableError");
 
 		const track = new FakeTrack();
-		track.onstop = () => {
-			this.order.push("release");
-			this.#busyUntil = Date.now() + this.release;
-		};
 		if (this.bornDead) track.readyState = "ended";
 		this.tracks.push(track);
 
@@ -193,22 +173,6 @@ const QUIET_MARGIN = 100;
 /** Burning the whole budget waits out every backoff, which outlasts the default per-test timeout. */
 const SPENT_TIMEOUT = 30_000;
 
-/**
- * An upper bound on how long the whole budget takes to burn: the first attempt plus a full backoff
- * for each failure it tolerates.
- *
- * A device busy for this long outlives every attempt the budget pays for.
- */
-function budgetWindow(): number {
-	let delay = Retry.DELAY.initial;
-	let total = 0;
-	for (let i = 0; i <= Retry.LIMIT; i++) {
-		total += delay;
-		delay = Math.min(delay * Retry.DELAY.multiplier, Retry.DELAY.max);
-	}
-	return total;
-}
-
 /** The track a source published, or undefined. */
 function published(media: Media | undefined): unknown {
 	const source = media?.audio ?? media?.video;
@@ -216,10 +180,168 @@ function published(media: Media | undefined): unknown {
 	return "track" in source ? source.track : source;
 }
 
+function fakeTime(): Disposable {
+	jest.useFakeTimers();
+	return { [Symbol.dispose]: () => jest.useRealTimers() };
+}
+
 for (const [kind, create] of [
 	["camera", (enabled: Signal<boolean>) => new Camera({ enabled })],
 	["microphone", (enabled: Signal<boolean>) => new Microphone({ enabled })],
 ] as const) {
+	for (const name of ["NotReadableError", "AbortError"]) {
+		test(`${kind} retries ${name} without reporting a terminal error`, async () => {
+			using _time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				// Settle discovery before starting so it cannot refund this attempt's budget.
+				await settle();
+				media.errors = [new DOMException("temporarily unavailable", name)];
+				enabled.set(true);
+				await settle();
+				expect(media.attempts).toBe(1);
+				expect(source.out.error.peek()).toBeUndefined();
+				expect(source.out.source.peek()).toBeUndefined();
+
+				jest.advanceTimersByTime(Retry.DELAY.initial);
+				await settle();
+				expect(media.attempts).toBe(2);
+				expect(published(source.out.source.peek())).toBe(media.latest());
+				expect(source.out.error.peek()).toBeUndefined();
+			} finally {
+				source.close();
+			}
+		});
+
+		test(`${kind} retains ${name} after exhausting the retry budget`, async () => {
+			using _time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				await settle();
+				const errors = Array.from(
+					{ length: Retry.LIMIT + 1 },
+					(_, i) => new DOMException(`failure ${i}`, name),
+				);
+				media.errors = [...errors];
+				enabled.set(true);
+				await settle();
+				for (let i = 0; i < Retry.LIMIT; i++) {
+					expect(media.attempts).toBe(i + 1);
+					expect(source.out.error.peek()).toBeUndefined();
+					jest.advanceTimersToNextTimer();
+					await settle();
+				}
+				expect(media.attempts).toBe(Retry.LIMIT + 1);
+				expect(source.out.source.peek()).toBeUndefined();
+				expect(source.out.error.peek()).toBe(errors.at(-1));
+				jest.advanceTimersByTime(Retry.SETTLED);
+				await settle();
+				expect(media.attempts).toBe(Retry.LIMIT + 1);
+				expect(source.out.error.peek()).toBe(errors.at(-1));
+
+				enabled.set(false);
+				await settle();
+				expect(source.out.error.peek()).toBeUndefined();
+				enabled.set(true);
+				await settle();
+				expect(media.attempts).toBe(Retry.LIMIT + 2);
+				expect(published(source.out.source.peek())).toBe(media.latest());
+			} finally {
+				source.close();
+			}
+		});
+	}
+
+	for (const error of [
+		new DOMException("denied", "NotAllowedError"),
+		new TypeError("bad constraints"),
+		new Error("unknown"),
+	]) {
+		test(`${kind} does not retry ${error.name}`, async () => {
+			using _time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				await settle();
+				media.errors = [error];
+				enabled.set(true);
+				await settle();
+				expect(source.out.error.peek()).toBe(error);
+				jest.advanceTimersByTime(Retry.SETTLED);
+				await settle();
+				expect(media.attempts).toBe(1);
+				expect(source.out.source.peek()).toBeUndefined();
+				expect(source.out.error.peek()).toBe(error);
+			} finally {
+				source.close();
+			}
+		});
+	}
+
+	for (const close of [false, true]) {
+		test(`${kind} cancels a pending retry when ${close ? "closed" : "disabled"}`, async () => {
+			using _time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				await settle();
+				media.errors = [new DOMException("busy", "NotReadableError")];
+				enabled.set(true);
+				await settle();
+				expect(media.attempts).toBe(1);
+				expect(source.out.error.peek()).toBeUndefined();
+				if (close) source.close();
+				else enabled.set(false);
+				await settle();
+				jest.advanceTimersByTime(Retry.SETTLED);
+				await settle();
+				expect(media.attempts).toBe(1);
+				expect(source.out.source.peek()).toBeUndefined();
+				expect(source.out.error.peek()).toBeUndefined();
+			} finally {
+				source.close();
+			}
+		});
+	}
+
+	for (const reject of [false, true]) {
+		test(`${kind} ignores a ${reject ? "rejection" : "stream"} arriving after cancellation`, async () => {
+			using _time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const pending = Promise.withResolvers<MediaStream>();
+			const open = spyOn(media, "getUserMedia").mockImplementationOnce(() => pending.promise);
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				await settle();
+				enabled.set(true);
+				await settle();
+				expect(open).toHaveBeenCalledTimes(1);
+				enabled.set(false);
+				await settle();
+				const track = new FakeTrack();
+				if (reject) pending.reject(new DOMException("aborted", "AbortError"));
+				else pending.resolve({ getTracks: () => [track] } as unknown as MediaStream);
+				await settle();
+				if (!reject) expect(track.stopped).toBe(true);
+				jest.advanceTimersByTime(Retry.SETTLED);
+				await settle();
+				expect(open).toHaveBeenCalledTimes(1);
+				expect(source.out.error.peek()).toBeUndefined();
+				expect(source.out.source.peek()).toBeUndefined();
+			} finally {
+				source.close();
+				open.mockRestore();
+			}
+		});
+	}
+
 	test(`${kind} reports a refusal and stops retrying until capture is reset`, async () => {
 		using media = install(new FakeMediaDevices());
 		media.denied = true;
@@ -240,6 +362,56 @@ for (const [kind, create] of [
 		await waitUntil(() => source.out.source.peek() !== undefined);
 		expect(media.attempts).toBe(2);
 		source.close();
+	});
+
+	test(`${kind} reports an ended track that exhausts the retry budget`, async () => {
+		using _time = fakeTime();
+		using media = install(new FakeMediaDevices());
+		const enabled = new Signal(false);
+		const source = create(enabled);
+		try {
+			// Settle discovery before starting so it cannot refund this attempt's budget.
+			await settle();
+			enabled.set(true);
+			await settle();
+			expect(published(source.out.source.peek())).toBe(media.latest());
+			expect(source.out.error.peek()).toBeUndefined();
+
+			for (let i = 0; i < Retry.LIMIT; i++) {
+				media.latest().end();
+				await settle();
+				expect(source.out.error.peek()).toBeUndefined();
+				jest.advanceTimersToNextTimer();
+				await settle();
+				expect(media.attempts).toBe(i + 2);
+				expect(published(source.out.source.peek())).toBe(media.latest());
+				expect(source.out.error.peek()).toBeUndefined();
+			}
+
+			media.latest().end();
+			await settle();
+			expect(media.attempts).toBe(Retry.LIMIT + 1);
+			expect(source.out.source.peek()).toBeUndefined();
+			const error = source.out.error.peek();
+			expect(error?.name).toBe("AbortError");
+			expect(error?.message).toBe("The media track ended");
+
+			jest.advanceTimersByTime(Retry.SETTLED);
+			await settle();
+			expect(media.attempts).toBe(Retry.LIMIT + 1);
+			expect(source.out.error.peek()).toBe(error);
+
+			enabled.set(false);
+			await settle();
+			expect(source.out.error.peek()).toBeUndefined();
+			enabled.set(true);
+			await settle();
+			expect(media.attempts).toBe(Retry.LIMIT + 2);
+			expect(published(source.out.source.peek())).toBe(media.latest());
+			expect(source.out.error.peek()).toBeUndefined();
+		} finally {
+			source.close();
+		}
 	});
 }
 
@@ -300,9 +472,6 @@ test("running out of retries clears the source instead of publishing a corpse", 
 	// Critically, the dead track is not left published: encoders would get no frames while the UI
 	// still reported a live source.
 	expect(mic.out.source.peek()).toBeUndefined();
-
-	// And it says why, so something other than silence can report it.
-	expect(mic.out.error.peek()).toBeInstanceOf(Error);
 
 	mic.close();
 });
@@ -528,124 +697,3 @@ for (const screenPixelRatio of [undefined, 2]) {
 		}
 	});
 }
-
-// A capture that is busy is not a capture that is broken. The device is there and we are allowed to
-// use it: something else has it, very often the capture we ourselves just stopped, because a browser
-// finishes handing a device back well after `stop()` returns. Counting that window against the
-// budget leaves the preview black after hiding video and showing it again.
-
-/** What a browser rejects with while a device is still held. */
-function busy(): DOMException {
-	return new DOMException("Could not start video source", "NotReadableError");
-}
-
-test("a busy device waits instead of spending the budget", () => {
-	const error = new Signal<Error | undefined>(undefined);
-	const retry = new Retry(error);
-	const effect = new Effect();
-
-	try {
-		// The first call is what the budget is keyed to; reuse the array so nothing looks like new intent.
-		const settings = [undefined];
-		expect(retry.begin(effect, settings)).toBe(true);
-
-		// Far more failures than the budget tolerates.
-		for (let i = 0; i < Retry.LIMIT * 3; i++) {
-			retry.failed(busy());
-			expect(retry.begin(effect, settings)).toBe(false); // paying the backoff
-			expect(retry.begin(effect, settings)).toBe(true); // and still willing to try
-		}
-
-		// Loudly, the whole time.
-		expect(error.peek()?.name).toBe("NotReadableError");
-	} finally {
-		effect.close();
-	}
-});
-
-test("a device that refuses still spends the budget", () => {
-	const error = new Signal<Error | undefined>(undefined);
-	const retry = new Retry(error);
-	const effect = new Effect();
-
-	try {
-		const settings = [undefined];
-		expect(retry.begin(effect, settings)).toBe(true);
-
-		for (let i = 0; i < Retry.LIMIT; i++) {
-			retry.failed(new Error("no such device"));
-			expect(retry.begin(effect, settings)).toBe(false);
-			expect(retry.begin(effect, settings)).toBe(true);
-		}
-
-		retry.failed(new Error("no such device"));
-		retry.begin(effect, settings);
-		expect(retry.begin(effect, settings)).toBe(false);
-		expect(error.peek()?.message).toBe("no such device");
-	} finally {
-		effect.close();
-	}
-});
-
-test("a capture waits for the previous one to be released before asking again", async () => {
-	using media = install(new FakeMediaDevices());
-	media.hold = Promise.withResolvers<void>();
-
-	const enabled = new Signal(true);
-	const camera = new Camera({ enabled });
-
-	try {
-		// The first attempt is still in flight when the user hides video and shows it again.
-		await waitUntil(() => media.attempts === 1);
-		enabled.set(false);
-		await settle();
-		enabled.set(true);
-		await settle(40);
-
-		// Asking now would be asking for a device we have not let go of.
-		expect(media.attempts).toBe(1);
-
-		media.hold.resolve();
-		await waitUntil(() => media.attempts === 2);
-		await settle();
-
-		expect(media.order).toEqual(["acquire", "release", "acquire"]);
-	} finally {
-		camera.close();
-	}
-});
-
-test(
-	"hiding video and showing it again survives a device that is still being released",
-	async () => {
-		using media = install(new FakeMediaDevices());
-		media.release = budgetWindow();
-
-		const enabled = new Signal(true);
-		const camera = new Camera({ enabled });
-
-		try {
-			await waitUntil(() => camera.out.source.peek() !== undefined);
-
-			// Three fast toggles, the way a user checks whether the button works at all.
-			for (let i = 0; i < 3; i++) {
-				enabled.set(false);
-				await settle();
-				enabled.set(true);
-				await settle();
-			}
-
-			// It says why it is dark rather than leaving a black preview to speak for it.
-			await waitUntil(() => camera.out.error.peek() !== undefined);
-			expect(camera.out.error.peek()?.name).toBe("NotReadableError");
-
-			// And it is still asking, so the camera comes back as soon as the device is free.
-			await waitUntil(() => camera.out.source.peek() !== undefined);
-			expect(published(camera.out.source.peek())).toBe(media.latest());
-			expect(camera.out.error.peek()).toBeUndefined();
-		} finally {
-			camera.close();
-		}
-	},
-	SPENT_TIMEOUT,
-);

@@ -1,10 +1,17 @@
-import { expect, mock, test } from "bun:test";
+import { expect, mock, spyOn, test } from "bun:test";
+import * as Moq from "@moq/net";
+import { Effect, Signal } from "@moq/signals";
+import { Baseline } from "../jitter";
 import type { StreamTrack } from "./types";
 
-mock.module("./capture-worker.ts?worker&inline", () => ({ default: class {} }));
+mock.module("./capture-worker.ts?worklet", () => ({ default: async () => "blob:fake-worker" }));
 const { Capture } = await import("./capture");
+const { Encoder } = await import("./encoder");
 
 class Frame {
+	// Every frame built, so a test can assert none is left open.
+	static all: Frame[] = [];
+
 	codedWidth = 1920;
 	codedHeight = 1080;
 	timestamp: number;
@@ -12,6 +19,7 @@ class Frame {
 
 	constructor(source?: Frame, init?: { timestamp: number }) {
 		this.timestamp = init?.timestamp ?? source?.timestamp ?? 0;
+		Frame.all.push(this);
 	}
 
 	clone(): Frame {
@@ -65,110 +73,189 @@ test("capture resamples live scale when frame dimensions stay unchanged", async 
 	}
 });
 
-// A capture pipeline can stop while the camera track is still live: the processor's readable ends or
-// errors and nothing above notices, because the fanout keeps handing out the object it already
-// published. Downstream then just stops (the preview holds its last frame, the capture rate goes to
-// zero, the encoders go quiet) while the element still announces a live broadcast.
+// Installs Frame as the global VideoFrame and returns a FrameSource fed by hand.
+function frameSource() {
+	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+	Object.defineProperty(globalThis, "VideoFrame", { configurable: true, value: Frame, writable: true });
+	Frame.all = [];
 
-const realSetTimeout = globalThis.setTimeout;
-const flush = () => new Promise((resolve) => realSetTimeout(resolve, 0));
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const frames = new ReadableStream<VideoFrame>({
+		start: (c) => {
+			controller = c;
+		},
+	});
 
-async function settle(rounds = 8): Promise<void> {
-	for (let i = 0; i < rounds; i++) await flush();
-}
-
-/** Run the rebuild delay on a compressed clock rather than waiting a second out. */
-function fastTimers(): () => void {
-	globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) =>
-		realSetTimeout(fn, ms !== undefined && ms > 20 ? 2 : ms, ...rest)) as typeof setTimeout;
-	const error = console.error;
-	// The stall is the subject here, so the noise it deliberately prints is not.
-	console.error = () => {};
-	return () => {
-		globalThis.setTimeout = realSetTimeout;
-		console.error = error;
+	return {
+		source: { frames, frameRate: 30 },
+		push: (timestamp: number) => controller.enqueue(new Frame(undefined, { timestamp }) as unknown as VideoFrame),
+		[Symbol.dispose]() {
+			if (original) Object.defineProperty(globalThis, "VideoFrame", original);
+			else Reflect.deleteProperty(globalThis, "VideoFrame");
+		},
 	};
 }
 
-test("a pipeline that stops on a live track is reported and rebuilt on it", async () => {
-	const restore = fastTimers();
-	const processor = Object.getOwnPropertyDescriptor(globalThis, "MediaStreamTrackProcessor");
-	const opened: ReadableStreamDefaultController<VideoFrame>[] = [];
-	Object.defineProperty(globalThis, "MediaStreamTrackProcessor", {
-		configurable: true,
-		value: class {
-			readonly readable = new ReadableStream<VideoFrame>({
-				start: (controller) => {
-					opened.push(controller);
-				},
-			});
-		},
-	});
+// Let the capture pump drain everything pushed so far.
+const flush = () => new Promise((resolve) => setTimeout(resolve, 10));
 
-	const videoFrame = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
-	Object.defineProperty(globalThis, "VideoFrame", { configurable: true, value: Frame });
+const open = () => Frame.all.filter((frame) => !frame.closed);
 
-	const track = { readyState: "live", kind: "video" } as unknown as StreamTrack;
-	const capture = new Capture({ source: track });
+test("a reader attaching to a still source starts with the current picture, stamped now", async () => {
+	using input = frameSource();
+	const clock = spyOn(performance, "now").mockReturnValue(1_000);
+	const capture = new Capture({ source: input.source });
+	const effect = new Effect();
+
 	try {
-		await settle();
-		expect(capture.out.stopped.peek()).toBeUndefined();
-		expect(opened).toHaveLength(1);
+		// The only frame the source sends, with nobody reading yet.
+		input.push(1_000_000);
+		await flush();
 
-		const display = capture.out.display.changed();
-		opened[0].enqueue(new Frame() as unknown as VideoFrame);
-		expect(await display).toMatchObject({ width: 1920, height: 1080 });
+		// Attach 90s later.
+		clock.mockReturnValue(91_000);
+		const fanout = capture.out.frames.peek();
+		if (!fanout) throw new Error("no fanout");
+		const reader = fanout.subscribe(effect).getReader();
 
-		// The processor gives up while the camera keeps running.
-		opened[0].close();
-		for (let i = 0; i < 40 && capture.out.stopped.peek() === undefined; i++) await flush();
-		expect(capture.out.stopped.peek()).toBeInstanceOf(Error);
+		const first = (await reader.read()).value as unknown as Frame;
+		expect(first.timestamp).toBe(91_000_000);
+		first.close();
 
-		// The track still has frames to give, so the pipeline is rebuilt on it rather than left
-		// pointing at a fanout that will never deliver again.
-		for (let i = 0; i < 40 && opened.length < 2; i++) await flush();
-		expect(opened.length).toBeGreaterThanOrEqual(2);
-		expect(capture.out.stopped.peek()).toBeUndefined();
-
-		// The dimensions belong to the source, so they survive the gap. Blanking them would blank
-		// the encoder's resolved config and drop the rendition out of the catalog, which takes every
-		// viewer's subscription with it and does not bring them back.
-		expect(capture.out.display.peek()).toMatchObject({ width: 1920, height: 1080 });
+		// Captured before the copy's stamp, so it would run time backwards: skipped.
+		input.push(90_999_000);
+		input.push(91_033_000);
+		const next = (await reader.read()).value as unknown as Frame;
+		expect(next.timestamp).toBe(91_033_000);
+		next.close();
 	} finally {
+		effect.close();
 		capture.close();
-		if (processor) Object.defineProperty(globalThis, "MediaStreamTrackProcessor", processor);
-		else Reflect.deleteProperty(globalThis, "MediaStreamTrackProcessor");
-		if (videoFrame) Object.defineProperty(globalThis, "VideoFrame", videoFrame);
-		else Reflect.deleteProperty(globalThis, "VideoFrame");
-		restore();
+		clock.mockRestore();
+	}
+
+	expect(open()).toEqual([]);
+});
+
+test("the held frame is closed when replaced, when an unread copy is dropped, and on close", async () => {
+	using input = frameSource();
+	const capture = new Capture({ source: input.source });
+
+	input.push(1_000);
+	input.push(2_000);
+	await flush();
+
+	// Only the newest is held: the source frames reached no reader and the first hold was replaced.
+	expect(open()).toHaveLength(1);
+
+	// A reader that leaves without reading its copy releases it.
+	const effect = new Effect();
+	capture.out.frames.peek()?.subscribe(effect);
+	expect(open()).toHaveLength(2);
+	effect.close();
+	expect(open()).toHaveLength(1);
+
+	capture.close();
+	expect(open()).toEqual([]);
+});
+
+test("closing the capture releases a copy its reader never read", async () => {
+	using input = frameSource();
+	const capture = new Capture({ source: input.source });
+	const effect = new Effect();
+
+	try {
+		input.push(1_000);
+		await flush();
+
+		const reader = capture.out.frames.peek()?.subscribe(effect).getReader();
+		if (!reader) throw new Error("no fanout");
+
+		// The reader outlives the capture, like the fanout's own queued frames.
+		capture.close();
+		expect(open()).toEqual([]);
+		expect((await reader.read()).done).toBe(true);
+	} finally {
+		effect.close();
 	}
 });
 
-test("a frame source that ends is reported and not rebuilt", async () => {
-	const restore = fastTimers();
-	const opened: ReadableStreamDefaultController<VideoFrame>[] = [];
-	// A `FrameSource` is the application's own stream. Reopening it is not ours to do, so this only
-	// has to stop pretending the capture is still live.
-	const capture = new Capture({
-		source: {
-			frames: new ReadableStream<VideoFrame>({
-				start: (controller) => {
-					opened.push(controller);
-				},
-			}),
-		},
-	});
-	try {
-		await settle();
-		expect(opened).toHaveLength(1);
+// https://github.com/moq-dev/moq/issues/4778
+test("an encoder resuming on a still source encodes a keyframe of the current picture, stamped now", async () => {
+	using input = frameSource();
+	const clock = spyOn(performance, "now").mockReturnValue(1_000);
 
-		opened[0].close();
-		for (let i = 0; i < 40 && capture.out.stopped.peek() === undefined; i++) await flush();
-		expect(capture.out.stopped.peek()).toBeInstanceOf(Error);
-		await settle(20);
-		expect(opened).toHaveLength(1);
+	const keys: number[] = [];
+	class RecordingVideoEncoder {
+		state: CodecState = "unconfigured";
+		#output: VideoEncoderInit["output"];
+		#codec?: string;
+
+		constructor(init: VideoEncoderInit) {
+			this.#output = init.output;
+		}
+
+		static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
+			return { supported: config.codec.startsWith("avc1") };
+		}
+
+		configure(config: VideoEncoderConfig): void {
+			this.state = "configured";
+			this.#codec = config.codec;
+		}
+
+		encode(frame: VideoFrame, options?: VideoEncoderEncodeOptions): void {
+			if (options?.keyFrame) keys.push(frame.timestamp);
+		}
+
+		// Only the probe flushes; report the configured codec, as Chrome does.
+		async flush(): Promise<void> {
+			const chunk = { type: "key", timestamp: 0, byteLength: 1, copyTo: () => {} };
+			this.#output(chunk as never, { decoderConfig: { codec: this.#codec } } as never);
+		}
+
+		close(): void {
+			this.state = "closed";
+		}
+	}
+	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
+	Object.defineProperty(globalThis, "VideoEncoder", {
+		configurable: true,
+		value: RecordingVideoEncoder,
+		writable: true,
+	});
+
+	const capture = new Capture({ source: input.source });
+	const track = new Moq.Track.Producer("video").accept();
+	// No subscriber yet, so the encoder idles while the source sends its only frame.
+	const live = new Signal<Moq.Track.Producer | undefined>(undefined);
+	const rendition = { config: new Signal(undefined), track: live, close: () => {} };
+	const encoder = new Encoder("video", {
+		enabled: true,
+		broadcast: { video: () => rendition, baseline: new Baseline() } as never,
+		capture,
+	});
+
+	try {
+		input.push(1_000_000);
+		// Wait for the probe to resolve a config from the captured dimensions.
+		for (let i = 0; i < 50 && !encoder.out.resolved.peek(); i++) await flush();
+		expect(encoder.out.resolved.peek()).toBeDefined();
+
+		// Drop the probe's own encode.
+		keys.length = 0;
+
+		clock.mockReturnValue(91_000);
+		live.set(track);
+		await flush();
+
+		expect(keys).toEqual([91_000_000]);
 	} finally {
+		encoder.close();
 		capture.close();
-		restore();
+		track.close();
+		clock.mockRestore();
+		if (original) Object.defineProperty(globalThis, "VideoEncoder", original);
+		else Reflect.deleteProperty(globalThis, "VideoEncoder");
 	}
 });

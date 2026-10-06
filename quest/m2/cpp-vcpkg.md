@@ -3,13 +3,14 @@
 ## Goal
 
 A consumer adds `moq-dev/vcpkg-registry` to `vcpkg-configuration.json`,
-depends on `moq`, and gets the prebuilt package for their triple without a
+depends on `moq-cpp`, and gets the prebuilt package for their triple without a
 Rust toolchain or the bindgen fork. A fresh consumer project installs it in
 CI on Windows, macOS, and Linux.
 
 ## Plan
 
-- `moq-dev/vcpkg-registry`: a git registry with a `moq` port whose portfile
+- `moq-dev/vcpkg-registry`: a git registry with a `moq-cpp` port, named after
+  the package (`find_package(moq-cpp)`, target `moq::cpp`), whose portfile
   downloads the per-target release tarball from `release-cpp.yml` by version
   and hash, installs headers, the static library, and the CMake config, and
   declares `supports` for exactly the release matrix. Versioning follows the
@@ -25,8 +26,8 @@ CI on Windows, macOS, and Linux.
 
 ## Required
 
-- [Package](/quest/m1/cpp/package.md) - the release tarballs the port fetches
+- [C++ through moq-ffi](/quest/m1/cpp/README.md) - the release tarballs the port fetches
 
 ## Related
 
-- [Conan remote](/quest/m2/cpp-conan.md) - the same tarball through Conan
+- [Conan remote](/quest/m3/cpp-conan.md) - the same tarball through Conan

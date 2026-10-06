@@ -6,7 +6,7 @@ import type { Consumer as OriginConsumer, Producer as OriginProducer } from "../
 import { Stream } from "../stream.ts";
 import * as Time from "../time.ts";
 import * as Hex from "../util/hex.ts";
-import { dev, redact } from "../util/log.ts";
+import { redact } from "../util/log.ts";
 import { isWebTransportSupported } from "./browser.ts";
 import type { Established } from "./established.ts";
 import { forwardAnnounced } from "./forward.ts";
@@ -156,7 +156,7 @@ export async function connect({ url, ...props }: ConnectProps): Promise<Establis
 		}
 
 		// Close a connection that settles after the abort.
-		pending.then((conn) => conn.close()).catch(() => {});
+		pending.then((conn) => conn.abort()).catch(() => {});
 		throw signal.reason;
 	} finally {
 		signal.removeEventListener("abort", onAbort);
@@ -213,10 +213,9 @@ async function connectInner(url: URL, props: Omit<ConnectProps, "url">, abort: P
 
 	// Save if WebSocket won the last race, so we won't give QUIC a head start next time.
 	if (session instanceof Session) {
-		// Still a warning, not a debug line: losing the race means we fell back off QUIC.
-		if (dev()) console.warn(redact(url), "connected via WebSocket");
+		console.debug(redact(url), "connected via WebSocket");
 		websocketWon.add(url.toString());
-	} else if (dev()) {
+	} else {
 		console.debug(redact(url), "connected via WebTransport");
 	}
 
@@ -254,10 +253,10 @@ async function connectTransport(url: URL, session: WebTransport, wiring: Session
 // Negotiate the MoQ protocol over an established transport. The caller races this against
 // the session closing so a close code is not lost behind a failed or stalled SETUP stream.
 async function negotiate(url: URL, session: WebTransport, wiring: SessionProps): Promise<Established> {
-	// qmux Session exposes the negotiated protocol directly (as "" when there is none);
-	// native WebTransport doesn't have a standard .protocol property yet.
+	// The DOM lib has no `protocol` property yet. It is "" when none was negotiated, and
+	// undefined in a browser that predates subprotocols (Firefox before 155).
 	const protocol: string | undefined = (session as { protocol?: string }).protocol || undefined;
-	if (dev()) console.debug(redact(url), "negotiated ALPN:", protocol ?? "(none)");
+	console.debug(redact(url), "negotiated ALPN:", protocol ?? "(none)");
 
 	// Choose setup encoding based on negotiated WebTransport protocol (if any).
 	let setupVersion: Ietf.Version;
@@ -281,7 +280,7 @@ async function negotiate(url: URL, session: WebTransport, wiring: SessionProps):
 		setupVersion = Ietf.Version.DRAFT_16;
 	} else if (protocol === Ietf.ALPN.DRAFT_15) {
 		setupVersion = Ietf.Version.DRAFT_15;
-	} else if (protocol === Lite.ALPN_07) {
+	} else if (protocol === Lite.ALPN_07_WIP) {
 		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_07, ...wiring });
 	} else if (protocol === Lite.ALPN_06) {
 		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_06, ...wiring });
@@ -297,7 +296,7 @@ async function negotiate(url: URL, session: WebTransport, wiring: SessionProps):
 		throw new Error(`unsupported WebTransport protocol: ${protocol}`);
 	}
 
-	const stream = await Stream.open(session);
+	const stream = await Stream.open(session, { version: setupVersion });
 	await stream.writer.u53(Lite.StreamId.ClientCompat);
 
 	const encoder = new TextEncoder();
@@ -362,7 +361,7 @@ async function handshakeAlpn(
 	version: Ietf.IetfVersion,
 	wiring: SessionProps,
 ): Promise<Established> {
-	const { control, solicit, hidden, cluster } = await exchangeSetup(session, version, "moq-lite-js");
+	const { control, early, solicit, hidden, cluster } = await exchangeSetup(session, version, "moq-lite-js");
 
 	return new Ietf.Connection({
 		...wiring,
@@ -370,6 +369,7 @@ async function handshakeAlpn(
 		url,
 		quic: session,
 		control,
+		early,
 		solicit,
 		hidden,
 		cluster,
@@ -438,7 +438,8 @@ async function connectWebTransport(
 		allowPooling: false,
 		congestionControl: "low-latency",
 		protocols: [
-			Lite.ALPN_07,
+			// Lite.ALPN_07_WIP is intentionally omitted: lite-07 is work-in-progress and
+			// not advertised by default (negotiate still accepts it if a server selects it).
 			Lite.ALPN_06,
 			Lite.ALPN_05,
 			Lite.ALPN_04,
@@ -471,12 +472,7 @@ async function connectWebTransport(
 		// Dev-only path: http:// can't be a real WebTransport origin, so we fetch the
 		// self-signed cert's hash over plain HTTP and pin it. Production uses https://
 		// and never reaches here. Keep this at debug so it doesn't read as a problem.
-		if (dev()) {
-			console.debug(
-				redact(fingerprintUrl),
-				"performing an insecure fingerprint fetch; use https:// in production",
-			);
-		}
+		console.debug(redact(fingerprintUrl), "performing an insecure fingerprint fetch; use https:// in production");
 
 		// Fetch the fingerprint from the server.
 		// TODO cancel the request if the effect is cancelled.
@@ -525,7 +521,7 @@ async function connectWebSocket(url: URL, delay: number, cancel: Promise<void>):
 	// advertises every QMux draft it knows about and the server picks one.
 	// Insertion order is the negotiation preference on the wire.
 	const versions = {
-		[Lite.ALPN_07]: null,
+		// Lite.ALPN_07_WIP omitted on purpose: lite-07 is work-in-progress, not advertised by default.
 		[Lite.ALPN_06]: null,
 		[Lite.ALPN_05]: null,
 		[Lite.ALPN_04]: null,

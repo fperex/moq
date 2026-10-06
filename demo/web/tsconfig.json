@@ -5,8 +5,7 @@
 		"moduleResolution": "bundler",
 		"jsx": "preserve",
 		"jsxImportSource": "solid-js",
-		"outDir": "dist",
-		"types": ["bun"]
+		"outDir": "dist"
 	},
 	"include": ["src", "../../js/common/worklet.d.ts"]
 }

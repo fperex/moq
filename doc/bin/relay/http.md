@@ -12,8 +12,8 @@ operational ones that must stay private.
 
 | Endpoint | Returns |
 | --- | --- |
-| `GET /announced/<prefix>` | Broadcasts announced under the prefix. |
-| `GET /fetch/<broadcast>/<track>?group=N` | One group from the cache, the latest by default. Useful for catch-up and debugging. |
+| `GET /announced/<prefix>` | Broadcasts announced under the prefix, named relative to it. |
+| `GET /fetch/<broadcast>/<track>?group=N` | One group from the cache, the latest by default, or `404` if the track has no such group. Useful for catch-up and debugging. |
 | `GET /certificate.sha256` | The fingerprint of the first configured TLS certificate, for pinning a self-signed dev certificate. |
 | `GET /health` | `200 ok`, unauthenticated, for load balancers. |
 
@@ -25,6 +25,9 @@ curl http://localhost:4443/fetch/demo/bbb.hang/catalog.json
 The announcement listing names each announced route by the prefix it covers;
 by convention a publisher announces each broadcast's exact path, so the list
 reads as broadcast names.
+
+`moq announced` and `moq fetch` answer the same questions over MoQ; see
+[Inspect a relay](/bin/inspect).
 
 A relay configured with more than one certificate has no single fingerprint to
 publish, and this endpoint answers for the first. The others are reachable over
@@ -52,7 +55,43 @@ split by `tier` and `role`, plus accept-loop counters per TCP listener. Alert
 on `moq_relay_accept_failures_total{class="exhausted"}`, which means the
 process ran out of a resource `accept` needs. Content dropped for drifting past
 a subscriber's budget is counted separately as `moq_relay_stale_bytes_total`
-and friends. Host CPU and memory belong to a node exporter.
+and friends. During a [shutdown drain](/bin/relay/config#shutdown),
+`moq_relay_draining_sessions` counts the sessions sent a GOAWAY that have not
+left yet. Host CPU and memory belong to a node exporter.
+
+`moq_relay_sessions_refused_total` counts the session attempts admission turned
+away, by `reason`:
+
+- `refused`: the decider said no (the auth server, the public rules, or an
+  embedder).
+- `unavailable`: the decider could not answer, so the client is told to retry
+  (the auth server was unreachable or answered with neither a grant nor a
+  refusal, a decider sent a grant the relay cannot use, or an embedder did not
+  answer).
+- `request`: an embedder refused the request as one it cannot decide.
+- `forbidden`: the grant allows nothing the session asked for, or an embedder
+  refused the session as forbidden.
+- `lan`: a LAN peer's membership proof was missing or wrong, or LAN discovery
+  is off.
+
+Only sessions are counted. The HTTP routes admit through the same decider but
+open no session, so like `moq_relay_sessions_opened_total` this leaves them out,
+and a refusal earlier in the handshake, such as TLS, never reaches admission. A
+rise in `unavailable` points at the auth server; a rise in `refused` at the
+credentials clients present.
+
+Each attempt counts once, so this is refused attempts, not refused clients, and
+one connect can be refused more than once. A client that races WebSocket against
+QUIC can be refused on both when its WebSocket upgrade goes out before QUIC
+connects; the browser client starts WebSocket after a head start, or at once for
+a URL where WebSocket won before. A client that cannot tell a refusal from a
+failure retries, and each retry counts: a browser refused over WebSocket sees no
+status and retries until its reconnect window closes, while a credential refusal
+over QUIC closes the session as unauthorized, which stops it.
+
+Traffic and session counters accumulate for the node's lifetime, including
+broadcasts and sessions that have ended. The stats publishing prefix (normally
+`.stats`) is excluded to avoid counting the feed's own traffic.
 
 With `--runtime-io-uring`, each QUIC worker thread also reports its own
 `moq_relay_uring_*` counters under a `worker` label: datagrams and syscalls
@@ -88,9 +127,10 @@ curl -X POST 'http://127.0.0.1:9101/sessions/revalidate?id=00ff'
 
 ### GET /nodes
 
-This relay's view of the cluster: each visible node's URL, Hop ID, the route
-its advertisement took, and the connections to it (with the same `conn` id the
-logs use). A route is priced twice: `cost` as the cluster stands, which reads 0
-through a relay already carrying the broadcast, and `cold_cost` with those
-discounts removed, which is what tells two warm relays apart. It is best-effort
-correlation, not authenticated identity.
+The peers this relay dialed and holds a session with: each node's URL, without
+its query, and the connections to it, with the same `conn` id the logs use.
+Peers that dialed this relay are not listed, since they declare no URL.
+
+```json
+{ "nodes": [{ "node": "https://us-east.example.com/", "connections": [{ "id": 3 }] }] }
+```

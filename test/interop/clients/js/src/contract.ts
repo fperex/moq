@@ -8,6 +8,8 @@
  * @module
  */
 
+import type * as Moq from "@moq/net";
+
 // ── the deterministic publisher ─────────────────────────────────────────────
 
 /** A deliberate defect, used to prove an assertion can fail. */
@@ -43,6 +45,35 @@ export type FixtureState = {
 	encodedFrames: number;
 };
 
+/** The newest published video's GOP, sampled independently of canvas capture and encoding. */
+export type LiveGop = {
+	/** The timestamp of its keyframe, in milliseconds on the publisher's media clock. */
+	timestamp: number;
+};
+
+/** Read the newest published GOP without retaining a subscription or changing its frames. */
+export async function readLiveGop(track: Moq.Track.Consumer): Promise<LiveGop> {
+	const subscriber = track.subscribe();
+	try {
+		const group = await subscriber.recvGroup();
+		if (!group) throw new Error("the fixture video has no published GOP");
+		try {
+			const frame = await group.readFrame();
+			if (!frame) throw new Error("the fixture GOP has no keyframe");
+			return { timestamp: frame.timestamp.asMillis() };
+		} finally {
+			group.close();
+		}
+	} finally {
+		subscriber.close();
+	}
+}
+
+/** True when the presented frame belongs to the sampled GOP or a newer one. */
+export function lateJoinStartsLive(gop: LiveGop, timestamp: number | undefined): boolean {
+	return timestamp !== undefined && timestamp >= gop.timestamp;
+}
+
 /** The camera publisher state mirrored onto its element for Playwright. */
 export type CaptureState = {
 	videoError?: string;
@@ -74,9 +105,6 @@ export const TONE_FLOOR_DB = 15;
  */
 export const AUDIBLE_RMS = 0.02;
 
-/** Which thread feeds a player's audio ring: the page's audio worker, or the page's own main thread. */
-export type AudioThread = "worker" | "main";
-
 /** Live instances of each resource the page's wrappers count. */
 export type Resources = {
 	/** Open `WebTransport` sessions, i.e. connections to the relay. */
@@ -106,7 +134,7 @@ export type Sample = {
 	/** Whether the subscriber has resolved an announced broadcast. */
 	broadcastActive: boolean;
 	/** The subscriber's catalog state, which stays offline without an announcement. */
-	broadcastStatus: "offline" | "loading" | "live";
+	broadcastStatus: "offline" | "loading" | "live" | "error";
 	/** Whether this document has received user activation. */
 	userActivated: boolean;
 	/** `performance.now()` when the sample was taken. */
@@ -133,8 +161,8 @@ export type Sample = {
 	audioTimestamp?: number;
 	/** Whether the audio buffer is waiting to refill. */
 	audioStalled: boolean;
-	/** Which thread feeds the audio ring (`audio.out.thread`), absent while the worker is starting. */
-	audioThread?: AudioThread;
+	/** How far playback trails the live edge, in milliseconds: the player's resolved sync delay. */
+	delay: number;
 	/** Peak frequency in the tone band, absent until the graph exists. */
 	toneHz?: number;
 	/** The tone step that peak names, absent when no tone stands above the floor. */
@@ -155,6 +183,15 @@ export type Sample = {
 	resources: Resources;
 };
 
+// ── the refused session ─────────────────────────────────────────────────────
+
+/** How a refused session ended, as `WebTransport.closed` reported it to the page. */
+export type CloseState =
+	/** `closed` resolved: the close capsule arrived. */
+	| { closeCode: number; reason: string }
+	/** `closed` rejected, or the relay admitted the session: the close never said why. */
+	| { error: string };
+
 // ── the command channel ─────────────────────────────────────────────────────
 
 /**
@@ -164,13 +201,15 @@ export type Sample = {
  * owns them rather than the driver reaching in.
  */
 export type InteropControl = {
+	/** Read the current video GOP while an existing viewer is still pulling media. */
+	liveGop(): Promise<LiveGop>;
 	/** Stop the fixture publisher, releasing its session. */
 	stop(): void;
 	/** Start (or restart) the fixture publisher on the same broadcast path. */
 	start(): void;
 	/** Remove the player from the DOM. */
 	detach(): void;
-	/** Put the player back and resume sampling. */
+	/** Blank the canvas the old session left behind, put the player back, and resume sampling. */
 	reattach(): void;
 	/** Connect a second player and leave it behind for the leaked-session negative control. */
 	startLeak(): void;

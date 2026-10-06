@@ -64,8 +64,8 @@ pub(crate) struct Tasks {
 }
 
 /// A claim on a [`TaskSet`]'s lifetime with no submission queue: what a
-/// broadcast published on an origin holds, so the driver outlives the producer
-/// handles a session was given and dropped.
+/// broadcast published on an origin and an `origin::Dynamic` hold, so the
+/// driver outlives the producer handles a session was given and dropped.
 pub(crate) struct Keepalive {
 	_alive: kio::Producer<()>,
 }
@@ -127,6 +127,12 @@ impl TasksWeak {
 		if !state.closed && !self.alive.is_closed() {
 			state.queued.push_back(task.maybe_boxed());
 		}
+	}
+
+	/// Poll for every owning handle being gone, after which the set finishes as soon
+	/// as its children do.
+	pub fn poll_orphaned(&self, waiter: &kio::Waiter) -> Poll<()> {
+		self.alive.poll_closed(waiter)
 	}
 }
 

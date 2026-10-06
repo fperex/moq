@@ -82,7 +82,6 @@ try {
 	const fatal: string[] = [];
 	page.on("console", (message) => {
 		const text = message.text();
-		void Promise.allSettled(message.args().map((argument) => argument.dispose()));
 		console.error(`[page] ${text}`);
 		if (text.includes("panicked at")) fatal.push(`panic: ${text}`);
 	});

@@ -460,6 +460,44 @@ impl Track {
 		}
 	}
 
+	/// Mark a timeline break, clearing partial frames and restarting handoff measurement.
+	///
+	/// Publishes a marker without lowering advertised values; resumed timestamps must continue forward.
+	pub fn discontinuity(&mut self) -> Result<()> {
+		self.group_start = None;
+		match self.kind {
+			TrackKind::Avc3 {
+				ref mut split,
+				ref mut import,
+			} => {
+				split.reset();
+				import.discontinuity()
+			}
+			TrackKind::Avc1 { ref mut import, .. } => import.discontinuity(),
+			TrackKind::Hev1 {
+				ref mut split,
+				ref mut import,
+			} => {
+				split.reset();
+				import.discontinuity()
+			}
+			TrackKind::Hvc1 { ref mut import, .. } => import.discontinuity(),
+			TrackKind::Av01 {
+				ref mut split,
+				ref mut import,
+			} => {
+				split.reset();
+				import.discontinuity()
+			}
+			TrackKind::Vp8(ref mut import) => import.discontinuity(),
+			TrackKind::Vp9(ref mut import) => import.discontinuity(),
+			TrackKind::Aac(ref mut import) => import.discontinuity(),
+			TrackKind::Opus(ref mut import) => import.discontinuity(),
+			TrackKind::Mp3(ref mut import) => import.discontinuity(),
+			TrackKind::Flac(ref mut import) => import.discontinuity(),
+		}
+	}
+
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		self.group_start = None;
@@ -829,6 +867,43 @@ mod tests {
 	}
 
 	#[tokio::test(start_paused = true)]
+	async fn flac_cut_per_frame_rewind_names_timestamp_and_edge() {
+		let (broadcast, catalog) = new_broadcast();
+		let config = crate::codec::flac::Config {
+			min_block_size: 4608,
+			max_block_size: 4608,
+			min_frame_size: 0,
+			max_frame_size: 0,
+			sample_rate: 48_000,
+			channel_count: 2,
+			bits_per_sample: 24,
+			total_samples: 0,
+			md5: [0; 16],
+		};
+		let mut import = Track::audio(
+			broadcast.reserve_track("audio").unwrap(),
+			catalog.reserve(),
+			AudioInit::new(AudioFormat::Flac, config.description()),
+		)
+		.unwrap();
+
+		let floor = 1_790_802_494_898_432;
+		for timestamp in [floor - 10_000, floor] {
+			import
+				.decode(b"flac frame", Some(Timestamp::from_micros(timestamp).unwrap()))
+				.unwrap();
+			import.cut(None).unwrap();
+		}
+		let err = import
+			.decode(b"flac frame", Some(Timestamp::from_micros(floor - 1).unwrap()))
+			.unwrap_err();
+		assert!(matches!(err, crate::Error::TimestampRewind(_)), "{err:?}");
+		let message = err.to_string();
+		assert!(message.contains("1790802494898431 µs"), "{message}");
+		assert!(message.contains("1790802494898432 µs"), "{message}");
+	}
+
+	#[tokio::test(start_paused = true)]
 	async fn aac_import_attaches_audio_specific_config() {
 		let (broadcast, catalog) = new_broadcast();
 		let config = crate::codec::aac::Config {
@@ -988,6 +1063,35 @@ mod tests {
 		import.finish().unwrap();
 
 		assert_eq!(collect_groups(subscriber).await, vec![3, 2]);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn discontinuity_resets_audio_measurement_and_separates_groups() {
+		let (mut broadcast, catalog) = new_broadcast();
+		let (import, subscriber) = opus_import(&mut broadcast, &catalog);
+		let mut import: Track = import.into();
+		let anchor = std::time::Instant::now();
+		for (pts, arrival) in [(0, 0), (20, 120)] {
+			let timestamp = Timestamp::from_micros(pts * 1_000).unwrap();
+			import.decode(b"a", Some(timestamp)).unwrap();
+			import
+				.flush(timestamp, anchor + Duration::from_millis(arrival))
+				.unwrap();
+		}
+		let before = catalog.snapshot().audio.renditions["audio"].jitter;
+		assert_eq!(before, Some(Duration::from_millis(100)));
+		import.discontinuity().unwrap();
+		for (pts, arrival) in [(100, 6_000), (120, 6_020)] {
+			let timestamp = Timestamp::from_micros(pts * 1_000).unwrap();
+			import.decode(b"b", Some(timestamp)).unwrap();
+			import
+				.flush(timestamp, anchor + Duration::from_millis(arrival))
+				.unwrap();
+		}
+		assert_eq!(catalog.snapshot().audio.renditions["audio"].jitter, before);
+		import.finish().unwrap();
+		// The middle group is the established empty-payload discontinuity marker.
+		assert_eq!(collect_groups(subscriber).await, vec![2, 1, 2]);
 	}
 
 	/// Cutting after every frame is still available, and is what a caller wanting the lowest

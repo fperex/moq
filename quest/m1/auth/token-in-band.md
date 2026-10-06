@@ -6,8 +6,8 @@ A client's credentials can travel inside the session instead of the URL, and
 several of them can ride one connection. Every client in this repository
 takes tokens as configuration separate from the address, presents each on its
 own AUTH stream at setup, and the relay admits the session on what the URL
-carried and widens it as the streams are answered. Peers below lite-06 keep
-working unchanged: the client puts the first token in the URL whenever any
+carried and widens it as the streams are answered. Peers without the AUTH
+stream keep working unchanged: the client puts the first token in the URL whenever any
 version it offers has no AUTH stream, so nothing is refused and nothing goes
 silent, and the token leaves the URL for good only once the offered set is
 AUTH-capable.
@@ -16,16 +16,22 @@ AUTH-capable.
 
 IETF AUTH initially carries only prefix-representable grants. Propagate its
 `Unsupported` result for an unrepresentable pattern union; do not retry the
-token through the URL, widen it, or leave token admission pending. Lite pattern
-AUTH can carry the full grant once the pattern-interest prerequisite lands.
+token through the URL, widen it, or leave token admission pending. Lite AUTH
+already carries the full pattern grant.
 
 - Client configuration separates the credential from the address: `moq_tokio::connect::Config` gains `tokens`, repeatable as
   `--connect-token` and `MOQ_CONNECT_TOKEN`, the default set for every dial
   the client makes. A `?jwt=` in the URL stays a member of the union, which is
   how cluster dial targets keep their per-peer credential, and per-dial
-  extras use the session's `auth().add()` once connected. moq-ffi
-  `MoqClient::set_tokens`, libmoq `moq_client_set_tokens` (mirrored in the
-  wrappers and `cpp/obs/src`), and `js/net`'s `connect` options field follow.
+  extras use the session's `auth().add()` once connected. moq-ffi gains a
+  `tokens` field on the `MoqClientConfig` record that
+  [FFI shape](/quest/m1/ffi-shape/README.md) (#4697) puts in place of every
+  `MoqClient` setter, mirroring `moq_tokio::connect::Config`, not a new
+  `set_tokens` setter (mirrored in the wrappers, and reaching the
+  generated C and C++ bindings and OBS through
+  [C++ through moq-ffi](/quest/m1/cpp/README.md)) and `js/net`'s `connect`
+  options field follow. Decided in the 2026-09-30 audit: no new libmoq API,
+  since it gets no more feature work.
 - Credential refresh belongs with token presentation. Resolve the configured
   credential source before each dial. After an authorization refusal, resolve
   it once more and retry only when the credential changed; do not loop on a
@@ -36,15 +42,18 @@ AUTH can carry the full grant once the pattern-interest prerequisite lands.
 - Presenting: WebTransport negotiates the moq version as a subprotocol of
   the CONNECT request that carries the URL, so the client cannot wait to
   learn whether the peer speaks AUTH. The client copies the first configured
-  token into the URL query whenever any offered version lacks AUTH (today,
-  everything below lite-06), and omits it once every offered version has the
+  token into the URL query whenever any offered version lacks AUTH (every
+  published lite version, since AUTH lands in the wip one), and omits it once every offered version has the
   stream. A token that went into the URL or the setup option is the
   connection credential, and the empty-token stream is its one and only
   stream; every other configured token gets its own AUTH stream on an
   AUTH-capable session, so no token is ever granted twice. On moq-transport
   the first token also rides the AUTHORIZATION TOKEN setup option
-  (`ParameterBytes::AuthorizationToken`, `USE_VALUE`, token type 0), which
-  scopes at accept the way the URL does.
+  (`ietf::token::into_setup`, `USE_VALUE`, token type 0), which
+  scopes at accept the way the URL does. While the URL also carries it, the
+  auth server sees the same credential twice: `moq auth serve` admits a SETUP
+  token equal to the `?jwt=` value and refuses two different ones
+  (`serve::Refusal::TwoTokens`). Never send different values in the two places.
 - The relay admits on the URL, then widens. An anonymous connection today is
   admitted with the public grant when one is configured and refused
   otherwise; with this quest a connection with no URL credential and no
@@ -62,7 +71,9 @@ AUTH can carry the full grant once the pattern-interest prerequisite lands.
 - Tests: a client with a configured token against an AUTH-capable relay is
   scoped exactly as the URL variant and the URL carries the token only while
   an old version is offered; the same client against a lite-05 relay still
-  authenticates through the URL; two configured tokens union; a client with
+  authenticates through the URL; a moq-transport client offering a draft
+  without AUTH, carrying the token in both the URL and the setup option, is
+  admitted by `moq auth serve`; two configured tokens union; a client with
   in-band tokens only and no public grant is admitted, and one that presents
   nothing is refused at the deadline; the cross-language harness runs with
   tokens configured.
@@ -71,9 +82,8 @@ Additive.
 
 ## Required
 
+- [FFI shape](/quest/m1/ffi-shape/README.md) - puts the `MoqClientConfig` record in place that `tokens` extends, so the wrappers break once
 - [Relay tokens](/quest/m1/auth/relay-refresh.md) - supplies the verify and
   widen path the configured tokens reuse
 - [Bindings](/quest/m1/auth/bindings.md) - supplies the client surface the new
   token setters sit beside
-- [moq-transport](/quest/m1/auth/moq-transport.md) - supplies the IETF AUTH
-  exchange the setup-option token pairs with

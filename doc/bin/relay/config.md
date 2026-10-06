@@ -19,6 +19,7 @@ written (an empty list, a `false` boolean) overrides the built-in default.
 [listen]
 bind = "[::]:443"                    # QUIC (UDP), as --listen. Omit for a stream-only relay.
 version = ["moq-lite-05"]            # Restrict accepted versions. Omit for all.
+timeout = "10s"                      # Handshake deadline. "0" waits forever.
 
 [listen.tls]
 cert = "cert.pem"                    # Certificate chain and key. Reloaded on change.
@@ -28,11 +29,20 @@ root = ["peer-ca.pem"]               # Optional: CAs for client certs (mTLS), re
 
 [listen.tcp]                         # Plaintext qmux over TCP for trusted local workers.
 bind = "127.0.0.1:4444"
+# tls = true                         # Or: qmux over TLS (tls://) with the listen certificate, no client certs.
 
 [listen.unix]                        # Plaintext qmux over a Unix socket, gated by peer credentials.
 bind = "/run/moq/internal.sock"
 allow.uid = [1001]
 ```
+
+`timeout` bounds how long an accepted connection has to finish its handshake:
+the QUIC, WebTransport, WebSocket, or qmux one, then the MoQ SETUP, through the
+relay accepting the session. After that it is an ordinary session. A peer that
+connects and never speaks is closed instead of being held open by keep-alives,
+with the MoQ timeout code once its transport is up. The `[web]` listeners apply it to reading HTTP request
+headers and, for the WebSocket fallback, to the SETUP after the upgrade. The
+`io_uring` workers do not apply it yet.
 
 ## \[quic]
 
@@ -42,21 +52,33 @@ Transport tuning, applied to accepted and dialed connections alike.
 [quic]
 congestion_control = "delay"         # "delay" (BBR, the default) or "loss" (CUBIC).
 max_streams = 10000                  # Concurrent streams per connection, bidi and uni. Default.
-idle_timeout = "30s"                 # Drop a connection after this long with nothing on it.
-keep_alive = "5s"                    # Ping interval; "0s" disables it. Ignored by iroh.
+idle_timeout = "10s"                 # Drop a connection after this long with nothing on it. Default.
+keep_alive = "3s"                    # Ping interval; "0s" disables it. Ignored by iroh. Default.
 gso = true                           # UDP segmentation offload. iroh cannot turn it off.
 mtu_discovery = false                # Path MTU discovery. Default.
-receive_window = 67108864            # Flow-control windows, in bytes. Omit for the backend default.
-stream_receive_window = 8388608
-send_window = 33554432
+receive_window = 67108864            # Whole-connection window, in bytes. Default (64 MiB).
+stream_receive_window = 8388608      # Per-stream window. Omit for the backend default.
+send_window = 33554432               # Unacknowledged outgoing data. Omit for the backend default.
 qlog = "/var/log/moq/qlog"           # Existing directory. Needs the `qlog` build feature.
 ```
 
 The native QUIC stack uses BBRv3 for delay-based congestion control. Iroh also
 uses noq and the same congestion controller.
 
+`idle_timeout` is how long a peer that vanished without a close keeps its
+sessions, and so its [cluster routes](/bin/relay/cluster#failure-detection).
+QUIC uses the smaller of the two endpoints' values
+([RFC 9000 section 10.1](https://www.rfc-editor.org/rfc/rfc9000#section-10.1)),
+so this also bounds the clients and peers on the other end. Keep `keep_alive`
+under a third of it, so a quiet connection that loses one ping still pings
+again before the deadline.
+
 Raise the receive windows when a fat, long path idles below the link rate: a
 window under the bandwidth-delay product stalls the sender waiting for credit.
+`receive_window` bounds how much unread data one peer can make the relay buffer
+across all of its streams; the transport's own default is unlimited, so it
+defaults to 64 MiB, enough for a relay-to-relay session to carry several Gbps at
+a 100 ms RTT.
 Keep `stream_receive_window` well under `receive_window` so one slow group
 cannot starve the connection. `send_window` caps unacknowledged outgoing data
 whatever the peer allows, bounding the transport send buffer. A zero window is refused, and the receive windows must fit a QUIC
@@ -77,8 +99,8 @@ io_uring = false                     # Drive them with io_uring instead of tokio
 ```
 
 Packets are steered by connection ID, so a client that migrates stays with its
-worker. The group shares one port, including an ephemeral (zero) port: the
-first worker binds it and the rest join that port. Use an explicit port unless
+worker. The group shares one port, including an ephemeral (zero) port, which is
+resolved once and joined by every worker. Use an explicit port unless
 something reads the bound address at startup. `workers` needs the `noq`
 feature and real certificate files rather than `tls.generate`. A build without
 QUIC rejects `workers` instead of
@@ -90,7 +112,10 @@ and refuses to start anywhere it cannot deliver. `[quic]` applies either way,
 except that `mtu_discovery` (its datagram path sends a fixed payload) and the
 three flow-control windows (these workers run fixed ones) are refused under
 `io_uring` rather than quietly ignored. Each worker reports its own counters at
-[`/metrics`](/bin/relay/http#get-metrics).
+[`/metrics`](/bin/relay/http#get-metrics). The kernel charges each worker's
+ring (~56 KiB, plus a page per socket) to `RLIMIT_MEMLOCK`, a budget shared by
+every io\_uring the user runs; raise it (`LimitMEMLOCK=` under systemd) if
+workers fail to start with a message naming that limit.
 
 ## \[web]
 
@@ -116,7 +141,7 @@ See [HTTP endpoints](/bin/relay/http).
 # Exactly one of these:
 url = "http://127.0.0.1:4440/"       # An auth server asked once per session event (`moq auth serve`,
                                      # or your own). https:// presents connect.tls; unix:// is a socket.
-# public = "anon/**"                 # Or a static anonymous grant, publish and subscribe alike.
+# public = "anon/**"                 # Or a static anonymous grant rooted at /, publish and subscribe alike.
 # public_subscribe = ["anon/**", "demo/**"]   # Or split them; patterns, `foo/**` for a subtree.
 # public_publish = ["anon/**"]
 ```
@@ -127,9 +152,8 @@ See [Authentication](/bin/relay/auth).
 
 ```toml
 [cluster]
-connect = ["https://us-east.example.com/?cost=10"]   # Peers to dial. ?cost prices the link, or use {url, cost, egress, token} objects.
+connect = ["https://us-east.example.com/?cost=10"]   # Peers to dial. ?cost prices the link, or use {url, cost, egress, token, upstream} objects.
 node = "https://us-west.example.com/"                 # This relay's own URL.
-mesh = true                                           # Gossip: peers discover and dial `node`.
 connect_api = "https://api.example.com/peers"        # Or fetch the peer list (JSON array of URLs and/or objects) live.
 token = "cluster.jwt"                                 # JWT for dials without an inline ?jwt=.
 id = 12345                                            # Stable Hop ID across restarts.
@@ -160,12 +184,12 @@ A draining upstream may name a replacement URI. `same-host` follows it only
 onto the host we already dialed, so a peer moves us between ports and schemes;
 `follow` also lets it choose the host, which means trusting it not to point us
 into the local network, since a name it controls resolves wherever it likes;
-`ignore` keeps the current address list. Empty, malformed, or refused redirects
-also preserve caller-configured fallbacks; only an accepted redirect replaces
-the list with the peer's URI. An empty URI is not a redirect at all: the peer is
-restarting and asking us back, so the same address is redialed with backoff.
-`handover` is a cap: a shorter deadline on the received GOAWAY wins, a longer
-one does not extend it.
+`ignore` keeps the current address list. An empty URI also keeps it, including
+caller-configured fallbacks; an accepted redirect replaces the list with the
+peer's URI. A malformed or refused redirect ends the connection with an error
+rather than redialing the old address or a fallback, and so does one leaving
+the host a `tls.fingerprint` pin verifies. `handover` is a cap: a shorter deadline on
+the received GOAWAY wins, a longer one does not extend it.
 
 ## \[cache]
 
@@ -201,21 +225,15 @@ prefix = ".stats"                    # Broadcasts appear under <prefix>/node/<no
 interval = 1                         # Seconds between snapshots.
 node = "sjc/1"                       # Disambiguates relays sharing a cluster.
 depth = 1                            # Also bucket by the first N path segments (per tenant).
+linger = "5m"                        # Keep an empty group's broadcast announced this long. Default.
 ```
 
-Each stats broadcast carries `publisher.json`, `subscriber.json`, and
-`sessions.json` tracks (plus compressed `.z` twins) with cumulative counters
-per broadcast. Every counter pair is `*_started` / `*_ended`:
-`announces_started` / `announces_ended`, `broadcasts_started` /
-`broadcasts_ended`, `subscriptions_started` / `subscriptions_ended`, and
-`sessions_started` / `sessions_ended`. A live count is started minus ended.
-This release also writes the previous `announced` / `*_closed` spellings beside
-the new names so an older consumer still reads a new relay; a new consumer
-accepts either spelling, with the canonical name winning. Payload counters
-(bytes, frames, groups, datagrams) are unchanged. Traffic is split by an
-arbitrary **tier** label chosen by the auth server's grant or `--cluster-tier`,
-which is what makes billing per customer or per region possible. Read them with
-the [`moq-stats`](https://docs.rs/moq-stats) crate.
+Each node publishes `publisher.json`, `subscriber.json`, and `sessions.json`
+tracks (plus compressed `.json.z` twins) of cumulative counters per broadcast
+and auth root, split by a **tier** label chosen by the auth server's grant or
+`--cluster-tier`, which is what makes billing per customer or per region
+possible. [Stats](/concept/stats) describes the paths, tracks, and encodings;
+read them with the [`moq-stats`](https://docs.rs/moq-stats) crate.
 
 ## \[iroh]
 
@@ -227,6 +245,28 @@ secret = "./iroh-secret.key"         # Persist the key so the endpoint id surviv
 ```
 
 See [Transport](/concept/transport#iroh-peer-to-peer-experimental).
+
+## Shutdown
+
+```toml
+drain_timeout = "10s"                # Top-level key, as --drain-timeout / MOQ_DRAIN_TIMEOUT.
+```
+
+The first SIGTERM or SIGINT starts a drain: every session is sent a GOAWAY
+asking it to reconnect, and is force-closed if it is still connected when the
+window ends. A session that connects during the drain, such as a client with a
+cached DNS answer, is sent a GOAWAY immediately, with only the time left in
+the window. The relay exits as soon as every session has left, when the window
+ends, or immediately on a second signal. `0` skips the GOAWAY and closes every
+session at once.
+
+The exit is logged with how long the drain took, as either
+`drain complete: every session left` or `drain deadline force-closed sessions`
+with the number `forced`. A session still in its handshake when the last one
+leaves is not waited for.
+Only moq-lite-04+ and moq-transport clients act on a GOAWAY; older ones are
+closed when the window ends. An embedder can take over the signals and start
+the drain itself; see [Embed](/bin/relay/#embed).
 
 ## \[log]
 

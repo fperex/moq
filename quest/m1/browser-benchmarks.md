@@ -2,21 +2,26 @@
 
 ## Goal
 
-A reproducible browser suite measures JS transport and media costs that the Rust
-Criterion targets and native relay load generator do not exercise.
+A reproducible real-browser suite measures JS transport and media costs that
+the Rust Criterion targets, the native relay load generator, and the Bun
+microbenchmarks do not exercise.
 
 ## Plan
 
-`rs/scripts/bench.sh::criterion_targets` discovers Cargo targets only. Existing JS unit
-tests validate behavior, and `test/wasm` validates browser interop, but neither
-provides a repeatable JS performance comparison. Reuse the existing relay/browser
-harness pieces and add a focused recipe with artifacts under the benchmark
-conventions. Microbenchmarks may run in Bun; browser conclusions must come from
-an identified browser version on a real WebTransport connection.
+The JS microbenchmarks already exist: the seven Bun sweeps in `js/net/bench`
+(`broadcasts`, `forward`, `frames`, `lite-varint`, `reader`, `track`,
+`varint`) run nightly and cover the origin map, forwarded route re-pricing,
+group frame decode, lite-07 against lite-06 varints, fragmented `Reader`
+reads, track retention, and varint coding. This
+quest is only the real-browser half: conclusions come from an identified
+browser version on a real WebTransport connection. `test/wasm` validates
+browser interop but measures nothing. Reuse the existing relay/browser harness
+pieces and add a focused recipe with artifacts under the benchmark conventions.
 
-- Cover `js/net/src/stream.ts` with buffered controls, fragmented varints, and
-  payloads from small audio through large keyframes. Sweep chunk sizes and record
-  CPU, wall time, allocation volume, GC pauses, and bytes copied where measurable.
+- Measure the `js/net/src/stream.ts` path in the browser over WebTransport,
+  with payloads from small audio through large keyframes, recording CPU, wall
+  time, allocation volume, GC pauses, and bytes copied where measurable. Add a
+  Bun sweep only for a cost the browser run finds and the seven miss.
 - Cover CMAF encode/decode with fixed audio/video fixtures and multiple samples.
   Keep fixture generation and relay startup outside timed intervals.
 - Add publish/watch scenarios measuring delivered/decoded/presented frames,

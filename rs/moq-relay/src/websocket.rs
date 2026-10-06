@@ -15,7 +15,7 @@ use axum::{
 use moq_net::origin;
 use moq_net::stats::Session;
 
-use crate::{auth, web::MtlsPeer, web::WebState, web::landing_response};
+use crate::{auth, refusals::Refusal, web::MtlsPeer, web::WebState, web::landing_response};
 
 // One axum extractor per fact the upgrade needs; there is no struct to fold them into.
 #[allow(clippy::too_many_arguments)]
@@ -36,10 +36,6 @@ pub(crate) async fn serve_ws(
 	let Ok(ws) = ws else {
 		return Ok(landing_response());
 	};
-
-	if state.shutdown.draining() {
-		return Err(StatusCode::SERVICE_UNAVAILABLE.into());
-	}
 
 	let alpns = versions.alpns();
 	let ws = negotiate_subprotocol(ws, &alpns)?;
@@ -63,21 +59,28 @@ pub(crate) async fn serve_ws(
 	request.alpn = ws.selected_protocol().and_then(|p| p.to_str().ok()).map(str::to_owned);
 	request.tls = mtls.and_then(|Extension(MtlsPeer(identity))| auth::peer(&identity));
 	let session_id = request.id.clone();
-	let lease = state.auth.admit(request.clone()).await?;
+	let lease = state
+		.auth
+		.admit(request.clone())
+		.await
+		.inspect_err(|err| state.cluster.refusals.record(err.into()))?;
 	let token = lease.token();
 	let publish = state.cluster.publisher(token);
 	// A verified client certificate marks a cluster peer, which discovers hidden
-	// routes; see `connection::authorize`.
+	// routes; see `Cluster::scope`.
 	let subscribe = state
 		.cluster
 		.subscriber(token)
 		.map(|subscribe| subscribe.consume().with_hidden(request.tls.is_some()));
-	let stats = state.cluster.stats.tier(token.tier.clone()).session(&token.root);
 
 	if publish.is_none() && subscribe.is_none() {
 		// Bad token, we can't publish or subscribe.
+		state.cluster.refusals.record(Refusal::Forbidden);
 		return Err(StatusCode::UNAUTHORIZED.into());
 	}
+
+	// Only an admitted session counts as present, as on the native path.
+	let stats = state.cluster.stats.tier(token.tier.clone()).session(&token.root);
 	let lease = lease.with_stats(stats.clone());
 
 	Ok(ws.on_upgrade(async move |socket| {
@@ -101,6 +104,7 @@ pub(crate) async fn serve_ws(
 			stats,
 			shutdown: state.shutdown.clone(),
 			socket_stats: socket_stats.map(|Extension(s)| s),
+			timeout: state.timeout,
 		};
 		let _ = handle_socket(socket, session, lease, Some((state.sessions.clone(), request))).await;
 	}))
@@ -119,6 +123,8 @@ struct SessionInputs {
 	shutdown: crate::shutdown::Observer,
 	/// The kernel's view of the socket under the upgrade, captured at accept time.
 	socket_stats: Option<crate::web::SocketStats>,
+	/// How long the peer has to send its MoQ SETUP after the upgrade, or `None` to wait forever.
+	timeout: Option<std::time::Duration>,
 }
 
 /// Serve one upgraded WebSocket until it closes or its lease ends.
@@ -152,6 +158,7 @@ where
 		stats,
 		mut shutdown,
 		socket_stats,
+		timeout,
 	} = session;
 
 	// Wrap the WebSocket in a WebTransport compatibility layer. We have to
@@ -188,12 +195,22 @@ where
 		server = server.with_subscriber(publish);
 	}
 	// Keep the driver in this task so cancellation tears down the transport.
-	let (session, driver) = server
-		.accept(
-			tokio::time::Instant::now().into_std(),
-			moq_tokio::transport::Session::new(ws),
-		)
-		.await?;
+	let ws = moq_tokio::transport::Session::new(ws);
+	let mut refused = ws.clone();
+	let accept = server.accept(tokio::time::Instant::now().into_std(), ws);
+	let (session, driver) = match timeout {
+		None => accept.await?,
+		Some(timeout) => match tokio::time::timeout(timeout, accept).await {
+			Ok(accepted) => accepted?,
+			// A peer that upgraded and never sent SETUP; tell it why it is dropped.
+			Err(_) => {
+				use web_transport_trait::poll::Session as _;
+				let err = moq_net::Error::Timeout;
+				refused.close(moq_net::SessionError::from(&err).to_code(), &err.to_string());
+				return Err(err.into());
+			}
+		},
+	};
 
 	let driver = moq_net::time::run(driver);
 	tokio::pin!(driver);
@@ -201,6 +218,7 @@ where
 	// The handshake is done, so this is a MoQ session now: only now can a push
 	// be serviced, and only now does the session appear in the live table.
 	let registration = pending.map(|(sessions, request)| sessions.register(request));
+	let _serving = shutdown.serve();
 
 	loop {
 		let nudged = async {
@@ -233,7 +251,7 @@ where
 					err = &mut driver => ended(err),
 					_ = &mut drain => ended(driver.await),
 				};
-				lease.close("shutdown", crate::connection::session_bytes(&session));
+				lease.close(moq_auth::lease::Reason::Shutdown, crate::connection::session_bytes(&session));
 				return res;
 			}
 			() = nudged => lease.revalidate(),
@@ -241,19 +259,11 @@ where
 	}
 }
 
-/// The driver's terminal error as a session outcome: a clean close is not a failure.
-fn ended(err: moq_net::Error) -> anyhow::Result<()> {
-	match err {
-		moq_net::Error::Closed => Ok(()),
-		err => Err(err.into()),
-	}
-}
-
 /// Pick a subprotocol for the upgrade, or fail the handshake outright.
 ///
 /// We advertise the configured qmux × moq-net subprotocol matrix, with bare
 /// qmux fallbacks last. axum picks the first entry that the client also offered, so
-/// a modern client lands on `qmux-01.moq-lite-07`; old clients still match
+/// a modern client lands on `qmux-01.moq-lite-06`; old clients still match
 /// `webtransport` or `qmux-00.moql` and negotiate via SETUP.
 ///
 /// When the client offered subprotocols and none of them are ours, the
@@ -264,6 +274,14 @@ fn ended(err: moq_net::Error) -> anyhow::Result<()> {
 ///
 /// A client that offers no subprotocol at all is left alone: it upgrades and
 /// negotiates the moq version over moq-lite SETUP instead.
+/// The driver's terminal error as a session outcome: a clean close is not a failure.
+fn ended(err: moq_net::Error) -> anyhow::Result<()> {
+	match err {
+		moq_net::Error::Closed => Ok(()),
+		err => Err(err.into()),
+	}
+}
+
 fn negotiate_subprotocol(ws: WebSocketUpgrade, alpns: &[&str]) -> Result<WebSocketUpgrade, StatusCode> {
 	let supported = supported_subprotocols(alpns);
 
@@ -964,6 +982,8 @@ mod tests {
 			// No descriptor to hand over: this drives the transport directly rather
 			// than through an accepted socket.
 			socket_stats: None,
+			// The keep-alive is under test, so the SETUP deadline must not end it first.
+			timeout: None,
 		};
 		let grant = moq_auth::Grant::new(
 			[moq_auth::Pattern::all()].into_iter().collect(),
@@ -1002,5 +1022,66 @@ mod tests {
 			.expect_err("the session ends on the keep-alive timeout, never cleanly");
 
 		drop(client);
+	}
+
+	/// A peer that upgrades and then never sends SETUP is refused at the deadline,
+	/// well before the keep-alive would notice, since its pongs keep it alive.
+	#[tokio::test(start_paused = true)]
+	async fn stalled_setup_is_closed_at_the_deadline() {
+		use web_transport_trait::Error as _;
+
+		let alpn = format!("{}{}", preferred_qmux_prefix(), newest_moq_alpn());
+		let (client_to_server, server_incoming) = mpsc::unbounded_channel();
+		let (server_to_client, client_incoming) = mpsc::unbounded_channel();
+		let timeout = Duration::from_secs(10);
+
+		let session = SessionInputs {
+			id: 0,
+			session: String::new(),
+			remote: "127.0.0.1:0".parse().unwrap(),
+			alpn: Some(alpn.clone()),
+			versions: moq_net::Versions::all(),
+			publish: None,
+			subscribe: None,
+			stats: Session::default(),
+			shutdown: crate::shutdown::Observer::disabled(),
+			socket_stats: None,
+			timeout: Some(timeout),
+		};
+		let grant = moq_auth::Grant::new(
+			[moq_auth::Pattern::all()].into_iter().collect(),
+			[moq_auth::Pattern::all()].into_iter().collect(),
+		);
+		let lease = crate::auth::Lease::new("/", moq_auth::lease::Consumer::fixed(grant));
+		let start = tokio::time::Instant::now();
+		let server = tokio::spawn(handle_socket(
+			Pipe::new(server_incoming, server_to_client, Arc::new(AtomicBool::new(false))),
+			session,
+			lease,
+			None,
+		));
+
+		// A live qmux peer that answers keep-alives but never speaks moq.
+		let client = qmux::ws::Upgraded::new(Pipe::new(
+			client_incoming,
+			client_to_server,
+			Arc::new(AtomicBool::new(false)),
+		))
+		.with_alpn(&alpn)
+		.connect();
+
+		let err = server
+			.await
+			.expect("server task panicked")
+			.expect_err("a peer that never sent SETUP was served");
+		assert!(matches!(err.downcast_ref(), Some(moq_net::Error::Timeout)), "{err:#}");
+		assert_eq!(start.elapsed(), timeout);
+
+		let closed = client.closed().await;
+		assert_eq!(
+			closed.session_error().map(|(code, _)| code),
+			Some(moq_net::SessionError::Timeout.to_code()),
+			"{closed:?}"
+		);
 	}
 }

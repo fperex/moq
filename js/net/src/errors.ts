@@ -4,11 +4,11 @@
  * @module
  */
 export {
-	Expired,
 	FrameTooLarge,
 	GroupTooLarge,
 	NotFound,
 	ProtocolViolation,
+	RefusedRedirect,
 	Session,
 	Stream,
 	type StreamOptions,

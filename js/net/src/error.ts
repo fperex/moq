@@ -92,8 +92,8 @@ export const StreamCode = Object.freeze(
 		Evicted: 0x35 as StreamCode,
 		/** A frame declared a payload larger than the receiver accepts. */
 		FrameTooLarge: 0x38 as StreamCode,
-		/** The publisher could serve this request but has no capacity for it now. */
-		NoCapacity: 0x30 as StreamCode,
+		/** The broadcast is neither announced nor served, so there is no route to it. */
+		Unroutable: 0x36 as StreamCode,
 		/** A group grew past its cache budget and was aborted. */
 		GroupTooLarge: 0x32 as StreamCode,
 	} as const),
@@ -150,9 +150,9 @@ export interface StreamOptions {
  *
  * This surfaces on every transport, so catch this type rather than feature-detecting
  * `WebTransportError`, which a non-browser runtime never defines and the WebSocket fallback
- * never throws. Local conditions with a code of their own subclass it ({@link Expired},
- * {@link TooFarBehind}, {@link FrameTooLarge}, {@link GroupTooLarge}, {@link NotFound}), so the same
- * `code` check catches a condition whether it was raised here or reported by the peer.
+ * never throws. Local conditions with a code of their own subclass it ({@link TooFarBehind},
+ * {@link FrameTooLarge}, {@link GroupTooLarge}, {@link NotFound}), so the same `code` check catches a condition
+ * whether it was raised here or reported by the peer.
  *
  * ```ts
  * try {
@@ -177,24 +177,6 @@ export class Stream extends Error {
 		);
 		this.name = "Stream";
 		this.code = code;
-	}
-}
-
-/**
- * Newer content exceeded this group's age budget, so its unread content is gone.
- *
- * Raised locally when a subscription's max age budget gives up on a group that still held
- * content, and decoded from a moq-lite peer's `OLD` reset.
- *
- * @public
- */
-export class Expired extends Stream {
-	constructor(options?: { cause?: unknown }) {
-		super(StreamCode.Old, {
-			...options,
-			message: "expired: group exceeded the subscription max age budget",
-		});
-		this.name = "Expired";
 	}
 }
 
@@ -261,6 +243,21 @@ export class NotFound extends Stream {
 	constructor(what: string, options?: { cause?: unknown }) {
 		super(StreamCode.NotFound, { ...options, message: `not found: ${what}` });
 		this.name = "NotFound";
+	}
+}
+
+/**
+ * A peer's GOAWAY named a redirect the connection refuses, or one it could not parse.
+ *
+ * Terminal: the peer is leaving, so the connection stops rather than redialing the old
+ * address. Mirrors the Rust `Error::RefusedRedirect`.
+ *
+ * @public
+ */
+export class RefusedRedirect extends Error {
+	constructor(reason: string) {
+		super(`GOAWAY redirect refused: ${reason}`);
+		this.name = "RefusedRedirect";
 	}
 }
 
@@ -376,7 +373,6 @@ export function fromTransport(err: unknown, options?: TransportErrorOptions): Er
 	if (options?.version !== undefined && !sharedStreamCode(code, options.version) && claimedLocally(code)) {
 		return new Stream(StreamCode.Internal, { cause: err, message: `remote error: ${code}` });
 	}
-	if (code === StreamCode.Old) return new Expired({ cause: err });
 	if (code === StreamCode.TooFarBehind) return new TooFarBehind({ cause: err });
 	if (code === StreamCode.FrameTooLarge) return new FrameTooLarge({ cause: err });
 	if (code === StreamCode.GroupTooLarge) return new GroupTooLarge({ cause: err });
@@ -441,6 +437,31 @@ export function fromClose(info: WebTransportCloseInfo): Session | null {
 	const code = (info.closeCode ?? SessionCode.Cancel) as SessionCode;
 	if (code === SessionCode.Cancel) return null;
 	return new Session(code, { reason: info.reason });
+}
+
+/**
+ * The session's close as the error it ends everything with, carrying the peer's code. A clean
+ * close code is still an error here: whatever the close cut off did not end.
+ *
+ * @internal
+ */
+export function closeError(quic: WebTransport): Promise<Error> {
+	return quic.closed.then(
+		(info) => fromClose(info) ?? new Session(SessionCode.Cancel, { reason: info.reason }),
+		(err: unknown) => error(err),
+	);
+}
+
+/**
+ * Report a failure the session's close caused as the session's own error, which carries the
+ * peer's close code; any other failure passes through.
+ *
+ * @internal
+ */
+export async function sessionCause(quic: WebTransport | undefined, err: unknown): Promise<Error> {
+	const source = typeof err === "object" && err !== null ? (err as { source?: unknown }).source : undefined;
+	if (quic && source === "session") return closeError(quic);
+	return error(err);
 }
 
 /**

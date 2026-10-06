@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.19](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.18...moq-loc-v0.2.19) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.18](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.17...moq-loc-v0.2.18) - 2026-10-03
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.17](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.16...moq-loc-v0.2.17) - 2026-09-30
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.16](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.15...moq-loc-v0.2.16) - 2026-09-27
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.15](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.14...moq-loc-v0.2.15) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.14](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.13...moq-loc-v0.2.14) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.13](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.12...moq-loc-v0.2.13) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.12](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.11...moq-loc-v0.2.12) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net
+
 ## [0.2.11](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.10...moq-loc-v0.2.11) - 2026-09-25
 
 ### Other

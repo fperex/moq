@@ -8,10 +8,10 @@ cost. Profiling is opt-in and has no production overhead when disabled.
 
 ## Plan
 
-`rs/scripts/bench.sh` already owns the builds, relay PID, workload, and host
+`bench/run.sh` already owns the builds, relay PID, workload, and host
 samples, but has no profiler integration. Reuse that lifecycle instead
 of adding a second launcher. `Cargo.toml` already has a `profiling` profile and
-`rs/moq-native/src/jemalloc.rs` already supports on-demand heap dumps.
+`rs/moq-tokio/src/jemalloc.rs` already supports on-demand heap dumps.
 
 - Add a focused `just` recipe selecting workload, duration, and capture mode through
   one configuration. Reuse locked builds and the existing profiling Cargo profile;
@@ -45,4 +45,4 @@ verify current supported versions and pin any newly installed tools.
 ## Related
 
 - [Benchmark comparisons](/quest/m1/performance-comparisons.md) - repeatable results and artifact metadata
-- [Relay memory](/quest/m1/relay-memory.md) - retained route and announcement memory
+- [Release profile](/quest/m1/release-profile.md) - also changes `[profile.profiling]`; land one, then rebase the other

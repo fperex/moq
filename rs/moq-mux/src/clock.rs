@@ -1,24 +1,35 @@
-//! The broadcast's shared clock: one monotonic epoch plus its fixed wall mapping.
+//! The broadcast's shared clock: one monotonic timeline plus its wall mapping.
 //!
-//! Create one [`Clock`] per broadcast and hand copies to every producer: because they share an
-//! epoch, frames captured at the same instant get the same timestamp, keeping concurrently
+//! Create one [`Clock`] per broadcast and hand copies to every producer: because they share a
+//! timeline, frames captured at the same instant get the same timestamp, keeping concurrently
 //! produced tracks (e.g. audio and video capture on separate threads) in sync. It is `Copy`, so
-//! handing it out is cheap.
+//! handing it out is cheap. A copy is a snapshot, though: beside a container importer, which
+//! re-anchors the catalog's clock on its first frame, read the catalog's clock at write time instead.
 //!
 //! The clock also owns the broadcast's wall mapping, advertised at the catalog root as
 //! `clock: { wall, timescale }`: `wall` is the wall-clock time of PTS zero in
 //! [`Clock::TIMESCALE`] units since the moq epoch (2020-01-01). A consumer derives any
-//! timestamp's wall time as `wall + pts` after converting it into this timescale. The mapping
-//! is fixed at construction and never overwritten: a discontinuity marker is a delivery event,
-//! not a new epoch, and a system-clock adjustment never retimes it.
+//! timestamp's wall time as `wall + pts` after converting it into this timescale. A discontinuity
+//! marker is a delivery event, not a new epoch, and a system-clock adjustment never retimes it.
 //!
-//! A source with its own zero (a file, a restarted encoder) is translated onto the mapping with
-//! [`SourceMap`]: the first frame anchors onto the live edge, and a reset re-anchors forward,
-//! preserving the real idle gap measured on this monotonic clock.
+//! A container importer publishes its stream's own timestamps, so it places the mapping instead:
+//! its first timestamp is live on arrival (see [`Config::with_clock`](crate::catalog::Config::with_clock)).
 
 use std::time::{Duration, Instant, SystemTime};
 
 use hang::catalog::{MAX_SAFE_INTEGER, MOQ_EPOCH_UNIX_MILLIS};
+
+/// Native capture inputs use the same epoch as the async clock.
+fn monotonic(at: Instant) -> crate::Result<web_async::time::Instant> {
+	#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+	return Ok(web_async::time::Instant::from_std(at));
+
+	#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+	{
+		let _ = at;
+		Err(anyhow::anyhow!("std::time::Instant inputs are unsupported in the browser").into())
+	}
+}
 
 /// The catalog clock for PTS zero at `wall`.
 fn wall_clock(wall: SystemTime) -> crate::Result<hang::catalog::Clock> {
@@ -42,13 +53,18 @@ fn wall_clock(wall: SystemTime) -> crate::Result<hang::catalog::Clock> {
 /// concurrently, e.g. an audio and a video capture running on separate
 /// threads, land on a single timeline.
 ///
-/// Copies share the epoch and the fixed wall mapping, so handing them to several producers keeps
-/// the broadcast on one clock. The wall mapping is established at construction: sampling it when
-/// a delayed first frame arrives would pretend that frame is timestamp zero, so the epoch is
-/// pinned up front and that frame's PTS converts into the mapping instead.
+/// Copies share the timeline and the wall mapping, so handing them to several producers keeps
+/// the broadcast on one clock.
+///
+/// A copy goes stale when a container importer's first frame re-anchors the catalog's clock (see
+/// [`Config::with_clock`](crate::catalog::Config::with_clock)): it keeps mapping onto the old
+/// timeline, misaligning everything it captures. To [`capture`](Self::capture) beside an importer,
+/// use [`catalog::Producer::clock`](crate::catalog::Producer::clock) read at write time.
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
-	epoch: Instant,
+	/// A monotonic instant, and what the clock read then in micros.
+	instant: web_async::time::Instant,
+	reading: u64,
 	wall: hang::catalog::Clock,
 }
 
@@ -59,28 +75,71 @@ impl Clock {
 	/// enough that the wall value stays within the JSON-safe integer range until the year 2255.
 	pub const TIMESCALE: moq_net::Timescale = moq_net::Timescale::MICRO;
 
-	/// Start a clock anchored at the current instant, with PTS zero at the current wall time.
+	/// What a fresh clock reads at construction.
+	///
+	/// Frames stamped beside it can carry slightly earlier timestamps (audio captured a moment
+	/// before the video it is muxed with). Starting the clock this far past zero leaves them room
+	/// instead of landing before the broadcast began.
+	const LEAD: Duration = Duration::from_secs(10);
+
+	/// Start a clock that reads ten seconds now, so PTS zero is ten seconds ago on the wall.
 	pub fn new() -> Self {
-		Self::at(Instant::now(), SystemTime::now())
-			.expect("the current wall time is representable as a broadcast clock")
+		Self::arrival(Self::LEAD).expect("the current wall time is representable as a broadcast clock")
 	}
 
-	/// Start a clock at an explicit monotonic epoch and wall time.
+	/// Start a clock at an explicit monotonic epoch and wall time: PTS zero at both.
 	///
 	/// The deterministic constructor: synthetic sources and fixtures pin both ends instead of
-	/// sampling. Refuses an unrepresentable wall.
+	/// sampling. Refuses an unrepresentable wall or a browser target without native instants.
 	pub fn at(epoch: Instant, wall: SystemTime) -> crate::Result<Self> {
 		Ok(Self {
-			epoch,
+			instant: monotonic(epoch)?,
+			reading: 0,
 			wall: wall_clock(wall)?,
 		})
 	}
 
-	/// The current timestamp since the clock's epoch.
+	/// A clock that reads `since` now: a source whose first timestamp is `since` is live on arrival.
+	///
+	/// Refuses a `since` so large that PTS zero lands before the moq epoch (2020), which the wall
+	/// mapping cannot name.
+	pub(crate) fn arrival(since: Duration) -> crate::Result<Self> {
+		let (instant, now) = (web_async::time::Instant::now(), SystemTime::now());
+		let unmappable = || crate::Error::UnmappableTimestamp(format!("{since:?} puts PTS zero before 2020"));
+		let zero = now.checked_sub(since).ok_or_else(unmappable)?;
+		Ok(Self {
+			instant,
+			reading: u64::try_from(since.as_micros()).map_err(|_| unmappable())?,
+			wall: wall_clock(zero).map_err(|_| unmappable())?,
+		})
+	}
+
+	/// The current timestamp on this clock.
 	pub fn now(&self) -> moq_net::Timestamp {
 		// u128 -> u64 truncation is unreachable: u64 microseconds is ~584,000 years.
-		moq_net::Timestamp::from_micros(self.epoch.elapsed().as_micros() as u64)
+		let elapsed = self.instant.elapsed().as_micros() as u64;
+		moq_net::Timestamp::from_micros(self.reading + elapsed)
 			.expect("an instant elapsed duration fits in a timestamp")
+	}
+
+	/// Map the instant a payload was captured (a datagram's arrival, a sensor read) onto this clock.
+	///
+	/// Refuses an instant ahead of now, which would claim the payload reached the transport before
+	/// it existed, and one before PTS zero, which no timestamp can name. Native capture instants
+	/// are unsupported in the browser.
+	pub fn capture(&self, at: Instant) -> crate::Result<moq_net::Timestamp> {
+		let at = monotonic(at)?;
+		if at > web_async::time::Instant::now() {
+			return Err(crate::Error::InvalidCapture);
+		}
+		let micros = match at.checked_duration_since(self.instant) {
+			Some(after) => self.reading + after.as_micros() as u64,
+			None => self
+				.reading
+				.checked_sub(self.instant.duration_since(at).as_micros() as u64)
+				.ok_or(crate::Error::InvalidCapture)?,
+		};
+		Ok(moq_net::Timestamp::from_micros(micros).expect("an instant elapsed duration fits in a timestamp"))
 	}
 
 	/// Units per second for [`wall`](Self::wall): [`TIMESCALE`](Self::TIMESCALE).
@@ -93,158 +152,18 @@ impl Clock {
 		self.wall
 	}
 
-	/// The wall-clock time of `pts` under this broadcast's fixed mapping.
+	/// The wall-clock time of `pts` under this broadcast's mapping.
 	///
-	/// Pure in the stored epoch: a system-clock adjustment after construction changes nothing.
+	/// Pure in the stored mapping: a system-clock adjustment after construction changes nothing.
 	/// Refuses an unrepresentable result rather than truncating it.
 	pub fn wall_clock(&self, pts: moq_net::Timestamp) -> crate::Result<SystemTime> {
 		self.wall.wall_clock(pts).map_err(crate::Error::from)
-	}
-
-	/// Translate a source with its own zero onto this broadcast's mapping.
-	///
-	/// Each adapter owns one per source; see [`SourceMap`]. The mapping itself is untouched.
-	pub fn source(&self) -> SourceMap {
-		SourceMap::new(*self)
 	}
 }
 
 impl Default for Clock {
 	fn default() -> Self {
 		Self::new()
-	}
-}
-
-/// Translates one source's timestamps onto the broadcast clock.
-///
-/// A source numbers from its own zero (a file starts at its first PTS, an encoder restarts at
-/// zero), while the broadcast numbers from the shared epoch. The first frame anchors onto the
-/// live edge, preserving the source's spacing from there on; a reset re-anchors forward,
-/// preserving the real idle gap measured on the broadcast's monotonic clock. Backwards steps
-/// within [`MAX_REORDER`](Self::MAX_REORDER) keep their offset, so permitted B-frame reordering
-/// inside a group survives verbatim.
-///
-/// The broadcast wall mapping is never touched: translating a reset is not a new epoch, and a
-/// discontinuity marker the adapter emits alongside is a delivery event the playhead reacts to,
-/// not a clock the catalog republishes. Retained records keep their timestamps.
-///
-/// Each publisher adapter owns one per source and wires its own restart detection to
-/// [`reset`](Self::reset); the automatic path only separates reordering from resets by size.
-pub struct SourceMap {
-	clock: Clock,
-	/// Broadcast micros minus source micros; `None` until the first frame anchors it.
-	offset: Option<i128>,
-	last_source: Option<u128>,
-	last_broadcast: Option<u64>,
-	/// `clock.now()` when the last frame was translated: the idle gap's start.
-	last_arrival: Option<u64>,
-}
-
-impl SourceMap {
-	/// The largest backwards source step still treated as permitted in-group reordering
-	/// (B-frames present out of decode order) rather than a source reset.
-	///
-	/// A larger backwards step re-anchors the source forward instead. Adapters that detect a
-	/// restart out of band re-anchor explicitly with [`reset`](Self::reset); this bound only
-	/// separates the two for the automatic path.
-	pub const MAX_REORDER: Duration = Duration::from_millis(500);
-
-	/// A translator onto `clock`, unanchored until the first frame.
-	pub fn new(clock: Clock) -> Self {
-		Self {
-			clock,
-			offset: None,
-			last_source: None,
-			last_broadcast: None,
-			last_arrival: None,
-		}
-	}
-
-	/// The broadcast clock this source translates onto.
-	pub fn clock(&self) -> Clock {
-		self.clock
-	}
-
-	/// Translate `pts` onto the broadcast clock, sampling the arrival time.
-	pub fn translate(&mut self, pts: moq_net::Timestamp) -> crate::Result<moq_net::Timestamp> {
-		self.translate_at(pts, self.clock.now().value())
-	}
-
-	/// Translate `pts` onto the broadcast clock, arriving at monotonic `now` micros.
-	///
-	/// The deterministic core behind [`translate`](Self::translate): synthetic sources pin the
-	/// arrival instants instead of sampling them.
-	pub fn translate_at(&mut self, pts: moq_net::Timestamp, now: u64) -> crate::Result<moq_net::Timestamp> {
-		let src = pts.as_micros();
-
-		let broadcast = match self.offset {
-			Some(offset) => {
-				let mapped = src as i128 + offset;
-				if mapped < 0 {
-					return Err(crate::Error::UnmappableTimestamp(format!(
-						"{pts:?} lands before the broadcast began"
-					)));
-				}
-				let mapped = u64::try_from(mapped).map_err(|_| {
-					crate::Error::UnmappableTimestamp(format!("{pts:?} lands outside the representable range"))
-				})?;
-				match self.last_broadcast {
-					Some(last) if mapped < last && last - mapped > Self::MAX_REORDER.as_micros() as u64 => {
-						// A source reset: re-anchor forward, counting the downtime as content.
-						self.reanchor(src, now)?
-					}
-					// Forward, steady, or reordered within a group: the offset stands.
-					_ => mapped,
-				}
-			}
-			// The first frame is live now; the source keeps its spacing from there. Rebasing by
-			// the frame's own PTS (rather than pretending it is timestamp zero) is what keeps a
-			// delayed first frame honest.
-			None => {
-				self.offset = Some(now as i128 - src as i128);
-				now
-			}
-		};
-
-		self.last_source = Some(src);
-		self.last_broadcast = Some(broadcast);
-		self.last_arrival = Some(now);
-		moq_net::Timestamp::from_micros(broadcast).map_err(crate::Error::from)
-	}
-
-	/// Re-anchor after an explicitly detected source restart, preserving the idle gap.
-	///
-	/// The adapter path for a restart it observes out of band (an encoder reload, a file loop):
-	/// the next frame continues after everything published so far plus the downtime since the
-	/// previous frame, instead of rewinding the broadcast.
-	pub fn reset(&mut self, pts: moq_net::Timestamp) -> crate::Result<moq_net::Timestamp> {
-		self.reset_at(pts, self.clock.now().value())
-	}
-
-	/// [`reset`](Self::reset) with an explicit arrival instant, for synthetic sources.
-	pub fn reset_at(&mut self, pts: moq_net::Timestamp, now: u64) -> crate::Result<moq_net::Timestamp> {
-		let src = pts.as_micros();
-		let broadcast = self.reanchor(src, now)?;
-		self.last_source = Some(src);
-		self.last_broadcast = Some(broadcast);
-		self.last_arrival = Some(now);
-		moq_net::Timestamp::from_micros(broadcast).map_err(crate::Error::from)
-	}
-
-	/// Move the offset so `src` continues after the last broadcast plus the idle gap since the
-	/// previous arrival. Returns the rebased broadcast micros.
-	fn reanchor(&mut self, src: u128, now: u64) -> crate::Result<u64> {
-		let base = match (self.last_broadcast, self.last_arrival) {
-			(Some(last), Some(arrival)) => last as u128 + now.saturating_sub(arrival) as u128,
-			// Unanchored: the reset frame itself is live now.
-			_ => now as u128,
-		};
-		self.offset = Some(base as i128 - src as i128);
-		let broadcast =
-			u64::try_from(base).map_err(|_| crate::Error::UnmappableTimestamp(format!("{base} is out of range")))?;
-		// Refuse a mapping that contradicts the range instead of publishing it.
-		moq_net::Timestamp::from_micros(broadcast)?;
-		Ok(broadcast)
 	}
 }
 
@@ -269,8 +188,55 @@ mod tests {
 		let clock = Clock::at(epoch(), moq_epoch() + Duration::from_secs(1)).unwrap();
 		let shared = clock;
 		// Compare the anchors, not live readings: two `now()` calls race the clock.
-		assert_eq!(clock.epoch, shared.epoch);
+		assert_eq!(clock.instant, shared.instant);
 		assert_eq!(clock.wall(), shared.wall());
+	}
+
+	/// A capture maps onto the clock's own timeline, and one ahead of now or before the epoch is
+	/// refused rather than clamped.
+	#[test]
+	fn a_capture_maps_onto_the_clock() {
+		let now = Instant::now();
+		let clock = Clock::at(now - Duration::from_secs(5), moq_epoch()).unwrap();
+		assert_eq!(clock.capture(now - Duration::from_secs(2)).unwrap(), us(3_000_000));
+
+		assert!(matches!(
+			clock.capture(Instant::now() + Duration::from_secs(1)),
+			Err(crate::Error::InvalidCapture)
+		));
+		assert!(matches!(
+			clock.capture(now - Duration::from_secs(6)),
+			Err(crate::Error::InvalidCapture)
+		));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn paused_clock_preserves_native_boundaries() {
+		let epoch = tokio::time::Instant::now();
+		let clock = Clock::at(epoch.into_std(), moq_epoch()).unwrap();
+		let fresh = Clock::new();
+		let before = fresh.now();
+		let wall = clock.wall();
+
+		tokio::time::advance(Duration::from_secs(3)).await;
+		assert_eq!(clock.now(), us(3_000_000));
+		assert_eq!(fresh.now().as_micros() - before.as_micros(), 3_000_000);
+		assert_eq!(clock.wall(), wall);
+		assert_eq!(
+			clock.wall_clock(clock.now()).unwrap(),
+			moq_epoch() + Duration::from_secs(3)
+		);
+
+		let captured = (epoch + Duration::from_secs(2)).into_std();
+		assert_eq!(clock.capture(captured).unwrap(), us(2_000_000));
+		assert!(matches!(
+			clock.capture((epoch + Duration::from_secs(4)).into_std()),
+			Err(crate::Error::InvalidCapture)
+		));
+		assert!(matches!(
+			clock.capture((epoch - Duration::from_secs(1)).into_std()),
+			Err(crate::Error::InvalidCapture)
+		));
 	}
 
 	#[test]
@@ -299,144 +265,39 @@ mod tests {
 	}
 
 	#[test]
-	fn delayed_first_frame_anchors_live() {
-		let clock = Clock::at(epoch(), moq_epoch()).unwrap();
-		let mut source = clock.source();
-
-		// The source's first frame already carries 5s of PTS; it is live now, not now + 5s.
-		let first = source.translate_at(us(5_000_000), 100_000).unwrap();
-		assert_eq!(first.as_micros(), 100_000);
-
-		// Spacing survives: a second later on the source is a second later on the broadcast.
-		let second = source.translate_at(us(6_000_000), 1_100_000).unwrap();
-		assert_eq!(second.as_micros(), 1_100_000);
-
-		// And the wall mapping accounts for the PTS: broadcast 100ms is wall + 100ms.
-		assert_eq!(
-			clock.wall_clock(first).unwrap(),
-			moq_epoch() + Duration::from_micros(100_000)
-		);
+	fn fresh_clock_leaves_room_before_now() {
+		let clock = Clock::new();
+		// PTS zero sits before construction, so a frame stamped a little before now still maps,
+		// and the mapping still names the current wall time.
+		assert!(clock.now().as_micros() >= Clock::LEAD.as_micros());
+		let now = clock.wall_clock(clock.now()).unwrap();
+		let drift = now
+			.duration_since(SystemTime::now())
+			.unwrap_or_else(|err| err.duration());
+		assert!(drift < Duration::from_secs(1), "wall + now is the current wall time");
 	}
 
+	/// A source whose first timestamp is ten hours in reads that timestamp now, mapped to now.
 	#[test]
-	fn multiple_timescales_share_one_mapping() {
-		let clock = Clock::at(epoch(), moq_epoch()).unwrap();
+	fn arrival_maps_the_first_timestamp_to_now() {
+		let since = Duration::from_secs(10 * 3600);
+		let clock = Clock::arrival(since).unwrap();
+		let now = clock.now();
+		assert!(now.as_micros() >= since.as_micros());
+		let drift = clock
+			.wall_clock(now)
+			.unwrap()
+			.duration_since(SystemTime::now())
+			.unwrap_or_else(|err| err.duration());
+		assert!(drift < Duration::from_secs(1), "the first timestamp is live on arrival");
 
-		// Two sources, 90kHz video and 48kHz audio, anchored at the same arrival instant.
-		let mut video = clock.source();
-		let mut audio = clock.source();
-		let v = video
-			.translate_at(
-				moq_net::Timestamp::new(180_000, moq_net::Timescale::new(90_000).unwrap()).unwrap(),
-				1_000_000,
-			)
-			.unwrap();
-		let a = audio
-			.translate_at(
-				moq_net::Timestamp::new(96_000, moq_net::Timescale::new(48_000).unwrap()).unwrap(),
-				1_000_000,
-			)
-			.unwrap();
+		// A capture from before the arrival still maps, down to PTS zero.
+		let earlier = clock.capture(Instant::now() - Duration::from_secs(1)).unwrap();
+		assert!(earlier.as_micros() < now.as_micros());
 
-		// Both said "2s of content, live now": one broadcast instant, one wall time.
-		assert_eq!(v.as_micros(), 1_000_000);
-		assert_eq!(a.as_micros(), 1_000_000);
-		assert_eq!(clock.wall_clock(v).unwrap(), clock.wall_clock(a).unwrap());
-
-		// A media second later is a broadcast second later on both.
-		let v2 = video
-			.translate_at(
-				moq_net::Timestamp::new(270_000, moq_net::Timescale::new(90_000).unwrap()).unwrap(),
-				2_000_000,
-			)
-			.unwrap();
-		let a2 = audio
-			.translate_at(
-				moq_net::Timestamp::new(144_000, moq_net::Timescale::new(48_000).unwrap()).unwrap(),
-				2_000_000,
-			)
-			.unwrap();
-		assert_eq!(v2.as_micros(), 2_000_000);
-		assert_eq!(a2.as_micros(), 2_000_000);
-	}
-
-	#[test]
-	fn reset_translation_preserves_the_idle_gap() {
-		let clock = Clock::at(epoch(), moq_epoch()).unwrap();
-		let mut source = clock.source();
-
-		assert_eq!(source.translate_at(us(0), 1_000_000).unwrap().as_micros(), 1_000_000);
-		assert_eq!(
-			source.translate_at(us(2_000_000), 3_000_000).unwrap().as_micros(),
-			3_000_000
-		);
-
-		// The encoder restarts at zero 5s later: the broadcast continues after the gap, and the
-		// wall epoch is untouched.
-		let wall_before = clock.wall();
-		let resumed = source.translate_at(us(0), 8_000_000).unwrap();
-		assert_eq!(resumed.as_micros(), 8_000_000);
-		assert_eq!(clock.wall(), wall_before);
-
-		// Spacing resumes from the new anchor.
-		let next = source.translate_at(us(1_000_000), 9_000_000).unwrap();
-		assert_eq!(next.as_micros(), 9_000_000);
-	}
-
-	#[test]
-	fn explicit_reset_marks_a_detected_restart() {
-		let clock = Clock::at(epoch(), moq_epoch()).unwrap();
-		let mut source = clock.source();
-
-		assert_eq!(source.translate_at(us(0), 1_000_000).unwrap().as_micros(), 1_000_000);
-		// The adapter saw the restart out of band and re-anchors, even though the PTS did not
-		// move backwards.
-		let resumed = source.reset_at(us(0), 4_000_000).unwrap();
-		assert_eq!(resumed.as_micros(), 4_000_000);
-	}
-
-	#[test]
-	fn bframe_reordering_within_a_group_survives() {
-		let clock = Clock::at(epoch(), moq_epoch()).unwrap();
-		let mut source = clock.source();
-
-		assert_eq!(source.translate_at(us(0), 1_000_000).unwrap().as_micros(), 1_000_000);
-		assert_eq!(
-			source.translate_at(us(40_000), 1_040_000).unwrap().as_micros(),
-			1_040_000
-		);
-		// A 20ms present-before-decode step back is reordering, not a reset: the offset stands.
-		let reordered = source.translate_at(us(20_000), 1_040_000).unwrap();
-		assert_eq!(reordered.as_micros(), 1_020_000);
-		// And the broadcast continues from the reordered frontier.
-		let next = source.translate_at(us(80_000), 1_080_000).unwrap();
-		assert_eq!(next.as_micros(), 1_080_000);
-	}
-
-	#[test]
-	fn mapping_past_u64_micros_is_refused() {
-		let clock = Clock::at(epoch(), moq_epoch()).unwrap();
-		let mut source = clock.source();
-
-		assert_eq!(source.translate_at(us(0), 0).unwrap().as_micros(), 0);
-		// A seconds-scale timestamp whose microsecond mapping exceeds u64::MAX.
-		let huge = moq_net::Timestamp::from_secs(u64::MAX / 1_000_000 + 2).unwrap();
+		// PTS zero before 2020 cannot be named on the wire.
 		assert!(matches!(
-			source.translate_at(huge, 0),
-			Err(crate::Error::UnmappableTimestamp(_))
-		));
-	}
-
-	#[test]
-	fn mapping_before_the_broadcast_began_is_refused() {
-		let clock = Clock::at(epoch(), moq_epoch()).unwrap();
-		let mut source = clock.source();
-
-		// The first frame carries 100ms of PTS but arrives 50ms in: the offset is negative.
-		assert_eq!(source.translate_at(us(100_000), 50_000).unwrap().as_micros(), 50_000);
-		// A small step back stays within reorder tolerance but lands before broadcast zero.
-		assert!(matches!(
-			source.translate_at(us(0), 50_000),
+			Clock::arrival(Duration::from_secs(100 * 365 * 86_400)),
 			Err(crate::Error::UnmappableTimestamp(_))
 		));
 	}

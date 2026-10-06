@@ -1,8 +1,6 @@
 import { expect, test } from "bun:test";
-import { Signal } from "@moq/signals";
 import { FrameTooLarge, GroupTooLarge } from "./error.ts";
 import { MAX_GROUP_CACHE_BYTES, MAX_GROUP_FRAMES, Producer } from "./group.ts";
-import { hooks } from "./internal.ts";
 import { Timestamp } from "./time.ts";
 
 const dec = new TextDecoder();
@@ -11,21 +9,21 @@ test("used reflects mirror demand and unused resolves when the last reader leave
 	const producer = new Producer(0);
 
 	// No mirror readers: no demand.
-	expect(producer.used.peek()).toBe(false);
+	expect(producer.demand().used.peek()).toBe(false);
 
 	const a = producer.mirror();
 	const b = producer.mirror();
-	expect(producer.used.peek()).toBe(true);
+	expect(producer.demand().used.peek()).toBe(true);
 
 	// Closing one of two keeps demand, so unused() stays pending.
 	a.close();
-	expect(producer.used.peek()).toBe(true);
+	expect(producer.demand().used.peek()).toBe(true);
 
 	// Closing the last reader drops demand; unused() resolves. Fetch coalescing awaits this to
 	// cancel a download that everyone has abandoned (a group may never end on its own).
 	b.close();
-	await producer.unused();
-	expect(producer.used.peek()).toBe(false);
+	await producer.demand().unused();
+	expect(producer.demand().used.peek()).toBe(false);
 });
 
 function pair(sequence: number) {
@@ -227,36 +225,4 @@ test("a frame larger than the cache is rejected rather than silently dropped", (
 	const consumer = producer.consume();
 	producer.close();
 	expect(consumer.tryReadFrame()).toBeUndefined();
-});
-
-test("an expiry subscription failure starts no write and releases earlier subscriptions", async () => {
-	const group = new Producer(0).consume();
-	const changed = new Signal(0);
-	const crowded = new Signal(0);
-	const listeners = Array.from({ length: 99 }, () => crowded.subscribe(() => {}));
-	let checks = 0;
-	let writes = 0;
-	hooks.expireGroup(group, {
-		expired: () => {
-			checks++;
-			return false;
-		},
-		changed: [changed, crowded],
-	});
-	try {
-		await expect(
-			hooks.guardGroup(group, async () => {
-				writes++;
-			}),
-		).rejects.toThrow("too many subscribers");
-		const before = checks;
-		changed.set(1);
-		crowded.set(1);
-		await Promise.resolve();
-		expect(checks).toBe(before);
-		expect(writes).toBe(0);
-	} finally {
-		for (const dispose of listeners) dispose();
-		group.close();
-	}
 });

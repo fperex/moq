@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type * as Catalog from "@moq/hang/catalog";
+import * as Catalog from "@moq/hang/catalog";
 import * as Moq from "@moq/net";
 import { Origin, Path } from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
@@ -110,75 +110,46 @@ describe("relativeBroadcast", () => {
 	const manual = (renditions: Record<string, Catalog.VideoConfig>) =>
 		manualCatalog({ video: { renditions } } as Catalog.Root);
 
-	it("rejects a catalog carrying an escaping rendition", async () => {
-		// The whole catalog goes, not just the offending rendition: the root is this
-		// consumer's authorized subtree, so the reference names content it cannot reach,
-		// and serving the rest would hide a publisher bug behind a track that never fills.
-		const { source, owner } = manual({
-			good: rendition(),
-			sibling: rendition("./source"),
-			bad: rendition("../../x"),
-		});
-
+	// The error a manual catalog was rejected with, after checking nothing was published.
+	const rejection = async (catalog: Catalog.Root): Promise<unknown> => {
+		const { source, owner } = manualCatalog(catalog);
 		const error = console.error;
-		console.error = () => {};
+		let logged: unknown;
+		console.error = (...args: unknown[]) => {
+			logged = args.at(-1);
+		};
 		try {
 			// The catalog is validated by an effect, which settles a microtask later.
 			await Promise.resolve();
 			expect(source.out.catalog.peek()).toBeUndefined();
+			return logged;
 		} finally {
 			console.error = error;
 			source.close();
 			owner.close();
 		}
+	};
+
+	it("rejects a catalog carrying an escaping rendition", async () => {
+		// The whole catalog goes, not just the offending rendition: the root is this
+		// consumer's authorized subtree, so the reference names content it cannot reach,
+		// and serving the rest would hide a publisher bug behind a track that never fills.
+		const catalog = {
+			video: { renditions: { good: rendition(), sibling: rendition("./source"), bad: rendition("../../x") } },
+		} as Catalog.Root;
+		expect(await rejection(catalog)).toBeInstanceOf(Catalog.EscapingBroadcast);
 	});
 
-	it("rejects a catalog whose json or binary track escapes the root", async () => {
-		// Data tracks carry the same `broadcast` reference as renditions. Rust rejects an
-		// escaping one; leaving the section out of the check would let it through.
-		const track = { mode: "snapshot", broadcast: Path.normalizeRelative("../../x") };
-		for (const section of ["json", "binary"] as const) {
-			const { source, owner } = manualCatalog({
+	it("rejects a catalog whose text or data track escapes the root", async () => {
+		// The shared hang check runs here too, so every section it covers rejects the catalog.
+		const broadcast = Path.normalizeRelative("../../x");
+		for (const section of ["text", "json", "binary"] as const) {
+			const key = section === "text" ? "renditions" : "tracks";
+			const catalog = {
 				video: { renditions: { good: rendition() } },
-				[section]: { tracks: { status: track } },
-			} as Catalog.Root);
-
-			const error = console.error;
-			console.error = () => {};
-			try {
-				await Promise.resolve();
-				expect(source.out.catalog.peek()).toBeUndefined();
-			} finally {
-				console.error = error;
-				source.close();
-				owner.close();
-			}
-		}
-	});
-
-	it("rejects a catalog whose text rendition escapes the root", async () => {
-		// The containment check covers every section carrying renditions: a text (caption)
-		// reference escaping the root rejects the catalog like a video or audio one.
-		const captions = {
-			format: "vtt",
-			role: "subtitle",
-			container: { kind: "legacy" },
-			broadcast: "../../x",
-		} as Catalog.TextConfig;
-		const { source, owner } = manualCatalog({
-			video: { renditions: { good: rendition() } },
-			text: { renditions: { captions } },
-		} as Catalog.Root);
-
-		const error = console.error;
-		console.error = () => {};
-		try {
-			await Promise.resolve();
-			expect(source.out.catalog.peek()).toBeUndefined();
-		} finally {
-			console.error = error;
-			source.close();
-			owner.close();
+				[section]: { [key]: { entry: { broadcast } } },
+			} as Catalog.Root;
+			expect(await rejection(catalog)).toBeInstanceOf(Catalog.EscapingBroadcast);
 		}
 	});
 
@@ -203,8 +174,8 @@ describe("relativeBroadcast", () => {
 		const { source, owner } = broadcast("a/b");
 		const effect = new Effect();
 		try {
-			// The catalog broadcast is consumed by an effect, which settles a microtask later.
-			await Promise.resolve();
+			// The catalog broadcast is consumed by an effect, which settles a few microtasks later.
+			await settle();
 			const own = source.out.active.peek();
 			expect(own).toBeDefined();
 			expect(source.relativeBroadcast(effect, undefined)).toBe(own);
@@ -257,6 +228,66 @@ describe("blind resolution", () => {
 		owner.close();
 		await settle();
 	});
+});
+
+describe("refusal", () => {
+	for (const announced of [true, false]) {
+		it(`reports a refusal until a fresh request (announced: ${announced})`, async () => {
+			const owner = new Origin.Producer();
+			const route = owner.dynamic(Path.from("room"));
+			const requests = route.requested();
+			const name = new Signal(Path.from("room/refused.hang"));
+			const enabled = new Signal(true);
+			const source = new Broadcast({ origin: owner, name, enabled, announced, catalogFormat: "hang" });
+
+			const first = await requests.next();
+			expect(first.value?.path).toBe(Path.from("room/refused.hang"));
+			first.value?.reject(new Error("not allowed"));
+			await settle();
+
+			expect(source.out.error.peek()?.message).toBe("not allowed");
+			expect(source.out.active.peek()).toBeUndefined();
+			expect(source.out.status.peek()).toBe("error");
+
+			// Terminal: the handler that said no is never asked again.
+			let again = requests.next();
+			let asked = false;
+			void again.then(() => {
+				asked = true;
+			});
+			for (let i = 0; i < 5; i++) await settle();
+			expect(asked).toBe(false);
+			expect(source.out.error.peek()?.message).toBe("not allowed");
+			expect(source.out.status.peek()).toBe("error");
+
+			// A new name is a fresh request: it clears the error and asks again.
+			name.set(Path.from("room/other.hang"));
+			const second = await again;
+			expect(second.value?.path).toBe(Path.from("room/other.hang"));
+			await settle();
+			expect(source.out.error.peek()).toBeUndefined();
+			expect(source.out.status.peek()).toBe("offline");
+
+			second.value?.reject(new Error("still not allowed"));
+			await settle();
+			expect(source.out.status.peek()).toBe("error");
+
+			// So is re-enabling.
+			again = requests.next();
+			enabled.set(false);
+			await settle();
+			expect(source.out.error.peek()).toBeUndefined();
+			expect(source.out.status.peek()).toBe("offline");
+			enabled.set(true);
+			const third = await again;
+			expect(third.value?.path).toBe(Path.from("room/other.hang"));
+
+			source.close();
+			route.close();
+			owner.close();
+			await settle();
+		});
+	}
 });
 
 describe("cross-broadcast renditions", () => {
@@ -338,6 +369,109 @@ describe("cross-broadcast renditions", () => {
 			expect(tracks("binary")).toEqual([]);
 		} finally {
 			source.close();
+			owner.close();
+		}
+	});
+});
+
+// A derived rendition produced only on demand by a service that claims a covering prefix (a
+// wildcard) instead of announcing each path. Nothing announces the rendition until something
+// subscribes to it, so the player must list it from the claim alone. The rendition is a sibling:
+// one beneath its source is already covered by the source's own announcement. The service prefix
+// is hidden, as a deployment keeps it out of listings, so the claim is only seen by opting in.
+describe("wildcard renditions", () => {
+	const name = Path.from("live/foo.hang");
+	const derived = Path.from(".pro/transcode/foo.hang");
+	const rel = Path.normalizeRelative("../.pro/transcode/foo.hang");
+
+	const watch = (owner: Origin.Producer) =>
+		new Broadcast({
+			origin: owner,
+			name,
+			enabled: true,
+			catalogFormat: "manual",
+			catalog: {
+				video: {
+					renditions: {
+						source: video("avc1.64001e"),
+						transcode: video("avc1.640028", rel),
+					},
+				},
+			} as Catalog.Root,
+		});
+
+	it("lists and demands a rendition only a wildcard covers", async () => {
+		const owner = new Origin.Producer();
+		const main = publish(owner, name);
+		const source = watch(owner);
+		const effect = new Effect();
+
+		try {
+			await settle();
+			expect(videoRenditions(source)).toEqual(["source"]);
+
+			const worker = owner.dynamic(Path.from(".pro/transcode"));
+			const requests = worker.requested();
+			await settle();
+			expect(videoRenditions(source)).toEqual(["source", "transcode"]);
+
+			// Selecting the rendition is what asks the worker to start, before anything announces it.
+			let active: Moq.Broadcast.Consumer | undefined;
+			effect.run((nested) => {
+				active = source.relativeBroadcast(nested, rel);
+			});
+			const { value: request } = await requests.next();
+			expect(request?.path).toBe(derived);
+			expect(active).toBeUndefined();
+
+			const produced = new Moq.Broadcast.Producer();
+			produced.createTrack("video").writeString("frame");
+			request?.accept(produced);
+			await settle();
+			expect(active).toBeDefined();
+			const track = active?.track("video").subscribe().ordered();
+			expect(await track?.readString()).toBe("frame");
+			track?.close();
+
+			// The worker announcing the path it now serves leaves the rendition where it was.
+			const concrete = owner.createBroadcast(derived);
+			concrete.announce();
+			await settle();
+			expect(videoRenditions(source)).toEqual(["source", "transcode"]);
+			expect(active).toBeDefined();
+
+			concrete.close();
+			worker.close();
+		} finally {
+			effect.close();
+			source.close();
+			main.close();
+			owner.close();
+		}
+	});
+
+	it("hides the rendition once the last covering wildcard is withdrawn", async () => {
+		const owner = new Origin.Producer();
+		const main = publish(owner, name);
+		const source = watch(owner);
+
+		try {
+			// A catch-all (an archive) and a narrower pool both cover the derived path.
+			const archive = owner.dynamic(Path.empty());
+			const worker = owner.dynamic(Path.from(".pro/transcode"));
+			await settle();
+			expect(videoRenditions(source)).toEqual(["source", "transcode"]);
+
+			worker.close();
+			await settle();
+			expect(videoRenditions(source)).toEqual(["source", "transcode"]);
+
+			archive.close();
+			await settle();
+			expect(videoRenditions(source)).toEqual(["source"]);
+		} finally {
+			source.close();
+			main.close();
 			owner.close();
 		}
 	});

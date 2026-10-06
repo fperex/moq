@@ -1,239 +1,175 @@
 /**
- * Plays one matrix row in headless Chromium and records what it heard.
+ * Plays one matrix row in headless Chromium, and refuses a row whose numbers would mean something
+ * other than what its key says.
  *
- * One row is one page, opened for `--duration` seconds against a relay reached through the shaper.
- * The driver's own job is small: stand the page up, wait for it to actually be playing, let it run,
- * and then decide whether what it measured is allowed to count. That last part is the point. A row
- * that ran on the WebSocket fallback never went through the UDP shaper, and a row whose document was
- * not isolated the way the matrix asked for ran a different context; both would otherwise pass quietly
- * against a budget written for something else, which is worse than failing.
+ * The page dials the shaper, which forwards UDP and nothing else. So the page's fetch of the
+ * certificate hash is answered here with the relay's own (the certificate is pinned by hash, so
+ * dialing another port needs nothing more), and a WebSocket fallback finds nobody listening: the
+ * session is WebTransport through the shaper, or nothing.
  *
- *     bun driver.ts --url http://127.0.0.1:4499 --broadcast bbb.hang --page dist \
- *         --delay auto --duration 60 --tag chromium-opus-48000-mild-plain \
- *         --sink http://127.0.0.1:5001/log --out <run dir>
+ *     bun driver.ts --url http://127.0.0.1:4501 --fingerprint http://127.0.0.1:4500/certificate.sha256 \
+ *         --broadcast tone-opus.hang --page dist --ring plain --delay auto --duration 60 \
+ *         --tag chromium-opus-48000-mild-plain --out <run dir>
+ *
+ * Writes `<tag>.ndjson` (the samples, appended as they are drained) and `<tag>.page.json` (the
+ * environment, console notes, and voids). `--capture` also writes `<tag>.arrivals.ndjson`, with
+ * frame arrivals on the samples' viewer clock. Exits nonzero when playback or capture fails.
  *
  * @module
  */
-import { mkdirSync } from "node:fs";
+import { appendFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { Page } from "playwright";
-import { Failure, finishTraces, launch, open, serve } from "../../../interop/clients/js/harness.ts";
-import { type Backend, backendVoid, type Ring, type Thread, threadVoid, type Void } from "./src/schema.ts";
+import { launch, sleep } from "../../../interop/clients/js/harness.ts";
+import type { Arrival, Environment, Ring, Void } from "./src/schema.ts";
 
 const { values } = parseArgs({
 	options: {
 		url: { type: "string" },
+		fingerprint: { type: "string" },
 		broadcast: { type: "string" },
 		page: { type: "string" },
+		ring: { type: "string" },
 		delay: { type: "string", default: "auto" },
 		duration: { type: "string", default: "60" },
 		tag: { type: "string" },
-		sink: { type: "string" },
 		out: { type: "string" },
-		ring: { type: "string", default: "plain" },
-		port: { type: "string", default: "0" },
-		offload: { type: "string", default: "true" },
+		capture: { type: "boolean", default: false },
 	},
 });
 
-const durationSec = Number.parseFloat(values.duration);
-if (!values.url || !values.broadcast || !values.page || !values.tag || !values.out) {
+const { url, fingerprint, broadcast, page: pageDir, tag, out } = values;
+const durationMs = Number.parseFloat(values.duration) * 1000;
+const ring = values.ring as Ring;
+if (
+	!url ||
+	!fingerprint ||
+	!broadcast ||
+	!pageDir ||
+	!tag ||
+	!out ||
+	!Number.isFinite(durationMs) ||
+	durationMs <= 0 ||
+	(ring !== "plain" && ring !== "isolated")
+) {
 	console.error(
-		"usage: driver.ts --url U --broadcast B --page DIR --tag T --out DIR [--delay auto] [--duration 60] [--sink URL] [--ring plain|isolated] [--offload true|false]",
+		"usage: driver.ts --url U --fingerprint F --broadcast B --page DIR --ring plain|isolated --tag T --out DIR [--delay auto] [--duration S>0] [--capture]",
 	);
 	process.exit(2);
 }
-if (!Number.isFinite(durationSec) || durationSec <= 0) {
-	console.error(`error: --duration must be a positive number (got '${values.duration}')`);
-	process.exit(2);
-}
-const ring = values.ring as Ring;
-if (ring !== "plain" && ring !== "isolated") {
-	console.error(`error: --ring must be plain or isolated (got '${values.ring}')`);
-	process.exit(2);
-}
-// `false` keeps the page's audio on its main thread, which the row then expects instead of the worker.
-if (values.offload !== "true" && values.offload !== "false") {
-	console.error(`error: --offload must be true or false (got '${values.offload}')`);
-	process.exit(2);
-}
-const expectThread = values.offload === "false" ? "main" : "worker";
 
-const out = resolve(values.out);
-mkdirSync(out, { recursive: true });
+/**
+ * How long the session and the first audio get, together, before the row is abandoned. It stays short
+ * of the step profile's change at 30s, so a step row always measures audio from before the change.
+ */
+const STARTUP_MS = 20_000;
+const startupDeadline = Date.now() + STARTUP_MS;
+/** How often the probe is drained into the ndjson. */
+const DRAIN_MS = 1000;
 
-// Isolation permits shared memory. The default worker still uses the message ring;
-// an isolated page runs the shared ring only when --offload false keeps audio on the page.
-const server = serve({
-	root: resolve(values.page),
-	port: Number.parseInt(values.port, 10),
-	routes: [
-		{
-			prefix: "/isolated",
-			headers: {
-				"cross-origin-opener-policy": "same-origin",
-				"cross-origin-embedder-policy": "require-corp",
-			},
-		},
-		{ prefix: "/plain", headers: {} },
-	],
+const hash = await fetch(fingerprint).then((r) => {
+	if (!r.ok) throw new Error(`${fingerprint}: ${r.status}`);
+	return r.text();
 });
 
-const query = new URLSearchParams({
-	url: values.url,
-	broadcast: values.broadcast,
-	delay: values.delay,
-	tag: values.tag,
+// Cross-origin isolation is a property of the document, not the bundle, so one build served under
+// two prefixes runs both rings. `/plain` is the production path: most viewers are not isolated, and
+// get the postMessage ring.
+const root = resolve(pageDir);
+const isolation = { "cross-origin-opener-policy": "same-origin", "cross-origin-embedder-policy": "require-corp" };
+const server = Bun.serve({
+	port: 0,
+	hostname: "127.0.0.1",
+	async fetch(req) {
+		const path = new URL(req.url).pathname;
+		const match = path.match(/^\/(isolated|plain)\/(.*)$/);
+		if (!match) return new Response("not found", { status: 404 });
+		const file = Bun.file(join(root, match[2] || "index.html"));
+		if (!(await file.exists())) return new Response("not found", { status: 404 });
+		return new Response(file, { headers: match[1] === "isolated" ? isolation : undefined });
+	},
 });
-if (values.sink) query.set("sink", values.sink);
-if (values.offload === "false") query.set("offload", "false");
-const pageUrl = `${server.origin}/${ring}/?${query}`;
-console.log(`endpoint: page ${pageUrl}`);
 
-/** What the page publishes about itself, read off the DOM rather than out of the sink. */
-type Status = {
-	crossOriginIsolated: boolean;
-	transport?: string;
-	thread?: Thread;
-	backend?: Backend;
-	timestamp?: number;
-	stalled?: boolean;
-	underruns?: number;
-	resolved?: number;
-};
+const query = new URLSearchParams({ url, broadcast, delay: values.delay, capture: String(values.capture) });
+const pageUrl = `http://127.0.0.1:${server.port}/${ring}/?${query}`;
+console.log(`page: ${pageUrl}`);
 
-const readStatus = async (page: Page): Promise<Status | undefined> => {
-	const text = await page.evaluate(() => document.getElementById("status")?.textContent ?? undefined);
-	if (!text) return undefined;
-	try {
-		return JSON.parse(text) as Status;
-	} catch {
-		return undefined;
-	}
-};
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
+const samplesFile = join(out, `${tag}.ndjson`);
+const arrivalsFile = join(out, `${tag}.arrivals.ndjson`);
 const voids: Void[] = [];
-const note = (assertion: string, detail: string) => {
+const refuse = (assertion: string, detail: string) => {
 	console.error(`void: ${assertion}: ${detail}`);
 	voids.push({ assertion, detail });
 };
 
-// The audio's own path, which the page's transport cannot show: the page hands its audio to a worker whose
-// session is a second one, and takes it back for good when the worker cannot play it. So it is checked
-// once the audio plays and again at the end. A row run with `--offload false` expects the main thread.
-const checkThread = (status: Status | undefined) => {
-	const found =
-		threadVoid(status?.thread, "webtransport", expectThread) ??
-		backendVoid(status?.backend, expectThread === "main" && ring === "isolated" ? "shared" : "message");
-	if (found && !voids.some((v) => v.assertion === found.assertion && v.detail === found.detail)) {
-		note(found.assertion, found.detail);
+/** Poll the page until `ready` returns a value, or throw naming what never happened. */
+async function waitFor<T>(page: Page, what: string, ready: () => T | undefined): Promise<T> {
+	while (Date.now() < startupDeadline) {
+		const value = await page.evaluate(ready);
+		if (value !== undefined && value !== null) return value;
+		await sleep(200);
+	}
+	throw new Error(`${what} not within ${STARTUP_MS / 1000}s`);
+}
+
+const drain = async (page: Page) => {
+	const error = await page.evaluate(() => globalThis.audioQuality.error());
+	if (error) throw new Error(`arrival capture: ${error}`);
+	const samples = await page.evaluate(() => globalThis.audioQuality.drain());
+	if (samples.length > 0) appendFileSync(samplesFile, `${samples.map((s) => JSON.stringify(s)).join("\n")}\n`);
+	if (values.capture) {
+		const arrivals: Arrival[] = await page.evaluate(() => globalThis.audioQuality.arrivals());
+		if (arrivals.length > 0) appendFileSync(arrivalsFile, `${arrivals.map((a) => JSON.stringify(a)).join("\n")}\n`);
 	}
 };
 
-// --autoplay-policy so an AudioContext starts without a click; the page still offers the button for
-// a human. No fake devices: nothing here captures, and a fake one would only add a clock.
+// No fake devices: nothing here captures. The autoplay flag stands in for the click a viewer makes.
 const browser = await launch(["--autoplay-policy=no-user-gesture-required"]);
-
-let status = 0;
-let page: Page | undefined;
+let environment: Environment | undefined;
+let notes: string[] = [];
+let failed = false;
 try {
-	const context = await browser.newContext();
-	[page] = await open(context, pageUrl, values.tag, true);
+	const page = await browser.newPage();
+	page.on("pageerror", (error) => console.error(`[page error] ${error.message}`));
+	await page.route(new URL("/certificate.sha256", url).href, (route) =>
+		route.fulfill({ body: hash, headers: { "access-control-allow-origin": "*" } }),
+	);
+	await page.goto(pageUrl, { waitUntil: "load" });
 
-	// The catalog is what says the session is up; without it there is nothing to measure and the
-	// failure is the relay or the publisher, not the player.
-	const deadline = Date.now() + 30_000;
-	let ready: Status | undefined;
-	while (Date.now() < deadline) {
-		ready = await readStatus(page);
-		if (ready?.transport) break;
-		await sleep(200);
-	}
-	if (!ready?.transport) throw new Failure("session", `no catalog within 30s: ${JSON.stringify(ready)}`);
-
-	// Both of these decide whether the row counts, and both are knowable now rather than after a
-	// minute of playing, so they are checked before the clock starts.
-	if (ready.transport !== "webtransport") {
-		note("transport", `negotiated ${ready.transport}, which does not traverse the UDP shaper`);
-	}
-	if (ready.crossOriginIsolated !== (ring === "isolated")) {
-		note("ring", `asked for ${ring}, page reports crossOriginIsolated=${ready.crossOriginIsolated}`);
-	}
-
-	// The device clock has to be real. A headless run that was throttled, or one whose AudioContext
-	// never actually rendered, still produces a full set of plausible counters: `currentTime` simply
-	// stops advancing, every quantum-based number goes quiet, and the row reads as flawless. One
-	// percent over ten seconds is far looser than any real drift and far tighter than a stall.
-	//
-	// The window starts once the ring is actually playing, not once the catalog arrived. An
-	// AudioContext that is still starting has a `currentTime` that has not caught up with wall time
-	// yet, and measuring across that start reads as a several-percent drift on a perfectly healthy
-	// run: the first ten seconds of playback is the claim, not the first ten seconds of the page.
-	const playingBy = Date.now() + 30_000;
-	while (Date.now() < playingBy) {
-		const state = await readStatus(page);
-		if (state && state.stalled === false && typeof state.timestamp === "number") break;
-		await sleep(200);
-	}
-	const playing = await readStatus(page);
-	console.log(`thread: ${JSON.stringify(playing?.thread ?? null)}`);
-	checkThread(playing);
-
-	const clock0 = await page.evaluate(() => performance.now());
-	const audio0 = await contextTime(page);
-	await sleep(10_000);
-	const clock1 = await page.evaluate(() => performance.now());
-	const audio1 = await contextTime(page);
-	if (audio0 !== undefined && audio1 !== undefined) {
-		const wall = clock1 - clock0;
-		const media = audio1 - audio0;
-		const error = Math.abs(media - wall) / wall;
-		console.log(
-			`clock: audio advanced ${media.toFixed(1)}ms over ${wall.toFixed(1)}ms wall (${(100 * error).toFixed(2)}%)`,
-		);
-		if (error > 0.01)
-			note("clock", `AudioContext.currentTime drifted ${(100 * error).toFixed(2)}% from wall clock over 10s`);
-	} else {
-		note("clock", "AudioContext.currentTime was never readable");
-	}
-
-	const remaining = durationSec * 1000 - 10_000;
-	if (remaining > 0) await sleep(remaining);
-
-	const final = await readStatus(page);
-	console.log(`final: ${JSON.stringify(final)}`);
-	checkThread(final);
-
-	// Closing the page is what fires `pagehide`, which is what flushes the last batch. Without this
-	// the run's final seconds are the ones that never arrive.
-	await page.close();
-	await sleep(500);
-} catch (err) {
-	const message = err instanceof Error ? err.message : String(err);
-	console.error(`FAIL ${values.tag}: ${message}`);
-	note("driver", message);
-	status = 1;
-} finally {
-	// Grading happens after this process exits, so retain even a successfully closed page's trace.
-	await finishTraces(true);
-	await browser.close().catch(() => {});
-	server.stop();
-}
-
-await Bun.write(join(out, `${values.tag}.voids.json`), JSON.stringify(voids, null, 1));
-process.exit(status);
-
-/** `AudioContext.currentTime` in ms, from the most recent sample the page took. */
-async function contextTime(p: Page): Promise<number | undefined> {
-	return await p.evaluate(() => {
-		const context = (
-			document.querySelector("moq-watch") as {
-				audio?: { out?: { context?: { peek(): AudioContext | undefined } } };
-			} | null
-		)?.audio?.out?.context?.peek();
-		return context ? context.currentTime * 1000 : undefined;
+	environment = await waitFor(page, "session", () => {
+		const env = globalThis.audioQuality?.environment();
+		return env?.transport ? env : undefined;
 	});
+	if (environment.transport !== "webtransport") {
+		refuse("transport", `negotiated ${environment.transport}, which never crosses the UDP shaper`);
+	}
+	if (environment.crossOriginIsolated !== (ring === "isolated")) {
+		refuse("ring", `asked for ${ring}, but crossOriginIsolated is ${environment.crossOriginIsolated}`);
+	}
+
+	// The row's duration is audio played, not startup: the window starts once the ring does.
+	await waitFor(page, "first audio", () => globalThis.audioQuality.playing() || undefined);
+
+	const end = Date.now() + durationMs;
+	while (Date.now() < end) {
+		await sleep(Math.min(DRAIN_MS, end - Date.now()));
+		await drain(page);
+	}
+	// A run that ends inside a gap still counts it.
+	await page.evaluate(() => globalThis.audioQuality.finish());
+	await drain(page);
+	// The context rate is only known once the graph exists, which is after the catalog.
+	environment = (await page.evaluate(() => globalThis.audioQuality.environment())) ?? environment;
+	notes = await page.evaluate(() => globalThis.audioQuality.notes());
+	await page.close();
+} catch (err) {
+	failed = true;
+	refuse("driver", err instanceof Error ? err.message : String(err));
+} finally {
+	await browser.close().catch(() => {});
+	server.stop(true);
 }
+
+await Bun.write(join(out, `${tag}.page.json`), JSON.stringify({ environment, notes, voids }, null, 1));
+process.exit(failed ? 1 : 0);

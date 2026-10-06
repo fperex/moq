@@ -29,21 +29,31 @@ final moq = await Moq.connect('https://relay.example.com');
 // Subscribe. The stream is live, so listen to it rather than awaiting its end.
 moq.announcements(
   options: const AnnounceOptions(prefix: 'live/', filter: '*/camera'),
-).listen((announcement) {
-  print(announcement.prefix());
-  print(announcement.captures());
+).listen((event) {
+  if (event is AnnounceEventStart) {
+    print(event.announce.prefix);
+    print(event.announce.captures);
+  } else if (event is AnnounceEventLive) {
+    print('caught up; what follows is live');
+  }
 });
 final broadcast = await moq.requestBroadcast('live/camera');
+final catalog = await broadcast.subscribeCatalog();
+print(await catalog.next());
 ```
 
 ```dart
 // Publish. bytes comes from your encoder or application source.
 final mine = moq.createBroadcast('live/camera');
 final track = mine.publishTrack(name: 'video', info: null);
-track.appendGroup().writeFrame(frame: Frame(payload: bytes));
+final group = track.appendGroup();
+group.writeFrame(frame: Frame(payload: bytes));
+group.finish();
 mine.announce(route: MoqRoute());
+track.finish();
+mine.close();
 
-moq.close();
+await moq.close();
 ```
 
 ```dart
@@ -65,13 +75,17 @@ await for (final request in server.requests()) {
 The three advertising operations: `moq.createBroadcast(path)` (or
 `origin.createBroadcast`) returns an unannounced producer, invisible to everyone;
 `broadcast.announce(route:)` / `broadcast.unannounce()` own that exact-path
-advertisement; `origin.dynamic_(prefix:, route:)` claims `prefix` and
+advertisement, and `broadcast.close()` ends the broadcast for good (a second
+call is a no-op); `origin.dynamic_(prefix:, route:)` claims `prefix` and
 every path beneath it (`''` for everything; Dart spells the origin method
 `dynamic_` because `dynamic` is reserved). Hold the returned handle while the
 claim should stay advertised, and reject the requests you will not serve. A
 route is a capability, not an inventory. `announcements(options:)` takes a
-literal prefix plus an optional relative pattern; `announcement.prefix()`
-stays origin-relative and `captures()` reports the wildcard matches. Paths with
+literal prefix plus an optional relative pattern and yields `AnnounceEvent`s:
+`AnnounceEventStart`, `AnnounceEventUpdate`, or `AnnounceEventEnd`
+carrying an `Announce`, whose `prefix` stays origin-relative and whose
+`captures` reports the wildcard matches, or `AnnounceEventLive` once every route
+live at subscribe time has been delivered. Paths with
 a `.`-prefixed segment below the prefix are [hidden](/concept/moq-lite#hidden-broadcasts) unless `hidden: true`.
 
 Sessions reconnect with backoff when the transport drops and re-announce local
@@ -96,7 +110,8 @@ Cancelling a stream releases the native cursor. The package re-exports
 Generated configuration setters throw if a connect, listen, or accept is in
 flight, or after `cancel()`. Incoming requests report a `MoqTransport` enum.
 `ProtocolMoqException` carries a `MoqProtocolException` as `details` (scope, verbatim
-code, kind) when the peer sent a session or stream code.
+code, kind) when the peer sent a session or stream code. An exception's
+`toString()` is the Rust error message.
 
 `moq.bandwidth()` divides the connection's send estimate; `reserve` a share
 for an app-owned encoder so several publishers on one session split the
@@ -108,6 +123,8 @@ catalog and container types are there, so already-encoded frames flow through
 `package:camera`, platform channels, or another codec package.
 
 `MediaProducer.flush(timestampUs: ...)` records the handoff of a locally encoded frame on the broadcast media clock. Call it after `writeFrame` only for live encoder output; file, pipe, and network imports stay clock-free. `MediaProducer` aliases the generated FFI object, so its method is available directly.
+
+Call `media.discontinuity()` when the source seeks, pauses, or changes its time base. It publishes a timeline marker and restarts handoff measurement without lowering advertised jitter. Resume with timestamps that continue forward on the broadcast media clock; this does not permit timestamp rewinds. On a video track, resume with a keyframe: a delta frame before it fails.
 
 ## Connection stats
 
@@ -131,3 +148,7 @@ not the same as zero. `rttUs` is microseconds; the `rtt` extension reads it as a
 
 - Source: [`dart/`](https://github.com/moq-dev/moq/tree/main/dart)
 - Packages: [moq](https://pub.dev/packages/moq), [moq\_ffi](https://pub.dev/packages/moq_ffi)
+
+Raw track publisher metadata has an optional maximum age. Omitting it imposes no publisher age limit; zero keeps the live edge. Local cache limits still apply, and media imports explicitly retain 30 seconds. See [publisher retention](/concept/moq-lite).
+
+Await `session.shutdown()` or `moq.close()` to drain finished tracks before disconnecting. These futures fail if delivery has not completed within one second. `session.cancel(code: 0)` remains immediate. Finish or abort live tracks before shutdown. IETF media streams are not drained yet.

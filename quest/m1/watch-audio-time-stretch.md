@@ -9,9 +9,10 @@ audio or rendering silence. Convergence is inaudible at ordinary drift and
 burst sizes.
 
 Boundaries: no packet loss concealment; an underrun still renders a ramped
-gap. The target estimator and the ring's slack and re-stall are #3517 on
-dev; the clock the stretch converges toward is
-[Plan: A/V clock](/quest/m0/plan-av-clock.md).
+gap. The target estimator and the ring's slack and re-stall are the
+[audio jitter target](/quest/m0/audio-jitter-target/README.md) line (#3517
+was closed in favor of it); the clock the stretch converges toward is
+[Plan: A/V clock](/quest/m1/av-clock.md).
 
 ## Plan
 
@@ -27,5 +28,5 @@ dev; the clock the stretch converges toward is
 
 ## Required
 
-- [Plan: A/V clock](/quest/m0/plan-av-clock.md) - stretching against a free-running ring only moves the drift
 - [Watch](/quest/m0/audio-jitter-target/watch.md) - the recorded traces this replays, and the JS target it converges toward
+- [A/V clock](/quest/m1/av-clock.md) - the clock the stretch converges toward

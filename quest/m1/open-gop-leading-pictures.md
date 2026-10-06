@@ -21,20 +21,55 @@ drop belongs on the consumer: ingest cannot know whether a given viewer has the
 previous GOP, and dropping at ingest would degrade continuous playback for
 everyone.
 
+Measured through `<moq-watch>` in Chromium 153 on macOS, on the clip
+`just test ts --open-gop` generates (three leading pictures per recovery
+point) stretched to 120 s. Continuous playback decoded every leading picture
+on both decoder paths, with no errors, and the two paths' frames were
+identical. At a cold join the paths differ. VideoToolbox (the default there)
+outputs nothing for the orphaned leading pictures and raises no error, and
+every frame it does output matches the continuous decode, so a viewer merely
+starts at the keyframe. The software decoder (`prefer-software`, the path a
+browser without hardware H.264 takes; Linux was not measured) raises
+`EncodingError` in every join, and the watch then closes its decoder, so video
+stops. The same joins with the leading pictures removed from the stream decode
+cleanly in software, so the error is the leading pictures, not the non-IDR
+keyframe. A latency skip ("skipping slow group") orphans the next group's
+leading pictures in the same way. The trim therefore has to happen before
+decode, and the JS test should drive the software decoder.
+
 - In the JS consumer (`js/hang/src/container/consumer.ts` forces the first
   sample of a group to `keyframe`, and `js/watch/src/video/decoder.ts` submits
   it as `"key"`): for the first group after any non-continuous transition,
   skip delta frames stamped before that group's keyframe. That covers a
-  subscribe, a declared discontinuity, and a latency skip: `#checkLatency`
+  subscribe, a declared discontinuity, and a latency skip: `#checkMaxAge`
   records the skip through `#gap` and `next()` reports the next frame with
   `continuous: false`. Latency skip also bumps playhead generation (startup
   delay) but does not flush the decoder. Leading pictures after that
   non-continuous transition are still skipped, as above; a viewer that skipped
   into a later GOP lacks its references just like a cold join.
   Every continuous group is passed through untouched.
-- The same rule in the Rust decode path (`moq-video` decode consumers), with
-  an equivalent non-continuous signal from `container::Consumer`, so native
-  playback and the transcoder tune in the same way.
+- The same rule in the Rust decode path (`moq-video` decode consumers), so
+  native playback and the transcoder tune in the same way.
+- The same rule in `moq export ts`. Decided (2026-10-01): the fixed-delay
+  export (#4645) still sends a join's orphaned leading pictures, so 3 of 500
+  frames on the open-GOP fixture decode after they present
+  (`dts-before-pts`). Trim them at tune-in from the same signal, on the
+  export's first group only, and make `just test ts --open-gop` pass under
+  `--strict`. Decided in the 2026-10-05 audit: the grader changes with it.
+  `test/ts/open-gop.py`'s decode-order check (a contiguous run of source
+  access units) and leading-pictures check, and the `test/ts/README.md` text
+  that says the round-trip must hand every leading picture on, both expect
+  every picture today; rewrite them to expect the first group's orphaned
+  leading pictures trimmed and every later group's kept. Rejected: dropping
+  this bullet and keeping the grader.
+- This quest owns the Rust non-continuous signal, which audio warmup and
+  consumer warmup reuse rather than each adding one. Today
+  `moq_mux::container::Consumer::poll_read` returns a bare frame, and
+  `discontinuity()` is a counter bumped on a declared marker group, an
+  unproven delivered hole, or a latency skip, but not on the subscribe itself.
+  Add the equivalent of JS `continuous`: false on the first frame after the
+  subscribe and after every bump, true otherwise. It changes the moq-mux
+  consumer API.
 - Tests: a synthetic group with a keyframe followed by two earlier-stamped
   deltas is trimmed on the first group and kept on the second; and a viewer
   that plays continuously, then latency-skips into a later open GOP, has that
@@ -43,8 +78,9 @@ everyone.
 
 ## Required
 
-- [#2067](/quest/m1/2067-test-open-gop-h-264-tune-in-end-to-end-leading-picture.md) - decides whether the glitch is dropped frames, corrupt frames, or a decoder error, which sets what this has to prove
+- [Fixed-delay release](/quest/m1/tstd/delay.md) - the TS export this trims lands with #4645
 
 ## Related
 
 - [Consumer warmup](/quest/m2/intra-refresh/consumer-warmup.md) - the `recovery_frame_cnt > 0` case this rule does not cover
+- [Audio warmup](/quest/m1/audio-warmup.md) - keys its Opus pre-roll trim on the same signal

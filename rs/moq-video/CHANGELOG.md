@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/moq-dev/moq/compare/moq-video-v0.1.9...moq-video-v0.1.10) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.9](https://github.com/moq-dev/moq/compare/moq-video-v0.1.8...moq-video-v0.1.9) - 2026-10-03
+
+### Added
+
+- *(video)* capture Windows displays and windows with WGC ([#4665](https://github.com/moq-dev/moq/pull/4665))
+
+## [0.1.8](https://github.com/moq-dev/moq/compare/moq-video-v0.1.7...moq-video-v0.1.8) - 2026-09-30
+
+### Fixed
+
+- *(video)* list V4L2 cameras once with PipeWire ([#4488](https://github.com/moq-dev/moq/pull/4488))
+- *(video)* guard portal sessions during negotiation ([#4492](https://github.com/moq-dev/moq/pull/4492))
+- *(video)* re-anchor native capture above its last timestamp ([#4418](https://github.com/moq-dev/moq/pull/4418))
+
+### Other
+
+- compile the Windows, macOS, and OBS plugin code on every PR ([#4370](https://github.com/moq-dev/moq/pull/4370))
+
+## [0.1.7](https://github.com/moq-dev/moq/compare/moq-video-v0.1.6...moq-video-v0.1.7) - 2026-09-27
+
+### Fixed
+
+- *(video)* keep the CUDA context alive until the NVDEC decoder is destroyed ([#4290](https://github.com/moq-dev/moq/pull/4290))
+
+## [0.1.6](https://github.com/moq-dev/moq/compare/moq-video-v0.1.5...moq-video-v0.1.6) - 2026-09-26
+
+### Added
+
+- *(moq-mux)* catalog delay measures cross-rendition encoder lateness ([#4170](https://github.com/moq-dev/moq/pull/4170))
+
+### Other
+
+- rename CLAUDE.md to AGENTS.md ([#4235](https://github.com/moq-dev/moq/pull/4235))
+
+## [0.1.5](https://github.com/moq-dev/moq/compare/moq-video-v0.1.4...moq-video-v0.1.5) - 2026-09-26
+
+### Fixed
+
+- *(nvenc)* commit rate changes and cleanup only once the driver accepts ([#4146](https://github.com/moq-dev/moq/pull/4146))
+
+## [0.1.4](https://github.com/moq-dev/moq/compare/moq-video-v0.1.3...moq-video-v0.1.4) - 2026-09-25
+
+### Other
+
+- *(capture)* drive native capture through clock edge cases in CI ([#4125](https://github.com/moq-dev/moq/pull/4125))
+
+## [0.1.3](https://github.com/moq-dev/moq/compare/moq-video-v0.1.2...moq-video-v0.1.3) - 2026-09-25
+
+### Added
+
+- *(mux)* measure encoder flush jitter per rendition ([#3940](https://github.com/moq-dev/moq/pull/3940))
+
 ## [0.1.2](https://github.com/moq-dev/moq/compare/moq-video-v0.1.1...moq-video-v0.1.2) - 2026-09-25
 
 ### Other

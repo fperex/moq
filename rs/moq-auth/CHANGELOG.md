@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/moq-dev/moq/compare/moq-auth-v0.2.0...moq-auth-v0.2.1) - 2026-10-03
+
+### Fixed
+
+- *(auth,hang)* out-of-range auth durations and catalog walls no longer panic ([#4600](https://github.com/moq-dev/moq/pull/4600))
+
+## [0.2.0](https://github.com/moq-dev/moq/compare/moq-auth-v0.1.5...moq-auth-v0.2.0) - 2026-09-30
+
+### Added
+
+- *(net)* read a subtree through an origin mount ([#4271](https://github.com/moq-dev/moq/pull/4271))
+
+### Fixed
+
+- *(hls,auth)* redact credentials from URLs in errors ([#4536](https://github.com/moq-dev/moq/pull/4536))
+- *(auth)* make grant expiry exact, dropping the clock-skew grace ([#4368](https://github.com/moq-dev/moq/pull/4368))
+- *(auth)* admit a SETUP token equal to the jwt query ([#4359](https://github.com/moq-dev/moq/pull/4359))
+- *(auth)* [**breaking**] restore 0.14 auth parity ([#4319](https://github.com/moq-dev/moq/pull/4319))
+
+### Other
+
+- *(auth)* run the outage tests on a paused clock without sockets ([#4527](https://github.com/moq-dev/moq/pull/4527))
+
+## [0.1.5](https://github.com/moq-dev/moq/compare/moq-auth-v0.1.4...moq-auth-v0.1.5) - 2026-09-27
+
+### Added
+
+- *(net)* the SETUP AUTHORIZATION TOKEN option reaches the verifier ([#4278](https://github.com/moq-dev/moq/pull/4278))
+
+### Fixed
+
+- *(auth)* root public and mTLS rules at / ([#4318](https://github.com/moq-dev/moq/pull/4318))
+
+### Other
+
+- *(auth)* run the outage grant test on the real clock ([#4291](https://github.com/moq-dev/moq/pull/4291))
+
+## [0.1.4](https://github.com/moq-dev/moq/compare/moq-auth-v0.1.3...moq-auth-v0.1.4) - 2026-09-26
+
+### Fixed
+
+- *(auth)* keep accepted grants on fixed expiry deadlines ([#4237](https://github.com/moq-dev/moq/pull/4237))
+
+## [0.1.3](https://github.com/moq-dev/moq/compare/moq-auth-v0.1.2...moq-auth-v0.1.3) - 2026-09-26
+
+### Other
+
+- *(auth)* wait on the recorded request instead of a fixed sleep ([#4194](https://github.com/moq-dev/moq/pull/4194))
+
+## [0.1.2](https://github.com/moq-dev/moq/compare/moq-auth-v0.1.1...moq-auth-v0.1.2) - 2026-09-25
+
+### Fixed
+
+- *(auth)* read and write legacy put/get token grants ([#4190](https://github.com/moq-dev/moq/pull/4190))
+
 ## [0.1.1](https://github.com/moq-dev/moq/compare/moq-auth-v0.1.0...moq-auth-v0.1.1) - 2026-09-25
 
 ### Added

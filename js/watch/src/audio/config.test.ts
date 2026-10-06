@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import * as Catalog from "@moq/hang/catalog";
 import { Time } from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
-import { audioMaxAge, decoderConfig, maxAgeHeadroom, playbackIdentity, playbackJitter } from "./config";
+import { decoderConfig, frameDuration, packetDuration, playbackIdentity } from "./config";
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -60,57 +60,27 @@ test("routing and decoder inputs change the playback identity", () => {
 	expect(playbackIdentity(config({ numberOfChannels: 1 }))).not.toEqual(base);
 });
 
-test("an advertised jitter of zero falls back to the codec frame duration", () => {
-	// 48kHz Opus reads as its 20ms frame, not 23ms: the worklet's render quantum is the ring's
-	// granularity, not the publisher's, so it is no longer folded in here.
-	const floor = playbackJitter(config());
-	expect(floor).toBe(Time.Milli(20));
-	expect(playbackJitter(config({ jitter: 0 }))).toBe(floor);
-	expect(playbackJitter(config({ jitter: 60 }))).toBe(Time.Milli(60));
+test("AAC and MP3 frame durations follow their codec frame sizes", () => {
+	expect(frameDuration(config({ codec: "mp4a.40.2", sampleRate: 48000 }))).toBeCloseTo(21.333, 3);
+	expect(frameDuration(config({ codec: "mp4a.40.5", sampleRate: 48000 }))).toBeCloseTo(42.667, 3);
+	expect(frameDuration(config({ codec: "mp3", sampleRate: 48000 }))).toBe(Time.Milli(24));
+	expect(frameDuration(config({ codec: "mp3", sampleRate: 24000 }))).toBe(Time.Milli(24));
 });
 
-test("AAC and MP3 jitter follows their codec frame sizes", () => {
-	expect(playbackJitter(config({ codec: "mp4a.40.2", sampleRate: 48000 }))).toBe(Time.Milli(22));
-	expect(playbackJitter(config({ codec: "mp4a.40.2", sampleRate: 24000 }))).toBe(Time.Milli(43));
-	expect(playbackJitter(config({ codec: "mp3", sampleRate: 48000 }))).toBe(Time.Milli(24));
-	expect(playbackJitter(config({ codec: "mp3", sampleRate: 24000 }))).toBe(Time.Milli(24));
+test("Opus and unknown codecs have no constant frame duration", () => {
+	// Opus states its duration per packet, in the TOC byte.
+	expect(frameDuration(config())).toBeUndefined();
+	expect(frameDuration(config({ codec: "flac" }))).toBeUndefined();
 });
 
-test("an unknown codec with no advertised jitter reserves nothing", () => {
-	// Nothing is known about its frame duration, so the estimator is the only term. The ring's own
-	// slack covers the render quantum either way.
-	expect(playbackJitter(config({ codec: "flac", jitter: 0 }))).toBe(Time.Milli(0));
-});
-
-// The age budget and the playout target measure the same arrivals, so a budget equal to the target
-// convicts exactly the frames the target was sized to cover. The headroom is the rounding between
-// them, and every term is something the ring absorbs without dropping a sample.
-test("the age budget headroom is a bucket, a frame, and the stretch band", () => {
-	// 20ms bucket + 20ms Opus frame + the 75ms the reader's time stretch closes on its own.
-	expect(maxAgeHeadroom(config())).toBe(Time.Milli(115));
-
-	// 20ms bucket + 24ms AAC-LC frame (1024 samples at 44.1kHz) + the same 75ms band.
-	expect(maxAgeHeadroom(config({ codec: "mp4a.40.2", sampleRate: 44100 }))).toBe(Time.Milli(119));
-});
-
-test("a publisher's flush span does not inflate the headroom", () => {
-	// A publisher batching ten frames per flush still hands the ring one frame at a time, so the
-	// headroom follows the codec's frame duration rather than the advertised span.
-	expect(maxAgeHeadroom(config({ jitter: 200 }))).toBe(maxAgeHeadroom(config()));
-
-	// With no codec frame duration to read, the advertised span is the only thing left.
-	expect(maxAgeHeadroom(config({ codec: "flac", jitter: 30 }))).toBe(Time.Milli(125));
-});
-
-test("the audio age budget carries the headroom, except in instant mode", () => {
-	const shared = Time.Milli(240);
-
-	// Auto and fixed both hold a buffer, so the ring can absorb the rounding above the target.
-	expect(audioMaxAge(shared, config(), false)).toBe(Time.Milli(355));
-
-	// Instant holds nothing, so there is nothing to absorb it with.
-	expect(audioMaxAge(shared, config(), true)).toBe(shared);
-
-	// No rendition selected yet: nothing says what a frame or a quantum is worth.
-	expect(audioMaxAge(shared, undefined, false)).toBe(shared);
+test("an implicit CMAF duration falls through to the Opus TOC", () => {
+	// TOC 0x78: config 15 (hybrid fullband, 20 ms), one frame.
+	const frame = {
+		timestamp: Time.Micro(0),
+		keyframe: true,
+		payload: new Uint8Array([0x78, 0]),
+		duration: Time.Micro(0),
+	};
+	expect(packetDuration("opus", frame)).toBe(Time.Milli(20));
+	expect(packetDuration("mp4a.40.2", frame)).toBeUndefined();
 });

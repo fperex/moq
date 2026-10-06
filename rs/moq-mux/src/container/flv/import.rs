@@ -409,7 +409,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		match packet_type {
 			AUDIO_PACKET_SEQUENCE_START => {
 				let config = match fourcc {
-					b"Opus" => config_from_opus_head(payload)?,
+					b"Opus" => crate::codec::opus::config(payload)?,
 					b"mp4a" => config_from_asc(payload)?,
 					// MP3 / AC-3 / E-AC-3 are verbatim with no sequence header; they
 					// configure from the first frame. Anything else is unsupported.
@@ -467,10 +467,12 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			tracing::debug!("video frame before sequence header, dropping");
 			return Ok(());
 		}
+		let timestamp = Timestamp::from_millis(pts_ms as u64)?;
+		// The first frame is live on arrival, anchored before the reservation below publishes.
+		self.catalog.anchor(timestamp)?;
 		// A media frame means every sequence header has arrived (FLV sends config before data), so
 		// the track set is declared; release the reservation to publish.
 		self.initial_reservation = None;
-		let timestamp = Timestamp::from_millis(pts_ms as u64)?;
 		let written = {
 			let stream = self.video.get_mut(&track_id).expect("checked above");
 			match stream.track.write(Frame {
@@ -495,15 +497,19 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 	/// Write one audio frame as its own group, so the relay can forward it immediately.
 	fn write_audio(&mut self, track_id: u8, data: &[u8], timestamp: u64) -> anyhow::Result<()> {
-		let Some(stream) = self.audio.get_mut(&track_id) else {
+		if !self.audio.contains_key(&track_id) {
 			tracing::debug!("audio frame before config, dropping");
 			return Ok(());
-		};
+		}
+		let timestamp = Timestamp::from_millis(timestamp)?;
+		// The first frame is live on arrival, anchored before the reservation below publishes.
+		self.catalog.anchor(timestamp)?;
 		// A media frame means every sequence header has arrived (FLV sends config before data), so
 		// the track set is declared; release the reservation to publish.
 		self.initial_reservation = None;
+		let stream = self.audio.get_mut(&track_id).expect("checked above");
 		stream.track.write(Frame {
-			timestamp: Timestamp::from_millis(timestamp)?,
+			timestamp,
 			duration: None,
 			payload: Bytes::copy_from_slice(data),
 			keyframe: true,
@@ -574,7 +580,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		let Some(stream) = self.video.get_mut(&track_id) else {
 			return Ok(());
 		};
-		let demand = stream.track.track().is_used();
+		let demand = stream.track.demand().is_used();
 		if demand {
 			stream.last_source.get_or_insert_with(Instant::now);
 		} else {
@@ -637,6 +643,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 	/// Finish every track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
+		// No frame follows to anchor the clock, so publish the declared track set now.
+		self.initial_reservation = None;
 		for stream in self.video.values_mut() {
 			stream.track.finish()?;
 		}
@@ -777,15 +785,6 @@ fn config_from_asc(asc_bytes: &[u8]) -> anyhow::Result<AudioConfig> {
 	let cfg = crate::codec::aac::Config::parse(&mut cursor)?;
 	let mut config = AudioConfig::new(AAC { profile: cfg.profile }, cfg.sample_rate, cfg.channel_count);
 	config.description = Some(Bytes::copy_from_slice(asc_bytes));
-	Ok(config)
-}
-
-/// Build an audio config for Opus from an `OpusHead` (RFC 7845) record.
-fn config_from_opus_head(head: &[u8]) -> anyhow::Result<AudioConfig> {
-	let mut cursor = head;
-	let cfg = crate::codec::opus::Config::parse(&mut cursor)?;
-	let mut config = AudioConfig::new(AudioCodec::Opus, cfg.sample_rate, cfg.channel_count);
-	config.description = Some(Bytes::copy_from_slice(head));
 	Ok(config)
 }
 

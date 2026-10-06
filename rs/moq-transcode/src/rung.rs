@@ -7,7 +7,9 @@
 //!   source track (mirroring the aggregate subscription) and transcodes group
 //!   for group until the track goes `unused` again.
 //! - A fetch of a specific group (`requested_group`) fetches that same group
-//!   from the source and transcodes just that group with a fresh encoder.
+//!   from the source and transcodes just that group with a fresh encoder. A
+//!   fetch that starts mid-group is refused: a fresh encode's frames are only
+//!   valid after the head that same encode produced.
 //!
 //! Output groups mirror the source group sequence numbers 1:1, so a fetch for
 //! output group N maps to source group N and a player switching renditions
@@ -183,9 +185,9 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 				// The output track closed; nothing more to serve.
 				return Ok(Ended::Closed);
 			},
-			err = rung.broadcast.closed() => {
+			() = rung.broadcast.closed() => {
 				// The source went away while idle; end the rung with it.
-				producer.clone().abort(err)?;
+				producer.clone().abort(moq_net::Error::Dropped)?;
 				return Ok(Ended::Closed);
 			}
 			() = retire.fired() => {
@@ -481,6 +483,20 @@ fn spawn_fetch(
 /// "the handler vanished" and hides the actual decode/encode/source failure from
 /// the waiting consumer.
 async fn fetch(rung: Rung, request: moq_net::group::Request) -> Result<(), Error> {
+	// A fresh encode of this group need not match the bytes the reader's head
+	// came from (the live encoder, or an earlier fetch), so its tail cannot
+	// continue that head. Refuse it so the reader moves on to the next group
+	// boundary instead of decoding a splice.
+	if request.frame_start() != 0 {
+		tracing::debug!(
+			sequence = request.sequence(),
+			frame = request.frame_start(),
+			"refusing a fetch that starts mid-group"
+		);
+		request.reject(moq_net::Error::NotFound);
+		return Ok(());
+	}
+
 	let options = moq_net::group::Fetch::default().with_priority(request.priority());
 	let mut source = match rung.source.fetch_group(request.sequence(), options).await {
 		Ok(source) => source,
@@ -751,10 +767,12 @@ mod tests {
 		let good = moq_video::encode::Encoded::new(
 			Bytes::from_static(b"hello"),
 			moq_net::Timestamp::from_micros(0).unwrap(),
+			true,
 		);
 		let bad = moq_video::encode::Encoded::new(
 			Bytes::from_static(b"world"),
 			moq_net::Timestamp::from_secs(1 << 60).unwrap(),
+			false,
 		);
 
 		assert!(write(&mut group, &guard, vec![good, bad]).is_err());

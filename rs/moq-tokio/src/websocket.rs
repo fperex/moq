@@ -3,7 +3,8 @@
 //! Used when QUIC is unreachable: UDP blocked by a firewall, a proxy in the way, a
 //! network that only passes TCP/443. The client races this against QUIC and gives QUIC
 //! a small head start ([`Config::delay`]), so WebSocket only wins when QUIC can't get
-//! through. Servers accept it on a separate TCP port via [`Listener`].
+//! through. A [`crate::Connection`] that lands on WebSocket keeps the QUIC dial going and
+//! moves onto it if it completes. Servers accept it on a separate TCP port via [`Listener`].
 
 use qmux::ws::tokio_tungstenite;
 use qmux::ws::tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, http};
@@ -105,6 +106,32 @@ type Result<T> = std::result::Result<T, Error>;
 
 // Track servers (hostname:port) where WebSocket won the race, so we won't give QUIC a headstart next time
 static WEBSOCKET_WON: LazyLock<Mutex<HashSet<(String, u16)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// The [`WEBSOCKET_WON`] key for a dial URL: the host and port the fallback dials.
+fn won_key(url: &Url) -> Result<(String, u16)> {
+	let host = url.host_str().ok_or(Error::MissingHostname)?.to_string();
+	let port = url.port().unwrap_or_else(|| match url.scheme() {
+		"https" | "wss" | "moql" | "moqt" => 443,
+		"http" | "ws" => 80,
+		_ => 443,
+	});
+	Ok((host, port))
+}
+
+/// Forget that WebSocket won for `url`, giving QUIC its head start again.
+///
+/// Called once a QUIC dial to `url` lands after all, which proves UDP gets through.
+pub(crate) fn forget(url: &Url) {
+	if let Ok(key) = won_key(url) {
+		WEBSOCKET_WON.lock().unwrap().remove(&key);
+	}
+}
+
+/// Whether the next dial to `url` skips QUIC's head start.
+#[cfg(all(test, feature = "noq"))]
+pub(crate) fn won(url: &Url) -> bool {
+	won_key(url).is_ok_and(|key| WEBSOCKET_WON.lock().unwrap().contains(&key))
+}
 
 /// WebSocket configuration for the client.
 #[derive(Clone, Debug, usage::Args, serde::Serialize, serde::Deserialize)]
@@ -278,13 +305,8 @@ pub(crate) async fn connect(
 		return Err(Error::Disabled);
 	}
 
-	let host = url.host_str().ok_or(Error::MissingHostname)?.to_string();
-	let port = url.port().unwrap_or_else(|| match url.scheme() {
-		"https" | "wss" | "moql" | "moqt" => 443,
-		"http" | "ws" => 80,
-		_ => 443,
-	});
-	let key = (host.clone(), port);
+	let key = won_key(&url)?;
+	let (host, port) = key.clone();
 
 	// Apply a small penalty to WebSocket to improve odds for QUIC to connect first,
 	// unless we've already had to fall back to WebSockets for this server.
@@ -351,7 +373,7 @@ pub(crate) async fn connect(
 			qmux::ws::Client::new()
 				.with_protocols(alpns.iter().map(|&a| (a, qmux_versions_for(a))))
 				.with_connector(connector)
-				.with_keep_alive(qmux::ws::KeepAlive::default()) // 5s ping / 30s deadline, parity with QUIC
+				.with_keep_alive(qmux::ws::KeepAlive::default()) // 5s ping / 30s deadline; TCP backs off retransmits too far for QUIC's 10s
 				.connect(url.as_str())
 				.await
 				.map_err(Error::connect)?
@@ -381,10 +403,14 @@ async fn connect_tls_override(
 		.get(http::header::HOST)
 		.cloned()
 		.ok_or(Error::MissingHostname)?;
+	// tokio-tungstenite takes the TLS name from the URL host, so a bare IPv6 override
+	// needs the URL brackets that `set_host` refuses to add.
 	let mut tls_url = url.clone();
-	tls_url
-		.set_host(Some(tls_host_name))
-		.map_err(|_| Error::connect(qmux::Error::InvalidServerName))?;
+	match tls_host_name.parse::<net::IpAddr>() {
+		Ok(ip) => tls_url.set_ip_host(ip),
+		Err(_) => tls_url.set_host(Some(tls_host_name)).map_err(|_| ()),
+	}
+	.map_err(|_| Error::connect(qmux::Error::InvalidServerName))?;
 	let mut request = tls_url
 		.as_str()
 		.into_client_request()
@@ -533,6 +559,14 @@ impl Listener {
 	/// Accept the next connection and retain the WebSocket request URL, the chosen
 	/// sub-protocol, and the peer's address.
 	pub(crate) async fn accept_with_url(&self) -> Option<Result<(qmux::Session, Url, Accepted)>> {
+		Some(self.accept_pending().await.await)
+	}
+
+	/// Accept a socket and return its independently driven WebSocket upgrade, so a
+	/// peer that stalls mid-upgrade holds up only itself.
+	pub(crate) async fn accept_pending(
+		&self,
+	) -> impl Future<Output = Result<(qmux::Session, Url, Accepted)>> + Send + use<> {
 		let (stream, addr) = self.accept_socket().await;
 		tracing::debug!(%addr, "accepted WebSocket TCP connection");
 
@@ -575,11 +609,11 @@ impl Listener {
 			Ok(response)
 		};
 
-		let websocket = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, None)
-			.await
-			.map_err(qmux::Error::from)
-			.map_err(Error::accept);
-		Some(websocket.map(|websocket| {
+		async move {
+			let websocket = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, None)
+				.await
+				.map_err(qmux::Error::from)
+				.map_err(Error::accept)?;
 			let (protocol, url) = accepted
 				.lock()
 				.unwrap()
@@ -590,8 +624,8 @@ impl Listener {
 				Some(protocol) => upgraded.with_alpn(protocol).accept(),
 				None => upgraded.accept(),
 			};
-			(session, url, Accepted { remote: addr, protocol })
-		}))
+			Ok((session, url, Accepted { remote: addr, protocol }))
+		}
 	}
 
 	/// The `accept(2)` half: keep asking until a connection comes back.
@@ -702,18 +736,41 @@ mod tests {
 
 	#[tokio::test]
 	async fn tls_host_name_override_dials_url_address() {
-		check_tls_authority(false).await;
+		check_tls_authority("127.0.0.1", false, Some("relay.example")).await;
 	}
 
 	#[tokio::test]
 	async fn fixed_addresses_keep_tls_name_and_request_host() {
-		tokio::time::pause();
-		check_tls_authority(true).await;
+		check_tls_authority("relay.example", true, None).await;
 	}
 
-	async fn check_tls_authority(fixed: bool) {
-		let rcgen::CertifiedKey { cert, signing_key } =
-			rcgen::generate_simple_self_signed(["relay.example".to_string()]).unwrap();
+	#[tokio::test]
+	async fn ipv6_literal() {
+		check_tls_authority("[::1]", false, None).await;
+	}
+
+	#[tokio::test]
+	async fn ipv6_literal_fixed_addresses() {
+		check_tls_authority("[::1]", true, None).await;
+	}
+
+	#[tokio::test]
+	async fn ipv6_tls_host_name_override() {
+		check_tls_authority("[::1]", false, Some("::1")).await;
+	}
+
+	/// Dial `wss://{url_host}` on loopback, optionally pinned to fixed addresses, and
+	/// check the TLS name and HTTP `Host` the server sees.
+	///
+	/// Stays on the wall clock. A paused clock auto-advances while the real dial
+	/// waits, so a timer on this path can fire before loopback delivers.
+	async fn check_tls_authority(url_host: &str, fixed: bool, tls_name: Option<&str>) {
+		let ipv6 = url_host.starts_with('[');
+		let name = tls_name.unwrap_or(url_host.trim_start_matches('[').trim_end_matches(']'));
+		// Clients send SNI only for DNS names, never for IP addresses.
+		let expected_sni = name.parse::<net::IpAddr>().is_err().then_some(name);
+
+		let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed([name.to_string()]).unwrap();
 		let cert = CertificateDer::from(cert);
 		let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
 		let provider = crate::crypto::provider();
@@ -732,7 +789,8 @@ mod tests {
 			.with_root_certificates(roots)
 			.with_no_client_auth();
 
-		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let loopback = if ipv6 { "[::1]:0" } else { "127.0.0.1:0" };
+		let listener = tokio::net::TcpListener::bind(loopback).await.unwrap();
 		let addr = listener.local_addr().unwrap();
 		let accepted = tokio::spawn(async move {
 			let (stream, _) = listener.accept().await.unwrap();
@@ -771,23 +829,21 @@ mod tests {
 		});
 
 		let config = Config::default();
-		let host = if fixed { "relay.example" } else { "127.0.0.1" };
-		let url = Url::parse(&format!("wss://{host}:{}/anon", addr.port())).unwrap();
+		let url = Url::parse(&format!("wss://{url_host}:{}/anon", addr.port())).unwrap();
 		// A TCP-only race would select this silent TLS peer and strand the dial.
-		let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let silent = tokio::net::TcpListener::bind(loopback).await.unwrap();
 		let target = if fixed {
 			crate::connect::Addr::pinned(url, [silent.local_addr().unwrap(), addr]).unwrap()
 		} else {
 			url.into()
 		};
-		let tls_name = (!fixed).then_some("relay.example");
-		let expected_host = format!("{host}:{}", addr.port());
+		let expected_host = format!("{url_host}:{}", addr.port());
 		let session = connect(&config, &client_tls, tls_name, target, moq_net::ALPNS)
 			.await
 			.unwrap();
 		drop(session);
 		let (server_name, host) = accepted.await.unwrap();
-		assert_eq!(server_name.as_deref(), Some("relay.example"));
+		assert_eq!(server_name.as_deref(), expected_sni);
 		assert_eq!(host.as_deref(), Some(expected_host.as_str()));
 	}
 

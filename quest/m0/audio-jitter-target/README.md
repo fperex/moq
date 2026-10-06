@@ -14,56 +14,27 @@ the same arrival trace.
 Boundaries: convergence still uses skip-ahead and silence, so playing slightly
 faster or slower to converge stays [Time
 stretch](/quest/m1/watch-audio-time-stretch.md). No packet loss concealment.
-Video keeps its own target; making the audio playhead the clock is [Plan: A/V
-clock](/quest/m0/plan-av-clock.md).
+Video keeps its own target; making the audio playhead the clock is [A/V
+clock](/quest/m1/av-clock.md).
 
 ## Plan
 
-Two quests: one implementation per language against the written algorithm.
-The two implementations are independent and may run in parallel. Both are
-additive and target `main`: the native knob is a new field on a
-`#[non_exhaustive]` struct, and the browser estimator is a new module plus a
-new `spread` observation.
+Both implementations are on `main` (#4162): `js/hang/src/container/jitter.ts`
+and `rs/moq-audio`'s `jitter.rs` follow `doc/concept/audio-jitter.md` and pass
+its conformance corpus, `js/watch` `Sync` holds the deepest track's target in
+`"auto"`, and `moq play --delay` defaults to `auto`. Both are the default for
+every viewer, so `"auto"` shipped ahead of the Chrome and Safari proof the
+Watch quest still owes; the maintainer accepted that, and the re-measured
+replay budgets, on 2026-10-04.
 
-The algorithm is written down at `doc/concept/audio-jitter.md`, with a
-conformance corpus beside it that both implementations will read.
+What the line still owes once Watch lands: its recorded trace replayed through
+the native decode path too, asserting the same target series the browser's
+`playout.test.ts` does. Grading native playback against the harness budgets is
+[Audio quality native](/quest/m1/audio-quality-native.md).
 
-Neither `main` nor `dev` has a measured estimator. `js/watch/src/sync.ts:159`
-still computes `max(MIN_JITTER, minRtt * 1.25)` from the connection's PROBE,
-and `js/watch/src/audio/latency.ts` still exists. `sync.ts` also adds the
-advertised jitter to that term, where the document settles on a maximum.
+## Required
 
-The prior art is the branch of PR #3517,
-`origin/quest/m0/3477-watch-auto-latency`, two commits ahead of `dev`. The PR
-is closed and never merged; the watch quest starts from the branch rather than
-from `dev`. It already deletes the RTT term
-(`MIN_JITTER`, `FALLBACK_JITTER`, `#minRtt`, and the `probe` input are gone
-from `sync.ts`; `latency.ts` survives, minus `reanchorFloor`) and plumbs a
-per-track arrival `spread` through `Container.Consumer`, measured at container
-frame arrival and before the age budget can skip a group, which is the right
-observation point. Its estimator, `js/hang/src/container/jitter.ts`, is a
-decaying histogram of 5 ms buckets, 200 of them so the percentile saturates at
-one second, read at the 95th percentile plus one frame, with the arrival
-minimum expiring over two 30 s windows, `reanchor()` on a discontinuity, and
-the step down bounded to one frame per second. `jitter.test.ts` and
-`js/watch/src/audio/replay.test.ts` cover it. What it gets wrong is the extra
-frame, learned from the first gap between observed timestamps, and a rise that
-is immediate and unclamped, so a tune-in across a stale group sets the target
-to seconds.
-
-Note that `sync.ts` has since been refactored on `main` to a `register(jitter)`
-list, so the branch does not rebase cleanly.
-
-Native has no jitter buffer at all. `rs/moq-audio`'s `decode::Options`
-(`rs/moq-audio/src/decode/consumer.rs`) carries `max_age`, how far
-playback may drift from the live edge before skipping a stalled group, and
-`start`, where to begin on a track that already holds groups. Nothing pads the
-buffer against uneven arrivals.
-
-## Quests
-
-- [Watch](/quest/m0/audio-jitter-target/watch.md) - js/watch and js/hang bring the #3517 branch's estimator into conformance
-- [Native](/quest/m0/audio-jitter-target/native.md) - rs/moq-audio grows a measured jitter buffer from the same algorithm
+- [Watch](/quest/m0/audio-jitter-target/watch.md) - the browser's measured target, proven on Chrome and Safari against the public relay
 
 ## Closes
 
@@ -71,7 +42,4 @@ buffer against uneven arrivals.
 
 ## Related
 
-- [Jitter clock](/quest/m1/jitter-flush-clock.md) - the advertised jitter (#3513 landed the flush span), which `doc/concept/audio-jitter.md` settles as a floor on the measured target
-- [Audio quality harness](/quest/m1/audio-quality-harness/README.md) - the automated proof, built on its own schedule
 - [Time stretch](/quest/m1/watch-audio-time-stretch.md) - inaudible convergence, on top of this
-- [Plan: A/V clock](/quest/m0/plan-av-clock.md) - the clock this target eventually feeds

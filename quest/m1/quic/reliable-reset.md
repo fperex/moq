@@ -40,10 +40,9 @@ header. Callers must not calculate or pass the hidden WebTransport header
 length. Preserve WebTransport application error codes unchanged on send,
 receive, and intermediary forwarding.
 
-Use the same state machine from qmux. Because qmux runs over a reliable ordered
-transport, serialization acknowledges the committed prefix immediately, but
-the receiver must still delay the reset until that prefix is available. Remove
-the qmux prototype's local `RESET_STREAM_AT` state once the shared core owns it.
+qmux on this shared state machine is [qmux on the QUIC stream state
+machine](/quest/m2/quic-qmux.md)'s (moved to m2 in the 2026-09-30 audit);
+this quest is native QUIC and WebTransport only.
 
 Test negotiation on/off and 0-RTT, loss and reordering of both the frame and
 prefix data, shrinking Reliable Size, reset after FIN, flow-control blocking,
@@ -56,19 +55,24 @@ the native interop matrix.
 Then use it in MoQ. A publisher that resets a group stream uses a Reliable
 Size covering the group header, so the subscriber can always attribute the
 reset to its group. Once reliable reset is negotiated, subscribers drop the
-grace they wait for missing groups below a track's declared end (see the track
-tail quests). Browsers keep the grace until WebTransport exposes
-reliable reset.
+grace they wait for missing groups below a track's declared end
+(`rs/moq-net/src/tail.rs`, `js/net/src/tail.ts`). Browsers keep the grace until
+WebTransport exposes reliable reset.
 
 Track the unversioned draft during implementation. The planning baseline is
 draft 10, with transport parameter `0x1d` and frame type `0x24`; do not freeze
 provisional codepoints if the document changes before release.
 
+## Required
+
+- [Hard fork](/quest/m1/quic/fork/README.md) - lands in `moq-quic`, not the frozen fork
+
 ## Related
 
-- [JS track tail](/quest/m1/js-track-tail.md) and [Rust track tail](/quest/m1/rust-track-tail.md) -
-  wait a grace for a group whose reset lost its header, until this lands
-- [qmux on the QUIC stream state machine](/quest/m1/quic/qmux.md) - consumes
-  the same reset state without a parallel implementation
+- moq-net (`rs/moq-net/src/tail.rs`) and `@moq/net` (`js/net/src/tail.ts`) wait
+  a grace for a group whose reset lost its header until this lands
 - The removed quiche backend was the one stack that had this, so it is the
   known browser-compliance gap.
+- [qmux on the QUIC stream state machine](/quest/m2/quic-qmux.md) - consumes
+  the same reset state without a parallel implementation
+- [noq#809](https://github.com/n0-computer/noq/issues/809) - the RESET_STREAM_AT ask to n0

@@ -9,12 +9,25 @@
 
 use moq_net::{Client, Server, Session, Version, origin};
 
-use super::mock::create_mock_session_pair;
+use super::mock::{MockSession, create_mock_session_pair};
 
-pub use moq_net::time::run;
-
+/// The current instant: simulated under `moq_net_sim`, tokio's in the benches.
 pub fn now() -> moq_net::time::Instant {
-	tokio::time::Instant::now().into_std()
+	match moq_net_sim::is_running() {
+		true => moq_net_sim::now(),
+		false => tokio::time::Instant::now().into_std(),
+	}
+}
+
+/// Run a protocol driver in the background: on `moq_net_sim` in tests, on tokio in
+/// the benches.
+pub fn spawn<D: moq_net::time::Driver + Send + Unpin + 'static>(mut driver: D) {
+	match moq_net_sim::is_running() {
+		true => drop(moq_net_sim::spawn(moq_net_sim::drive(move |now, waiter| {
+			driver.poll(now, waiter)
+		}))),
+		false => drop(tokio::spawn(moq_net::time::run(driver))),
+	}
 }
 
 /// Options for [`connect_mock`].
@@ -22,13 +35,15 @@ pub struct MockConnectOptions {
 	/// The MoQ version to negotiate (determines the ALPN protocol string).
 	pub version: Version,
 	/// Origin whose broadcasts the client publishes to the server.
-	pub client_publish: Option<origin::Producer>,
+	pub client_publish: Option<origin::Consumer>,
 	/// Origin the client inserts remote broadcasts into.
 	pub client_subscribe: Option<origin::Producer>,
 	/// Origin whose broadcasts the server publishes to the client.
-	pub server_publish: Option<origin::Producer>,
+	pub server_publish: Option<origin::Consumer>,
 	/// Origin the server inserts remote broadcasts into.
 	pub server_subscribe: Option<origin::Producer>,
+	/// One-way delay for stream data in each direction.
+	pub latency: std::time::Duration,
 }
 
 impl MockConnectOptions {
@@ -40,6 +55,7 @@ impl MockConnectOptions {
 			client_subscribe: None,
 			server_publish: None,
 			server_subscribe: None,
+			latency: std::time::Duration::ZERO,
 		}
 	}
 }
@@ -49,6 +65,10 @@ impl MockConnectOptions {
 pub struct MockPair {
 	pub client: Session,
 	pub server: Session,
+	/// The client's end of the mock transport, for steering delivery.
+	pub client_transport: MockSession,
+	/// The server's end of the mock transport, for steering delivery.
+	pub server_transport: MockSession,
 }
 
 /// Run the MoQ handshake over the mock transport, returning connected sessions.
@@ -63,6 +83,8 @@ pub struct MockPair {
 pub async fn connect_mock(opts: MockConnectOptions) -> MockPair {
 	let protocol = opts.version.alpn();
 	let (client_transport, server_transport) = create_mock_session_pair(Some(protocol));
+	client_transport.set_latency(opts.latency);
+	let transports = (client_transport.clone(), server_transport.clone());
 
 	let mut client = Client::new().with_versions(opts.version.into());
 	if let Some(publish) = &opts.client_publish {
@@ -89,7 +111,7 @@ pub async fn connect_mock(opts: MockConnectOptions) -> MockPair {
 			.connect(now(), client_transport)
 			.await
 			.expect("client handshake failed");
-		tokio::spawn(run(driver));
+		spawn(driver);
 		session
 	};
 	let server_fut = async {
@@ -97,13 +119,38 @@ pub async fn connect_mock(opts: MockConnectOptions) -> MockPair {
 			.accept(now(), server_transport)
 			.await
 			.expect("server handshake failed");
-		tokio::spawn(run(driver));
+		spawn(driver);
 		session
 	};
-	let (client_session, server_session) = tokio::join!(client_fut, server_fut);
+	let (client_session, server_session) = futures::join!(client_fut, server_fut);
 
 	MockPair {
 		client: client_session,
 		server: server_session,
+		client_transport: transports.0,
+		server_transport: transports.1,
 	}
+}
+
+/// Peer two relays the way `moq-relay`'s cluster does: one session, both directions.
+pub async fn peer(version: Version, a: &origin::Producer, b: &origin::Producer) -> MockPair {
+	peer_with_latency(version, a, b, std::time::Duration::ZERO).await
+}
+
+/// [`peer`] over a link with a one-way `latency`.
+pub async fn peer_with_latency(
+	version: Version,
+	a: &origin::Producer,
+	b: &origin::Producer,
+	latency: std::time::Duration,
+) -> MockPair {
+	let a = a.clone().peer();
+	let b = b.clone().peer();
+	let mut options = MockConnectOptions::new(version);
+	options.client_publish = Some(a.consume().with_hidden(true));
+	options.client_subscribe = Some(a);
+	options.server_publish = Some(b.consume().with_hidden(true));
+	options.server_subscribe = Some(b);
+	options.latency = latency;
+	connect_mock(options).await
 }

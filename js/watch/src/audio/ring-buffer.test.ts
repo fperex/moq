@@ -1,11 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Time } from "@moq/net";
-import * as Playout from "./playout";
 import { AudioRingBuffer } from "./ring-buffer";
-
-// The band the reader's time stretch converges across, which the ring has to be able to hold above
-// its target on top of the target itself. 75 samples at the 1kHz rate most of these tests use.
-const SKIP = Playout.frames(1000, Playout.STRETCH_BOUND);
 
 function read(buffer: AudioRingBuffer, samples: number, channelCount = 2): Float32Array[] {
 	const output: Float32Array[] = [];
@@ -36,43 +31,13 @@ function write(
 	buffer.write(Time.Micro.fromMilli(timestamp), data);
 }
 
-/**
- * Write `samples` as a run of `chunk`-sized writes starting at `timestamp`.
- *
- * The ring holds the target with one chunk on top, so a test that wants a ring that plays has to
- * arrive the way a decoder does: several chunks, not one big one. The rate is 1000 in these tests,
- * so a sample is a millisecond.
- */
-function writeChunks(
-	buffer: AudioRingBuffer,
-	timestamp: number,
-	samples: number,
-	chunk: number,
-	props?: { channels?: number; value?: number },
-): void {
-	for (let i = 0; i < samples; i += chunk) {
-		write(buffer, (timestamp + i) as Time.Milli, Math.min(chunk, samples - i), props);
-	}
-}
-
-/** Fill the ring with `samples` as two halves, which un-stalls a ring targeting half of them. */
-function fill(
-	buffer: AudioRingBuffer,
-	timestamp: number,
-	samples: number,
-	props?: { channels?: number; value?: number },
-): void {
-	writeChunks(buffer, timestamp, samples, Math.ceil(samples / 2), props);
-}
-
 describe("initialization", () => {
 	it("should initialize with valid parameters", () => {
 		const buffer = new AudioRingBuffer({ rate: 48000, channels: 2, latency: 100 as Time.Milli });
 
-		// Capacity is twice the target plus the stretch band: the ring has to be able to hold the
-		// slack the overflow band tolerates, or every chunk arriving on a full ring would drop the
-		// oldest samples.
-		expect(buffer.capacity).toBe(9600 + Playout.frames(48000, Playout.STRETCH_BOUND)); // 48000 * 0.1 * 2, plus the band
+		// Capacity is twice the target: the ring has to be able to hold the slack the overflow band
+		// tolerates, or every chunk arriving on a full ring would drop the oldest samples.
+		expect(buffer.capacity).toBe(9600); // 48000 * 0.1 * 2
 		expect(buffer.length).toBe(0);
 	});
 
@@ -109,7 +74,7 @@ describe("writing data", () => {
 	});
 
 	it("should handle gaps by filling with zeros", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 100 as Time.Milli }); // 100 samples buffer
 
 		// Write at timestamp 0
 		write(buffer, 0 as Time.Milli, 10, { channels: 2, value: 1.0 });
@@ -121,7 +86,7 @@ describe("writing data", () => {
 		expect(buffer.length).toBe(30); // 10 + 10 (gap) + 10
 
 		// Exit stalled mode by filling buffer
-		fill(buffer, 30, 70, { channels: 2, value: 0.0 });
+		write(buffer, 30 as Time.Milli, 70, { channels: 2, value: 0.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read and verify the gap was filled with zeros
@@ -146,10 +111,10 @@ describe("writing data", () => {
 	});
 
 	it("should handle late-arriving samples (out-of-order writes)", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 
 		// Fill buffer to exit stalled mode
-		fill(buffer, 0, 100, { channels: 1, value: 0.0 });
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 0.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read 50 samples to advance read pointer to 50
@@ -183,10 +148,10 @@ describe("writing data", () => {
 	});
 
 	it("should discard samples that are too old", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 100 as Time.Milli });
 
 		// Exit stalled mode by filling buffer
-		fill(buffer, 0, 100, { channels: 2, value: 0.0 });
+		write(buffer, 0 as Time.Milli, 100, { channels: 2, value: 0.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read 60 samples, readIndex now at 60
@@ -216,10 +181,10 @@ describe("writing data", () => {
 
 describe("reading data", () => {
 	it("should read available data", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 100 as Time.Milli });
 
 		// Exit stalled mode by filling the buffer
-		fill(buffer, 0, 100, { channels: 2, value: 0.0 });
+		write(buffer, 0 as Time.Milli, 100, { channels: 2, value: 0.0 });
 		// Buffer should now be out of stalled mode
 		expect(buffer.stalled).toBe(false);
 
@@ -254,10 +219,10 @@ describe("reading data", () => {
 	});
 
 	it("should handle partial reads", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 100 as Time.Milli });
 
 		// Exit stalled mode by filling the buffer
-		fill(buffer, 0, 100, { channels: 2, value: 0.0 });
+		write(buffer, 0 as Time.Milli, 100, { channels: 2, value: 0.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read some to make room (readIndex at 80)
@@ -300,7 +265,7 @@ describe("stall behavior", () => {
 	});
 
 	it("should exit stalled mode when buffer is full", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 100 as Time.Milli });
 
 		// Fill the buffer completely
 		write(buffer, 0 as Time.Milli, 100, { channels: 2, value: 1.0 });
@@ -317,63 +282,51 @@ describe("stall behavior", () => {
 });
 
 describe("ring buffer wrapping", () => {
-	// 400 sample target, so 875 samples of capacity. The ring holds the target plus one 200 sample
-	// chunk, and skips only past the 75 sample stretch band above that.
-	const TARGET = 400;
-	const CHUNK = 200;
-	const HOLD = TARGET + CHUNK;
-	const BAND = HOLD + SKIP;
+	it("should wrap around when buffer is full", () => {
+		// 100 sample target, so 200 samples of capacity.
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 
-	it("tolerates a burst that drains again", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: TARGET as Time.Milli });
-
-		writeChunks(buffer, 0, HOLD, CHUNK, { channels: 1, value: 1.0 });
-		expect(buffer.stalled).toBe(false);
-		expect(read(buffer, 400, 1)[0].length).toBe(400);
-
-		// A flush lands several chunks at once, taking the ring past the band in one go. It drains
-		// back before the next one, so the trough never rises and nothing is dropped: the reader's
-		// time stretch is what walks it back down.
-		write(buffer, 600 as Time.Milli, 200, { channels: 1, value: 2.0 });
-		write(buffer, 800 as Time.Milli, 200, { channels: 1, value: 3.0 });
-		write(buffer, 1000 as Time.Milli, 200, { channels: 1, value: 4.0 });
-		expect(buffer.length).toBeGreaterThan(BAND);
-
-		// And it all plays: abs 400-1199, so 2.0 arrives where the first writes left off.
-		expect(read(buffer, 800, 1)[0].length).toBe(800);
-	});
-
-	it("drops back to the hold level once the surplus outlasts a window of playback", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: TARGET as Time.Milli });
-
-		writeChunks(buffer, 0, HOLD, CHUNK, { channels: 1, value: 1.0 });
+		// Fill to the target
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
-		// Two hundred samples in, a hundred out: the trough climbs past the band and stays there,
-		// which is a publisher running faster than real time rather than a burst.
-		let media = HOLD;
-		let dropped = false;
-		for (let i = 0; i < 20; i++) {
-			write(buffer, media as Time.Milli, 200, { channels: 1, value: 2.0 });
-			media += 200;
-			read(buffer, 100, 1);
-			if (buffer.length <= HOLD) dropped = true;
-			expect(buffer.length).toBeLessThanOrEqual(buffer.capacity);
+		// Read 50 samples to make room (readIndex at 50)
+		const output1 = read(buffer, 50, 1);
+		expect(output1[0].length).toBe(50);
+
+		// Write 50 more samples at timestamp 100 (fills from sample 100-149)
+		write(buffer, 100 as Time.Milli, 50, { channels: 1, value: 2.0 });
+
+		// Now we have 100 samples available (50-149)
+		expect(buffer.length).toBe(100);
+
+		// One chunk above the target is tolerated rather than dropped (50-199).
+		write(buffer, 150 as Time.Milli, 50, { channels: 1, value: 3.0 });
+		expect(buffer.length).toBe(150);
+
+		// Past the band: drop back to the target, wrapping abs 200-249 onto slots 0-49.
+		write(buffer, 200 as Time.Milli, 50, { channels: 1, value: 4.0 });
+		expect(buffer.length).toBe(100);
+
+		// Read all 100 samples: abs 150-199 = 3.0, abs 200-249 = 4.0.
+		const output2 = read(buffer, 100, 1);
+		expect(output2[0].length).toBe(100);
+
+		for (let i = 0; i < 50; i++) {
+			expect(output2[0][i]).toBe(3.0);
 		}
-
-		expect(dropped).toBe(true);
-		// Nothing stale survived the wrap: everything past the first writes is the second value.
-		const output = read(buffer, 100, 1);
-		expect(output[0].every((sample) => sample === 2.0)).toBe(true);
+		for (let i = 50; i < 100; i++) {
+			expect(output2[0][i]).toBe(4.0);
+		}
 	});
 });
 
 describe("multi-channel handling", () => {
 	it("should handle stereo data correctly", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 100 as Time.Milli });
 
 		// Exit stalled mode by filling buffer
-		fill(buffer, 0, 100, { channels: 2, value: 0.5 });
+		write(buffer, 0 as Time.Milli, 100, { channels: 2, value: 0.5 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read some to make room
@@ -422,7 +375,7 @@ describe("edge cases", () => {
 	});
 
 	it("should handle fractional timestamps", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 2, latency: 100 as Time.Milli });
 
 		// Exit stalled mode first
 		write(buffer, 0 as Time.Milli, 100, { channels: 2, value: 0.0 });
@@ -441,7 +394,7 @@ describe("edge cases", () => {
 describe("resize", () => {
 	it("should resize to a larger buffer", () => {
 		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
-		expect(buffer.capacity).toBe(200 + SKIP);
+		expect(buffer.capacity).toBe(200);
 
 		// Write 50 samples
 		write(buffer, 0 as Time.Milli, 50, { channels: 1, value: 1.0 });
@@ -450,80 +403,34 @@ describe("resize", () => {
 		// Resize to larger buffer (200ms = 200 samples)
 		buffer.resize(200 as Time.Milli);
 
-		expect(buffer.capacity).toBe(400 + SKIP);
+		expect(buffer.capacity).toBe(400);
 		expect(buffer.length).toBe(50); // Samples preserved
 		expect(buffer.stalled).toBe(true); // Should trigger stall
 	});
 
 	it("should resize to a smaller buffer and keep the most recent samples", () => {
 		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
-		expect(buffer.capacity).toBe(200 + SKIP);
+		expect(buffer.capacity).toBe(200);
 
-		// Write 250 samples in 50 sample chunks: 150 with value 1.0, the rest with 2.0. The reader
-		// takes a block once the ring holds its level, because until it has the writer starts the
-		// playhead at the newest audio less that level rather than letting a fill run deep: a ring only
-		// sits above what it holds once playback is under way.
-		writeChunks(buffer, 0, 150, 50, { channels: 1, value: 1.0 });
-		expect(read(buffer, 50, 1)[0].length).toBe(50);
-		writeChunks(buffer, 150, 100, 50, { channels: 1, value: 2.0 });
-		expect(buffer.length).toBe(200);
+		// Write 80 samples: first 40 with value 1.0, next 40 with value 2.0
+		write(buffer, 0 as Time.Milli, 40, { channels: 1, value: 1.0 });
+		write(buffer, 40 as Time.Milli, 40, { channels: 1, value: 2.0 });
+		expect(buffer.length).toBe(80);
 
-		// Resize to a 30 sample target. Capacity is the level the ring holds, the 30 sample target
-		// with the 50 sample chunk on top, plus the band. Everything past it is dropped from the
-		// front, so the window that survives ends where the old one did.
+		// Resize to a 30 sample target (60 samples of capacity).
+		// Should keep the most recent 60 samples (samples 20-79)
 		buffer.resize(30 as Time.Milli);
 
-		const capacity = 30 + 50 + SKIP;
-		expect(buffer.capacity).toBe(capacity);
-		expect(buffer.length).toBe(capacity); // Truncated to new capacity
-		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe((250 - capacity) as Time.Milli);
-	});
-
-	it("keeps the timeline when every buffered sample fits", () => {
-		// Capacity follows the target, so every step of it moves the samples into an array of a new
-		// size. Nothing was skipped, so the reader must not be told to forget what it learned.
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 40 as Time.Milli });
-		writeChunks(buffer, 0, 60, 20, { channels: 1, value: 1.0 });
-		expect(read(buffer, 20, 1)[0].length).toBe(20);
-		write(buffer, 60 as Time.Milli, 20, { channels: 1, value: 2.0 });
-		const generation = buffer.view().generation;
-
-		buffer.resize(60 as Time.Milli);
-		expect(buffer.capacity).toBe(120 + SKIP);
-		expect(buffer.length).toBe(60);
-		expect(buffer.view().generation).toBe(generation);
-
-		buffer.resize(40 as Time.Milli);
-		expect(buffer.capacity).toBe(80 + SKIP);
-		expect(buffer.length).toBe(60);
-		expect(buffer.view().generation).toBe(generation);
-
-		const output = read(buffer, 60, 1);
-		expect(output[0].length).toBe(60);
-		expect(output[0].subarray(0, 40).every((sample) => sample === 1.0)).toBe(true);
-		expect(output[0].subarray(40).every((sample) => sample === 2.0)).toBe(true);
-	});
-
-	it("starts a new timeline when the new capacity drops samples", () => {
-		// The shrink above: 200 buffered against a capacity of 155, so the reader's next sample is not
-		// the one after its last.
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
-		writeChunks(buffer, 0, 150, 50, { channels: 1, value: 1.0 });
-		expect(read(buffer, 50, 1)[0].length).toBe(50);
-		writeChunks(buffer, 150, 100, 50, { channels: 1, value: 2.0 });
-		expect(buffer.length).toBe(200);
-		const generation = buffer.view().generation;
-
-		buffer.resize(30 as Time.Milli);
-		expect(buffer.length).toBe(30 + 50 + SKIP);
-		expect(buffer.view().generation).not.toBe(generation);
+		expect(buffer.capacity).toBe(60);
+		expect(buffer.length).toBe(60); // Truncated to new capacity
+		expect(buffer.stalled).toBe(false); // Already covers the new floor
 	});
 
 	it("should be a no-op when capacity is unchanged", () => {
 		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 
 		// Exit stalled mode
-		fill(buffer, 0, 200, { channels: 1, value: 1.0 });
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Resize to same capacity
@@ -531,7 +438,7 @@ describe("resize", () => {
 
 		// Should still not be stalled (no-op)
 		expect(buffer.stalled).toBe(false);
-		expect(buffer.capacity).toBe(200 + SKIP);
+		expect(buffer.capacity).toBe(200);
 	});
 
 	it("should throw on zero latency", () => {
@@ -551,12 +458,11 @@ describe("resize", () => {
 		buffer.write(0 as Time.Micro, data);
 		expect(buffer.length).toBe(60);
 
-		// Resize to smaller buffer. The 60 sample chunk is wider than the new 50 sample target, so
-		// capacity holds that rather than twice the target.
+		// Resize to smaller buffer
 		buffer.resize(50 as Time.Milli);
-		expect(buffer.capacity).toBe(50 + 60 + SKIP);
+		expect(buffer.capacity).toBe(100);
 		expect(buffer.length).toBe(60);
-		expect(buffer.stalled).toBe(true);
+		expect(buffer.stalled).toBe(false);
 	});
 
 	it("should handle resize when buffer is empty", () => {
@@ -566,16 +472,16 @@ describe("resize", () => {
 		// Resize empty buffer
 		buffer.resize(200 as Time.Milli);
 
-		expect(buffer.capacity).toBe(400 + SKIP);
+		expect(buffer.capacity).toBe(400);
 		expect(buffer.length).toBe(0);
 		expect(buffer.stalled).toBe(true);
 	});
 
 	it("should handle resize after partial read", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 
 		// Fill and exit stalled mode
-		fill(buffer, 0, 100, { channels: 1, value: 1.0 });
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read 60 samples (readIndex at 60, writeIndex at 100)
@@ -588,23 +494,23 @@ describe("resize", () => {
 
 		// Resize to a 50 sample target - 100 of capacity, so all 70 survive (samples 60-129)
 		buffer.resize(50 as Time.Milli);
-		expect(buffer.capacity).toBe(100 + SKIP);
+		expect(buffer.capacity).toBe(100);
 		expect(buffer.length).toBe(70);
 		expect(buffer.stalled).toBe(false);
 	});
 
-	it("should exit stall and read new data after resize", () => {
+	it("should resume and then read new data after a shrinking resize", () => {
 		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 
 		// Write some initial data
 		write(buffer, 0 as Time.Milli, 50, { channels: 1, value: 1.0 });
 
-		// Resize to smaller buffer
+		// Resize to a floor the buffered data already covers
 		buffer.resize(50 as Time.Milli);
-		expect(buffer.stalled).toBe(true);
+		expect(buffer.stalled).toBe(false);
 
-		// Write new data to reach the new target and exit stall. Nothing is dropped: the ring has
-		// room for the preserved samples plus a chunk above the target.
+		// Nothing is dropped: the ring has room for the preserved samples plus a chunk above the
+		// target.
 		write(buffer, 50 as Time.Milli, 50, { channels: 1, value: 2.0 });
 		expect(buffer.stalled).toBe(false);
 		expect(buffer.length).toBe(100);
@@ -621,21 +527,21 @@ describe("resize", () => {
 	});
 
 	it("should preserve samples correctly when resizing larger then filling", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 30 as Time.Milli });
-		expect(buffer.capacity).toBe(60 + SKIP);
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 50 as Time.Milli });
+		expect(buffer.capacity).toBe(100);
 
 		// Write 30 samples
 		write(buffer, 0 as Time.Milli, 30, { channels: 1, value: 1.0 });
 		expect(buffer.length).toBe(30);
 
-		// Resize to larger buffer (50ms = 50 samples)
-		buffer.resize(50 as Time.Milli);
-		expect(buffer.capacity).toBe(100 + SKIP);
+		// Resize to larger buffer (100ms = 100 samples)
+		buffer.resize(100 as Time.Milli);
+		expect(buffer.capacity).toBe(200);
 		expect(buffer.length).toBe(30); // All samples preserved
 		expect(buffer.stalled).toBe(true);
 
 		// Write 70 more samples to fill the buffer and exit stall
-		fill(buffer, 30, 70, { channels: 1, value: 2.0 });
+		write(buffer, 30 as Time.Milli, 70, { channels: 1, value: 2.0 });
 		expect(buffer.stalled).toBe(false);
 		expect(buffer.length).toBe(100);
 
@@ -657,10 +563,10 @@ describe("resize", () => {
 		// capacity, preserved samples ended up in the wrong slots and read() returned
 		// mangled data. This test fails under that bug by constructing a scenario
 		// where `copyStart % newCapacity !== 0`.
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 50 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 
 		// Fill the buffer to exit stall (writeIndex=100, readIndex=0).
-		fill(buffer, 0, 100, { channels: 1, value: 1.0 });
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Advance readIndex to 20 so there's room to wrap the write pointer.
@@ -672,9 +578,9 @@ describe("resize", () => {
 		write(buffer, 110 as Time.Milli, 10, { channels: 1, value: 3.0 });
 
 		// Preserved range after resize: all 100 buffered samples = abs 20..119.
-		// copyStart = 120 - 100 = 20, and 20 % 150 = 20 (non-zero → triggers the bug).
-		buffer.resize(25 as Time.Milli);
-		expect(buffer.capacity).toBe(25 + 50 + SKIP);
+		// copyStart = 120 - 100 = 20, and 20 % 100 = 20 (non-zero → triggers the bug).
+		buffer.resize(50 as Time.Milli);
+		expect(buffer.capacity).toBe(100);
 		expect(buffer.length).toBe(100);
 		expect(buffer.stalled).toBe(false);
 
@@ -701,37 +607,36 @@ describe("resize", () => {
 		// while timestamps stayed absolute, the next write would leave a giant zero
 		// gap. This test asserts that post-resize writes land contiguously with the
 		// preserved samples.
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 200 as Time.Milli });
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 
 		// Fill the buffer, then partially drain it.
-		fill(buffer, 0, 400, { channels: 1, value: 1.0 });
-		read(buffer, 160, 1);
-		// Wrap the writer over slots 0-119 with value 2.0 (abs 400-519).
-		write(buffer, 400 as Time.Milli, 120, { channels: 1, value: 2.0 });
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 1.0 });
+		read(buffer, 40, 1);
+		// Wrap the writer over slots 0-29 with value 2.0 (abs 100-129).
+		write(buffer, 100 as Time.Milli, 30, { channels: 1, value: 2.0 });
 
-		// Resize smaller. All 360 buffered samples fit the new 400 sample capacity: abs 160..519.
-		buffer.resize(200 as Time.Milli);
-		expect(buffer.length).toBe(360);
+		// Resize smaller. All 90 buffered samples fit the new 100 sample capacity: abs 40..129.
+		buffer.resize(50 as Time.Milli);
+		expect(buffer.length).toBe(90);
 		expect(buffer.stalled).toBe(false);
 
-		// Write the next 40 samples at their real timestamp. This should append,
+		// Write the next 10 samples at their real timestamp. This should append,
 		// not create a gap or be discarded as "too old".
-		write(buffer, 520 as Time.Milli, 40, { channels: 1, value: 3.0 });
+		write(buffer, 130 as Time.Milli, 10, { channels: 1, value: 3.0 });
 
-		// That put the ring past the band (200 + 40 + 75), so it drops back to the level it holds,
-		// the 200 sample target with the 40 sample chunk on top. Remaining: abs 320..399 = 1.0 (80),
-		// abs 400..519 = 2.0 (120), abs 520..559 = 3.0 (40).
-		expect(buffer.length).toBe(240);
+		// That put the ring past the band, so it drops back to the 50 sample target.
+		// Remaining: abs 90..99 = 1.0 (10), abs 100..129 = 2.0 (30), abs 130..139 = 3.0 (10).
+		expect(buffer.length).toBe(50);
 
-		const output = read(buffer, 240, 1);
-		expect(output[0].length).toBe(240);
-		for (let i = 0; i < 80; i++) {
+		const output = read(buffer, 50, 1);
+		expect(output[0].length).toBe(50);
+		for (let i = 0; i < 10; i++) {
 			expect(output[0][i]).toBe(1.0);
 		}
-		for (let i = 80; i < 200; i++) {
+		for (let i = 10; i < 40; i++) {
 			expect(output[0][i]).toBe(2.0);
 		}
-		for (let i = 200; i < 240; i++) {
+		for (let i = 40; i < 50; i++) {
 			expect(output[0][i]).toBe(3.0);
 		}
 	});
@@ -769,8 +674,8 @@ describe("live anchoring", () => {
 	// in step. Without anchoring, a first frame at a large timestamp gap-filled the whole ring
 	// with zeros, un-stalled on that overflow, and left the playhead a floor before the frame.
 	it("anchors a live ring to the first frame instead of gap-filling from zero", () => {
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 40 as Time.Milli });
-		expect(buffer.capacity).toBe(80 + SKIP);
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
+		expect(buffer.capacity).toBe(200);
 
 		write(buffer, 2000 as Time.Milli, 40, { channels: 1, value: 0.5 });
 		// Still short of the floor, so nothing plays yet and the ring holds only real samples.
@@ -788,53 +693,60 @@ describe("live anchoring", () => {
 	});
 });
 
-describe("capacity", () => {
-	it("grows capacity with the target rather than capping the band", () => {
-		// The write path bounds the ring at `min(target + slack, capacity)`, so a target that climbed
-		// past a fixed capacity would be silently capped there and the deeper buffer would never
-		// arrive. `resize` keeps capacity at twice the target, which is what stops that.
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 200 as Time.Milli });
-		fill(buffer, 0, 400, { channels: 1, value: 1.0 });
+describe("re-buffer", () => {
+	it("re-stalls and refills to the target after running dry", () => {
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 40 as Time.Milli });
+
+		write(buffer, 0 as Time.Milli, 20, { channels: 1, value: 1.0 });
+		write(buffer, 20 as Time.Milli, 20, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
-		buffer.resize(1000 as Time.Milli);
-		expect(buffer.capacity).toBeGreaterThanOrEqual(1000);
+		// Drain it.
+		expect(read(buffer, 40, 1)[0].length).toBe(40);
+		expect(buffer.length).toBe(0);
 
-		write(buffer, 400 as Time.Milli, 1000, { channels: 1, value: 2.0 });
-		expect(buffer.length).toBeGreaterThanOrEqual(1000);
+		// The next read finds nothing and parks playback rather than handing the worklet a quantum
+		// of silence and trying again on the next one.
+		expect(read(buffer, 20, 1)[0].length).toBe(0);
+		expect(buffer.stalled).toBe(true);
+		expect(buffer.underruns).toBe(1);
+
+		// A single chunk is not the target, so playback stays parked.
+		write(buffer, 40 as Time.Milli, 20, { channels: 1, value: 2.0 });
+		expect(buffer.stalled).toBe(true);
+		expect(read(buffer, 20, 1)[0].length).toBe(0);
+
+		// Reaching the target resumes it, and nothing buffered in the meantime was lost.
+		write(buffer, 60 as Time.Milli, 20, { channels: 1, value: 2.0 });
+		expect(buffer.stalled).toBe(false);
+		expect(read(buffer, 40, 1)[0].length).toBe(40);
 	});
 
-	it("grows capacity for a chunk wider than the target", () => {
-		// A publisher whose frames are longer than the delay its catalog advertises: 60ms Opus under
-		// a 20ms advertised jitter. The ring has to hold the 20ms target with that 60ms chunk on top
-		// and the stretch band above it, or the hard capacity would start dropping the audio the
-		// band exists to keep.
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 20 as Time.Milli });
-		expect(buffer.capacity).toBe(40 + SKIP);
+	it("counts a quantum it could only partly fill as an underrun", () => {
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 40 as Time.Milli });
 
-		write(buffer, 0 as Time.Milli, 60, { channels: 1, value: 1.0 });
-		expect(buffer.capacity).toBe(20 + 60 + SKIP);
-		expect(buffer.length).toBe(60);
+		write(buffer, 0 as Time.Milli, 20, { channels: 1, value: 1.0 });
+		write(buffer, 20 as Time.Milli, 20, { channels: 1, value: 1.0 });
+		expect(read(buffer, 30, 1)[0].length).toBe(30);
 
-		// A second chunk sits inside the band the wider ring can now hold, so nothing is thrown away.
-		// The old capacity of twice the target plus the band was 115, and 120 would not have fit.
-		write(buffer, 60 as Time.Milli, 60, { channels: 1, value: 2.0 });
-		expect(buffer.length).toBe(120);
-		expect(buffer.debug().discarded).toBe(0);
-	});
+		// Ten samples remain against a quantum of twenty: the rest of the quantum is silence, which
+		// is an underrun whether or not a chunk lands before the next read. It is not a stall: a
+		// refill would cost the whole target to cover a gap shorter than one quantum.
+		expect(read(buffer, 20, 1)[0].length).toBe(10);
+		expect(buffer.stalled).toBe(false);
+		expect(buffer.underruns).toBe(1);
 
-	it("keeps the timeline when a wider chunk grows it mid-stream", () => {
-		// A publisher moving from 20ms to 60ms frames. The wider ring holds everything the narrow one
-		// did, so the reader is still on the timeline it was playing.
-		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 20 as Time.Milli });
-		writeChunks(buffer, 0, 40, 20, { channels: 1, value: 1.0 });
+		// A chunk landing before the next read keeps playback going.
+		write(buffer, 40 as Time.Milli, 20, { channels: 1, value: 2.0 });
 		expect(read(buffer, 20, 1)[0].length).toBe(20);
-		const generation = buffer.view().generation;
+		expect(buffer.underruns).toBe(1);
+	});
 
-		write(buffer, 40 as Time.Milli, 60, { channels: 1, value: 2.0 });
-		expect(buffer.capacity).toBe(20 + 60 + SKIP);
-		expect(buffer.length).toBe(80);
-		expect(buffer.view().generation).toBe(generation);
+	it("does not count an underrun while parked", () => {
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 40 as Time.Milli });
+		read(buffer, 20, 1);
+		read(buffer, 20, 1);
+		expect(buffer.underruns).toBe(0);
 	});
 });
 
@@ -924,33 +836,52 @@ describe("buffered mode", () => {
 	});
 });
 
-describe("latency increase re-anchor", () => {
-	it("resize() does not re-stall a mid-playback ring, but reset() does", () => {
+describe("latency increase", () => {
+	// Video holds a deeper floor on its own, so audio has to park for the difference or it runs
+	// ahead. Flushing instead cost the whole floor in silence for every rise, however small.
+	it("parks a playing ring until the deeper floor refills, keeping what it buffered", () => {
 		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
 
-		// Fill to the floor so playback starts (un-stalls), then play some samples.
-		fill(buffer, 0, 200, { channels: 1, value: 1.0 });
+		// Fill to the floor so playback starts, then play half of it.
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 		read(buffer, 50, 1);
 
-		// Raising the latency floor grows the target but must NOT re-stall a ring mid-playback:
-		// resize() only re-stalls an empty ring, so it keeps draining at the old depth. This is
-		// exactly why setLatency() alone doesn't re-buffer -- the reader expands into the new depth.
-		buffer.resize(200 as Time.Milli);
+		buffer.resize(110 as Time.Milli);
+		expect(buffer.stalled).toBe(true);
+		expect(buffer.length).toBe(50);
+
+		// Refilling to the 110-sample floor takes 60 more samples, not the whole floor.
+		write(buffer, 100 as Time.Milli, 59, { channels: 1, value: 2.0 });
+		expect(buffer.stalled).toBe(true);
+		write(buffer, 159 as Time.Milli, 1, { channels: 1, value: 2.0 });
 		expect(buffer.stalled).toBe(false);
 
-		// reset() re-stalls, so the ring refills to the (new) floor before playing again, and it also
-		// throws the buffer away and re-anchors. The supply parks with stall() instead (`Supply.#runLatency`),
-		// and only for a delay the viewer set past the stretch bound; reset() contrasts with resize().
-		buffer.reset();
+		// Playback resumes where it parked rather than at the refill.
+		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(50 as Time.Milli);
+		expect(read(buffer, 1, 1)[0][0]).toBe(1.0);
+	});
+
+	it("keeps playing through a shallower floor", () => {
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 1.0 });
+		read(buffer, 50, 1);
+
+		buffer.resize(90 as Time.Milli);
+		expect(buffer.stalled).toBe(false);
+	});
+
+	it("resumes a refill once a shallower floor is already covered", () => {
+		const buffer = new AudioRingBuffer({ rate: 1000, channels: 1, latency: 100 as Time.Milli });
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 1.0 });
+		read(buffer, 50, 1);
+
+		buffer.resize(110 as Time.Milli);
 		expect(buffer.stalled).toBe(true);
 
-		// ...and it refills to the *new* 200 sample floor, not the old 100: 200 buffered in 50 sample
-		// chunks is still one chunk short of what the ring holds, and that chunk is what resumes
-		// playback. This proves resize(200) moved the target.
-		writeChunks(buffer, 0, 200, 50, { channels: 1, value: 1.0 });
-		expect(buffer.stalled).toBe(true);
-		write(buffer, 200 as Time.Milli, 50, { channels: 1, value: 1.0 });
+		// No further frame arrives, as when the source stops, so only the lower floor can resume it.
+		buffer.resize(50 as Time.Milli);
 		expect(buffer.stalled).toBe(false);
+		expect(read(buffer, 1, 1)[0][0]).toBe(1.0);
 	});
 });

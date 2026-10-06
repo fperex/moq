@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/moq-dev/moq/compare/kio-v0.6.1...kio-v0.6.2) - 2026-09-30
+
+### Fixed
+
+- *(kio)* keep a lost waiter's recorded lists idempotent ([#4422](https://github.com/moq-dev/moq/pull/4422))
+- *(net)* keep an aborted track's finished groups, expire ended tracks ([#4378](https://github.com/moq-dev/moq/pull/4378))
+
+## [0.6.1](https://github.com/moq-dev/moq/compare/kio-v0.6.0...kio-v0.6.1) - 2026-09-26
+
+### Fixed
+
+- *(moq-net)* serve only the lite routes a request woke, and bound kio waiter lists ([#4216](https://github.com/moq-dev/moq/pull/4216))
+
+### Other
+
+- *(kio)* keep a parked waiter that quiet lists still hold ([#4240](https://github.com/moq-dev/moq/pull/4240))
+
 ## [0.6.0](https://github.com/moq-dev/moq/compare/kio-v0.5.9...kio-v0.6.0) - 2026-09-23
 
 ### Added

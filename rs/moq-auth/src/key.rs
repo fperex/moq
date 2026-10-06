@@ -7,7 +7,7 @@ use p256::elliptic_curve::SecretKey;
 use p256::elliptic_curve::pkcs8::EncodePrivateKey;
 use rsa::BigUint;
 use rsa::pkcs1::EncodeRsaPrivateKey;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use std::sync::OnceLock;
 use std::{collections::HashSet, fmt, path::Path as StdPath};
 
@@ -525,34 +525,40 @@ impl Key {
 		Ok(self.encode.get_or_init(|| encoding_key))
 	}
 
-	/// Verify a token's signature with this key and return its claims.
+	/// Decode a signed token into any payload, checking only signature, algorithm, and key ID.
 	///
-	/// Rejects an expired token (the `exp` claim) and one that grants nothing.
-	/// Scoping the claims to a connection path is a separate step; see
-	/// [`Claims::authorize`].
-	pub fn verify(&self, token: &str) -> crate::Result<Claims> {
+	/// The caller validates payload fields and expiry. Use [`verify`](Self::verify) for
+	/// this crate's strict [`Claims`] contract.
+	pub fn decode<C: DeserializeOwned>(&self, token: &str) -> crate::Result<C> {
 		if !self.operations.contains(&KeyOperation::Verify) {
 			return Err(KeyError::VerifyUnsupported.into());
 		}
-
-		let decode = self.to_decoding_key()?;
-
-		let mut validation = jsonwebtoken::Validation::new(self.algorithm.into());
-		validation.required_spec_claims = Default::default(); // Don't require exp, but still validate it if present
-		validation.validate_exp = false; // We validate exp ourselves to handle null values
-
-		let token = jsonwebtoken::decode::<Claims>(token, decode, &validation)?;
-
-		if let Some(exp) = token.claims.expires
-			&& exp < std::time::SystemTime::now()
-		{
-			return Err(crate::Error::TokenExpired);
+		let header = jsonwebtoken::decode_header(token)?;
+		match (self.kid.as_ref(), header.kid.as_deref()) {
+			(Some(expected), Some(actual)) if expected.encode() == actual => {}
+			(Some(_), None) => return Err(KeyError::MissingKid.into()),
+			(_, Some(actual)) => return Err(KeyError::KeyNotFound(actual.to_string()).into()),
+			(None, None) => {}
 		}
 
-		token.claims.validate()?;
-		self.validate_scope(&token.claims)?;
+		let mut validation = jsonwebtoken::Validation::new(self.algorithm.into());
+		validation.required_spec_claims = Default::default();
+		validation.validate_exp = false;
+		validation.validate_nbf = false;
+		validation.validate_aud = false;
+		Ok(jsonwebtoken::decode::<C>(token, self.to_decoding_key()?, &validation)?.claims)
+	}
 
-		Ok(token.claims)
+	/// Verify a token's signature and this crate's strict claims, expiry, not-before, and key scope.
+	///
+	/// Scoping the claims to a connection path is a separate step; see
+	/// [`Claims::authorize`].
+	pub fn verify(&self, token: &str) -> crate::Result<Claims> {
+		let claims: Claims = self.decode(token)?;
+		validate_times(&claims, std::time::SystemTime::now())?;
+		claims.validate()?;
+		self.validate_scope(&claims)?;
+		Ok(claims)
 	}
 
 	/// Sign the claims with this key, returning the encoded token.
@@ -602,6 +608,17 @@ impl Key {
 		}
 		Ok(())
 	}
+}
+
+/// Refuse claims expired at `now` (`exp <= now`) or not yet valid (`nbf > now`), as `jose` does.
+fn validate_times(claims: &Claims, now: std::time::SystemTime) -> crate::Result<()> {
+	if claims.expires.is_some_and(|exp| exp <= now) {
+		return Err(crate::Error::TokenExpired);
+	}
+	if claims.not_before.is_some_and(|nbf| nbf > now) {
+		return Err(crate::Error::TokenNotYetValid);
+	}
+	Ok(())
 }
 
 /// Serialize bytes as base64url without padding
@@ -684,7 +701,32 @@ mod tests {
 			subscribe: patterns(&["test-sub/**"]),
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
+			not_before: None,
 		}
+	}
+
+	#[test]
+	fn decode_accepts_other_payloads_but_checks_kid_and_algorithm() {
+		let key = create_test_key();
+		let mut header = Header::new(Algorithm::HS256.into());
+		header.kid = key.kid.as_ref().map(ToString::to_string);
+		let payload = serde_json::json!({"custom": "accepted", "exp": 1, "aud": "other-service"});
+		let token = jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap();
+		let decoded: serde_json::Value = key.decode(&token).unwrap();
+		assert_eq!(decoded, payload);
+		assert!(key.verify(&token).is_err(), "strict claims reject the custom payload");
+
+		header.kid = Some("someone-else".into());
+		let wrong_kid = jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap();
+		assert!(matches!(
+			key.decode::<serde_json::Value>(&wrong_kid),
+			Err(crate::Error::Key(KeyError::KeyNotFound(_)))
+		));
+
+		header.kid = key.kid.as_ref().map(ToString::to_string);
+		header.alg = jsonwebtoken::Algorithm::HS384;
+		let wrong_algorithm = jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap();
+		assert!(key.decode::<serde_json::Value>(&wrong_algorithm).is_err());
 	}
 
 	#[test]
@@ -906,6 +948,7 @@ mod tests {
 			subscribe: patterns(&[]),
 			expires: None,
 			issued: None,
+			not_before: None,
 		};
 
 		let result = key.sign(&invalid_claims);
@@ -962,6 +1005,95 @@ mod tests {
 		assert!(result.is_ok());
 	}
 
+	/// Sign an arbitrary payload with `key`, bypassing [`Claims`], as another issuer might.
+	fn sign_raw(key: &Key, payload: serde_json::Value) -> String {
+		let mut header = Header::new(key.algorithm.into());
+		header.kid = key.kid.as_ref().map(ToString::to_string);
+		jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap()
+	}
+
+	/// An issuer's bookkeeping is read and dropped; anything else is refused by name,
+	/// since it might narrow the grant, and a misspelled `root` would widen it to
+	/// everything.
+	#[test]
+	fn test_key_verify_only_registered_claims() {
+		let key = create_test_key();
+		let now = SystemTime::now()
+			.duration_since(SystemTime::UNIX_EPOCH)
+			.unwrap()
+			.as_secs();
+
+		let token = sign_raw(
+			&key,
+			serde_json::json!({"root": "room", "publish": ["**"], "iss": "api", "sub": "alice", "jti": "1", "iat": now}),
+		);
+		assert_eq!(key.verify(&token).unwrap().root, "room");
+
+		for (claim, payload) in [
+			("rooot", serde_json::json!({"rooot": "room/123", "publish": ["**"]})),
+			(
+				"user_id",
+				serde_json::json!({"root": "room", "publish": ["**"], "user_id": 7}),
+			),
+			(
+				"cluster",
+				serde_json::json!({"root": "room", "put": [""], "cluster": true}),
+			),
+		] {
+			let err = key.verify(&sign_raw(&key, payload)).unwrap_err().to_string();
+			assert!(err.contains(&format!("`{claim}`")), "{claim}: {err}");
+		}
+
+		// No audience is configured, so there is nothing to check one against.
+		let token = sign_raw(
+			&key,
+			serde_json::json!({"root": "room", "publish": ["**"], "aud": "relay"}),
+		);
+		assert!(key.verify(&token).is_err());
+	}
+
+	#[test]
+	fn test_key_verify_enforces_not_before() {
+		let key = create_test_key();
+		let at = |offset: i64| {
+			let now = SystemTime::now()
+				.duration_since(SystemTime::UNIX_EPOCH)
+				.unwrap()
+				.as_secs() as i64;
+			sign_raw(
+				&key,
+				serde_json::json!({"root": "room", "publish": ["**"], "nbf": now + offset}),
+			)
+		};
+		assert!(key.verify(&at(-60)).is_ok());
+		assert!(matches!(key.verify(&at(3600)), Err(crate::Error::TokenNotYetValid)));
+	}
+
+	/// `exp` is refused at the instant itself and `nbf` accepted at it, matching `jose`.
+	#[test]
+	fn validate_times_at_the_boundary() {
+		let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+		let second = Duration::from_secs(1);
+
+		let at = |expires: Option<SystemTime>, not_before: Option<SystemTime>| {
+			let mut claims = create_test_claims();
+			claims.expires = expires;
+			claims.not_before = not_before;
+			validate_times(&claims, now)
+		};
+
+		assert!(at(Some(now + second), None).is_ok());
+		assert!(matches!(at(Some(now), None), Err(crate::Error::TokenExpired)));
+		assert!(matches!(at(Some(now - second), None), Err(crate::Error::TokenExpired)));
+
+		assert!(at(None, Some(now)).is_ok());
+		assert!(at(None, Some(now - second)).is_ok());
+		assert!(matches!(
+			at(None, Some(now + second)),
+			Err(crate::Error::TokenNotYetValid)
+		));
+	}
+
 	#[test]
 	fn test_key_verify_expired_token() {
 		let key = create_test_key();
@@ -982,6 +1114,7 @@ mod tests {
 			subscribe: patterns(&["**"]),
 			expires: None,
 			issued: None,
+			not_before: None,
 		};
 		let token = key.sign(&claims).unwrap();
 
@@ -1001,6 +1134,7 @@ mod tests {
 			subscribe: patterns(&["test-sub/**"]),
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
+			not_before: None,
 		};
 
 		let token = key.sign(&original_claims).unwrap();
@@ -1603,11 +1737,40 @@ mod tests {
 	}
 
 	#[test]
-	fn test_js_legacy_prefix_token_is_refused() {
-		// The signature is fine; the claims speak prefixes, which is no longer a token.
+	fn test_js_legacy_prefix_token_verifies_as_subtrees() {
 		let key = Key::from_str(JS_HS256_KEY).unwrap();
-		let err = key.verify(JS_HS256_LEGACY_TOKEN).unwrap_err();
-		assert!(err.to_string().contains("unknown field"), "{err}");
+		let claims = key.verify(JS_HS256_LEGACY_TOKEN).unwrap();
+		assert_eq!(claims.root, "live");
+		assert_eq!(claims.publish, patterns(&["camera1/**"]));
+		assert_eq!(claims.subscribe, patterns(&["camera1/**", "camera2/**"]));
+	}
+
+	#[test]
+	fn test_legacy_scoped_key_signs_within_its_prefixes() {
+		// A key minted by moq-token-cli with `--root demo --put room`.
+		let json = r#"{"kty":"oct","alg":"HS256","key_ops":["sign","verify"],"k":"Fp8kipWUJeUFqeSqWym_tRC_tyI8z-QpqopIGrbrD68","scope":{"root":"demo","put":["room"]}}"#;
+		let key = Key::from_str(json).unwrap();
+		assert_eq!(key.scope.as_ref().unwrap().publish, patterns(&["room/**"]));
+
+		let inside = Claims {
+			root: "demo/room".into(),
+			publish: patterns(&["alice"]),
+			..Default::default()
+		};
+		let outside = Claims {
+			root: "demo".into(),
+			publish: patterns(&["lobby/**"]),
+			..Default::default()
+		};
+		assert!(key.verify(&key.sign(&inside).unwrap()).is_ok());
+		assert!(matches!(key.sign(&outside), Err(crate::Error::ScopeExceeded)));
+
+		// Written back the way it was read, so the old CLI still loads it.
+		assert!(
+			serde_json::to_string(&key)
+				.unwrap()
+				.contains(r#""scope":{"root":"demo","put":["room"]}"#)
+		);
 	}
 
 	#[test]

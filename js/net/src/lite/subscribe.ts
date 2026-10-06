@@ -1,7 +1,10 @@
+import type * as Epoch from "../epoch.ts";
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
+import type { Location } from "../track.ts";
+import { decodeEpoch, encodeEpoch } from "./epoch.ts";
 import * as Message from "./message.ts";
-import { hasFrameBounds, hasGroupOrder, resolvesStart, Version } from "./version.ts";
+import { hasFrameBounds, hasGroupOrder, hasLargest, hasStreamCount, resolvesStart, Version } from "./version.ts";
 
 /**
  * Encode the `Group Start` field shared by SUBSCRIBE and SUBSCRIBE_UPDATE.
@@ -229,6 +232,8 @@ export class SubscribeUpdate {
 export class Subscribe {
 	id: bigint;
 	broadcast: Path.Valid;
+	/** The publisher instance the subscriber expects. Lite-07+. */
+	epoch?: Epoch.Valid;
 	track: string;
 	priority: number;
 	/** Subscriber max latency in milliseconds; zero skips once a newer group is available. */
@@ -253,6 +258,7 @@ export class Subscribe {
 	constructor(props: {
 		id: bigint;
 		broadcast: Path.Valid;
+		epoch?: Epoch.Valid;
 		track: string;
 		priority: number;
 		maxAge?: number;
@@ -263,6 +269,7 @@ export class Subscribe {
 	}) {
 		this.id = props.id;
 		this.broadcast = props.broadcast;
+		this.epoch = props.epoch;
 		this.track = props.track;
 		this.priority = props.priority;
 		this.maxAge = props.maxAge ?? 0;
@@ -275,6 +282,7 @@ export class Subscribe {
 	async #encode(w: Writer, version: Version) {
 		await w.u62(this.id);
 		await w.string(Path.encode(this.broadcast));
+		await encodeEpoch(w, version, this.epoch);
 		await w.string(this.track);
 		await w.u8(this.priority);
 
@@ -295,6 +303,7 @@ export class Subscribe {
 	static async #decode(r: Reader, version: Version): Promise<Subscribe> {
 		const id = await r.u62();
 		const broadcast = Path.decode(await r.string());
+		const epoch = await decodeEpoch(r, version);
 		const track = await r.string();
 		const priority = await r.u8();
 
@@ -312,6 +321,7 @@ export class Subscribe {
 				return new Subscribe({
 					id,
 					broadcast,
+					epoch,
 					track,
 					priority,
 					maxAge,
@@ -433,18 +443,39 @@ export class SubscribeOk {
 export class SubscribeStart {
 	group: number;
 
-	constructor(group: number) {
+	/**
+	 * The publisher's largest (group, frame) when it answered, or `undefined` for a track
+	 * with nothing yet. Draft-07+ only; not on the wire before, where it decodes as `undefined`.
+	 */
+	largest?: Location;
+
+	constructor(group: number, largest?: Location) {
 		this.group = group;
+		this.largest = largest;
 	}
 
-	async encode(w: Writer): Promise<void> {
+	async encode(w: Writer, version: Version): Promise<void> {
 		return Message.encode(w, async (w) => {
 			await w.u53(this.group);
+			if (!hasLargest(version)) return;
+			// Group + 1, so 0 is a track with nothing yet; the frame follows only otherwise.
+			if (this.largest === undefined) {
+				await w.u53(0);
+			} else {
+				await w.u53(this.largest.group + 1);
+				await w.u53(this.largest.frame);
+			}
 		});
 	}
 
-	static async decode(r: Reader): Promise<SubscribeStart> {
-		return Message.decode(r, async (r) => new SubscribeStart(await r.u53()));
+	static async decode(r: Reader, version: Version): Promise<SubscribeStart> {
+		return Message.decode(r, async (r) => {
+			const group = await r.u53();
+			if (!hasLargest(version)) return new SubscribeStart(group);
+			const largest = await r.u53();
+			if (largest === 0) return new SubscribeStart(group);
+			return new SubscribeStart(group, { group: largest - 1, frame: await r.u53() });
+		});
 	}
 }
 
@@ -456,24 +487,35 @@ export class SubscribeEnd {
 	/** The exclusive final group sequence: the first sequence that will never be produced. */
 	group: number;
 
-	constructor(group: number) {
+	/**
+	 * The number of group streams the publisher opened for this subscription.
+	 * Draft-07+ only; not on the wire before, where it decodes as 0.
+	 */
+	streams: number;
+
+	constructor(group: number, streams = 0) {
 		this.group = group;
+		this.streams = streams;
 	}
 
-	async encode(w: Writer): Promise<void> {
+	async encode(w: Writer, version: Version): Promise<void> {
 		return Message.encode(w, async (w) => {
 			await w.u53(this.group);
+			if (hasStreamCount(version)) await w.u53(this.streams);
 		});
 	}
 
-	static async decode(r: Reader): Promise<SubscribeEnd> {
-		return Message.decode(r, async (r) => new SubscribeEnd(await r.u53()));
+	static async decode(r: Reader, version: Version): Promise<SubscribeEnd> {
+		return Message.decode(
+			r,
+			async (r) => new SubscribeEnd(await r.u53(), hasStreamCount(version) ? await r.u53() : 0),
+		);
 	}
 }
 
 /// Indicates that one or more groups have been dropped.
 ///
-/// Draft03+ only.
+/// Draft-03 to Draft-06 only: Draft-07 counts group streams in SUBSCRIBE_END instead.
 export class SubscribeDrop {
 	start: number;
 	end: number;
@@ -510,8 +552,9 @@ export class SubscribeDrop {
  *
  * The discriminator is version-dependent:
  * - Draft-03/04: `0x0` SUBSCRIBE_OK, `0x1` SUBSCRIBE_DROP.
- * - Draft-05+: `0x0` SUBSCRIBE_START, `0x1` SUBSCRIBE_END, `0x2` SUBSCRIBE_DROP
+ * - Draft-05/06: `0x0` SUBSCRIBE_START, `0x1` SUBSCRIBE_END, `0x2` SUBSCRIBE_DROP
  *   (SUBSCRIBE_OK was removed; acceptance is implicit).
+ * - Draft-07+: `0x0` SUBSCRIBE_START, `0x1` SUBSCRIBE_END (SUBSCRIBE_DROP was removed).
  */
 export type SubscribeResponse =
 	| { ok: SubscribeOk }
@@ -545,15 +588,15 @@ export async function encodeSubscribeResponse(w: Writer, resp: SubscribeResponse
 			// Draft-05+: SUBSCRIBE_OK is gone; START/END/DROP carry the resolved range.
 			if ("start" in resp) {
 				await w.u53(0x0);
-				await resp.start.encode(w);
+				await resp.start.encode(w, version);
 			} else if ("end" in resp) {
 				await w.u53(0x1);
-				await resp.end.encode(w);
-			} else if ("drop" in resp) {
+				await resp.end.encode(w, version);
+			} else if ("drop" in resp && !hasStreamCount(version)) {
 				await w.u53(0x2);
 				await resp.drop.encode(w);
 			} else {
-				throw new Error("SUBSCRIBE_OK not supported for this version");
+				throw new Error("subscribe response not supported for this version");
 			}
 			break;
 	}
@@ -580,10 +623,11 @@ export async function decodeSubscribeResponse(r: Reader, version: Version): Prom
 			const typ = await r.u53();
 			switch (typ) {
 				case 0x0:
-					return { start: await SubscribeStart.decode(r) };
+					return { start: await SubscribeStart.decode(r, version) };
 				case 0x1:
-					return { end: await SubscribeEnd.decode(r) };
+					return { end: await SubscribeEnd.decode(r, version) };
 				case 0x2:
+					if (hasStreamCount(version)) throw new Error(`unknown subscribe response type: ${typ}`);
 					return { drop: await SubscribeDrop.decode(r) };
 				default:
 					throw new Error(`unknown subscribe response type: ${typ}`);

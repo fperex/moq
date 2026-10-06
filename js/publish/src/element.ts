@@ -7,6 +7,7 @@
  */
 import * as Moq from "@moq/net";
 import { Effect, readonlys, Signal } from "@moq/signals";
+import * as Announce from "./announce";
 import * as Audio from "./audio";
 import { Broadcast } from "./broadcast";
 import * as Preview from "./preview";
@@ -24,11 +25,9 @@ export type SourceType = "camera" | "screen" | "file";
  * When to announce the broadcast. Nobody can see or subscribe to it until it is announced.
  *
  * `always` announces immediately, `never` never announces, and `source` waits until media is
- * actually being captured (a live audio/video track, i.e. permission granted) and then holds until
- * the selected source changes. A camera source waits for every enabled track, so a refused
- * microphone cannot advertise a partial broadcast. Defaults to `source` so we don't announce an
- * empty broadcast with no audio/video, while a device being switched or re-acquired keeps its
- * subscribers.
+ * actually being captured. A camera source waits for every enabled track, so a refused microphone
+ * cannot advertise a partial broadcast. `source` also waits until every captured track's config
+ * resolves or fails, so a subscriber's first catalog lists every rendition. Defaults to `source`.
  */
 export type AnnounceMode = "always" | "source" | "never";
 
@@ -136,19 +135,6 @@ export default class MoqPublish extends HTMLElement {
 	// Whether to advertise the broadcast, driven by the `announce` mode.
 	#announcing = new Signal(false);
 
-	#errors = {
-		video: new Signal<Error | undefined>(undefined),
-		audio: new Signal<Error | undefined>(undefined),
-	};
-
-	/**
-	 * Why capture is not running while it is switched on, or undefined while it is.
-	 *
-	 * The device could not be opened, or the pipeline reading it stopped. Something has to say so:
-	 * a black preview and a silent broadcast are what the user sees otherwise.
-	 */
-	readonly errors = readonlys(this.#errors);
-
 	/**
 	 * Effects scoped to this element's lifetime, closed on disconnect.
 	 *
@@ -179,36 +165,6 @@ export default class MoqPublish extends HTMLElement {
 			this.#videoEnabled.set(!invisible);
 			this.#audioEnabled.set(!muted);
 			this.#eitherEnabled.set(!muted || !invisible);
-		});
-
-		this.signals.run((effect) => {
-			const announce = effect.get(this.controls.announce);
-
-			// A fresh selection has captured nothing yet, so the latch below starts closed.
-			const camera = effect.get(this.controls.source) === "camera";
-			let captured = false;
-
-			effect.run((effect) => {
-				// "source" waits until media is actually being captured -- a live audio or
-				// video track exists -- not merely a source *type* selected. Otherwise we'd
-				// announce an empty broadcast while the getUserMedia/getDisplayMedia
-				// permission prompt is still pending (or after the user denies it). A camera
-				// source is one publication: it waits for every enabled track, so denying
-				// either permission cannot advertise a partial broadcast.
-				//
-				// It latches: once this selection has produced its tracks the broadcast stays
-				// announced until the selection changes. A track that stops is one source
-				// being switched or re-acquired, not the end of the broadcast, and an
-				// unannounce drops every subscription (catalog included) for the tenth of a
-				// second it takes to open the next device.
-				const video = effect.get(this.#videoSource) !== undefined;
-				const audio = effect.get(this.#audioSource) !== undefined;
-				const ready =
-					!camera ||
-					((!effect.get(this.#videoEnabled) || video) && (!effect.get(this.#audioEnabled) || audio));
-				captured ||= (video || audio) && ready;
-				this.#announcing.set(announce === "always" || (announce === "source" && captured));
-			});
 		});
 
 		this.#capture = new Video.Capture({ source: this.#videoSource });
@@ -246,6 +202,13 @@ export default class MoqPublish extends HTMLElement {
 			bandwidth: this.connection.bandwidth,
 		});
 		this.signals.cleanup(() => this.audio.close());
+
+		Announce.run(this.signals, this.#announcing, {
+			mode: this.controls.announce,
+			camera: this.signals.computed((effect) => effect.get(this.controls.source) === "camera"),
+			video: { enabled: this.#videoEnabled, source: this.#videoSource, settled: this.video.settled },
+			audio: { enabled: this.#audioEnabled, source: this.#audioSource, settled: this.audio.settled },
+		});
 
 		// Watch to see if the preview element is added or removed.
 		const setPreview = () => {
@@ -311,37 +274,6 @@ export default class MoqPublish extends HTMLElement {
 			console.warn('moq-publish: preview="encoded" requires a <canvas> element; showing the raw source.');
 		});
 
-		this.signals.run((effect) => {
-			const source = effect.get(this.sources.video);
-			const failed =
-				effect.get(this.#videoEnabled) && source instanceof Source.Camera
-					? effect.get(source.out.error)
-					: undefined;
-			if (failed) {
-				// A refusal is the user's answer rather than a fault, and `errors` already carries it.
-				const log = failed.name === "NotAllowedError" ? console.warn : console.error;
-				log(`moq-publish: camera unavailable: ${failed.message}`);
-			}
-
-			// The capture reports its own stall, loudly, so only the source is logged here.
-			effect.set(this.#errors.video, failed ?? effect.get(this.#capture.out.stopped));
-		});
-
-		this.signals.run((effect) => {
-			const source = effect.get(this.sources.audio);
-			const failed =
-				effect.get(this.#audioEnabled) && source instanceof Source.Microphone
-					? effect.get(source.out.error)
-					: undefined;
-			if (failed) {
-				// A refusal is the user's answer rather than a fault, and `errors` already carries it.
-				const log = failed.name === "NotAllowedError" ? console.warn : console.error;
-				log(`moq-publish: microphone unavailable: ${failed.message}`);
-			}
-
-			effect.set(this.#errors.audio, failed);
-		});
-
 		this.signals.run(this.#runSource.bind(this));
 	}
 
@@ -376,9 +308,6 @@ export default class MoqPublish extends HTMLElement {
 		}
 	}
 
-	// Mirror the selected source into the capture inputs. Each mirror belongs to this run: on
-	// `this.signals` it would outlive the source it reads, so every switch would leave another one
-	// behind, holding a closed source alive and writing what it sees into the live capture.
 	#runSource(effect: Effect) {
 		const source = effect.get(this.controls.source);
 

@@ -1,5 +1,4 @@
-import { heapStats } from "bun:jsc";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Time, Track } from "@moq/net";
 import { Consumer, Producer, Rolled } from "./index.ts";
 
@@ -90,8 +89,8 @@ test("a second group is reported while the first is still open", async () => {
 
 	// Both mirrors are released. The read that lost the race would otherwise stay registered on the
 	// first group, keeping this consumer's subscription reachable after the caller drops it.
-	expect(first.used.peek()).toBe(false);
-	expect(second.used.peek()).toBe(false);
+	expect(first.demand().used.peek()).toBe(false);
+	expect(second.demand().used.peek()).toBe(false);
 
 	// Sticky: a later read must not report the rest of the first group as a whole log.
 	first.writeFrame({ payload: encode({ n: 2 }), timestamp: Time.Timestamp.now() });
@@ -112,6 +111,24 @@ test("a second concurrent read is refused rather than served the first one's gro
 	expect(await first).toEqual({ n: 0 });
 });
 
+// Counts the reactions `run` attaches to promises still pending once it returns. A promise holds each
+// reaction until it settles, so one left per iteration on a promise that outlives the loop is a leak.
+// Recorded by hand: Bun's `mock.contexts` misses the engine's own calls from `Promise.race`.
+async function pendingReactions(run: () => Promise<void>): Promise<number> {
+	const reacted: Promise<unknown>[] = [];
+	const then = Promise.prototype.then;
+	const spy = spyOn(Promise.prototype, "then").mockImplementation(function (this: Promise<unknown>, ...args) {
+		reacted.push(this);
+		return then.apply(this, args);
+	} as typeof then);
+	try {
+		await run();
+	} finally {
+		spy.mockRestore();
+	}
+	return reacted.filter((promise) => Bun.peek.status(promise) === "pending").length;
+}
+
 // A blocked read races the frame against the track's next group, which stays pending for the whole
 // log. Racing it per record must not leave a reaction behind on it each time.
 test("blocked reads leave nothing behind on the pending group read", async () => {
@@ -119,24 +136,28 @@ test("blocked reads leave nothing behind on the pending group read", async () =>
 	const producer = new Producer<Rec>({ track });
 	const subscriber = track.subscribe();
 	const consumer = new Consumer<Rec>({ track: subscriber });
-	const promises = () => {
-		Bun.gc(true);
-		return heapStats().objectTypeCounts.Promise ?? 0;
-	};
 
-	const read = async (from: number, count: number) => {
-		for (let n = from; n < from + count; n++) {
+	const reactions = await pendingReactions(async () => {
+		for (let n = 0; n < 1000; n++) {
 			const next = consumer.next();
 			producer.append({ n });
 			expect((await next)?.n).toBe(n);
 		}
-	};
-
-	await read(0, 50);
-	const before = promises();
-	await read(50, 1000);
-	expect(promises() - before).toBeLessThan(100);
+	});
+	expect(reactions).toBeLessThan(10);
 
 	subscriber.close();
 	producer.finish();
+});
+
+test("each record keeps its capture timestamp", async () => {
+	const track = new Track.Producer("test");
+	const producer = new Producer<number>({ track });
+	producer.append(1, Time.Timestamp.fromMillis(1_000));
+	producer.append(2, Time.Timestamp.fromMillis(2_000));
+	producer.finish();
+
+	const group = await track.subscribe().ordered().nextGroup();
+	expect((await group?.readFrame())?.timestamp.as(Time.Timescale.MILLI)).toBe(1_000);
+	expect((await group?.readFrame())?.timestamp.as(Time.Timescale.MILLI)).toBe(2_000);
 });

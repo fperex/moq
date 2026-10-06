@@ -90,14 +90,26 @@ pub enum Error {
 	#[error("token has expired")]
 	TokenExpired,
 
+	#[error("token is not valid yet")]
+	TokenNotYetValid,
+
 	#[error(transparent)]
 	Pattern(#[from] moq_pattern::InvalidPattern),
 
 	#[error("grant names nothing; the session is refused")]
 	UselessGrant,
 
+	#[error("grant marks an upstream that is not a peer")]
+	UpstreamWithoutPeer,
+
 	#[error("grant asks to be revalidated but never expires")]
 	UnboundedRevalidate,
+
+	#[error("session limits need a revalidate cadence, which ages out the slots of a relay that died")]
+	LimitsWithoutRevalidate,
+
+	#[error("the grant bound reaches past the system clock's range")]
+	ExpiresOutOfRange,
 
 	#[error("grant asks to be revalidated at no interval")]
 	ZeroRevalidate,
@@ -172,8 +184,12 @@ from_message! {
 }
 
 #[cfg(feature = "client")]
-from_message! {
-	reqwest::Error => Unavailable,
+impl From<reqwest::Error> for Error {
+	fn from(err: reqwest::Error) -> Self {
+		// reqwest prints the full URL in its error, and a dialed URL can carry
+		// credentials in its query or userinfo.
+		Self::Unavailable(message(err.without_url()))
+	}
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

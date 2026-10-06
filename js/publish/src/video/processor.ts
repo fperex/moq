@@ -1,7 +1,8 @@
 import { Time } from "@moq/net";
+import { hostedAssets } from "../assets";
 import type { FromWorker, ToWorker } from "./capture-worker";
-// Compiled and inlined as a blob URL by Vite.
-import CaptureWorker from "./capture-worker.ts?worker&inline";
+// A blob: URL, or a hosted file when assets() is set; see vite-plugin-worklet.
+import CaptureWorker from "./capture-worker.ts?worklet";
 import type { StreamTrack } from "./types";
 
 /**
@@ -22,17 +23,22 @@ export function TrackProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
 	return deferred(async () => (await workerProcessor(track)) ?? videoProcessor(track));
 }
 
-// Cached so repeated support checks don't each spawn a worker.
-let probe: Promise<boolean> | undefined;
+// Cached so repeated support checks don't each spawn a worker. Keyed on the assets base, because a
+// blob: worker refused by the CSP says nothing about the hosted file that assets() switches to.
+let probe: { base: URL | undefined; supported: Promise<boolean> } | undefined;
 
 /** Whether this engine can capture via a native MediaStreamTrackProcessor in a worker. */
 export async function workerSupported(): Promise<boolean> {
-	probe ??= spawn().then((worker) => {
-		worker?.close();
-		return worker !== undefined;
-	});
+	const base = hostedAssets();
+	if (probe === undefined || probe.base !== base) {
+		const supported = spawn().then((worker) => {
+			worker?.close();
+			return worker !== undefined;
+		});
+		probe = { base, supported };
+	}
 
-	return probe;
+	return probe.supported;
 }
 
 // Maps capture timestamps onto our wall clock so audio and video share one epoch. The first frame
@@ -139,19 +145,26 @@ type Handle = {
 };
 
 // Starts a capture worker and waits for its support report, returning undefined when the engine has
-// no MediaStreamTrackProcessor in a worker either.
+// no MediaStreamTrackProcessor in a worker either, and throwing when a hosted file fails to load.
 async function spawn(): Promise<Handle | undefined> {
+	const hosted = hostedAssets();
 	let worker: Handle;
 
 	try {
-		worker = handle(new CaptureWorker());
+		worker = handle(new Worker(await CaptureWorker(hosted)));
 	} catch (err) {
-		// A strict CSP can refuse blob: workers, so treat it like an engine without the API.
+		// A strict CSP can refuse blob: workers, so treat it like an engine without the API. A hosted
+		// file that fails to load reports through onerror instead.
 		console.warn("moq-publish: failed to start the capture worker", err);
 		return undefined;
 	}
 
 	const ready = await worker.next();
+	if (ready.type === "error" && hosted) {
+		// The page opted into hosted files, so a load failure is a broken deploy, not a missing API.
+		worker.close();
+		throw new Error(`moq-publish: failed to load the hosted capture worker from ${hosted}: ${ready.message}`);
+	}
 	if (ready.type !== "ready" || !ready.supported) {
 		worker.close();
 		return undefined;
@@ -199,88 +212,16 @@ function handle(worker: Worker): Handle {
 	};
 }
 
-// How many frame periods requestVideoFrameCallback may stay quiet before the worker tick captures
-// instead. One period is ordinary jitter; two means the callback is suspended.
-const GRACE = 2;
-
-// The last resort: draw a <video> element into frames. It's gross, so it's only for engines with no
+// The last resort: draw a <video> element into frames. It's gross and it stops producing (or worse,
+// repeats the same picture) when the window isn't composited, so it's only for engines with no
 // native MediaStreamTrackProcessor at all.
 // Based on: https://jan-ivar.github.io/polyfills/mediastreamtrackprocessor.js
 // Thanks Jan-Ivar
 function videoProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
 	console.warn("Using MediaStreamTrackProcessor polyfill; performance might suffer.");
 
-	// Firefox throttles requestVideoFrameCallback to about 1/s while the document is hidden, though
-	// the camera keeps filling the element, so the callback alone freezes a hidden publisher. A
-	// worker's timers are the one clock the browser does not throttle, so one captures whenever the
-	// callback goes quiet.
-	//
-	// A source that reports no rate (a canvas capture track reports 0) is sampled at 30: the tick
-	// over-samples on purpose, and the media clock check drops whatever it repeats.
-	const rate = track.getSettings().frameRate || 30;
-
 	let video: HTMLVideoElement;
 	let handle: number | undefined;
-	let ticker: Worker | undefined;
-
-	// The element's media clock at the last picture we took, so a tick landing between two camera
-	// frames doesn't hand the encoder the same picture twice.
-	let taken = Number.NEGATIVE_INFINITY;
-	// What we stamped it with, so the two clocks can't build a timeline that goes backwards.
-	let stamped = Number.NEGATIVE_INFINITY;
-	// When the callback last fired, which is how a tick tells a suspended callback from a slow camera.
-	let beat = 0;
-	// The pull waiting for a picture. Nothing is captured without one, so a slow consumer drops
-	// frames at the source rather than queueing them.
-	let waiting: { resolve: (frame: VideoFrame) => void; reject: (err: Error) => void } | undefined;
-
-	// Take the picture the element is showing, if it is one we haven't taken and anybody wants it.
-	// `at` is on the performance.now() timebase, so audio and video stay on one epoch.
-	const take = (at: Time.Milli): void => {
-		const pull = waiting;
-		if (!pull || video.currentTime <= taken) return;
-		waiting = undefined;
-
-		if (at <= stamped) {
-			// A returning callback can carry a frame-start time just before the last worker tick.
-			if (stamped - at > 1000 / rate) {
-				pull.reject(new Error(`video capture went backwards: ${at}ms after ${stamped}ms`));
-				return;
-			}
-			at = Time.Milli(stamped + 0.001);
-		}
-
-		taken = video.currentTime;
-		stamped = at;
-
-		try {
-			pull.resolve(new VideoFrame(video, { timestamp: Time.Micro.fromMilli(at) }));
-		} catch (err) {
-			pull.reject(err as Error);
-		}
-	};
-
-	// requestVideoFrameCallback fires once per frame the camera actually delivers, so it samples the
-	// true cadence rather than racing a wall clock: Safari and Firefox clamp performance.now() to
-	// whole milliseconds, which can't express a 33.333ms period. The chain runs whether or not
-	// anybody is pulling, because its silence is what the tick keys on.
-	const camera = (now: DOMHighResTimeStamp, metadata: VideoFrameCallbackMetadata): void => {
-		beat = now;
-		handle = video.requestVideoFrameCallback(camera);
-
-		// captureTime is the frame's capture instant, and Firefox supplies none, which is what lets
-		// a tick stamped with performance.now() share this timeline.
-		take((metadata.captureTime ?? now) as Time.Milli);
-	};
-
-	// Both clocks free-run, so both have to be let go of, whether the stream ended or broke.
-	const stop = (): void => {
-		if (handle !== undefined) video.cancelVideoFrameCallback(handle);
-		handle = undefined;
-		ticker?.terminate();
-		ticker = undefined;
-		if (video) video.srcObject = null;
-	};
 
 	return new ReadableStream<VideoFrame>({
 		async start() {
@@ -292,42 +233,25 @@ function videoProcessor(track: StreamTrack): ReadableStream<VideoFrame> {
 					video.onloadedmetadata = r;
 				}),
 			]);
-
-			beat = performance.now();
-			handle = video.requestVideoFrameCallback(camera);
-
-			try {
-				ticker = new CaptureWorker();
-				ticker.onmessage = (event: MessageEvent<FromWorker>) => {
-					const now = performance.now();
-					if (event.data.type !== "tick" || now - beat < (GRACE * 1000) / rate) return;
-					take(now as Time.Milli);
-				};
-
-				// Twice the camera's rate: a tick that lands between frames costs one comparison,
-				// while one that lands too late costs a frame.
-				ticker.postMessage({ type: "tick", period: 500 / rate } satisfies ToWorker);
-			} catch (err) {
-				// A strict CSP can refuse blob: workers. The callback alone still captures whenever
-				// the window is on screen, which is worse than this but better than nothing.
-				console.warn("moq-publish: no capture clock; a hidden window will stop sending video", err);
-			}
 		},
 		async pull(controller) {
-			try {
-				controller.enqueue(
-					await new Promise<VideoFrame>((resolve, reject) => {
-						waiting = { resolve, reject };
-					}),
-				);
-			} catch (err) {
-				// A stream that errors is never cancelled, and both clocks outlive it: the capture
-				// rebuilds on the same track, so a leaked worker would be a leak per rebuild.
-				stop();
-				throw err;
-			}
+			// requestVideoFrameCallback fires once per frame the camera actually delivers, so we
+			// sample its true cadence rather than racing a wall clock: Safari and Firefox clamp
+			// performance.now() to whole milliseconds, which can't express a 33.333ms period.
+			await new Promise<void>((resolve) => {
+				handle = video.requestVideoFrameCallback((now, metadata) => {
+					// captureTime is the frame's capture instant; both it and now are on the
+					// performance.now() timebase, so audio and video stay on one epoch.
+					const timestamp = (metadata.captureTime ?? now) as Time.Milli;
+					controller.enqueue(new VideoFrame(video, { timestamp: Time.Micro.fromMilli(timestamp) }));
+					resolve();
+				});
+			});
 		},
-		cancel: stop,
+		cancel() {
+			if (handle !== undefined) video.cancelVideoFrameCallback(handle);
+			if (video) video.srcObject = null;
+		},
 	});
 }
 

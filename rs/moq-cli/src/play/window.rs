@@ -18,6 +18,7 @@ use winit::window::{Window, WindowId};
 use super::args::Args;
 use super::layout::fit;
 use super::media::Media;
+use super::output::Output;
 use super::timeline::Presentation;
 
 /// How early a frame may be shown rather than waiting another wakeup for it.
@@ -57,7 +58,7 @@ pub fn run(
 		.context("failed to create the playback event loop")?;
 	let proxy = event_loop.create_proxy();
 	let video = Arc::new(Mutex::new(VecDeque::new()));
-	let presentation = Arc::new(Mutex::new(Presentation::new(args.delay.into_std())));
+	let presentation = Arc::new(Mutex::new(Presentation::new(args.video_delay())));
 	// Signals the decoder that the presenter took a frame, so it can hand over
 	// the next one instead of dropping it.
 	let drained = Arc::new(tokio::sync::Notify::new());
@@ -70,7 +71,7 @@ pub fn run(
 			video: video.clone(),
 			presentation: presentation.clone(),
 			drained: drained.clone(),
-			proxy: proxy.clone(),
+			output: proxy.clone(),
 		}
 		.run(),
 	);
@@ -78,11 +79,9 @@ pub fn run(
 	let signal = tokio::spawn({
 		let proxy = proxy.clone();
 		async move {
-			let event = match crate::shutdown_signal().await {
-				Ok(()) => Event::Finished,
-				Err(error) => Event::Failed(format!("shutdown listener failed: {error:#}")),
-			};
-			let _ = proxy.send_event(event);
+			if tokio::signal::ctrl_c().await.is_ok() {
+				let _ = proxy.send_event(Event::Finished);
+			}
 		}
 	});
 
@@ -101,6 +100,18 @@ pub fn run(
 	match app.error {
 		Some(err) => anyhow::bail!(err),
 		None => Ok(()),
+	}
+}
+
+impl Output for EventLoopProxy<Event> {
+	type Speaker = moq_audio::playback::Engine;
+
+	async fn speaker(&self) -> anyhow::Result<Self::Speaker> {
+		Ok(moq_audio::playback::Engine::open(Default::default()).await?)
+	}
+
+	fn send(&self, event: Event) {
+		let _ = self.send_event(event);
 	}
 }
 

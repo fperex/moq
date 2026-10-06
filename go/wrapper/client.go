@@ -43,7 +43,7 @@ type Backoff struct {
 	Initial    time.Duration // delay before the first retry (default 1s)
 	Multiplier uint32        // applied to the delay after each failure (default 2)
 	Max        time.Duration // ceiling on the delay (default 5s)
-	Timeout    time.Duration // give up after this long (default 60s)
+	Timeout    time.Duration // give up after this long (default 10s)
 }
 
 // RetryForever, passed as Backoff.Timeout, keeps a reconnecting session retrying
@@ -54,7 +54,7 @@ const (
 	defaultBackoffInitial    = time.Second
 	defaultBackoffMultiplier = 2
 	defaultBackoffMax        = 5 * time.Second
-	defaultBackoffTimeout    = 60 * time.Second
+	defaultBackoffTimeout    = 10 * time.Second
 )
 
 // ffi resolves the unset fields, which is load-bearing rather than cosmetic:
@@ -203,6 +203,7 @@ type Client struct {
 	consumer  *OriginConsumer
 	session   *Session
 	closeOnce sync.Once
+	closeErr  error
 }
 
 // Dial connects to a MoQ server and returns the established client. Cancel ctx
@@ -324,11 +325,11 @@ func (c *Client) Session() *Session {
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		if c.session != nil {
-			c.session.Shutdown()
+			c.closeErr = c.session.Shutdown(context.Background())
 		}
 		if c.inner != nil {
 			c.inner.Cancel()
 		}
 	})
-	return nil
+	return c.closeErr
 }

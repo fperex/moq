@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.9...moq-audio-v0.1.10) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.9](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.8...moq-audio-v0.1.9) - 2026-10-03
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.8](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.7...moq-audio-v0.1.8) - 2026-09-30
+
+### Fixed
+
+- *(audio)* conceal one Opus packet's length for a lost packet, not 120 ms ([#4442](https://github.com/moq-dev/moq/pull/4442))
+
+### Other
+
+- compile the Windows, macOS, and OBS plugin code on every PR ([#4370](https://github.com/moq-dev/moq/pull/4370))
+
+## [0.1.7](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.6...moq-audio-v0.1.7) - 2026-09-27
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.6](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.5...moq-audio-v0.1.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: kio, moq-net, hang, moq-mux
+
+## [0.1.5](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.4...moq-audio-v0.1.5) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.4](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.3...moq-audio-v0.1.4) - 2026-09-25
+
+### Fixed
+
+- *(audio)* honor and validate Opus stream descriptions ([#4130](https://github.com/moq-dev/moq/pull/4130))
+
+### Other
+
+- *(capture)* drive native capture through clock edge cases in CI ([#4125](https://github.com/moq-dev/moq/pull/4125))
+
+## [0.1.3](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.2...moq-audio-v0.1.3) - 2026-09-25
+
+### Added
+
+- *(mux)* measure encoder flush jitter per rendition ([#3940](https://github.com/moq-dev/moq/pull/3940))
+
 ## [0.1.2](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.1...moq-audio-v0.1.2) - 2026-09-25
 
 ### Other

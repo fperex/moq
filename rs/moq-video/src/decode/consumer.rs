@@ -74,7 +74,7 @@ impl Options {
 /// `moq_audio::decode::Consumer`.
 pub struct Consumer {
 	/// A [`Sink`] rather than a bare `Decoder`: the read loop below is held
-	/// across `.await` by every caller (libmoq's spawned task, moq-transcode),
+	/// across `.await` by every caller (moq-c's spawned task, moq-transcode),
 	/// so the codec would otherwise migrate between executor workers and
 	/// unbalance the per-thread COM apartment the Windows backend opens.
 	decoder: Sink,
@@ -600,8 +600,17 @@ mod tests {
 				keyframe: true,
 			})
 			.unwrap();
+		producer.discontinuity().unwrap();
+		producer
+			.write(moq_mux::container::Frame {
+				timestamp: Timestamp::from_micros(200_000).unwrap(),
+				duration: None,
+				payload: Bytes::from_static(b"new access unit"),
+				keyframe: true,
+			})
+			.unwrap();
+		producer.finish().unwrap();
 
-		// Subscribed across the seam: one made after the break would start at its marker.
 		let catalog = VideoConfig::new(hang::catalog::H264 {
 			inline: true,
 			profile: 0x42,
@@ -624,17 +633,6 @@ mod tests {
 		.await
 		.unwrap();
 
-		producer.discontinuity().unwrap();
-		producer
-			.write(moq_mux::container::Frame {
-				timestamp: Timestamp::from_micros(200_000).unwrap(),
-				duration: None,
-				payload: Bytes::from_static(b"new access unit"),
-				keyframe: true,
-			})
-			.unwrap();
-		producer.finish().unwrap();
-
 		let mut timestamps = Vec::new();
 		while let Some(frame) = consumer.read().await.unwrap() {
 			timestamps.push(frame.timestamp.as_micros());
@@ -645,7 +643,7 @@ mod tests {
 	/// Cancellation while a threaded flush is in flight leaves the sink poisoned.
 	/// The next read surfaces that error rather than reporting a clean end and
 	/// silently discarding the tail.
-	#[cfg(not(target_os = "macos"))]
+	#[cfg(not(apple))]
 	#[tokio::test]
 	async fn cancelled_track_end_flush_is_not_reported_as_drained() {
 		probe::prepare_blocking_flush();

@@ -19,7 +19,7 @@ The reference implementation. Every crate is on
 | [moq-uring](https://docs.rs/moq-uring) | Experimental Linux io\_uring worker: one pinned thread per ring serving moq-lite over its own QUIC stack. |
 | [hang](/lib/rs/hang) | The media layer: catalog, containers, ordered frame delivery. |
 | [moq-mux](/lib/rs/moq-mux) | Import and export fMP4/CMAF, MPEG-TS, Matroska, FLV, and Annex-B. |
-| [moq-archive](https://docs.rs/moq-archive) | Versioned hang recordings on any `object_store` backend: track layout, `.info` JSON, and segment objects. |
+| [moq-archive](https://docs.rs/moq-archive) | Versioned hang recordings on any `object_store` backend: track layout, `.info` JSON, per-track timelines, and span objects. |
 | [moq-video](/lib/rs/moq-video) | Native capture, hardware encode/decode (Apple, Windows, NVIDIA, VAAPI, V4L2, Android), and GPU rendering. |
 | [moq-v4l](https://docs.rs/moq-v4l) | Safe Video4Linux 2 bindings with the kernel headers checked in, so a build needs no libclang. |
 | [moq-audio](/lib/rs/moq-audio) | Microphone and speaker, Opus/PCM/AAC codecs, echo cancellation. |
@@ -27,13 +27,12 @@ The reference implementation. Every crate is on
 | [moq-auth](/lib/rs/moq-auth) | The authorization contract: requests, grants, leases, the HTTP client, the reference server, JWT keys, signing, and verification, plus listing live sessions and pushing a re-check. |
 | [moq-room](/lib/rs/moq-room) | Headless rooms: announce-derived roster, token claims, and a chat track. |
 | [moq-json](/lib/rs/moq-json) | JSON over tracks: snapshots with merge-patch deltas, or append logs. |
-| [moq-binary](/lib/rs/moq-binary) | Opaque payloads over tracks: snapshots or append logs. |
+| [moq-flate](/lib/rs/moq-flate) | Opaque payloads over tracks, optionally compressed with group-scoped DEFLATE: snapshots or append logs. |
 | [moq-e2ee](https://docs.rs/moq-e2ee) | End-to-end encryption of groups, datagrams, and track names, scoped to a publisher epoch. |
-| [moq-flate](https://docs.rs/moq-flate) | Group-scoped DEFLATE for any track. |
 | [moq-loc](https://docs.rs/moq-loc), [moq-msf](https://docs.rs/moq-msf) | The IETF LOC container and MSF catalog. |
 | [moq-stats](https://docs.rs/moq-stats) | Publish and consume relay traffic counters as tracks. |
 | [moq-hls](https://docs.rs/moq-hls), [moq-rtmp](https://docs.rs/moq-rtmp), [moq-srt](https://docs.rs/moq-srt), [moq-rtc](https://docs.rs/moq-rtc) | The [gateways](/bin/), as libraries you can embed with your own auth. |
-| [moq-ffi](https://docs.rs/moq-ffi), [libmoq](/lib/c/) | The UniFFI core behind the language bindings, and the C ABI. |
+| [moq-ffi](https://docs.rs/moq-ffi), [moq-c](/lib/c/) | The UniFFI core behind the language bindings, and the C ABI. |
 | [moq-relay](/bin/relay/), [moq-cli](/bin/cli) | The binaries, also usable as crates. |
 | [web-transport](https://github.com/moq-dev/web-transport) | The QUIC/WebTransport/qmux transports, in a sibling repository. |
 
@@ -54,8 +53,9 @@ let session = client.with_origin(origin.clone()).connect(url);
 // Subscribe: wait for a route, resolve the broadcast at its path, read the catalog.
 let consumer = origin.consume();
 let mut announced = consumer.announced();
-while let Some(update) = announced.next().await {
-    if !update.kind.is_active() { continue }
+while let Some(event) = announced.next().await {
+    // Skip retractions, and `Live`, which marks the end of what was already live.
+    let moq_net::announce::Event::Start(update) = event else { continue };
     let broadcast = consumer.request_broadcast(&update.prefix).await?;
     let catalog = broadcast
         .track(hang::Catalog::DEFAULT_NAME)?
@@ -74,6 +74,10 @@ let mut broadcast = origin.publish("my-stream.hang", Default::default())?;
 // each requested path for the application to accept or reject.
 ```
 
+Before exiting, `session.close().await` delivers what was already queued, such as
+the tracks you just finished, within one second. Then `Client::close` (on a clone of
+the client) sends the QUIC close before the runtime stops.
+
 The examples run the session and the origin work concurrently (`tokio::select!` or
 `spawn`), since the announcement loop is live. Runnable examples:
 [`rs/hang/examples/video.rs`](https://github.com/moq-dev/moq/blob/main/rs/hang/examples/video.rs)
@@ -83,7 +87,11 @@ URLs may be `https://` (WebTransport, with raw QUIC preferred for native),
 `moql://`/`moqt://` (raw QUIC), or `iroh://`. A `?jwt=` query carries the
 token. `http://` is for a relay on localhost only: it fetches the certificate
 fingerprint unauthenticated before upgrading, so never send a token over it. Connections race
-QUIC against WebSocket and remember which won.
+QUIC against WebSocket and remember which won. When WebSocket wins, a `Connection` keeps
+dialing QUIC and moves onto it once the relay admits that session, handing live tracks over
+at a group boundary and draining the WebSocket session; `Connection::transport()` reports
+which is live. A refused or stalled QUIC session leaves the WebSocket session serving, and
+moq-lite-03 and -04, which give no sign of admission, never upgrade.
 
 The `Default::default()` above is the QUIC transport section, and the same value
 serves a dial and a listener:
@@ -98,7 +106,8 @@ quic.send_window = Some(32 << 20);          // unacknowledged data we may hold
 let client = moq_tokio::connect::Config::default().init(quic)?;
 ```
 
-Unset flow-control windows keep the transport defaults, and `init` errors on a
+Unset flow-control windows keep the transport defaults, except `receive_window`,
+which defaults to 64 MiB because the transport's is unlimited. `init` errors on a
 knob the transport cannot honor rather than dropping it: iroh cannot disable
 GSO. `quic::Resolved::default()` is what an
 untouched config resolves to, so read the defaults from there. The

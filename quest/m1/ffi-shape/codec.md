@@ -17,11 +17,17 @@ key apart from its rendition; pick one convention for both. Go's
 through `demand()` only. Both groups stay behind their cargo features and off
 wasm.
 
-libmoq's codec symbols follow.
+The video encoder's output mirrors moq-video's `encode::Gop`:
+`MoqVideoEncoderOutput.gop: Option<u32>` becomes a `MoqVideoGop` enum with a
+`Keyframe { interval }` variant, defaulting to keyframes at two seconds, and
+documented as non-exhaustive like the core. The wrappers expose it as an enum
+their callers construct, not one they are asked to match, so
+[intra-refresh bindings](/quest/m3/intra-refresh-bindings.md) adds the refresh
+variant additively instead of breaking `gop` a second time. Go gets no uniffi
+default, so its zero value must read as keyframe mode.
 
-Public API: breaking in every binding and libmoq. Wire: none.
+The audio and video frame and decoder-output records carry microsecond fields
+(`timestamp_us`, `max_age_us`, `frame_duration_us`); in Python and Go they
+should become owned `timedelta` / `time.Duration` records like net's.
 
-## Required
-
-- [JSON](/quest/m1/ffi-shape/json.md) - sets the per-language namespace pattern
-- [Media](/quest/m1/ffi-shape/media.md) - the catalog handle the encoders register into
+Public API: breaking in every binding. Wire: none.

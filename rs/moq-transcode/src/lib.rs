@@ -123,20 +123,29 @@ impl Transcoder {
 			.subscribe(hang::Catalog::default_subscription())
 			.await?;
 		let mut catalogs = moq_mux::catalog::hang::Consumer::<()>::new(track);
+		let mut decoders = catalog::Decoders::new(config.feed_decoder());
 		let (source_name, source_config, snapshot) = loop {
 			let Some(snapshot) = catalogs.next().await? else {
 				return Err(Error::NoSource);
 			};
-			match catalog::choose_source(&snapshot.video) {
+			match catalog::choose_source(&snapshot.video, &mut decoders).await {
 				Ok((name, config)) => break (name, config, snapshot),
-				Err(_) => tracing::debug!("no transcodable rendition yet; waiting for a catalog update"),
+				Err(Error::NoSource) => tracing::debug!("no transcodable rendition yet; waiting for a catalog update"),
+				Err(err) => return Err(err),
 			}
 		};
 		// The ladder, the shared decode behind it, and the rungs serving off it.
 		// Resolved again on every source catalog snapshot, so a source that resizes
 		// mid-stream takes the ladder with it.
-		let mut ladder =
-			pipeline::Pipeline::new(source.clone(), config.clone(), active, source_name, source_config).await?;
+		let mut ladder = pipeline::Pipeline::new(
+			source.clone(),
+			config.clone(),
+			active,
+			decoders,
+			source_name,
+			source_config,
+		)
+		.await?;
 
 		// Publish the derivative catalog before any encoder exists, so subscribers
 		// can pick a rung immediately. Commit so a catalog that cannot be published fails
@@ -190,7 +199,7 @@ impl Transcoder {
 		tasks.shutdown().await;
 
 		derived.finish()?;
-		output.finish();
+		output.close();
 		Ok(())
 	}
 }
@@ -1262,6 +1271,129 @@ mod tests {
 		transcoder.abort();
 	}
 
+	/// A fetch that starts partway through a group is refused rather than served.
+	/// A fresh encode of that group need not match the bytes of the head a reader
+	/// holds, so its tail cannot continue it. The reader moves on to the next group.
+	#[tokio::test]
+	async fn a_mid_group_fetch_is_refused() {
+		let source = source_catalog(320, 240);
+		// Serve any source group on demand, so a fetch that is not refused has
+		// something to transcode and resolves.
+		let source_fetches = source._track.dynamic();
+		let server = tokio::spawn(async move {
+			while let Ok(request) = source_fetches.requested_group().await {
+				let mut group = request.accept(None).unwrap();
+				write_keyframe(&mut group);
+				group.finish().unwrap();
+			}
+		});
+
+		let config = Config {
+			ladder: Ladder::new([Rung::new(120, moq_net::bandwidth::Rate::from_bps(100_000))]).unwrap(),
+			encoder: moq_video::encode::Kind::Software,
+			decoder: moq_video::decode::Kind::Software,
+			source: None,
+			..Default::default()
+		};
+		let output = moq_net::broadcast::Info::default().produce();
+		let consumer = output.consume();
+		let transcoder = tokio::spawn(run(source.broadcast.consume(), output, config));
+
+		let catalog = loop {
+			match consumer.track(hang::Catalog::DEFAULT_NAME) {
+				Ok(track) => break track,
+				Err(moq_net::Error::NotFound) => tokio::task::yield_now().await,
+				Err(err) => panic!("catalog track: {err}"),
+			}
+		};
+		let mut catalogs = moq_mux::catalog::hang::Consumer::<()>::new(catalog.subscribe(None).await.unwrap());
+		await_catalog(&mut catalogs, |snapshot| {
+			snapshot.video.renditions.contains_key("video/120p")
+		})
+		.await;
+
+		// The source publishes no live groups, so group 7 is a cache miss that
+		// reaches the rung's fetch handler.
+		let rung = consumer.track("video/120p").unwrap();
+		rung.query().await.unwrap();
+
+		let partial = rung
+			.fetch_group(7, moq_net::group::Fetch::default().with_frame_start(2))
+			.await;
+		match partial {
+			Err(moq_net::Error::NotFound) => {}
+			Err(err) => panic!("expected a NotFound refusal, got {err}"),
+			Ok(_) => panic!("served a fetch that starts mid-group"),
+		}
+
+		// The whole group still serves.
+		let mut whole = rung.fetch_group(7, None).await.unwrap();
+		while whole.read_frame().await.unwrap().is_some() {}
+		assert!(whole.finished().await.unwrap() > 0, "the whole group had no frames");
+
+		server.abort();
+		transcoder.abort();
+	}
+
+	/// Two transcoders fed the same source publish groups that mirror the
+	/// source's sequences and timestamps rather than anything numbered per
+	/// instance.
+	#[tokio::test]
+	async fn two_instances_mirror_source_groups() {
+		let source = source_broadcast(2, 5);
+		let config = Config {
+			ladder: Ladder::new([Rung::new(120, moq_net::bandwidth::Rate::from_bps(100_000))]).unwrap(),
+			encoder: moq_video::encode::Kind::Software,
+			decoder: moq_video::decode::Kind::Software,
+			source: None,
+			..Default::default()
+		};
+
+		// Mirrored from the source, not numbered by either instance.
+		let expected: Vec<_> = (0..2u64)
+			.map(|sequence| {
+				(
+					sequence,
+					(0..5).map(|i| (sequence * 5 + i) as u128 * 33_333).collect::<Vec<_>>(),
+				)
+			})
+			.collect();
+
+		for _ in 0..2 {
+			let output = moq_net::broadcast::Info::default().produce();
+			let consumer = output.consume();
+			let transcoder = tokio::spawn(run(source.broadcast.consume(), output, config.clone()));
+
+			let track = loop {
+				match consumer.track(hang::Catalog::DEFAULT_NAME) {
+					Ok(track) => break track,
+					Err(moq_net::Error::NotFound) => tokio::task::yield_now().await,
+					Err(err) => panic!("catalog track: {err}"),
+				}
+			};
+			let mut catalogs = moq_mux::catalog::hang::Consumer::<()>::new(track.subscribe(None).await.unwrap());
+			await_catalog(&mut catalogs, |snapshot| {
+				snapshot.video.renditions.contains_key("video/120p")
+			})
+			.await;
+
+			let rung = consumer.track("video/120p").unwrap();
+			let mut groups = Vec::new();
+			for sequence in 0..2 {
+				let mut fetched = rung.fetch_group(sequence, None).await.unwrap();
+				let mut timestamps = Vec::new();
+				while let Some(payload) = fetched.read_frame().await.unwrap() {
+					let frame = hang::container::Frame::decode(payload.payload).unwrap();
+					timestamps.push(frame.timestamp.as_micros());
+				}
+				groups.push((fetched.sequence, timestamps));
+			}
+
+			assert_eq!(groups, expected);
+			transcoder.abort();
+		}
+	}
+
 	/// A source whose codec description changes rebuilds the shared decode, so
 	/// every rung retires with it. The picture may not have moved at all, so shape
 	/// alone would hand the replacements the names that just ended. They have to be
@@ -1326,6 +1458,130 @@ mod tests {
 		subscribe(&consumer, "video/120p.2").await;
 
 		transcoder.abort();
+	}
+
+	/// A source broadcast whose catalog offers a 1080p H.265 rendition next to a
+	/// 360p H.264 one, the way a simulcasting publisher would. The tracks exist
+	/// but carry no media, since no rung encodes until someone asks.
+	fn mixed_codec_source() -> (
+		moq_net::broadcast::Producer,
+		moq_mux::catalog::Producer,
+		[moq_net::track::Producer; 2],
+	) {
+		let mut broadcast = moq_net::broadcast::Info::default().produce();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+
+		let mut hevc = hang::catalog::VideoConfig::new(hang::catalog::H265 {
+			in_band: true,
+			profile_space: 0,
+			profile_idc: 1,
+			profile_compatibility_flags: [0x60, 0, 0, 0],
+			tier_flag: false,
+			level_idc: 120,
+			constraint_flags: [0x90, 0, 0, 0, 0, 0],
+		});
+		hevc.coded_width = Some(1920);
+		hevc.coded_height = Some(1080);
+		hevc.bitrate = Some(6_000_000);
+
+		let mut avc = hang::catalog::VideoConfig::new(hang::catalog::H264 {
+			inline: true,
+			profile: 0x42,
+			constraints: 0,
+			level: 30,
+		});
+		avc.coded_width = Some(640);
+		avc.coded_height = Some(360);
+		avc.bitrate = Some(1_000_000);
+
+		let mut guard = catalog.modify().unwrap();
+		guard.video.insert("hevc", hevc).unwrap();
+		guard.video.insert("avc", avc).unwrap();
+		guard.commit().unwrap();
+
+		let info = hang::container::track_info(hang::catalog::PRIORITY.video);
+		let tracks = [
+			broadcast.create_track("hevc", info.clone()).unwrap(),
+			broadcast.create_track("avc", info).unwrap(),
+		];
+		(broadcast, catalog, tracks)
+	}
+
+	/// A larger rendition this host can't decode must not win the source. With
+	/// only the software decoder, the 1080p H.265 entry would be chosen, sized a
+	/// ladder the H.264 one can't serve, and failed the moment a rung was asked for.
+	#[tokio::test]
+	async fn an_undecodable_larger_rendition_is_not_the_source() {
+		let (broadcast, _catalog, _tracks) = mixed_codec_source();
+
+		let config = Config {
+			ladder: Ladder::new([
+				Rung::new(720, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+				Rung::new(120, moq_net::bandwidth::Rate::from_bps(100_000)),
+			])
+			.unwrap(),
+			encoder: moq_video::encode::Kind::Software,
+			decoder: moq_video::decode::Kind::Software,
+			source: None,
+			..Default::default()
+		};
+
+		let output = moq_net::broadcast::Info::default().produce();
+		let consumer = output.consume();
+		let transcoder = tokio::spawn(run(broadcast.consume(), output, config));
+
+		let track = loop {
+			match consumer.track(hang::Catalog::DEFAULT_NAME) {
+				Ok(track) => break track,
+				Err(moq_net::Error::NotFound) => tokio::task::yield_now().await,
+				Err(err) => panic!("catalog track: {err}"),
+			}
+		};
+		let mut catalogs = moq_mux::catalog::hang::Consumer::<()>::new(track.subscribe(None).await.unwrap());
+		let derived = await_catalog(&mut catalogs, |snapshot| !snapshot.video.renditions.is_empty()).await;
+
+		// Sized against the 640x360 H.264 rendition: no room for 720p, and 120p is
+		// 212 wide either way.
+		let names: Vec<_> = derived.video.renditions.keys().map(String::as_str).collect();
+		assert_eq!(
+			names,
+			["video/120p"],
+			"the ladder was sized against the H.265 rendition"
+		);
+
+		transcoder.abort();
+	}
+
+	/// A decoder forced by name that this build doesn't have leaves nothing to
+	/// transcode from, and `run` has to say so rather than wait forever.
+	#[tokio::test]
+	async fn a_missing_decoder_is_refused() {
+		let (broadcast, _catalog, _tracks) = mixed_codec_source();
+
+		let config = Config {
+			ladder: Ladder::new([Rung::new(120, moq_net::bandwidth::Rate::from_bps(100_000))]).unwrap(),
+			encoder: moq_video::encode::Kind::Software,
+			decoder: moq_video::decode::Kind::Named("missing".to_string()),
+			source: None,
+			..Default::default()
+		};
+
+		let output = moq_net::broadcast::Info::default().produce();
+		let result = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			run(broadcast.consume(), output, config),
+		)
+		.await
+		.expect("run kept waiting for a source it can never decode");
+
+		match result {
+			// Why the largest rendition's decoder refused.
+			Err(Error::Video(moq_video::Error::UnknownDecoder { name, codec, .. })) => {
+				assert_eq!(name, "missing");
+				assert_eq!(codec, moq_video::decode::Codec::H265);
+			}
+			other => panic!("expected the decoder's refusal, got {other:?}"),
+		}
 	}
 
 	/// `run` must terminate (not hang in its shutdown drain) when the source

@@ -19,6 +19,12 @@ subscriber checks end-to-end: the browser encodes fake microphone audio, and the
 Python and Go clients encode a synthetic tone through `moq-ffi` at a 2.5 ms frame
 duration, so the matrix covers the FFI audio path with a non-default codec config.
 
+Whenever the browser subscriber is in the run, the matrix ends with a close-code
+case: Chromium dials the relay with a token its public rules refuse, and
+`WebTransport.closed` must carry the relay's code and reason. Chromium treats a
+server's HTTP/3 control stream ending as fatal, so a server that ends it under
+the close capsule loses both; no Rust peer is that strict.
+
 `just test media` is a separate, browser-only run that asks a harder
 question: is the media a viewer gets actually advancing and in sync, and does the
 player survive the publication lifecycle. See [Media QA](#media-qa).
@@ -28,11 +34,11 @@ player survive the publication lifecycle. See [Media QA](#media-qa).
 | Client | Source under test | Built with | Roles |
 |---|---|---|---|
 | Rust | `rs/moq-relay` + `rs/moq-cli` | `cargo build` | publish (video) + subscribe |
-| Python | `py/moq-rs` (+ `rs/moq-ffi`, import `moq`) | `just py build` (maturin editable into `.venv`) | publish (video + audio) + subscribe |
-| Go | `go/wrapper` (+ `rs/moq-ffi`, import `moq-go/moq`) | `go/scripts/stage.sh` (uniffi-bindgen-go) + `go build` | publish (video + audio) + subscribe |
+| Python | `py/moq-rs` (+ `rs/moq-ffi`, import `moq`) | `uv build` wheels (maturin + hatchling), installed into a venv in the run directory | publish (video + audio) + subscribe |
+| Go | `go/wrapper` (+ `rs/moq-ffi`, import `moq-go/moq`) | `sh/go/stage.sh` (uniffi-bindgen-go) + `go build` | publish (video + audio) + subscribe |
 | Browser | `js/watch` + `js/publish` | `vite build` + headless Chromium (Playwright) | publish (video + audio) + rendered playback |
 | Native JS | `js/net` + `js/hang` + the npm `@moq/web-transport` polyfill | `node` (tsx) and `bun` | subscribe |
-| C | `rs/libmoq` | `cargo build -p libmoq` + `cc` | subscribe |
+| C | `rs/moq-c` | `cargo build -p moq-c` + `cc` | subscribe |
 | GStreamer | `rs/moq-gst` (`moqsrc`) | `cargo build -p moq-gst` + `gst-launch-1.0` | subscribe |
 
 The browser, native JS, C, and GStreamer clients subscribe only by choice
@@ -40,7 +46,7 @@ The browser, native JS, C, and GStreamer clients subscribe only by choice
 intentionally minimal, and `moqsink` publishing needs request-pad muxing this
 client doesn't drive). Rust, Python, Go, and the browser publish.
 
-The Go client builds against the modules `go/scripts/stage.sh` assembles from
+The Go client builds against the modules `sh/go/stage.sh` assembles from
 this checkout: `moq-ffi` compiled for the host, bindings regenerated with
 `uniffi-bindgen-go`, and the `go/wrapper` module wired to them by a `replace`.
 That is the same staging `just go check` uses, so this cell covers the Go
@@ -75,6 +81,9 @@ just test interop --all
 
 # Pick your own axes:
 just test interop --publishers rust,python --subscribers rust,c,js-native-bun
+
+# Subscription termination: Rust/JS response bytes over in-memory transports.
+just test bare-fin
 
 # Negative control: no publisher, every subscriber must time out.
 just test interop-negative
@@ -123,12 +132,10 @@ Each run covers, against a real local relay:
   The fake device is not physical hardware, and the headless permission decision
   is not a person clicking a browser prompt.
 - **pause and resume**, **unsubscribe and rejoin**, **detach and reattach**,
-  **publisher stop and same-path republish**, and **late join**.
-- **audio thread** - every measured window must find the player's audio on the
-  thread the run expects, read off `audio.out.thread`: the page's audio worker
-  by default, and the page's own main thread in a second run that sets
-  `offload="false"` and repeats every case that plays the audio. Each run is the
-  other's control: a reading stuck on either thread fails one of them.
+  **publisher stop and same-path republish**, and **late join**. The late join
+  must present the newest published GOP or a newer one. Its lower bound is the
+  encoded keyframe timestamp sampled before the existing viewer closes, since
+  painting the canvas does not mean capture and encoding have finished.
 - **resources return to baseline** - the page wraps `WebTransport`, `WebSocket`,
   `AudioContext`, and `Worker` to count live instances, so a detach that leaks a
   session is visible rather than merely invisible.
@@ -167,11 +174,14 @@ contract](../README.md).
 ```text
 interop.sh              orchestrator: build clients, run the relay + matrix or media checks
 interop.toml            relay config (anonymous, self-signed localhost)
+bare-fin.ts             the JS side of `just test bare-fin`, driven by moq-net's tests
+varint.ts               the JS side of the varint check, driven by moq-net's tests
 clients/
   python/interop.py       publish/subscribe via py/moq-rs (import moq)
   go/main.go              publish/subscribe via go/wrapper (import moq-go/moq)
   js/                     headless-Chromium publish/subscribe via @moq/watch + @moq/publish
     driver.ts             the interop matrix's browser publisher/subscriber
+    close.ts              the refused session's close code and reason
     media.ts              the media output + lifecycle checks
     harness.ts            shared Playwright plumbing
     src/contract.ts       what the page and its drivers agree on, free of browser imports
@@ -179,8 +189,9 @@ clients/
     src/pattern.ts        how that fixture encodes itself into the picture and the audio
     src/probe.ts          subscriber-side measurement, taken at the sinks
     src/instrument.ts     live counts of the platform resources the page holds
+    src/close.ts          the refused session, read off `WebTransport.closed`
   js-native/subscribe.ts  subscribe via @moq/net + @moq/hang + the WebTransport polyfill
-  c/subscribe.c           subscribe via rs/libmoq
+  c/subscribe.c           subscribe via rs/moq-c
 ```
 
 ## CI
@@ -188,3 +199,28 @@ clients/
 `.github/workflows/interop.yml` runs the full matrix nightly (and on demand, and on
 PRs that touch `test/interop/`). A red cell means a real interop break in the
 current tree.
+
+## Subscription termination
+
+`just test bare-fin` exchanges encoded subscription responses between Rust and
+JS, then feeds them into each implementation's subscriber over an in-memory
+transport. It checks bare FIN before and after SUBSCRIBE\_START on lite-05/06/07,
+and FIN without PUBLISH\_DONE on IETF draft-19. Clean-end controls use the same
+path. This tests response interoperability, not network delivery or relay behavior.
+The interop workflow runs it alongside the real-transport matrix.
+
+## Varints
+
+Every `just test interop` run starts with `varint_interop` in moq-net, which
+hands moq-net's QUIC and leading-ones encodings of each varint size boundary
+(plus 2^53, where a JS `number` stops being exact, and 2^62 - 1) to
+`varint.ts`. That script decodes them into js/net's `U64`, checks its
+`number` conversion, and returns js/net's own encodings, which Rust requires to
+match byte for byte and decode back to the same value.
+
+`lite_varint_interop` runs next to it and does the same through moq-lite's
+version dispatch: `lite-varint.ts` decodes Rust's lite-06 (QUIC) and lite-07
+(leading-ones) varints, a SETUP carrying a 62-bit Hop ID, a datagram, and a
+GROUP stream with frames, and re-encodes them byte for byte. Past 2^62-1 the
+range is per version: JS writes lite-07's 64-bit values, which Rust reads back,
+and JS refuses them on lite-06.

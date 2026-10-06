@@ -146,80 +146,34 @@ export class Renderer {
 		const ctx = effect.get(this.#ctx);
 		if (!ctx) return;
 
-		let animate: number | undefined;
-		let dirty = false;
-		let source: VideoFrame | undefined;
-		const frames: VideoFrame[] = [];
-		// The display's refresh interval, measured from rAF timestamps (60Hz until measured), and
-		// whether the last refresh left a frame queued. A pair released inside one refresh is shown
-		// over two; a queue that is still non-empty a refresh later is a standing lag, so it drains.
-		let refresh = 1000 / 60;
-		let last: number | undefined;
-		let carried = false;
-		const clear = () => {
-			for (const frame of frames) frame.close();
-			frames.length = 0;
-			carried = false;
-		};
-		const render = (now?: number) => {
+		const frame = effect.get(this.decoder.out.frame);
+		const video = effect.get(this.decoder.source.out.catalog);
+
+		// Request a callback to render the frame based on the monitor's refresh rate.
+		// Always render, even when paused (to show last frame).
+		let animate: number | undefined = requestAnimationFrame(() => {
+			this.#render(ctx, frame, video);
+
+			if (frame) {
+				this.#out.frame.update((current) => {
+					current?.close();
+					return frame.clone();
+				});
+				this.#out.timestamp.set(Time.Milli.fromMicro(frame.timestamp as Time.Micro));
+			} else {
+				this.#out.frame.update((current) => {
+					current?.close();
+					return undefined;
+				});
+				this.#out.timestamp.set(undefined);
+			}
+
 			animate = undefined;
-			if (now !== undefined && last !== undefined) {
-				const delta = now - last;
-				if (delta > 0 && delta < 100) refresh = delta;
-			}
-			if (now !== undefined) last = now;
-			if (carried && frames.length > 1) {
-				while (frames.length > 1) frames.shift()?.close();
-			}
-			if (dirty || frames.length) {
-				dirty = false;
-				const pending = frames.shift();
-				carried = frames.length > 0;
-				const frame = pending ?? (source ? this.#out.frame.peek() : undefined);
-				const video = this.decoder.source.out.catalog.peek();
-				try {
-					this.#render(ctx, frame, video);
-					const retained = frame?.clone();
-					this.#out.frame.update((current) => {
-						current?.close();
-						return retained;
-					});
-					this.#out.timestamp.set(frame ? Time.Milli.fromMicro(frame.timestamp as Time.Micro) : undefined);
-				} finally {
-					pending?.close();
-				}
-			}
-			// Keep a place in every display refresh while playing. Rescheduling from a
-			// frame update during that refresh would miss its already-snapshotted callbacks.
-			if (this.decoder.in.enabled.peek()) animate = requestAnimationFrame(render);
-		};
-		effect.run((inner) => {
-			const frame = inner.get(this.decoder.out.frame);
-			inner.get(this.decoder.source.out.catalog);
-			const enabled = inner.get(this.decoder.in.enabled);
-			const reset = !enabled || !this.#out.frame.peek() || !frame;
-			if (reset) clear();
-			if (frame && (frame !== source || reset)) {
-				frames.push(frame.clone());
-				// Timers can release adjacent frames on opposite sides of a display refresh.
-				// Preserve that pair, but never turn it into a stale presentation backlog. Adjacent
-				// is sized from the display, not a fixed 20ms of media: two refreshes' worth keeps a
-				// 30fps pair on a 60Hz display.
-				const adjacent = Math.max(20_000, 2.1 * refresh * 1000);
-				while (frames.length > 2 || (frames[0] && frame.timestamp - frames[0].timestamp > adjacent)) {
-					frames.shift()?.close();
-				}
-			}
-			source = frame;
-			dirty = true;
-			// A paused tile still paints changed metadata or its final frame once.
-			if (animate === undefined) animate = requestAnimationFrame(render);
 		});
 
 		// Clean up any pending animation request.
 		effect.cleanup(() => {
 			if (animate !== undefined) cancelAnimationFrame(animate);
-			clear();
 		});
 	}
 

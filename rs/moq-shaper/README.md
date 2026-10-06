@@ -38,15 +38,14 @@ profile never acted.
 | `--batch`, `--batch-window` | Hold datagrams until this many wait, or the window closes, then release them together. See [Batches](#batches). |
 | `--shared` | Every client shares one link each way. See [Shared path](#shared-path). |
 | `--profile` | A built-in profile's name, or a profile TOML file, in place of the flags that shape the path. See [Profiles](#profiles). |
-| `--tcp-passthrough` | Also pipe TCP on the listening port to the target, untouched. See [TCP](#tcp). |
 | `--report` | Write the profile, seed and counters to this file as JSON at exit. See [Report](#report). |
-| `--report-interval` | Print the same JSON as one line on stdout at this nonzero interval. |
+| `--report-interval` | Print the same JSON as one line on stdout this often. |
 
 As a library, `Shaper::bind` takes a `Config`: where to listen and forward, the seed, and a `Profile`
 per direction. It also takes a `Setup`, which is a `Config` plus the opt-in options below, each off by
-default. `Shaper::verify` fails when the shaper stopped forwarding, or when an impairment the profile
-configures never acted and the traffic makes that silence implausible. Each step is judged against
-the traffic received while its profile was active. The relay's drills
+default. `Shaper::verify` fails when the shaper stopped forwarding, when an impairment the profile
+configures never acted and the traffic makes that silence implausible, or when a direction carried
+traffic but no datagram saw one of its phases, before the first step or after one. The relay's drills
 (`rs/moq-relay/tests/drills.rs`, described in `test/drill/README.md`) run every scenario through it.
 
 ## What a seed does and does not fix
@@ -65,7 +64,7 @@ later datagram can overtake an earlier one. A drill wants that, and `jitter` may
 
 `gaussian` treats `jitter` as a sigma, clamps the draw at zero, and never lets a datagram leave before the
 one in front of it: queueing delay on a FIFO path, which stretches and compresses the spacing and never
-changes the order. Only `reorder` overtakes. This matters beyond realism: QUIC reads an overtake as loss,
+changes the order. The sigma may exceed `delay`, but a nonzero `jitter` still needs a nonzero `delay`. Only `reorder` overtakes. This matters beyond realism: QUIC reads an overtake as loss,
 retransmits and backs off, so a run meant to measure a jittery path ends up measuring the congestion
 response. On a 5ms delay with 5ms of jitter, reordering alone dragged a receiver's audio buffer from
 120ms to nearly two seconds.
@@ -85,14 +84,19 @@ both. A flow's treatment then depends on how its datagrams interleave with the o
 A paced hop, a Wi-Fi access point or a cellular scheduler bunches traffic: nothing moves for a while, then
 several datagrams arrive at once. A batch holds datagrams until `count` are waiting, or until `window`
 after the first arrived, then sends them all when the latest would have left. No delay or jitter produces
-that clump, and it is what a receiver's jitter estimate has to cope with.
+that clump, and it is what a receiver's jitter estimate has to cope with. A `count` below two is refused,
+since the datagram that fills a batch never waits.
 
 ## Steps
 
-A step changes a direction's delay, jitter, loss, reorder or rate limit once the run reaches `at`, counted
-from when forwarding started. It changes only what it names, so a later step puts one knob back. A rate
-step keeps the old bucket's credit, or its debt, clipped to the new one, and a limit that was not there
-starts full. A step can add or change a rate limit, never remove one. Steps come from a profile file.
+A step changes a direction's delay, jitter, loss or reorder once the run reaches `at`, counted from when
+forwarding started. It changes only what it names, so a later step puts one knob back. The rate limit
+never steps, since datagrams already queued behind it would keep the old rate's departures and a new
+rate would reorder them. A step that leaves the profile as it was, or comes at zero, is refused. Steps
+come from a profile file. `verify` holds each phase's impairments only to the traffic that phase treated.
+A direction that carried traffic fails `verify` unless some datagram saw each phase: the profile before
+the first step and after every step. Traffic that starts late, ends early, or goes quiet across a step
+never saw the path change.
 
 ## Profiles
 
@@ -134,7 +138,7 @@ delay = "5ms"
 ```
 
 `--profile` takes a file's path, or one of the built-ins in `profiles/`, embedded in the binary. The
-audio-quality lane (`test/audio-quality/`) runs the first five.
+audio-quality lane (`test/audio-quality/`) uses `bursty` and `step`, plus its own flag profiles.
 
 | Name | What it models |
 | --- | --- |
@@ -142,17 +146,8 @@ audio-quality lane (`test/audio-quality/`) runs the first five.
 | `mild` | A healthy wired LAN: 5ms delay, 5ms sigma, in order. |
 | `bursty` | A paced hop: seven datagrams per 160ms window, released together. |
 | `step` | 5ms for thirty seconds, then 60ms, with no recovery. |
-| `high-rtt` | An intercontinental path: 75ms one way, 30ms sigma, in order. |
-| `lossy` | 2% loss, with 1% of datagrams skipping a 20ms delay to overtake. |
 
 Each built-in is a shared path, as a browser page's sessions on one host would be.
-
-## TCP
-
-A relay serves `/certificate.sha256` over HTTP on the port number it serves QUIC on, and a browser fetches
-it before it dials WebTransport. With `tcp_passthrough`, the shaper listens for TCP on its own port and
-pipes each connection to the target untouched, so the page loads through it. TCP is never impaired: a
-reliable transport cannot shed load, so shaping it would only measure how TCP retransmits.
 
 ## Counters
 
@@ -178,8 +173,3 @@ A profile that silently did nothing turns an impaired run into an unimpaired pas
 for the shaper's own exit; a harness grading a run should also check the report, where `near-zero` is the
 only profile for which a `delayed` of zero is the right answer. Keep the name, the seed and the counters
 with the run's artifacts: the seed is what turns a failing run into one that can be looked at again.
-
-## Benchmark
-
-`cargo bench -p moq-shaper --bench forward` measures UDP round trips across 1, 10, and 100 clients,
-with 0, 4, and 64 scheduled profile steps. It checks packet contents and runs in nightly CI.

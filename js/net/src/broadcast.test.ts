@@ -109,6 +109,80 @@ test("concurrent dynamic producers share a sequence namespace", async () => {
 	broadcast.close();
 });
 
+test("a sibling producer's groups do not settle an aborted end", async () => {
+	const broadcast = new BroadcastProducer();
+	const firstSubscriber = broadcast.track("media").subscribe();
+	const secondSubscriber = broadcast.track("media").subscribe();
+	const firstRequest = await wireOf(broadcast).requested();
+	const secondRequest = await wireOf(broadcast).requested();
+	if (!firstRequest || !secondRequest) throw new Error("expected requests");
+	const firstProducer = firstRequest.accept();
+	const secondProducer = secondRequest.accept();
+
+	const reader = firstProducer.subscribe();
+	firstProducer.finishAt(3);
+	for (let i = 0; i < 3; i++) secondProducer.appendGroup().close();
+	const boom = new Error("boom");
+	firstProducer.close(boom);
+
+	// The first producer never received the groups its end promised, so it was cut off.
+	expect(firstProducer.closed.peek()).toBe(boom);
+	await expect(reader.recvGroup()).rejects.toBe(boom);
+
+	firstSubscriber.close();
+	secondSubscriber.close();
+	secondProducer.close();
+	broadcast.close();
+});
+
+test("a clean close ends at the track's own last group, not a sibling's", async () => {
+	const broadcast = new BroadcastProducer();
+	const firstSubscriber = broadcast.track("media").subscribe();
+	const secondSubscriber = broadcast.track("media").subscribe();
+	const firstRequest = await wireOf(broadcast).requested();
+	const secondRequest = await wireOf(broadcast).requested();
+	if (!firstRequest || !secondRequest) throw new Error("expected requests");
+	const firstProducer = firstRequest.accept();
+	const secondProducer = secondRequest.accept();
+
+	const reader = firstProducer.subscribe();
+	firstProducer.appendGroup().close();
+	for (let i = 0; i < 3; i++) secondProducer.appendGroup().close();
+	firstProducer.close();
+
+	// The sibling took 1..3, which the first producer will never send.
+	expect(reader.final()).toBe(1);
+
+	firstSubscriber.close();
+	secondSubscriber.close();
+	secondProducer.close();
+	broadcast.close();
+});
+
+test("finishAt accepts an end below a sibling's groups", async () => {
+	const broadcast = new BroadcastProducer();
+	const firstSubscriber = broadcast.track("media").subscribe();
+	const secondSubscriber = broadcast.track("media").subscribe();
+	const firstRequest = await wireOf(broadcast).requested();
+	const secondRequest = await wireOf(broadcast).requested();
+	if (!firstRequest || !secondRequest) throw new Error("expected requests");
+	const firstProducer = firstRequest.accept();
+	const secondProducer = secondRequest.accept();
+
+	const reader = firstProducer.subscribe();
+	firstProducer.appendGroup().close();
+	for (let i = 0; i < 3; i++) secondProducer.appendGroup().close();
+	expect(() => firstProducer.finishAt(0)).toThrow("track end 0 is below the next sequence 1");
+	firstProducer.finishAt(2);
+	expect(reader.final()).toBe(2);
+
+	firstSubscriber.close();
+	secondSubscriber.close();
+	firstProducer.close();
+	secondProducer.close();
+	broadcast.close();
+});
+
 test("closing a broadcast rejects a dequeued request", async () => {
 	const broadcast = new BroadcastProducer();
 	const subscriber = broadcast.track("media").subscribe();
@@ -412,4 +486,62 @@ test("a fetch waits for a group still to come", async () => {
 	expect(await group.readString()).toBe("1");
 
 	broadcast.close();
+});
+
+test("aborting a fetch rejects with the signal's reason", async () => {
+	const broadcast = new BroadcastProducer();
+	broadcast.createTrack("video");
+
+	const early = new Error("early");
+	await expect(wireOf(broadcast).fetchGroup("video", 0, { signal: AbortSignal.abort(early) })).rejects.toBe(early);
+
+	const controller = new AbortController();
+	const pending = wireOf(broadcast).fetchGroup("video", 0, { signal: controller.signal });
+	const late = new Error("late");
+	controller.abort(late);
+	await expect(pending).rejects.toBe(late);
+
+	broadcast.close();
+});
+
+test("broadcast demand watches static and pending tracks rather than broadcast handles", async () => {
+	const broadcast = new BroadcastProducer();
+	const demand = broadcast.demand();
+	const consumer = broadcast.consume();
+	expect(demand.used.peek()).toBe(false);
+	const video = broadcast.createTrack("video");
+	const first = video.subscribe();
+	await Promise.resolve();
+	expect(demand.used.peek()).toBe(true);
+	const second = consumer.track("audio").subscribe();
+	const request = await wireOf(broadcast).requested();
+	if (!request) throw new Error("expected request");
+	const requested = request.demand();
+	expect(requested.used.peek()).toBe(true);
+	first.close();
+	await Promise.resolve();
+	expect(demand.used.peek()).toBe(true);
+	second.close();
+	await requested.unused();
+	await demand.unused();
+	expect(demand.used.peek()).toBe(false);
+	request.reject();
+	video.close();
+	broadcast.close();
+	expect(await demand.closed).toBeNull();
+	consumer.close();
+});
+
+test("broadcast closure clears active demand and subscriptions", async () => {
+	const broadcast = new BroadcastProducer();
+	const track = broadcast.createTrack("video");
+	const subscriber = track.subscribe();
+	const demand = broadcast.demand();
+	await Promise.resolve();
+	expect(demand.used.peek()).toBe(true);
+	broadcast.close();
+	expect(demand.used.peek()).toBe(false);
+	await demand.unused();
+	subscriber.close();
+	track.close();
 });

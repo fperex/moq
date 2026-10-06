@@ -20,13 +20,17 @@ const SQ_ENTRIES: u32 = 256;
 
 /// Completion queue depth. Every in-flight operation can post a completion
 /// (one per send buffer with GSO on, one per provided receive buffer, the
-/// park futex, transient cancels), so this covers a few sockets at the
-/// default pool ceilings in [`udp::Config`]. Running past it is not fatal:
-/// the kernel backlogs completions (`IORING_FEAT_NODROP`) rather than drop
-/// them. But the backlog is an allocation-per-CQE slow path and it ends any
-/// armed multishot receive, so the CQ is sized to keep it out of steady
-/// state.
-const CQ_ENTRIES: u32 = 4096;
+/// park futex, transient cancels), so this covers one socket at the default
+/// pool ceilings in [`udp::Config`], the one-socket-per-worker layout the
+/// relay runs. Running past it is not fatal: the kernel backlogs completions
+/// (`IORING_FEAT_NODROP`) rather than drop them. But the backlog is an
+/// allocation-per-CQE slow path and it ends any armed multishot receive, so
+/// the CQ is sized to keep it out of steady state.
+///
+/// No larger: the ring is charged to `RLIMIT_MEMLOCK` at 16 bytes per entry,
+/// most of each worker's footprint, and that budget is shared by every
+/// io_uring the user runs.
+const CQ_ENTRIES: u32 = 2048;
 
 /// Maximum completions copied at once while teardown is deadline-bounded.
 const TEARDOWN_CQE_BATCH: usize = 64;
@@ -118,7 +122,7 @@ impl Worker {
 						kernel_release()
 					))
 				}
-				_ => Error::Io(err),
+				_ => Error::ring(err),
 			})?;
 
 		// One feature bit gates the whole floor: MIN_TIMEOUT landed in 6.12
@@ -891,14 +895,14 @@ mod tests {
 
 	#[test]
 	fn cq_covers_the_default_pool_ceilings() {
-		// The completion queue must cover at least two sockets at their
-		// default pool ceilings (plus the futex), or the kernel's overflow
-		// slow path becomes steady state for the workload the ceilings exist
-		// to serve. Fails when someone raises the udp defaults without
-		// revisiting CQ_ENTRIES.
+		// The completion queue must cover a socket at its default pool
+		// ceilings (plus the futex), or the kernel's overflow slow path
+		// becomes steady state for the workload the ceilings exist to serve.
+		// Fails when someone raises the udp defaults without revisiting
+		// CQ_ENTRIES.
 		let config = udp::Config::default();
 		let per_socket = u32::from(config.tx_buffers_max) + u32::from(config.rx_buffers_max);
-		assert!(CQ_ENTRIES > 2 * per_socket, "CQ_ENTRIES fell behind the pool defaults");
+		assert!(CQ_ENTRIES > per_socket, "CQ_ENTRIES fell behind the pool defaults");
 	}
 
 	#[test]
@@ -1122,6 +1126,63 @@ mod tests {
 			.expect_err("oversized segment");
 		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 		drop(worker);
+	}
+
+	/// A route or driver that cannot segment fails a GSO train with `EIO` or
+	/// `EINVAL`. The train goes out again one datagram at a time, later sends
+	/// skip GSO, and the socket stays usable. `SO_NO_CHECK` makes Linux refuse
+	/// every `UDP_SEGMENT` send with `EINVAL` while plain sends still go out.
+	#[test]
+	fn rejected_gso_train_is_resent_unsegmented() {
+		let Some(mut worker) = worker() else { return };
+		let handle = worker.handle();
+		let io = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+		let one: libc::c_int = 1;
+		// SAFETY: a valid socket and a c_int option value.
+		let rc = unsafe {
+			libc::setsockopt(
+				std::os::fd::AsRawFd::as_raw_fd(&io),
+				libc::SOL_SOCKET,
+				libc::SO_NO_CHECK,
+				(&raw const one).cast(),
+				std::mem::size_of_val(&one) as libc::socklen_t,
+			)
+		};
+		assert_eq!(rc, 0, "SO_NO_CHECK: {}", std::io::Error::last_os_error());
+		let sock = handle.udp(io, udp::Config::default()).expect("socket");
+		let to = sock.local_addr().expect("addr");
+
+		// Two trains of two: the first is rejected and resent, the second
+		// never tries GSO.
+		for _ in 0..2 {
+			let deadline = Instant::now() + Duration::from_secs(5);
+			let mut received = 0;
+			let Poll::Ready(Ok(mut tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
+				panic!("the socket failed after a rejected train");
+			};
+			tx[..2 * 1200].fill(7);
+			tx.send(udp::Transmit {
+				to,
+				len: 2 * 1200,
+				segment: 1200,
+				ecn: None,
+			})
+			.expect("send");
+			while received < 2 * 1200 && Instant::now() < deadline {
+				let handle = handle.clone();
+				worker
+					.block_on(async move {
+						Deadline::after(&handle, Duration::from_millis(10)).wait().await;
+					})
+					.unwrap();
+				while let Poll::Ready(packet) = sock.poll_recv(&kio::Waiter::noop()) {
+					received += packet.expect("receive path failed").payload().len();
+				}
+			}
+			assert_eq!(received, 2 * 1200, "the train was dropped");
+		}
+		// One rejected train, then two single datagrams for each train.
+		assert_eq!(handle.metrics().snapshot().tx_sends, 5);
 	}
 
 	/// The counters an ops scrape reads have to move for real work, and a

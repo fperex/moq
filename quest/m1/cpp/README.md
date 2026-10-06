@@ -1,16 +1,16 @@
-# C++ through moq-ffi
+# [S] C++ through moq-ffi
 
 ## Goal
 
-A C++ developer adds one registry line or one tarball, includes `<moq/moq.hpp>`,
+A C++ developer adds one release tarball, includes `<moq/moq.hpp>`,
 and holds the whole moq-ffi surface (session, origin, broadcast, track, group,
 media, audio and video) as RAII objects whose async operations return
 cancellable futures, with no `user_data` plumbing, no handle integers, and no
 thread of their own to babysit. The OBS plugin is the in-tree consumer that
 proves the shape; external SDK users are the audience.
 
-Non-goals: libmoq stays as the plain-C ABI, keeps its own release, and keeps
-following the Cross-Package Sync table like every other wrapper; no
+Non-goals: the plain-C ABI, which moves to C generated from moq-ffi in
+[Generated C bindings](/quest/m1/c/README.md); no
 second hand-written C++ surface (ergonomics are fixed in moq-ffi where every
 binding benefits); no wire or public Rust API change.
 
@@ -41,22 +41,45 @@ One library, C++17 floor (OBS's baseline), feature-gated extras: `co_await`
 on a future under `__cpp_impl_coroutine`, `std::expected` under
 `__cpp_lib_expected`. Never a second library per standard.
 
-Distribution is all of: a release tarball with a CMake package config and
-pkg-config file (mirroring `libmoq.yml`), a vcpkg registry we own, and a Conan
-remote we own, the latter two fetching the prebuilt tarball so consumers never
-need a Rust toolchain or the bindgen fork. vcpkg lands first; the Conan recipe
-reads the same release manifest so a release bumps both.
+Distribution is a release tarball with a CMake package config and pkg-config
+file (mirroring `moq-c.yml`), so consumers never need a Rust toolchain or the
+bindgen fork. Decided in the 2026-09-30 audit: this line promises the tarball
+only. A [vcpkg registry](/quest/m2/cpp-vcpkg.md) (m2) and a
+[Conan remote](/quest/m3/cpp-conan.md) (m3) fetch the same tarball later and
+stay deferred.
 
-## Quests
+Confirmed in [#4100](https://github.com/moq-dev/moq/pull/4100):
 
-- [Generator](/quest/m1/cpp/generator.md) - the uniffi 0.32 C++ generator with futures and expected-style errors, pinned and generating `cpp/ffi` in CI
-- [Package](/quest/m1/cpp/package.md) - the `cpp/moq` wrapper, CMake package, release tarball, interop client, and docs
-- [OBS migration](/quest/m1/cpp/obs.md) - the OBS plugin moves from libmoq handles and trampolines to the generated C++
+- The fork's base is LiveKit's PR #1 (`uniffi-0.31-async`), not PR #5,
+  which runs a worker thread per in-flight future and has no `then()` or
+  async callback interfaces, both of which OBS needs.
+- Fork tags keep upstream's `v<generator>+v<uniffi>` scheme with a
+  `-kixelated.N` pre-release (`v0.11.0-kixelated.1+v0.32.2`), matching the
+  Dart fork, so they never collide with an upstream tag.
+- Cancelling abandons the future rather than delivering an error: a generic
+  `E` has no cancelled variant, and a `std::variant<E, Cancelled>` would
+  burden every call site.
+- Callback interfaces are refused under `error_style = "expected"` until a
+  consumer needs one; their bridge is built on `std::exception_ptr`.
+- MSVC is covered by the post-merge nightly, not a branch dispatch: branches
+  never dispatch the nightly.
+
+Decided in the 2026-10-05 audit: the [FFI shape](/quest/m1/ffi-shape/README.md)
+line (#4519) lands first, and this line ports `cpp/moq`, `cpp/obs`, and the
+C++ interop client onto the reshaped moq-ffi, since its branch still calls
+APIs FFI shape deleted.
+
+Recorded in the 2026-10-06 audit: every child (generator #4100, package
+#4187, cancel, C++ standard, macOS alias check, OBS migration #4281) merged
+into the line branch, which deletes their quest files, so main deletes them
+too. What remains is landing [#4079](https://github.com/moq-dev/moq/pull/4079).
+
+## Required
+
+- [FFI shape](/quest/m1/ffi-shape/README.md) - lands first; this line ports onto its moq-ffi
 
 ## Related
 
-- [C# through moq-ffi](/quest/m2/cs/README.md) - the same recipe with NordSecurity's C# generator
-- [Unreal prototype](/quest/m2/unreal.md) - a UE5 module consumes the package with exceptions disabled
-- [#2907](/quest/m4/2907-bind-the-browser-through-moq-ffi-uniffi-instead-of-a.md) - the browser reaches moq-ffi through a generator too; shares the Task-per-target findings
 - [vcpkg registry](/quest/m2/cpp-vcpkg.md) - a registry we own serves the prebuilt package to `vcpkg` manifests
-- [Conan remote](/quest/m2/cpp-conan.md) - a remote we own serves the same tarball to `conan install`
+- [Conan remote](/quest/m3/cpp-conan.md) - a remote we own serves the prebuilt package to Conan
+- [Unreal prototype](/quest/m3/unreal.md) - a UE5 module consumes the package with exceptions disabled

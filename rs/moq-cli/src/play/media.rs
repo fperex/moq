@@ -3,78 +3,64 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use hang::moq_net;
-use moq_audio::playback::{Engine, Sink};
 use moq_mux::catalog::{self, Stream};
-use winit::event_loop::EventLoopProxy;
+// tokio's clock, which is the wall clock unless a test pauses it to drive the
+// playout clock itself.
+use tokio::time::Instant;
 
 use super::args::Args;
+use super::output::{Output, Sink, Speaker};
 use super::playback::{Kind, Playback, joined};
 use super::source::subscribe;
-use super::timeline::{AudioTimeline, Presentation, timestamp};
+use super::timeline::{AudioTimeline, Presentation, fit, timestamp};
+use super::video::Video;
 use super::window::Event;
 
-/// Decoded frames held for presentation, and the point at which the decoder is
-/// made to wait. About a second at 30fps: enough to absorb a burst, few enough
-/// that raw frames can't run away with memory.
-const MAX_VIDEO_FRAMES: usize = 30;
+/// The floor on the speaker's buffer, whatever delay was asked for. The device
+/// pulls on a fixed clock, so a ring shallower than this drops out on ordinary
+/// network jitter, and one with no depth at all can never be read from.
+const AUDIO_BUFFER_MIN: Duration = Duration::from_millis(50);
 
-/// How much audio the speaker holds between the decode task and the device.
+/// How far the speaker may run over its target before a write skips back onto
+/// it.
 ///
-/// Not the playout delay, which the jitter buffer inside
-/// [`moq_audio::decode::Consumer`] holds: only what the device needs to ride out
-/// the decode task being scheduled late. The engine runs on that task rather than
-/// in the device callback, which mixes every sink on the device and must not
-/// allocate, lock, or log, all of which the engine does.
-const AUDIO_DEVICE_CUSHION: Duration = Duration::from_millis(30);
+/// The level moves by a device period each time the speaker pulls and by a
+/// packet each time one lands, so a margin under that would skip on ordinary
+/// cadence. Anything over it is latency nobody asked for, since a live stream
+/// arrives as fast as it plays and never drains the excess on its own.
+const AUDIO_SLACK: Duration = Duration::from_millis(20);
 
-/// The deepest jitter buffer this player will let the measurement ask for.
-///
-/// A ceiling for the estimator to rise to, since `--delay` is only the floor; the
-/// consumer keeps the wire budget just above what it measures. Four thirds of the
-/// estimator's range, rounded up, because playout claims three quarters of the
-/// budget.
-const AUDIO_MAX_AGE: Duration =
-	Duration::from_nanos((moq_audio::decode::Options::DELAY_MAX.as_nanos() as u64 * 4).div_ceil(3));
+/// Silence written per slice when padding, so the buffer stays a fixed size.
+const AUDIO_SILENCE: Duration = Duration::from_millis(20);
 
-/// How much audio is handed to the speaker per write.
-///
-/// The playout delay lives in the sink, so every byte written past that depth
-/// overshoots it, and writing in slices keeps the overshoot under one slice
-/// however long a PCM frame is (an Opus packet caps at 120 ms, but a PCM one is
-/// only required to be sample-aligned). Pacing between the slices is also what
-/// stops `Sink::write`, which never blocks and drops whatever won't fit, from
-/// losing the tail of a burst.
-const AUDIO_CHUNK: Duration = Duration::from_millis(20);
-
-/// How much longer than the speaker could possibly hold to wait for it to
-/// drain. A device that never opens reports its queue as full forever, and a
-/// truncated tail beats hanging on the way out, but the budget has to cover the
-/// ring the delay asked for or every finite track loses its last `delay`.
+/// How much longer than the speaker holds to wait for it to drain. A device that
+/// never opens reports its queue as full forever, and a truncated tail beats
+/// hanging on the way out.
 const AUDIO_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// Everything the media task needs to fill the window and the speaker.
-pub(super) struct Media {
+pub(super) struct Media<O: Output> {
 	pub(super) origin: moq_net::origin::Consumer,
 	pub(super) broadcast: String,
 	pub(super) args: Args,
 	pub(super) video: Arc<Mutex<VecDeque<moq_video::Frame>>>,
 	pub(super) presentation: Arc<Mutex<Presentation>>,
 	pub(super) drained: Arc<tokio::sync::Notify>,
-	pub(super) proxy: EventLoopProxy<Event>,
+	pub(super) output: O,
 }
 
-impl Media {
+impl<O: Output> Media<O> {
 	pub(super) async fn run(self) {
-		let proxy = self.proxy.clone();
+		let output = self.output.clone();
 		let event = match self.play().await {
 			Ok(()) => Event::Ended,
 			Err(err) => Event::Failed(format!("{err:#}")),
 		};
-		let _ = proxy.send_event(event);
+		output.send(event);
 	}
 
 	async fn play(self) -> anyhow::Result<()> {
@@ -93,7 +79,7 @@ impl Media {
 		// it, so their sinks mix on one stream: a second stream on an exclusive
 		// device would fail to open. Released once none of them is left, so an
 		// idle `play` does not hold the device.
-		let mut engine = None;
+		let mut speaker = None;
 		// Retired audio sinks still playing out what they hold.
 		let mut tails = tokio::task::JoinSet::new();
 
@@ -118,10 +104,10 @@ impl Media {
 								// continue this one: its first frame re-pins.
 								self.presentation.lock().unwrap().restarted();
 							}
-							// The retired sink still holds what the device has not played, and a
-							// replacement fills its own jitter buffer before its first sample
-							// sounds. Played one after the other, a rendition switch costs that
-							// in silence, so the tail plays out while the replacement fills.
+							// The retired sink still holds a delay of audio, and a replacement
+							// holds its own before its first sample sounds. Played one after
+							// the other, a rendition switch costs that delay in silence, so the
+							// tail plays out while the replacement fills.
 							if let Some(sink) = sink {
 								tails.spawn(drain(sink));
 							}
@@ -148,11 +134,12 @@ impl Media {
 				}
 			}
 
-			// The engine is only open while some audio is, so releasing it marks the
+			// The speaker is only open while some audio is, so releasing it marks the
 			// last of it going quiet: nothing holds playback to the speaker's cadence
 			// any more, and video takes the anchor back.
-			if !playback.playing(Kind::Audio) && tails.is_empty() && engine.take().is_some() {
+			if !playback.playing(Kind::Audio) && tails.is_empty() && speaker.take().is_some() {
 				self.presentation.lock().unwrap().stopped();
+				self.drained.notify_one();
 			}
 
 			// Start whatever isn't playing from the newest snapshot, which is not
@@ -182,26 +169,45 @@ impl Media {
 							continue;
 						}
 					};
-					let mut decode = moq_video::decode::Options::new();
-					decode.start = moq_video::decode::Start::Latest;
 					// Nothing older than the playhead is worth presenting, so the delay
-					// doubles as the staleness budget on the wire.
-					decode.max_age = self.args.delay.into_std();
-					match moq_video::decode::Consumer::new(&rendition, &config, &name, decode).await {
-						Ok(consumer) => {
-							tracing::info!(track = name, decoder = consumer.name(), "playing video rendition");
-							let presentation = self.presentation.clone();
-							let video = self.video.clone();
-							let drained = self.drained.clone();
-							let proxy = self.proxy.clone();
-							tasks.spawn(async move {
-								(
-									Kind::Video,
-									play_video(consumer, presentation, video, drained, proxy)
-										.await
-										.map(|()| None),
-								)
-							});
+					// doubles as the staleness budget on the wire. With no speaker to
+					// follow, the playhead is video's own, so waiting on the audio
+					// estimate's budget would only freeze the picture.
+					let max_age = if snapshot.audio.renditions.is_empty() {
+						self.args.video_delay()
+					} else {
+						self.args.max_age()
+					};
+					let opened = async {
+						let decoder = moq_video::decode::Sink::open(&config, &Default::default()).await?;
+						let track = rendition.track(&name)?;
+						let mut subscriber = track
+							.subscribe(
+								moq_net::track::Subscription::default()
+									.with_priority(hang::catalog::PRIORITY.video)
+									.with_max_age(max_age),
+							)
+							.await?;
+						// Start at the local live edge without asking the shared publisher
+						// subscription to rewind to a cached sequence.
+						if let Some(latest) = track.latest() {
+							subscriber.set_groups(latest..);
+						}
+						let format = catalog::hang::Container::try_from(&config)?;
+						Ok::<_, anyhow::Error>((moq_mux::container::Consumer::new(subscriber, format), decoder))
+					}
+					.await;
+					match opened {
+						Ok((track, decoder)) => {
+							tracing::info!(track = name, decoder = decoder.name(), "playing video rendition");
+							let video = Video {
+								presentation: self.presentation.clone(),
+								frames: self.video.clone(),
+								changed: self.drained.clone(),
+								output: self.output.clone(),
+								max_age,
+							};
+							tasks.spawn(async move { (Kind::Video, video.run(track, decoder).await.map(|()| None)) });
 							playback.started(Kind::Video);
 							break;
 						}
@@ -224,27 +230,29 @@ impl Media {
 							continue;
 						}
 					};
-					// `--delay` is the floor under the jitter buffer, not the buffer
-					// itself: the consumer measures what arrives and holds at least
-					// this much, and the budget it keeps on the wire follows that
-					// measurement rather than the ceiling below.
 					let mut decode = moq_audio::decode::Options::new();
 					decode.start = moq_audio::decode::Start::Latest;
-					decode.delay = Some(self.args.delay.into_std());
-					decode.max_age = AUDIO_MAX_AGE;
+					// Floored: the speaker holds at least AUDIO_BUFFER_MIN whatever was
+					// asked for, so a smaller budget would skip a group the playhead could
+					// still have reached, and would size the hole fill below to a playhead
+					// that does not exist.
+					decode.max_age = self.args.max_age().max(AUDIO_BUFFER_MIN);
+					decode.delay = self.args.fixed_delay();
 					// The sink and the frame-duration math below both assume f32,
 					// so ask for it rather than inheriting the decoder default.
 					decode.output.format = moq_audio::Format::F32;
 					match moq_audio::decode::Consumer::new(&rendition, &config, &name, decode).await {
 						Ok(consumer) => {
-							tracing::info!(track = name, "playing audio rendition");
-							if engine.is_none() {
-								engine = Some(Engine::open(Default::default()).await?);
+							tracing::info!(track = name, decoder = consumer.name(), "playing audio rendition");
+							if speaker.is_none() {
+								speaker = Some(self.output.speaker().await?);
 							}
 							let audio = AudioPlayback {
-								engine: engine.clone().expect("opened above"),
+								speaker: speaker.clone().expect("opened above"),
 								presentation: self.presentation.clone(),
-								proxy: self.proxy.clone(),
+								latency: self.args.fixed_delay().unwrap_or_default().max(AUDIO_BUFFER_MIN),
+								changed: self.drained.clone(),
+								output: self.output.clone(),
 							};
 							tasks.spawn(async move { (Kind::Audio, play_audio(consumer, audio).await.map(Some)) });
 							playback.started(Kind::Audio);
@@ -269,58 +277,36 @@ impl Media {
 	}
 }
 
-async fn play_video(
-	mut consumer: moq_video::decode::Consumer,
+struct AudioPlayback<O: Output> {
+	changed: Arc<tokio::sync::Notify>,
+	speaker: O::Speaker,
 	presentation: Arc<Mutex<Presentation>>,
-	video: Arc<Mutex<VecDeque<moq_video::Frame>>>,
-	drained: Arc<tokio::sync::Notify>,
-	proxy: EventLoopProxy<Event>,
-) -> anyhow::Result<()> {
-	while let Some(frame) = consumer.read().await? {
-		// Fold the arrival into the playout clock before queueing it, so the window
-		// always has a deadline for whatever it finds in the queue. A move has to
-		// wake it before the wait below, not after: the window is asleep on the old
-		// anchor's deadline, and it is the only thing that drains the queue this
-		// task is about to block on.
-		if presentation.lock().unwrap().video(frame.timestamp, Instant::now()) {
-			let _ = proxy.send_event(Event::Wake);
-		}
-
-		// Wait for room rather than dropping the oldest. Audio is paced to real
-		// time, so during a catch-up burst the frames at the front are still ahead
-		// of the clock, and dropping them would blank the window until the clock
-		// reached whatever survived. The playout clock is anchored to the wall
-		// clock, so the queue always drains and this always clears.
-		while video.lock().unwrap().len() >= MAX_VIDEO_FRAMES {
-			drained.notified().await;
-		}
-
-		video.lock().unwrap().push_back(frame);
-		let _ = proxy.send_event(Event::Wake);
-	}
-	Ok(())
+	/// The depth the sink opens on, which also sizes its ring.
+	latency: Duration,
+	output: O,
 }
 
-struct AudioPlayback {
-	engine: Engine,
-	presentation: Arc<Mutex<Presentation>>,
-	proxy: EventLoopProxy<Event>,
-}
-
-/// Play a track until it ends, handing back the sink with what it still holds.
-async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPlayback) -> anyhow::Result<Sink> {
+/// Play a track until it ends, handing back the sink with the delay it still
+/// holds.
+async fn play_audio<O: Output>(
+	mut consumer: moq_audio::decode::Consumer,
+	playback: AudioPlayback<O>,
+) -> anyhow::Result<<O::Speaker as Speaker>::Sink> {
 	let AudioPlayback {
-		engine,
+		changed,
+		speaker,
 		presentation,
-		proxy,
+		latency,
+		output,
 	} = playback;
 
-	// The playout delay lives in the consumer's jitter buffer, which hands back one
-	// block at a time whatever the network is doing; the speaker holds only the
-	// cushion the device needs. Pacing is what keeps the two in step: the loop below
-	// waits for the ring to drain to the cushion before pulling the next block, so
-	// the blocks come out on the device's clock, and the window schedules video
-	// against where the speaker has actually reached.
+	// The playout delay is the consumer's to size, from how unevenly packets arrive,
+	// and the sink is where it lives: a sample handed over now sounds that much
+	// later. That estimate times each packet when `read` hands it over, so this
+	// loop never waits on the speaker between reads. It writes everything as it
+	// comes and lets `fit` hold the sink on the target instead. The window
+	// schedules video against where the speaker actually is, which keeps the two
+	// together whatever the target does.
 	let sample_rate = consumer.sample_rate();
 	let layout = consumer.layout();
 	let channels = layout.channels();
@@ -328,15 +314,26 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 	input.format = moq_audio::Format::F32;
 	input.sample_rate = sample_rate;
 	input.layout = layout;
-	input.latency = AUDIO_DEVICE_CUSHION;
-	let mut sink = engine.sink(input.clone())?;
+	// The floor the sink opens on and pads an underflow back to, and what sizes
+	// its ring, so a fixed delay has to be it or the ring could not hold it. An
+	// estimated target moves, so it gets the floor, and `fit` steers the sink
+	// onto the target on every write.
+	input.latency = latency;
+	let mut sink = speaker.sink(input.clone())?;
+	let mut dry = true;
 
-	// The furthest the media timeline may step forward between blocks and still be
-	// the same timeline, in samples. Playout splices over the holes it can, so a
-	// step this big is a stream that restarted somewhere else rather than a gap:
-	// the sink starts over and the clock re-anchors, since audio buffered against
-	// the old timeline cannot be carried across.
-	let fill_max = (consumer.max_age().as_secs_f64() * sample_rate as f64) as u64;
+	// One sample across every channel, the unit a write has to stay aligned to.
+	let stride = channels as usize * size_of::<f32>();
+	let samples = |duration: Duration| (duration.as_secs_f64() * sample_rate as f64).round() as u64;
+	let slack = samples(AUDIO_SLACK);
+	let silence = vec![0u8; samples(AUDIO_SILENCE).max(1) as usize * stride];
+
+	// The longest hole worth playing through, in samples. A hole this player would
+	// rather sit through is one it is already willing to buffer, which is what the
+	// decoder's latency budget says: anything longer is what that budget chose to
+	// skip, so playing it as silence would hand back the delay the skip avoided.
+	// Past it the sink skips the hole and the clock re-anchors, as it does today.
+	let fill_max = samples(consumer.max_age());
 
 	let mut timeline = AudioTimeline::default();
 
@@ -364,9 +361,9 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 		};
 		dropping = false;
 
-		let samples = frame.data.len() / size_of::<f32>() / channels as usize;
+		let length = frame.data.len() / stride;
 		let start = timestamp(frame.timestamp);
-		let timing = timeline.push(start, samples, sample_rate, fill_max);
+		let timing = timeline.push(start, length, sample_rate, fill_max);
 
 		// A rewind or a hole too large to fill starts a new playback sink. The old
 		// sink has no media clock, so its buffered audio cannot be carried across a
@@ -374,16 +371,35 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 		if timing.reset_sink {
 			drop(sink);
 			presentation.lock().unwrap().restarted();
-			sink = engine.sink(input.clone())?;
+			sink = speaker.sink(input.clone())?;
+			dry = true;
 		}
 
-		// Let the speaker drain back to the cushion before topping it up. This is
-		// what paces the whole task: playout hands back a block the moment it is
-		// asked, so the device's own clock is what decides when to ask.
-		if let Some(excess) = sink.buffered().checked_sub(AUDIO_DEVICE_CUSHION) {
-			tokio::time::sleep(excess).await;
+		// A hole in the media is a hole in the audio, not a splice. Handing the next
+		// frame straight to the speaker shortens the track by the missing duration,
+		// which leaves it running ahead of media time until the clock below
+		// re-anchors, taking the video with it. So the hole goes in as silence ahead
+		// of the frame, and the pair is fitted to the target as one write.
+		let buffered = samples(sink.buffered());
+		dry |= buffered == 0;
+		// Capped at the age budget: audio older than it is skipped rather than held,
+		// so a deeper target could never fill. The advertised floor needs the cap,
+		// being a number the publisher declared about itself, unbounded. The budget
+		// is also what the sink's ring was sized to hold.
+		let target = samples(consumer.delay().min(consumer.max_age()).max(AUDIO_BUFFER_MIN));
+		let fit = fit(dry, buffered, target, slack, timing.silence + length as u64);
+		dry = false;
+
+		// Playback drops stay on the live timeline; retrying them would add latency,
+		// and the sink already reports them in its logs.
+		let mut quiet = fit.pad + timing.silence.saturating_sub(fit.skip);
+		while quiet > 0 {
+			let part = (quiet as usize * stride).min(silence.len());
+			let _ = sink.write(&silence[..part])?;
+			quiet -= (part / stride) as u64;
 		}
-		let _ = sink.write(&frame.data)?;
+		let skip = fit.skip.saturating_sub(timing.silence) as usize * stride;
+		let _ = sink.write(&frame.data[skip.min(frame.data.len())..])?;
 
 		// Anchor the playout clock on where the speaker has actually reached, which
 		// is the only half of the pipeline that cannot skip ahead. A move has to
@@ -392,9 +408,10 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 		let moved = presentation
 			.lock()
 			.unwrap()
-			.audio(timing.end, sink.buffered(), Instant::now());
+			.audio(timing.end, sink.buffered(), Instant::now().into_std());
 		if moved {
-			let _ = proxy.send_event(Event::Wake);
+			changed.notify_one();
+			output.send(Event::Wake);
 		}
 	}
 
@@ -403,44 +420,245 @@ async fn play_audio(mut consumer: moq_audio::decode::Consumer, playback: AudioPl
 
 /// Play out what a retired sink still holds, instead of cutting the tail off
 /// by dropping it.
-async fn drain(sink: Sink) {
-	let drain = async {
-		// A partial period is left to the device: waiting on the last few
-		// milliseconds costs a wakeup per iteration and can never fully settle.
-		while let Some(remaining) = sink.buffered().checked_sub(Duration::from_millis(10)) {
-			tokio::time::sleep(remaining.max(Duration::from_millis(10))).await;
-		}
-	};
-	// A write tops the ring up to its latency, the device cushion, and then adds a block, so that
-	// sum is the deepest it can be when the track ends, and draining it takes exactly that long in
-	// real time.
-	let _ = tokio::time::timeout(sink.input().latency + AUDIO_CHUNK + AUDIO_DRAIN_GRACE, drain).await;
+async fn drain(sink: impl Sink) {
+	// The estimated target moves, so the depth the sink was opened with says
+	// nothing about what it holds now: read it at retirement instead.
+	let _ = tokio::time::timeout(sink.buffered() + AUDIO_DRAIN_GRACE, sink.finish()).await;
 }
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use bytes::Bytes;
+	use hang::catalog::{AudioCodec, AudioConfig};
+	use moq_mux::catalog::hang::Container;
 
-	/// The ceiling has to leave the estimator its whole range above the floor.
-	///
-	/// Sizing it from `--delay` instead is the trap: playout claims three quarters
-	/// of the budget, so a budget four thirds of the floor pins the target to the
-	/// floor, and a measured jitter buffer that can never measure anything is just a
-	/// fixed one with extra steps.
-	#[test]
-	fn the_budget_leaves_the_estimator_room_to_rise() {
-		assert!(
-			AUDIO_MAX_AGE * 3 / 4 >= moq_audio::decode::Options::DELAY_MAX,
-			"{AUDIO_MAX_AGE:?} caps the target below {:?}",
-			moq_audio::decode::Options::DELAY_MAX
-		);
+	use super::*;
+	use crate::play::args::Delay;
+	use crate::play::fake::Recorder;
+
+	const SAMPLE_RATE: u32 = 48_000;
+	/// Samples per packet.
+	const PACKET: u64 = 960;
+	const PACKET_DURATION: Duration = Duration::from_millis(20);
+
+	/// A mono PCM rendition, published and named in the catalog until dropped.
+	fn rendition(
+		broadcast: &moq_net::broadcast::Producer,
+		catalog: &catalog::Producer,
+		name: &str,
+	) -> moq_mux::container::Producer<Container, AudioConfig> {
+		let track = broadcast
+			.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		catalog
+			.audio(
+				track,
+				Container::Legacy(moq_mux::container::Kind::Audio),
+				AudioConfig::new(AudioCodec::Pcm, SAMPLE_RATE, 1),
+			)
+			.unwrap()
 	}
 
-	/// The speaker holds only what the device needs, since the delay lives in the
-	/// jitter buffer. A cushion as deep as the delay would add it twice.
-	#[test]
-	fn the_device_cushion_is_not_the_delay() {
-		assert!(AUDIO_DEVICE_CUSHION < Duration::from_millis(50));
-		assert!(!AUDIO_DEVICE_CUSHION.is_zero(), "a ring with no depth cannot be read");
+	/// The `index`th packet of the broadcast, every sample set to `sample` so the
+	/// recorder can tell which rendition played it.
+	fn packet(index: u64, sample: f32) -> moq_mux::container::Frame {
+		let payload: Vec<u8> = std::iter::repeat_n(sample.to_le_bytes(), PACKET as usize)
+			.flatten()
+			.collect();
+		moq_mux::container::Frame {
+			timestamp: moq_net::Timestamp::from_scale(index * PACKET, SAMPLE_RATE as u64).unwrap(),
+			duration: None,
+			payload: Bytes::from(payload),
+			keyframe: true,
+		}
+	}
+
+	fn media(origin: &moq_net::origin::Producer, delay: Duration, output: Recorder) -> Media<Recorder> {
+		Media {
+			origin: origin.consume(),
+			broadcast: "room".to_string(),
+			args: Args {
+				catalog_format: None,
+				delay: Delay::Fixed(delay),
+				select: Default::default(),
+			},
+			video: Default::default(),
+			presentation: Arc::new(Mutex::new(Presentation::new(delay))),
+			drained: Default::default(),
+			output,
+		}
+	}
+
+	/// A publisher retires an audio rendition by naming its replacement and then
+	/// finishing the old track. The retired sink still holds a delay of audio, and
+	/// the replacement's sink holds its own before its first sample sounds, so
+	/// played one after the other the switch costs a delay of silence (#3966).
+	#[tokio::test]
+	async fn an_audio_rendition_switch_leaves_no_gap() {
+		tokio::time::pause();
+
+		const OLD: f32 = 0.25;
+		const NEW: f32 = 0.5;
+		let delay = Duration::from_millis(500);
+
+		let origin = moq_tokio::origin::spawn();
+		let mut broadcast = origin.create_broadcast("room").unwrap();
+		broadcast.announce(Default::default()).unwrap();
+		let mut catalog = catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+
+		let recorder = Recorder::default();
+		let player = tokio::spawn(media(&origin, delay, recorder.clone()).run());
+
+		// A second of the old rendition, published in real time.
+		// Paced against absolute deadlines: tokio rounds each sleep up to the next
+		// millisecond, which relative sleeps would accumulate into a publisher
+		// falling behind the speaker.
+		let mut old = rendition(&broadcast, &catalog, "old");
+		let start = Instant::now();
+		let mut index = 0;
+		while index < 50 {
+			old.write(packet(index, OLD)).unwrap();
+			index += 1;
+			tokio::time::sleep_until(start + PACKET_DURATION * index as u32).await;
+		}
+
+		// The replacement joins the catalog, then the old track finishes.
+		let mut new = rendition(&broadcast, &catalog, "new");
+		new.write(packet(index, NEW)).unwrap();
+		index += 1;
+		old.finish().unwrap();
+		drop(old);
+
+		while index < 100 {
+			tokio::time::sleep_until(start + PACKET_DURATION * index as u32).await;
+			new.write(packet(index, NEW)).unwrap();
+			index += 1;
+		}
+		new.finish().unwrap();
+		drop(new);
+		catalog.finish().unwrap();
+
+		player.await.unwrap();
+		match recorder.events().pop() {
+			Some(Event::Ended) => {}
+			Some(Event::Failed(err)) => panic!("playback failed: {err}"),
+			_ => panic!("playback never ended"),
+		}
+
+		let played = recorder.played();
+		let old_end = played.iter().filter(|p| p.sample == OLD).map(|p| p.to).max().unwrap();
+		let new_start = played.iter().filter(|p| p.sample == NEW).map(|p| p.from).min().unwrap();
+		// Tokio rounds the replacement's pacing sleep to the next millisecond.
+		// The exact sample count below rules out any truncation within that tick.
+		let gap = new_start.saturating_duration_since(old_end);
+		assert!(gap <= Duration::from_millis(1), "the switch went silent for {gap:?}");
+		let old_duration: Duration = played.iter().filter(|p| p.sample == OLD).map(|p| p.to - p.from).sum();
+		assert_eq!(old_duration, Duration::from_secs(1));
+	}
+	#[tokio::test]
+	async fn a_finite_audio_track_plays_its_final_samples() {
+		tokio::time::pause();
+		let origin = moq_tokio::origin::spawn();
+		let mut broadcast = origin.create_broadcast("room").unwrap();
+		broadcast.announce(Default::default()).unwrap();
+		let mut catalog = catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+		let recorder = Recorder::default();
+		let player = tokio::spawn(media(&origin, Duration::from_millis(50), recorder.clone()).run());
+		let mut audio = rendition(&broadcast, &catalog, "audio");
+		audio.write(packet(0, 0.25)).unwrap();
+		tokio::time::sleep(PACKET_DURATION).await;
+		audio.finish().unwrap();
+		drop(audio);
+		catalog.finish().unwrap();
+		player.await.unwrap();
+		match recorder.events().pop() {
+			Some(Event::Ended) => {}
+			Some(Event::Failed(err)) => panic!("playback failed: {err}"),
+			_ => panic!("playback never ended"),
+		}
+		let played: Duration = recorder.played().iter().map(|p| p.to - p.from).sum();
+		assert_eq!(played, PACKET_DURATION, "the finished track lost its tail");
+	}
+
+	/// The 61-frame tune-in burst from #3946 must reach the clock before the
+	/// window drains its first picture, regardless of the raw queue's capacity.
+	#[tokio::test]
+	async fn a_wide_delay_observes_the_whole_tune_in_burst() {
+		tokio::time::pause();
+		let delay = Duration::from_secs(2);
+		let origin = moq_tokio::origin::spawn();
+		let broadcast = origin.create_broadcast("room").unwrap();
+		let track = broadcast
+			.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
+		let mut producer = moq_mux::container::Producer::new(track, Container::Legacy(moq_mux::container::Kind::Data));
+		let mut config = moq_video::encode::Config::new(64, 64, moq_video::Rate::new(30, 1).unwrap());
+		config.kind = moq_video::encode::Kind::Software;
+		config.gop = moq_video::encode::Gop::Keyframe { interval: 120 };
+		let mut encoder = moq_video::encode::Encoder::new(&config).unwrap();
+		for index in 0..=60 {
+			let surface = moq_video::Surface::rgba(&vec![128; 64 * 64 * 4], moq_video::Size::new(64, 64)).unwrap();
+			let frame = moq_video::Frame::new(surface, moq_net::Timestamp::from_millis(index * 33).unwrap());
+			for encoded in encoder.encode(&frame).unwrap() {
+				producer
+					.write(moq_mux::container::Frame {
+						timestamp: encoded.timestamp,
+						duration: None,
+						payload: encoded.payload,
+						keyframe: index == 0,
+					})
+					.unwrap();
+			}
+		}
+		producer.finish().unwrap();
+		let catalog = hang::catalog::VideoConfig::new(hang::catalog::H264 {
+			inline: true,
+			profile: 0x42,
+			constraints: 0,
+			level: 30,
+		});
+		let mut options = moq_video::decode::Options::new();
+		options.decoder.kind = moq_video::decode::Kind::Software;
+		options.max_age = delay;
+		let decoder = moq_video::decode::Sink::open(&catalog, &options.decoder).await.unwrap();
+		let subscriber = broadcast
+			.consume()
+			.track("video")
+			.unwrap()
+			.subscribe(moq_net::track::Subscription::default().with_max_age(delay))
+			.await
+			.unwrap();
+		let track = moq_mux::container::Consumer::new(subscriber, Container::try_from(&catalog).unwrap());
+		let recorder = Recorder::default();
+		let media = media(&origin, delay, recorder.clone());
+		let now = Instant::now();
+		let last = moq_net::Timestamp::from_millis(60 * 33).unwrap();
+		let task = tokio::spawn(
+			Video {
+				presentation: media.presentation.clone(),
+				frames: media.video.clone(),
+				changed: media.drained.clone(),
+				output: recorder.clone(),
+				max_age: delay,
+			}
+			.run(track, decoder),
+		);
+		loop {
+			tokio::task::yield_now().await;
+			if media.video.lock().unwrap().len() == 30
+				|| media.presentation.lock().unwrap().due(last) == Some((now + delay).into_std())
+			{
+				break;
+			}
+		}
+		let due = media.presentation.lock().unwrap().due(last);
+		task.abort();
+		let _ = task.await;
+		assert_eq!(
+			due,
+			Some((now + delay).into_std()),
+			"the decoder did not observe the live edge"
+		);
+		assert!(recorder.present(&media).is_none(), "nothing is due before its delay");
 	}
 }

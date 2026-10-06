@@ -91,8 +91,9 @@ pub struct Config {
 
 	/// How long accepted sessions may keep running after a shutdown signal, e.g.
 	/// "10s" or "500ms". The first signal sends every session a GOAWAY and waits
-	/// this long for clients to reconnect elsewhere before force-closing them; a
-	/// second signal exits immediately. Zero closes them at once, with no GOAWAY
+	/// up to this long for clients to reconnect elsewhere before force-closing
+	/// them, exiting as soon as they have all left; a second signal exits
+	/// immediately. Zero closes them at once, with no GOAWAY
 	/// they would have no time to act on. Defaults to 10 seconds.
 	#[usage(skip)]
 	#[serde(with = "crate::duration::serde_duration")]
@@ -310,6 +311,7 @@ impl Config {
 		deprecated.extend(self.listen.deprecated());
 		deprecated.extend(self.connect.deprecated());
 		deprecated.extend(self.cluster.deprecated());
+		deprecated.extend(self.auth.deprecated());
 		if let Some(server) = &self.server {
 			deprecated.toml("[server]", "[listen]", None);
 			deprecated.extend(server.deprecated());
@@ -344,6 +346,17 @@ impl Config {
 mod tests {
 	use super::*;
 	use crate::test_env::EnvGuard;
+
+	#[test]
+	fn packaged_service_arguments() {
+		let unit = include_str!("../../../packaging/moq-relay/moq-relay.service");
+		let command = unit.lines().find_map(|line| line.strip_prefix("ExecStart=")).unwrap();
+		let mut args = command.split_whitespace();
+		assert_eq!(args.next(), Some("/usr/bin/moq-relay"));
+		let args: Vec<_> = args.map(std::ffi::OsStr::new).collect();
+		let cli = Cli::parse_from(&args).expect("packaged service arguments must parse");
+		assert_eq!(cli.config.file.as_deref(), Some("/etc/moq-relay/relay.toml"));
+	}
 
 	/// The relay's own default still applies once the released spellings are gone.
 	#[test]
@@ -423,6 +436,66 @@ max_streams = 64
 		assert!(err.contains("both directions"), "{err}");
 	}
 
+	/// A 0.14 `[auth]` config with `key` and `public` would otherwise boot with
+	/// every JWT ignored; each removed key refuses with its replacement named.
+	#[test]
+	fn released_auth_keys_refuse_to_boot() {
+		let toml = r#"
+[auth]
+key = "root.jwk"
+key_dir = "keys/"
+auth_api = "https://api.example.com/auth"
+domains = ["example.com"]
+mtls_tier = "internal"
+public = "anon/**"
+
+[auth.tls]
+root = ["ca.pem"]
+"#;
+		let mut config: Config = toml::from_str(toml).expect("released config must still parse");
+		let err = config.resolve().expect_err("must refuse").to_string();
+		for old in [
+			"[auth] key -> --auth-url to `moq auth serve --key`",
+			"[auth] key_dir -> --auth-url to `moq auth serve --key-dir`",
+			"[auth] auth_api -> ",
+			"[auth] domains -> ",
+			"[auth] mtls_tier -> --auth-url to `moq auth serve --tier`",
+			"[auth.tls] -> --connect-tls-*",
+		] {
+			assert!(err.contains(old), "{old}: {err}");
+		}
+	}
+
+	/// The environment is the half a removed flag silently misses: a relay deployed
+	/// through it never typed the flag.
+	#[test]
+	fn released_auth_env_refuses_to_boot() {
+		let vars = [
+			("MOQ_AUTH_KEY", "--auth-key / MOQ_AUTH_KEY"),
+			("MOQ_AUTH_KEY_DIR", "--auth-key-dir / MOQ_AUTH_KEY_DIR"),
+			("MOQ_AUTH_API", "--auth-api / MOQ_AUTH_API"),
+			("MOQ_AUTH_PUBLIC_API", "--auth-public-api / MOQ_AUTH_PUBLIC_API"),
+			("MOQ_AUTH_DOMAIN", "--auth-domain / MOQ_AUTH_DOMAIN"),
+			("MOQ_AUTH_MTLS_TIER", "--auth-mtls-tier / MOQ_AUTH_MTLS_TIER"),
+			("MOQ_AUTH_TLS_ROOT", "--auth-tls-* / MOQ_AUTH_TLS_*"),
+		];
+		let _env = EnvGuard::clear(&vars.map(|(var, _)| var));
+		for (var, spelling) in vars {
+			unsafe { std::env::set_var(var, "x") };
+			let err = Config::parse_and_merge(["moq-relay", "--auth-public", "**"])
+				.expect_err("must refuse")
+				.to_string();
+			unsafe { std::env::remove_var(var) };
+			assert!(err.contains(spelling), "{var}: {err}");
+		}
+
+		// 0.14 took the bare flag, so it has to parse to be refused by name.
+		let err = Config::parse_and_merge(["moq-relay", "--auth-public", "**", "--auth-tls-disable-verify"])
+			.expect_err("must refuse")
+			.to_string();
+		assert!(err.contains("--auth-tls-* / MOQ_AUTH_TLS_*"), "{err}");
+	}
+
 	/// A released flag and a released table are refused together, in one message.
 	///
 	/// The flag lands on a hidden field the merge's TOML round-trip drops, so a
@@ -486,7 +559,7 @@ max_streams = 64
 	/// Bare defaults loaded from TOML survive when the CLI does not mention them.
 	#[test]
 	fn cli_does_not_clobber_toml_stats_enabled() {
-		let _env = EnvGuard::clear(&["MOQ_STATS_ENABLED", "MOQ_STATS_DEPTH"]);
+		let _env = EnvGuard::clear(&["MOQ_STATS_ENABLED", "MOQ_STATS_DEPTH", "MOQ_STATS_LINGER"]);
 
 		let toml = r#"
 [stats]
@@ -494,6 +567,7 @@ enabled = true
 interval = 5
 node = "localhost"
 depth = 2
+linger = "2m"
 "#;
 		let dir = std::env::temp_dir().join("moq-relay-config-test");
 		std::fs::create_dir_all(&dir).unwrap();
@@ -510,6 +584,15 @@ depth = 2
 		assert_eq!(config.stats.interval, 5);
 		assert_eq!(config.stats.node.as_deref(), Some("localhost"));
 		assert_eq!(config.stats.depth, 2);
+		assert_eq!(config.stats.linger(), Some(std::time::Duration::from_secs(120)));
+
+		let args = vec![
+			std::ffi::OsString::from("moq-relay"),
+			std::ffi::OsString::from(&path),
+			std::ffi::OsString::from("--stats-linger=30s"),
+		];
+		let config = Config::parse_and_merge(args).expect("config load");
+		assert_eq!(config.stats.linger(), Some(std::time::Duration::from_secs(30)));
 	}
 
 	/// Bare runtime defaults loaded from TOML survive when the CLI omits them.
@@ -619,25 +702,6 @@ duration = "30s"
 		assert_eq!(decoded.duration, set.duration, "round trip must preserve the duration");
 
 		toml::to_string(&unset).expect("serialize None");
-	}
-
-	/// A released TOML value still survives the merge so the refusal can name it.
-	#[test]
-	fn cli_does_not_clobber_toml_linger() {
-		let _env = EnvGuard::clear(&["MOQ_CLUSTER_LINGER"]);
-
-		let toml = r#"
-[cluster]
-linger = "30s"
-"#;
-		let dir = std::env::temp_dir().join("moq-relay-config-test");
-		std::fs::create_dir_all(&dir).unwrap();
-		let path = dir.join("linger-toml-wins.toml");
-		std::fs::write(&path, toml).unwrap();
-
-		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
-		let err = Config::parse_and_merge(args).expect_err("must refuse").to_string();
-		assert!(err.contains("--cluster-linger"), "{err}");
 	}
 
 	/// Preferred addresses loaded from TOML survive when the CLI omits them.

@@ -6,11 +6,25 @@ use web_transport_trait::Stats as _;
 
 use crate::{Error, SessionError, Version, bandwidth, goaway};
 
+/// How long [`Session::close`] waits for queued data before closing anyway.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// A close requested by a session handle, executed by the driver.
 #[derive(Clone)]
-struct Close {
-	code: u32,
-	reason: String,
+enum Close {
+	/// Close now with this code.
+	Abort { code: u32, reason: String },
+	/// Close once the protocol owes the peer nothing, or at [`CLOSE_TIMEOUT`].
+	Drain,
+}
+
+/// How the session ended, published by the driver.
+#[derive(Clone)]
+struct Ended {
+	/// The transport's terminal error.
+	err: Error,
+	/// The drain's outcome, when a drain is what closed the transport.
+	drain: Option<Result<(), Error>>,
 }
 
 /// The stats cell shared between the driver's sampler and the handles.
@@ -19,6 +33,31 @@ struct StatsState {
 	sample: Stats,
 	/// A handle read the stats since the last sample: keep sampling.
 	demanded: bool,
+}
+
+/// How [`Session::setup`] learns that the peer's SETUP arrived.
+#[derive(Clone)]
+pub(crate) enum Setup {
+	/// The handshake read it before the session started.
+	Read,
+	/// The lite driver records it from the peer's Setup Stream.
+	Lite(crate::lite::PeerSetup),
+	/// The moq-transport driver records it from the peer's SETUP stream.
+	Ietf(crate::ietf::peer::PeerSetup),
+	/// The version carries no SETUP from the peer.
+	Never,
+}
+
+impl Setup {
+	/// `Ready(true)` once the SETUP arrived, `Ready(false)` if it never will.
+	fn poll(&self, waiter: &kio::Waiter) -> Poll<bool> {
+		match self {
+			Self::Read => Poll::Ready(true),
+			Self::Lite(setup) => setup.poll_seen(waiter).map(|()| true),
+			Self::Ietf(setup) => setup.poll_seen(waiter).map(|()| true),
+			Self::Never => Poll::Ready(false),
+		}
+	}
 }
 
 /// A snapshot of connection statistics for a [`Session`].
@@ -76,16 +115,18 @@ pub struct Stats {
 /// the stats sample) is relayed through the driver.
 #[derive(Clone)]
 pub struct Session {
-	/// Handle side to driver: `Some` once [`abort`](Self::abort) ran; the
-	/// channel closing (the last handle dropping) is the implicit Cancel.
+	/// Handle side to driver: `Some` once [`abort`](Self::abort) or
+	/// [`close`](Self::close) ran; the channel closing (the last handle
+	/// dropping) is the implicit Cancel, unless a drain was already requested.
 	close: kio::Producer<Option<Close>>,
-	/// Driver to handle side: the transport's terminal error.
-	closed: kio::Consumer<Option<Error>>,
+	/// Driver to handle side: how the transport ended.
+	closed: kio::Consumer<Option<Ended>>,
 	stats: kio::Shared<StatsState>,
 	version: Version,
 	send_bandwidth: Option<bandwidth::Consumer>,
 	recv_bandwidth: Option<bandwidth::Consumer>,
 	goaway: Arc<goaway::Handle>,
+	setup: Setup,
 }
 
 impl Session {
@@ -129,18 +170,52 @@ impl Session {
 	}
 
 	/// Close the transport with an explicit error, instead of waiting for the last
-	/// clone to drop. Idempotent: the first close wins.
+	/// clone to drop. Idempotent: the first abort wins, and it cuts short a
+	/// [`close`](Self::close) still draining.
 	///
 	/// The close is executed by the session's driver, so it reaches the wire
 	/// once the runtime polls it (immediately on a live runtime).
 	pub fn abort(&self, err: Error) {
 		if let Ok(mut close) = self.close.write()
-			&& close.is_none()
+			&& !matches!(*close, Some(Close::Abort { .. }))
 		{
-			*close = Some(Close {
+			*close = Some(Close::Abort {
 				code: SessionError::from(&err).to_code(),
 				reason: err.to_string(),
 			});
+		}
+	}
+
+	/// Close the session once the data it queued has been delivered.
+	///
+	/// Waits until every stream still serving the peer (a subscription whose track
+	/// finished, a fetch, a track info reply) has written its data and FIN and the
+	/// peer acknowledged them, then closes the transport. Returns
+	/// [`Error::Timeout`] if that takes longer than one second, closing anyway, or
+	/// the session's terminal error if it ended some other way first. A track that
+	/// is still live never finishes, so finish or abort tracks before closing.
+	///
+	/// Both protocols withdraw this session's announcements and wait for their
+	/// delivery. IETF drafts 14 through 16 send withdrawals without waiting.
+	pub async fn close(self) -> Result<(), Error> {
+		if let Ok(mut close) = self.close.write()
+			&& close.is_none()
+		{
+			*close = Some(Close::Drain);
+		}
+		// The drain outlives this handle, so dropping it cannot cut the drain short.
+		let closed = self.closed.clone();
+		drop(self);
+
+		match closed
+			.wait(|state| match &**state {
+				Some(ended) => Poll::Ready(ended.clone()),
+				None => Poll::Pending,
+			})
+			.await
+		{
+			Ok(ended) => ended.drain.unwrap_or(Err(ended.err)),
+			Err(kio::Closed) => Err(Error::Cancel),
 		}
 	}
 
@@ -156,7 +231,7 @@ impl Session {
 		match self
 			.closed
 			.wait(|state| match &**state {
-				Some(err) => Poll::Ready(err.clone()),
+				Some(ended) => Poll::Ready(ended.err.clone()),
 				None => Poll::Pending,
 			})
 			.await
@@ -165,6 +240,35 @@ impl Session {
 			// The driver was dropped before it could observe the close.
 			Err(kio::Closed) => Error::Cancel,
 		}
+	}
+
+	/// Wait for the peer's SETUP, or return the session's close reason.
+	///
+	/// Resolves when the peer's SETUP arrives. This crate's servers send it only once
+	/// they admit the client, but neither protocol requires that ordering, so another
+	/// server may send SETUP and still refuse the session afterward.
+	/// [`crate::Client::connect`] returns before the SETUP on moq-lite-05+ and
+	/// moq-transport draft 17+. Older versions read it during the handshake and resolve
+	/// at once, except moq-lite-03 and -04, which carry none and return
+	/// [`Error::Unsupported`]. A session that already closed returns its close reason.
+	pub async fn setup(&self) -> Result<(), Error> {
+		kio::wait(|waiter| {
+			match self.closed.poll(waiter, |state| match &**state {
+				Some(ended) => Poll::Ready(ended.err.clone()),
+				None => Poll::Pending,
+			}) {
+				Poll::Ready(Ok(err)) => return Poll::Ready(Err(err)),
+				// The driver was dropped before it could observe the close.
+				Poll::Ready(Err(_)) => return Poll::Ready(Err(Error::Cancel)),
+				Poll::Pending => {}
+			}
+			match self.setup.poll(waiter) {
+				Poll::Ready(true) => Poll::Ready(Ok(())),
+				Poll::Ready(false) => Poll::Ready(Err(Error::Unsupported)),
+				Poll::Pending => Poll::Pending,
+			}
+		})
+		.await
 	}
 
 	/// Drain the peer gracefully: the handle for sending this session's single
@@ -206,6 +310,7 @@ impl Session {
 		recv_bandwidth: Option<bandwidth::Consumer>,
 		protocol: crate::driver::Protocol<S>,
 		goaway: goaway::Handle,
+		setup: Setup,
 	) -> (Self, crate::Driver<S>)
 	where
 		S: crate::transport::poll::Session,
@@ -229,6 +334,7 @@ impl Session {
 		});
 
 		let supervisor = Supervisor {
+			local_close: protocol.local_close(),
 			runtime: runtime.clone(),
 			closed_watch: session.clone(),
 			session,
@@ -237,6 +343,7 @@ impl Session {
 			stats: stats.clone(),
 			send_bandwidth: send_producer,
 			mode: SamplerMode::Idle,
+			drain: Drain::Idle,
 		};
 
 		let session = Self {
@@ -247,6 +354,7 @@ impl Session {
 			send_bandwidth,
 			recv_bandwidth,
 			goaway: Arc::new(goaway),
+			setup,
 		};
 		let driver = crate::Driver::new(
 			runtime.clone(),
@@ -268,6 +376,7 @@ impl Session {
 ///
 /// Finishes once the transport reports closed; everything else is moot then.
 pub(crate) struct Supervisor<S> {
+	local_close: Arc<std::sync::atomic::AtomicBool>,
 	runtime: crate::time::Clock,
 	session: S,
 	// A dedicated clone for the close watch, since each pending poll operation
@@ -277,29 +386,38 @@ pub(crate) struct Supervisor<S> {
 	/// first close matters, and the channel closing is the last handle
 	/// dropping).
 	close: Option<kio::Consumer<Option<Close>>>,
-	/// Where the transport's terminal error is published for [`Session::closed`].
-	closed: kio::Producer<Option<Error>>,
+	/// Where the transport's end is published for [`Session::closed`].
+	closed: kio::Producer<Option<Ended>>,
 	stats: kio::Shared<StatsState>,
 	/// The send-rate estimate channel, when the backend reports one. `None`
 	/// also once every consumer is gone for good.
 	send_bandwidth: Option<bandwidth::Producer>,
 	mode: SamplerMode,
+	drain: Drain,
+}
+
+/// A [`Session::close`] waiting for the protocol to deliver what it queued.
+enum Drain {
+	/// Nobody asked for one.
+	Idle,
+	/// Requested: close once drained, or at the deadline.
+	Waiting(crate::time::Deadline),
+	/// The drain closed the transport, with this outcome.
+	Done(Result<(), Error>),
 }
 
 enum SamplerMode {
 	/// Nobody wants stats; sampling is paused.
 	Idle,
 	/// Someone does; sample when the deadline elapses.
-	Polling {
-		deadline: crate::runtime::Deadline<crate::time::Clock>,
-	},
+	Polling { deadline: crate::time::Deadline },
 }
 
 impl<S: crate::transport::poll::Session> Supervisor<S> {
 	const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 	pub(crate) fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
-		let mut cx = std::task::Context::from_waker(waiter.waker());
+		let mut cx = waiter.context();
 
 		// The transport's terminal error ends the supervisor.
 		if let Poll::Ready(err) = self.closed_watch.poll_closed(&mut cx) {
@@ -307,35 +425,89 @@ impl<S: crate::transport::poll::Session> Supervisor<S> {
 			// this cell, so leave it holding the session's final counters
 			// rather than whichever sample the last demand happened to catch.
 			self.stats.lock().sample = snapshot(&self.session);
+			let drain = match std::mem::replace(&mut self.drain, Drain::Idle) {
+				Drain::Done(res) => Some(res),
+				_ => None,
+			};
 			if let Ok(mut closed) = self.closed.write() {
-				*closed = Some(Error::from_transport(err));
+				*closed = Some(Ended {
+					err: Error::from_transport(err),
+					drain,
+				});
 			}
 			return Poll::Ready(());
 		}
 
-		// Execute the first handle-side close request. The channel closing is
-		// the last handle dropping, with an abort written just before winning
-		// over the implicit cancel.
-		if let Some(close) = &self.close {
-			let request = match close.poll(waiter, |state| match &**state {
+		// Execute the handle-side close requests. The channel closing is the
+		// last handle dropping, with a request written just before winning over
+		// the implicit cancel. A drain loops back to watch for an abort, which
+		// cuts it short.
+		while let Some(close) = &self.close {
+			let draining = matches!(self.drain, Drain::Waiting(_));
+			let (request, last) = match close.poll(waiter, |state| match &**state {
+				Some(Close::Drain) if draining => Poll::Pending,
 				Some(request) => Poll::Ready(request.clone()),
 				None => Poll::Pending,
 			}) {
-				Poll::Ready(Ok(request)) => Some(request),
-				Poll::Ready(Err(last)) => Some(last.clone().unwrap_or_else(|| Close {
-					code: SessionError::Cancel.to_code(),
-					reason: "dropped".to_string(),
-				})),
-				Poll::Pending => None,
+				Poll::Ready(Ok(request)) => (request, false),
+				Poll::Ready(Err(last)) => (
+					last.clone().unwrap_or_else(|| {
+						self.local_close.store(true, std::sync::atomic::Ordering::Relaxed);
+						Close::Abort {
+							code: SessionError::Cancel.to_code(),
+							reason: "dropped".to_string(),
+						}
+					}),
+					true,
+				),
+				Poll::Pending => break,
 			};
-			if let Some(request) = request {
-				self.session.close(request.code, &request.reason);
-				self.close = None;
+			match request {
+				Close::Abort { code, reason } => {
+					self.session.close(code, &reason);
+					self.drain = Drain::Idle;
+					self.close = None;
+				}
+				Close::Drain => {
+					if !draining {
+						self.drain = Drain::Waiting(crate::time::Deadline::after(&self.runtime, CLOSE_TIMEOUT));
+					}
+					// No handle is left to abort.
+					if last {
+						self.close = None;
+					}
+				}
 			}
 		}
 
 		self.poll_sampler(waiter);
 		Poll::Pending
+	}
+
+	pub(crate) fn draining(&self) -> bool {
+		matches!(self.drain, Drain::Waiting(_))
+	}
+
+	/// Finish a requested drain once the protocol owes the peer nothing, or at
+	/// the deadline. Returns whether this closed the transport.
+	///
+	/// Called after the protocol ran this turn, since only then is `drained`
+	/// current.
+	pub(crate) fn poll_drain(&mut self, drained: bool, waiter: &kio::Waiter) -> bool {
+		let Drain::Waiting(deadline) = &mut self.drain else {
+			return false;
+		};
+		let res = match drained {
+			true => Ok(()),
+			false if deadline.poll(waiter).is_ready() => Err(Error::Timeout),
+			false => return false,
+		};
+		self.local_close.store(true, std::sync::atomic::Ordering::Relaxed);
+		self.session.close(SessionError::Cancel.to_code(), "");
+		self.drain = Drain::Done(res);
+		// The transport is closed, so no later request can change anything.
+		self.close = None;
+		true
 	}
 
 	/// Take one sample and arm the next deadline.
@@ -353,7 +525,7 @@ impl<S: crate::transport::poll::Session> Supervisor<S> {
 		stats.demanded = false;
 		drop(stats);
 		self.mode = SamplerMode::Polling {
-			deadline: crate::runtime::Deadline::after(&self.runtime, Self::POLL_INTERVAL),
+			deadline: crate::time::Deadline::after(&self.runtime, Self::POLL_INTERVAL),
 		};
 	}
 
@@ -429,3 +601,45 @@ const _: () = {
 	const fn assert_send_sync<T: Send + Sync>() {}
 	assert_send_sync::<Session>();
 };
+
+/// Session-local advertisement withdrawal; the source origin remains shared.
+#[derive(Clone, Default)]
+pub(crate) struct Withdrawal(kio::Shared<WithdrawalState>);
+
+#[derive(Default)]
+struct WithdrawalState {
+	closing: bool,
+	active: usize,
+}
+
+impl Withdrawal {
+	pub(crate) fn begin(&self) {
+		self.0.lock().closing = true;
+	}
+
+	pub(crate) fn poll(&self, waiter: &kio::Waiter) -> Poll<()> {
+		self.0
+			.poll(
+				waiter,
+				|state| if state.closing { Poll::Ready(()) } else { Poll::Pending },
+			)
+			.map(|_| ())
+	}
+
+	pub(crate) fn drained(&self) -> bool {
+		self.0.read().active == 0
+	}
+
+	pub(crate) fn register(&self) -> Withdrawing {
+		self.0.lock().active += 1;
+		Withdrawing(self.clone())
+	}
+}
+
+pub(crate) struct Withdrawing(Withdrawal);
+
+impl Drop for Withdrawing {
+	fn drop(&mut self) {
+		self.0.0.lock().active -= 1;
+	}
+}

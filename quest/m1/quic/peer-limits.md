@@ -30,7 +30,9 @@ Tests: a cluster session sees the raised `MAX_STREAMS` after SETUP and a
 viewer session does not; the io_uring path applies the same values; a
 `peer` table below the defaults is refused at resolve time.
 
-## Related
+## Required
 
+- [Hard fork](/quest/m1/quic/fork/README.md) - lands in `moq-quic`, not the frozen fork
 - [io_uring flow control](/quest/m1/uring-flow-control-windows.md) - the
-  static windows on the same workers
+  io_uring workers hardcode their windows today, so the peer values have
+  nothing to raise there until the static windows reach them

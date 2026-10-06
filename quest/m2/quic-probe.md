@@ -46,10 +46,12 @@ retain the baseline and record why before exposing an ineffective option.
 
 ## Required
 
-- [Release BBR fixes](/quest/m1/quic/bbr-release.md) - exclude known controller defects from the experiment
+- [Hard fork](/quest/m1/quic/fork/README.md) - the change lands in `moq-quic`, not the frozen fork
 
 ## Related
 
-- [Natural media drains](/quest/m2/quic-bbr-app-limited.md) - separate ProbeRTT policy experiment
-- [FEC experiment](/quest/m2/quic-fec.md) - repetition competes for the redundancy budget
-- [GCC egress experiment](/quest/m2/quic-gcc.md) - delay control changes what headroom means
+- [Viewer up-switch](/quest/m2/viewer-upswitch.md) - the viewer side, which requires this
+- [Natural media drains](/quest/m2/quic-bbr-natural-drain.md) - separate ProbeRTT policy experiment
+- [GCC egress experiment](/quest/m3/quic-gcc.md) - delay control changes what headroom means
+- [noq#811](https://github.com/n0-computer/noq/issues/811) - probing while app-limited, proposed to n0
+- [noq#476](https://github.com/n0-computer/noq/issues/476) - the earlier bitrate-probing ask

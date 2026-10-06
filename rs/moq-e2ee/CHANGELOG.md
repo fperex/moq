@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/moq-dev/moq/compare/moq-e2ee-v0.0.10...moq-e2ee-v0.0.11) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.0.10](https://github.com/moq-dev/moq/compare/moq-e2ee-v0.0.9...moq-e2ee-v0.0.10) - 2026-10-03
+
+### Other
+
+- *(moxygen)* Moxygen compatibility ([#4253](https://github.com/moq-dev/moq/pull/4253))
+
+## [0.0.9](https://github.com/moq-dev/moq/compare/moq-e2ee-v0.0.8...moq-e2ee-v0.0.9) - 2026-09-30
+
+### Other
+
+- updated the following local packages: kio, moq-net
+
+## [0.0.8](https://github.com/moq-dev/moq/compare/moq-e2ee-v0.0.7...moq-e2ee-v0.0.8) - 2026-09-27
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.0.7](https://github.com/moq-dev/moq/compare/moq-e2ee-v0.0.6...moq-e2ee-v0.0.7) - 2026-09-26
+
+### Other
+
+- updated the following local packages: kio, moq-net
+
+## [0.0.6](https://github.com/moq-dev/moq/compare/moq-e2ee-v0.0.5...moq-e2ee-v0.0.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.0.5](https://github.com/moq-dev/moq/compare/moq-e2ee-v0.0.4...moq-e2ee-v0.0.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.0.4](https://github.com/moq-dev/moq/compare/moq-e2ee-v0.0.3...moq-e2ee-v0.0.4) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net
+
 ## [0.0.3](https://github.com/moq-dev/moq/compare/moq-e2ee-v0.0.2...moq-e2ee-v0.0.3) - 2026-09-25
 
 ### Other

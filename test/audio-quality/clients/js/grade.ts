@@ -1,34 +1,18 @@
 /**
- * Grades a run's summaries against `budgets.json` and prints the table.
+ * Grades a run's summaries against `budgets.json`, prints the table, and writes `grade.md`.
  *
- * Every budget value is a ceiling, and a row with no budget is a failure rather than a pass: a
- * matrix that grows a cell nobody wrote a budget for would otherwise quietly grade nothing. A void
- * row fails the same way, for the same reason: its numbers are the ones that cannot be trusted. A
- * budgeted metric the run never measured fails too, since a ceiling with nothing to compare it
- * against grades nothing while looking like a pass.
+ * Every budget value is a ceiling on one `<metric>_<aggregation>` key. Under `--enforce` a run fails
+ * on any of: a value over its ceiling, a budgeted value the run never measured, a void row, or a row
+ * with no budget at all. Each of those would otherwise read as a pass while grading nothing.
  *
- * A row marked `recorded` in `budgets.json` is graded and its breaches are printed, but it does not
- * fail the run: its ceilings are what a machine measured rather than what the player is required to
- * achieve. Every other row is enforced.
- *
- * `silence_share` is graded raw against its ceiling like everything else, with one exception. A
- * share over its ceiling passes when the analyzer proved that every quiet window it counted lines up
- * with quiet source at the same media time (see `src/silence.ts`), and only then: a quiet window over
- * audible source, one it could not place, or a proof counting other windows than the share did keeps
- * the failure. Both the raw share and the proof are printed.
- *
- * The table prints and the results are written either way; the exit status is zero unless
- * `--enforce` is passed, which the nightly job does. `budgets.json` says how each ceiling in it was
- * arrived at.
- *
- *     bun grade.ts --run <run dir> --budgets ../../budgets.json [--enforce]
+ *     bun grade.ts --run <run dir> --budgets <budgets.json> [--enforce]
  *
  * @module
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { type Budget, type Budgets, METRICS, type QuietProof, type Row, rowKey, type Summary } from "./src/schema.ts";
+import { type Budgets, METRIC_KEYS, type Row, rowKey, type Summary } from "./src/schema.ts";
 
 const { values } = parseArgs({
 	options: {
@@ -37,26 +21,24 @@ const { values } = parseArgs({
 		enforce: { type: "boolean", default: false },
 	},
 });
-
 if (!values.run || !values.budgets) {
 	console.error("usage: grade.ts --run <run dir> --budgets <budgets.json> [--enforce]");
 	process.exit(2);
 }
+const run = values.run;
 
 const budgets = JSON.parse(readFileSync(values.budgets, "utf8")) as Budgets;
-
-const summaries = readdirSync(values.run)
+const summaries = readdirSync(run)
 	.filter((f) => f.endsWith(".summary.json"))
 	.sort()
-	.map((f) => JSON.parse(readFileSync(join(values.run as string, f), "utf8")) as Summary);
-
+	.map((f) => JSON.parse(readFileSync(join(run, f), "utf8")) as Summary);
 if (summaries.length === 0) {
-	console.error(`error: no summaries in ${values.run}`);
-	process.exit(2);
+	console.error(`error: no summaries in ${run}`);
+	process.exit(1);
 }
 
 /** A budget applies to exactly one matrix cell, matched on the whole row. */
-const budgetFor = (row: Row): Budget | undefined =>
+const budgetFor = (row: Row) =>
 	budgets.rows.find(
 		(b) =>
 			b.runtime === row.runtime &&
@@ -66,174 +48,55 @@ const budgetFor = (row: Row): Budget | undefined =>
 			b.ring === row.ring,
 	);
 
-/** Every graded key a budget may name, in schema order, so the table reads the same every run. */
-const keys = Object.entries(METRICS).flatMap(([name, spec]) => spec.aggregations.map((a) => `${name}_${a}`));
-
-type Verdict = {
-	row: string;
-	key: string;
-	value: number | null;
-	ceiling: number;
-	/** Whether the raw value is over its ceiling. */
-	over: boolean;
-	/** Whether a raw silence breach was proven to be the source's own quiet, which passes it. */
-	authored: boolean;
-	/** Whether the run produced no value for a metric this row budgets. */
-	missing: boolean;
-	/** Whether a breach fails the run, or is only reported. */
-	enforced: boolean;
-};
-
-/** The graded silence key, the one breach a quiet proof can excuse. */
-const SILENCE = "silence_share_share";
-
-/**
- * Whether `proof` excuses a raw silence share of `value`: proven, and counting the very windows the
- * share was taken over, rounded the way the analyzer rounds it.
- */
-const excuses = (proof: QuietProof | undefined, value: number | null): boolean =>
-	proof?.proven === true &&
-	proof.windows > 0 &&
-	value !== null &&
-	Math.round((proof.quiet / proof.windows) * 1000) / 1000 === value;
-
-/** The quiet proof, as a breach line prints it. */
-function proofLine(proof: QuietProof | undefined, value: number | null): string {
-	if (!proof) return "no quiet proof in this summary";
-	const counts = `${proof.matched}/${proof.quiet} quiet windows over quiet source`;
-	const segments = proof.segments.length > 1 ? `, ${proof.segments.length} analyser lag segments` : "";
-	const fit = proof.alignment
-		? ` (log RMS r ${proof.alignment.correlation.toFixed(5)}, level ${proof.alignment.gain.toFixed(3)}, ${proof.alignment.audible} audible windows${segments})`
-		: "";
-	if (!proof.proven) return `${counts}${fit}; ${proof.reason ?? "unproven"}`;
-	if (!excuses(proof, value))
-		return `${counts}${fit}, but it counts ${proof.quiet} of ${proof.windows} windows, not this share`;
-	return `${counts}${fit}`;
-}
-
-const verdicts: Verdict[] = [];
-const proofs = new Map<string, QuietProof | undefined>();
-const voided: string[] = [];
-const reportedVoid: string[] = [];
-const unbudgeted: string[] = [];
-
+const failures: string[] = [];
 for (const summary of summaries) {
 	const key = rowKey(summary.row);
 	const budget = budgetFor(summary.row);
 	if (!budget) {
-		unbudgeted.push(key);
+		failures.push(`${key}: no budget`);
 		continue;
 	}
-	if (summary.voids.length > 0) {
-		const reason = `${key}: ${summary.voids.map((v) => `${v.assertion} (${v.detail})`).join("; ")}`;
-		// A recorded row has nothing to enforce, so a run of it that cannot be trusted is reported
-		// rather than failed. An enforced row's void is a failure: the alternative is a green matrix
-		// over a cell that measured the WebSocket fallback, the other ring, or a throttled clock.
-		if (budget.recorded === true) reportedVoid.push(reason);
-		else voided.push(reason);
-		continue;
-	}
-	proofs.set(key, summary.silence);
-	for (const metric of keys) {
+	for (const v of summary.voids) failures.push(`${key}: void, ${v.assertion} (${v.detail})`);
+	if (summary.voids.length > 0) continue;
+	for (const metric of METRIC_KEYS) {
 		const ceiling = budget[metric];
 		if (typeof ceiling !== "number") continue;
-		const value = summary.metrics[metric] ?? null;
-		const over = value !== null && value > ceiling;
-		verdicts.push({
-			row: key,
-			key: metric,
-			value,
-			ceiling,
-			over,
-			// Only over the ceiling does the proof matter: within it, a row keeps the verdict it had.
-			authored: over && metric === SILENCE && excuses(summary.silence, value),
-			// A ceiling with nothing to compare it against is not a pass. The run was asked to
-			// measure this and did not, which is the same silent hole as a row with no budget.
-			missing: value === null,
-			enforced: budget.recorded !== true,
-		});
+		const value = summary.metrics[metric];
+		if (value === null || value === undefined) failures.push(`${key}: ${metric} unmeasured, ceiling ${ceiling}`);
+		else if (value > ceiling) failures.push(`${key}: ${metric} ${value} > ${ceiling}`);
 	}
 }
 
-// ── the table ───────────────────────────────────────────────────────────────
+/** The columns a reader scans first: what the listener would have noticed, and the delay paid for it. */
+const COLUMNS: [string, string][] = [
+	["underruns/min", "underruns_per_min"],
+	["short/min", "short_quanta_per_min"],
+	["episodes/min", "underrun_episodes_per_min"],
+	["gap ms/min", "underrun_ms_per_min"],
+	["skips/min", "skip_aheads_per_min"],
+	["discarded ms/min", "discarded_ms_per_min"],
+	["stalled", "stalled_share"],
+	["silence", "silence_share"],
+	["target p95", "target_ms_p95"],
+	["converge ms", "converge_ms_last"],
+];
 
-const lines: string[] = [];
-lines.push(
-	"| row | underrun ep/min | underrun ms/min | skips/min | skipped ms/min | groups/min | silence | quiet proven | stalled | target p95 | converge s | void |",
-);
-lines.push("|---|---|---|---|---|---|---|---|---|---|---|---|");
-const cell = (x: number | null | undefined) => (x === null || x === undefined ? "n/a" : String(x));
-// Quiet windows placed over quiet source, of those counted, or why none could be.
-const quietCell = (proof: QuietProof | undefined) =>
-	proof === undefined ? "n/a" : `${proof.matched}/${proof.quiet}${proof.proven ? "" : " unproven"}`;
-for (const summary of summaries) {
-	const m = summary.metrics;
-	lines.push(
-		`| ${rowKey(summary.row)} | ${cell(m.underrun_episodes_per_min)} | ${cell(m.underrun_samples_per_min)} | ${cell(m.skip_aheads_per_min)} | ${cell(m.skipped_samples_per_min)} | ${cell(m.skipped_groups_per_min)} | ${cell(m.silence_share_share)} | ${quietCell(summary.silence)} | ${cell(m.stalled_quanta_share)} | ${cell(m.target_ms_p95)} | ${cell(m.converge_s_seconds)} | ${summary.voids.map((v) => v.assertion).join(",") || "-"} |`,
-	);
-}
-
-/** A breach as a line: the raw value against its ceiling, and for silence the proof beside it. */
-const breach = (v: Verdict) =>
-	`- ${v.row} ${v.key}: ${v.value} > ${v.ceiling}${v.key === SILENCE ? `; ${proofLine(proofs.get(v.row), v.value)}` : ""}`;
-
-const over = verdicts.filter((v) => v.over && !v.authored && v.enforced);
-const reported = verdicts.filter((v) => v.over && !v.authored && !v.enforced);
-const authored = verdicts.filter((v) => v.authored);
-const missing = verdicts.filter((v) => v.missing && v.enforced);
-lines.push("");
-if (over.length > 0 || missing.length > 0) {
-	if (over.length > 0) {
-		lines.push("over budget:");
-		for (const v of over) lines.push(breach(v));
-	}
-	if (missing.length > 0) {
-		lines.push("budgeted but never measured:");
-		for (const v of missing) lines.push(`- ${v.row} ${v.key}: no value, ceiling was ${v.ceiling}`);
-	}
-} else {
-	lines.push(
-		`within budget: ${verdicts.filter((v) => v.enforced).length} enforced checks across ${summaries.length - voided.length} rows`,
-	);
-}
-if (authored.length > 0) {
-	lines.push("", "over the raw silence ceiling, every quiet window proven over quiet source (passes):");
-	for (const v of authored) lines.push(breach(v));
-}
-if (reported.length > 0) {
-	lines.push("", "over a recorded ceiling (reported, not enforced):");
-	for (const v of reported) lines.push(breach(v));
-}
-if (voided.length > 0) {
-	lines.push("", "void rows (not graded):");
-	for (const v of voided) lines.push(`- ${v}`);
-}
-if (reportedVoid.length > 0) {
-	lines.push("", "void rows on a recorded budget (reported, not enforced):");
-	for (const v of reportedVoid) lines.push(`- ${v}`);
-}
-if (unbudgeted.length > 0) {
-	lines.push("", "rows with no budget:");
-	for (const u of unbudgeted) lines.push(`- ${u}`);
-}
-
+const lines = [
+	`| row | ${COLUMNS.map(([label]) => label).join(" | ")} | void |`,
+	`|---|${COLUMNS.map(() => "---|").join("")}---|`,
+	...summaries.map(
+		(s) =>
+			`| ${rowKey(s.row)} | ${COLUMNS.map(([, k]) => s.metrics[k] ?? "n/a").join(" | ")} | ${s.voids.map((v) => v.assertion).join(",") || "-"} |`,
+	),
+	"",
+	...(failures.length > 0 ? ["failures:", ...failures.map((f) => `- ${f}`)] : ["within budget"]),
+];
 const report = lines.join("\n");
 console.log(report);
-await Bun.write(join(values.run, "grade.md"), `${report}\n`);
-await Bun.write(
-	join(values.run, "grade.json"),
-	JSON.stringify({ enforced: values.enforce, verdicts, voided, reportedVoid, unbudgeted }, null, 1),
-);
+await Bun.write(join(run, "grade.md"), `${report}\n`);
 
 if (!values.enforce) {
-	console.log("\nreporting only: pass --enforce to fail the run on these budgets");
+	if (failures.length > 0) console.log("\nreporting only: pass --enforce to fail on these");
 	process.exit(0);
 }
-
-const failed = over.length > 0 || missing.length > 0 || unbudgeted.length > 0 || voided.length > 0;
-if (failed) {
-	console.error(
-		`FAIL: ${over.length} over budget, ${missing.length} budgeted but never measured, ${unbudgeted.length} unbudgeted, ${voided.length} void`,
-	);
-}
-process.exit(failed ? 1 : 0);
+process.exit(failures.length > 0 ? 1 : 0);

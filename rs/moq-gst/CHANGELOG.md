@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.11](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.10...moq-gst-v0.4.11) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-tokio
+
+## [0.4.10](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.9...moq-gst-v0.4.10) - 2026-10-03
+
+### Added
+
+- *(tokio)* default QUIC idle timeout to 10s ([#4606](https://github.com/moq-dev/moq/pull/4606))
+
+### Other
+
+- publish only from release ([#4738](https://github.com/moq-dev/moq/pull/4738))
+
+## [0.4.9](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.8...moq-gst-v0.4.9) - 2026-09-30
+
+### Fixed
+
+- *(gst)* recover from leading deltas and timestamp rewinds ([#4480](https://github.com/moq-dev/moq/pull/4480))
+- *(moq-gst)* moqsrc waits for its session to end on stop ([#4416](https://github.com/moq-dev/moq/pull/4416))
+- *(gst)* keep waiting for a keyframe after a header-only buffer ([#4356](https://github.com/moq-dev/moq/pull/4356))
+
+### Other
+
+- one rpm repo command that works on DNF4 and DNF5 ([#4567](https://github.com/moq-dev/moq/pull/4567))
+
+## [0.4.8](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.7...moq-gst-v0.4.8) - 2026-09-27
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-tokio
+
+## [0.4.7](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.6...moq-gst-v0.4.7) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+- *(mux)* forward importer discontinuities through publishers ([#4239](https://github.com/moq-dev/moq/pull/4239))
+
+## [0.4.6](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.5...moq-gst-v0.4.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-tokio
+
+## [0.4.5](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.4...moq-gst-v0.4.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-tokio, hang
+
+## [0.4.4](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.3...moq-gst-v0.4.4) - 2026-09-25
+
+### Fixed
+
+- *(moq-gst)* wait for the sink's reconnect loop to end on stop ([#4074](https://github.com/moq-dev/moq/pull/4074))
+
 ## [0.4.3](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.2...moq-gst-v0.4.3) - 2026-09-25
 
 ### Other
