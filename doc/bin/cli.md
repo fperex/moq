@@ -11,6 +11,8 @@ it locally. On macOS or Linux, install it with
 `curl -fsSL https://moq.sh | sh`, or use cargo, brew, apt, dnf, winget, or
 Docker; see [Install](/setup/install).
 
+`SIGINT` and, on Unix, `SIGTERM` stop the running stages or the native player.
+
 ## What it does
 
 | Verb | Endpoint | |
