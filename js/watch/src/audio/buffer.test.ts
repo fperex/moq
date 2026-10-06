@@ -30,6 +30,7 @@ describe("SharedAudioBuffer", () => {
 			latency: 100,
 			buffered: false,
 			conceal: true,
+			shared: true,
 		});
 		try {
 			const old = new SharedRingBuffer(sent[0]);
@@ -57,6 +58,7 @@ describe("SharedAudioBuffer", () => {
 			latency: 100,
 			buffered: true,
 			conceal: true,
+			shared: true,
 		});
 		buffer.insert(0 as Time.Micro, [new Float32Array(200)]);
 		const settles = (wait: Promise<void>) =>
@@ -206,21 +208,6 @@ function state(worklet: FakeWorklet, reader: Playhead | undefined, stalled: bool
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** The postMessage ring, which a page that is not cross-origin isolated runs. */
-function messages<T>(run: () => T): T {
-	const isolated = Object.getOwnPropertyDescriptor(globalThis, "crossOriginIsolated");
-	Object.defineProperty(globalThis, "crossOriginIsolated", { configurable: true, value: false });
-	const log = console.warn;
-	console.warn = () => {};
-	try {
-		return run();
-	} finally {
-		console.warn = log;
-		if (isolated) Object.defineProperty(globalThis, "crossOriginIsolated", isolated);
-		else Reflect.deleteProperty(globalThis, "crossOriginIsolated");
-	}
-}
-
 function build(worklet: FakeWorklet, props: Partial<Parameters<typeof createAudioBuffer>[1]> = {}): AudioBuffer {
 	return createAudioBuffer(worklet as unknown as AudioWorkletNode, {
 		context,
@@ -229,6 +216,7 @@ function build(worklet: FakeWorklet, props: Partial<Parameters<typeof createAudi
 		latency: 4800,
 		buffered: false,
 		conceal: true,
+		shared: true,
 		...props,
 	});
 }
@@ -238,7 +226,7 @@ describe("AudioBuffer output clock", () => {
 		clock = fakeClock(1010);
 		const worklet = new FakeWorklet();
 		let output = { contextTime: 0, performanceTime: 0 };
-		const buffer = messages(() => build(worklet, { context: { getOutputTimestamp: () => output } }));
+		const buffer = build(worklet, { context: { getOutputTimestamp: () => output }, shared: false });
 		try {
 			worklet.deliver({ ...state(worklet, playhead(500, 1), false), contextTime: Time.Second(1) });
 			expect(buffer.clock.peek()).toBeUndefined();
@@ -275,7 +263,7 @@ describe("AudioBuffer output clock", () => {
 		clock = fakeClock(50_000);
 		const worklet = new FakeWorklet();
 		const output = { contextTime: 0.00535, performanceTime: 0 };
-		const buffer = messages(() => build(worklet, { context: { getOutputTimestamp: () => output } }));
+		const buffer = build(worklet, { context: { getOutputTimestamp: () => output }, shared: false });
 		try {
 			worklet.deliver({ ...state(worklet, playhead(500, 1), false), contextTime: Time.Second(0.02) });
 			expect(buffer.clock.peek()).toBeUndefined();
@@ -318,9 +306,11 @@ describe("AudioBuffer output clock", () => {
 	it("a partial output timestamp neither throws nor strands backpressure", async () => {
 		const worklet = new FakeWorklet();
 		let output: Partial<AudioTimestamp> = { contextTime: 1, performanceTime: 1000 };
-		const buffer = messages(() =>
-			build(worklet, { context: { getOutputTimestamp: () => output as AudioTimestamp }, buffered: true }),
-		);
+		const buffer = build(worklet, {
+			context: { getOutputTimestamp: () => output as AudioTimestamp },
+			buffered: true,
+			shared: false,
+		});
 		try {
 			// Playing, 500ms in. A frame at 1s is more than the 100ms floor ahead, so it is held.
 			worklet.deliver(state(worklet, playhead(500, 1), false));
@@ -354,7 +344,7 @@ describe("AudioBuffer, flushed", () => {
 
 	it("never reports the old playhead once the postMessage ring is flushed", async () => {
 		const worklet = new FakeWorklet();
-		const buffer = messages(() => build(worklet, { context: output }));
+		const buffer = build(worklet, { context: output, shared: false });
 
 		// A signal write notifies on the microtask, so each step settles before the next one.
 		const settle = () => sleep(0);

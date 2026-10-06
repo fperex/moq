@@ -202,6 +202,12 @@ export function outputTimestamp(
 	return { contextTime, performanceTime };
 }
 
+/**
+ * Where a ring's writes go: the render worklet's node, or any port the worklet takes ring writes from
+ * (see `Port` in `render.ts`), which is how a writer off the main thread reaches it.
+ */
+export type RingTarget = Pick<AudioWorkletNode, "port">;
+
 /** How the ring behind the worklet is built. */
 export interface AudioBufferProps {
 	/** Maps render time to the audio device's output clock. */
@@ -216,29 +222,47 @@ export interface AudioBufferProps {
 	buffered: boolean;
 	/** Whether the reader conceals a gap with synthesized audio or plays it as a ramp into silence. */
 	conceal: boolean;
+	/**
+	 * Whether the ring is shared memory rather than messages. Shared memory needs
+	 * {@link supportsSharedArrayBuffer}, and the graph's builder decides: see `Graph.shared` in `supply.ts`.
+	 */
+	shared: boolean;
 }
 
+/** Create the audio buffer `props.shared` asks for: `SharedAudioBuffer`, or `PostAudioBuffer`. */
+export function createAudioBuffer(worklet: RingTarget, props: AudioBufferProps): AudioBuffer {
+	return props.shared ? new SharedAudioBuffer(worklet, props) : new PostAudioBuffer(worklet, props);
+}
+
+// Whether the transport has been named already, since it is the same answer for the rest of the
+// document's life.
+let reported = false;
+
 /**
- * Create the best audio buffer implementation for the current environment.
- * Picks `SharedAudioBuffer` when possible, falling back to `PostAudioBuffer`.
+ * Say which transport the page's own ring writes run on, once per document: isolation is the page's,
+ * so every player lands on the same one. A note, not a warning, since neither answer is a fault. The
+ * audio worker writes by message whatever the page is, so this describes the page's own writes only.
  */
-export function createAudioBuffer(worklet: AudioWorkletNode, props: AudioBufferProps): AudioBuffer {
-	if (supportsSharedArrayBuffer()) {
-		console.log("[audio] using SharedArrayBuffer audio buffer");
-		return new SharedAudioBuffer(worklet, props);
+export function reportTransport(shared: boolean): void {
+	if (reported) return;
+	reported = true;
+
+	if (shared) {
+		console.info("[audio] using the SharedArrayBuffer audio buffer");
+		return;
 	}
+
 	console.warn(
 		"[audio] SharedArrayBuffer unavailable, falling back to the higher latency postMessage audio buffer. " +
 			"Serve the page cross-origin isolated (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp) to avoid this.",
 	);
-	return new PostAudioBuffer(worklet, props);
 }
 
 /** SharedArrayBuffer-backed implementation. Writes go directly into shared memory. */
 class SharedAudioBuffer implements AudioBuffer {
 	readonly rate: number;
 	readonly channels: number;
-	#worklet: AudioWorkletNode;
+	#worklet: RingTarget;
 	#ring: SharedRingBuffer;
 
 	readonly #timestamp = new Signal<Time.Micro>(0 as Time.Micro);
@@ -263,7 +287,7 @@ class SharedAudioBuffer implements AudioBuffer {
 
 	#signals = new Effect();
 
-	constructor(worklet: AudioWorkletNode, props: AudioBufferProps) {
+	constructor(worklet: RingTarget, props: AudioBufferProps) {
 		const { channels, rate, buffered, latency: latencySamples } = props;
 		this.#worklet = worklet;
 		this.channels = channels;
@@ -366,7 +390,7 @@ class SharedAudioBuffer implements AudioBuffer {
 class PostAudioBuffer implements AudioBuffer {
 	readonly rate: number;
 	readonly channels: number;
-	#worklet: AudioWorkletNode;
+	#worklet: RingTarget;
 
 	readonly #timestamp = new Signal<Time.Micro>(0 as Time.Micro);
 	readonly timestamp: Getter<Time.Micro> = this.#timestamp;
@@ -394,7 +418,7 @@ class PostAudioBuffer implements AudioBuffer {
 
 	#signals = new Effect();
 
-	constructor(worklet: AudioWorkletNode, props: AudioBufferProps) {
+	constructor(worklet: RingTarget, props: AudioBufferProps) {
 		const { channels, rate, buffered, conceal, latency: latencySamples } = props;
 		this.#worklet = worklet;
 		this.channels = channels;
