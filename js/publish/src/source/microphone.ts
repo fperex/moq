@@ -96,22 +96,9 @@ export class Microphone {
 		};
 
 		effect.spawn(async () => {
-			const media = navigator.mediaDevices.getUserMedia({ audio: finalConstraints });
-
-			// If the effect is cancelled, stop any stream that arrives after cancellation too.
-			effect.cleanup(() =>
-				media.then(
-					(stream) =>
-						stream.getTracks().forEach((track) => {
-							track.stop();
-						}),
-					() => {},
-				),
-			);
-
 			let stream: MediaStream | undefined;
 			try {
-				stream = await effect.race(media);
+				stream = await this.#retry.open(effect, { audio: finalConstraints });
 			} catch (error) {
 				if (effect.abort.aborted) return;
 				if (this.#retry.rejected(error)) return;

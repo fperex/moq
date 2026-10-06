@@ -39,6 +39,12 @@ export class Retry {
 	// How long the next attempt still owes the backoff, set by `failed` and paid by `begin`.
 	#wait: DOMHighResTimeStamp | undefined;
 
+	// The release of a capture still being acquired when its run was cancelled, which `open` waits
+	// for. A browser only starts handing a device back at `stop()`, and a run's cleanup is not
+	// ordered against the next run's `getUserMedia`, so asking right away can ask for a device the
+	// page has not let go of yet.
+	#released: Promise<void> | undefined;
+
 	// The cause of the latest failure. Only surfaced once the budget is spent, so a retry stays quiet.
 	#error: Error | undefined;
 
@@ -72,6 +78,48 @@ export class Retry {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Ask the browser for a capture once the previous one has been released, and stop it again if the
+	 * run is cancelled first. Resolves undefined when the run was cancelled, and rejects with the
+	 * browser's refusal, which {@link rejected} classifies.
+	 */
+	async open(effect: Effect, constraints: MediaStreamConstraints): Promise<MediaStream | undefined> {
+		const previous = this.#released;
+		if (previous !== undefined) {
+			await effect.race(previous);
+			if (effect.abort.aborted) return undefined;
+		}
+
+		const media = navigator.mediaDevices.getUserMedia(constraints);
+		let settled = false;
+		const stop = (stream: MediaStream) => {
+			for (const track of stream.getTracks()) track.stop();
+		};
+		media.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		effect.cleanup(() => {
+			// Still being acquired: whatever arrives is stopped, and the next attempt waits for that.
+			if (!settled) {
+				const released = media
+					.then(stop, () => {})
+					.then(() => {
+						if (this.#released === released) this.#released = undefined;
+					});
+				this.#released = released;
+				return;
+			}
+			media.then(stop, () => {});
+		});
+		return await effect.race(media);
 	}
 
 	/** Spends budget and reruns the effect, returning whether another attempt is allowed. */
