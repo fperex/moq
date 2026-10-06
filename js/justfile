@@ -57,6 +57,11 @@ catalog-bench:
     bun install --frozen-lockfile
     bun publish/bench/catalog.ts
 
+# Time one audio worklet render quantum through the playout engine, stretching, copying, and concealing.
+stretch-bench:
+    bun install --frozen-lockfile
+    bun watch/bench/stretch.ts
+
 # Time Effect create and close, which pays for the creation stack its diagnostics print.
 signals-bench:
     bun install --frozen-lockfile

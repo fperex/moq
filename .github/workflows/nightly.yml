@@ -133,6 +133,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: nix develop --command just js catalog-bench
 
+      # The audio worklet's render quantum is the one budget the browser enforces: the engine's
+      # percentiles print against a quarter of it. No threshold; the unit tests hold the counts.
+      - name: JS audio playout benchmark
+        if: ${{ !cancelled() }}
+        run: nix develop --command just js stretch-bench
+
       # Times Effect create and close beside a bare `new Error()`. No threshold: it only
       # has to keep running, and its numbers track the creation stack's cost.
       - name: JS signals effect benchmark
