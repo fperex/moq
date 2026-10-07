@@ -111,10 +111,12 @@ with `at` on the viewer's clock. `record.ts` stamps a frame as it comes off its 
 over WebTransport. It stamps before the consumer's in-order delivery, whose waits and skips depend
 on the delay, so the replay decides those again.
 
-`replay.ts` plays a trace through the player's own `Container.Consumer` and rings on a simulated
-clock ([`js/watch/src/audio/replay.ts`](../../js/watch/src/audio/replay.ts)), at the "auto" delay a
-real `Sync` resolves from the playout target that consumer measures, and reads each quantum through
-the tap's classifier. The consumer makes the player's group ordering, max age skips, and
+`replay.ts` plays a trace through the player's own `Container.Consumer`, rings, and playout engine
+on a simulated clock ([`js/watch/src/audio/replay.ts`](../../js/watch/src/audio/replay.ts)), at the
+"auto" delay a real `Sync` resolves from the playout target that consumer measures, and reads each
+quantum through the tap's classifier. The engine decides every block the way the AudioWorklet does,
+so a gap the player would conceal, a surplus it would stretch out, and a hole it would step over
+are heard here too. The consumer makes the player's group ordering, max age skips, and
 discontinuity resets again at that delay, and the ring follows the delay as it moves; a group's stream is taken to finish with its last recorded frame. Every
 frame is the trace's median spacing long, so a frame that never arrived stays missing audio, and
 rendering runs to the end of the observation, so an outage after the last arrival is heard. It
