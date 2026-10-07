@@ -5,8 +5,8 @@ import type { SharedRingBufferInit } from "./shared-ring-buffer";
 
 /** Everything a writer sends the render worklet: over the node's own port, or over one handed to it as a {@link Port}. */
 export type Message = InitShared | InitPost | Data | Latency | Reset | Truncate | Port | Close;
-/** Playback reports and errors, sent by the render worklet. */
-export type ToMain = State | Unreadable;
+/** Playback reports, errors and the end of the processor, sent by the render worklet. */
+export type ToMain = State | Unreadable | Stopped;
 
 /**
  * A message reached the worklet and could not be deserialized, so whatever it carried never arrived:
@@ -33,10 +33,22 @@ export interface Port {
 /**
  * The node is done with: the processor stops rendering and lets the browser collect it. A processor
  * whose `process` keeps returning true keeps running after its node is disconnected, for as long as the
- * context is open, and the decoder rebuilds nodes in a context that stays open.
+ * context is open, and the decoder rebuilds nodes in a context that stays open. It answers with
+ * {@link Stopped} once it has.
  */
 export interface Close {
 	type: "close";
+}
+
+/**
+ * The processor has stopped, said on the node's own port in the quantum a {@link Close} ends it.
+ *
+ * Chromium keeps a closed context, and every node in it, for as long as a processor in it has not
+ * stopped, and a processor only stops in a quantum it renders. So the page closes the context once
+ * every processor in it has said this.
+ */
+export interface Stopped {
+	type: "stopped";
 }
 
 /** Init message when SharedArrayBuffer is available. */

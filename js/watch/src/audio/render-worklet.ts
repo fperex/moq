@@ -1,6 +1,6 @@
 import { Time } from "@moq/net";
 import { Stretcher } from "./playout";
-import type { Message, State, Unreadable } from "./render";
+import type { Message, State, Stopped, Unreadable } from "./render";
 import { AudioRingBuffer } from "./ring-buffer";
 import { SharedRingBuffer } from "./shared-ring-buffer";
 
@@ -76,7 +76,7 @@ class Render extends AudioWorkletProcessor {
 				for (const port of this.#ports) {
 					port.onmessage = null;
 					port.onmessageerror = null;
-					// The node's own port is the page's to close.
+					// The node's own port stays open to say when `process` has stopped.
 					if (port !== this.port) port.close();
 				}
 				this.#ports.length = 0;
@@ -115,8 +115,13 @@ class Render extends AudioWorkletProcessor {
 	}
 
 	process(_inputs: Float32Array[][], outputs: Float32Array[][], _parameters: Record<string, Float32Array>) {
-		// Nothing feeds a node that is done with, so returning false ends the processor.
-		if (this.#closed) return false;
+		if (this.#closed) {
+			// Nothing feeds the node, so returning false ends the processor in this quantum.
+			const stopped: Stopped = { type: "stopped" };
+			this.port.postMessage(stopped);
+			this.port.close();
+			return false;
+		}
 
 		const output = outputs[0];
 		const backend = this.#backend;

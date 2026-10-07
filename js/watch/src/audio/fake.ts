@@ -168,17 +168,19 @@ class Context extends EventTarget {
 	}
 }
 
-/** A render node whose port takes what the page posts to it and closes every port it is handed. */
-class Node {
+/** A render node whose port takes what the page posts to it, and which says it stopped and closes every port it is handed when told to close. */
+class Node extends EventTarget {
 	readonly #channel = new MessageChannel();
 	readonly port = this.#channel.port1;
 
 	constructor() {
+		super();
 		const processor = this.#channel.port2;
 		const ports: MessagePort[] = [processor];
 		processor.onmessage = (event: MessageEvent<{ type?: string; port?: MessagePort }>) => {
 			if (event.data?.type === "port" && event.data.port) ports.push(event.data.port);
 			if (event.data?.type !== "close") return;
+			processor.postMessage({ type: "stopped" });
 			for (const port of ports) port.close();
 		};
 	}

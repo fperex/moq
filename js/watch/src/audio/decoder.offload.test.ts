@@ -57,14 +57,26 @@ let nextPort: MessagePort | undefined;
 class MockContext extends EventTarget {
 	// Whether the browser starts a context without a gesture.
 	static autoplay = true;
+	// Whether the worklet module of a context built now loads only when the case says, and is aborted
+	// if the context closes first, as a browser aborts it.
+	static deferModule = false;
+	static built: MockContext[] = [];
 
 	state = "suspended";
 	readonly sampleRate: number;
-	readonly audioWorklet = { addModule: () => Promise.resolve() };
+	module?: PromiseWithResolvers<void>;
+	readonly audioWorklet = {
+		addModule: () => {
+			if (!MockContext.deferModule) return Promise.resolve();
+			this.module ??= Promise.withResolvers<void>();
+			return this.module.promise;
+		},
+	};
 
 	constructor(options?: { sampleRate?: number }) {
 		super();
 		this.sampleRate = options?.sampleRate ?? RATE;
+		MockContext.built.push(this);
 	}
 
 	resume(): Promise<void> {
@@ -82,6 +94,7 @@ class MockContext extends EventTarget {
 
 	close(): Promise<void> {
 		this.state = "closed";
+		this.module?.reject(new DOMException("Unable to load a worklet module.", "AbortError"));
 		return Promise.resolve();
 	}
 
@@ -97,44 +110,65 @@ class MockContext extends EventTarget {
  * Told to close, its processor stops in the next quantum its context renders, as an engine's does: a
  * running context renders on its own, one that is not waits until it runs.
  */
-class Node {
+class Node extends EventTarget {
 	static built: Node[] = [];
 	/**
 	 * Whether the worklet of a node built now hears nothing the page sends it but its close, so no ring
 	 * reaches it. A plain close on the node's own port is what every engine delivers.
 	 */
 	static deaf = false;
+	/** Whether quanta are rendered only by `quantum`, so a case can hold a processor between its close and its stop. */
+	static manual = false;
+	readonly context: MockContext;
 	readonly port: MessagePort;
 	readonly render: Processor;
 	/** The worklet's end of the node's port. */
 	readonly worklet: MessagePort;
+	/** The type of everything the page sent the processor, in order. */
+	readonly heard: string[] = [];
 	#closed = false;
 	#stopped = false;
 
 	constructor(context: MockContext) {
+		super();
 		if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
 		const { port1, port2 } = new MessageChannel();
 		const deaf = Node.deaf ? new MessageChannel() : undefined;
 		nextPort = deaf?.port2 ?? port2;
 		this.render = new Render();
+		this.context = context;
 		this.port = port1;
 		this.worklet = port2;
 		Node.built.push(this);
 
-		// Quanta rendered one per tick while the context runs, until the processor returns false.
-		const render = () => {
-			if (!this.#closed || this.#stopped || context.state !== "running") return;
-			if (this.render.process([], [stereo()], {})) setTimeout(render, 0);
-			else this.#stopped = true;
-		};
 		port2.addEventListener("message", (event: MessageEvent<{ type?: string }>) => {
+			this.heard.push(String(event.data?.type));
 			if (event.data?.type !== "close") return;
 			this.#closed = true;
 			deaf?.port1.postMessage(event.data);
-			setTimeout(render, 0);
+			this.#tick();
 		});
 		port2.start();
-		context.addEventListener("statechange", () => setTimeout(render, 0));
+		// A deaf processor still says when it stops, which is all of it the page hears.
+		deaf?.port1.addEventListener("message", (event: MessageEvent<{ type?: string }>) => {
+			if (event.data?.type === "stopped") port2.postMessage(event.data);
+		});
+		deaf?.port1.start();
+		context.addEventListener("statechange", () => this.#tick());
+	}
+
+	#tick(): void {
+		if (!Node.manual) setTimeout(() => this.quantum(), 0);
+	}
+
+	/**
+	 * Render one quantum of a closed node, which a context only does while it runs. Rendered one per
+	 * tick until the processor returns false, unless the case holds them back.
+	 */
+	quantum(): void {
+		if (!this.#closed || this.#stopped || this.context.state !== "running") return;
+		if (this.render.process([], [stereo()], {})) this.#tick();
+		else this.#stopped = true;
 	}
 
 	connect(): void {}
@@ -368,6 +402,9 @@ beforeEach(() => {
 	scope.EncodedAudioChunk = FakeChunk;
 	Node.built = [];
 	Node.deaf = false;
+	Node.manual = false;
+	MockContext.built = [];
+	MockContext.deferModule = false;
 	InProcessWorker.created = [];
 	InProcessWorker.next = "serve";
 	FakeDecoder.refuse.clear();
@@ -517,11 +554,16 @@ async function feed(t: Tile, from: number, count: number, wait: (ms: number) => 
 	}
 }
 
-/** A tile the worker plays for: its player, timing and graph sent, and 400 ms of media played. */
-async function playing(props?: { isolated?: boolean; tracks?: string[]; offload?: Signal<boolean> }) {
+/** A tile played for: its player, timing and graph sent (to the worker, if it has one), and 400 ms of media played. */
+async function playing(props?: { isolated?: boolean; tracks?: string[]; offload?: boolean | Signal<boolean> }) {
 	scope.crossOriginIsolated = props?.isolated ?? true;
-	const t = tile({ tracks: props?.tracks, offload: props?.offload ?? true });
-	await until(() => InProcessWorker.created.length === 1 && worker().told("graph").length > 0, "the graph");
+	const offload = props?.offload ?? true;
+	const t = tile({ tracks: props?.tracks, offload });
+	if (offload === false) {
+		await until(() => Node.built.length === 1 && t.page.live() === 1, "the page's own subscription");
+	} else {
+		await until(() => InProcessWorker.created.length === 1 && worker().told("graph").length > 0, "the graph");
+	}
 	await feed(t, 0, 20);
 	await sleep(100);
 	const [node] = Node.built;
@@ -1170,6 +1212,278 @@ describe("a node the decoder replaces in the same context", () => {
 
 		// The context is still open, so the old node's processor would run until it closes.
 		expect(old.render.process([], [quantum()], {})).toBe(false);
+	});
+});
+
+// Who feeds the ring behind the node, and over what: the page's worker, which writes by message on any
+// page, or the page itself, which writes shared memory where it is isolated and messages where it is not.
+const SUPPLIES = [
+	["the worker on an isolated page", true, true],
+	["the worker on a plain page", true, false],
+	["the page over a shared ring", false, true],
+	["the page over a message ring", false, false],
+] as const;
+
+/** The rendition at another rate, which is another context. */
+function at(sampleRate: number): Catalog.Root {
+	return {
+		audio: {
+			renditions: { audio: { codec: "opus", container: { kind: "legacy" }, sampleRate, numberOfChannels: 2 } },
+		},
+	} as unknown as Catalog.Root;
+}
+
+// Chromium keeps a closed context, and every node in it, for as long as one of its processors has not
+// stopped, and a processor only stops in a quantum its context renders. A context closed straight
+// after its nodes are told to stop leaves one of each in the page's heap per detach, so it is closed
+// once every processor in it has said it stopped. `Node.manual` holds the processor between its close
+// and its stop, which is where the context must still be open.
+describe.each(SUPPLIES)("a player played by %s, in the context's life", (_supply, offload, isolated) => {
+	/** A player whose graph is built, and the context and node of it. */
+	async function built() {
+		scope.crossOriginIsolated = isolated;
+		const t = tile({ offload });
+		await until(() => Node.built.length === 1, "the graph's node");
+		const context = t.decoder.out.context.peek() as unknown as MockContext;
+		return { t, context, node: Node.built[0] };
+	}
+
+	/** Take the player off the page and wait for it to let go of its graph, which its processor has not yet stopped. */
+	async function detach(t: Tile) {
+		t.attached.set(false);
+		await until(() => t.decoder.out.context.peek() === undefined, "the graph let go");
+		await sleep(30);
+	}
+
+	it("closes the context only once the processor in it has stopped", async () => {
+		Node.manual = true;
+		const t = await playing({ offload, isolated });
+		const [node] = Node.built;
+		const context = t.decoder.out.context.peek() as unknown as MockContext;
+		// The ring is the one the row names, and it plays.
+		expect(loudest(t.played)).toBeGreaterThan(0.4);
+		expect(context.state).toBe("running");
+
+		await detach(t);
+
+		// Told to stop, and gone from the outputs, but the context renders on until the processor says so.
+		expect(node.heard).toContain("close");
+		expect(t.decoder.out.root.peek()).toBeUndefined();
+		expect(context.state).toBe("running");
+
+		node.quantum();
+		await until(() => context.state === "closed", "the context closed once the processor stopped");
+	});
+
+	it("closes a context that is not running at once", async () => {
+		// A suspended context renders no quantum, so its processor never stops and waiting would only
+		// hold the context open. Chromium keeps this pair: nothing short of rendering releases it.
+		MockContext.autoplay = false;
+		Node.manual = true;
+		const { t, context, node } = await built();
+		expect(context.state).toBe("suspended");
+
+		t.attached.set(false);
+		await until(() => context.state === "closed", "the suspended context closed at once");
+		expect(node.heard).toContain("close");
+	});
+
+	it("closes a context that stops running while its processor stops, then", async () => {
+		// The browser suspends a context whose device fails, and interrupts one for a call: either way the
+		// quantum the processor would stop in never comes.
+		Node.manual = true;
+		const { t, context } = await built();
+		await until(() => context.state === "running", "the context running");
+
+		await detach(t);
+		expect(context.state).toBe("running");
+
+		await context.suspend();
+		await until(() => context.state === "closed", "the context closed once it stopped running");
+	});
+
+	it("does not wait for a processor that failed", async () => {
+		// A processor that throws is stopped by the browser, which says so on the node rather than its port.
+		Node.manual = true;
+		const { t, context, node } = await built();
+		await until(() => context.state === "running", "the context running");
+
+		await detach(t);
+		expect(context.state).toBe("running");
+
+		node.dispatchEvent(new Event("processorerror"));
+		await until(() => context.state === "closed", "the context closed once the processor failed");
+	});
+
+	it("closes the context a rate change replaces once the processor in it has stopped", async () => {
+		Node.manual = true;
+		const { t, context: first, node } = await built();
+		await until(() => first.state === "running", "the first context running");
+
+		t.catalog.set(at(44_100));
+		await until(() => MockContext.built.length === 2, "the replacement context");
+		const second = MockContext.built[1];
+		expect(second.sampleRate).toBe(44_100);
+		await until(() => Node.built.length === 2, "the replacement's node");
+		await sleep(30);
+
+		// The replacement is built at once, and the one it replaces renders on until its processor stops.
+		expect(Node.built[1].context).toBe(second);
+		expect(t.decoder.out.context.peek()).toBe(second as unknown as AudioContext);
+		expect(node.heard).toContain("close");
+		expect(first.state).toBe("running");
+
+		node.quantum();
+		await until(() => first.state === "closed", "the replaced context closed once its processor stopped");
+		expect(second.state).toBe("running");
+	});
+
+	it("keeps the context and its node through a mute, which clears `enabled` and not `attached`", async () => {
+		const t = await playing({ offload, isolated });
+		const [context] = MockContext.built;
+		const [node] = Node.built;
+
+		t.enabled.set(false);
+		await sleep(100);
+		expect(context.state).toBe("running");
+		expect(node.heard).not.toContain("close");
+
+		// The unmute costs no gesture, because it is the same context.
+		t.enabled.set(true);
+		await sleep(100);
+		expect(t.decoder.out.context.peek()).toBe(context as unknown as AudioContext);
+		expect(MockContext.built).toHaveLength(1);
+		expect(Node.built).toHaveLength(1);
+	});
+
+	it("builds a context again when it is put back on the page, and plays through it", async () => {
+		const t = await playing({ offload, isolated });
+		const [first] = MockContext.built;
+		// A fixed target, so the 400 ms fed after the gap is more than the ring waits to fill.
+		t.delay.set(Time.Milli(100));
+
+		t.attached.set(false);
+		await until(() => first.state === "closed", "the context closed");
+		expect(t.decoder.out.context.peek()).toBeUndefined();
+
+		t.attached.set(true);
+		await until(() => MockContext.built.length === 2 && Node.built.length === 2, "a new context and node");
+		expect(t.decoder.out.context.peek()).toBe(MockContext.built[1] as unknown as AudioContext);
+		expect(Node.built[1].context).toBe(MockContext.built[1]);
+		expect(first.state).toBe("closed");
+
+		await feed(t, 20, 20);
+		await sleep(100);
+		expect(loudest(pull(Node.built[1], 60))).toBeGreaterThan(0.4);
+	});
+});
+
+describe("a player the worker gave back to the page, then taken off", () => {
+	it("closes the context once the processor of the node it ended on has stopped", async () => {
+		Node.manual = true;
+		const t = tile({ offload: true });
+		await until(() => handed()(), "the graph handed over");
+		const [first] = Node.built;
+		const context = t.decoder.out.context.peek() as unknown as MockContext;
+
+		// The page takes the audio back onto a fresh node of the same context, and the old node's
+		// processor stops, which leaves the context open for the new one.
+		fallbacks();
+		const [player] = worker().told("player");
+		worker().say({ type: "error", id: player.id, message: "TypeError: boom" });
+		await until(() => Node.built.length === 2, "the page's own node");
+		const [, second] = Node.built;
+		await sleep(30);
+		expect(first.heard).toContain("close");
+		first.quantum();
+		await sleep(30);
+		expect(context.state).toBe("running");
+
+		t.attached.set(false);
+		await until(() => t.decoder.out.context.peek() === undefined, "the graph let go");
+		await sleep(30);
+
+		// Only the second node's processor is left running, and the context is open until it stops.
+		expect(second.heard).toContain("close");
+		expect(context.state).toBe("running");
+		second.quantum();
+		await until(() => context.state === "closed", "the context closed once both processors stopped");
+	});
+
+	it("waits for the processors of both nodes when they are told to stop together", async () => {
+		Node.manual = true;
+		const t = tile({ offload: true });
+		await until(() => handed()(), "the graph handed over");
+		const [first] = Node.built;
+		const context = t.decoder.out.context.peek() as unknown as MockContext;
+
+		fallbacks();
+		const [player] = worker().told("player");
+		worker().say({ type: "error", id: player.id, message: "TypeError: boom" });
+		await until(() => Node.built.length === 2, "the page's own node");
+		const [, second] = Node.built;
+		t.attached.set(false);
+		await until(() => t.decoder.out.context.peek() === undefined, "the graph let go");
+		await sleep(30);
+		expect(context.state).toBe("running");
+
+		// Neither processor has stopped, and one stopping is not both.
+		second.quantum();
+		await sleep(30);
+		expect(context.state).toBe("running");
+		first.quantum();
+		await until(() => context.state === "closed", "the context closed once both processors stopped");
+	});
+});
+
+describe("a worklet module still loading when its context goes", () => {
+	it("is cancelled before the context closes, so a rate change leaves no error behind", async () => {
+		MockContext.deferModule = true;
+		const errors = spyOn(console, "error").mockImplementation(() => {});
+		cleanup.push(() => errors.mockRestore());
+		const t = tile({ offload: false });
+		await until(() => MockContext.built[0]?.module !== undefined, "the first context's load");
+
+		t.catalog.set(at(44_100));
+		await until(() => MockContext.built[1]?.module !== undefined, "the replacement's load");
+		const [first, second] = MockContext.built;
+		expect(first.state).toBe("closed");
+		expect(second.sampleRate).toBe(44_100);
+
+		second.module?.resolve();
+		await until(() => Node.built.length === 1, "the replacement's node");
+		await sleep(30);
+		expect(Node.built[0].context).toBe(second);
+		expect(t.decoder.out.context.peek()).toBe(second as unknown as AudioContext);
+		expect(errors).not.toHaveBeenCalled();
+	});
+
+	it("is cancelled before the context closes, so a detach leaves no error behind", async () => {
+		MockContext.deferModule = true;
+		const errors = spyOn(console, "error").mockImplementation(() => {});
+		cleanup.push(() => errors.mockRestore());
+		const t = tile({ offload: false });
+		await until(() => MockContext.built[0]?.module !== undefined, "the context's load");
+
+		t.attached.set(false);
+		await until(() => MockContext.built[0].state === "closed", "the context closed");
+		await sleep(30);
+		expect(Node.built).toEqual([]);
+		expect(errors).not.toHaveBeenCalled();
+	});
+
+	it("stays an error when it fails in the context the player is still using", async () => {
+		MockContext.deferModule = true;
+		const errors = spyOn(console, "error").mockImplementation(() => {});
+		cleanup.push(() => errors.mockRestore());
+		tile({ offload: false });
+		await until(() => MockContext.built[0]?.module !== undefined, "the context's load");
+
+		const failure = new Error("module failed");
+		MockContext.built[0].module?.reject(failure);
+		await until(() => errors.mock.calls.length > 0, "the failure reported");
+		expect(errors).toHaveBeenCalledWith("spawn error", failure);
+		expect(Node.built).toEqual([]);
 	});
 });
 

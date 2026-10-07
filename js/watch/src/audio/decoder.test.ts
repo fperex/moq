@@ -58,13 +58,27 @@ class FakeContext extends EventTarget {
 // What the page sent every render worklet it built.
 let posted: unknown[] = [];
 
-class FakeWorklet {
+// Behind a processor that stops the way the render worklet's does: in the next quantum its context
+// renders after it is told to close, saying so on the node's port. A running context renders on its
+// own; a suspended one never does.
+class FakeWorklet extends EventTarget {
 	readonly port = Object.assign(new EventTarget(), {
-		postMessage(message: unknown) {
+		postMessage: (message: unknown) => {
 			posted.push(message);
+			if ((message as { type?: string }).type !== "close") return;
+			queueMicrotask(() => {
+				if (this.context.state === "running") {
+					this.port.dispatchEvent(new MessageEvent("message", { data: { type: "stopped" } }));
+				}
+			});
 		},
 		start() {},
 	});
+	readonly context: FakeContext;
+	constructor(context: FakeContext) {
+		super();
+		this.context = context;
+	}
 	disconnect() {}
 }
 

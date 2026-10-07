@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { Time } from "@moq/net";
-import type { Data, InitPost, Message, Port, State, ToMain } from "./render";
+import type { Data, InitPost, InitShared, Message, Port, State, ToMain } from "./render";
+import { allocSharedRingBuffer } from "./shared-ring-buffer";
 
 // The render worklet itself, loaded into a stand-in for its global scope: `AudioWorkletProcessor`
 // hands each processor the port the test gives it, `registerProcessor` captures the class, and
@@ -186,4 +187,66 @@ describe("render worklet ports", () => {
 
 		node.port2.close();
 	});
+
+	// Whichever ring the processor was playing when its node was closed, if it had one yet.
+	const RINGS: Array<[string, Message | undefined]> = [
+		["no ring yet", undefined],
+		[
+			"a shared ring",
+			{ type: "init-shared", ...allocSharedRingBuffer(1, RATE, RATE), conceal: false } satisfies InitShared,
+		],
+		[
+			"a message ring",
+			{
+				type: "init-post",
+				channels: 1,
+				rate: RATE,
+				latency: Time.Milli(20),
+				buffered: false,
+				conceal: false,
+			} satisfies InitPost,
+		],
+	];
+
+	it.each(RINGS)(
+		"says on the node's own port that its processor stopped, in the quantum that stops it, with %s",
+		async (_ring, init) => {
+			// Chromium keeps a closed context, and every node in it, for as long as one of its processors
+			// has not stopped, and a processor only stops in a quantum it renders. The page closes the
+			// context on this, not on the close it sent.
+			if (!Render) throw new Error("render-worklet.ts registered no 'render' processor");
+			const node = new MessageChannel();
+			nextPort = node.port1;
+			const render = new Render();
+			const extra = new MessageChannel();
+			const handoff: Port = { type: "port", port: extra.port1 };
+			const page: ToMain[] = [];
+			const writer: ToMain[] = [];
+			const stopped = (messages: ToMain[]) => messages.filter((message) => message.type === "stopped");
+			try {
+				node.port2.onmessage = (event: MessageEvent<ToMain>) => page.push(event.data);
+				extra.port2.onmessage = (event: MessageEvent<ToMain>) => writer.push(event.data);
+				node.port2.postMessage(handoff, [extra.port1]);
+				// The ring comes from the writer's port, as a worker's does.
+				if (init) extra.port2.postMessage(init);
+				await settle();
+				pull(render, 10);
+
+				node.port2.postMessage({ type: "close" });
+				await settle();
+
+				// Nothing yet: a close is not a stop, which is the quantum the context renders next.
+				expect(stopped(page)).toEqual([]);
+
+				expect(render.process([], [[new Float32Array(QUANTUM)]], {})).toBe(false);
+				await settle();
+				expect(stopped(page)).toEqual([{ type: "stopped" }]);
+				// Only the page closes a context, so a writer's port hears nothing of it.
+				expect(stopped(writer)).toEqual([]);
+			} finally {
+				node.port2.close();
+				extra.port2.close();
+			}
+		},
+	);
 });

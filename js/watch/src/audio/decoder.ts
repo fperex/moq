@@ -17,7 +17,7 @@ import type { Sync } from "../sync";
 import { reportTransport, supportsSharedArrayBuffer } from "./buffer";
 import { AUTO_MAX_AGE, target } from "./latency";
 import type { Snapshot } from "./playout";
-import type { Close } from "./render";
+import type { Close, ToMain } from "./render";
 // A blob: URL, or a hosted file when assets() is set; see vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -175,10 +175,6 @@ export class Decoder {
 	// Why the page took the audio back from its worker, once it has: for good. See #runFallback.
 	readonly #fallback = new Signal<string | undefined>(undefined);
 
-	// The context the graph runs in, with what it was built for. Nodes are built against this and not
-	// against the shape, so a node never meets a context the shape has already moved past.
-	readonly #built = new Signal<{ context: AudioContext; rate: number; channels: number } | undefined>(undefined);
-
 	// The context, worklet, and ring are keyed on this alone. It outlives a rendition's absence, so
 	// the queued tail plays out and a return with the same shape reuses the graph.
 	#shape = new Signal<Shape | undefined>(undefined);
@@ -236,7 +232,6 @@ export class Decoder {
 		this.#signals.run(this.#runShape.bind(this));
 		this.#signals.run(this.#runRate.bind(this));
 		this.#signals.run(this.#runContext.bind(this));
-		this.#signals.run(this.#runNode.bind(this));
 		this.#signals.run(this.#runRing.bind(this));
 		this.#signals.run(this.#runOutputs.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
@@ -367,6 +362,9 @@ export class Decoder {
 	 * can be heard out of it, and what it holds is a render thread and one of the handful of contexts a
 	 * browser allows. Keyed on `attached` rather than on `enabled`, which a mute also clears, so a muted
 	 * tile keeps the context it has.
+	 *
+	 * The nodes are built inside this run, so a teardown cancels their module loads and tells their
+	 * processors to stop before it closes the context, which then waits for them. See `Processors`.
 	 */
 	#runContext(effect: Effect): void {
 		if (!effect.get(this.in.attached)) return;
@@ -386,9 +384,13 @@ export class Decoder {
 			sampleRate: shape.sampleRate,
 		});
 		effect.set(this.#out.context, context);
-		effect.set(this.#built, { context, rate: shape.sampleRate, channels: shape.channels });
 
-		effect.cleanup(() => context.close());
+		// Registered before the nodes' effect, so a teardown reaches it after that has told every processor
+		// to stop: the context is closed once they have.
+		const processors = new Processors(context);
+		effect.cleanup(() => processors.close());
+
+		effect.run((inner) => this.#runNode(inner, context, processors, shape));
 	}
 
 	/**
@@ -397,10 +399,8 @@ export class Decoder {
 	 * A node of its own for every supply: a writer reaches a node through what it was handed at build,
 	 * so a supply taking over from another gets one nothing else writes into.
 	 */
-	#runNode(effect: Effect): void {
-		const built = effect.get(this.#built);
-		if (!built) return;
-		const { context, rate: sampleRate, channels: channelCount } = built;
+	#runNode(effect: Effect, context: AudioContext, processors: Processors, shape: Shape): void {
+		const { sampleRate, channels: channelCount } = shape;
 
 		const active = effect.get(this.#active);
 		if (!active) return;
@@ -427,6 +427,7 @@ export class Decoder {
 				channelCountMode: "explicit",
 				outputChannelCount: [channelCount],
 			});
+			processors.add(worklet);
 			effect.cleanup(() => {
 				// The context outlives this node, so the processor has to be told to end. See `Close`.
 				const close: Close = { type: "close" };
@@ -555,4 +556,63 @@ export class Decoder {
 
 	// Whether the WebCodecs audio decoder can play this config.
 	static supported = supported;
+}
+
+/**
+ * The processors built in one AudioContext, which closes it once every one of them has stopped.
+ *
+ * Chromium keeps a closed context, and every node in it, for as long as one of its processors has not
+ * stopped, and a processor only stops in a quantum its context renders. So a running context is closed
+ * once each processor has said it stopped (see `Stopped`), and one that renders nothing (suspended for
+ * want of a gesture, interrupted, failed) is closed at once: its processors can never stop, and waiting
+ * would only hold it open.
+ */
+class Processors {
+	readonly #context: AudioContext;
+	// Every processor that has not said it stopped.
+	readonly #active = new Set<AudioWorkletNode>();
+	// Owns every listener, all released once the context is closed.
+	readonly #signals = new Effect();
+	#closing = false;
+
+	constructor(context: AudioContext) {
+		this.#context = context;
+	}
+
+	/** Follow the processor behind `node` until it says it stopped, or fails, which stops it too. */
+	add(node: AudioWorkletNode): void {
+		this.#active.add(node);
+		const dispose = this.#signals.run((effect) => {
+			const stop = () => {
+				dispose();
+				this.#active.delete(node);
+				if (this.#closing && this.#active.size === 0) this.#close();
+			};
+			effect.event(node.port, "message", (event) => {
+				if ((event as MessageEvent<ToMain>).data?.type === "stopped") stop();
+			});
+			effect.event(node, "processorerror", stop);
+			// A port only delivers to listeners added with addEventListener once it is started.
+			node.port.start();
+		});
+	}
+
+	/** Close the context once every processor in it has stopped, or now if it renders nothing. */
+	close(): void {
+		this.#closing = true;
+		if (this.#active.size === 0 || this.#context.state !== "running") {
+			this.#close();
+			return;
+		}
+		// A context that stops rendering never runs the quantum a processor would stop in.
+		this.#signals.event(this.#context, "statechange", () => {
+			if (this.#context.state !== "running") this.#close();
+		});
+	}
+
+	#close(): void {
+		this.#signals.close();
+		// A context closed twice rejects, and there is nothing to do about a close that fails anyway.
+		this.#context.close().catch(() => {});
+	}
 }
