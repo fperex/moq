@@ -18,6 +18,7 @@ We're using Vite but other bundlers should work too.
 Run `just web` (or `bun --bun vite` from this directory) and open the pages:
 
 - `watch.html` - Watch inspector: one tile per live broadcast discovered under a prefix, click to make a tile active (audio + a live stats panel for video/audio/network and a custom `meta.json` metadata track).
+  Bench tools, off by default: `?offload=0` keeps each tile's audio on the main thread, `?stall=MS/EVERY` (with optional `stallAt` and `stallFor`, in seconds) freezes the main thread, and `?csp=1` refuses the audio worker.
 - `publish.html` - Publish from a camera/screen/file, plus an editor for the custom `meta.json` metadata track.
 - `meet.html` - Conferencing: a room is a path prefix, participants publish `{identity}/camera` and `{identity}/screen`, discovered from the announce stream. Open the same room in two tabs.
 - `stats.html` - Relay stats dashboard: auto-discovers every node publishing `.stats` and aggregates external vs. cluster traffic. Needs `[stats] enabled = true` on the relay (the demo configs already set it).
