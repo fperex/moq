@@ -29,10 +29,15 @@ test("Player owns the shared pipeline and feeds output policy into decoders", as
 		expect(player.audio.in.enabled.peek()).toBe(true);
 		expect(player.textRenderer.in.enabled.peek()).toBe(true);
 
+		// On the page, so it keeps an audio context.
+		expect(player.audio.in.attached.peek()).toBe(true);
+
 		muted.set(true);
 		await flush();
 		expect(player.audio.in.enabled.peek()).toBe(false);
 		expect(player.video.in.enabled.peek()).toBe(true);
+		// A mute stops the download and keeps the context, so the unmute needs no gesture.
+		expect(player.audio.in.attached.peek()).toBe(true);
 
 		paused.set(true);
 		await flush();
@@ -46,6 +51,8 @@ test("Player owns the shared pipeline and feeds output policy into decoders", as
 		expect(player.video.in.enabled.peek()).toBe(false);
 		expect(player.audio.in.enabled.peek()).toBe(false);
 		expect(player.textRenderer.in.enabled.peek()).toBe(false);
+		// Off the page, nothing can be heard, so the decoder releases its context.
+		expect(player.audio.in.attached.peek()).toBe(false);
 	} finally {
 		player.close();
 	}
