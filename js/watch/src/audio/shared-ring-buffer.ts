@@ -651,6 +651,9 @@ export class SharedRingBuffer implements RingReader {
 	 */
 	reset(): void {
 		this.#anchored = false;
+		// The timeline the ring held is gone from here, not from the next insert: a reader holding a
+		// concealment of it must not keep playing it through a pause nothing will fill.
+		Atomics.add(this.#control, TIMELINE, 1);
 		Atomics.store(this.#control, STALLED, 1);
 		const write = Atomics.load(this.#control, WRITE);
 		const state = Atomics.load(this.#state, 0);

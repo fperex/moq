@@ -136,7 +136,7 @@ describe.each(RINGS)("%s ring: the reader surface", (_, build) => {
 		expect(ring.buffer.debug().queued).toBe(10);
 	});
 
-	it("changes generation when the ring re-anchors, and only then", () => {
+	it("changes generation when the timeline is replaced, and only then", () => {
 		const ring = build(40);
 		insertChunks(ring, 0, 40, 10);
 		const first = ring.buffer.view().generation;
@@ -147,9 +147,14 @@ describe.each(RINGS)("%s ring: the reader surface", (_, build) => {
 		ring.insert(30, 10);
 		expect(ring.buffer.view().generation).toBe(first);
 
+		// A flush replaces it at once, so a reader covering the gap stops rather than playing the old
+		// timeline through a pause nothing will fill.
 		ring.buffer.reset();
+		const flushed = ring.buffer.view().generation;
+		expect(flushed).not.toBe(first);
+
 		insertChunks(ring, 5000, 40, 10);
-		expect(ring.buffer.view().generation).not.toBe(first);
+		expect(ring.buffer.view().generation).not.toBe(flushed);
 	});
 
 	it("counts audio the writer threw away as too old", () => {

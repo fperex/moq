@@ -20,9 +20,9 @@ export class AudioRingBuffer implements RingReader {
 	// Whether the read/write indices have been anchored to the first inserted sample.
 	#anchored = false;
 
-	// Bumped whenever the ring re-anchors to a new media timeline, so a reader holding a block from
-	// the previous one knows to drop it. The shared transport reads its TIMELINE slot for the same
-	// purpose.
+	// Bumped whenever the media timeline is replaced (a reset, or a re-anchor), so a reader holding a
+	// block from the previous one knows to drop it. The shared transport reads its TIMELINE slot for
+	// the same purpose.
 	#generation = 0;
 
 	// How far above the target the ring may sit before it drops audio. See SKIP in
@@ -408,6 +408,9 @@ export class AudioRingBuffer implements RingReader {
 		this.#writeIndex = 0;
 		this.#stalled = true;
 		this.#anchored = false;
+		// The timeline the ring held is gone from here, not from the next write: a reader holding a
+		// concealment of it must not keep playing it through a pause nothing will fill.
+		this.#generation++;
 	}
 
 	/**
