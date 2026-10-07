@@ -1,10 +1,89 @@
 /**
- * Fakes the audio tests share: the audio worker, and a clock the test moves by hand.
+ * Fakes the audio tests share: WebCodecs, the relay session the worker dials, the worker itself, and a
+ * clock the test moves by hand.
  *
  * @internal Test support, not part of the player.
  */
+import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
-import type { FromWorker, Support, ToWorker } from "./worker/protocol";
+import { Signal } from "@moq/signals";
+import type { Session } from "./worker/host";
+import type { FromWorker, Support, ToWorker, Transports } from "./worker/protocol";
+
+const RATE = 48_000;
+
+// ── WebCodecs, enough of it ─────────────────────────────────────────────────
+
+export class FakeChunk {
+	readonly timestamp: number;
+	constructor(init: { timestamp: number }) {
+		this.timestamp = init.timestamp;
+	}
+}
+
+/** One 20 ms stereo packet of a constant, stamped from the chunk that produced it. */
+export class FakeAudioData {
+	readonly format = "f32-planar";
+	readonly sampleRate = RATE;
+	readonly numberOfFrames = 960;
+	readonly numberOfChannels = 2;
+	readonly timestamp: number;
+	constructor(timestamp: number) {
+		this.timestamp = timestamp;
+	}
+	copyTo(dst: Float32Array): void {
+		dst.fill(0.5);
+	}
+	close(): void {}
+}
+
+export class FakeDecoder {
+	/** The codecs this realm's decoder turns down. */
+	static refuse = new Set<string>();
+
+	state = "configured";
+	readonly #output: (data: FakeAudioData) => void;
+	constructor(init: { output: (data: FakeAudioData) => void }) {
+		this.#output = init.output;
+	}
+	static async isConfigSupported(config: { codec: string }): Promise<{ supported: boolean }> {
+		return { supported: !FakeDecoder.refuse.has(config.codec) };
+	}
+	configure(): void {}
+	decode(chunk: FakeChunk): void {
+		this.#output(new FakeAudioData(chunk.timestamp));
+	}
+	reset(): void {}
+	close(): void {
+		this.state = "closed";
+	}
+	async flush(): Promise<void> {}
+}
+
+// ── the relay ───────────────────────────────────────────────────────────────
+
+/** A session as the worker's host sees one, reading from an origin in this process. */
+export class FakeSession implements Session {
+	readonly origin: Signal<Moq.Origin.Table | undefined>;
+	readonly status: Signal<Moq.Connection.Status> = new Signal<Moq.Connection.Status>("connected");
+	readonly transport: Signal<Moq.Connection.Transport | undefined> = new Signal<Moq.Connection.Transport | undefined>(
+		"webtransport",
+	);
+	readonly enabled = new Signal(true);
+	readonly url: URL;
+	readonly transports: Transports;
+	closed = false;
+
+	constructor(url: URL, transports: Transports, origin: Moq.Origin.Table) {
+		this.url = url;
+		this.transports = transports;
+		this.origin = new Signal<Moq.Origin.Table | undefined>(origin);
+	}
+
+	close(): void {
+		this.closed = true;
+	}
+}
 
 // ── the worker ──────────────────────────────────────────────────────────────
 

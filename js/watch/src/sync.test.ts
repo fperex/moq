@@ -263,6 +263,19 @@ describe("clock", () => {
 		sync.close();
 	});
 
+	it("anchors on when a frame arrived rather than when it was reported", async () => {
+		clock = fakeClock();
+		const sync = new Sync({ delay: 100 as Time.Milli });
+		await flush();
+
+		// Read on another thread 300ms ago and reported now: playback is 300ms further along than a
+		// frame arriving this instant would put it.
+		sync.received(5000 as Time.Milli, "audio", Time.Milli.sub(clock.at, Time.Milli(300)));
+		expect(sync.now()).toBe(5200 as Time.Milli);
+
+		sync.close();
+	});
+
 	it("re-anchors on reset", async () => {
 		clock = fakeClock();
 		const sync = new Sync({ delay: 100 as Time.Milli });
