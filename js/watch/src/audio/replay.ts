@@ -4,11 +4,11 @@
  * Every frame is written into its group at the instant the trace says it arrived, and the player's
  * real `Container.Consumer` decides what to deliver, wait for, and skip, at the max age the delay
  * sets. Delivered frames go into the real ring, and a discontinuity resets it, the way the decoder
- * does. One render quantum is read every quantum's worth of that same clock, which is what the
- * AudioWorklet does. A real {@link Sync} resolves the delay from the playout target the decoder
- * registers, measured by that same consumer from the recorded catalog config, and the ring follows
- * it the way the decoder resizes it, so a change to any of them moves what a replay hears. Decoding
- * is taken as instant and sample exact.
+ * does. One render quantum is rendered every quantum's worth of that same clock, through the playout
+ * engine the AudioWorklet owns, which is what the AudioWorklet does. A real {@link Sync} resolves the
+ * delay from the playout target the decoder registers, measured by that same consumer from the
+ * recorded catalog config, and the ring follows it the way the decoder resizes it, so a change to any
+ * of them moves what a replay hears. Decoding is taken as instant and sample exact.
  *
  * Deterministic, so the audio quality harness grades its output with no headroom, and a unit test
  * can assert exact counts.
@@ -22,6 +22,8 @@ import { Effect } from "@moq/signals";
 import { type Delay, Sync } from "../sync";
 import { frameDuration } from "./config";
 import { ringSamples, target } from "./latency";
+import type { Playhead } from "./playhead";
+import { type Counters, type RingReader, Stretcher } from "./playout";
 import { AudioRingBuffer } from "./ring-buffer";
 import { allocSharedRingBuffer, SharedRingBuffer } from "./shared-ring-buffer";
 import { Terminal } from "./terminal";
@@ -38,6 +40,9 @@ const WIRE_MAX_AGE = Time.Milli(Number.MAX_SAFE_INTEGER);
 /** Any non-empty payload: an empty one is the legacy container's end marker. */
 const PAYLOAD = new Uint8Array(1);
 
+/** The empty payload that is the legacy container's end marker. */
+const MARKER = new Uint8Array(0);
+
 /** One frame reaching the container consumer. */
 export interface Arrival {
 	/** When it arrived, on the viewer's monotonic clock, in ms. */
@@ -46,6 +51,48 @@ export interface Arrival {
 	timestamp: number;
 	/** The group that carried it. */
 	group: number;
+	/**
+	 * The publisher declared its timeline finished here rather than sending a frame: the endpoint a
+	 * muting publisher writes, alone in its group.
+	 *
+	 * Carries no media, so it is neither inserted nor measured, but it is what raises the discontinuity
+	 * that resets the ring.
+	 */
+	endpoint?: boolean;
+}
+
+/** A recorded trace, as trimmed into `./fixtures`. */
+export interface Fixture {
+	/** Where the recording came from. */
+	source: string;
+	/** What it is, and what makes it worth keeping. */
+	description: string;
+	/**
+	 * Arrival timing only: no payload, no codec, nothing identifying.
+	 *
+	 * A frame to a group, as the publishers recorded publish them. `stalled` is the recording's own
+	 * note that the receiver's event loop was blocked before it read the frame, which a replay does
+	 * not act on. `endpoint` is a publisher declaring its timeline finished rather than sending a frame.
+	 */
+	arrivals: { timestamp_us: number; arrival_ms: number; stalled?: boolean; endpoint?: boolean }[];
+}
+
+/**
+ * A fixture's arrivals in the units a replay takes, from the first one's moment.
+ *
+ * A frame is a group, numbered by its place in media order, which is what a publisher numbers them by:
+ * a frame that arrives before an earlier one is a group that overtook another.
+ */
+export function recorded(fixture: Fixture): Arrival[] {
+	const order = [...new Set(fixture.arrivals.map((a) => a.timestamp_us))].sort((a, b) => a - b);
+	const groups = new Map(order.map((timestamp, group) => [timestamp, group]));
+	const first = fixture.arrivals[0].arrival_ms;
+	return fixture.arrivals.map(({ timestamp_us, arrival_ms, endpoint }) => ({
+		at: arrival_ms - first,
+		timestamp: timestamp_us / 1000,
+		group: groups.get(timestamp_us) ?? 0,
+		endpoint,
+	}));
 }
 
 /** What a replay plays through. */
@@ -56,6 +103,11 @@ export interface Options {
 	rate: number;
 	/** The configured delay, as the element takes it. "instant" plays no audio, so it has no replay. */
 	delay: Exclude<Delay, "instant">;
+	/**
+	 * Whether a gap is concealed with synthesized audio rather than played as a ramp into silence. On
+	 * by default, which is what a page runs. Off is the control a concealment test grades against.
+	 */
+	conceal?: boolean;
 	/** The rendition as the catalog described it: its advertised jitter, delay, and codec. */
 	config: Catalog.AudioConfig;
 	/**
@@ -73,6 +125,13 @@ export interface Quantum {
 	output: Float32Array;
 	/** Whether the ring was stalled after this quantum. */
 	stalled: boolean;
+	/** What the playout engine has done so far, cumulative. Reused between yields. */
+	counters: Counters;
+	/**
+	 * Where the reader is and how fast it moves, as the page would sample it, or undefined before the
+	 * ring anchors. Stateful: the rate is measured between calls, so ask at the cadence a page polls.
+	 */
+	playhead(): Playhead | undefined;
 	/** The playhead after this quantum, on the media clock, in ms. */
 	timestamp: number;
 	/** The delay `Sync` resolved as of this quantum, in ms: what sizes the ring. */
@@ -82,11 +141,14 @@ export interface Quantum {
 /** The two rings behind the calls the decoder and the worklet make on them. */
 interface Ring {
 	insert(timestamp: Time.Micro, data: Float32Array[]): void;
-	read(output: Float32Array[]): number;
+	/** What the playout engine reads. A resized shared ring is a new one, so this is read afresh. */
+	readonly reader: RingReader;
 	reset(): void;
-	setLatency(samples: number): void;
+	/** Move the target, and say whether that replaced the ring the worklet reads. */
+	setLatency(samples: number): boolean;
 	readonly stalled: boolean;
 	readonly timestamp: Time.Micro;
+	readonly playhead: Playhead | undefined;
 }
 
 /** The shared ring, sized and grown the way `SharedAudioBuffer` sizes and grows it. */
@@ -95,17 +157,24 @@ function shared(rate: number, latency: number): Ring {
 	ring.setLatency(latency);
 	return {
 		insert: (timestamp, data) => ring.insert(timestamp, data),
-		read: (output) => ring.read(output),
+		get reader() {
+			return ring;
+		},
 		reset: () => ring.reset(),
 		setLatency: (samples) => {
 			ring.setLatency(samples);
-			if (ring.capacity < samples * 1.5) ring = ring.resize(Math.max(rate, samples * 2));
+			if (ring.capacity >= samples * 1.5) return false;
+			ring = ring.resize(Math.max(rate, samples * 2));
+			return true;
 		},
 		get stalled() {
 			return ring.stalled;
 		},
 		get timestamp() {
 			return ring.timestamp;
+		},
+		get playhead() {
+			return ring.playhead;
 		},
 	};
 }
@@ -118,14 +187,22 @@ function post(rate: number, latency: number): Ring {
 	const ring = new AudioRingBuffer({ rate, channels: 1, latency: millis(rate, latency) });
 	return {
 		insert: (timestamp, data) => ring.write(timestamp, data),
-		read: (output) => ring.read(output),
+		reader: ring,
 		reset: () => ring.reset(),
-		setLatency: (samples) => ring.resize(millis(rate, samples)),
+		setLatency: (samples) => {
+			ring.resize(millis(rate, samples));
+			return false;
+		},
 		get stalled() {
 			return ring.stalled;
 		},
 		get timestamp() {
 			return ring.timestamp;
+		},
+		get playhead() {
+			// One object, refilled: copied, because a caller keeps it past the next read.
+			const playhead = ring.playhead;
+			return playhead && { ...playhead };
 		},
 	};
 }
@@ -212,6 +289,9 @@ export async function* replay(trace: Arrival[], options: Options): AsyncGenerato
 
 	let delay = sync.out.delay.peek();
 	const ring = (options.ring === "shared" ? shared : post)(rate, ringSamples(rate, delay));
+	// The engine the worklet owns: one per reader, kept across the ring being replaced under it.
+	const engine = new Stretcher(rate, 1, options.conceal ?? true);
+	let rendered = 0;
 
 	// The decoder's read loop, with the codec taken out. A failure is rethrown at the next quantum.
 	const terminal = new Terminal();
@@ -265,7 +345,7 @@ export async function* replay(trace: Arrival[], options: Options): AsyncGenerato
 				}
 				const timestamp = micros(arrival.timestamp);
 				group.writeFrame({
-					payload: Container.Legacy.encodeFrame(PAYLOAD, timestamp),
+					payload: Container.Legacy.encodeFrame(arrival.endpoint ? MARKER : PAYLOAD, timestamp),
 					timestamp: Time.Timestamp.fromMicros(timestamp),
 				});
 				if (ends.get(arrival.group) === next) {
@@ -281,12 +361,25 @@ export async function* replay(trace: Arrival[], options: Options): AsyncGenerato
 			const resolved = sync.out.delay.peek();
 			if (resolved !== delay) {
 				delay = resolved;
-				ring.setLatency(ringSamples(rate, delay));
+				// A replacement ring is the same timeline: the engine drops its block and keeps its counters.
+				if (ring.setLatency(ringSamples(rate, delay))) engine.discontinuity();
 			}
 
+			// Everything that arrived by now has been read, so the clock moves on to the quantum for
+			// whoever watches it from outside: a `Sync` paced against this replay.
+			clock = now;
 			output.fill(0);
-			ring.read([output]);
-			yield { at: now, output, stalled: ring.stalled, timestamp: Time.Milli.fromMicro(ring.timestamp), delay };
+			engine.render(ring.reader, [output], rendered);
+			rendered += QUANTUM;
+			yield {
+				at: now,
+				output,
+				stalled: ring.stalled,
+				counters: engine.counters(),
+				playhead: () => ring.playhead,
+				timestamp: Time.Milli.fromMicro(ring.timestamp),
+				delay,
+			};
 		}
 	} finally {
 		consumer.close();
