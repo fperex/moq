@@ -11,6 +11,7 @@ import { Source } from "./source";
 
 // Bun cannot load the blob-URL worklet import.
 mock.module("./render-worklet.ts?worklet", () => ({ default: async () => "blob:fake-render" }));
+mock.module("./worker/worker.ts?worklet", () => ({ default: async () => "blob:fake-worker" }));
 const { Decoder } = await import("./decoder");
 
 // Drain reactive work without advancing playback time.

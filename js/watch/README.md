@@ -73,6 +73,7 @@ The simplest way to watch a stream:
 | `delay`          | `auto`, duration, `instant` | `auto`       | Distance from the live edge. `instant` paints frames as they decode and disables audio. |
 | `buffer`         | duration                   | `0ms`         | Future-dated media held before playback skips ahead. |
 | `conceal`        | boolean                    | true          | Cover an audio gap with synthesized audio; `false` leaves the gap audible. |
+| `offload`        | boolean                    | true          | Feed the audio from a worker, off the page's main thread; `false` keeps it on the page. |
 | `captions`       | string                     | off           | Text rendition to render. |
 | `catalog-format` | hang, hangz, msf, manual   | auto-detected | The catalog format; detected from the name suffix unless set. `hangz` (compressed) is opt-in. |
 
@@ -105,6 +106,8 @@ const connection = new Watch.Net.Connection({
 const muted = new Signal(false);
 const player = new Watch.Player({
     origin: connection.origin,
+    // The relay the audio worker dials; without it the audio stays on the main thread.
+    url: connection.url,
     probe: connection.probe,
     name: Watch.Net.Path.from("room/alice.hang"),
     canvas,

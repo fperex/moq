@@ -28,6 +28,7 @@ const OBSERVED = [
 	"delay",
 	"buffer",
 	"conceal",
+	"offload",
 	// Released spellings are observed only so assigning them can fail loudly instead of being ignored.
 	"reload",
 	"latency",
@@ -155,6 +156,7 @@ export default class MoqWatch extends HTMLElement {
 	#name = new Signal<Moq.Path.Valid>(Moq.Path.empty());
 	#announced = new Signal(true);
 	#conceal = new Signal(true);
+	#offload = new Signal(true);
 	#catalogFormat = new Signal<CatalogFormat | undefined>(undefined);
 	#catalog = new Signal<Catalog.Root | undefined>(undefined);
 
@@ -192,11 +194,14 @@ export default class MoqWatch extends HTMLElement {
 
 		this.player = new Player({
 			origin: this.connection.origin,
+			// The same relay, for the audio worker's own session.
+			url: this.connection.url,
 			probe: this.connection.probe,
 			enabled: this.#enabled,
 			name: this.#name,
 			announced: this.#announced,
 			conceal: this.#conceal,
+			offload: this.#offload,
 			catalogFormat: this.#catalogFormat,
 			catalog: this.#catalog,
 			canvas: this.#canvas,
@@ -383,6 +388,8 @@ export default class MoqWatch extends HTMLElement {
 			this.controls.buffer.set(parseBuffer(newValue));
 		} else if (name === "conceal") {
 			this.#conceal.set(parseBoolean(newValue, true));
+		} else if (name === "offload") {
+			this.#offload.set(parseBoolean(newValue, true));
 		} else if (name === "reload") {
 			console.warn("moq-watch: `reload` was renamed to `announced`");
 		} else if (name === "latency" || name === "latency-min" || name === "jitter") {
@@ -461,6 +468,15 @@ export default class MoqWatch extends HTMLElement {
 
 	set conceal(value: boolean) {
 		this.#conceal.set(value);
+	}
+
+	/** Whether the audio is fed from the page's audio worker rather than its main thread. See {@link Audio.DecoderInput.offload}. */
+	get offload(): boolean {
+		return this.#offload.peek();
+	}
+
+	set offload(value: boolean) {
+		this.#offload.set(value);
 	}
 
 	/** @internal */

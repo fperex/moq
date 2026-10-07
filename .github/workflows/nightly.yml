@@ -139,6 +139,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: nix develop --command just js stretch-bench
 
+      # The audio worker reports on every player twenty times a second, so what the page pays per report
+      # is swept over players x report rate. No threshold; the unit test holds the slope by counting.
+      - name: JS audio worker report benchmark
+        if: ${{ !cancelled() }}
+        run: nix develop --command just js remote-bench
+
       # Times Effect create and close beside a bare `new Error()`. No threshold: it only
       # has to keep running, and its numbers track the creation stack's cost.
       - name: JS signals effect benchmark

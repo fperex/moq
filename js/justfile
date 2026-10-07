@@ -62,6 +62,11 @@ stretch-bench:
     bun install --frozen-lockfile
     bun watch/bench/stretch.ts
 
+# Sweep the reports of the audio worker's players over players x report rate, on the page's main thread.
+remote-bench:
+    bun install --frozen-lockfile
+    bun watch/bench/remote.ts
+
 # Time Effect create and close, which pays for the creation stack its diagnostics print.
 signals-bench:
     bun install --frozen-lockfile

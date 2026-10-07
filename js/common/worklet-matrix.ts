@@ -34,6 +34,7 @@ try {
 			`export { default as render } from "${js}/watch/src/audio/render-worklet.ts?worklet";`,
 			`export { default as capture } from "${js}/publish/src/audio/capture-worklet.ts?worklet";`,
 			`export { default as worker } from "${js}/publish/src/video/capture-worker.ts?worklet";`,
+			`export { default as audio } from "${js}/watch/src/audio/worker/worker.ts?worklet";`,
 		].join("\n"),
 	);
 	await build({
@@ -50,7 +51,7 @@ try {
 
 	writeFileSync(
 		join(root, "main.js"),
-		`import { render, capture, worker } from "worklet-lib";
+		`import { render, capture, worker, audio } from "worklet-lib";
 const base = location.search.includes("hosted") ? new URL("/moq/", location.href) : undefined;
 window.result = (async () => {
 	const context = new AudioContext();
@@ -65,7 +66,14 @@ window.result = (async () => {
 			spawned.onerror = () => reject(new Error("capture worker failed to load"));
 		});
 		spawned.terminate();
-		return ready === "ready" ? "ok" : ready;
+		if (ready !== "ready") return ready;
+		const player = new Worker(await audio(base));
+		const said = await new Promise((resolve, reject) => {
+			player.onmessage = (event) => resolve(event.data.type);
+			player.onerror = () => reject(new Error("audio worker failed to load"));
+		});
+		player.terminate();
+		return said === "ready" ? "ok" : said;
 	} catch (error) {
 		return String(error);
 	} finally {
