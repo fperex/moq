@@ -262,7 +262,9 @@ function installGatedWebAudio(addModule: () => Promise<void> = () => Promise.res
 			this.transition("running");
 			return Promise.resolve();
 		}
+		closes = 0;
 		close(): Promise<void> {
+			this.closes++;
 			return Promise.resolve();
 		}
 		transition(state: string): void {
@@ -272,15 +274,27 @@ function installGatedWebAudio(addModule: () => Promise<void> = () => Promise.res
 		}
 	}
 
-	class GatedWorklet {
-		port = Object.assign(new EventTarget(), { start: () => {} });
+	class GatedWorklet extends EventTarget {
+		// What the page told the processor, which answers on the port once it has stopped.
+		sent: unknown[] = [];
+		port = Object.assign(new EventTarget(), {
+			start: () => {},
+			postMessage: (message: unknown) => {
+				this.sent.push(message);
+			},
+		});
 		zero: number;
 		constructor(_context: unknown, _name: string, options?: AudioWorkletNodeOptions) {
+			super();
 			this.zero = options?.processorOptions?.zero;
 			worklets.push(this);
 		}
 		connect(): void {}
 		disconnect(): void {}
+		// What the processor posts once it has stopped, in the quantum that ends it.
+		stop(): void {
+			this.port.dispatchEvent(new MessageEvent("message", { data: { type: "stopped" } }));
+		}
 		// What the processor posts once the graph renders a quantum.
 		render(): void {
 			this.port.dispatchEvent(
@@ -484,4 +498,79 @@ test("blocks when the worklet node can't be built, until its inputs change", asy
 	capture.close();
 	await settle();
 	error.mockRestore();
+});
+
+// Chromium keeps a closed context, and every node in it, for as long as one of its processors has not
+// stopped, so the context is closed only once the processor says it has.
+test("closes the context once the capture processor has stopped", async () => {
+	using webaudio = installGatedWebAudio();
+
+	webaudio.gesture();
+	const capture = new Capture({ enabled: true, source: new Signal(fakeSource()) as never });
+	await settle();
+	const [context] = webaudio.contexts;
+	const [worklet] = webaudio.worklets;
+	expect(context.state).toBe("running");
+
+	capture.close();
+	await settle();
+	// Told to stop, which it does in the next quantum it renders.
+	expect(worklet.sent).toEqual([{ type: "close" }]);
+	expect(context.closes).toBe(0);
+
+	worklet.stop();
+	await settle();
+	expect(context.closes).toBe(1);
+});
+
+// A context that renders nothing never runs the quantum a processor stops in, so waiting would only
+// hold it open.
+test("closes a context that is not running at once", async () => {
+	using webaudio = installGatedWebAudio();
+
+	const capture = new Capture({ enabled: true, source: new Signal(fakeSource()) as never });
+	await settle();
+	expect(webaudio.contexts[0].state).toBe("suspended");
+
+	capture.close();
+	await settle();
+	expect(webaudio.contexts[0].closes).toBe(1);
+});
+
+test("closes the context when it stops running while the processor stops", async () => {
+	using webaudio = installGatedWebAudio();
+
+	webaudio.gesture();
+	const capture = new Capture({ enabled: true, source: new Signal(fakeSource()) as never });
+	await settle();
+	const [context] = webaudio.contexts;
+
+	capture.close();
+	await settle();
+	expect(context.closes).toBe(0);
+
+	context.transition("interrupted");
+	await settle();
+	expect(context.closes).toBe(1);
+});
+
+// A processor retired by a rebuild (the context was interrupted and resumed) stops the same way.
+test("stops the processor a rebuild retires without closing the context", async () => {
+	using webaudio = installGatedWebAudio();
+
+	webaudio.gesture();
+	const capture = new Capture({ enabled: true, source: new Signal(fakeSource()) as never });
+	await settle();
+	webaudio.contexts[0].transition("interrupted");
+	await settle();
+	webaudio.contexts[0].transition("running");
+	await settle();
+
+	expect(webaudio.worklets.length).toBe(2);
+	expect(webaudio.worklets[0].sent).toEqual([{ type: "close" }]);
+	expect(webaudio.worklets[1].sent).toEqual([]);
+	expect(webaudio.contexts[0].closes).toBe(0);
+
+	capture.close();
+	await settle();
 });

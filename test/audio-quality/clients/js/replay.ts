@@ -2,8 +2,9 @@
  * Replays the recorded traces through the player's consumer and rings, and writes each row the way
  * `driver.ts` writes a browser row, so `analyze.ts` reduces both alike.
  *
- * The player half is `js/watch/src/audio/replay.ts`: the real container consumer and rings on a
- * simulated clock, at the delay a real `Sync` resolves from the playout target it measures. This half
+ * The player half is `js/watch/src/audio/replay.ts`: the real container consumer, rings, and playout
+ * engine on a simulated clock, at the delay a real `Sync` resolves from the playout target it
+ * measures. This half
  * reads its quanta through the same classifier the page's output tap runs, and samples the ring
  * every 250 ms of simulated time, as the probe samples a page. Every profile is the trace's name at
  * the "auto" delay a viewer gets by default.

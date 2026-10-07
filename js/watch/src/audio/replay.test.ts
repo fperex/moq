@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, type Mock, spyOn } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import { Time } from "@moq/net";
+import type { Counters } from "./playout";
 import { type Arrival, type Options, QUANTUM, replay } from "./replay";
 
 const RATE = 48000;
@@ -29,6 +30,24 @@ async function underruns(trace: Arrival[], options: Options): Promise<number> {
 	return short;
 }
 
+/**
+ * What the engine did with a trace: the quanta that came back short, as {@link underruns} counts them,
+ * and the counters it ended on.
+ */
+async function played(trace: Arrival[], options: Options): Promise<{ short: number; counters: Counters }> {
+	let started = false;
+	let short = 0;
+	let counters: Counters | undefined;
+	for await (const quantum of replay(trace, options)) {
+		const filled = quantum.output.findLastIndex((v) => v !== 0) + 1;
+		if (started && filled < QUANTUM) short++;
+		if (filled > 0) started = true;
+		counters = { ...quantum.counters };
+	}
+	if (!counters) throw new Error("the replay rendered nothing");
+	return { short, counters };
+}
+
 describe.each(["shared", "post"] as const)("%s ring", (ring) => {
 	// The consumer warns on every group it skips.
 	let warn: Mock<typeof console.warn>;
@@ -46,21 +65,29 @@ describe.each(["shared", "post"] as const)("%s ring", (ring) => {
 		).toBe(0);
 	});
 
+	// The ring on its own, without the synthesized audio a page covers a gap with: what a listener who
+	// turned `conceal` off hears.
 	it("underruns when a flush span outlasts the target, and not when it is covered", async () => {
 		// Five frames held and flushed at once: 80 ms of arrival spread.
 		const trace = paced(10, (i) => 30 + (4 - (i % 5)) * 20);
-		expect(
-			await underruns(trace, { ring, rate: RATE, config: CONFIG, delay: Time.Milli(40), duration: observed(10) }),
-		).toBeGreaterThan(50);
-		expect(
-			await underruns(trace, {
-				ring,
-				rate: RATE,
-				config: CONFIG,
-				delay: Time.Milli(150),
-				duration: observed(10),
-			}),
-		).toBe(0);
+		const options = { ring, rate: RATE, config: CONFIG, conceal: false, duration: observed(10) };
+		expect(await underruns(trace, { ...options, delay: Time.Milli(40) })).toBeGreaterThan(50);
+		expect(await underruns(trace, { ...options, delay: Time.Milli(150) })).toBe(0);
+	});
+
+	it("covers the gaps a short target leaves with synthesized audio, and plays through them", async () => {
+		const trace = paced(10, (i) => 30 + (4 - (i % 5)) * 20);
+		const options = { ring, rate: RATE, config: CONFIG, delay: Time.Milli(40), duration: observed(10) };
+		const control = await played(trace, { ...options, conceal: false });
+		const concealed = await played(trace, options);
+
+		// The same ring runs dry, and a listener hears a short quantum for each of the control's. With
+		// concealment on, the engine fills them: almost none reach the device short, and what covered
+		// them is counted.
+		expect(control.counters.concealed).toBe(0);
+		expect(control.short).toBeGreaterThan(50);
+		expect(concealed.counters.concealed).toBeGreaterThan(0);
+		expect(concealed.short).toBeLessThan(control.short / 5);
 	});
 
 	it("holds newer groups behind a missing one until the max age gives up on it", async () => {
@@ -68,16 +95,12 @@ describe.each(["shared", "post"] as const)("%s ring", (ring) => {
 		// The consumer delivers in group order, so the ring runs dry for longer than the missing frame
 		// while the groups behind it wait. Writing arrivals straight into the ring plays straight through.
 		const frame = Math.ceil((20 / 1000) * (RATE / QUANTUM));
-		expect(
-			await underruns(trace, {
-				ring,
-				rate: RATE,
-				config: CONFIG,
-				delay: Time.Milli(100),
-				duration: observed(10),
-			}),
-		).toBeGreaterThan(frame);
+		const options = { ring, rate: RATE, config: CONFIG, delay: Time.Milli(100), duration: observed(10) };
+		expect(await underruns(trace, { ...options, conceal: false })).toBeGreaterThan(frame);
 		expect(warn).toHaveBeenCalled();
+
+		// With concealment the page covers what the groups behind it wait for.
+		expect((await played(trace, options)).counters.concealed).toBeGreaterThan(0);
 	});
 
 	it("leaves a frame missing inside a group as missing audio", async () => {

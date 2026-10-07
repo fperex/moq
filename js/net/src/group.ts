@@ -4,7 +4,7 @@
  * @module
  */
 import { type Dispose, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
-import { FrameTooLarge, GroupTooLarge, TooFarBehind } from "./error.ts";
+import { FrameTooLarge, GroupTooLarge, StreamCode, StreamError, TooFarBehind } from "./error.ts";
 import { hooks, type ReadGroupFrame } from "./internal.ts";
 import { Timestamp } from "./time.ts";
 
@@ -430,7 +430,11 @@ export class Consumer {
 		if (!this.#expiry?.expired()) return false;
 
 		if (unread) {
-			this.#terminal = new Error("group exceeded the subscription max age budget");
+			// Old, as the Rust publisher resets it: a newer group superseded this one, which is a
+			// gap to resync from, not an internal failure.
+			this.#terminal = new StreamError(StreamCode.Old, {
+				message: "group exceeded the subscription max age budget",
+			});
 		} else {
 			this.#ended = true;
 		}

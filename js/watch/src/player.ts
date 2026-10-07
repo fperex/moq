@@ -34,6 +34,12 @@ export type PlayerInput = {
 	volume: Getter<number>;
 	/** Silence audio and stop its download. */
 	muted: Getter<boolean>;
+	/** Whether a gap in the audio is concealed rather than played as a gap. See {@link Audio.DecoderInput.conceal}. */
+	conceal: Getter<boolean>;
+	/** The relay the broadcast is read from, which the audio worker dials. See {@link Audio.DecoderInput.url}. */
+	url: Getter<URL | undefined>;
+	/** Whether the audio is fed from a dedicated worker. See {@link Audio.DecoderInput.offload}. */
+	offload: Getter<boolean>;
 	/** Canvas visibility policy for video downloads. */
 	visible: Getter<Video.Visible>;
 	/** Playback distance from the live edge. */
@@ -89,6 +95,9 @@ export class Player {
 			paused: getter(props.paused ?? false),
 			volume: getter(props.volume ?? 0.5),
 			muted: getter(props.muted ?? false),
+			conceal: getter(props.conceal ?? true),
+			url: getter<URL | undefined>(props.url),
+			offload: getter(props.offload ?? true),
 			visible: getter(props.visible ?? "20%"),
 			delay: getter(props.delay ?? "auto"),
 			buffer: getter(props.buffer ?? Time.Milli.zero),
@@ -121,7 +130,17 @@ export class Player {
 		this.#signals.cleanup(() => this.sync.close());
 
 		this.video = new Video.Decoder({ source: videoSource, sync: this.sync, enabled: this.#videoEnabled });
-		this.audio = new Audio.Decoder({ source: audioSource, sync: this.sync, enabled: this.#audioEnabled });
+		this.audio = new Audio.Decoder({
+			source: audioSource,
+			sync: this.sync,
+			enabled: this.#audioEnabled,
+			// A disabled player can never be heard, so it releases its audio context. A mute only
+			// stops the download and keeps the context, so the unmute needs no gesture.
+			attached: this.in.enabled,
+			conceal: this.in.conceal,
+			url: this.in.url,
+			offload: this.in.offload,
+		});
 		this.#signals.cleanup(() => {
 			this.video.close();
 			this.audio.close();

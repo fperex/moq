@@ -11,6 +11,7 @@ import { Source } from "./source";
 
 // Bun cannot load the blob-URL worklet import.
 mock.module("./render-worklet.ts?worklet", () => ({ default: async () => "blob:fake-render" }));
+mock.module("./worker/worker.ts?worklet", () => ({ default: async () => "blob:fake-worker" }));
 const { Decoder } = await import("./decoder");
 
 // Drain reactive work without advancing playback time.
@@ -26,6 +27,10 @@ class FakeContext extends EventTarget {
 	state: AudioContextState = "running";
 	readonly sampleRate: number;
 	readonly audioWorklet = { addModule: () => moduleLoaded };
+	// A device 40ms behind the render graph: what was rendered up to context time 1.04s is only now
+	// at 1.00s on the output.
+	readonly currentTime = 1.04;
+	getOutputTimestamp = () => ({ contextTime: 1, performanceTime: performance.now() });
 	readonly calls = { suspend: 0, resume: 0, close: 0 };
 	constructor(options: AudioContextOptions) {
 		super();
@@ -50,8 +55,30 @@ class FakeContext extends EventTarget {
 	};
 }
 
-class FakeWorklet {
-	readonly port = Object.assign(new EventTarget(), { postMessage() {}, start() {} });
+// What the page sent every render worklet it built.
+let posted: unknown[] = [];
+
+// Behind a processor that stops the way the render worklet's does: in the next quantum its context
+// renders after it is told to close, saying so on the node's port. A running context renders on its
+// own; a suspended one never does.
+class FakeWorklet extends EventTarget {
+	readonly port = Object.assign(new EventTarget(), {
+		postMessage: (message: unknown) => {
+			posted.push(message);
+			if ((message as { type?: string }).type !== "close") return;
+			queueMicrotask(() => {
+				if (this.context.state === "running") {
+					this.port.dispatchEvent(new MessageEvent("message", { data: { type: "stopped" } }));
+				}
+			});
+		},
+		start() {},
+	});
+	readonly context: FakeContext;
+	constructor(context: FakeContext) {
+		super();
+		this.context = context;
+	}
 	disconnect() {}
 }
 
@@ -95,6 +122,7 @@ beforeEach(() => {
 	frameTimestamp = 0;
 	codecs = 0;
 	contexts = [];
+	posted = [];
 	moduleLoaded = Promise.resolve();
 	for (const name of globals) originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
 
@@ -175,7 +203,7 @@ function feed() {
 	};
 }
 
-async function play(initial: Delay) {
+async function play(initial: Delay, props?: { conceal?: boolean; enabled?: Signal<boolean> }) {
 	const push = feed();
 	const truncate = spyOn(SharedRingBuffer.prototype, "truncate");
 	const reset = spyOn(SharedRingBuffer.prototype, "reset");
@@ -199,7 +227,7 @@ async function play(initial: Delay) {
 	const delay = new Signal<Delay>(initial);
 	const source = new Source({ broadcast, supported: async () => true });
 	const sync = new Sync({ delay });
-	const decoder = new Decoder({ source, sync });
+	const decoder = new Decoder({ source, sync, conceal: props?.conceal, enabled: props?.enabled });
 	await microtasks();
 
 	// Enough frames to get past the legacy decoder's warm-up, so a handover would truncate.
@@ -229,6 +257,7 @@ async function play(initial: Delay) {
 			consumer = producer.consume();
 			frameTimestamp = 0;
 		},
+		sync,
 		// The rings written to, and the timestamps of every frame that reached one.
 		rings: () => [...new Set(insert.mock.contexts)] as SharedRingBuffer[],
 		inserted: () => insert.mock.calls.map(([timestamp]) => timestamp as number),
@@ -246,6 +275,54 @@ async function play(initial: Delay) {
 		},
 	};
 }
+
+describe("Decoder clock", () => {
+	// The ring's playhead is published once a poll, so the page waits out one.
+	const poll = () => new Promise((resolve) => setTimeout(resolve, 120));
+
+	it("drives the shared clock from the ring while audio is on, and hands it back when it is not", async () => {
+		const enabled = new Signal(true);
+		const playback = await play(Time.Milli(100), { enabled });
+		try {
+			expect(playback.sync.out.clock.peek()).toBeUndefined();
+
+			await playback.play();
+			await poll();
+			expect(playback.sync.out.clock.peek()).toBe("audio");
+			expect(playback.sync.track("audio").clock.peek()?.rate).toBeGreaterThanOrEqual(0);
+
+			// A muted ring drains to a playhead that stopped meaning anything.
+			enabled.set(false);
+			await microtasks();
+			expect(playback.sync.out.clock.peek()).toBeUndefined();
+		} finally {
+			playback.close();
+		}
+	});
+});
+
+describe("Decoder concealment", () => {
+	const concealed = () =>
+		posted.map((message) => (message as { conceal?: boolean }).conceal).filter((c) => c !== undefined);
+
+	it("asks the render worklet to conceal gaps by default", async () => {
+		const playback = await play(Time.Milli(100));
+		try {
+			expect(concealed()).toEqual([true]);
+		} finally {
+			playback.close();
+		}
+	});
+
+	it("leaves a gap audible as a gap when asked to", async () => {
+		const playback = await play(Time.Milli(100), { conceal: false });
+		try {
+			expect(concealed()).toEqual([false]);
+		} finally {
+			playback.close();
+		}
+	});
+});
 
 describe("Decoder across a delay change", () => {
 	for (const initial of [Time.Milli(100), "auto"] as const) {

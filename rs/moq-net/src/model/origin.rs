@@ -6240,6 +6240,78 @@ mod tests {
 		(server, upstream, dynamic, resolved)
 	}
 
+	/// A finished catalog a first reader consumed and left stays reusable by a second front,
+	/// which has no copy of its own: the shared upstream cache still holds its head, so the
+	/// second reader gets the snapshot instead of waiting for the next catalog change.
+	#[moq_net_sim::test]
+	async fn another_front_replays_a_resumed_finished_catalog() {
+		let producer = origin(1).produce();
+		let server = producer
+			.dynamic("room/alice", Route::default().with_hops(hops(&[10])))
+			.unwrap();
+		let pending = producer.consume().excluding(origin(20)).request_broadcast("room/alice");
+		let upstream = broadcast::Info::new().produce();
+		let mut dynamic = upstream.dynamic();
+		queued(&server).await.accept(&upstream);
+		let resolved = pending.await.unwrap();
+
+		let track = resolved.track("catalog").unwrap();
+		let subscribing = moq_net_sim::spawn(async move { track.subscribe(None).await });
+		let source = dynamic.requested_track().await.unwrap().resolving_start().accept(None);
+		let mut group = source.create_group(10u64.into()).unwrap();
+		group.write_frame(crate::Timestamp::ZERO, b"snapshot".as_ref()).unwrap();
+		group.finish().unwrap();
+		let mut first = subscribing.await.unwrap().unwrap();
+		first.recv_group().await.unwrap().unwrap();
+		drop(first);
+		moq_net_sim::timeout(Duration::from_secs(5), source.demand().unused())
+			.await
+			.expect("unused timed out")
+			.unwrap();
+		drop(source);
+
+		// The same reader returns: the source resumes at the finished catalog.
+		let track = resolved.track("catalog").unwrap();
+		let subscribing = moq_net_sim::spawn(async move { track.subscribe(None).await });
+		let resumed = moq_net_sim::timeout(Duration::from_secs(5), dynamic.requested_track())
+			.await
+			.expect("the returning reader never asked the source")
+			.unwrap()
+			.resolving_start()
+			.accept(None);
+		let mut first = subscribing.await.unwrap().unwrap();
+		settle(|| resumed.subscription().is_some()).await;
+		let mut response = resumed.create_group(10u64.into()).unwrap();
+		response
+			.write_frame(crate::Timestamp::ZERO, b"snapshot".as_ref())
+			.unwrap();
+		response.finish().unwrap();
+		let mut group = first.recv_group().await.unwrap().unwrap();
+		assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], b"snapshot");
+
+		// Another front, with no warm copy of its own, reads the same catalog.
+		let resolved = producer
+			.consume()
+			.excluding(origin(30))
+			.request_broadcast("room/alice")
+			.await
+			.unwrap();
+		let mut second = moq_net_sim::timeout(
+			Duration::from_secs(1),
+			resolved.track("catalog").unwrap().subscribe(None),
+		)
+		.await
+		.expect("the second front never got a subscription")
+		.unwrap();
+		let mut group = moq_net_sim::timeout(Duration::from_secs(1), second.recv_group())
+			.await
+			.expect("the second front never got the catalog")
+			.unwrap()
+			.unwrap();
+		assert_eq!(group.sequence, 10);
+		assert_eq!(&group.read_frame().await.unwrap().unwrap().payload[..], b"snapshot");
+	}
+
 	/// A finished track stays readable from the front while it is read and for the
 	/// linger after, then leaves the broadcast so it stops pinning its cache: the next
 	/// reader asks the source afresh.

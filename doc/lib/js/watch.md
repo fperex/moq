@@ -32,6 +32,8 @@ in sync at the latency you ask for.
 | `paused`, `muted`, `volume` | The usual player controls, mirrored as reactive properties. |
 | `delay` | How far playback trails the live edge: `"auto"` (the default, sized from how late frames actually arrive; see [audio jitter](/concept/audio-jitter)), a duration like `"300ms"`, or `"instant"` to paint frames as they decode with no pacing at all. |
 | `buffer` | Future-dated media held beyond the live edge before playback skips ahead, e.g. `"30s"`. Defaults to none. |
+| `offload` | Feed the audio from a worker, off the page's main thread (default on). `offload="false"` keeps it on the page. See [Audio off the main thread](#audio-off-the-main-thread). |
+| `conceal` | Cover a gap in the audio with synthesized audio instead of playing it as a gap (default on). `conceal="false"` leaves the loss audible, for a listener who would rather hear it than hear invented audio. Read when the audio graph is built. See [playout](/concept/playout). |
 | `captions` | The caption track to show, or absent for off. `el.text.out.available` lists the renditions for a picker. |
 | `visible` | Only subscribe to video while the element is on screen: a margin (`"20%"` default, `"200px"`), `"always"`, or `"never"`. |
 | `announced` | Wait for the broadcast to be announced before subscribing (default on), so a player can be mounted before the stream exists. |
@@ -154,6 +156,8 @@ import * as Watch from "@moq/watch";
 const connection = new Moq.Connection({ url: new URL("https://relay.example.com/anon") });
 const player = new Watch.Player({
     origin: connection.origin,
+    // The relay the audio worker dials; without it the audio stays on the main thread.
+    url: connection.url,
     probe: connection.probe,
     name: Moq.Path.from("alice.hang"),
     canvas,
@@ -185,12 +189,51 @@ decoded PCM; the buffer stays as encoded frames with backpressure on the
 decoder, so a large one is cheap. `el.reset()` flushes and re-anchors at the
 next frame, which is how a producer interrupts an utterance.
 
+## Audio off the main thread
+
+By default the audio does not wait on the page's main thread. One worker per
+page subscribes to every player's audio, decodes it, and writes the ring the
+audio worklet plays from, so a page busy with layout, video, or its own scripts
+cannot starve the sound. The page keeps the AudioContext, the picture, the
+captions, and the controls, and the worker reports back what the stats and the
+clock need.
+
+The worker writes the ring with messages, on a cross-origin isolated page too.
+Only audio kept on the page writes it through shared memory, which isolation
+allows.
+
+`offload="false"`, or `el.offload = false`, keeps a player's audio on the main
+thread.
+
+The worker dials the relay itself, with the same URL (`?jwt=` included) and only
+the transports the page would race. So a page holds one more session per relay
+URL, which all its players share, and the relay's priority of audio over video
+applies within each session, not between the two.
+
+A browser without `Worker` keeps the audio on the page. The page also keeps it,
+or takes it back for good, and warns once in the console, when:
+
+- a Content Security Policy refuses the worker, which starts from a `blob:` URL:
+  allow it with `worker-src blob:`, or host it (see [Strict CSP](#strict-csp));
+- the worker has no native `AudioDecoder`, or cannot open a transport the page
+  would use;
+- the worker plays nothing within 5 seconds of trying, counting only time the
+  page could play it (unmuted, unpaused, its AudioContext running, the broadcast
+  live);
+- the worker stops reporting for 2 seconds while it plays;
+- the worker refuses the rendition, or the worklet cannot read what the worker
+  sent it.
+
+The page then plays the audio itself on a fresh node of the same context, so the
+viewer's gesture is not spent again.
+
 ## Strict CSP
 
-The audio worklet loads from a `blob:` URL by default, so it needs no hosted
-files but a CSP must allow `blob:` in `script-src`. For a CSP that refuses
-`blob:`, copy `node_modules/@moq/watch/assets/*` into a directory your origin
-serves, and point the package at it before playback starts:
+The audio worklet and the audio worker load from `blob:` URLs by default, so
+they need no hosted files but a CSP must allow `blob:` in `script-src` and
+`worker-src`. For a CSP that refuses `blob:`, copy
+`node_modules/@moq/watch/assets/*` into a directory your origin serves, and
+point the package at it before playback starts:
 
 ```ts
 import * as Watch from "@moq/watch";
@@ -199,5 +242,5 @@ Watch.assets("/moq/");
 ```
 
 The URL must end with `/`. Copy the files again on every upgrade: the worklet
-changes with the package. `@moq/room` and `@moq/boy` play through
+and the worker change with the package. `@moq/room` and `@moq/boy` play through
 `@moq/watch`, so this one call covers them.

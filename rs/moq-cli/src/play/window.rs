@@ -79,9 +79,7 @@ pub fn run(
 	let signal = tokio::spawn({
 		let proxy = proxy.clone();
 		async move {
-			if tokio::signal::ctrl_c().await.is_ok() {
-				let _ = proxy.send_event(Event::Finished);
-			}
+			let _ = proxy.send_event(shutdown().await);
 		}
 	});
 
@@ -112,6 +110,14 @@ impl Output for EventLoopProxy<Event> {
 
 	fn send(&self, event: Event) {
 		let _ = self.send_event(event);
+	}
+}
+
+/// The event for the process shutdown signal.
+async fn shutdown() -> Event {
+	match crate::shutdown_signal().await {
+		Ok(()) => Event::Finished,
+		Err(error) => Event::Failed(format!("shutdown listener failed: {error:#}")),
 	}
 }
 
@@ -592,5 +598,33 @@ impl Presenter {
 			pass.set_bind_group(0, bind, &[]);
 			pass.draw(0..3, 0..1);
 		}
+	}
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use super::*;
+
+	/// SIGTERM, what a supervisor sends on stop, closes the window like Ctrl-C does.
+	///
+	/// A signal can't be mocked and is process-wide, so this relies on nextest running
+	/// each test in its own process. Sent before the handler exists, it would take the
+	/// default action and kill the test binary.
+	#[tokio::test]
+	async fn sigterm_finishes_playback() {
+		let mut waiting = std::pin::pin!(shutdown());
+		std::future::poll_fn(|cx| {
+			assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+			std::task::Poll::Ready(())
+		})
+		.await;
+		assert!(
+			std::process::Command::new("/bin/kill")
+				.args(["-TERM", &std::process::id().to_string()])
+				.status()
+				.unwrap()
+				.success()
+		);
+		assert!(matches!(waiting.await, Event::Finished));
 	}
 }

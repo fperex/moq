@@ -4,6 +4,7 @@ import { Signal } from "@moq/signals";
 
 // Vite's worklet loader is not available in Bun; discovery does not start audio.
 mock.module("../../watch/src/audio/render-worklet.ts?worklet", () => ({ default: async () => "blob:fake-render" }));
+mock.module("../../watch/src/audio/worker/worker.ts?worklet", () => ({ default: async () => "blob:fake-worker" }));
 const { Remote } = await import("./remote.ts");
 const { Room } = await import("./room.ts");
 

@@ -16,9 +16,13 @@ class FakeTrack extends EventTarget {
 		return { deviceId: "default" };
 	}
 
+	// Told to the device that handed this track out.
+	onstop: (() => void) | undefined;
+
 	stop(): void {
 		this.stopped = true;
 		this.readyState = "ended";
+		this.onstop?.();
 	}
 
 	/** Die the way an unplugged device does. */
@@ -50,14 +54,23 @@ class FakeMediaDevices extends EventTarget {
 	// a missing device rejects without pushing one.
 	attempts = 0;
 
+	// Held open to keep an attempt in flight, so a toggle can land while one is still running.
+	hold: PromiseWithResolvers<void> | undefined;
+
+	// Acquisitions and releases in the order they happened.
+	order: ("acquire" | "release")[] = [];
+
 	async getUserMedia(): Promise<MediaStream> {
+		this.order.push("acquire");
 		this.attempts += 1;
+		if (this.hold) await this.hold.promise;
 		const error = this.errors.shift();
 		if (error) throw error;
 		if (this.denied) throw new DOMException("Permission denied", "NotAllowedError");
 		if (this.missing) throw new Error("NotFoundError");
 
 		const track = new FakeTrack();
+		track.onstop = () => this.order.push("release");
 		if (this.bornDead) track.readyState = "ended";
 		this.tracks.push(track);
 
@@ -409,6 +422,40 @@ for (const [kind, create] of [
 			expect(media.attempts).toBe(Retry.LIMIT + 2);
 			expect(published(source.out.source.peek())).toBe(media.latest());
 			expect(source.out.error.peek()).toBeUndefined();
+		} finally {
+			source.close();
+		}
+	});
+}
+
+// A browser only starts handing a device back at `stop()`, and a run's cleanup is not ordered against
+// the next run's `getUserMedia`. Hiding a source while an attempt is still in flight and showing it
+// again must not ask for a device the page has not let go of yet.
+for (const [kind, create] of [
+	["camera", (enabled: Signal<boolean>) => new Camera({ enabled })],
+	["microphone", (enabled: Signal<boolean>) => new Microphone({ enabled })],
+] as const) {
+	test(`a ${kind} waits for the previous capture to be released before asking again`, async () => {
+		using media = install(new FakeMediaDevices());
+		media.hold = Promise.withResolvers<void>();
+
+		const enabled = new Signal(true);
+		const source = create(enabled);
+
+		try {
+			await settle();
+			expect(media.attempts).toBe(1);
+
+			enabled.set(false);
+			await settle();
+			enabled.set(true);
+			await settle(40);
+			expect(media.attempts).toBe(1);
+
+			media.hold.resolve();
+			await settle(40);
+			expect(media.attempts).toBe(2);
+			expect(media.order).toEqual(["acquire", "release", "acquire"]);
 		} finally {
 			source.close();
 		}

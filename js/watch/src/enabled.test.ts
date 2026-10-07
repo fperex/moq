@@ -3,6 +3,7 @@ import { expect, mock, test } from "bun:test";
 // Bun cannot load the blob-URL worklet import used by the audio decoder. This default-input test
 // never creates an AudioContext or reaches the worklet implementation.
 mock.module("./audio/render-worklet.ts?worklet", () => ({ default: async () => "blob:fake-render" }));
+mock.module("./audio/worker/worker.ts?worklet", () => ({ default: async () => "blob:fake-worker" }));
 
 const Watch = await import("./index");
 

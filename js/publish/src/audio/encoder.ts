@@ -588,7 +588,11 @@ export class Encoder {
 		const current = this.#decoderDescription.peek();
 		if (current?.config === config && current.description === description) return;
 
-		this.#decoderDescription.set({ config, description });
+		// The catalog merges this onto the exact config object it was reported for, so a rebuilt
+		// encoder reporting the same bytes against a fresh one is an equal value and no notification
+		// of its own. Force one, or the rendition keeps the entry published before this description
+		// found its config: the same rendition minus the description a decoder inits from.
+		this.#decoderDescription.set({ config, description }, true);
 	}
 
 	close() {
